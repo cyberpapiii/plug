@@ -1,0 +1,300 @@
+# Implementation Plan
+
+## Phased Approach
+
+Five phases, each delivering a working increment. Each phase can be validated independently.
+
+---
+
+## Phase 1: Core Proxy (MVP)
+
+**Goal**: A working MCP multiplexer over stdio. One `fanout connect` command, multiple upstream servers, tool routing. No HTTP, no TUI.
+
+### 1.1 Project Scaffolding
+- [ ] Cargo workspace with `fanout` binary crate and `fanout-core` library crate
+- [ ] CI: GitHub Actions for build + test on macOS (ARM), Linux (x86), Windows
+- [ ] cargo-dist configuration for releases
+- [ ] Release profile (strip, lto, codegen-units=1, panic=abort)
+
+### 1.2 Configuration
+- [ ] Config struct with serde Deserialize
+- [ ] Figment layered loading: defaults → TOML file → env vars → CLI flags
+- [ ] Config validation with actionable error messages
+- [ ] `fanout config validate` command
+- [ ] `fanout config path` command
+- [ ] Environment variable references (`$VAR_NAME`) in config values
+
+### 1.3 Server Management (stdio)
+- [ ] Spawn upstream MCP servers as child processes (`tokio::process::Command`)
+- [ ] Capture stdout (MCP messages) and stderr (server logs) separately
+- [ ] Initialize each upstream server (send `initialize`, receive `InitializeResult`, send `initialized`)
+- [ ] Store per-server capabilities and tool list
+- [ ] Startup concurrency batching (start 3 servers at a time, not all at once)
+- [ ] Graceful shutdown: close stdin → wait 5s → SIGTERM → wait 5s → SIGKILL
+- [ ] No orphaned child processes on fanout exit (use process groups or signal forwarding)
+
+### 1.4 Tool Routing
+- [ ] ToolRouter with 4-tier resolution (cache → prefix → negative cache → fan-out)
+- [ ] DashMap tool cache: `tool_name → server_id`
+- [ ] Prefix extraction: `github__create_issue` → `github`
+- [ ] Negative cache with 30s TTL
+- [ ] Fan-out via `tokio::JoinSet` with 25s per-server timeout
+
+### 1.5 Fan-Out & Merge
+- [ ] `tools/list`: parallel fan-out to all servers, merge results, cache
+- [ ] Merge-based cache: preserve last-known tools when a server times out
+- [ ] Tool name prefixing (configurable: on by default, `__` delimiter)
+- [ ] Collision detection: warn if two servers define the same unprefixed tool name
+- [ ] `resources/list`: merge (always return `{resources: []}` if none — Codex compatibility)
+- [ ] `prompts/list`: merge
+- [ ] `prompts/get`: route to the server that owns the prompt
+
+### 1.6 Request Routing
+- [ ] `tools/call`: resolve server via ToolRouter, forward, return response
+- [ ] Request ID remapping: client req ID → upstream req ID → client req ID
+- [ ] `resources/read`: route by URI prefix/ownership
+- [ ] Error handling: clear JSON-RPC errors for tool not found, server unavailable, timeout
+
+### 1.7 Notification Forwarding
+- [ ] `list_changed` from upstream: invalidate cache, re-fan-out, notify all downstream clients
+- [ ] `progress` from upstream: forward to the client that initiated the request
+- [ ] `cancelled` from downstream: forward to the upstream server
+
+### 1.8 `fanout connect` Command
+- [ ] stdio bridge: read MCP from stdin, write to stdout
+- [ ] This is what clients invoke: `{"command": "fanout", "args": ["connect"]}`
+- [ ] Handle initialize: synthesize capabilities from all upstreams
+- [ ] Client type detection from `clientInfo.name`
+
+### 1.9 Basic CLI
+- [ ] `fanout status` — server health (pretty + --output json)
+- [ ] `fanout server list` — list configured servers
+- [ ] `fanout tool list` — list all tools
+
+### 1.10 Validation
+- [ ] Connect Claude Code via `.mcp.json` → verify tools/list and tools/call work
+- [ ] Connect two Claude Code instances simultaneously → verify no conflicts
+- [ ] Kill one upstream server → verify other servers keep working
+
+---
+
+## Phase 2: HTTP + Portless
+
+**Goal**: Streamable HTTP server for remote clients. Legacy SSE for OpenCode. `.localhost` subdomain routing. Session management.
+
+### 2.1 Streamable HTTP Server
+- [ ] Axum server on port 3282 (configurable)
+- [ ] POST `/mcp` — accept JSON-RPC requests, return JSON or SSE stream
+- [ ] GET `/mcp` — server-initiated SSE stream for notifications
+- [ ] DELETE `/mcp` — session termination
+- [ ] `MCP-Session-Id` generation (UUID v4) and validation
+- [ ] `MCP-Protocol-Version` header handling
+- [ ] `Accept` header parsing (application/json vs text/event-stream)
+- [ ] Origin header validation (DNS rebinding prevention)
+- [ ] Bind to 127.0.0.1 by default (configurable)
+
+### 2.2 Legacy SSE Server
+- [ ] GET `/sse` — return `endpoint` event (old SSE protocol for OpenCode)
+- [ ] POST to dynamic endpoint from `endpoint` event
+- [ ] Backwards-compatibility procedure per MCP spec
+
+### 2.3 `.localhost` Subdomain Routing
+- [ ] Host header extraction in axum middleware
+- [ ] Route `servername.localhost:3282` → direct proxy to that specific server
+- [ ] Route `localhost:3282` → main MCP endpoint (aggregated)
+- [ ] DashMap route registry: `subdomain → server_id`
+- [ ] Auto-register subdomains on server start, remove on server stop
+
+### 2.4 Streamable HTTP Client (for remote upstream servers)
+- [ ] reqwest-based client for upstream Streamable HTTP servers
+- [ ] Session management (MCP-Session-Id tracking)
+- [ ] SSE stream parsing for server-initiated messages
+- [ ] Reconnection with Last-Event-ID
+
+### 2.5 Session Management
+- [ ] Per-client session tracking (DashMap<SessionId, ClientSession>)
+- [ ] Session timeout (configurable, default 30 minutes of inactivity)
+- [ ] Proper session cleanup on client disconnect
+- [ ] Session resumability for HTTP clients (Last-Event-ID)
+
+### 2.6 HTTP/2 Support
+- [ ] Enable HTTP/2 via axum-server + rustls (optional, for performance)
+- [ ] Self-signed cert generation via rcgen for `.localhost`
+
+### 2.7 Validation
+- [ ] Connect Gemini CLI via HTTP → verify tool discovery works within 60s
+- [ ] Connect OpenCode via SSE → verify legacy protocol works
+- [ ] Access `github.localhost:3282/mcp` → verify direct server access
+- [ ] Multiple HTTP clients + stdio clients simultaneously
+
+---
+
+## Phase 3: Resilience + Token Efficiency
+
+**Goal**: Circuit breakers, health checks, client-aware tool filtering, lazy schemas, tool search.
+
+### 3.1 Circuit Breakers
+- [ ] tower-circuitbreaker integration per upstream server
+- [ ] 50% failure rate threshold, 30s open duration, 2 half-open probes
+- [ ] Event bus notification on state transitions
+- [ ] TUI/log visibility of circuit breaker state
+
+### 3.2 Health Checks
+- [ ] Periodic `ping` to each upstream server (interval: 60s + jitter)
+- [ ] Health state machine: Healthy → Degraded → Failed
+- [ ] Exponential backoff for failed health checks
+- [ ] Event bus notification on health transitions
+
+### 3.3 Adaptive Backpressure
+- [ ] Evaluate flow-guard vs simple semaphore for our scale
+- [ ] Implement concurrency limits per upstream server
+- [ ] Back off when upstream latency increases
+
+### 3.4 Client-Aware Tool Filtering
+- [ ] Client type detection from `clientInfo.name` → tool limit
+- [ ] Cursor: 40 tools max
+- [ ] Windsurf: 100 tools max
+- [ ] VS Code Copilot: 128 tools max
+- [ ] Priority sorting: usage frequency → config `priority_tools` → alphabetical
+- [ ] Event: "Cursor: serving 40/65 tools (25 filtered)"
+- [ ] Log which tools were filtered
+
+### 3.5 Lazy Schema Loading
+- [ ] Return minimal tool definitions in `tools/list` (name, title, description only — no inputSchema)
+- [ ] Provide `inputSchema` only when `tools/call` is invoked or when client explicitly requests
+- [ ] Configurable: opt-in per client or global
+- [ ] Research: does the MCP spec support this? Or do we need a custom extension?
+
+### 3.6 Tool Search / Catalog Mode
+- [ ] `search_tools` meta-tool: search by name, description, category
+- [ ] Return top 5-10 matching tools with full schemas
+- [ ] Configurable: activate when total tools > threshold (e.g., 50)
+- [ ] Research: how does Claude Code's built-in Tool Search work? Can we align with it?
+
+### 3.7 Startup Optimization
+- [ ] Concurrent server startup in batches of 3
+- [ ] Pre-populate tool cache at startup (don't wait for first client request)
+- [ ] Warm cache for `prompts/list` and `resources/list` at startup (Gemini CLI needs fast response)
+
+### 3.8 Validation
+- [ ] Kill/restart an upstream server → verify circuit breaker opens/closes
+- [ ] Connect Cursor with > 40 tools → verify only 40 are served
+- [ ] Measure tool call overhead → must be < 5ms for cached routes
+
+---
+
+## Phase 4: TUI
+
+**Goal**: Beautiful ratatui dashboard with real-time monitoring.
+
+### 4.1 Core TUI Framework
+- [ ] Ratatui + crossterm setup with tokio async event loop
+- [ ] Event stream: crossterm key/mouse events + tick + render + engine events
+- [ ] Core `App` state struct (separate from Engine — TUI state only)
+- [ ] Modal navigation system (vim-inspired)
+
+### 4.2 Dashboard Layout
+- [ ] Responsive layout: wide (side-by-side), medium (stacked), narrow (tabbed)
+- [ ] Servers panel: name, tool count, latency, health status
+- [ ] Clients panel: type, session ID, tools served, last activity
+- [ ] Activity panel: rolling log of MCP requests
+
+### 4.3 Panel Views
+- [ ] Tools view (full screen): searchable list of all tools with server origin
+- [ ] Tool detail: full schema, annotations, server, description
+- [ ] Log view (full screen): structured log with level/server/client filters
+- [ ] Doctor view: diagnostic results
+
+### 4.4 Interactivity
+- [ ] Server management: restart, disable/enable from TUI
+- [ ] Search within any panel (`/`)
+- [ ] Context-aware keybinding bar
+- [ ] Help overlay (`?`)
+
+### 4.5 Visual Polish
+- [ ] Status indicators: ● ◐ ○ ↔
+- [ ] Colors: green/yellow/red/cyan/dim
+- [ ] NO_COLOR support
+- [ ] Smooth status transitions (server connecting → connected)
+
+### 4.6 Headless/Daemon Mode
+- [ ] Same Engine, no TUI
+- [ ] PID file for daemon detection
+- [ ] Unix socket for CLI → daemon communication (`fanout status` talks to running daemon)
+- [ ] Structured logging to file (tracing-appender)
+
+### 4.7 Validation
+- [ ] TUI renders correctly at 80x24, 120x40, 200x60
+- [ ] All key bindings work
+- [ ] Real-time updates visible (connect/disconnect clients and servers)
+
+---
+
+## Phase 5: Polish + Distribution
+
+**Goal**: Auto-import, export, doctor, config hot-reload, tool enrichment, release pipeline.
+
+### 5.1 Config Auto-Import
+- [ ] Scan all known client config locations (see CLIENT-COMPAT.md)
+- [ ] Parse each format (Claude JSON, Cursor JSON, Codex TOML, Gemini JSON)
+- [ ] Deduplicate servers by command + args signature
+- [ ] First-run interactive import
+- [ ] `fanout import <source>` for individual clients
+- [ ] `fanout import --all --yes` for non-interactive
+
+### 5.2 Config Export
+- [ ] `fanout export claude-desktop` — generate claude_desktop_config.json
+- [ ] `fanout export cursor` — generate .cursor/mcp.json
+- [ ] `fanout export codex` — generate TOML snippet
+- [ ] `fanout export gemini-cli` — generate settings.json snippet
+
+### 5.3 Config Hot-Reload
+- [ ] `notify` file watcher on config.toml
+- [ ] SIGHUP handler (Unix) for manual reload trigger
+- [ ] Diff detection: add new servers, remove deleted, restart changed
+- [ ] No restart required for settings changes (bind address change = warning)
+
+### 5.4 Tool Enrichment (Optional, Opt-In)
+- [ ] Auto-inferred annotations from tool name patterns (readOnly, destructive, idempotent)
+- [ ] Tool name normalization (human-readable titles from `snake_case` names)
+- [ ] Configurable per-server: enrichment on/off, annotation defaults
+
+### 5.5 Doctor Command
+- [ ] Config validation
+- [ ] Port availability check
+- [ ] Environment variable presence check
+- [ ] Server connectivity check (ping each)
+- [ ] Tool collision detection
+- [ ] Client tool limit warnings
+
+### 5.6 Release Pipeline
+- [ ] cargo-dist configuration
+- [ ] GitHub Actions: build on tag push
+- [ ] Targets: macOS ARM, macOS Intel, Linux x86 (glibc + musl), Linux ARM, Windows
+- [ ] Homebrew tap: `brew install fanout`
+- [ ] Shell installer: `curl -fsSL https://get.fanout.dev | sh`
+- [ ] README with installation instructions
+- [ ] Changelog
+
+### 5.7 Server Cards
+- [ ] Serve `/.well-known/mcp.json` endpoint
+- [ ] Include: server name, version, tool count, server list, supported transports
+- [ ] Ready for June 2026 spec
+
+### 5.8 Validation
+- [ ] Full end-to-end: install from Homebrew → import → connect all major clients → tools work
+- [ ] Binary size < 10 MB
+- [ ] Startup < 1 second
+- [ ] Tool call overhead < 5ms
+
+---
+
+## Milestone Summary
+
+| Phase | Deliverable | Key Validation |
+|-------|------------|----------------|
+| 1 | Working stdio multiplexer | Claude Code → fanout → 4 servers, tool calls work |
+| 2 | HTTP + .localhost | Gemini CLI + OpenCode connected alongside stdio clients |
+| 3 | Resilient + token-efficient | Circuit breakers tested, Cursor gets exactly 40 tools |
+| 4 | Beautiful TUI | Screenshot-worthy dashboard with real-time updates |
+| 5 | Polished + distributable | `brew install fanout && fanout` works end-to-end |
