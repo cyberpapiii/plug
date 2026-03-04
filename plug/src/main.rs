@@ -73,6 +73,28 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Import MCP servers from AI client configs
+    Import {
+        /// Only scan specific clients (comma-separated: claude-desktop,cursor,vscode,...)
+        #[arg(long, value_delimiter = ',')]
+        clients: Option<Vec<String>>,
+        /// Don't modify config — just show what would be imported
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Export plug config snippet for a target client
+    Export {
+        /// Target client (claude-desktop, claude-code, cursor, windsurf, vscode, gemini-cli, codex-cli, opencode, zed, cline, factory, nanobot)
+        target: String,
+        /// Use HTTP transport instead of stdio
+        #[arg(long)]
+        http: bool,
+        /// HTTP port (default: from config or 3282)
+        #[arg(long, default_value = "3282")]
+        port: u16,
+    },
+    /// Run diagnostic checks on your plug setup
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +170,15 @@ async fn main() -> anyhow::Result<()> {
                 cmd_tool_list(cli.config.as_ref(), &cli.output).await?;
             }
         },
+        Commands::Import { clients, dry_run } => {
+            cmd_import(cli.config.as_ref(), clients, dry_run, &cli.output)?;
+        }
+        Commands::Export { target, http, port } => {
+            cmd_export(&target, http, port)?;
+        }
+        Commands::Doctor => {
+            cmd_doctor(cli.config.as_ref(), &cli.output).await?;
+        }
         Commands::Config { command } => match command {
             ConfigCommands::Validate => {
                 let config = plug_core::config::load_config(cli.config.as_ref());
@@ -660,5 +691,213 @@ async fn cmd_tool_list(
     }
 
     server_manager.shutdown_all().await;
+    Ok(())
+}
+
+/// `plug import` — scan AI client configs and import MCP server definitions.
+fn cmd_import(
+    config_path: Option<&std::path::PathBuf>,
+    clients: Option<Vec<String>>,
+    dry_run: bool,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    use plug_core::import::{self, ClientSource};
+
+    // Determine which clients to scan
+    let sources: Vec<ClientSource> = match clients {
+        Some(names) => {
+            let mut sources = Vec::new();
+            for name in &names {
+                match name.as_str() {
+                    "claude-desktop" => sources.push(ClientSource::ClaudeDesktop),
+                    "claude-code" => sources.push(ClientSource::ClaudeCode),
+                    "cursor" => sources.push(ClientSource::Cursor),
+                    "windsurf" => sources.push(ClientSource::Windsurf),
+                    "vscode" => sources.push(ClientSource::VSCodeCopilot),
+                    "gemini" | "gemini-cli" => sources.push(ClientSource::GeminiCli),
+                    "codex" | "codex-cli" => sources.push(ClientSource::CodexCli),
+                    "opencode" => sources.push(ClientSource::OpenCode),
+                    "zed" => sources.push(ClientSource::Zed),
+                    "cline" => sources.push(ClientSource::Cline),
+                    "factory" => sources.push(ClientSource::Factory),
+                    "nanobot" => sources.push(ClientSource::Nanobot),
+                    _ => {
+                        eprintln!("unknown client: {name}");
+                        eprintln!(
+                            "valid clients: claude-desktop, claude-code, cursor, windsurf, vscode, gemini-cli, codex-cli, opencode, zed, cline, factory, nanobot"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            sources
+        }
+        None => ClientSource::all().to_vec(),
+    };
+
+    // Load existing config to detect duplicates
+    let existing = match plug_core::config::load_config(config_path) {
+        Ok(cfg) => cfg.servers,
+        Err(_) => std::collections::HashMap::new(),
+    };
+
+    let report = import::import(&existing, &sources);
+
+    match output {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+            // Show scan results
+            for result in &report.scanned {
+                if !result.servers.is_empty() {
+                    eprintln!(
+                        "  {} — found {} server(s)",
+                        result.source,
+                        result.servers.len()
+                    );
+                }
+                if let Some(ref err) = result.error {
+                    eprintln!("  {} — error: {err}", result.source);
+                }
+            }
+
+            if report.duplicates_merged > 0 {
+                eprintln!(
+                    "  merged {} duplicate(s)",
+                    report.duplicates_merged
+                );
+            }
+            if report.skipped > 0 {
+                eprintln!(
+                    "  skipped {} already-configured server(s)",
+                    report.skipped
+                );
+            }
+
+            if report.new_servers.is_empty() {
+                println!("no new servers to import");
+            } else if dry_run {
+                println!(
+                    "would import {} new server(s):",
+                    report.new_servers.len()
+                );
+                for s in &report.new_servers {
+                    println!("  {} (from {})", s.name, s.source);
+                }
+                let existing_names: Vec<String> = existing.keys().cloned().collect();
+                let toml = import::servers_to_toml(&report.new_servers, &existing_names);
+                println!("\nconfig to append:\n{toml}");
+            } else {
+                // Write to config file
+                let config_file = config_path
+                    .cloned()
+                    .unwrap_or_else(plug_core::config::default_config_path);
+                let existing_names: Vec<String> = existing.keys().cloned().collect();
+                let toml = import::servers_to_toml(&report.new_servers, &existing_names);
+
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&config_file)?;
+                file.write_all(toml.as_bytes())?;
+
+                println!(
+                    "imported {} server(s) into {}",
+                    report.new_servers.len(),
+                    config_file.display()
+                );
+                for s in &report.new_servers {
+                    println!("  + {} (from {})", s.name, s.source);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// `plug export <target>` — generate a config snippet for a target client.
+fn cmd_export(target: &str, http: bool, port: u16) -> anyhow::Result<()> {
+    use plug_core::export::{ExportOptions, ExportTarget, ExportTransport};
+
+    let target: ExportTarget = target
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}\nvalid targets: {}", ExportTarget::all_names().join(", ")))?;
+
+    let transport = if http {
+        ExportTransport::Http
+    } else {
+        ExportTransport::Stdio
+    };
+
+    let options = ExportOptions {
+        target,
+        transport,
+        port,
+    };
+
+    let config = plug_core::export::export_config(&options);
+    println!("{config}");
+
+    // Show where to put it
+    let path = plug_core::export::default_config_path(target, false);
+    if let Some(path) = path {
+        eprintln!("\nadd this to: {}", path.display());
+    }
+
+    Ok(())
+}
+
+/// `plug doctor` — run diagnostic checks on the plug setup.
+async fn cmd_doctor(
+    config_path: Option<&std::path::PathBuf>,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    let resolved_path = config_path
+        .cloned()
+        .unwrap_or_else(plug_core::config::default_config_path);
+    let config = plug_core::config::load_config(config_path)?;
+
+    let report = plug_core::doctor::run_doctor(&config, &resolved_path).await;
+
+    match output {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+            let mut pass = 0;
+            let mut warn = 0;
+            let mut fail = 0;
+
+            for check in &report.checks {
+                let icon = match check.status {
+                    plug_core::doctor::CheckStatus::Pass => {
+                        pass += 1;
+                        "ok"
+                    }
+                    plug_core::doctor::CheckStatus::Warn => {
+                        warn += 1;
+                        "!!"
+                    }
+                    plug_core::doctor::CheckStatus::Fail => {
+                        fail += 1;
+                        "FAIL"
+                    }
+                };
+                println!("[{icon:>4}] {}: {}", check.name, check.message);
+                if let Some(ref fix) = check.fix_suggestion {
+                    println!("       fix: {fix}");
+                }
+            }
+
+            println!("\n{pass} passed, {warn} warnings, {fail} failures");
+            if fail > 0 {
+                std::process::exit(1);
+            }
+        }
+    }
+
     Ok(())
 }
