@@ -271,8 +271,8 @@ New `AppMode::Doctor` with:
 - [x] `plug-core/src/reload.rs` — File watcher, config diff, server drain logic
 - [x] `plug-core/src/enrichment.rs` — Annotation inference, name normalization
 - [ ] `plug-core/src/engine.rs` — Add `reload_config()` method, spawn file watcher task
-- [ ] `plug-core/src/config/mod.rs` — Add `enrichment` field to `ServerConfig`
-- [ ] `plug-core/src/proxy/mod.rs` — Apply enrichment in `refresh_tools()`
+- [x] `plug-core/src/config/mod.rs` — Add `enrichment` field to `ServerConfig`
+- [x] `plug-core/src/proxy/mod.rs` — Apply enrichment in `refresh_tools()`
 - [x] `plug/src/daemon.rs` — Add SIGHUP handler, `Reload` IPC request
 - [x] `plug/src/main.rs` — Add `plug reload` CLI command
 - [ ] `Cargo.toml` (workspace) — Add `notify` dependency
