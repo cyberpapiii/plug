@@ -1,0 +1,28 @@
+[package]
+name = "plug-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core library for plug MCP multiplexer"
+
+[dependencies]
+rmcp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+figment.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+arc-swap.workspace = true
+uuid.workspace = true
+directories.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+plug-test-harness = { path = "../plug-test-harness" }

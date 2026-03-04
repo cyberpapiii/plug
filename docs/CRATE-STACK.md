@@ -114,21 +114,20 @@ Before adding a crate:
 
 ## Resilience
 
-### `tower-circuitbreaker` — Circuit Breaker
-- **Version**: 0.1+
-- **Why**: Tower-native circuit breaker layer. Configurable failure rate threshold, sliding window, half-open probing. Integrates with existing Tower service stack.
+### `tower-resilience` — Circuit Breaker + Resilience (UPDATED: replaces tower-circuitbreaker)
+- **Version**: 0.7
+- **Why**: Bundles circuit breaker, bulkhead, retry, rate limiting, and 10 other resilience patterns. The `tower-circuitbreaker` crate was deprecated by its author in favor of this workspace.
 - **Configuration**: 50% failure rate → open, 30s cooldown, 2 probe calls in half-open.
-- **Research needed**: Verify the crate is maintained and works with Tower 0.5. Check if it supports async state transitions.
+- **Source**: https://github.com/joshrotenberg/tower-resilience (75 stars)
 
-### `flow-guard` — Adaptive Concurrency
-- **Version**: 0.2+
-- **Why**: TCP Vegas congestion control for dynamic concurrency limits. If upstreams slow down, automatically reduce concurrent calls.
-- **Research needed**: Evaluate if this is mature enough for production. Check if a simpler semaphore-based approach is sufficient for our scale.
+### `tokio::sync::Semaphore` — Concurrency Limiting (UPDATED: replaces flow-guard)
+- **Why**: TCP Vegas (flow-guard) is overkill for <20 upstream servers. MCP server latency is inherently variable (LLM inference, tool execution), so Vegas would misinterpret normal variance as congestion. A simple semaphore with configurable per-server limits is the right tool.
+- **No additional crate needed** — built into tokio.
 
-### `backoff` — Exponential Backoff
-- **Version**: 0.4+
-- **Why**: Exponential backoff with jitter for reconnection logic. Configurable max retries and intervals.
-- **Alternative**: Implement manually (it's not complex), but using the crate ensures correct jitter implementation.
+### `backon` — Exponential Backoff (UPDATED: replaces backoff)
+- **Version**: 1.6.0
+- **Why**: The `backoff` crate is unmaintained. `backon` is actively maintained, supports async/blocking/wasm/no_std, and has a stable 1.0+ API.
+- **Source**: https://crates.io/crates/backon
 
 ---
 
@@ -161,10 +160,9 @@ Before adding a crate:
 - **Version**: 0.2+
 - **Why**: Non-blocking file writer with daily rotation. For daemon/headless mode where stdout is not available.
 
-### `tui-logger` — In-TUI Log Display
-- **Version**: Latest
-- **Why**: Routes tracing events to a ratatui widget. Enables the log view panel in the TUI.
-- **Research needed**: Test integration with tracing-subscriber (TuiTracingSubscriberLayer).
+### Custom TUI Log Widget (UPDATED: replaces tui-logger)
+- **Why**: `tui-logger` 0.17.x pins `ratatui = "0.29"`, conflicting with our target of ratatui 0.30.0. Rather than pin an older ratatui, we'll build a minimal custom widget (~100-200 LOC) that subscribes to tracing events directly. Ratatui's built-in tracing recipe provides a reference implementation.
+- **Source**: https://ratatui.rs/recipes/apps/log-with-tracing/
 
 ### `metrics` — Application Metrics (Optional, Phase 5)
 - **Version**: 0.24+
@@ -223,18 +221,18 @@ Target binary size: < 10 MB (release, stripped).
 
 ---
 
-## Open Research Questions
+## Resolved Research Questions (2026-03-03)
 
-1. **rmcp proxy pattern**: Can rmcp's client and server handlers coexist cleanly in one binary? What's the best way to compose them for a proxy? Are there examples of this in the wild?
+1. **rmcp proxy pattern**: YES — coexist cleanly. AgentGateway validates this. See `docs/research/rmcp-feasibility.md`.
 
-2. **tower-circuitbreaker maturity**: Is this crate production-ready? Alternatives? Should we implement our own?
+2. **tower-circuitbreaker maturity**: DEPRECATED — replaced by `tower-resilience` v0.7.
 
-3. **flow-guard vs simple semaphore**: Is TCP Vegas overkill for our scale (< 20 upstream servers)? Would a simple `tokio::sync::Semaphore` with fixed limits suffice?
+3. **flow-guard vs simple semaphore**: Semaphore wins. TCP Vegas overkill for <20 servers.
 
-4. **Figment env var interpolation**: Does Figment natively support `$VAR_NAME` syntax in TOML values, or do we need a custom deserializer?
+4. **Figment env var interpolation**: NO native support. Need custom post-processor (~50 LOC) to expand `$VAR_NAME` references in TOML values. The idiomatic Figment approach is to use the `Env` provider as an overlay, but that doesn't support inline references.
 
-5. **ratatui + tui-logger integration**: Is tui-logger's TuiTracingSubscriberLayer compatible with tracing-subscriber's layered subscriber? Any performance concerns with high-throughput logging?
+5. **ratatui + tui-logger integration**: CONFLICT — tui-logger pins ratatui 0.29. Build custom widget instead.
 
-6. **axum SSE server**: What's the best pattern for axum to serve both Streamable HTTP (POST → JSON or SSE) and legacy SSE (GET → endpoint event) on the same port?
+6. **axum SSE server**: Use separate routes — `/mcp` for Streamable HTTP (POST/GET/DELETE), `/sse` for legacy SSE (GET → endpoint event). AgentGateway's `LegacySSEService` is the reference implementation.
 
-7. **crossterm Mode 2026**: Should we enable synchronized rendering by default? What's the terminal compatibility matrix?
+7. **crossterm Mode 2026**: Deferred to Phase 4 TUI implementation.

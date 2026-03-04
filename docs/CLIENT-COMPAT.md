@@ -10,12 +10,12 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 |--------|-----------|-----------|---------------|-----------------|
 | Claude Code | stdio | None (tool search at >10% ctx) | JSON | `.mcp.json` or `~/.claude.json` |
 | Claude Desktop | stdio, SSE, Streamable HTTP | None | JSON | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| Cursor | stdio, SSE, Streamable HTTP | **40** | JSON | `.cursor/mcp.json` or `~/.cursor/mcp.json` |
+| Cursor | stdio, SSE, Streamable HTTP | **None** (Dynamic Context Discovery) | JSON | `.cursor/mcp.json` or `~/.cursor/mcp.json` |
 | Windsurf | stdio, SSE, Streamable HTTP | **100** | JSON | `~/.codeium/windsurf/mcp_config.json` |
 | VS Code Copilot | stdio, SSE, Streamable HTTP | **128** | JSON | `.vscode/mcp.json` or settings |
-| Gemini CLI | Direct HTTP | None documented | JSON | `~/.gemini/settings.json` |
+| Gemini CLI | stdio, SSE, Streamable HTTP | None documented | JSON | `~/.gemini/settings.json` |
 | Codex CLI | stdio, Streamable HTTP | None documented | TOML | `~/.codex/config.toml` |
-| OpenCode | SSE only | None documented | Config file | Varies |
+| OpenCode | SSE, Streamable HTTP | None documented | Config file | Varies |
 | Zed | stdio only | None documented | JSON | `settings.json` |
 | Factory/Droid | stdio, HTTP | None documented | CLI config | Varies |
 
@@ -93,18 +93,17 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 }
 ```
 
-**CRITICAL BEHAVIOR — 40 TOOL HARD LIMIT**:
-- Cursor has a hard limit of 40 tools across ALL connected MCP servers
-- Tools beyond 40 are **silently dropped** — no error, no warning, no notification
-- The user has no way to know which tools were dropped
-- Per-tool toggling is NOT available in Cursor
+**UPDATED (2026-03-03): 40-TOOL LIMIT ELIMINATED**:
+- Cursor released "Dynamic Context Discovery" in January 2026
+- Users report 80+ tools working without warnings
+- 46.9% reduction in agent token usage
+- The old 40-tool limit only applies to pre-v2.3 Cursor
+- `clientInfo.name`: `cursor-vscode`
 
 **fanout implications**:
-- MUST detect Cursor from `clientInfo.name` during initialization
-- MUST filter tool list to 40 tools maximum
-- SHOULD sort tools by priority (usage frequency, user-configured priority_tools)
-- SHOULD emit a warning event: "Cursor: serving 40/65 tools (25 filtered)"
-- SHOULD log which tools were filtered so the user can adjust priorities
+- No tool limit filtering needed for current Cursor versions
+- Still detect Cursor via `clientInfo.name` for any future version-aware behavior
+- Keep configurable tool limits as a safety valve
 
 **Forum reference**: https://forum.cursor.com/t/mcp-server-40-tool-limit-in-cursor-is-this-frustrating-your-workflow/81627
 
@@ -162,21 +161,22 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 
 ### Gemini CLI
 
-**Transport**: Direct HTTP (NOT stdio)
+**Transport**: stdio, SSE, AND Streamable HTTP (all three supported)
 **Config format**: JSON
+**`clientInfo.name`**: `gemini-cli-mcp-client`
 ```json
 // ~/.gemini/settings.json
 {
   "mcpServers": {
     "fanout": {
-      "httpUrl": "http://localhost:3282/mcp",
-      "authHeaders": {
-        "Authorization": "Bearer <token>"
-      }
+      "command": "fanout",
+      "args": ["connect"]
     }
   }
 }
 ```
+
+**UPDATED (2026-03-03)**: Gemini CLI supports ALL transports — stdio, SSE, and Streamable HTTP — not just "Direct HTTP" as previously documented. Can be configured as either stdio or HTTP.
 
 **CRITICAL BEHAVIORS**:
 1. **Calls `list_prompts` FIRST** — before `tools/list`. If `prompts/list` hangs or times out, tools are NEVER discovered. Sequential discovery, not parallel.
@@ -186,7 +186,7 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 **fanout implications**:
 - `prompts/list` MUST respond instantly (< 100ms). Return cached or empty.
 - `tools/list` MUST also respond quickly. Pre-cache tool lists at startup.
-- Gemini connects via HTTP, not stdio — must have HTTP server running
+- Gemini can connect via stdio OR HTTP — both paths must work
 - Test with Gemini CLI as part of compatibility validation
 
 **Bug reference**: https://github.com/google-gemini/gemini-cli/issues/7324
@@ -224,20 +224,15 @@ args = ["connect"]
 
 ### OpenCode
 
-**Transport**: SSE only (no Streamable HTTP support)
-**Issue**: https://github.com/anomalyco/opencode/issues/8058
+**Transport**: SSE and Streamable HTTP (auto-negotiation)
+**`clientInfo.name`**: `opencode`
 
-**CRITICAL BEHAVIOR**:
-- Sends GET expecting SSE protocol (old-style: `endpoint` event followed by POST to that endpoint)
-- Returns `405` or `ERR_CONNECTION_REFUSED` for HTTP-only servers
-- No Streamable HTTP support (as of March 2026)
+**UPDATED (2026-03-03)**: OpenCode now supports Streamable HTTP with auto-negotiation. Legacy SSE support remains for backwards compatibility but is no longer the only option.
 
 **fanout implications**:
-- MUST serve legacy SSE endpoint for OpenCode compatibility
-- Use the backwards-compatibility procedure from the MCP spec:
-  - Serve old SSE endpoint at `/sse` (GET returns `endpoint` event)
-  - Serve Streamable HTTP at `/mcp` (POST endpoint)
-  - Clients auto-negotiate based on what works
+- OpenCode can connect via Streamable HTTP (preferred) or legacy SSE
+- Legacy SSE endpoint (`/sse`) still useful for older OpenCode versions
+- Lower priority for legacy SSE implementation since OpenCode now auto-negotiates
 
 ---
 
@@ -298,14 +293,41 @@ This shows which features each client actually supports (not just what the spec 
 
 ## Client Detection Strategy
 
-Detect client type from `clientInfo.name` in `InitializeRequest`:
+Detect client type from `clientInfo.name` in `InitializeRequest` using exact match as primary, fuzzy fallback as secondary (ADR-007):
+
+**Confirmed `clientInfo.name` values** (verified 2026-03-03):
+
+| Client | `clientInfo.name` |
+|--------|-------------------|
+| Claude Code | `claude-code` |
+| Claude Desktop | `claude-ai` |
+| Cursor | `cursor-vscode` |
+| Windsurf | `windsurf-client` |
+| VS Code Copilot | `Visual-Studio-Code` |
+| Gemini CLI | `gemini-cli-mcp-client` |
+| OpenCode | `opencode` |
+| Zed | `Zed` |
 
 ```rust
 fn detect_client(client_info: &ClientInfo) -> ClientType {
+    // Tier 1: Exact match (preferred — verified values)
+    match client_info.name.as_str() {
+        "claude-code" => return ClientType::ClaudeCode,
+        "claude-ai" => return ClientType::ClaudeDesktop,
+        "cursor-vscode" => return ClientType::Cursor,
+        "windsurf-client" => return ClientType::Windsurf,
+        "Visual-Studio-Code" => return ClientType::VSCodeCopilot,
+        "gemini-cli-mcp-client" => return ClientType::GeminiCli,
+        "opencode" => return ClientType::OpenCode,
+        "Zed" => return ClientType::Zed,
+        _ => {}
+    }
+
+    // Tier 2: Fuzzy fallback (for unknown client versions)
     let name = client_info.name.to_lowercase();
     match () {
-        _ if name.contains("claude code") || name.contains("claude-code") => ClientType::ClaudeCode,
-        _ if name.contains("claude") && name.contains("desktop") => ClientType::ClaudeDesktop,
+        _ if name.contains("claude-code") || name.contains("claude code") => ClientType::ClaudeCode,
+        _ if name.contains("claude") => ClientType::ClaudeDesktop,
         _ if name.contains("cursor") => ClientType::Cursor,
         _ if name.contains("windsurf") || name.contains("codeium") => ClientType::Windsurf,
         _ if name.contains("copilot") || name.contains("vscode") => ClientType::VSCodeCopilot,
@@ -313,13 +335,14 @@ fn detect_client(client_info: &ClientInfo) -> ClientType {
         _ if name.contains("codex") => ClientType::CodexCli,
         _ if name.contains("opencode") => ClientType::OpenCode,
         _ if name.contains("zed") => ClientType::Zed,
-        _ if name.contains("factory") || name.contains("droid") => ClientType::FactoryDroid,
         _ => ClientType::Unknown,
     }
 }
 ```
 
 **Unknown clients get conservative defaults**: no tool limit, full tool list, standard timeouts.
+
+**Source**: Apify MCP Client Capabilities Index, `docs/research/client-validation.md`
 
 ---
 
