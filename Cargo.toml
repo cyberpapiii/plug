@@ -23,6 +23,8 @@ rmcp = { version = "1.0.0", features = [
     "transport-streamable-http-client-reqwest",
     "transport-streamable-http-server",
     "server-side-http",
+    # TLS support for HTTPS upstream servers
+    "reqwest-native-tls",
 ] }
 
 # Async runtime
