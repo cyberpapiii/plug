@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Router, extract::Request};
 use rmcp::model::*;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -36,11 +38,19 @@ pub struct HttpState {
 
 /// Build the axum Router with all middleware and handlers.
 pub fn build_router(state: Arc<HttpState>) -> Router {
-    Router::new()
+    // Discovery endpoint — exempt from origin validation
+    let discovery = Router::new()
+        .route("/.well-known/mcp.json", get(get_server_card))
+        .with_state(state.clone());
+
+    // MCP protocol routes — protected by origin validation middleware
+    let mcp = Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .layer(middleware::from_fn(validate_origin))
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
-        .with_state(state)
+        .with_state(state);
+
+    discovery.merge(mcp)
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +182,40 @@ async fn delete_mcp(
     } else {
         Err(HttpError::SessionNotFound)
     }
+}
+
+/// GET /.well-known/mcp.json — server discovery card.
+///
+/// Exempt from origin validation — intended for discovery by any client.
+async fn get_server_card(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let tool_count = state.router.tool_count();
+    let servers: Vec<String> = state
+        .router
+        .server_manager()
+        .server_statuses()
+        .into_iter()
+        .map(|s| s.server_id)
+        .collect();
+
+    let card = json!({
+        "name": "plug",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "MCP multiplexer",
+        "tools": tool_count,
+        "servers": servers,
+        "transports": ["stdio", "streamable-http", "sse"],
+    });
+
+    let mut response = (StatusCode::OK, Json(card)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=60"),
+    );
+    response.headers_mut().insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +773,62 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn server_card_returns_json() {
+        let app = build_router(test_state());
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("max-age=60")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-Content-Type-Options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "plug");
+        assert_eq!(json["description"], "MCP multiplexer");
+        assert!(json["version"].is_string());
+        assert!(json["tools"].is_number());
+        assert!(json["servers"].is_array());
+        assert_eq!(
+            json["transports"],
+            serde_json::json!(["stdio", "streamable-http", "sse"])
+        );
+    }
+
+    #[tokio::test]
+    async fn server_card_accessible_with_external_origin() {
+        // Discovery endpoint must NOT be blocked by origin validation
+        let app = build_router(test_state());
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .header("origin", "https://evil.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
