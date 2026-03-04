@@ -45,19 +45,21 @@ Download the binary for your platform from the [releases page](https://github.co
 
 ## Quick Start
 
-**1. Create a config file** at `~/.config/plug/config.toml`:
+**1. Import your existing MCP servers** (auto-discovers from all installed AI clients):
+
+```sh
+plug import --all --yes
+```
+
+Or create a config file manually at `~/.config/plug/config.toml`:
 
 ```toml
-# ~/.config/plug/config.toml
-
-[[servers]]
-name = "github"
+[servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_TOKEN = "$GITHUB_TOKEN" }
 
-[[servers]]
-name = "filesystem"
+[servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
 ```
@@ -103,7 +105,13 @@ plug tool list            # List all available tools across all servers
 plug tool list --output json  # Machine-readable output for agent use
 plug config validate      # Validate your config file
 plug config path          # Show config file location
+plug import --all         # Import MCP servers from all installed AI clients
+plug import cursor        # Import from a specific client
+plug export claude-code   # Generate config snippet for a client
 plug doctor               # Diagnose connectivity and configuration issues
+plug reload               # Hot-reload config without restarting
+plug serve --daemon       # Run as headless daemon with IPC
+plug serve                # Run with TUI dashboard
 ```
 
 ## Configuration
@@ -113,37 +121,34 @@ Full configuration reference:
 ```toml
 # ~/.config/plug/config.toml
 
-# Bind address for HTTP server (Phase 2+)
-# bind = "127.0.0.1:3282"
+# Global settings
+enable_prefix = true       # Prefix tool names with server name (default: true)
+prefix_delimiter = "__"    # Delimiter between server name and tool name
 
-# Prefix tool names with server name to avoid collisions
-# prefix_tools = true  # default: true
+[http]
+bind_address = "127.0.0.1"
+port = 3282
 
-[[servers]]
-name = "github"
+[servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_TOKEN = "$GITHUB_TOKEN" }
 
-[[servers]]
-name = "notion"
+[servers.notion]
 command = "npx"
 args = ["-y", "@notionhq/notion-mcp-server"]
 env = { NOTION_API_KEY = "$NOTION_API_KEY" }
 
-[[servers]]
-name = "filesystem"
+[servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
 
-# Optional per-server settings
-[[servers]]
-name = "postgres"
+[servers.postgres]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-postgres", "$DATABASE_URL"]
 env = { DATABASE_URL = "$DATABASE_URL" }
-# Limit concurrent requests to this server
-# max_concurrency = 1
+max_concurrent = 1         # Limit concurrent requests
+enrichment = true          # Infer tool annotations from name patterns
 ```
 
 Environment variable references (`$VAR_NAME`) in config values are expanded at startup.
