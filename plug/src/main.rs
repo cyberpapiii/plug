@@ -478,6 +478,13 @@ async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<
 
     let cancel = engine.cancel_token().clone();
 
+    // Spawn config file watcher for automatic hot-reload
+    plug_core::watcher::spawn_config_watcher(
+        engine.clone(),
+        engine.cancel_token().clone(),
+        engine.tracker(),
+    );
+
     // Spawn SIGHUP reload handler
     let sighup_handle = tokio::spawn(daemon::sighup_reload(
         engine.clone(),

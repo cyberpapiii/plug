@@ -234,6 +234,11 @@ impl Engine {
         self.config.load()
     }
 
+    /// Get a reference to the task tracker (for spawning background tasks).
+    pub fn tracker(&self) -> &TaskTracker {
+        &self.tracker
+    }
+
     /// Atomically swap in a new config.
     pub fn store_config(&self, config: Config) {
         self.config.store(Arc::new(config));

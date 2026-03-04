@@ -16,3 +16,4 @@ pub mod proxy;
 pub mod reload;
 pub mod server;
 pub mod types;
+pub mod watcher;

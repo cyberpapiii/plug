@@ -73,6 +73,10 @@ ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 color-eyre = "0.6"
 
+# File watching (Phase 5)
+notify = "7"
+notify-debouncer-mini = "0.5"
+
 # Daemon (Phase 4)
 tracing-appender = "0.2"
 fs2 = "0.4"

@@ -38,6 +38,10 @@ toml.workspace = true
 backon.workspace = true
 rand.workspace = true
 
+# File watching (Phase 5)
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+
 # Phase 4
 subtle.workspace = true
 hex.workspace = true
