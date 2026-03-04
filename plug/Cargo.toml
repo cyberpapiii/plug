@@ -33,3 +33,6 @@ futures.workspace = true
 # Daemon (Phase 4)
 tracing-appender.workspace = true
 fs2.workspace = true
+subtle.workspace = true
+hex.workspace = true
+directories.workspace = true

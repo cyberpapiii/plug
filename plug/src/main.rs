@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod daemon;
 mod tui;
 
 use std::sync::Arc;
@@ -40,11 +41,19 @@ enum Commands {
         /// Also start stdio bridge on stdin/stdout
         #[arg(long)]
         stdio: bool,
+        /// Run as headless daemon with IPC socket
+        #[arg(long)]
+        daemon: bool,
     },
     /// Launch the TUI dashboard
     Tui,
-    /// Show server health status
+    /// Show server health status (queries daemon if running)
     Status,
+    /// Daemon management
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     /// Server management
     Server {
         #[command(subcommand)]
@@ -60,6 +69,12 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Stop the running daemon
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -105,8 +120,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Connect => {
             cmd_connect(cli.config.as_ref()).await?;
         }
-        Commands::Serve { stdio } => {
-            cmd_serve(cli.config.as_ref(), stdio).await?;
+        Commands::Serve { stdio, daemon } => {
+            if daemon {
+                cmd_daemon(cli.config.as_ref()).await?;
+            } else {
+                cmd_serve(cli.config.as_ref(), stdio).await?;
+            }
         }
         Commands::Tui => {
             cmd_tui(cli.config.as_ref()).await?;
@@ -114,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status => {
             cmd_status(cli.config.as_ref(), &cli.output).await?;
         }
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Stop => {
+                cmd_daemon_stop().await?;
+            }
+        },
         Commands::Server { command } => match command {
             ServerCommands::List => {
                 cmd_server_list(cli.config.as_ref(), &cli.output).await?;
@@ -245,10 +269,56 @@ async fn cmd_tui(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()>
 }
 
 /// `plug status` — show health of all upstream servers.
+///
+/// Tries to query a running daemon via IPC first. If no daemon is running,
+/// falls back to starting servers directly and querying them.
 async fn cmd_status(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
+    // Try daemon IPC first
+    if let Ok(response) = daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
+        match response {
+            plug_core::ipc::IpcResponse::Status {
+                servers,
+                clients,
+                uptime_secs,
+            } => {
+                match output {
+                    OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "source": "daemon",
+                            "uptime_secs": uptime_secs,
+                            "clients": clients,
+                            "servers": servers,
+                        }))?);
+                    }
+                    OutputFormat::Text => {
+                        println!("connected to daemon (uptime: {}s, clients: {})", uptime_secs, clients);
+                        if servers.is_empty() {
+                            println!("no servers configured");
+                        } else {
+                            println!("{:<20} {:<10} {:<6}", "NAME", "STATUS", "TOOLS");
+                            for status in &servers {
+                                let health = format!("{:?}", status.health);
+                                println!(
+                                    "{:<20} {:<10} {:<6}",
+                                    status.server_id, health, status.tool_count
+                                );
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            plug_core::ipc::IpcResponse::Error { message, .. } => {
+                tracing::debug!(error = %message, "daemon status query failed, falling back");
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback: start servers directly
     let config = plug_core::config::load_config(config_path)?;
 
     let server_manager = Arc::new(plug_core::server::ServerManager::new());
@@ -264,7 +334,6 @@ async fn cmd_status(
             if statuses.is_empty() {
                 println!("no servers configured");
             } else {
-                // Print table header
                 println!("{:<20} {:<10} {:<6}", "NAME", "STATUS", "TOOLS");
                 for status in &statuses {
                     let health = format!("{:?}", status.health);
@@ -331,6 +400,74 @@ async fn cmd_server_list(
                     println!("{:<20} {:<10} {:<10} {}", name, transport, status, target);
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// `plug serve --daemon` — start headless daemon with IPC socket.
+///
+/// Creates an Engine, starts it, sets up file logging, then runs the
+/// Unix socket IPC listener until shutdown.
+async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
+
+    let cancel = engine.cancel_token().clone();
+
+    // Run daemon IPC listener + signal handler
+    tokio::select! {
+        result = daemon::run_daemon(&engine) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "daemon error");
+            }
+        }
+        _ = daemon::shutdown_signal(cancel) => {}
+    }
+
+    tracing::info!("shutting down");
+    engine.shutdown().await;
+
+    Ok(())
+}
+
+/// `plug daemon stop` — tell the running daemon to shut down.
+async fn cmd_daemon_stop() -> anyhow::Result<()> {
+    let auth_token = match daemon::read_auth_token() {
+        Ok(token) => token,
+        Err(_) => {
+            eprintln!("no plug daemon running");
+            std::process::exit(1);
+        }
+    };
+
+    let request = plug_core::ipc::IpcRequest::Shutdown { auth_token };
+    match daemon::ipc_request(&request).await {
+        Ok(plug_core::ipc::IpcResponse::Ok) => {
+            eprintln!("daemon shutting down");
+        }
+        Ok(plug_core::ipc::IpcResponse::Error { message, .. }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("unexpected response from daemon");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("failed to connect to daemon: {e}");
+            std::process::exit(1);
         }
     }
 

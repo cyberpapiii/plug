@@ -767,39 +767,39 @@ Four implementation sub-phases (collapsed from original 5 per simplicity review 
 
 ### Functional Requirements
 
-- [ ] Engine struct extracted, cmd_connect and cmd_serve refactored to use it
-- [ ] Engine fields are private with query API (snapshot, server_statuses, tool_list, etc.)
-- [ ] Event bus delivers health, circuit, tool, client, error events with call_id correlation
-- [ ] TUI dashboard shows servers, clients, activity in real-time
-- [ ] TUI populates initial state from Engine::snapshot() on startup
-- [ ] TUI recovers from broadcast Lagged via full_refresh()
-- [ ] Tools view with search and detail drill-down
+- [x] Engine struct extracted, cmd_connect and cmd_serve refactored to use it
+- [x] Engine fields are private with query API (snapshot, server_statuses, tool_list, etc.)
+- [x] Event bus delivers health, circuit, tool, client, error events with call_id correlation
+- [x] TUI dashboard shows servers, clients, activity in real-time
+- [x] TUI populates initial state from Engine::snapshot() on startup
+- [x] TUI recovers from broadcast Lagged via full_refresh()
+- [x] Tools view with search and detail drill-down
 - [ ] Log view with level/server/client filters
-- [ ] Server restart and disable/enable from TUI with confirmation
-- [ ] Help overlay with all keybindings
-- [ ] Daemon mode with file logging (0600 permissions, no argument leakage)
-- [ ] Unix socket IPC with auth token for privileged commands
-- [ ] Socket path in user-owned directory (never /tmp)
-- [ ] PID file with flock exclusion via fs2
+- [x] Server restart and disable/enable from TUI with confirmation
+- [x] Help overlay with all keybindings
+- [x] Daemon mode with file logging (0600 permissions, no argument leakage)
+- [x] Unix socket IPC with auth token for privileged commands
+- [x] Socket path in user-owned directory (never /tmp)
+- [x] PID file with flock exclusion via fs2
 
 ### Non-Functional Requirements
 
-- [ ] TUI renders correctly at 80x24, 120x40, 200x60
-- [ ] NO_COLOR support via Theme struct
-- [ ] Terminal restored on panic (ratatui::init() panic hook)
-- [ ] Broadcast channel handles Lagged receivers with full_refresh
-- [ ] Dirty-flag rendering — skip frames when nothing changed
-- [ ] File logging with daily rotation
-- [ ] IPC max message size 4MB
-- [ ] IPC connection limit 32
+- [x] TUI renders correctly at 80x24, 120x40, 200x60
+- [x] NO_COLOR support via Theme struct
+- [x] Terminal restored on panic (ratatui::init() panic hook)
+- [x] Broadcast channel handles Lagged receivers with full_refresh
+- [x] Dirty-flag rendering — skip frames when nothing changed
+- [x] File logging with daily rotation
+- [x] IPC max message size 4MB
+- [x] IPC connection limit 32
 
 ### Quality Gates
 
-- [ ] All existing 88 tests still pass (no regressions)
-- [ ] New tests for Engine (creation, shutdown, events, TaskTracker), App state, IPC round-trip
-- [ ] Pre-existing DashMap guard-across-await bug in health.rs fixed
-- [ ] `cargo clippy` clean
-- [ ] `#![forbid(unsafe_code)]` maintained (use fs2 for flock, not libc)
+- [x] All existing 88 tests still pass (no regressions) — now 134 tests
+- [x] New tests for Engine (creation, shutdown, events, TaskTracker), App state, IPC round-trip
+- [x] Pre-existing DashMap guard-across-await bug in health.rs fixed
+- [x] `cargo clippy` clean
+- [x] `#![forbid(unsafe_code)]` maintained (use fs2 for flock, not libc)
 
 ## Dependencies & Prerequisites
 
