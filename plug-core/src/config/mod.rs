@@ -108,6 +108,9 @@ pub struct ServerConfig {
     /// Startup timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Tool call timeout in seconds (default: 300). Set higher for slow tools.
+    #[serde(default = "default_call_timeout")]
+    pub call_timeout_secs: u64,
     /// Max concurrent requests to this server (default: 1 for stdio, 10 for HTTP).
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
@@ -128,6 +131,10 @@ fn default_true() -> bool {
 
 fn default_timeout() -> u64 {
     30
+}
+
+fn default_call_timeout() -> u64 {
+    300
 }
 
 fn default_max_concurrent() -> usize {
@@ -386,6 +393,7 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
@@ -410,6 +418,7 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
@@ -438,6 +447,7 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
@@ -466,6 +476,7 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 0,
+                call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
@@ -498,6 +509,7 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
@@ -526,6 +538,7 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 0,
+                call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
