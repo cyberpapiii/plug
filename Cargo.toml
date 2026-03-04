@@ -1,0 +1,63 @@
+[workspace]
+members = ["plug", "plug-core", "plug-test-harness"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86.0"
+license = "Apache-2.0"
+repository = "https://github.com/plug-mcp/plug"
+
+[workspace.dependencies]
+# MCP SDK
+rmcp = { version = "1.0.0", features = [
+    "client",
+    "server",
+    "macros",
+    "schemars",
+    "transport-io",
+    "transport-child-process",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Concurrency
+dashmap = "6.1"
+arc-swap = "1.8"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Paths
+directories = "6"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+panic = "abort"
+
+[profile.ci]
+inherits = "release"
+lto = "thin"

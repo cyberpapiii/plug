@@ -93,10 +93,11 @@ Five phases, each delivering a working increment. Each phase can be validated in
 - [ ] Origin header validation (DNS rebinding prevention)
 - [ ] Bind to 127.0.0.1 by default (configurable)
 
-### 2.2 Legacy SSE Server
-- [ ] GET `/sse` — return `endpoint` event (old SSE protocol for OpenCode)
+### 2.2 Legacy SSE Server (Lower Priority — ADR-009)
+- [ ] GET `/sse` — return `endpoint` event (old SSE protocol for backwards compat)
 - [ ] POST to dynamic endpoint from `endpoint` event
-- [ ] Backwards-compatibility procedure per MCP spec
+- [ ] Based on AgentGateway's `LegacySSEService` reference implementation
+- [ ] Note: OpenCode now supports Streamable HTTP; legacy SSE needed only for very old clients
 
 ### 2.3 `.localhost` Subdomain Routing
 - [ ] Host header extraction in axum middleware
@@ -122,8 +123,8 @@ Five phases, each delivering a working increment. Each phase can be validated in
 - [ ] Self-signed cert generation via rcgen for `.localhost`
 
 ### 2.7 Validation
-- [ ] Connect Gemini CLI via HTTP → verify tool discovery works within 60s
-- [ ] Connect OpenCode via SSE → verify legacy protocol works
+- [ ] Connect Gemini CLI via stdio or HTTP → verify tool discovery works within 60s
+- [ ] Connect OpenCode via Streamable HTTP (or SSE fallback) → verify protocol works
 - [ ] Access `github.localhost:3282/mcp` → verify direct server access
 - [ ] Multiple HTTP clients + stdio clients simultaneously
 
@@ -134,7 +135,7 @@ Five phases, each delivering a working increment. Each phase can be validated in
 **Goal**: Circuit breakers, health checks, client-aware tool filtering, lazy schemas, tool search.
 
 ### 3.1 Circuit Breakers
-- [ ] tower-circuitbreaker integration per upstream server
+- [ ] `tower-resilience` v0.7 integration per upstream server (replaces deprecated tower-circuitbreaker)
 - [ ] 50% failure rate threshold, 30s open duration, 2 half-open probes
 - [ ] Event bus notification on state transitions
 - [ ] TUI/log visibility of circuit breaker state
@@ -145,25 +146,25 @@ Five phases, each delivering a working increment. Each phase can be validated in
 - [ ] Exponential backoff for failed health checks
 - [ ] Event bus notification on health transitions
 
-### 3.3 Adaptive Backpressure
-- [ ] Evaluate flow-guard vs simple semaphore for our scale
-- [ ] Implement concurrency limits per upstream server
-- [ ] Back off when upstream latency increases
+### 3.3 Concurrency Limiting
+- [ ] `tokio::sync::Semaphore` for per-server concurrency limits (replaces flow-guard — TCP Vegas overkill for <20 servers)
+- [ ] Default: 1 concurrent request for stdio servers, configurable higher for HTTP servers
+- [ ] `backon` v1.6.0 for exponential backoff on reconnection (replaces unmaintained backoff crate)
 
 ### 3.4 Client-Aware Tool Filtering
-- [ ] Client type detection from `clientInfo.name` → tool limit
-- [ ] Cursor: 40 tools max
+- [ ] Client type detection from `clientInfo.name` → exact match (ADR-007), fuzzy fallback
+- [ ] Cursor: no limit (Dynamic Context Discovery eliminated 40-tool limit, ADR-005)
 - [ ] Windsurf: 100 tools max
 - [ ] VS Code Copilot: 128 tools max
 - [ ] Priority sorting: usage frequency → config `priority_tools` → alphabetical
-- [ ] Event: "Cursor: serving 40/65 tools (25 filtered)"
+- [ ] Event: "Windsurf: serving 100/150 tools (50 filtered)"
 - [ ] Log which tools were filtered
 
-### 3.5 Lazy Schema Loading
-- [ ] Return minimal tool definitions in `tools/list` (name, title, description only — no inputSchema)
-- [ ] Provide `inputSchema` only when `tools/call` is invoked or when client explicitly requests
-- [ ] Configurable: opt-in per client or global
-- [ ] Research: does the MCP spec support this? Or do we need a custom extension?
+### 3.5 Token Efficiency (REVISED — inputSchema is REQUIRED per spec, ADR-003)
+- [ ] Omit optional fields from tools/list: `title`, `outputSchema`, `annotations`, `icons` (when not needed)
+- [ ] Tool description truncation (opt-in, configurable max length)
+- [ ] `$ref`-based schema deduplication for shared schema fragments (inspired by SEP-1576)
+- [ ] Lean on client-side tool search (Claude Code already reduces 77K→8.7K tokens)
 
 ### 3.6 Tool Search / Catalog Mode
 - [ ] `search_tools` meta-tool: search by name, description, category
@@ -178,7 +179,7 @@ Five phases, each delivering a working increment. Each phase can be validated in
 
 ### 3.8 Validation
 - [ ] Kill/restart an upstream server → verify circuit breaker opens/closes
-- [ ] Connect Cursor with > 40 tools → verify only 40 are served
+- [ ] Connect Windsurf with > 100 tools → verify only 100 are served
 - [ ] Measure tool call overhead → must be < 5ms for cached routes
 
 ---
@@ -295,6 +296,6 @@ Five phases, each delivering a working increment. Each phase can be validated in
 |-------|------------|----------------|
 | 1 | Working stdio multiplexer | Claude Code → fanout → 4 servers, tool calls work |
 | 2 | HTTP + .localhost | Gemini CLI + OpenCode connected alongside stdio clients |
-| 3 | Resilient + token-efficient | Circuit breakers tested, Cursor gets exactly 40 tools |
+| 3 | Resilient + token-efficient | Circuit breakers tested, Windsurf gets exactly 100 tools |
 | 4 | Beautiful TUI | Screenshot-worthy dashboard with real-time updates |
 | 5 | Polished + distributable | `brew install fanout && fanout` works end-to-end |

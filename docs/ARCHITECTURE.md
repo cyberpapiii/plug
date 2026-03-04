@@ -75,26 +75,28 @@ pub struct ClientSession {
 }
 ```
 
-**Upstream sessions**: One per MCP server. Shared across all clients.
+**Upstream sessions**: One per client per server (N×M model). Each downstream client gets its own upstream session to each server, ensuring proper isolation of session state (logging levels, resource subscriptions, capabilities).
 
 ```rust
 pub struct UpstreamSession {
     server_id: String,
+    client_session_id: SessionId,       // The downstream client this session belongs to
     transport: TransportHandle,         // stdio child process or HTTP client
     capabilities: ServerCapabilities,   // From initialize response
     tools: RwLock<Vec<Tool>>,           // Last known tool list
     health: AtomicHealth,               // Healthy, Degraded, Failed
     circuit_breaker: CircuitBreaker,
-    request_map: DashMap<UpstreamReqId, (SessionId, RequestId)>,
 }
 ```
 
-**Session multiplexing**: When Client A calls `tools/call github__create_issue`, the session manager:
+**Why per-client sessions (ADR-002)**: MCP session state is per-session — `logging/setLevel` mutates persistent state, `resources/subscribe` creates persistent subscriptions. If Client A sets debug logging on a shared session, Client B would also get debug logs. N clients × M servers = N×M upstream sessions. This is more expensive but correct. Phase 4 daemon can optimize with session pooling.
+
+**Session routing**: When Client A calls `tools/call github__create_issue`, the session manager:
 1. Resolves "github" as the target server via ToolRouter
-2. Generates a unique upstream request ID
-3. Maps `(upstream_req_id) → (client_a_session, client_a_req_id)`
-4. Sends the request on the shared upstream connection
-5. When the response arrives, looks up the mapping and routes it back to Client A
+2. Looks up Client A's dedicated upstream session to "github"
+3. Sends the request on Client A's upstream connection (no ID remapping needed within a dedicated session)
+4. When the response arrives, routes it back to Client A
+5. If Client A's upstream session doesn't exist yet, creates it lazily (initialize handshake)
 
 ### 3. Tool Router
 
@@ -157,7 +159,7 @@ pub trait Transport: Send + Sync + 'static {
 |-----------|---------------|------|
 | stdio | Read stdin, write stdout (via `fanout connect`) | Claude Code, Cursor, Zed, any local client |
 | Streamable HTTP | Axum server on port 3282 | Remote clients, Gemini CLI, Claude Desktop |
-| Legacy SSE | Axum with SSE endpoint (backwards compat) | OpenCode |
+| Legacy SSE | Axum with SSE endpoint (backwards compat) | Older clients |
 | .localhost router | Axum Host header routing | Per-server direct access |
 
 **Outbound transports** (fanout connects to servers):
@@ -334,7 +336,7 @@ Tokio multi-threaded runtime with work-stealing scheduler. One runtime for the e
 |-------|---------------|----------------|
 | Config | `ArcSwap<Config>` | Read-heavy, rare writes. Lock-free atomic swap. |
 | Client sessions | `DashMap<SessionId, ClientSession>` | Concurrent reads, frequent insert/remove. |
-| Upstream sessions | `DashMap<String, UpstreamSession>` | Read-heavy, rare add/remove. |
+| Upstream sessions | `DashMap<(SessionId, String), UpstreamSession>` | Keyed by (client_session, server_id). Lazy creation on first access. |
 | Tool cache | `DashMap<String, (String, Tool)>` | High-frequency reads, writes on cache miss. |
 | Negative cache | `DashMap<String, Instant>` | Read-heavy, TTL-based eviction. |
 | Request mapping | `DashMap<UpstreamReqId, (SessionId, RequestId)>` | Per-request insert/remove. |
