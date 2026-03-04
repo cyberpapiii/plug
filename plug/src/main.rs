@@ -33,6 +33,12 @@ enum OutputFormat {
 enum Commands {
     /// Start the MCP stdio bridge (what clients invoke)
     Connect,
+    /// Start the HTTP server for web-based MCP clients
+    Serve {
+        /// Also start stdio bridge on stdin/stdout
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Show server health status
     Status,
     /// Server management
@@ -94,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Connect => {
             cmd_connect(cli.config.as_ref()).await?;
+        }
+        Commands::Serve { stdio } => {
+            cmd_serve(cli.config.as_ref(), stdio).await?;
         }
         Commands::Status => {
             cmd_status(cli.config.as_ref(), &cli.output).await?;
@@ -286,6 +295,126 @@ async fn cmd_server_list(
             }
         }
     }
+
+    Ok(())
+}
+
+/// `plug serve` — start the HTTP server for web-based MCP clients.
+///
+/// Starts upstream servers, builds a shared ToolRouter, and serves MCP
+/// over HTTP (Streamable HTTP transport). Optionally also runs the stdio
+/// bridge via `--stdio`.
+async fn cmd_serve(
+    config_path: Option<&std::path::PathBuf>,
+    with_stdio: bool,
+) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    // Warn on non-loopback bind address
+    let bind_addr = &config.http.bind_address;
+    if bind_addr != "127.0.0.1" && bind_addr != "::1" && bind_addr != "localhost" {
+        tracing::warn!(
+            bind_address = %bind_addr,
+            "binding to non-loopback address — ensure this is intentional"
+        );
+    }
+
+    // Start all upstream servers
+    let server_manager = Arc::new(plug_core::server::ServerManager::new());
+    server_manager.start_all(&config).await?;
+
+    // Build shared ToolRouter (used by both HTTP and optional stdio)
+    let router = Arc::new(plug_core::proxy::ToolRouter::new(
+        server_manager.clone(),
+        config.prefix_delimiter.clone(),
+    ));
+    router.refresh_tools().await;
+
+    // Cancellation token for coordinated shutdown
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    // Build HTTP server state and router
+    let http_state = Arc::new(plug_core::http::server::HttpState {
+        router: router.clone(),
+        sessions: plug_core::http::session::SessionManager::new(
+            config.http.session_timeout_secs,
+            config.http.max_sessions,
+        ),
+        cancel: cancel.clone(),
+        sse_channel_capacity: config.http.sse_channel_capacity,
+    });
+
+    // Start session cleanup background task
+    http_state.sessions.spawn_cleanup_task(cancel.clone());
+
+    let axum_router = plug_core::http::server::build_router(http_state);
+    let listen_addr = format!("{}:{}", config.http.bind_address, config.http.port);
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {listen_addr}: {e}"))?;
+
+    tracing::info!("HTTP server listening on http://{listen_addr}");
+
+    if with_stdio {
+        // Run HTTP server + stdio bridge simultaneously
+        let proxy = plug_core::proxy::ProxyHandler::from_router(router);
+
+        use rmcp::ServiceExt as _;
+        let transport = rmcp::transport::io::stdio();
+        let service = proxy
+            .serve(transport)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start stdio service: {e}"))?;
+
+        tracing::info!("stdio bridge active");
+
+        tokio::select! {
+            result = axum::serve(listener, axum_router)
+                .with_graceful_shutdown(cancel.clone().cancelled_owned()) =>
+            {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "HTTP server error");
+                }
+            }
+            result = service.waiting() => {
+                tracing::info!("stdio client disconnected");
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "stdio service error");
+                }
+                cancel.cancel();
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal");
+                cancel.cancel();
+            }
+        }
+    } else {
+        // HTTP server only
+        tokio::select! {
+            result = axum::serve(listener, axum_router)
+                .with_graceful_shutdown(cancel.clone().cancelled_owned()) =>
+            {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "HTTP server error");
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal");
+                cancel.cancel();
+            }
+        }
+    }
+
+    tracing::info!("shutting down upstream servers");
+    server_manager.shutdown_all().await;
 
     Ok(())
 }
