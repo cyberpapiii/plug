@@ -170,9 +170,7 @@ mod tests {
             IpcRequest::Register {
                 client_info: Some("claude-code".to_string()),
             },
-            IpcRequest::Register {
-                client_info: None,
-            },
+            IpcRequest::Register { client_info: None },
             IpcRequest::Deregister {
                 session_id: "sess-123".to_string(),
             },
@@ -246,9 +244,7 @@ mod tests {
         }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)
-        assert!(!requires_auth(&IpcRequest::Register {
-            client_info: None,
-        }));
+        assert!(!requires_auth(&IpcRequest::Register { client_info: None }));
         assert!(!requires_auth(&IpcRequest::Deregister {
             session_id: "s".to_string(),
         }));

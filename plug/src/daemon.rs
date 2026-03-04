@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use fs2::FileExt as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
@@ -29,6 +29,8 @@ const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Tracks proxy client sessions connected to the daemon.
 pub struct ClientRegistry {
     sessions: DashMap<String, ClientSession>,
+    /// Notified whenever the client count changes (for grace period logic).
+    changed: Notify,
 }
 
 /// Metadata for a connected proxy client.
@@ -41,6 +43,7 @@ impl ClientRegistry {
     fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            changed: Notify::new(),
         }
     }
 
@@ -59,6 +62,7 @@ impl ClientRegistry {
                 connected_at: Instant::now(),
             },
         );
+        self.changed.notify_waiters();
         session_id
     }
 
@@ -71,6 +75,7 @@ impl ClientRegistry {
                 duration_secs = duration.as_secs(),
                 "client deregistered"
             );
+            self.changed.notify_waiters();
         }
     }
 
@@ -299,7 +304,7 @@ async fn send_response(
 ///
 /// Returns the tracing-appender guard that MUST be held for the daemon's lifetime
 /// (dropping it flushes and closes the log file).
-pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
+pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::Result<()> {
     let rt_dir = runtime_dir();
     let log_directory = log_dir();
 
@@ -369,6 +374,51 @@ pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
     let client_registry = Arc::new(ClientRegistry::new());
 
+    // Grace period: when the last proxy client disconnects, start a countdown.
+    // If no new client connects before it fires, shut down the daemon.
+    // A grace_period_secs of 0 means never auto-shutdown (explicit shutdown only).
+    let grace_cancel = CancellationToken::new();
+    let grace_registry = client_registry.clone();
+
+    if grace_period_secs > 0 {
+        let grace_token = grace_cancel.clone();
+        let daemon_cancel = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                // Wait for a change in client count
+                grace_registry.changed.notified().await;
+
+                // If no clients remain, start the grace timer
+                if grace_registry.count() == 0 {
+                    tracing::info!(
+                        grace_secs = grace_period_secs,
+                        "last client disconnected, starting grace period"
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
+                            // Grace period expired — check again (a client may have connected
+                            // and disconnected without us seeing the notify)
+                            if grace_registry.count() == 0 {
+                                tracing::info!("grace period expired with no clients, shutting down");
+                                daemon_cancel.cancel();
+                                return;
+                            }
+                        }
+                        _ = grace_registry.changed.notified() => {
+                            // Client count changed — re-check
+                            if grace_registry.count() > 0 {
+                                tracing::info!("client reconnected, grace period cancelled");
+                            }
+                            // Either way, loop back to the outer wait
+                        }
+                        _ = grace_token.cancelled() => return,
+                    }
+                }
+            }
+        });
+    }
+
     // Accept IPC connections until shutdown
     loop {
         tokio::select! {
@@ -420,6 +470,9 @@ pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Stop grace period task
+    grace_cancel.cancel();
 
     // Cleanup
     tracing::info!("daemon shutting down, cleaning up");
@@ -629,9 +682,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             method,
             params,
-        } => {
-            dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await
-        }
+        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await,
     }
 }
 
@@ -673,10 +724,7 @@ async fn dispatch_mcp_request(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let arguments = p
-                        .get("arguments")
-                        .and_then(|v| v.as_object())
-                        .cloned();
+                    let arguments = p.get("arguments").and_then(|v| v.as_object()).cloned();
                     (name, arguments)
                 }
                 None => {

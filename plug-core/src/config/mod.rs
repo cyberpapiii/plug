@@ -34,6 +34,10 @@ pub struct Config {
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
+    /// Seconds to keep daemon alive after last client disconnects (default: 60).
+    /// Set to 0 to shut down immediately when no clients remain.
+    #[serde(default = "default_grace_period")]
+    pub daemon_grace_period_secs: u64,
     /// Upstream server definitions.
     #[serde(default)]
     pub servers: HashMap<String, ServerConfig>,
@@ -51,6 +55,7 @@ impl Default for Config {
             tool_search_threshold: 50,
             priority_tools: Vec::new(),
             http: HttpConfig::default(),
+            daemon_grace_period_secs: 60,
             servers: HashMap::new(),
         }
     }
@@ -147,6 +152,10 @@ fn default_health_interval() -> u64 {
 
 fn default_tool_search_threshold() -> usize {
     50
+}
+
+fn default_grace_period() -> u64 {
+    60
 }
 
 /// Transport type for upstream servers.

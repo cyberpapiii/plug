@@ -634,7 +634,7 @@ async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<
 
     // Run daemon IPC listener + signal handler
     tokio::select! {
-        result = daemon::run_daemon(engine.clone()) => {
+        result = daemon::run_daemon(engine.clone(), engine.config().daemon_grace_period_secs) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "daemon error");
             }

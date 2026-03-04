@@ -42,18 +42,18 @@ impl IpcProxyHandler {
 
     /// Send an IPC request and read the response.
     async fn ipc_round_trip(&self, request: &IpcRequest) -> Result<IpcResponse, McpError> {
-        let payload =
-            serde_json::to_vec(request).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let payload = serde_json::to_vec(request)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // Serialize IPC access — one request at a time per connection
         let mut writer = self.writer.lock().await;
-        daemon::write_frame_pub(&mut *writer, &payload)
+        daemon::write_frame_pub(&mut writer, &payload)
             .await
             .map_err(|e| McpError::internal_error(format!("IPC write failed: {e}"), None))?;
         drop(writer);
 
         let mut reader = self.reader.lock().await;
-        let frame = daemon::read_frame_pub(&mut *reader)
+        let frame = daemon::read_frame_pub(&mut reader)
             .await
             .map_err(|e| McpError::internal_error(format!("IPC read failed: {e}"), None))?
             .ok_or_else(|| McpError::internal_error("daemon closed connection", None))?;
@@ -169,7 +169,10 @@ impl ServerHandler for IpcProxyHandler {
                     } else if let Ok(err) = serde_json::from_value::<McpError>(payload) {
                         Err(err)
                     } else {
-                        Err(McpError::internal_error("unexpected tool call response", None))
+                        Err(McpError::internal_error(
+                            "unexpected tool call response",
+                            None,
+                        ))
                     }
                 }
                 IpcResponse::Error { code, message } => {
