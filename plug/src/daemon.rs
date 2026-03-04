@@ -513,6 +513,45 @@ pub async fn shutdown_signal(cancel: CancellationToken) {
     cancel.cancel();
 }
 
+/// Listen for SIGHUP and trigger config reload.
+///
+/// Runs in a loop — each SIGHUP triggers a reload. Exits when cancellation
+/// token is triggered.
+#[cfg(unix)]
+pub async fn sighup_reload(engine: Arc<Engine>, cancel: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+    loop {
+        tokio::select! {
+            _ = sighup.recv() => {
+                tracing::info!("received SIGHUP — reloading config");
+                let config_path = plug_core::config::default_config_path();
+                match plug_core::config::load_config(Some(&config_path)) {
+                    Ok(new_config) => match engine.reload_config(new_config).await {
+                        Ok(report) => {
+                            tracing::info!(
+                                added = report.added.len(),
+                                removed = report.removed.len(),
+                                changed = report.changed.len(),
+                                "config reloaded via SIGHUP"
+                            );
+                        }
+                        Err(e) => tracing::error!(error = %e, "config reload failed"),
+                    },
+                    Err(e) => tracing::error!(error = %e, "failed to load config for reload"),
+                }
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
+}
+
+/// No-op SIGHUP handler for non-Unix platforms.
+#[cfg(not(unix))]
+pub async fn sighup_reload(_engine: Arc<Engine>, cancel: CancellationToken) {
+    cancel.cancelled().await;
+}
+
 /// Fallback for non-Unix platforms.
 #[cfg(not(unix))]
 pub async fn shutdown_signal(cancel: CancellationToken) {

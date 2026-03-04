@@ -478,6 +478,12 @@ async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<
 
     let cancel = engine.cancel_token().clone();
 
+    // Spawn SIGHUP reload handler
+    let sighup_handle = tokio::spawn(daemon::sighup_reload(
+        engine.clone(),
+        engine.cancel_token().clone(),
+    ));
+
     // Run daemon IPC listener + signal handler
     tokio::select! {
         result = daemon::run_daemon(engine.clone()) => {
@@ -487,6 +493,8 @@ async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<
         }
         _ = daemon::shutdown_signal(cancel) => {}
     }
+
+    sighup_handle.abort();
 
     tracing::info!("shutting down");
     engine.shutdown().await;
