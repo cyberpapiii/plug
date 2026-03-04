@@ -203,8 +203,8 @@ Five phases, each delivering a working increment. Each phase can be validated in
 ### 4.3 Panel Views
 - [x] Tools view (full screen): searchable list of all tools with server origin
 - [x] Tool detail: full schema, annotations, server, description
-- [ ] Log view (full screen): structured log with level/server/client filters
-- [ ] Doctor view: diagnostic results
+- [x] Log view (full screen): structured log with level/server/client filters
+- [x] Doctor view: diagnostic results
 
 ### 4.4 Interactivity
 - [x] Server management: restart, disable/enable from TUI
@@ -274,7 +274,7 @@ Five phases, each delivering a working increment. Each phase can be validated in
 - [x] Targets: macOS ARM, macOS Intel, Linux x86 (glibc + musl), Linux ARM, Windows
 - [x] Homebrew tap: `brew install plug`
 - [x] Shell installer: `curl -fsSL https://get.plug.dev | sh`
-- [ ] README with installation instructions
+- [x] README with installation instructions
 - [x] Changelog
 
 ### 5.7 Server Cards
