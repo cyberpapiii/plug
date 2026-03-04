@@ -351,7 +351,7 @@ async fn connect_standalone(config_path: Option<&std::path::PathBuf>) -> anyhow:
         anyhow::bail!("config validation failed with {} error(s)", errors.len());
     }
 
-    let engine = plug_core::engine::Engine::new(config);
+    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
 
     let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
@@ -454,7 +454,7 @@ async fn cmd_tui(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()>
         anyhow::bail!("config validation failed with {} error(s)", errors.len());
     }
 
-    let engine = plug_core::engine::Engine::new(config);
+    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
 
     tui::run(&engine).await?;
@@ -725,7 +725,7 @@ async fn cmd_serve(
         );
     }
 
-    let engine = plug_core::engine::Engine::new(config.clone());
+    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;
 
     let cancel = engine.cancel_token().clone();
