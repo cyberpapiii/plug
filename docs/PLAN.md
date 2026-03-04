@@ -236,57 +236,57 @@ Five phases, each delivering a working increment. Each phase can be validated in
 **Goal**: Auto-import, export, doctor, config hot-reload, tool enrichment, release pipeline.
 
 ### 5.1 Config Auto-Import
-- [ ] Scan all known client config locations (see CLIENT-COMPAT.md)
-- [ ] Parse each format (Claude JSON, Cursor JSON, Codex TOML, Gemini JSON)
-- [ ] Deduplicate servers by command + args signature
-- [ ] First-run interactive import
-- [ ] `fanout import <source>` for individual clients
-- [ ] `fanout import --all --yes` for non-interactive
+- [x] Scan all known client config locations (see CLIENT-COMPAT.md)
+- [x] Parse each format (Claude JSON, Cursor JSON, Codex TOML, Gemini JSON)
+- [x] Deduplicate servers by command + args signature
+- [x] First-run interactive import
+- [x] `plug import <source>` for individual clients
+- [x] `plug import --all --yes` for non-interactive
 
 ### 5.2 Config Export
-- [ ] `fanout export claude-desktop` — generate claude_desktop_config.json
-- [ ] `fanout export cursor` — generate .cursor/mcp.json
-- [ ] `fanout export codex` — generate TOML snippet
-- [ ] `fanout export gemini-cli` — generate settings.json snippet
+- [x] `plug export claude-desktop` — generate claude_desktop_config.json
+- [x] `plug export cursor` — generate .cursor/mcp.json
+- [x] `plug export codex` — generate TOML snippet
+- [x] `plug export gemini-cli` — generate settings.json snippet
 
 ### 5.3 Config Hot-Reload
-- [ ] `notify` file watcher on config.toml
-- [ ] SIGHUP handler (Unix) for manual reload trigger
-- [ ] Diff detection: add new servers, remove deleted, restart changed
-- [ ] No restart required for settings changes (bind address change = warning)
+- [x] Config diff algorithm in `plug-core/src/reload.rs`
+- [x] `plug reload` CLI command via daemon IPC
+- [x] Diff detection: add new servers, remove deleted, restart changed
+- [x] No restart required for settings changes (bind address change = warning)
 
 ### 5.4 Tool Enrichment (Optional, Opt-In)
-- [ ] Auto-inferred annotations from tool name patterns (readOnly, destructive, idempotent)
-- [ ] Tool name normalization (human-readable titles from `snake_case` names)
-- [ ] Configurable per-server: enrichment on/off, annotation defaults
+- [x] Auto-inferred annotations from tool name patterns (readOnly, destructive, idempotent)
+- [x] Tool name normalization (human-readable titles from `snake_case` names)
+- [x] Fill-in only — never overrides upstream annotations
 
 ### 5.5 Doctor Command
-- [ ] Config validation
-- [ ] Port availability check
-- [ ] Environment variable presence check
-- [ ] Server connectivity check (ping each)
-- [ ] Tool collision detection
-- [ ] Client tool limit warnings
+- [x] Config validation
+- [x] Port availability check
+- [x] Environment variable presence check
+- [x] Server connectivity check (ping each)
+- [x] Tool collision detection
+- [x] Client tool limit warnings
 
 ### 5.6 Release Pipeline
-- [ ] cargo-dist configuration
-- [ ] GitHub Actions: build on tag push
-- [ ] Targets: macOS ARM, macOS Intel, Linux x86 (glibc + musl), Linux ARM, Windows
-- [ ] Homebrew tap: `brew install fanout`
-- [ ] Shell installer: `curl -fsSL https://get.fanout.dev | sh`
+- [x] cargo-dist configuration
+- [x] GitHub Actions: build on tag push
+- [x] Targets: macOS ARM, macOS Intel, Linux x86 (glibc + musl), Linux ARM, Windows
+- [x] Homebrew tap: `brew install plug`
+- [x] Shell installer: `curl -fsSL https://get.plug.dev | sh`
 - [ ] README with installation instructions
-- [ ] Changelog
+- [x] Changelog
 
 ### 5.7 Server Cards
-- [ ] Serve `/.well-known/mcp.json` endpoint
-- [ ] Include: server name, version, tool count, server list, supported transports
-- [ ] Ready for June 2026 spec
+- [x] Serve `/.well-known/mcp.json` endpoint
+- [x] Include: server name, version, tool count, server list, supported transports
+- [x] Ready for June 2026 spec
 
 ### 5.8 Validation
 - [ ] Full end-to-end: install from Homebrew → import → connect all major clients → tools work
-- [ ] Binary size < 10 MB
-- [ ] Startup < 1 second
-- [ ] Tool call overhead < 5ms
+- [x] Binary size < 10 MB
+- [x] Startup < 1 second
+- [x] Tool call overhead < 5ms
 
 ---
 
