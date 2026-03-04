@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod tui;
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -39,6 +41,8 @@ enum Commands {
         #[arg(long)]
         stdio: bool,
     },
+    /// Launch the TUI dashboard
+    Tui,
     /// Show server health status
     Status,
     /// Server management
@@ -103,6 +107,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Serve { stdio } => {
             cmd_serve(cli.config.as_ref(), stdio).await?;
+        }
+        Commands::Tui => {
+            cmd_tui(cli.config.as_ref()).await?;
         }
         Commands::Status => {
             cmd_status(cli.config.as_ref(), &cli.output).await?;
@@ -205,6 +212,31 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
             tracing::info!("received shutdown signal");
         }
     }
+
+    tracing::info!("shutting down");
+    engine.shutdown().await;
+
+    Ok(())
+}
+
+/// `plug tui` — launch the TUI dashboard.
+///
+/// Creates an Engine, starts it, then runs the TUI event loop.
+async fn cmd_tui(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
+
+    tui::run(&engine).await?;
 
     tracing::info!("shutting down");
     engine.shutdown().await;

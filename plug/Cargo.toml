@@ -28,6 +28,7 @@ rand.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 color-eyre.workspace = true
+futures.workspace = true
 
 # Daemon (Phase 4)
 tracing-appender.workspace = true
