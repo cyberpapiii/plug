@@ -234,6 +234,16 @@ impl Engine {
         self.config.load()
     }
 
+    /// Get a reference to the task tracker (for spawning background tasks).
+    pub fn tracker(&self) -> &TaskTracker {
+        &self.tracker
+    }
+
+    /// Atomically swap in a new config.
+    pub fn store_config(&self, config: Config) {
+        self.config.store(Arc::new(config));
+    }
+
     /// Restart a specific upstream server. Rate-limited: at most 1 restart
     /// per server per 10 seconds. Applies to both TUI and IPC callers.
     pub async fn restart_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
@@ -291,20 +301,37 @@ impl Engine {
         }
     }
 
-    /// Enable or disable a server. Data-in pattern — caller specifies
-    /// the desired state explicitly.
+    /// Enable or disable a server. Clones the current config, toggles the
+    /// `enabled` field, and applies via `reload_config` for a clean diff.
     pub async fn set_server_enabled(
         &self,
-        _server_id: &str,
-        _enabled: bool,
+        server_id: &str,
+        enabled: bool,
     ) -> Result<(), anyhow::Error> {
-        // TODO: Implement in Sub-phase C when config hot-reload is added.
-        // For now, this is a placeholder that validates the server exists.
-        let config = self.config.load();
-        if !config.servers.contains_key(_server_id) {
-            anyhow::bail!("unknown server: {_server_id}");
+        let mut new_config = (**self.config.load()).clone();
+        let server = new_config
+            .servers
+            .get_mut(server_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?;
+
+        if server.enabled == enabled {
+            return Ok(()); // No change needed
         }
-        anyhow::bail!("set_server_enabled not yet implemented — requires config hot-reload")
+
+        server.enabled = enabled;
+        self.reload_config(new_config).await?;
+        Ok(())
+    }
+
+    /// Reload configuration from a new Config.
+    ///
+    /// Diffs the old and new configs, starts/stops/restarts servers as needed,
+    /// refreshes the tool cache, and emits `ConfigReloaded`.
+    pub async fn reload_config(
+        &self,
+        new_config: Config,
+    ) -> Result<crate::reload::ReloadReport, anyhow::Error> {
+        crate::reload::apply_reload(self, new_config).await
     }
 }
 
@@ -402,6 +429,160 @@ mod tests {
         let engine = Engine::new(test_config());
         let result = engine.set_server_enabled("nonexistent", true).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn engine_set_server_enabled_noop() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.servers.insert(
+            "test".to_string(),
+            ServerConfig {
+                command: Some("echo".to_string()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+            },
+        );
+
+        let engine = Engine::new(config);
+        // Already enabled — should be a no-op
+        let result = engine.set_server_enabled("test", true).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn engine_set_server_enabled_toggle() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.servers.insert(
+            "test".to_string(),
+            ServerConfig {
+                command: Some("echo".to_string()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+            },
+        );
+
+        let engine = Engine::new(config);
+        let mut rx = engine.subscribe();
+
+        // Disable the server — triggers reload which emits ConfigReloaded
+        let result = engine.set_server_enabled("test", false).await;
+        assert!(result.is_ok());
+
+        // Config should reflect the change
+        let cfg = engine.config();
+        assert!(!cfg.servers["test"].enabled);
+
+        // Should have emitted ConfigReloaded (possibly after other events)
+        let mut found_reloaded = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, EngineEvent::ConfigReloaded) {
+                found_reloaded = true;
+                break;
+            }
+        }
+        assert!(found_reloaded, "expected ConfigReloaded event");
+    }
+
+    /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain
+    /// safe while reload_config removes/adds servers. The ArcSwap-based design
+    /// guarantees wait-free reads; this test documents that invariant.
+    #[tokio::test]
+    async fn concurrent_reads_during_reload() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Config A: has "alpha" server (will be removed by reload)
+        let mut config_a = Config::default();
+        config_a.servers.insert(
+            "alpha".to_string(),
+            ServerConfig {
+                command: Some("echo".to_string()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+            },
+        );
+
+        // Config B: empty (removes "alpha")
+        let config_b = Config::default();
+
+        let engine = Arc::new(Engine::new(config_a));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Spawn reader tasks that continuously call snapshot/server_statuses/tool_list
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let eng = engine.clone();
+            let done_flag = done.clone();
+            readers.push(tokio::spawn(async move {
+                let mut iterations = 0u64;
+                while !done_flag.load(Ordering::Relaxed) {
+                    let _snap = eng.snapshot();
+                    let _statuses = eng.server_statuses();
+                    let _tools = eng.tool_list();
+                    iterations += 1;
+                    // Yield to avoid starving the reload task
+                    if iterations % 100 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                iterations
+            }));
+        }
+
+        // Run several reload cycles concurrently with the readers
+        // (reload with empty config — no actual MCP servers to start/stop,
+        // but it exercises the full config diff + swap + event path)
+        for _ in 0..10 {
+            let _ = engine.reload_config(config_b.clone()).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Signal readers to stop
+        done.store(true, Ordering::Relaxed);
+
+        // All readers should complete without panic
+        for handle in readers {
+            let iterations = handle.await.expect("reader task panicked");
+            assert!(iterations > 0, "reader should have executed at least once");
+        }
+
+        // Config should reflect the last reload (empty)
+        let snap = engine.snapshot();
+        assert!(snap.servers.is_empty());
     }
 
     #[tokio::test]

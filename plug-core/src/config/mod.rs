@@ -117,6 +117,9 @@ pub struct ServerConfig {
     /// Enable circuit breaker for this server (default: true).
     #[serde(default = "default_true")]
     pub circuit_breaker_enabled: bool,
+    /// Enable tool enrichment (annotation inference, title normalization).
+    #[serde(default)]
+    pub enrichment: bool,
 }
 
 fn default_true() -> bool {
@@ -140,7 +143,7 @@ fn default_tool_search_threshold() -> usize {
 }
 
 /// Transport type for upstream servers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportType {
     #[default]
@@ -386,6 +389,7 @@ mod tests {
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
+                enrichment: false,
             },
         );
         let errors = validate_config(&cfg);
@@ -409,6 +413,7 @@ mod tests {
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
+                enrichment: false,
             },
         );
         let errors = validate_config(&cfg);
@@ -436,6 +441,7 @@ mod tests {
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
+                enrichment: false,
             },
         );
         let errors = validate_config(&cfg);
@@ -463,6 +469,7 @@ mod tests {
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
+                enrichment: false,
             },
         );
         let errors = validate_config(&cfg);
@@ -494,6 +501,7 @@ mod tests {
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
+                enrichment: false,
             },
         );
         let errors = validate_config(&cfg);
@@ -521,6 +529,7 @@ mod tests {
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
+                enrichment: false,
             },
         );
         let errors = validate_config(&cfg);

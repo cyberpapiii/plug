@@ -25,6 +25,8 @@ pub enum AppMode {
     Dashboard,
     Tools,
     ToolDetail(String),
+    Logs,
+    Doctor,
     Help,
 }
 
@@ -117,6 +119,10 @@ pub struct App {
     // Confirmed action ready for dispatch
     pending_confirmed: Option<PendingAction>,
 
+    // Doctor check results
+    pub doctor_checks: Vec<plug_core::doctor::CheckResult>,
+    pub doctor_state: ListState,
+
     // Totals
     pub tool_count: usize,
 }
@@ -158,6 +164,8 @@ impl App {
             search_active: false,
             confirm: None,
             pending_confirmed: None,
+            doctor_checks: Vec::new(),
+            doctor_state: ListState::default(),
             tool_count: snapshot.tool_count,
         }
     }
@@ -303,6 +311,8 @@ impl App {
                     self.dirty = true;
                 }
             }
+            AppMode::Logs => self.handle_logs_input(code),
+            AppMode::Doctor => self.handle_doctor_input(code),
             AppMode::Help => {
                 // Any key dismisses help
                 self.mode = AppMode::Dashboard;
@@ -341,6 +351,14 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.mode = AppMode::Tools;
+                self.dirty = true;
+            }
+            KeyCode::Char('l') => {
+                self.mode = AppMode::Logs;
+                self.dirty = true;
+            }
+            KeyCode::Char('d') => {
+                self.mode = AppMode::Doctor;
                 self.dirty = true;
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -404,6 +422,62 @@ impl App {
             KeyCode::Char('/') => {
                 self.search_active = true;
                 self.search_query = Some(String::new());
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_logs_input(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = self.activity_log.len();
+                if len > 0 {
+                    let i = self
+                        .activity_state
+                        .selected()
+                        .map(|i| (i + 1).min(len - 1))
+                        .unwrap_or(0);
+                    self.activity_state.select(Some(i));
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let i = self
+                    .activity_state
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                self.activity_state.select(Some(i));
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_doctor_input(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = self.doctor_checks.len();
+                if len > 0 {
+                    let i = self
+                        .doctor_state
+                        .selected()
+                        .map(|i| (i + 1).min(len - 1))
+                        .unwrap_or(0);
+                    self.doctor_state.select(Some(i));
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let i = self
+                    .doctor_state
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                self.doctor_state.select(Some(i));
                 self.dirty = true;
             }
             _ => {}

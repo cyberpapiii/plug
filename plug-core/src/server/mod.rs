@@ -368,6 +368,55 @@ impl ServerManager {
             .collect()
     }
 
+    /// Start a single server and register it in the manager.
+    pub async fn start_and_register(
+        &self,
+        name: &str,
+        config: &ServerConfig,
+    ) -> Result<(), anyhow::Error> {
+        let upstream = Self::start_server(name, config).await?;
+        let max_concurrent = upstream.config.max_concurrent;
+        let cb_enabled = upstream.config.circuit_breaker_enabled;
+        let mut new_map = HashMap::clone(&self.servers.load());
+        new_map.insert(name.to_string(), Arc::new(upstream));
+        self.servers.store(Arc::new(new_map));
+
+        self.health.insert(name.to_string(), HealthState::new());
+        self.semaphores.insert(
+            name.to_string(),
+            Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        );
+        if cb_enabled {
+            self.circuit_breakers.insert(
+                name.to_string(),
+                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+            );
+        }
+        Ok(())
+    }
+
+    /// Stop and remove a single upstream server.
+    pub async fn stop_server(&self, name: &str) {
+        let mut new_map = HashMap::clone(&self.servers.load());
+        if let Some(upstream_arc) = new_map.remove(name) {
+            self.servers.store(Arc::new(new_map));
+            self.health.remove(name);
+            self.circuit_breakers.remove(name);
+            self.semaphores.remove(name);
+
+            match Arc::try_unwrap(upstream_arc) {
+                Ok(upstream) => {
+                    tracing::info!(server = %name, "stopped server");
+                    drop(upstream);
+                }
+                Err(arc) => {
+                    tracing::warn!(server = %name, "could not take ownership; relying on Drop");
+                    drop(arc);
+                }
+            }
+        }
+    }
+
     /// Replace an upstream server (used after reconnection).
     /// Updates the servers map and resets related state.
     pub fn replace_server(&self, name: &str, upstream: UpstreamServer) {

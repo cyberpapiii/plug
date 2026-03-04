@@ -1,0 +1,50 @@
+[workspace]
+members = ["plug"]
+
+[dist]
+# cargo-dist configuration
+cargo-dist-version = "0.26.0"
+
+# Hosting and CI
+ci = "github"
+hosting = ["github"]
+
+# Build targets
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+
+# Installers
+installers = ["shell", "homebrew"]
+
+# Homebrew tap
+tap = "plug-mcp/homebrew-tap"
+
+# Formula name for Homebrew
+formula = "plug"
+
+# Shell installer config
+install-path = "CARGO_HOME"
+
+# Checksum generation
+checksum = "sha256"
+
+# Build settings
+build-local-artifacts = true
+
+# Archive format: zip for Windows, tar.gz for everything else
+windows-archive = ".zip"
+unix-archive = ".tar.gz"
+
+# Auto-include relevant files
+include = ["README.md", "CHANGELOG.md", "LICENSE"]
+
+# Package metadata
+[dist.dependencies]
+# No additional system dependencies required

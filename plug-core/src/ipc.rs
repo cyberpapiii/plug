@@ -26,6 +26,9 @@ pub enum IpcRequest {
         server_id: String,
         auth_token: String,
     },
+    /// Reload configuration from disk.
+    Reload { auth_token: String },
+
     /// Graceful daemon shutdown.
     Shutdown { auth_token: String },
 }
@@ -38,6 +41,10 @@ impl fmt::Debug for IpcRequest {
             Self::RestartServer { server_id, .. } => f
                 .debug_struct("RestartServer")
                 .field("server_id", server_id)
+                .field("auth_token", &"[REDACTED]")
+                .finish(),
+            Self::Reload { .. } => f
+                .debug_struct("Reload")
                 .field("auth_token", &"[REDACTED]")
                 .finish(),
             Self::Shutdown { .. } => f
@@ -68,16 +75,16 @@ pub enum IpcResponse {
 pub fn requires_auth(request: &IpcRequest) -> bool {
     matches!(
         request,
-        IpcRequest::RestartServer { .. } | IpcRequest::Shutdown { .. }
+        IpcRequest::RestartServer { .. } | IpcRequest::Reload { .. } | IpcRequest::Shutdown { .. }
     )
 }
 
 /// Extract the auth_token from a request, if present.
 pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     match request {
-        IpcRequest::RestartServer { auth_token, .. } | IpcRequest::Shutdown { auth_token, .. } => {
-            Some(auth_token.as_str())
-        }
+        IpcRequest::RestartServer { auth_token, .. }
+        | IpcRequest::Reload { auth_token, .. }
+        | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }

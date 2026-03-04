@@ -40,6 +40,8 @@ pub struct RouterConfig {
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
     pub tool_filter_enabled: bool,
+    /// Servers with enrichment enabled (annotation inference + title normalization).
+    pub enrichment_servers: std::collections::HashSet<String>,
 }
 
 impl From<&Config> for RouterConfig {
@@ -50,6 +52,12 @@ impl From<&Config> for RouterConfig {
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
             tool_filter_enabled: config.tool_filter_enabled,
+            enrichment_servers: config
+                .servers
+                .iter()
+                .filter(|(_, sc)| sc.enrichment)
+                .map(|(name, _)| name.clone())
+                .collect(),
         }
     }
 }
@@ -104,6 +112,12 @@ impl ToolRouter {
             routes.insert(prefixed_name.clone(), server_name.clone());
 
             let mut prefixed_tool = tool.clone();
+
+            // Apply enrichment if enabled for this server
+            if self.config.enrichment_servers.contains(&server_name) {
+                crate::enrichment::enrich_tool(&mut prefixed_tool);
+            }
+
             prefixed_tool.name = Cow::Owned(prefixed_name);
 
             // Strip optional fields for token efficiency
@@ -606,6 +620,7 @@ mod tests {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
         }
     }
 
