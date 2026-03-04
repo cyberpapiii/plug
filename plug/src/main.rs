@@ -92,6 +92,12 @@ enum Commands {
         /// HTTP port (default: from config or 3282)
         #[arg(long, default_value = "3282")]
         port: u16,
+        /// Write config to the target client's config file (merges with existing)
+        #[arg(long)]
+        write: bool,
+        /// Use project-level config path instead of global
+        #[arg(long)]
+        project: bool,
     },
     /// Run diagnostic checks on your plug setup
     Doctor,
@@ -175,8 +181,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Import { clients, dry_run } => {
             cmd_import(cli.config.as_ref(), clients, dry_run, &cli.output)?;
         }
-        Commands::Export { target, http, port } => {
-            cmd_export(&target, http, port)?;
+        Commands::Export {
+            target,
+            http,
+            port,
+            write,
+            project,
+        } => {
+            cmd_export(&target, http, port, write, project)?;
         }
         Commands::Doctor => {
             cmd_doctor(cli.config.as_ref(), &cli.output).await?;
@@ -830,7 +842,13 @@ fn cmd_import(
 }
 
 /// `plug export <target>` — generate a config snippet for a target client.
-fn cmd_export(target: &str, http: bool, port: u16) -> anyhow::Result<()> {
+fn cmd_export(
+    target: &str,
+    http: bool,
+    port: u16,
+    write: bool,
+    project: bool,
+) -> anyhow::Result<()> {
     use plug_core::export::{ExportOptions, ExportTarget, ExportTransport};
 
     let target: ExportTarget = target.parse().map_err(|e: String| {
@@ -852,16 +870,70 @@ fn cmd_export(target: &str, http: bool, port: u16) -> anyhow::Result<()> {
         port,
     };
 
-    let config = plug_core::export::export_config(&options);
-    println!("{config}");
+    let config_snippet = plug_core::export::export_config(&options);
 
-    // Show where to put it
-    let path = plug_core::export::default_config_path(target, false);
-    if let Some(path) = path {
-        eprintln!("\nadd this to: {}", path.display());
+    if write {
+        let path = plug_core::export::default_config_path(target, project)
+            .ok_or_else(|| anyhow::anyhow!("no known config path for {target:?}"))?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // For JSON targets: merge into existing file or write new
+        if path.exists() {
+            let existing = std::fs::read_to_string(&path)?;
+            let merged = merge_json_config(&existing, &config_snippet)?;
+            std::fs::write(&path, merged)?;
+            eprintln!("merged into: {}", path.display());
+        } else {
+            std::fs::write(&path, &config_snippet)?;
+            eprintln!("wrote: {}", path.display());
+        }
+    } else {
+        println!("{config_snippet}");
+
+        // Show where to put it
+        let path = plug_core::export::default_config_path(target, project);
+        if let Some(path) = path {
+            eprintln!("\nadd this to: {}", path.display());
+        }
     }
 
     Ok(())
+}
+
+/// Merge a JSON config snippet into an existing JSON config file.
+/// Preserves existing entries and adds the plug entry.
+fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
+    let mut existing_json: serde_json::Value =
+        serde_json::from_str(existing).unwrap_or_else(|_| serde_json::json!({}));
+
+    let snippet_json: serde_json::Value =
+        serde_json::from_str(snippet).map_err(|e| anyhow::anyhow!("invalid JSON snippet: {e}"))?;
+
+    // Deep merge: for each top-level key in snippet, merge into existing
+    if let (Some(existing_obj), Some(snippet_obj)) =
+        (existing_json.as_object_mut(), snippet_json.as_object())
+    {
+        for (key, value) in snippet_obj {
+            if let (Some(existing_inner), Some(snippet_inner)) = (
+                existing_obj.get_mut(key).and_then(|v| v.as_object_mut()),
+                value.as_object(),
+            ) {
+                // Merge nested objects (e.g., mcpServers.plug into existing mcpServers)
+                for (k, v) in snippet_inner {
+                    existing_inner.insert(k.clone(), v.clone());
+                }
+            } else {
+                existing_obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    serde_json::to_string_pretty(&existing_json)
+        .map_err(|e| anyhow::anyhow!("failed to serialize merged config: {e}"))
 }
 
 /// `plug doctor` — run diagnostic checks on the plug setup.
