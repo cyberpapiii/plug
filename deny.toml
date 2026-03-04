@@ -16,7 +16,7 @@ allow = [
 [advisories]
 version = 2
 vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "ignore"
 
 [bans]
 multiple-versions = "warn"

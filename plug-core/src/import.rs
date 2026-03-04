@@ -226,6 +226,7 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
 /// Platform-specific config paths for Claude Desktop.
 /// Extracted to its own function to satisfy clippy's `vec_init_then_push` lint
 /// when using `#[cfg]` attributes on individual push calls.
+#[allow(unused_variables)]
 fn claude_desktop_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     #[cfg(target_os = "macos")]

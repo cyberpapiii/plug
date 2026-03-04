@@ -3,7 +3,7 @@ members = ["plug"]
 
 [dist]
 # cargo-dist configuration
-cargo-dist-version = "0.26.0"
+cargo-dist-version = "0.31.0"
 
 # Hosting and CI
 ci = "github"

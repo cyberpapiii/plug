@@ -27,7 +27,7 @@ jobs:
       - name: Install cargo-dist
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-dist@0.26.0
+          tool: cargo-dist@0.31.0
 
       - name: Plan release
         id: plan
@@ -91,7 +91,7 @@ jobs:
       - name: Install cargo-dist
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-dist@0.26.0
+          tool: cargo-dist@0.31.0
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -167,7 +167,7 @@ jobs:
       - name: Install cargo-dist
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-dist@0.26.0
+          tool: cargo-dist@0.31.0
 
       - name: Generate changelog with git-cliff
         uses: orhun/git-cliff-action@v4
