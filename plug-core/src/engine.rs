@@ -234,6 +234,11 @@ impl Engine {
         self.config.load()
     }
 
+    /// Atomically swap in a new config.
+    pub fn store_config(&self, config: Config) {
+        self.config.store(Arc::new(config));
+    }
+
     /// Restart a specific upstream server. Rate-limited: at most 1 restart
     /// per server per 10 seconds. Applies to both TUI and IPC callers.
     pub async fn restart_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
@@ -305,6 +310,17 @@ impl Engine {
             anyhow::bail!("unknown server: {_server_id}");
         }
         anyhow::bail!("set_server_enabled not yet implemented — requires config hot-reload")
+    }
+
+    /// Reload configuration from a new Config.
+    ///
+    /// Diffs the old and new configs, starts/stops/restarts servers as needed,
+    /// refreshes the tool cache, and emits `ConfigReloaded`.
+    pub async fn reload_config(
+        &self,
+        new_config: Config,
+    ) -> Result<crate::reload::ReloadReport, anyhow::Error> {
+        crate::reload::apply_reload(self, new_config).await
     }
 }
 

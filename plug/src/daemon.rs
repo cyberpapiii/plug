@@ -220,7 +220,7 @@ async fn send_response(
 ///
 /// Returns the tracing-appender guard that MUST be held for the daemon's lifetime
 /// (dropping it flushes and closes the log file).
-pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
+pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
     let rt_dir = runtime_dir();
     let log_directory = log_dir();
 
@@ -311,6 +311,7 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
                         let server_manager = engine.server_manager().clone();
                         let snapshot = engine.snapshot();
                         let auth = auth_token.clone();
+                        let engine_clone = engine.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit; // held for connection lifetime
@@ -321,6 +322,7 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
                                 cancel: engine_cancel,
                                 auth_token: auth,
                                 server_manager,
+                                engine: engine_clone,
                                 started_at,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
@@ -351,6 +353,7 @@ struct ConnectionContext {
     cancel: CancellationToken,
     auth_token: Arc<str>,
     server_manager: Arc<plug_core::server::ServerManager>,
+    engine: Arc<Engine>,
     started_at: Instant,
 }
 
@@ -421,7 +424,7 @@ async fn handle_ipc_connection(
         }
 
         // Dispatch request
-        let response = dispatch_request(&request, &ctx);
+        let response = dispatch_request(&request, &ctx).await;
 
         send_response(&mut writer, &response).await?;
 
@@ -436,7 +439,7 @@ async fn handle_ipc_connection(
 }
 
 /// Dispatch a single IPC request to the appropriate Engine query.
-fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcResponse {
+async fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcResponse {
     match request {
         IpcRequest::Status => {
             let servers = ctx.server_manager.server_statuses();
@@ -460,9 +463,29 @@ fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcRespons
             }
         }
         IpcRequest::Reload { .. } => {
-            // Reload is handled asynchronously by the caller —
-            // here we just acknowledge the request.
-            IpcResponse::Ok
+            // Load fresh config from disk and apply via Engine
+            let config_path = plug_core::config::default_config_path();
+            match plug_core::config::load_config(Some(&config_path)) {
+                Ok(new_config) => match ctx.engine.reload_config(new_config).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            added = report.added.len(),
+                            removed = report.removed.len(),
+                            changed = report.changed.len(),
+                            "config reloaded via IPC"
+                        );
+                        IpcResponse::Ok
+                    }
+                    Err(e) => IpcResponse::Error {
+                        code: "RELOAD_FAILED".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(e) => IpcResponse::Error {
+                    code: "CONFIG_LOAD_FAILED".to_string(),
+                    message: e.to_string(),
+                },
+            }
         }
         IpcRequest::Shutdown { .. } => IpcResponse::Ok,
     }

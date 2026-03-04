@@ -473,14 +473,14 @@ async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<
         anyhow::bail!("config validation failed with {} error(s)", errors.len());
     }
 
-    let engine = plug_core::engine::Engine::new(config);
+    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
 
     let cancel = engine.cancel_token().clone();
 
     // Run daemon IPC listener + signal handler
     tokio::select! {
-        result = daemon::run_daemon(&engine) => {
+        result = daemon::run_daemon(engine.clone()) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "daemon error");
             }

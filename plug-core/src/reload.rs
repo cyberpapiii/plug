@@ -151,7 +151,10 @@ pub async fn apply_reload(
     // 4. Refresh tool cache
     engine.tool_router().refresh_tools().await;
 
-    // 5. Emit event
+    // 5. Swap config atomically
+    engine.store_config(new_config);
+
+    // 6. Emit event
     let _ = engine.event_sender().send(EngineEvent::ConfigReloaded);
 
     // Log restart-required warnings
