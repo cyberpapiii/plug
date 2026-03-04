@@ -527,6 +527,172 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    /// Full session lifecycle: initialize → tools/list → ping → delete
+    #[tokio::test]
+    async fn full_session_lifecycle() {
+        let state = test_state();
+
+        // 1. Initialize — get session ID
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "lifecycle-test", "version": "1.0" }
+            }
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let session_id = resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // 2. tools/list with session
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 3. ping with session
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "ping"
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 4. DELETE session
+        let app = build_router(state.clone());
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 5. Verify session is gone — tools/list should fail
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/list"
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn notification_without_session_returns_400() {
+        let app = build_router(test_state());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn notification_with_valid_session_returns_202() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn initialize_response_contains_server_info() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "info-test", "version": "1.0" }
+            }
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["result"]["serverInfo"]["name"], "plug");
+        assert!(json["result"]["capabilities"]["tools"].is_object());
+    }
+
     #[tokio::test]
     async fn origin_localhost_accepted() {
         let state = test_state();
