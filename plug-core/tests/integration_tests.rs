@@ -146,8 +146,8 @@ fn test_client_detection_unknown() {
 #[test]
 fn test_config_loading_defaults() {
     let cfg = Config::default();
-    assert_eq!(cfg.bind_address, "127.0.0.1");
-    assert_eq!(cfg.port, 3282);
+    assert_eq!(cfg.http.bind_address, "127.0.0.1");
+    assert_eq!(cfg.http.port, 3282);
     assert_eq!(cfg.log_level, "info");
     assert_eq!(cfg.prefix_delimiter, "__");
     assert!(cfg.enable_prefix);
@@ -161,9 +161,11 @@ fn test_config_loading_from_toml() {
     use figment::Figment;
 
     let toml_str = r#"
-        port = 9090
         log_level = "debug"
         prefix_delimiter = "::"
+
+        [http]
+        port = 9090
 
         [servers.myserver]
         command = "node"
@@ -177,7 +179,7 @@ fn test_config_loading_from_toml() {
         .extract()
         .expect("failed to parse TOML");
 
-    assert_eq!(cfg.port, 9090);
+    assert_eq!(cfg.http.port, 9090);
     assert_eq!(cfg.log_level, "debug");
     assert_eq!(cfg.prefix_delimiter, "::");
 
@@ -204,6 +206,7 @@ fn test_config_validation_valid() {
             enabled: true,
             transport: TransportType::Stdio,
             url: None,
+            auth_token: None,
             timeout_secs: 30,
         },
     );
@@ -223,6 +226,7 @@ fn test_config_validation_catches_missing_command() {
             enabled: true,
             transport: TransportType::Stdio,
             url: None,
+            auth_token: None,
             timeout_secs: 30,
         },
     );

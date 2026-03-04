@@ -11,10 +11,6 @@ pub use expand::expand_env_vars;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Bind address for HTTP server (Phase 2).
-    pub bind_address: String,
-    /// Port for HTTP server (Phase 2).
-    pub port: u16,
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
     /// Tool name prefix delimiter.
@@ -23,6 +19,9 @@ pub struct Config {
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     pub startup_concurrency: usize,
+    /// HTTP server configuration.
+    #[serde(default)]
+    pub http: HttpConfig,
     /// Upstream server definitions.
     #[serde(default)]
     pub servers: HashMap<String, ServerConfig>,
@@ -31,13 +30,40 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1".to_string(),
-            port: 3282,
             log_level: "info".to_string(),
             prefix_delimiter: "__".to_string(),
             enable_prefix: true,
             startup_concurrency: 3,
+            http: HttpConfig::default(),
             servers: HashMap::new(),
+        }
+    }
+}
+
+/// HTTP server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    /// Bind address for HTTP server.
+    pub bind_address: String,
+    /// Port for HTTP server.
+    pub port: u16,
+    /// Session timeout in seconds.
+    pub session_timeout_secs: u64,
+    /// Maximum number of concurrent sessions.
+    pub max_sessions: usize,
+    /// SSE channel buffer capacity per session.
+    pub sse_channel_capacity: usize,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: "127.0.0.1".to_string(),
+            port: 3282,
+            session_timeout_secs: 1800,
+            max_sessions: 100,
+            sse_channel_capacity: 32,
         }
     }
 }
@@ -61,6 +87,8 @@ pub struct ServerConfig {
     pub transport: TransportType,
     /// URL for HTTP transport.
     pub url: Option<String>,
+    /// Bearer token for HTTP upstream authentication.
+    pub auth_token: Option<String>,
     /// Startup timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -89,8 +117,8 @@ pub enum TransportType {
 pub fn validate_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
 
-    if config.port == 0 {
-        errors.push("port must be in range 1-65535".to_string());
+    if config.http.port == 0 {
+        errors.push("http.port must be in range 1-65535".to_string());
     }
 
     if config.startup_concurrency == 0 {
@@ -171,6 +199,9 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
         if let Some(ref mut url) = server.url {
             *url = expand_env_vars(url);
         }
+        if let Some(ref mut token) = server.auth_token {
+            *token = expand_env_vars(token);
+        }
     }
 
     Ok(config)
@@ -196,8 +227,11 @@ mod tests {
     #[test]
     fn default_values_are_sensible() {
         let cfg = Config::default();
-        assert_eq!(cfg.bind_address, "127.0.0.1");
-        assert_eq!(cfg.port, 3282);
+        assert_eq!(cfg.http.bind_address, "127.0.0.1");
+        assert_eq!(cfg.http.port, 3282);
+        assert_eq!(cfg.http.session_timeout_secs, 1800);
+        assert_eq!(cfg.http.max_sessions, 100);
+        assert_eq!(cfg.http.sse_channel_capacity, 32);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.prefix_delimiter, "__");
         assert!(cfg.enable_prefix);
@@ -211,16 +245,18 @@ mod tests {
     fn load_from_toml_overrides_defaults() {
         let cfg = config_from_toml(
             r#"
-            port = 8080
             log_level = "debug"
             startup_concurrency = 5
+
+            [http]
+            port = 8080
             "#,
         );
-        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.http.port, 8080);
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.startup_concurrency, 5);
         // Non-overridden fields keep defaults
-        assert_eq!(cfg.bind_address, "127.0.0.1");
+        assert_eq!(cfg.http.bind_address, "127.0.0.1");
     }
 
     #[test]
@@ -266,12 +302,12 @@ mod tests {
 
         let fig = Figment::new()
             .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string("port = 9999"))
+            .merge(Toml::string("startup_concurrency = 7"))
             .merge(Env::prefixed("PLUG_").split("__"));
 
         let cfg: Config = fig.extract().expect("extract failed");
         // TOML override should win over default when no env var is actually set
-        assert_eq!(cfg.port, 9999);
+        assert_eq!(cfg.startup_concurrency, 7);
     }
 
     // ---- validation ----
@@ -288,6 +324,7 @@ mod tests {
                 enabled: true,
                 transport: TransportType::Stdio,
                 url: None,
+                auth_token: None,
                 timeout_secs: 30,
             },
         );
@@ -307,6 +344,7 @@ mod tests {
                 enabled: true,
                 transport: TransportType::Stdio,
                 url: None,
+                auth_token: None,
                 timeout_secs: 30,
             },
         );
@@ -326,6 +364,7 @@ mod tests {
                 enabled: true,
                 transport: TransportType::Http,
                 url: None,
+                auth_token: None,
                 timeout_secs: 30,
             },
         );
@@ -345,6 +384,7 @@ mod tests {
                 enabled: true,
                 transport: TransportType::Stdio,
                 url: None,
+                auth_token: None,
                 timeout_secs: 0,
             },
         );
@@ -354,10 +394,8 @@ mod tests {
 
     #[test]
     fn validate_zero_port() {
-        let cfg = Config {
-            port: 0,
-            ..Config::default()
-        };
+        let mut cfg = Config::default();
+        cfg.http.port = 0;
         let errors = validate_config(&cfg);
         assert!(errors.iter().any(|e| e.contains("port")));
     }
@@ -374,6 +412,7 @@ mod tests {
                 enabled: true,
                 transport: TransportType::Stdio,
                 url: None,
+                auth_token: None,
                 timeout_secs: 30,
             },
         );
@@ -384,10 +423,10 @@ mod tests {
     #[test]
     fn validate_multiple_errors() {
         let mut cfg = Config {
-            port: 0,
             startup_concurrency: 0,
             ..Config::default()
         };
+        cfg.http.port = 0;
         cfg.servers.insert(
             "bad_stdio".to_string(),
             ServerConfig {
@@ -397,6 +436,7 @@ mod tests {
                 enabled: true,
                 transport: TransportType::Stdio,
                 url: None,
+                auth_token: None,
                 timeout_secs: 0,
             },
         );
