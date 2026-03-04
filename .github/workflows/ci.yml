@@ -32,7 +32,8 @@ jobs:
         include:
           - os: macos-latest       # ARM (Apple Silicon)
           - os: ubuntu-latest      # x86_64 Linux
-          - os: windows-latest     # x86_64 Windows
+          # Windows disabled — daemon uses Unix sockets (future: named pipes)
+          # - os: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
