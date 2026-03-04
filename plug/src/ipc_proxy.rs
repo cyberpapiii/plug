@@ -94,10 +94,21 @@ impl ServerHandler for IpcProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
+            let client_name = request.client_info.name.to_string();
             tracing::info!(
-                client = %request.client_info.name,
+                client = %client_name,
                 "client connected via IPC proxy"
             );
+
+            // Forward client info to daemon for client-type-aware tool filtering
+            let update_req = IpcRequest::UpdateSession {
+                session_id: self.session_id.clone(),
+                client_info: client_name,
+            };
+            if let Err(e) = self.ipc_round_trip(&update_req).await {
+                tracing::warn!(error = %e, "failed to update session client info");
+            }
+
             context.peer.set_peer_info(request);
             Ok(self.get_info())
         }

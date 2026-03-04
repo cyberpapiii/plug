@@ -44,6 +44,12 @@ pub enum IpcRequest {
     /// Deregister a proxy client session (clean disconnect).
     Deregister { session_id: String },
 
+    /// Update a session's client info (sent after MCP initialize handshake).
+    UpdateSession {
+        session_id: String,
+        client_info: String,
+    },
+
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
         session_id: String,
@@ -79,6 +85,14 @@ impl fmt::Debug for IpcRequest {
             Self::Deregister { session_id } => f
                 .debug_struct("Deregister")
                 .field("session_id", session_id)
+                .finish(),
+            Self::UpdateSession {
+                session_id,
+                client_info,
+            } => f
+                .debug_struct("UpdateSession")
+                .field("session_id", session_id)
+                .field("client_info", client_info)
                 .finish(),
             Self::McpRequest {
                 session_id, method, ..
@@ -162,6 +176,10 @@ mod tests {
             IpcRequest::Deregister {
                 session_id: "sess-123".to_string(),
             },
+            IpcRequest::UpdateSession {
+                session_id: "sess-123".to_string(),
+                client_info: "claude-code".to_string(),
+            },
             IpcRequest::McpRequest {
                 session_id: "sess-123".to_string(),
                 method: "tools/list".to_string(),
@@ -233,6 +251,10 @@ mod tests {
         }));
         assert!(!requires_auth(&IpcRequest::Deregister {
             session_id: "s".to_string(),
+        }));
+        assert!(!requires_auth(&IpcRequest::UpdateSession {
+            session_id: "s".to_string(),
+            client_info: "claude-code".to_string(),
         }));
         assert!(!requires_auth(&IpcRequest::McpRequest {
             session_id: "s".to_string(),

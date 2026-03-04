@@ -605,6 +605,26 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             IpcResponse::Ok
         }
 
+        IpcRequest::UpdateSession {
+            session_id,
+            client_info,
+        } => {
+            if let Some(mut entry) = ctx.client_registry.sessions.get_mut(session_id) {
+                entry.client_info = Some(client_info.clone());
+                tracing::info!(
+                    session_id = %session_id,
+                    client_info = %client_info,
+                    "session updated with client info"
+                );
+                IpcResponse::Ok
+            } else {
+                IpcResponse::Error {
+                    code: "UNKNOWN_SESSION".to_string(),
+                    message: format!("session '{session_id}' not found"),
+                }
+            }
+        }
+
         IpcRequest::McpRequest {
             session_id,
             method,
