@@ -49,6 +49,15 @@ pub async fn run(engine: &Engine) -> anyhow::Result<()> {
             Some(Ok(event)) = crossterm_events.next() => {
                 app.handle_input(event);
 
+                // If entering Doctor mode, run checks
+                if app.mode == AppMode::Doctor && app.doctor_checks.is_empty() {
+                    let config = engine.config();
+                    let config_path = plug_core::config::default_config_path();
+                    let report = plug_core::doctor::run_doctor(&config, &config_path).await;
+                    app.doctor_checks = report.checks;
+                    app.dirty = true;
+                }
+
                 // Dispatch confirmed actions (e.g., server restart)
                 if let Some(action) = app.take_confirmed_action() {
                     match action {
@@ -124,7 +133,7 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
         };
         let status = match &app.mode {
             AppMode::Dashboard => format!(
-                " {} servers | {} tools | Tab: cycle | /: search | ?: help | q: quit{}",
+                " {} servers | {} tools | Tab: cycle | t: tools | l: logs | d: doctor | ?: help | q: quit{}",
                 app.servers.len(),
                 app.tool_count,
                 search_hint,
@@ -133,6 +142,8 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
                 " Tools | j/k: navigate | Enter: details | /: search | Esc: back{search_hint}"
             ),
             AppMode::ToolDetail(name) => format!(" Tool: {name} | Esc: back"),
+            AppMode::Logs => format!(" Logs ({} entries) | j/k: scroll | Esc: back", app.activity_log.len()),
+            AppMode::Doctor => format!(" Doctor ({} checks) | j/k: scroll | Esc: back", app.doctor_checks.len()),
             AppMode::Help => " Help | press any key to dismiss".to_string(),
         };
         render_status_bar(f, status_area, &status, theme);
@@ -143,9 +154,16 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
         AppMode::Dashboard => render_dashboard(f, main_area, app, theme),
         AppMode::Tools => widgets::tools::render(f, main_area, app, theme),
         AppMode::ToolDetail(_) => {
-            // Placeholder — render tool detail in Sub-phase C
             widgets::tools::render(f, main_area, app, theme);
         }
+        AppMode::Logs => widgets::logs::render(f, main_area, app, theme),
+        AppMode::Doctor => widgets::doctor::render(
+            f,
+            main_area,
+            &app.doctor_checks,
+            &mut app.doctor_state,
+            theme,
+        ),
         AppMode::Help => {
             render_dashboard(f, main_area, app, theme);
             widgets::help::render(f, main_area, theme);
