@@ -141,10 +141,15 @@ impl Engine {
 
     /// Start all upstream servers and spawn health checkers.
     ///
+    /// Requires `Arc<Self>` so that health checks and tool router can hold
+    /// a weak reference back to Engine for session recovery (reconnect on error).
     /// Uses `self.tracker.spawn()` for all background tasks to enable
     /// ordered shutdown via `TaskTracker::wait()`.
-    pub async fn start(&self) -> Result<(), anyhow::Error> {
+    pub async fn start(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         let config = self.config.load();
+
+        // Wire up the Engine reference for session recovery in ToolRouter
+        self.tool_router.set_engine(Arc::downgrade(self));
 
         // Start all upstream servers
         self.server_manager.start_all(&config).await?;
@@ -164,10 +169,11 @@ impl Engine {
             });
         }
 
-        // Spawn health checkers using TaskTracker
+        // Spawn health checkers using TaskTracker (with Engine ref for proactive recovery)
         spawn_health_checks(
             self.server_manager.clone(),
             self.tool_router.clone(),
+            Arc::clone(self),
             self.event_tx.clone(),
             self.cancel.clone(),
             &config,
@@ -294,6 +300,62 @@ impl Engine {
             Err(e) => {
                 let _ = self.event_tx.send(EngineEvent::Error {
                     context: Arc::from("restart_server"),
+                    message: Arc::from(e.to_string().as_str()),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Reconnect a specific upstream server without rate limiting.
+    ///
+    /// Used by reactive recovery (tool call path) and proactive recovery
+    /// (health check path). Unlike `restart_server()`, this has no cooldown
+    /// because session recovery should not be throttled.
+    ///
+    /// Uses an AtomicBool per-server to prevent concurrent reconnects —
+    /// if another caller is already reconnecting, returns Ok immediately.
+    pub async fn reconnect_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
+        let reconnecting = self.server_manager.get_reconnecting_flag(server_id);
+
+        // Try to claim the reconnect — if already in progress, return Ok
+        if reconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!(server = %server_id, "reconnect already in progress, skipping");
+            return Ok(());
+        }
+
+        let result = self.do_reconnect(server_id).await;
+        reconnecting.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// Internal reconnection logic shared by `reconnect_server`.
+    async fn do_reconnect(&self, server_id: &str) -> Result<(), anyhow::Error> {
+        let config = self.config.load();
+        let server_config = config
+            .servers
+            .get(server_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?
+            .clone();
+
+        match ServerManager::start_server(server_id, &server_config).await {
+            Ok(upstream) => {
+                self.server_manager.replace_server(server_id, upstream);
+                self.tool_router.refresh_tools().await;
+
+                let _ = self.event_tx.send(EngineEvent::ServerStarted {
+                    server_id: Arc::from(server_id),
+                });
+
+                tracing::info!(server = %server_id, "server reconnected");
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.event_tx.send(EngineEvent::Error {
+                    context: Arc::from("reconnect_server"),
                     message: Arc::from(e.to_string().as_str()),
                 });
                 Err(e)

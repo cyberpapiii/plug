@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use backon::{ExponentialBuilder, Retryable as _};
 use rand::Rng as _;
 use tokio::sync::broadcast;
 use tokio::time::MissedTickBehavior;
@@ -15,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::engine::EngineEvent;
+use crate::engine::{Engine, EngineEvent};
 use crate::proxy::ToolRouter;
 use crate::server::ServerManager;
 use crate::types::ServerHealth;
@@ -25,9 +26,13 @@ use crate::types::ServerHealth;
 /// Each server gets its own tokio task with a staggered start (random jitter)
 /// to avoid thundering-herd pings. Tasks run until `cancel` is triggered.
 /// Uses `tracker.spawn()` for ordered shutdown via `TaskTracker::wait()`.
+///
+/// When a server transitions to `Failed`, spawns a proactive recovery task
+/// that attempts reconnection with exponential backoff via `backon`.
 pub fn spawn_health_checks(
     server_manager: Arc<ServerManager>,
     router: Arc<ToolRouter>,
+    engine: Arc<Engine>,
     event_tx: broadcast::Sender<EngineEvent>,
     cancel: CancellationToken,
     config: &Config,
@@ -42,8 +47,10 @@ pub fn spawn_health_checks(
         let interval = Duration::from_secs(sc.health_check_interval_secs);
         let mgr = server_manager.clone();
         let router = router.clone();
+        let engine = engine.clone();
         let cancel = cancel.clone();
         let event_tx = event_tx.clone();
+        let tracker_clone = tracker.clone();
 
         tracker.spawn(async move {
             // Stagger start with random 0-10s jitter to avoid thundering herd
@@ -75,11 +82,62 @@ pub fn spawn_health_checks(
                                 old,
                                 new,
                             });
+
+                            // Proactive recovery: when a server reaches Failed,
+                            // spawn a tracked recovery task with exponential backoff.
+                            if new == ServerHealth::Failed {
+                                let engine = engine.clone();
+                                let name = name.clone();
+                                tracker_clone.spawn(async move {
+                                    spawn_proactive_recovery(&engine, &name).await;
+                                });
+                            }
                         }
                     }
                 }
             }
         });
+    }
+}
+
+/// Attempt proactive recovery of a failed server with exponential backoff.
+///
+/// Uses `backon` to retry `Engine::reconnect_server()` up to 5 times
+/// with delays from 1s to 60s. On success, the server is replaced and
+/// health/circuit breaker state is reset via `replace_server()`.
+async fn spawn_proactive_recovery(engine: &Engine, server_name: &str) {
+    tracing::info!(server = %server_name, "starting proactive recovery");
+
+    let reconnect = || async { engine.reconnect_server(server_name).await };
+
+    match reconnect
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(60))
+                .with_max_times(5)
+                .with_jitter(),
+        )
+        .notify(|err, dur| {
+            tracing::warn!(
+                server = %server_name,
+                error = %err,
+                retry_in_ms = dur.as_millis(),
+                "proactive recovery attempt failed, will retry"
+            );
+        })
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(server = %server_name, "proactive recovery succeeded");
+        }
+        Err(e) => {
+            tracing::error!(
+                server = %server_name,
+                error = %e,
+                "proactive recovery exhausted (5 attempts), will retry on next health cycle"
+            );
+        }
     }
 }
 

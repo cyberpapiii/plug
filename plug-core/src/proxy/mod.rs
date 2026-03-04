@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::Config;
-use crate::engine::{EngineEvent, next_call_id};
+use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
 use crate::server::ServerManager;
 use crate::types::{ClientType, ServerHealth};
@@ -69,6 +69,9 @@ pub struct ToolRouter {
     config: RouterConfig,
     /// Optional event sender for tool call observability.
     event_tx: Option<broadcast::Sender<EngineEvent>>,
+    /// Weak reference to Engine for session recovery (reconnect on error).
+    /// Set after Engine construction via `set_engine()`.
+    engine: std::sync::RwLock<Option<Weak<Engine>>>,
 }
 
 impl ToolRouter {
@@ -83,6 +86,7 @@ impl ToolRouter {
             })),
             config,
             event_tx: None,
+            engine: std::sync::RwLock::new(None),
         }
     }
 
@@ -90,6 +94,13 @@ impl ToolRouter {
     pub fn with_event_tx(mut self, tx: broadcast::Sender<EngineEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    /// Set the Engine reference for session recovery.
+    pub fn set_engine(&self, engine: Weak<Engine>) {
+        if let Ok(mut guard) = self.engine.write() {
+            *guard = Some(engine);
+        }
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
@@ -192,14 +203,28 @@ impl ToolRouter {
     /// Call a tool by its prefixed name, routing to the correct upstream server.
     ///
     /// Applies: health gate → circuit breaker → semaphore → timeout.
+    /// On session/transport errors, attempts one automatic reconnect + retry.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        self.call_tool_inner(tool_name, arguments, false).await
+    }
+
+    /// Inner tool call implementation with retry support.
+    /// `is_retry` prevents infinite recursion — max 1 reconnect per call.
+    /// Uses `Box::pin` for the recursive call to avoid infinitely-sized future.
+    fn call_tool_inner<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        is_retry: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>> {
+        Box::pin(async move {
         // Intercept search_tools meta-tool
         if tool_name == "plug__search_tools" {
-            return self.handle_search_tools(arguments);
+            return self.handle_search_tools(arguments.clone());
         }
 
         // Look up the server for this prefixed tool name
@@ -269,8 +294,8 @@ impl ToolRouter {
 
         // Build the upstream call with the original (unprefixed) tool name
         let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-        if let Some(args) = arguments {
-            upstream_params = upstream_params.with_arguments(args);
+        if let Some(ref args) = arguments {
+            upstream_params = upstream_params.with_arguments(args.clone());
         }
 
         // Emit ToolCallStarted event
@@ -313,6 +338,56 @@ impl ToolRouter {
                     });
                 }
                 Ok(response)
+            }
+            Ok(Err(e)) if is_session_error(&e) && !is_retry => {
+                // Session/transport error on first attempt — try to reconnect and retry
+                tracing::warn!(
+                    server = %server_id,
+                    tool = %original_name,
+                    error = %e,
+                    "session error detected, attempting reconnect"
+                );
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(EngineEvent::ToolCallCompleted {
+                        call_id,
+                        server_id: Arc::clone(&server_id_arc),
+                        tool_name: Arc::clone(&tool_name_arc),
+                        duration_ms,
+                        success: false,
+                    });
+                }
+
+                // Attempt reconnect via Engine (AtomicBool prevents stampede)
+                let engine_ref = self.engine.read().ok().and_then(|g| {
+                    g.as_ref().and_then(|w| w.upgrade())
+                });
+                if let Some(engine) = engine_ref {
+                    match engine.reconnect_server(&server_id).await {
+                        Ok(()) => {
+                            tracing::info!(server = %server_id, "reconnected, retrying tool call");
+                        }
+                        Err(reconnect_err) => {
+                            tracing::error!(
+                                server = %server_id,
+                                error = %reconnect_err,
+                                "reconnect failed, returning original error"
+                            );
+                            if let Some(cb) = &cb {
+                                cb.on_failure();
+                            }
+                            return Err(McpError::internal_error(e.to_string(), None));
+                        }
+                    }
+                } else {
+                    // No Engine reference — can't reconnect, return error
+                    if let Some(cb) = &cb {
+                        cb.on_failure();
+                    }
+                    return Err(McpError::internal_error(e.to_string(), None));
+                }
+
+                // Retry the tool call exactly once
+                self.call_tool_inner(tool_name, arguments, true).await
             }
             Ok(Err(e)) => {
                 tracing::error!(
@@ -362,6 +437,7 @@ impl ToolRouter {
                 }))
             }
         }
+        })
     }
 
     /// Handle the `plug__search_tools` meta-tool call.
@@ -420,6 +496,38 @@ impl ToolRouter {
     /// Get a reference to the underlying ServerManager.
     pub fn server_manager(&self) -> &Arc<ServerManager> {
         &self.server_manager
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session error classification
+// ---------------------------------------------------------------------------
+
+/// Classify whether a ServiceError indicates a session/transport failure
+/// that should trigger automatic reconnection.
+///
+/// rmcp v1.0.0 error mapping:
+/// - HTTP 404 "Session not found" → `ServiceError::TransportSend(DynamicTransportError)`
+///   with formatted string containing "404" and "session not found"
+/// - Connection refused/reset → `ServiceError::TransportSend` or `TransportClosed`
+/// - JSON-RPC application errors → `ServiceError::McpError` (do NOT reconnect)
+/// - Timeouts → `ServiceError::Timeout` (do NOT reconnect)
+fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
+    use rmcp::service::ServiceError;
+    match e {
+        // Transport send failures (HTTP 404, connection refused, etc.)
+        ServiceError::TransportSend(dyn_err) => {
+            let msg = dyn_err.to_string().to_lowercase();
+            msg.contains("404") || msg.contains("session") || msg.contains("connection")
+        }
+        // Transport closed = connection dropped (server crashed/restarted)
+        ServiceError::TransportClosed => true,
+        // All other variants: do NOT reconnect
+        // McpError = application-level error (tool errors, invalid params)
+        // Timeout = slow tool, not a server failure
+        // Cancelled = task cancelled
+        // UnexpectedResponse = wrong response type
+        _ => false,
     }
 }
 
@@ -818,5 +926,46 @@ mod tests {
         let result = router.handle_search_tools(Some(args)).unwrap();
         let text = format!("{result:?}");
         assert!(text.contains("No tools found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Session error classification tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_session_error_transport_closed() {
+        use rmcp::service::ServiceError;
+        assert!(is_session_error(&ServiceError::TransportClosed));
+    }
+
+    #[test]
+    fn is_session_error_mcp_error_not_session() {
+        use rmcp::service::ServiceError;
+        // Application-level MCP error should NOT trigger reconnect
+        let mcp_err = McpError::internal_error("tool failed".to_string(), None);
+        assert!(!is_session_error(&ServiceError::McpError(mcp_err)));
+    }
+
+    #[test]
+    fn is_session_error_timeout_not_session() {
+        use rmcp::service::ServiceError;
+        // Timeouts should NOT trigger reconnect
+        assert!(!is_session_error(&ServiceError::Timeout {
+            timeout: Duration::from_secs(30),
+        }));
+    }
+
+    #[test]
+    fn is_session_error_cancelled_not_session() {
+        use rmcp::service::ServiceError;
+        assert!(!is_session_error(&ServiceError::Cancelled {
+            reason: Some("test".to_string()),
+        }));
+    }
+
+    #[test]
+    fn is_session_error_unexpected_response_not_session() {
+        use rmcp::service::ServiceError;
+        assert!(!is_session_error(&ServiceError::UnexpectedResponse));
     }
 }
