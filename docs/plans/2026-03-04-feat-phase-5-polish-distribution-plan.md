@@ -305,7 +305,7 @@ New `AppMode::Doctor` with:
 - [x] `dist-workspace.toml` — cargo-dist configuration (generated)
 - [x] `.github/workflows/release.yml` — CI release workflow (generated)
 - [x] `install.sh` — Shell installer script
-- [ ] `README.md` — Installation + quick start docs
+- [x] `README.md` — Installation + quick start docs
 - [x] `CHANGELOG.md` — Auto-generated changelog
 
 **Success criteria**:
