@@ -351,7 +351,7 @@ New `AppMode::Doctor` with:
 - [x] Config hot-reload: remove server → drains in-flight, stops gracefully
 - [x] Config hot-reload: invalid TOML → rejected, current config preserved
 - [x] `plug reload` CLI command triggers reload via daemon IPC
-- [ ] SIGHUP triggers config reload (Unix only)
+- [x] SIGHUP triggers config reload (Unix only)
 - [x] Tool enrichment adds annotations when `enrichment = true` in server config
 - [x] Enrichment never overrides upstream-provided annotations
 - [x] `GET /.well-known/mcp.json` returns server card
