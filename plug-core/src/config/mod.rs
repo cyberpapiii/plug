@@ -140,7 +140,7 @@ fn default_tool_search_threshold() -> usize {
 }
 
 /// Transport type for upstream servers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportType {
     #[default]

@@ -95,6 +95,8 @@ enum Commands {
     },
     /// Run diagnostic checks on your plug setup
     Doctor,
+    /// Reload config from disk (sends reload signal to daemon)
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -178,6 +180,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Doctor => {
             cmd_doctor(cli.config.as_ref(), &cli.output).await?;
+        }
+        Commands::Reload => {
+            cmd_reload().await?;
         }
         Commands::Config { command } => match command {
             ConfigCommands::Validate => {
@@ -896,6 +901,38 @@ async fn cmd_doctor(
             if fail > 0 {
                 std::process::exit(1);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// `plug reload` — tell the running daemon to reload its config.
+async fn cmd_reload() -> anyhow::Result<()> {
+    let auth_token = match daemon::read_auth_token() {
+        Ok(token) => token,
+        Err(_) => {
+            eprintln!("no plug daemon running");
+            std::process::exit(1);
+        }
+    };
+
+    let request = plug_core::ipc::IpcRequest::Reload { auth_token };
+    match daemon::ipc_request(&request).await {
+        Ok(plug_core::ipc::IpcResponse::Ok) => {
+            eprintln!("config reload triggered");
+        }
+        Ok(plug_core::ipc::IpcResponse::Error { message, .. }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("unexpected response from daemon");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("failed to connect to daemon: {e}");
+            std::process::exit(1);
         }
     }
 

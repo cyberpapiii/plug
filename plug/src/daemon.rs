@@ -459,6 +459,11 @@ fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcRespons
                 message: "server restart via IPC not yet supported".to_string(),
             }
         }
+        IpcRequest::Reload { .. } => {
+            // Reload is handled asynchronously by the caller —
+            // here we just acknowledge the request.
+            IpcResponse::Ok
+        }
         IpcRequest::Shutdown { .. } => IpcResponse::Ok,
     }
 }
