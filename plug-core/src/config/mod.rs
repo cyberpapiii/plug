@@ -104,7 +104,7 @@ pub struct ServerConfig {
     /// URL for HTTP transport.
     pub url: Option<String>,
     /// Bearer token for HTTP upstream authentication.
-    pub auth_token: Option<String>,
+    pub auth_token: Option<crate::types::SecretString>,
     /// Startup timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -259,7 +259,7 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
             *url = expand_env_vars(url);
         }
         if let Some(ref mut token) = server.auth_token {
-            *token = expand_env_vars(token);
+            *token = expand_env_vars(token.as_str()).into();
         }
     }
 

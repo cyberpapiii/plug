@@ -136,9 +136,9 @@ impl ToolRouter {
             return self.list_tools();
         }
         let snapshot = self.cache.load();
-        match client_type.tool_limit() {
-            Some(100) => Arc::clone(&snapshot.tools_windsurf),
-            Some(128) => Arc::clone(&snapshot.tools_copilot),
+        match client_type {
+            ClientType::Windsurf => Arc::clone(&snapshot.tools_windsurf),
+            ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),
             _ => Arc::clone(&snapshot.tools_all),
         }
     }
@@ -471,8 +471,9 @@ impl ServerHandler for ProxyHandler {
             );
 
             // Store client type for list_tools filtering
-            if let Ok(mut ct) = self.client_type.write() {
-                *ct = client_type;
+            match self.client_type.write() {
+                Ok(mut ct) => *ct = client_type,
+                Err(e) => tracing::warn!("client_type lock poisoned: {e}"),
             }
 
             context.peer.set_peer_info(request);
