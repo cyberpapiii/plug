@@ -58,11 +58,11 @@ pub enum EngineEvent {
         tool_count: usize,
     },
     ClientConnected {
-        session_id: String,
+        session_id: Arc<str>,
         client_type: ClientType,
     },
     ClientDisconnected {
-        session_id: String,
+        session_id: Arc<str>,
     },
     ToolCallStarted {
         call_id: u64,
@@ -242,14 +242,23 @@ impl Engine {
     /// Restart a specific upstream server. Rate-limited: at most 1 restart
     /// per server per 10 seconds. Applies to both TUI and IPC callers.
     pub async fn restart_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
-        // Rate limit check
-        if let Some(last) = self.restart_timestamps.get(server_id) {
-            if last.elapsed() < RESTART_COOLDOWN {
-                let remaining = RESTART_COOLDOWN - last.elapsed();
-                anyhow::bail!(
-                    "restart rate limited — try again in {}s",
-                    remaining.as_secs() + 1
-                );
+        // Atomic rate limit check + timestamp update via entry API
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.restart_timestamps.entry(server_id.to_string()) {
+                Entry::Occupied(mut entry) => {
+                    if entry.get().elapsed() < RESTART_COOLDOWN {
+                        let remaining = RESTART_COOLDOWN - entry.get().elapsed();
+                        anyhow::bail!(
+                            "restart rate limited — try again in {}s",
+                            remaining.as_secs() + 1
+                        );
+                    }
+                    entry.insert(Instant::now());
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(Instant::now());
+                }
             }
         }
 
@@ -259,10 +268,6 @@ impl Engine {
             .get(server_id)
             .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?
             .clone();
-
-        // Record restart timestamp
-        self.restart_timestamps
-            .insert(server_id.to_string(), Instant::now());
 
         let _ = self.event_tx.send(EngineEvent::ServerStopped {
             server_id: Arc::from(server_id),

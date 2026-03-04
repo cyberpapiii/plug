@@ -131,7 +131,6 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
             ),
             AppMode::Tools => format!(" Tools | j/k: navigate | Enter: details | /: search | Esc: back{search_hint}"),
             AppMode::ToolDetail(name) => format!(" Tool: {name} | Esc: back"),
-            AppMode::Logs => " Logs | Esc: back".to_string(),
             AppMode::Help => " Help | press any key to dismiss".to_string(),
         };
         render_status_bar(f, status_area, &status, theme);
@@ -145,7 +144,6 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
             // Placeholder — render tool detail in Sub-phase C
             widgets::tools::render(f, main_area, app, theme);
         }
-        AppMode::Logs => widgets::logs::render(f, main_area, theme),
         AppMode::Help => {
             render_dashboard(f, main_area, app, theme);
             widgets::help::render(f, main_area, theme);

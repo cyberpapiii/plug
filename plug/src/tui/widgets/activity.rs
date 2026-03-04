@@ -23,9 +23,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme, focused: 
         .border_style(border_style)
         .title(Line::from(" Activity "));
 
+    // Only render entries visible in the panel (area height minus border rows)
+    let visible_rows = area.height.saturating_sub(2) as usize;
     let items: Vec<ListItem> = app
         .activity_log
         .iter()
+        .take(visible_rows.max(1))
         .map(|entry| {
             let flash_style = if entry.flash_remaining > 0 {
                 theme.highlight

@@ -318,35 +318,37 @@ async fn cmd_status(
         }
     }
 
-    // Fallback: start servers directly
+    // No daemon running — show configured servers from config only
     let config = plug_core::config::load_config(config_path)?;
-
-    let server_manager = Arc::new(plug_core::server::ServerManager::new());
-    server_manager.start_all(&config).await?;
-
-    let statuses = server_manager.server_statuses();
 
     match output {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&statuses)?);
+            let servers: Vec<serde_json::Value> = config
+                .servers
+                .keys()
+                .map(|name| serde_json::json!({"name": name, "status": "not_running"}))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "source": "config",
+                "daemon_running": false,
+                "servers": servers,
+            }))?);
         }
         OutputFormat::Text => {
-            if statuses.is_empty() {
+            eprintln!("no daemon running — showing configured servers");
+            if config.servers.is_empty() {
                 println!("no servers configured");
             } else {
-                println!("{:<20} {:<10} {:<6}", "NAME", "STATUS", "TOOLS");
-                for status in &statuses {
-                    let health = format!("{:?}", status.health);
-                    println!(
-                        "{:<20} {:<10} {:<6}",
-                        status.server_id, health, status.tool_count
-                    );
+                let mut names: Vec<&String> = config.servers.keys().collect();
+                names.sort();
+                println!("{:<20} {:<10}", "NAME", "STATUS");
+                for name in names {
+                    println!("{:<20} {:<10}", name, "not_running");
                 }
             }
         }
     }
 
-    server_manager.shutdown_all().await;
     Ok(())
 }
 

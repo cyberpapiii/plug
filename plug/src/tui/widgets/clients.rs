@@ -30,7 +30,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme, focused: 
             let type_str = format!("{:?}", client.client_type);
             let line = Line::from(vec![
                 Span::styled(format!("{:<14} ", type_str), theme.info),
-                Span::styled(&client.session_id, theme.dim),
+                Span::styled(&*client.session_id, theme.dim),
             ]);
             ListItem::new(line)
         })

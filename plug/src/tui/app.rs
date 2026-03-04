@@ -5,6 +5,7 @@
 //! Engine internals directly.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::widgets::ListState;
@@ -24,7 +25,6 @@ pub enum AppMode {
     Dashboard,
     Tools,
     ToolDetail(String),
-    Logs,
     Help,
 }
 
@@ -40,7 +40,7 @@ pub struct ServerInfo {
 /// A client entry for the clients panel.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
-    pub session_id: String,
+    pub session_id: Arc<str>,
     pub client_type: ClientType,
 }
 
@@ -178,6 +178,10 @@ impl App {
 
         self.tool_count = snapshot.tool_count;
 
+        // Clear stale client list (missed connect/disconnect events during lag)
+        self.clients.clear();
+        self.client_state = ListState::default();
+
         // Preserve selection if within bounds
         if let Some(sel) = self.server_state.selected() {
             if sel >= self.servers.len() {
@@ -301,7 +305,6 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppMode::Logs => self.handle_logs_input(code),
             AppMode::Help => {
                 // Any key dismisses help
                 self.mode = AppMode::Dashboard;
@@ -342,10 +345,6 @@ impl App {
                 self.mode = AppMode::Tools;
                 self.dirty = true;
             }
-            KeyCode::Char('l') => {
-                self.mode = AppMode::Logs;
-                self.dirty = true;
-            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.navigate_focused_panel(1);
                 self.dirty = true;
@@ -366,11 +365,6 @@ impl App {
                         }
                     }
                 }
-            }
-            KeyCode::Char('/') => {
-                self.search_active = true;
-                self.search_query = Some(String::new());
-                self.dirty = true;
             }
             _ => {}
         }
@@ -401,12 +395,13 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('/') => {
+                self.search_active = true;
+                self.search_query = Some(String::new());
+                self.dirty = true;
+            }
             _ => {}
         }
-    }
-
-    fn handle_logs_input(&mut self, _code: crossterm::event::KeyCode) {
-        // Log view navigation — placeholder for Sub-phase C
     }
 
     fn navigate_focused_panel(&mut self, direction: i32) {
@@ -716,14 +711,14 @@ mod tests {
         assert_eq!(app.clients.len(), 0);
 
         app.handle_engine_event(EngineEvent::ClientConnected {
-            session_id: "abc-123".to_string(),
+            session_id: Arc::from("abc-123"),
             client_type: ClientType::ClaudeCode,
         });
         assert_eq!(app.clients.len(), 1);
-        assert_eq!(app.clients[0].session_id, "abc-123");
+        assert_eq!(&*app.clients[0].session_id, "abc-123");
 
         app.handle_engine_event(EngineEvent::ClientDisconnected {
-            session_id: "abc-123".to_string(),
+            session_id: Arc::from("abc-123"),
         });
         assert_eq!(app.clients.len(), 0);
     }
@@ -829,6 +824,9 @@ mod tests {
         assert!(!app.search_active);
 
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // Switch to Tools mode first (search only available in Tools mode)
+        app.mode = AppMode::Tools;
 
         // Activate search with /
         let slash = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));

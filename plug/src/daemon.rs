@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use fs2::FileExt as _;
@@ -14,10 +14,8 @@ use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use plug_core::engine::{Engine, EngineEvent};
-use plug_core::ipc::{
-    self, IpcRequest, IpcResponse, IpcToolInfo, MAX_FRAME_SIZE,
-};
+use plug_core::engine::Engine;
+use plug_core::ipc::{self, IpcRequest, IpcResponse, MAX_FRAME_SIZE};
 
 /// Maximum concurrent IPC connections.
 const MAX_IPC_CONNECTIONS: usize = 32;
@@ -111,17 +109,22 @@ fn verify_auth_token(provided: &str, expected: &str) -> bool {
 // ──────────────────────────── Directory setup ────────────────────────────────
 
 /// Create a directory with 0700 permissions, creating parents as needed.
+/// On unix, uses DirBuilder to set mode atomically at creation time.
 fn ensure_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("failed to create directory: {}", path.display()))?;
-
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .with_context(|| format!("failed to create directory: {}", path.display()))?;
     }
-
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create directory: {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -194,7 +197,8 @@ async fn write_frame(
     stream: &mut tokio::net::unix::OwnedWriteHalf,
     payload: &[u8],
 ) -> anyhow::Result<()> {
-    let len = payload.len() as u32;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("payload too large: {} bytes", payload.len()))?;
     stream.write_u32(len).await?;
     stream.write_all(payload).await?;
     stream.flush().await?;
@@ -255,7 +259,7 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
 
     // Clean up stale socket if it exists
     let sock_path = socket_path();
-    if sock_path.exists() {
+    if std::fs::symlink_metadata(&sock_path).is_ok() {
         // Try connecting to check if another daemon is alive
         if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
             anyhow::bail!("another plug daemon is already running on {}", sock_path.display());
@@ -304,21 +308,20 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
                         };
 
                         let engine_cancel = engine.cancel_token().clone();
-                        let engine_event_tx = engine.event_sender();
-                        let tool_router = engine.tool_router().clone();
                         let server_manager = engine.server_manager().clone();
                         let snapshot = engine.snapshot();
                         let auth = auth_token.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit; // held for connection lifetime
+                            let started_at = Instant::now()
+                                .checked_sub(snapshot.uptime)
+                                .unwrap_or_else(Instant::now);
                             let ctx = ConnectionContext {
                                 cancel: engine_cancel,
-                                event_tx: engine_event_tx,
                                 auth_token: auth,
-                                tool_router,
                                 server_manager,
-                                uptime_secs: snapshot.uptime.as_secs(),
+                                started_at,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
@@ -346,11 +349,9 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
 /// holding a reference to Engine.
 struct ConnectionContext {
     cancel: CancellationToken,
-    event_tx: tokio::sync::broadcast::Sender<EngineEvent>,
     auth_token: Arc<str>,
-    tool_router: Arc<plug_core::proxy::ToolRouter>,
     server_manager: Arc<plug_core::server::ServerManager>,
-    uptime_secs: u64,
+    started_at: Instant,
 }
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
@@ -422,35 +423,6 @@ async fn handle_ipc_connection(
         // Dispatch request
         let response = dispatch_request(&request, &ctx);
 
-        // Handle Subscribe specially — stream events
-        if matches!(request, IpcRequest::Subscribe) {
-            let mut rx = ctx.event_tx.subscribe();
-            // Send initial OK
-            send_response(&mut writer, &IpcResponse::Ok).await?;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = ctx.cancel.cancelled() => break,
-                    result = rx.recv() => {
-                        match result {
-                            Ok(event) => {
-                                let resp = IpcResponse::Event(event);
-                                if send_response(&mut writer, &resp).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(skipped = n, "IPC subscriber lagged");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-            break; // Subscribe takes over the connection
-        }
-
         send_response(&mut writer, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
@@ -471,40 +443,10 @@ fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcRespons
             IpcResponse::Status {
                 servers,
                 clients: 0, // TODO: track client count in Engine
-                uptime_secs: ctx.uptime_secs,
+                uptime_secs: ctx.started_at.elapsed().as_secs(),
             }
         }
-        IpcRequest::ServerList => {
-            let servers = ctx.server_manager.server_statuses();
-            IpcResponse::ServerList { servers }
-        }
-        IpcRequest::ClientList => {
-            IpcResponse::ClientList { clients: 0 } // TODO: track in Engine
-        }
-        IpcRequest::ToolList => {
-            let tools = ctx
-                .tool_router
-                .list_tools_for_client(plug_core::types::ClientType::Unknown);
-            let tool_infos: Vec<IpcToolInfo> = tools
-                .iter()
-                .map(|t| IpcToolInfo {
-                    name: t.name.to_string(),
-                    server_id: String::new(), // Tool doesn't carry server origin
-                    description: t
-                        .description
-                        .as_ref()
-                        .map(|d| d.to_string())
-                        .unwrap_or_default(),
-                })
-                .collect();
-            IpcResponse::ToolList { tools: tool_infos }
-        }
-        IpcRequest::Subscribe => {
-            // Handled specially in handle_ipc_connection
-            IpcResponse::Ok
-        }
         IpcRequest::RestartServer { server_id, .. } => {
-            // Validate server exists
             let statuses = ctx.server_manager.server_statuses();
             if !statuses.iter().any(|s| s.server_id == *server_id) {
                 return IpcResponse::Error {
@@ -517,18 +459,7 @@ fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcRespons
                 message: "server restart via IPC not yet supported".to_string(),
             }
         }
-        IpcRequest::SetServerEnabled { server_id, .. } => {
-            let statuses = ctx.server_manager.server_statuses();
-            if !statuses.iter().any(|s| s.server_id == *server_id) {
-                return IpcResponse::Error {
-                    code: "UNKNOWN_SERVER".to_string(),
-                    message: format!("server '{server_id}' not found"),
-                };
-            }
-            IpcResponse::Ok
-        }
         IpcRequest::Shutdown { .. } => {
-            // Actual shutdown handled in handle_ipc_connection after sending OK
             IpcResponse::Ok
         }
     }

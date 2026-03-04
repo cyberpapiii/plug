@@ -3,46 +3,51 @@
 //! Shared between `plug-core` (types) and `plug` (socket listener).
 //! Wire format: 4-byte big-endian u32 length prefix + JSON payload.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-use crate::engine::EngineEvent;
 use crate::types::ServerStatus;
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Requests sent from CLI → daemon over Unix socket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Only 3 variants — Status (read-only), RestartServer and Shutdown (mutating).
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcRequest {
-    // Read-only (no auth required)
     /// Query daemon status (servers, client count, uptime).
     Status,
-    /// List all upstream servers.
-    ServerList,
-    /// List connected clients.
-    ClientList,
-    /// List all available tools.
-    ToolList,
-    /// Stream EngineEvents over the socket.
-    Subscribe,
 
-    // Mutating (auth_token required)
     /// Restart a specific upstream server.
     RestartServer {
         server_id: String,
-        auth_token: String,
-    },
-    /// Enable or disable a server.
-    SetServerEnabled {
-        server_id: String,
-        enabled: bool,
         auth_token: String,
     },
     /// Graceful daemon shutdown.
     Shutdown {
         auth_token: String,
     },
+}
+
+/// Custom Debug that redacts auth_token fields to prevent log leakage.
+impl fmt::Debug for IpcRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status => write!(f, "Status"),
+            Self::RestartServer { server_id, .. } => f
+                .debug_struct("RestartServer")
+                .field("server_id", server_id)
+                .field("auth_token", &"[REDACTED]")
+                .finish(),
+            Self::Shutdown { .. } => f
+                .debug_struct("Shutdown")
+                .field("auth_token", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// Responses sent from daemon → CLI over Unix socket.
@@ -55,18 +60,6 @@ pub enum IpcResponse {
         clients: usize,
         uptime_secs: u64,
     },
-    /// List of upstream servers.
-    ServerList {
-        servers: Vec<ServerStatus>,
-    },
-    /// Client count (detailed client info requires future Session tracking).
-    ClientList {
-        clients: usize,
-    },
-    /// Tool list with names and server origins.
-    ToolList {
-        tools: Vec<IpcToolInfo>,
-    },
     /// Success acknowledgement for mutating commands.
     Ok,
     /// Error with machine-parseable code and human-readable message.
@@ -74,25 +67,13 @@ pub enum IpcResponse {
         code: String,
         message: String,
     },
-    /// Streamed engine event (sent when Subscribe is active).
-    Event(EngineEvent),
-}
-
-/// Simplified tool info for IPC responses (avoids serializing full rmcp::model::Tool).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpcToolInfo {
-    pub name: String,
-    pub server_id: String,
-    pub description: String,
 }
 
 /// Check whether a request requires authentication.
 pub fn requires_auth(request: &IpcRequest) -> bool {
     matches!(
         request,
-        IpcRequest::RestartServer { .. }
-            | IpcRequest::SetServerEnabled { .. }
-            | IpcRequest::Shutdown { .. }
+        IpcRequest::RestartServer { .. } | IpcRequest::Shutdown { .. }
     )
 }
 
@@ -100,7 +81,6 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
 pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     match request {
         IpcRequest::RestartServer { auth_token, .. }
-        | IpcRequest::SetServerEnabled { auth_token, .. }
         | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
@@ -114,8 +94,6 @@ mod tests {
     fn request_serialization_round_trip() {
         let requests = vec![
             IpcRequest::Status,
-            IpcRequest::ServerList,
-            IpcRequest::Subscribe,
             IpcRequest::RestartServer {
                 server_id: "test-server".to_string(),
                 auth_token: "abc123".to_string(),
@@ -147,13 +125,6 @@ mod tests {
                 clients: 0,
                 uptime_secs: 42,
             },
-            IpcResponse::ToolList {
-                tools: vec![IpcToolInfo {
-                    name: "test_tool".to_string(),
-                    server_id: "srv1".to_string(),
-                    description: "A test tool".to_string(),
-                }],
-            },
         ];
 
         for resp in &responses {
@@ -167,18 +138,9 @@ mod tests {
     #[test]
     fn requires_auth_identifies_mutating_commands() {
         assert!(!requires_auth(&IpcRequest::Status));
-        assert!(!requires_auth(&IpcRequest::ServerList));
-        assert!(!requires_auth(&IpcRequest::ClientList));
-        assert!(!requires_auth(&IpcRequest::ToolList));
-        assert!(!requires_auth(&IpcRequest::Subscribe));
 
         assert!(requires_auth(&IpcRequest::RestartServer {
             server_id: "s".to_string(),
-            auth_token: "t".to_string(),
-        }));
-        assert!(requires_auth(&IpcRequest::SetServerEnabled {
-            server_id: "s".to_string(),
-            enabled: true,
             auth_token: "t".to_string(),
         }));
         assert!(requires_auth(&IpcRequest::Shutdown {
@@ -207,5 +169,16 @@ mod tests {
         let resp = IpcResponse::Ok;
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, r#"{"type":"Ok"}"#);
+    }
+
+    #[test]
+    fn debug_redacts_auth_token() {
+        let req = IpcRequest::RestartServer {
+            server_id: "srv".to_string(),
+            auth_token: "super_secret_token".to_string(),
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(!debug_str.contains("super_secret"));
+        assert!(debug_str.contains("[REDACTED]"));
     }
 }
