@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod daemon;
+mod ipc_proxy;
 mod tui;
 
 use std::sync::Arc;
@@ -247,29 +248,68 @@ fn init_stderr_tracing(verbose: u8) {
 
 /// `plug connect` — the primary stdio bridge mode.
 ///
-/// Creates an Engine, starts it, builds a ProxyHandler from the Engine's
-/// ToolRouter, then serves MCP over stdin/stdout using rmcp's stdio transport.
-/// Handles SIGINT/SIGTERM for graceful shutdown via Engine.
+/// tmux-style: checks for a running daemon, auto-starts one if needed,
+/// then proxies MCP traffic through the daemon's shared Engine via IPC.
+/// Falls back to standalone mode if daemon startup fails.
 async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    let config = plug_core::config::load_config(config_path)?;
-
-    let errors = plug_core::config::validate_config(&config);
-    if !errors.is_empty() {
-        for err in &errors {
-            tracing::error!("{err}");
+    // Try to connect via daemon (shared mode)
+    match connect_via_daemon(config_path).await {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, "daemon proxy failed, falling back to standalone mode");
         }
-        anyhow::bail!("config validation failed with {} error(s)", errors.len());
     }
 
-    let engine = plug_core::engine::Engine::new(config);
-    engine.start().await?;
+    // Fallback: standalone mode (no daemon, independent Engine)
+    connect_standalone(config_path).await
+}
 
-    // Build the proxy handler from Engine's ToolRouter
-    let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+/// Connect through the daemon's shared Engine via IPC proxy.
+async fn connect_via_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    // 1. Try to connect to existing daemon
+    let stream = match daemon::connect_to_daemon().await {
+        Some(stream) => {
+            tracing::info!("connected to existing daemon");
+            stream
+        }
+        None => {
+            // 2. No daemon running — auto-start one
+            tracing::info!("no daemon running, auto-starting");
+            auto_start_daemon(config_path)?;
+            // 3. Wait for daemon to be ready
+            wait_for_daemon_ready().await?
+        }
+    };
 
-    tracing::info!("starting stdio bridge");
+    let (mut reader, mut writer) = stream.into_split();
 
-    // Serve MCP over stdin/stdout
+    // 4. Register with daemon
+    let register_req = plug_core::ipc::IpcRequest::Register {
+        client_info: None, // Will be updated in Phase 4 via initialize
+    };
+    let payload = serde_json::to_vec(&register_req)?;
+    daemon::write_frame_pub(&mut writer, &payload).await?;
+
+    let frame = daemon::read_frame_pub(&mut reader)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed connection during registration"))?;
+
+    let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)?;
+    let session_id = match response {
+        plug_core::ipc::IpcResponse::Registered { session_id } => session_id,
+        plug_core::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!("registration failed: {code}: {message}");
+        }
+        _ => anyhow::bail!("unexpected response to Register"),
+    };
+
+    tracing::info!(session_id = %session_id, "registered with daemon");
+
+    // 5. Bridge: stdio (MCP client) ←→ IPC (daemon)
+    let proxy = ipc_proxy::IpcProxyHandler::new(reader, writer, session_id);
+
+    tracing::info!("starting IPC proxy stdio bridge");
+
     use rmcp::ServiceExt as _;
     let transport = rmcp::transport::io::stdio();
     let service = proxy
@@ -290,10 +330,99 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
         }
     }
 
+    // 6. Deregister on clean exit (best-effort)
+    // Note: the proxy's IPC connection reader/writer are inside the service,
+    // which has been consumed. The daemon auto-deregisters on EOF anyway.
+    tracing::info!("disconnecting from daemon");
+
+    Ok(())
+}
+
+/// Standalone mode: creates an independent Engine (no daemon sharing).
+async fn connect_standalone(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
+
+    let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+
+    tracing::info!("starting stdio bridge (standalone mode)");
+
+    use rmcp::ServiceExt as _;
+    let transport = rmcp::transport::io::stdio();
+    let service = proxy
+        .serve(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start MCP service: {e}"))?;
+
+    tokio::select! {
+        result = service.waiting() => {
+            tracing::info!("client disconnected");
+            if let Err(e) = result {
+                tracing::error!(error = %e, "service error");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received shutdown signal");
+        }
+    }
+
     tracing::info!("shutting down");
     engine.shutdown().await;
 
     Ok(())
+}
+
+/// Auto-start a daemon by forking `plug serve --daemon`.
+fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to determine plug executable path: {e}"))?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("serve").arg("--daemon");
+    if let Some(path) = config_path {
+        cmd.arg("--config").arg(path);
+    }
+
+    // Detach: redirect stdio to /dev/null so the daemon doesn't inherit our stdin/stdout
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
+
+    tracing::info!(exe = %exe.display(), "spawned daemon process");
+    Ok(())
+}
+
+/// Wait for the daemon to be ready (socket exists and responds).
+async fn wait_for_daemon_ready() -> anyhow::Result<tokio::net::UnixStream> {
+    let mut delay = std::time::Duration::from_millis(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    while std::time::Instant::now() < deadline {
+        if let Some(stream) = daemon::connect_to_daemon().await {
+            tracing::info!("daemon is ready");
+            return Ok(stream);
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_millis(500));
+    }
+
+    anyhow::bail!(
+        "daemon failed to start within 10 seconds — check logs at {}",
+        daemon::log_dir().display()
+    )
 }
 
 /// `plug tui` — launch the TUI dashboard.

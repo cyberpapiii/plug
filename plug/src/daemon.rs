@@ -232,6 +232,13 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
 
 // ──────────────────────── Length-prefixed framing ─────────────────────────────
 
+/// Read a length-prefixed JSON frame from a Unix socket (public for IPC proxy).
+pub async fn read_frame_pub(
+    stream: &mut tokio::net::unix::OwnedReadHalf,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    read_frame(stream).await
+}
+
 /// Read a length-prefixed JSON frame from a Unix socket.
 ///
 /// Wire format: 4-byte big-endian u32 length + JSON payload.
@@ -254,6 +261,14 @@ async fn read_frame(
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+/// Write a length-prefixed JSON frame to a Unix socket (public for IPC proxy).
+pub async fn write_frame_pub(
+    stream: &mut tokio::net::unix::OwnedWriteHalf,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    write_frame(stream, payload).await
 }
 
 /// Write a length-prefixed JSON frame to a Unix socket.
