@@ -344,7 +344,7 @@ New `AppMode::Doctor` with:
 - [x] `plug import claude-desktop` imports servers from Claude Desktop config
 - [x] `plug import --all --yes` imports from all detected clients non-interactively
 - [x] `plug export cursor` prints valid Cursor MCP config to stdout
-- [ ] `plug export vscode --write` merges into existing VS Code config
+- [x] `plug export vscode --write` merges into existing VS Code config
 - [x] `plug doctor` runs 9+ checks with pass/warn/fail output
 - [x] `plug doctor --output json` returns structured results with exit code 0/1/2
 - [x] Config hot-reload: add server to config.toml → server starts within 2s
