@@ -350,6 +350,7 @@ impl ServerManager {
         self.health.clear();
         self.circuit_breakers.clear();
         self.semaphores.clear();
+        self.reconnecting.clear();
     }
 
     /// Return health/status information for all servers.

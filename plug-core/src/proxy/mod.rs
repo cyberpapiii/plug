@@ -98,9 +98,11 @@ impl ToolRouter {
 
     /// Set the Engine reference for session recovery.
     pub fn set_engine(&self, engine: Weak<Engine>) {
-        if let Ok(mut guard) = self.engine.write() {
-            *guard = Some(engine);
-        }
+        let mut guard = self
+            .engine
+            .write()
+            .expect("engine RwLock poisoned — prior panic");
+        *guard = Some(engine);
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
@@ -518,7 +520,11 @@ fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
         // Transport send failures (HTTP 404, connection refused, etc.)
         ServiceError::TransportSend(dyn_err) => {
             let msg = dyn_err.to_string().to_lowercase();
-            msg.contains("404") || msg.contains("session") || msg.contains("connection")
+            msg.contains("404")
+                || msg.contains("session not found")
+                || msg.contains("connection refused")
+                || msg.contains("connection reset")
+                || msg.contains("broken pipe")
         }
         // Transport closed = connection dropped (server crashed/restarted)
         ServiceError::TransportClosed => true,

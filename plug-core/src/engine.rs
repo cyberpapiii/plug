@@ -8,7 +8,7 @@
 //! return value types, never through direct field access.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -327,9 +327,16 @@ impl Engine {
             return Ok(());
         }
 
-        let result = self.do_reconnect(server_id).await;
-        reconnecting.store(false, Ordering::SeqCst);
-        result
+        // RAII guard ensures the flag is always cleared, even on panic or task cancellation.
+        struct ReconnectGuard(Arc<AtomicBool>);
+        impl Drop for ReconnectGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = ReconnectGuard(reconnecting);
+
+        self.do_reconnect(server_id).await
     }
 
     /// Internal reconnection logic shared by `reconnect_server`.

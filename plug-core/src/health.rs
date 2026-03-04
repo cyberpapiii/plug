@@ -85,11 +85,14 @@ pub fn spawn_health_checks(
 
                             // Proactive recovery: when a server reaches Failed,
                             // spawn a tracked recovery task with exponential backoff.
+                            // The AtomicBool reconnect flag in ServerManager deduplicates
+                            // concurrent attempts, so stacking tasks is safe.
                             if new == ServerHealth::Failed {
                                 let engine = engine.clone();
                                 let name = name.clone();
+                                let cancel = cancel.clone();
                                 tracker_clone.spawn(async move {
-                                    spawn_proactive_recovery(&engine, &name).await;
+                                    spawn_proactive_recovery(&engine, &name, cancel).await;
                                 });
                             }
                         }
@@ -105,12 +108,16 @@ pub fn spawn_health_checks(
 /// Uses `backon` to retry `Engine::reconnect_server()` up to 5 times
 /// with delays from 1s to 60s. On success, the server is replaced and
 /// health/circuit breaker state is reset via `replace_server()`.
-async fn spawn_proactive_recovery(engine: &Engine, server_name: &str) {
+async fn spawn_proactive_recovery(
+    engine: &Engine,
+    server_name: &str,
+    cancel: CancellationToken,
+) {
     tracing::info!(server = %server_name, "starting proactive recovery");
 
     let reconnect = || async { engine.reconnect_server(server_name).await };
 
-    match reconnect
+    let recovery = reconnect
         .retry(
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_secs(1))
@@ -125,18 +132,26 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str) {
                 retry_in_ms = dur.as_millis(),
                 "proactive recovery attempt failed, will retry"
             );
-        })
-        .await
-    {
-        Ok(()) => {
-            tracing::info!(server = %server_name, "proactive recovery succeeded");
+        });
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::debug!(server = %server_name, "proactive recovery cancelled during shutdown");
         }
-        Err(e) => {
-            tracing::error!(
-                server = %server_name,
-                error = %e,
-                "proactive recovery exhausted (5 attempts), will retry on next health cycle"
-            );
+        result = recovery => {
+            match result {
+                Ok(()) => {
+                    tracing::info!(server = %server_name, "proactive recovery succeeded");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        server = %server_name,
+                        error = %e,
+                        "proactive recovery exhausted (5 attempts), will retry on next health cycle"
+                    );
+                }
+            }
         }
     }
 }
