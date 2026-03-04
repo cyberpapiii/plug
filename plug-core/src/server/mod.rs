@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use rmcp::ServiceExt as _;
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
 
 use crate::config::{Config, ServerConfig, TransportType};
 use crate::types::{ServerHealth, ServerStatus};
@@ -165,11 +168,69 @@ impl ServerManager {
                     })
                 }
                 TransportType::Http => {
-                    tracing::warn!(
+                    let url = config
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("HTTP transport requires a URL"))?;
+
+                    // Basic SSRF protection: reject private/loopback URLs
+                    let parsed = url
+                        .parse::<http::Uri>()
+                        .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+                    if let Some(host) = parsed.host() {
+                        if host == "169.254.169.254"
+                            || host == "metadata.google.internal"
+                        {
+                            anyhow::bail!(
+                                "URL points to cloud metadata service — blocked for safety"
+                            );
+                        }
+                    }
+
+                    let mut transport_config =
+                        StreamableHttpClientTransportConfig::with_uri(url);
+
+                    if let Some(ref token) = config.auth_token {
+                        transport_config =
+                            transport_config.auth_header(format!("Bearer {token}"));
+                    }
+
+                    tracing::info!(
                         server = %name,
-                        "HTTP transport not yet implemented"
+                        url = %url,
+                        "connecting to HTTP upstream"
                     );
-                    Err(anyhow::anyhow!("HTTP transport not yet implemented"))
+
+                    let transport =
+                        StreamableHttpClientTransport::from_config(transport_config);
+
+                    let client: McpClient = ().serve(transport).await.map_err(|e| {
+                        anyhow::anyhow!("failed to connect to HTTP upstream: {e}")
+                    })?;
+
+                    let tools_result = client
+                        .peer()
+                        .list_all_tools()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+
+                    let server_info = client.peer().peer_info();
+                    if let Some(info) = server_info {
+                        tracing::info!(
+                            server = %name,
+                            server_name = %info.server_info.name,
+                            server_version = %info.server_info.version,
+                            "connected to HTTP upstream"
+                        );
+                    }
+
+                    Ok(UpstreamServer {
+                        name: name.to_string(),
+                        config: config.clone(),
+                        client,
+                        tools: tools_result,
+                        health: ServerHealth::Healthy,
+                    })
                 }
             }
         })
