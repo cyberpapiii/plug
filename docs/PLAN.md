@@ -189,45 +189,45 @@ Five phases, each delivering a working increment. Each phase can be validated in
 **Goal**: Beautiful ratatui dashboard with real-time monitoring.
 
 ### 4.1 Core TUI Framework
-- [ ] Ratatui + crossterm setup with tokio async event loop
-- [ ] Event stream: crossterm key/mouse events + tick + render + engine events
-- [ ] Core `App` state struct (separate from Engine — TUI state only)
-- [ ] Modal navigation system (vim-inspired)
+- [x] Ratatui + crossterm setup with tokio async event loop
+- [x] Event stream: crossterm key/mouse events + tick + render + engine events
+- [x] Core `App` state struct (separate from Engine — TUI state only)
+- [x] Modal navigation system (vim-inspired)
 
 ### 4.2 Dashboard Layout
-- [ ] Responsive layout: wide (side-by-side), medium (stacked), narrow (tabbed)
-- [ ] Servers panel: name, tool count, latency, health status
-- [ ] Clients panel: type, session ID, tools served, last activity
-- [ ] Activity panel: rolling log of MCP requests
+- [x] Responsive layout: wide (side-by-side), medium (stacked), narrow (tabbed)
+- [x] Servers panel: name, tool count, latency, health status
+- [x] Clients panel: type, session ID, tools served, last activity
+- [x] Activity panel: rolling log of MCP requests
 
 ### 4.3 Panel Views
-- [ ] Tools view (full screen): searchable list of all tools with server origin
-- [ ] Tool detail: full schema, annotations, server, description
+- [x] Tools view (full screen): searchable list of all tools with server origin
+- [x] Tool detail: full schema, annotations, server, description
 - [ ] Log view (full screen): structured log with level/server/client filters
 - [ ] Doctor view: diagnostic results
 
 ### 4.4 Interactivity
-- [ ] Server management: restart, disable/enable from TUI
-- [ ] Search within any panel (`/`)
-- [ ] Context-aware keybinding bar
-- [ ] Help overlay (`?`)
+- [x] Server management: restart, disable/enable from TUI
+- [x] Search within any panel (`/`)
+- [x] Context-aware keybinding bar
+- [x] Help overlay (`?`)
 
 ### 4.5 Visual Polish
-- [ ] Status indicators: ● ◐ ○ ↔
-- [ ] Colors: green/yellow/red/cyan/dim
-- [ ] NO_COLOR support
-- [ ] Smooth status transitions (server connecting → connected)
+- [x] Status indicators: ● ◐ ○ ↔
+- [x] Colors: green/yellow/red/cyan/dim
+- [x] NO_COLOR support
+- [x] Smooth status transitions (server connecting → connected)
 
 ### 4.6 Headless/Daemon Mode
-- [ ] Same Engine, no TUI
-- [ ] PID file for daemon detection
-- [ ] Unix socket for CLI → daemon communication (`fanout status` talks to running daemon)
-- [ ] Structured logging to file (tracing-appender)
+- [x] Same Engine, no TUI
+- [x] PID file for daemon detection
+- [x] Unix socket for CLI → daemon communication (`plug status` talks to running daemon)
+- [x] Structured logging to file (tracing-appender)
 
 ### 4.7 Validation
-- [ ] TUI renders correctly at 80x24, 120x40, 200x60
-- [ ] All key bindings work
-- [ ] Real-time updates visible (connect/disconnect clients and servers)
+- [x] TUI renders correctly at 80x24, 120x40, 200x60
+- [x] All key bindings work
+- [x] Real-time updates visible (connect/disconnect clients and servers)
 
 ---
 
