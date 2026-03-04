@@ -275,7 +275,7 @@ New `AppMode::Doctor` with:
 - [x] `plug-core/src/proxy/mod.rs` — Apply enrichment in `refresh_tools()`
 - [x] `plug/src/daemon.rs` — Add SIGHUP handler, `Reload` IPC request
 - [x] `plug/src/main.rs` — Add `plug reload` CLI command
-- [ ] `Cargo.toml` (workspace) — Add `notify` dependency
+- [x] `Cargo.toml` (workspace) — Add `notify` dependency
 
 **Success criteria**:
 - Edit config.toml while plug is running → servers added/removed/restarted automatically
