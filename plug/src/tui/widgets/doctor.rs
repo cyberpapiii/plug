@@ -37,18 +37,13 @@ pub fn render(
             .iter()
             .map(|check| {
                 let (icon, icon_style) = match check.status {
-                    CheckStatus::Pass => (
-                        " ok ",
-                        Style::default().fg(ratatui::style::Color::Green),
-                    ),
-                    CheckStatus::Warn => (
-                        " !! ",
-                        Style::default().fg(ratatui::style::Color::Yellow),
-                    ),
-                    CheckStatus::Fail => (
-                        "FAIL",
-                        Style::default().fg(ratatui::style::Color::Red),
-                    ),
+                    CheckStatus::Pass => {
+                        (" ok ", Style::default().fg(ratatui::style::Color::Green))
+                    }
+                    CheckStatus::Warn => {
+                        (" !! ", Style::default().fg(ratatui::style::Color::Yellow))
+                    }
+                    CheckStatus::Fail => ("FAIL", Style::default().fg(ratatui::style::Color::Red)),
                 };
 
                 let mut spans = vec![

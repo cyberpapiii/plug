@@ -369,7 +369,11 @@ impl ServerManager {
     }
 
     /// Start a single server and register it in the manager.
-    pub async fn start_and_register(&self, name: &str, config: &ServerConfig) -> Result<(), anyhow::Error> {
+    pub async fn start_and_register(
+        &self,
+        name: &str,
+        config: &ServerConfig,
+    ) -> Result<(), anyhow::Error> {
         let upstream = Self::start_server(name, config).await?;
         let max_concurrent = upstream.config.max_concurrent;
         let cb_enabled = upstream.config.circuit_breaker_enabled;

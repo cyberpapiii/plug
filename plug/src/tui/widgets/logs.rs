@@ -26,7 +26,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .rev() // newest first
         .map(|entry| {
             let status = match entry.success {
-                Some(true) => Span::styled(" ok ", Style::default().fg(ratatui::style::Color::Green)),
+                Some(true) => {
+                    Span::styled(" ok ", Style::default().fg(ratatui::style::Color::Green))
+                }
                 Some(false) => {
                     Span::styled("FAIL", Style::default().fg(ratatui::style::Color::Red))
                 }

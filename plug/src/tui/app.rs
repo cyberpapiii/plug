@@ -434,13 +434,21 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 let len = self.activity_log.len();
                 if len > 0 {
-                    let i = self.activity_state.selected().map(|i| (i + 1).min(len - 1)).unwrap_or(0);
+                    let i = self
+                        .activity_state
+                        .selected()
+                        .map(|i| (i + 1).min(len - 1))
+                        .unwrap_or(0);
                     self.activity_state.select(Some(i));
                     self.dirty = true;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                let i = self.activity_state.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                let i = self
+                    .activity_state
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
                 self.activity_state.select(Some(i));
                 self.dirty = true;
             }
@@ -454,13 +462,21 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 let len = self.doctor_checks.len();
                 if len > 0 {
-                    let i = self.doctor_state.selected().map(|i| (i + 1).min(len - 1)).unwrap_or(0);
+                    let i = self
+                        .doctor_state
+                        .selected()
+                        .map(|i| (i + 1).min(len - 1))
+                        .unwrap_or(0);
                     self.doctor_state.select(Some(i));
                     self.dirty = true;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                let i = self.doctor_state.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                let i = self
+                    .doctor_state
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
                 self.doctor_state.select(Some(i));
                 self.dirty = true;
             }

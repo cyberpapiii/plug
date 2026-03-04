@@ -142,8 +142,14 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
                 " Tools | j/k: navigate | Enter: details | /: search | Esc: back{search_hint}"
             ),
             AppMode::ToolDetail(name) => format!(" Tool: {name} | Esc: back"),
-            AppMode::Logs => format!(" Logs ({} entries) | j/k: scroll | Esc: back", app.activity_log.len()),
-            AppMode::Doctor => format!(" Doctor ({} checks) | j/k: scroll | Esc: back", app.doctor_checks.len()),
+            AppMode::Logs => format!(
+                " Logs ({} entries) | j/k: scroll | Esc: back",
+                app.activity_log.len()
+            ),
+            AppMode::Doctor => format!(
+                " Doctor ({} checks) | j/k: scroll | Esc: back",
+                app.doctor_checks.len()
+            ),
             AppMode::Help => " Help | press any key to dismiss".to_string(),
         };
         render_status_bar(f, status_area, &status, theme);

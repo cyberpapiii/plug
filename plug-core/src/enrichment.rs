@@ -38,7 +38,8 @@ fn infer_annotations(tool: &mut Tool) {
         }
     }
 
-    if annotations.destructive_hint.is_none() && destructive_prefixes.iter().any(|p| name.starts_with(p))
+    if annotations.destructive_hint.is_none()
+        && destructive_prefixes.iter().any(|p| name.starts_with(p))
     {
         annotations.destructive_hint = Some(true);
     }
@@ -111,8 +112,16 @@ mod tests {
             let mut tool = make_tool(&name);
             enrich_tool(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
-            assert_eq!(ann.destructive_hint, Some(true), "expected destructiveHint=true for {name}");
-            assert_eq!(ann.read_only_hint, Some(false), "expected readOnlyHint=false for {name}");
+            assert_eq!(
+                ann.destructive_hint,
+                Some(true),
+                "expected destructiveHint=true for {name}"
+            );
+            assert_eq!(
+                ann.read_only_hint,
+                Some(false),
+                "expected readOnlyHint=false for {name}"
+            );
         }
     }
 
@@ -123,7 +132,11 @@ mod tests {
             let mut tool = make_tool(&name);
             enrich_tool(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
-            assert_eq!(ann.read_only_hint, Some(false), "expected readOnlyHint=false for {name}");
+            assert_eq!(
+                ann.read_only_hint,
+                Some(false),
+                "expected readOnlyHint=false for {name}"
+            );
         }
     }
 

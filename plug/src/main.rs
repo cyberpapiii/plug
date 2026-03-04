@@ -768,25 +768,16 @@ fn cmd_import(
             }
 
             if report.duplicates_merged > 0 {
-                eprintln!(
-                    "  merged {} duplicate(s)",
-                    report.duplicates_merged
-                );
+                eprintln!("  merged {} duplicate(s)", report.duplicates_merged);
             }
             if report.skipped > 0 {
-                eprintln!(
-                    "  skipped {} already-configured server(s)",
-                    report.skipped
-                );
+                eprintln!("  skipped {} already-configured server(s)", report.skipped);
             }
 
             if report.new_servers.is_empty() {
                 println!("no new servers to import");
             } else if dry_run {
-                println!(
-                    "would import {} new server(s):",
-                    report.new_servers.len()
-                );
+                println!("would import {} new server(s):", report.new_servers.len());
                 for s in &report.new_servers {
                     println!("  {} (from {})", s.name, s.source);
                 }
@@ -827,9 +818,12 @@ fn cmd_import(
 fn cmd_export(target: &str, http: bool, port: u16) -> anyhow::Result<()> {
     use plug_core::export::{ExportOptions, ExportTarget, ExportTransport};
 
-    let target: ExportTarget = target
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!("{e}\nvalid targets: {}", ExportTarget::all_names().join(", ")))?;
+    let target: ExportTarget = target.parse().map_err(|e: String| {
+        anyhow::anyhow!(
+            "{e}\nvalid targets: {}",
+            ExportTarget::all_names().join(", ")
+        )
+    })?;
 
     let transport = if http {
         ExportTransport::Http
