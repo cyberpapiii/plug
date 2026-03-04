@@ -61,12 +61,12 @@ async fn validate_origin(req: Request, next: Next) -> Result<Response, HttpError
             return Err(HttpError::InvalidOrigin);
         }
 
-        let is_local = origin.starts_with("http://localhost")
-            || origin.starts_with("https://localhost")
-            || origin.starts_with("http://127.0.0.1")
-            || origin.starts_with("https://127.0.0.1")
-            || origin.starts_with("http://[::1]")
-            || origin.starts_with("https://[::1]");
+        // Parse origin to extract host — prevents bypass via localhost.evil.com
+        let is_local = if let Some(host) = extract_origin_host(origin) {
+            host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
+        } else {
+            false
+        };
 
         if !is_local {
             return Err(HttpError::InvalidOrigin);
@@ -96,8 +96,10 @@ async fn post_mcp(
     }
 
     // 2. Parse JSON-RPC message
-    let message: ClientJsonRpcMessage = serde_json::from_slice(&body)
-        .map_err(|e| HttpError::BadRequest(format!("invalid JSON-RPC: {e}")))?;
+    let message: ClientJsonRpcMessage = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(error = %e, "invalid JSON-RPC message from client");
+        HttpError::BadRequest("invalid JSON-RPC message".into())
+    })?;
 
     // 3. Route based on message type
     match message {
@@ -302,6 +304,27 @@ fn build_initialize_result() -> InitializeResult {
 
     InitializeResult::new(capabilities)
         .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+}
+
+/// Extract the host from an Origin header value.
+///
+/// Origin format is `scheme://host[:port]`. We parse manually to avoid
+/// pulling in the `url` crate dependency for this single use case.
+fn extract_origin_host(origin: &str) -> Option<&str> {
+    let after_scheme = origin.split("://").nth(1)?;
+    // Strip port and path: take everything before ':' or '/'
+    let host = after_scheme
+        .split(':')
+        .next()
+        .unwrap_or(after_scheme)
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 /// Extract session ID from request headers.
@@ -691,6 +714,22 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(json["result"]["serverInfo"]["name"], "plug");
         assert!(json["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn origin_localhost_subdomain_rejected() {
+        let app = build_router(test_state());
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("origin", "http://localhost.evil.com")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

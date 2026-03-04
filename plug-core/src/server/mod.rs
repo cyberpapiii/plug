@@ -173,16 +173,16 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("HTTP transport requires a URL"))?;
 
-                    // Basic SSRF protection: reject private/loopback URLs
+                    // SSRF protection: reject private/loopback/link-local URLs.
+                    // Note: DNS-based bypasses (hostname resolving to private IP) are
+                    // not covered here — would require async DNS resolution at connect time.
                     let parsed = url
                         .parse::<http::Uri>()
                         .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
                     if let Some(host) = parsed.host() {
-                        if host == "169.254.169.254"
-                            || host == "metadata.google.internal"
-                        {
+                        if is_blocked_host(host) {
                             anyhow::bail!(
-                                "URL points to cloud metadata service — blocked for safety"
+                                "URL host '{host}' is blocked — private, loopback, or metadata endpoint"
                             );
                         }
                     }
@@ -275,29 +275,45 @@ impl ServerManager {
     }
 
     /// Gracefully shutdown all upstream servers.
+    ///
+    /// Swaps in an empty map, then attempts to take ownership of each server
+    /// via `Arc::try_unwrap` and cancel it cleanly. Falls back to dropping
+    /// the Arc if other references still exist (rmcp's Drop handles cleanup).
     pub async fn shutdown_all(&self) {
-        // Swap in empty map to take ownership
+        // Swap in empty map — after this, no new code can access the servers
         let old = self.servers.swap(Arc::new(HashMap::new()));
-        let names: Vec<String> = old.keys().cloned().collect();
 
-        if names.is_empty() {
+        let map = match Arc::try_unwrap(old) {
+            Ok(map) => map,
+            Err(arc) => {
+                tracing::warn!("other references to server map exist; dropping");
+                drop(arc);
+                return;
+            }
+        };
+
+        if map.is_empty() {
             return;
         }
 
-        tracing::info!(count = names.len(), "shutting down upstream servers");
+        tracing::info!(count = map.len(), "shutting down upstream servers");
 
-        for name in &names {
-            if let Some(upstream) = old.get(name) {
-                tracing::info!(server = %name, "shutting down server");
-                // We need to get a mutable reference to close the client.
-                // Since we've swapped the map, we have the only remaining Arc references.
-                // Use Arc::try_unwrap to get ownership if possible.
-                let upstream_clone = Arc::clone(upstream);
-                // We can't easily get mutable access to close the client through Arc,
-                // so we'll just drop the Arc and let the client's Drop impl handle cleanup.
-                // The rmcp client's Drop spawns a cleanup task.
-                drop(upstream_clone);
-                tracing::info!(server = %name, "server shut down");
+        for (name, upstream_arc) in map {
+            match Arc::try_unwrap(upstream_arc) {
+                Ok(upstream) => {
+                    tracing::info!(server = %name, "shutting down server");
+                    // Drop the UpstreamServer — rmcp client's Drop impl handles
+                    // sending the shutdown notification and cleaning up the process.
+                    drop(upstream);
+                    tracing::info!(server = %name, "server shut down");
+                }
+                Err(arc) => {
+                    tracing::warn!(
+                        server = %name,
+                        "could not take ownership; relying on Drop"
+                    );
+                    drop(arc);
+                }
             }
         }
     }
@@ -320,5 +336,72 @@ impl ServerManager {
 impl Default for ServerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Check if a hostname or IP address is blocked for SSRF prevention.
+///
+/// Blocks: loopback, private (RFC 1918), link-local, cloud metadata endpoints.
+fn is_blocked_host(host: &str) -> bool {
+    // Known metadata hostnames
+    if host == "metadata.google.internal" {
+        return true;
+    }
+
+    // Try parsing as IP address
+    let host_trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host_trimmed.parse::<std::net::IpAddr>() {
+        return is_blocked_ip(&ip);
+    }
+
+    false
+}
+
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()          // 127.0.0.0/8
+                || v4.is_private()    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local() // 169.254.0.0/16 (covers cloud metadata)
+                || v4.is_broadcast()  // 255.255.255.255
+                || v4.is_unspecified() // 0.0.0.0
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()      // ::1
+                || v6.is_unspecified() // ::
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssrf_blocks_loopback() {
+        assert!(is_blocked_host("127.0.0.1"));
+        assert!(is_blocked_host("127.0.0.2"));
+        assert!(is_blocked_host("[::1]"));
+    }
+
+    #[test]
+    fn ssrf_blocks_private_ranges() {
+        assert!(is_blocked_host("10.0.0.1"));
+        assert!(is_blocked_host("172.16.0.1"));
+        assert!(is_blocked_host("192.168.1.1"));
+    }
+
+    #[test]
+    fn ssrf_blocks_link_local_and_metadata() {
+        assert!(is_blocked_host("169.254.169.254"));
+        assert!(is_blocked_host("169.254.0.1"));
+        assert!(is_blocked_host("metadata.google.internal"));
+    }
+
+    #[test]
+    fn ssrf_allows_public_ips() {
+        assert!(!is_blocked_host("8.8.8.8"));
+        assert!(!is_blocked_host("1.1.1.1"));
+        assert!(!is_blocked_host("example.com"));
     }
 }
