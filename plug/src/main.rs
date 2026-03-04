@@ -256,11 +256,12 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
     match connect_via_daemon(config_path).await {
         Ok(()) => return Ok(()),
         Err(e) => {
-            tracing::warn!(error = %e, "daemon proxy failed, falling back to standalone mode");
+            tracing::error!(error = %e, "daemon proxy failed — falling back to standalone mode (last resort)");
+            eprintln!("warning: daemon connection failed, using standalone mode (slower startup, no connection sharing)");
         }
     }
 
-    // Fallback: standalone mode (no daemon, independent Engine)
+    // Last-resort fallback: standalone mode (no daemon, independent Engine)
     connect_standalone(config_path).await
 }
 
@@ -422,7 +423,7 @@ fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
 /// Wait for the daemon to be ready (socket exists and responds).
 async fn wait_for_daemon_ready() -> anyhow::Result<tokio::net::UnixStream> {
     let mut delay = std::time::Duration::from_millis(10);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     while std::time::Instant::now() < deadline {
         if let Some(stream) = daemon::connect_to_daemon().await {
@@ -434,7 +435,7 @@ async fn wait_for_daemon_ready() -> anyhow::Result<tokio::net::UnixStream> {
     }
 
     anyhow::bail!(
-        "daemon failed to start within 10 seconds — check logs at {}",
+        "daemon failed to start within 30 seconds — check logs at {}",
         daemon::log_dir().display()
     )
 }
