@@ -150,6 +150,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build a `RouterConfig` from the global `Config`.
+fn router_config(config: &plug_core::config::Config) -> plug_core::proxy::RouterConfig {
+    plug_core::proxy::RouterConfig {
+        prefix_delimiter: config.prefix_delimiter.clone(),
+        priority_tools: config.priority_tools.clone(),
+        tool_description_max_chars: config.tool_description_max_chars,
+        tool_search_threshold: config.tool_search_threshold,
+        tool_filter_enabled: config.tool_filter_enabled,
+    }
+}
+
 /// `plug connect` — the primary stdio bridge mode.
 ///
 /// Loads config, starts all upstream servers, builds the ProxyHandler,
@@ -173,9 +184,18 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
     // Build the proxy handler and refresh tool cache
     let proxy = plug_core::proxy::ProxyHandler::new(
         server_manager.clone(),
-        config.prefix_delimiter.clone(),
+        router_config(&config),
     );
     proxy.refresh_tools().await;
+
+    // Spawn health checks
+    let cancel = tokio_util::sync::CancellationToken::new();
+    plug_core::health::spawn_health_checks(
+        server_manager.clone(),
+        proxy.router().clone(),
+        cancel.clone(),
+        &config,
+    );
 
     tracing::info!("starting stdio bridge");
 
@@ -200,6 +220,8 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
         }
     }
 
+    // Cancel health checks first, then shutdown servers
+    cancel.cancel();
     tracing::info!("shutting down upstream servers");
     server_manager.shutdown_all().await;
 
@@ -334,7 +356,7 @@ async fn cmd_serve(
     // Build shared ToolRouter (used by both HTTP and optional stdio)
     let router = Arc::new(plug_core::proxy::ToolRouter::new(
         server_manager.clone(),
-        config.prefix_delimiter.clone(),
+        router_config(&config),
     ));
     router.refresh_tools().await;
 
@@ -354,6 +376,14 @@ async fn cmd_serve(
 
     // Start session cleanup background task
     http_state.sessions.spawn_cleanup_task(cancel.clone());
+
+    // Spawn health checks for all upstream servers
+    plug_core::health::spawn_health_checks(
+        server_manager.clone(),
+        router.clone(),
+        cancel.clone(),
+        &config,
+    );
 
     let axum_router = plug_core::http::server::build_router(http_state);
     let listen_addr = format!("{}:{}", config.http.bind_address, config.http.port);
@@ -413,6 +443,8 @@ async fn cmd_serve(
         }
     }
 
+    // Cancel health checks first, then shutdown servers
+    cancel.cancel();
     tracing::info!("shutting down upstream servers");
     server_manager.shutdown_all().await;
 
@@ -432,7 +464,7 @@ async fn cmd_tool_list(
     // Use ProxyHandler to get the prefixed tool list
     let proxy = plug_core::proxy::ProxyHandler::new(
         server_manager.clone(),
-        config.prefix_delimiter.clone(),
+        router_config(&config),
     );
     proxy.refresh_tools().await;
 

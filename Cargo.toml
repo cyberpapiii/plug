@@ -60,6 +60,10 @@ directories = "6"
 futures = "0.3"
 tower = { version = "0.5", features = ["util"] }
 
+# Resilience (Phase 3)
+backon = "1.6"
+rand = "0.8"
+
 # HTTP Server (Phase 2)
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit"] }

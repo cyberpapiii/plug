@@ -201,6 +201,8 @@ async fn handle_request(
                 session = %session_id,
                 "HTTP client connected"
             );
+            // Store client type in session
+            let _ = state.sessions.set_client_type(&session_id, client_type);
 
             let result = build_initialize_result();
 
@@ -222,8 +224,11 @@ async fn handle_request(
         }
 
         ClientRequest::ListToolsRequest(_) => {
+            let session_id_str = extract_session_id(headers)?;
             validate_session_header(headers, &state.sessions)?;
-            let tools = state.router.list_tools();
+            let client_type = state.sessions.get_client_type(&session_id_str)
+                .unwrap_or(crate::types::ClientType::Unknown);
+            let tools = state.router.list_tools_for_client(client_type);
             let result = ListToolsResult::with_all_items((*tools).clone());
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListToolsResult(result),
@@ -395,7 +400,16 @@ mod tests {
 
     fn test_state() -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(sm, "__".to_string()));
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                tool_filter_enabled: true,
+            },
+        ));
         Arc::new(HttpState {
             router,
             sessions: SessionManager::new(1800, 100),

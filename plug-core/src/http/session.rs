@@ -22,6 +22,7 @@ struct SessionState {
     last_activity: Instant,
     /// SSE sender for this session (at most one active SSE stream per session).
     sse_sender: Option<mpsc::Sender<SseMessage>>,
+    client_type: crate::types::ClientType,
 }
 
 /// A message to send via SSE to a client.
@@ -48,6 +49,7 @@ impl SessionManager {
             SessionState {
                 last_activity: Instant::now(),
                 sse_sender: None,
+                client_type: crate::types::ClientType::Unknown,
             },
         );
 
@@ -84,6 +86,19 @@ impl SessionManager {
             .ok_or(HttpError::SessionNotFound)?;
         entry.sse_sender = Some(sender);
         Ok(())
+    }
+
+    /// Set the client type for a session (called during initialize).
+    pub fn set_client_type(&self, session_id: &str, client_type: crate::types::ClientType) -> Result<(), HttpError> {
+        let mut entry = self.sessions.get_mut(session_id).ok_or(HttpError::SessionNotFound)?;
+        entry.client_type = client_type;
+        Ok(())
+    }
+
+    /// Get the client type for a session.
+    pub fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
+        let entry = self.sessions.get(session_id).ok_or(HttpError::SessionNotFound)?;
+        Ok(entry.client_type)
     }
 
     /// Remove a session and clean up its resources.

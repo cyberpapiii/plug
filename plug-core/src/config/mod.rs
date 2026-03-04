@@ -19,6 +19,18 @@ pub struct Config {
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     pub startup_concurrency: usize,
+    /// Enable client-aware tool filtering (default: true).
+    #[serde(default = "default_true")]
+    pub tool_filter_enabled: bool,
+    /// Max chars for tool descriptions (None = no truncation).
+    #[serde(default)]
+    pub tool_description_max_chars: Option<usize>,
+    /// Tool count threshold to activate search_tools meta-tool (default: 50).
+    #[serde(default = "default_tool_search_threshold")]
+    pub tool_search_threshold: usize,
+    /// Priority tools served first when filtering (tool names).
+    #[serde(default)]
+    pub priority_tools: Vec<String>,
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -34,6 +46,10 @@ impl Default for Config {
             prefix_delimiter: "__".to_string(),
             enable_prefix: true,
             startup_concurrency: 3,
+            tool_filter_enabled: true,
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            priority_tools: Vec::new(),
             http: HttpConfig::default(),
             servers: HashMap::new(),
         }
@@ -92,6 +108,15 @@ pub struct ServerConfig {
     /// Startup timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Max concurrent requests to this server (default: 1 for stdio, 10 for HTTP).
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Health check interval in seconds (default: 60).
+    #[serde(default = "default_health_interval")]
+    pub health_check_interval_secs: u64,
+    /// Enable circuit breaker for this server (default: true).
+    #[serde(default = "default_true")]
+    pub circuit_breaker_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -100,6 +125,18 @@ fn default_true() -> bool {
 
 fn default_timeout() -> u64 {
     30
+}
+
+fn default_max_concurrent() -> usize {
+    1
+}
+
+fn default_health_interval() -> u64 {
+    60
+}
+
+fn default_tool_search_threshold() -> usize {
+    50
 }
 
 /// Transport type for upstream servers.
@@ -125,6 +162,10 @@ pub fn validate_config(config: &Config) -> Vec<String> {
         errors.push("startup_concurrency must be > 0".to_string());
     }
 
+    if config.tool_search_threshold < 10 {
+        errors.push("tool_search_threshold must be >= 10".to_string());
+    }
+
     for (name, server) in &config.servers {
         if name.is_empty() {
             errors.push("server name must not be empty".to_string());
@@ -139,6 +180,24 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
         if server.timeout_secs == 0 {
             errors.push(format!("server '{name}': timeout must be > 0"));
+        }
+
+        if server.max_concurrent == 0 {
+            errors.push(format!("server '{name}': max_concurrent must be > 0"));
+        }
+
+        if server.health_check_interval_secs < 5 {
+            errors.push(format!(
+                "server '{name}': health_check_interval_secs must be >= 5"
+            ));
+        }
+
+        if server.max_concurrent > 1 && matches!(server.transport, TransportType::Stdio) {
+            tracing::warn!(
+                server = %name,
+                max_concurrent = server.max_concurrent,
+                "max_concurrent > 1 for stdio transport — stdio is serial, this may not behave as expected"
+            );
         }
 
         match server.transport {
@@ -326,6 +385,9 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
             },
         );
         let errors = validate_config(&cfg);
@@ -346,6 +408,9 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
             },
         );
         let errors = validate_config(&cfg);
@@ -366,6 +431,9 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
             },
         );
         let errors = validate_config(&cfg);
@@ -386,6 +454,9 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 0,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
             },
         );
         let errors = validate_config(&cfg);
@@ -414,6 +485,9 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
             },
         );
         let errors = validate_config(&cfg);
@@ -438,6 +512,9 @@ mod tests {
                 url: None,
                 auth_token: None,
                 timeout_secs: 0,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
             },
         );
         let errors = validate_config(&cfg);

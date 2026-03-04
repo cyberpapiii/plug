@@ -30,6 +30,10 @@ tokio-util.workspace = true
 http.workspace = true
 bytes.workspace = true
 
+# Resilience (Phase 3)
+backon.workspace = true
+rand.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true

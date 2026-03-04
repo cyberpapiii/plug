@@ -5,13 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use rmcp::ServiceExt as _;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 
+use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
-use crate::types::{ServerHealth, ServerStatus};
+use crate::types::{HealthState, ServerHealth, ServerStatus};
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
@@ -31,12 +33,18 @@ pub struct UpstreamServer {
 /// are infrequent and use compare-and-swap.
 pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
+    pub(crate) health: DashMap<String, HealthState>,
+    pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
+    pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
 }
 
 impl ServerManager {
     pub fn new() -> Self {
         Self {
             servers: ArcSwap::from_pointee(HashMap::new()),
+            health: DashMap::new(),
+            circuit_breakers: DashMap::new(),
+            semaphores: DashMap::new(),
         }
     }
 
@@ -82,9 +90,24 @@ impl ServerManager {
                             "server started"
                         );
                         // Clone current map, insert new server, swap
+                        let max_concurrent = upstream.config.max_concurrent;
+                        let cb_enabled = upstream.config.circuit_breaker_enabled;
                         let mut new_map = HashMap::clone(&self.servers.load());
-                        new_map.insert(name, Arc::new(upstream));
+                        new_map.insert(name.clone(), Arc::new(upstream));
                         self.servers.store(Arc::new(new_map));
+
+                        // Initialize resilience state for this server
+                        self.health.insert(name.clone(), HealthState::new());
+                        self.semaphores.insert(
+                            name.clone(),
+                            Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+                        );
+                        if cb_enabled {
+                            self.circuit_breakers.insert(
+                                name.clone(),
+                                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+                            );
+                        }
                     }
                     Ok((name, Err(e))) => {
                         tracing::error!(server = %name, error = %e, "failed to start server");
@@ -258,7 +281,10 @@ impl ServerManager {
         let servers = self.servers.load();
         let mut result = Vec::new();
         for (server_name, upstream) in servers.iter() {
-            if upstream.health == ServerHealth::Healthy {
+            let health_ok = self.health.get(server_name)
+                .map(|h| h.health != ServerHealth::Failed)
+                .unwrap_or(true);
+            if health_ok {
                 for tool in &upstream.tools {
                     result.push((server_name.clone(), tool.clone()));
                 }
@@ -316,6 +342,10 @@ impl ServerManager {
                 }
             }
         }
+
+        self.health.clear();
+        self.circuit_breakers.clear();
+        self.semaphores.clear();
     }
 
     /// Return health/status information for all servers.
@@ -323,13 +353,33 @@ impl ServerManager {
         let servers = self.servers.load();
         servers
             .values()
-            .map(|upstream| ServerStatus {
-                server_id: upstream.name.clone(),
-                health: upstream.health,
-                tool_count: upstream.tools.len(),
-                last_seen: None,
+            .map(|upstream| {
+                let health = self.health.get(&upstream.name)
+                    .map(|h| h.health)
+                    .unwrap_or(upstream.health);
+                ServerStatus {
+                    server_id: upstream.name.clone(),
+                    health,
+                    tool_count: upstream.tools.len(),
+                    last_seen: None,
+                }
             })
             .collect()
+    }
+
+    /// Replace an upstream server (used after reconnection).
+    /// Updates the servers map and resets related state.
+    pub fn replace_server(&self, name: &str, upstream: UpstreamServer) {
+        let mut new_map = HashMap::clone(&self.servers.load());
+        new_map.insert(name.to_string(), Arc::new(upstream));
+        self.servers.store(Arc::new(new_map));
+
+        // Reset circuit breaker on successful reconnection
+        if let Some(cb) = self.circuit_breakers.get(name) {
+            cb.reset();
+        }
+
+        tracing::info!(server = %name, "server replaced after reconnection");
     }
 }
 
