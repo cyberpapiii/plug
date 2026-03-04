@@ -12,14 +12,19 @@ use crate::client_detect::detect_client;
 use crate::error::ProtocolError;
 use crate::server::ServerManager;
 
+/// Atomically-swapped tool cache: tool list + routing table together.
+/// Stored in a single ArcSwap to prevent torn reads between list_tools and call_tool.
+struct ToolCache {
+    routes: HashMap<String, String>,
+    tools: Vec<Tool>,
+}
+
 /// MCP proxy handler that aggregates tools from multiple upstream servers
 /// and routes tool calls to the correct upstream.
 pub struct ProxyHandler {
     server_manager: Arc<ServerManager>,
-    /// Routing cache: prefixed_tool_name -> server_id
-    tool_routes: Arc<ArcSwap<HashMap<String, String>>>,
-    /// Cached merged tool list
-    merged_tools: Arc<ArcSwap<Vec<Tool>>>,
+    /// Combined tool cache (routes + definitions) swapped atomically
+    cache: Arc<ArcSwap<ToolCache>>,
     /// Tool name prefix delimiter
     prefix_delimiter: String,
 }
@@ -28,13 +33,16 @@ impl ProxyHandler {
     pub fn new(server_manager: Arc<ServerManager>, prefix_delimiter: String) -> Self {
         Self {
             server_manager,
-            tool_routes: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            merged_tools: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            cache: Arc::new(ArcSwap::from_pointee(ToolCache {
+                routes: HashMap::new(),
+                tools: Vec::new(),
+            })),
             prefix_delimiter,
         }
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
+    /// Both are swapped atomically to prevent torn reads.
     pub async fn refresh_tools(&self) {
         let upstream_tools = self.server_manager.get_tools().await;
 
@@ -58,8 +66,8 @@ impl ProxyHandler {
             "refreshed tool cache"
         );
 
-        self.merged_tools.store(Arc::new(tools));
-        self.tool_routes.store(Arc::new(routes));
+        // Atomic swap of both routes and tools together
+        self.cache.store(Arc::new(ToolCache { routes, tools }));
     }
 }
 
@@ -104,8 +112,8 @@ impl ServerHandler for ProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
-            let tools = self.merged_tools.load();
-            Ok(ListToolsResult::with_all_items(tools.as_ref().clone()))
+            let cache = self.cache.load();
+            Ok(ListToolsResult::with_all_items(cache.tools.clone()))
         }
     }
 
@@ -118,8 +126,8 @@ impl ServerHandler for ProxyHandler {
             let tool_name = request.name.as_ref();
 
             // Look up the server for this prefixed tool name
-            let routes = self.tool_routes.load();
-            let server_id = routes.get(tool_name).ok_or_else(|| {
+            let cache = self.cache.load();
+            let server_id = cache.routes.get(tool_name).ok_or_else(|| {
                 McpError::from(ProtocolError::ToolNotFound {
                     tool_name: tool_name.to_string(),
                 })
@@ -131,24 +139,29 @@ impl ServerHandler for ProxyHandler {
                 .and_then(|s| s.strip_prefix(&self.prefix_delimiter))
                 .unwrap_or(tool_name);
 
-            // Get the upstream server's client
-            let guard = self.server_manager.get_server(server_id).await.ok_or_else(|| {
-                McpError::from(ProtocolError::ServerUnavailable {
-                    server_id: server_id.clone(),
-                })
-            })?;
+            let server_id = server_id.clone();
+            let original_name = original_name.to_string();
+            drop(cache);
 
-            let upstream = &guard[server_id];
+            // Get the upstream server's peer — clone and release lock immediately
+            let peer = {
+                let guard = self.server_manager.get_server(&server_id).await.ok_or_else(|| {
+                    McpError::from(ProtocolError::ServerUnavailable {
+                        server_id: server_id.clone(),
+                    })
+                })?;
+                let upstream = &guard[&server_id];
+                upstream.client.peer().clone()
+            };
+            // Lock is released here
 
             // Build the upstream call with the original (unprefixed) tool name
-            let mut upstream_params = CallToolRequestParams::new(original_name.to_string());
+            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
             if let Some(args) = request.arguments {
                 upstream_params = upstream_params.with_arguments(args);
             }
 
-            let result: CallToolResult = upstream
-                .client
-                .peer()
+            let result: CallToolResult = peer
                 .call_tool(upstream_params)
                 .await
                 .map_err(|e| {
@@ -211,10 +224,8 @@ mod tests {
         let handler = ProxyHandler::new(sm, "__".to_string());
         handler.refresh_tools().await;
 
-        let tools = handler.merged_tools.load();
-        assert!(tools.is_empty());
-
-        let routes = handler.tool_routes.load();
-        assert!(routes.is_empty());
+        let cache = handler.cache.load();
+        assert!(cache.tools.is_empty());
+        assert!(cache.routes.is_empty());
     }
 }

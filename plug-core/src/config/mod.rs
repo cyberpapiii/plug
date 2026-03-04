@@ -102,6 +102,13 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             errors.push("server name must not be empty".to_string());
         }
 
+        if name.contains(&config.prefix_delimiter) {
+            errors.push(format!(
+                "server '{name}': name must not contain the prefix delimiter '{}'",
+                config.prefix_delimiter
+            ));
+        }
+
         if server.timeout_secs == 0 {
             errors.push(format!("server '{name}': timeout must be > 0"));
         }
@@ -147,7 +154,7 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
     let mut config: Config = Figment::new()
         .merge(Serialized::defaults(Config::default()))
         .merge(Toml::file(&path))
-        .merge(Env::prefixed("PLUG_").split("_"))
+        .merge(Env::prefixed("PLUG_").split("__"))
         .extract()?;
 
     // Expand $VAR_NAME references in server configs
@@ -260,7 +267,7 @@ mod tests {
         let fig = Figment::new()
             .merge(Serialized::defaults(Config::default()))
             .merge(Toml::string("port = 9999"))
-            .merge(Env::prefixed("PLUG_").split("_"));
+            .merge(Env::prefixed("PLUG_").split("__"));
 
         let cfg: Config = fig.extract().expect("extract failed");
         // TOML override should win over default when no env var is actually set

@@ -15,13 +15,9 @@ figment.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-dashmap.workspace = true
 arc-swap.workspace = true
 uuid.workspace = true
 directories.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

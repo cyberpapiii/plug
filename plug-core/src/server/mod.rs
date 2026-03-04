@@ -173,6 +173,9 @@ impl ServerManager {
                 Err(e)
             }
             Err(_) => {
+                // When the timeout fires, the inner future is dropped.
+                // rmcp's TokioChildProcess uses ChildWithCleanup whose Drop impl
+                // spawns a task to kill the child process, so no orphan leak occurs.
                 let msg = format!(
                     "server '{}' timed out after {}s during startup",
                     name, config.timeout_secs
