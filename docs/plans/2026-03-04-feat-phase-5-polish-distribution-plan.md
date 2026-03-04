@@ -270,7 +270,7 @@ New `AppMode::Doctor` with:
 **Files to create/modify**:
 - [x] `plug-core/src/reload.rs` — File watcher, config diff, server drain logic
 - [x] `plug-core/src/enrichment.rs` — Annotation inference, name normalization
-- [ ] `plug-core/src/engine.rs` — Add `reload_config()` method, spawn file watcher task
+- [x] `plug-core/src/engine.rs` — Add `reload_config()` method, spawn file watcher task
 - [x] `plug-core/src/config/mod.rs` — Add `enrichment` field to `ServerConfig`
 - [x] `plug-core/src/proxy/mod.rs` — Apply enrichment in `refresh_tools()`
 - [x] `plug/src/daemon.rs` — Add SIGHUP handler, `Reload` IPC request
@@ -341,33 +341,33 @@ New `AppMode::Doctor` with:
 
 ### Functional Requirements
 
-- [ ] `plug import claude-desktop` imports servers from Claude Desktop config
-- [ ] `plug import --all --yes` imports from all detected clients non-interactively
-- [ ] `plug export cursor` prints valid Cursor MCP config to stdout
+- [x] `plug import claude-desktop` imports servers from Claude Desktop config
+- [x] `plug import --all --yes` imports from all detected clients non-interactively
+- [x] `plug export cursor` prints valid Cursor MCP config to stdout
 - [ ] `plug export vscode --write` merges into existing VS Code config
-- [ ] `plug doctor` runs 9+ checks with pass/warn/fail output
-- [ ] `plug doctor --output json` returns structured results with exit code 0/1/2
-- [ ] Config hot-reload: add server to config.toml → server starts within 2s
-- [ ] Config hot-reload: remove server → drains in-flight, stops gracefully
-- [ ] Config hot-reload: invalid TOML → rejected, current config preserved
-- [ ] `plug reload` CLI command triggers reload via daemon IPC
+- [x] `plug doctor` runs 9+ checks with pass/warn/fail output
+- [x] `plug doctor --output json` returns structured results with exit code 0/1/2
+- [x] Config hot-reload: add server to config.toml → server starts within 2s
+- [x] Config hot-reload: remove server → drains in-flight, stops gracefully
+- [x] Config hot-reload: invalid TOML → rejected, current config preserved
+- [x] `plug reload` CLI command triggers reload via daemon IPC
 - [ ] SIGHUP triggers config reload (Unix only)
-- [ ] Tool enrichment adds annotations when `enrichment = true` in server config
-- [ ] Enrichment never overrides upstream-provided annotations
-- [ ] `GET /.well-known/mcp.json` returns server card
-- [ ] TUI `l` key opens log view with filtering
-- [ ] TUI `d` key opens doctor view
-- [ ] Binary < 10 MB (release profile)
-- [ ] Startup < 1 second
-- [ ] Tool call overhead < 5ms for cached routes
+- [x] Tool enrichment adds annotations when `enrichment = true` in server config
+- [x] Enrichment never overrides upstream-provided annotations
+- [x] `GET /.well-known/mcp.json` returns server card
+- [x] TUI `l` key opens log view with filtering
+- [x] TUI `d` key opens doctor view
+- [x] Binary < 10 MB (release profile)
+- [x] Startup < 1 second
+- [x] Tool call overhead < 5ms for cached routes
 
 ### Quality Gates
 
-- [ ] All tests pass (`cargo test`)
-- [ ] Clippy clean (`cargo clippy -- -D warnings`)
-- [ ] `cargo fmt --check` passes
-- [ ] Import parsers tested with fixture files for each client format
-- [ ] Doctor checks tested with mock scenarios
+- [x] All tests pass (`cargo test`)
+- [x] Clippy clean (`cargo clippy -- -D warnings`)
+- [x] `cargo fmt --check` passes
+- [x] Import parsers tested with fixture files for each client format
+- [x] Doctor checks tested with mock scenarios
 - [ ] Hot-reload tested with concurrent requests during server removal
 
 ## Dependencies & Prerequisites
