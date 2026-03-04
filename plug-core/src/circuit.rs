@@ -37,7 +37,7 @@ fn nanos_since_epoch() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Observable state of the circuit breaker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CircuitState {
     Closed,
     Open,

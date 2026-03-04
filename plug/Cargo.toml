@@ -22,3 +22,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio-util.workspace = true
 axum.workspace = true
+rand.workspace = true
+
+# TUI (Phase 4)
+ratatui.workspace = true
+crossterm.workspace = true
+color-eyre.workspace = true
+
+# Daemon (Phase 4)
+tracing-appender.workspace = true
+fs2.workspace = true

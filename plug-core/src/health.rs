@@ -9,22 +9,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng as _;
+use tokio::sync::broadcast;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
+use crate::engine::EngineEvent;
 use crate::proxy::ToolRouter;
 use crate::server::ServerManager;
+use crate::types::ServerHealth;
 
 /// Spawn health-check background tasks for all enabled servers.
 ///
 /// Each server gets its own tokio task with a staggered start (random jitter)
 /// to avoid thundering-herd pings. Tasks run until `cancel` is triggered.
+/// Uses `tracker.spawn()` for ordered shutdown via `TaskTracker::wait()`.
 pub fn spawn_health_checks(
     server_manager: Arc<ServerManager>,
     router: Arc<ToolRouter>,
+    event_tx: broadcast::Sender<EngineEvent>,
     cancel: CancellationToken,
     config: &Config,
+    tracker: &TaskTracker,
 ) {
     for (name, sc) in &config.servers {
         if !sc.enabled {
@@ -36,8 +43,9 @@ pub fn spawn_health_checks(
         let mgr = server_manager.clone();
         let router = router.clone();
         let cancel = cancel.clone();
+        let event_tx = event_tx.clone();
 
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             // Stagger start with random 0-10s jitter to avoid thundering herd
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..10_000));
             tokio::time::sleep(jitter).await;
@@ -56,10 +64,17 @@ pub fn spawn_health_checks(
                         break;
                     }
                     _ = tick.tick() => {
-                        let changed = health_check_server(&mgr, &name).await;
-                        if changed {
-                            tracing::info!(server = %name, "health state changed, refreshing tools");
+                        let result = health_check_server(&mgr, &name).await;
+                        if let Some((old, new)) = result {
+                            tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
                             router.refresh_tools().await;
+
+                            // Emit event on state transition (transition-based, not time-suppressed)
+                            let _ = event_tx.send(EngineEvent::ServerHealthChanged {
+                                server_id: Arc::from(name.as_str()),
+                                old,
+                                new,
+                            });
                         }
                     }
                 }
@@ -70,11 +85,15 @@ pub fn spawn_health_checks(
 
 /// Ping a single upstream server and update its health state.
 ///
-/// Returns `true` if the health state changed (caller should refresh tools).
-async fn health_check_server(mgr: &ServerManager, name: &str) -> bool {
+/// Returns `Some((old, new))` if the health state changed (caller should
+/// refresh tools and emit event). Returns `None` if unchanged.
+async fn health_check_server(
+    mgr: &ServerManager,
+    name: &str,
+) -> Option<(ServerHealth, ServerHealth)> {
     let upstream = match mgr.get_upstream(name) {
         Some(u) => u,
-        None => return false,
+        None => return None,
     };
 
     // Use list_tools as a lightweight health probe (universal across MCP servers).
@@ -90,29 +109,26 @@ async fn health_check_server(mgr: &ServerManager, name: &str) -> bool {
 
     let success = matches!(result, Ok(Ok(_)));
 
-    // Update health state in DashMap
+    // Clone-and-drop pattern: extract state, drop guard, then use data.
     let mut entry = mgr.health.entry(name.to_string()).or_default();
-    if success {
-        let changed = entry.record_success();
-        if changed {
-            tracing::info!(
-                server = %name,
-                health = ?entry.health,
-                "health improved"
-            );
-        }
-        changed
+    let old_health = entry.health;
+    let changed = if success {
+        entry.record_success()
     } else {
-        let changed = entry.record_failure();
-        if changed {
-            tracing::warn!(
-                server = %name,
-                health = ?entry.health,
-                consecutive_failures = entry.consecutive_failures,
-                "health degraded"
-            );
+        entry.record_failure()
+    };
+    let new_health = entry.health;
+    drop(entry); // Drop DashMap guard before any .await
+
+    if changed {
+        if success {
+            tracing::info!(server = %name, health = ?new_health, "health improved");
+        } else {
+            tracing::warn!(server = %name, health = ?new_health, "health degraded");
         }
-        changed
+        Some((old_health, new_health))
+    } else {
+        None
     }
 }
 

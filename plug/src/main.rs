@@ -163,9 +163,9 @@ fn router_config(config: &plug_core::config::Config) -> plug_core::proxy::Router
 
 /// `plug connect` — the primary stdio bridge mode.
 ///
-/// Loads config, starts all upstream servers, builds the ProxyHandler,
-/// then serves MCP over stdin/stdout using rmcp's stdio transport.
-/// Handles SIGINT/SIGTERM for graceful shutdown.
+/// Creates an Engine, starts it, builds a ProxyHandler from the Engine's
+/// ToolRouter, then serves MCP over stdin/stdout using rmcp's stdio transport.
+/// Handles SIGINT/SIGTERM for graceful shutdown via Engine.
 async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     let config = plug_core::config::load_config(config_path)?;
 
@@ -177,25 +177,11 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
         anyhow::bail!("config validation failed with {} error(s)", errors.len());
     }
 
-    // Start all upstream servers
-    let server_manager = Arc::new(plug_core::server::ServerManager::new());
-    server_manager.start_all(&config).await?;
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
 
-    // Build the proxy handler and refresh tool cache
-    let proxy = plug_core::proxy::ProxyHandler::new(
-        server_manager.clone(),
-        router_config(&config),
-    );
-    proxy.refresh_tools().await;
-
-    // Spawn health checks
-    let cancel = tokio_util::sync::CancellationToken::new();
-    plug_core::health::spawn_health_checks(
-        server_manager.clone(),
-        proxy.router().clone(),
-        cancel.clone(),
-        &config,
-    );
+    // Build the proxy handler from Engine's ToolRouter
+    let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
 
     tracing::info!("starting stdio bridge");
 
@@ -220,10 +206,8 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
         }
     }
 
-    // Cancel health checks first, then shutdown servers
-    cancel.cancel();
-    tracing::info!("shutting down upstream servers");
-    server_manager.shutdown_all().await;
+    tracing::info!("shutting down");
+    engine.shutdown().await;
 
     Ok(())
 }
@@ -323,9 +307,9 @@ async fn cmd_server_list(
 
 /// `plug serve` — start the HTTP server for web-based MCP clients.
 ///
-/// Starts upstream servers, builds a shared ToolRouter, and serves MCP
-/// over HTTP (Streamable HTTP transport). Optionally also runs the stdio
-/// bridge via `--stdio`.
+/// Creates an Engine, starts it, builds HttpState from the Engine's
+/// ToolRouter, and serves MCP over HTTP (Streamable HTTP transport).
+/// Optionally also runs the stdio bridge via `--stdio`.
 async fn cmd_serve(
     config_path: Option<&std::path::PathBuf>,
     with_stdio: bool,
@@ -349,23 +333,14 @@ async fn cmd_serve(
         );
     }
 
-    // Start all upstream servers
-    let server_manager = Arc::new(plug_core::server::ServerManager::new());
-    server_manager.start_all(&config).await?;
+    let engine = plug_core::engine::Engine::new(config.clone());
+    engine.start().await?;
 
-    // Build shared ToolRouter (used by both HTTP and optional stdio)
-    let router = Arc::new(plug_core::proxy::ToolRouter::new(
-        server_manager.clone(),
-        router_config(&config),
-    ));
-    router.refresh_tools().await;
+    let cancel = engine.cancel_token().clone();
 
-    // Cancellation token for coordinated shutdown
-    let cancel = tokio_util::sync::CancellationToken::new();
-
-    // Build HTTP server state and router
+    // Build HTTP server state (SessionManager is transport-specific, stays outside Engine)
     let http_state = Arc::new(plug_core::http::server::HttpState {
-        router: router.clone(),
+        router: engine.tool_router().clone(),
         sessions: plug_core::http::session::SessionManager::new(
             config.http.session_timeout_secs,
             config.http.max_sessions,
@@ -377,14 +352,6 @@ async fn cmd_serve(
     // Start session cleanup background task
     http_state.sessions.spawn_cleanup_task(cancel.clone());
 
-    // Spawn health checks for all upstream servers
-    plug_core::health::spawn_health_checks(
-        server_manager.clone(),
-        router.clone(),
-        cancel.clone(),
-        &config,
-    );
-
     let axum_router = plug_core::http::server::build_router(http_state);
     let listen_addr = format!("{}:{}", config.http.bind_address, config.http.port);
     let listener = tokio::net::TcpListener::bind(&listen_addr)
@@ -395,7 +362,7 @@ async fn cmd_serve(
 
     if with_stdio {
         // Run HTTP server + stdio bridge simultaneously
-        let proxy = plug_core::proxy::ProxyHandler::from_router(router);
+        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
 
         use rmcp::ServiceExt as _;
         let transport = rmcp::transport::io::stdio();
@@ -443,10 +410,8 @@ async fn cmd_serve(
         }
     }
 
-    // Cancel health checks first, then shutdown servers
-    cancel.cancel();
-    tracing::info!("shutting down upstream servers");
-    server_manager.shutdown_all().await;
+    tracing::info!("shutting down");
+    engine.shutdown().await;
 
     Ok(())
 }

@@ -64,6 +64,17 @@ tower = { version = "0.5", features = ["util"] }
 backon = "1.6"
 rand = "0.8"
 
+# TUI (Phase 4)
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+color-eyre = "0.6"
+
+# Daemon (Phase 4)
+tracing-appender = "0.2"
+fs2 = "0.4"
+subtle = "2.6"
+hex = "0.4"
+
 # HTTP Server (Phase 2)
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit"] }

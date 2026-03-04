@@ -8,9 +8,11 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
+use tokio::sync::broadcast;
 
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
+use crate::engine::{next_call_id, EngineEvent};
 use crate::error::ProtocolError;
 use crate::server::ServerManager;
 use crate::types::{ClientType, ServerHealth};
@@ -44,6 +46,8 @@ pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
     cache: Arc<ArcSwap<RouterSnapshot>>,
     config: RouterConfig,
+    /// Optional event sender for tool call observability.
+    event_tx: Option<broadcast::Sender<EngineEvent>>,
 }
 
 impl ToolRouter {
@@ -57,7 +61,14 @@ impl ToolRouter {
                 tools_copilot: Arc::new(Vec::new()),
             })),
             config,
+            event_tx: None,
         }
+    }
+
+    /// Set the event sender for tool call observability.
+    pub fn with_event_tx(mut self, tx: broadcast::Sender<EngineEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
@@ -117,17 +128,28 @@ impl ToolRouter {
         let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect());
         let tools_all = Arc::new(tools);
 
+        let tool_count = tools_all.len();
+
         self.cache.store(Arc::new(RouterSnapshot {
             routes,
             tools_all,
             tools_windsurf,
             tools_copilot,
         }));
+
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
+        }
     }
 
     /// Get the current list of tools (zero-copy via Arc). Returns all tools.
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
         Arc::clone(&self.cache.load().tools_all)
+    }
+
+    /// Total number of tools in the unfiltered cache.
+    pub fn tool_count(&self) -> usize {
+        self.cache.load().tools_all.len()
     }
 
     /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
@@ -232,11 +254,27 @@ impl ToolRouter {
             upstream_params = upstream_params.with_arguments(args);
         }
 
+        // Emit ToolCallStarted event
+        let call_id = next_call_id();
+        let server_id_arc = Arc::<str>::from(server_id.as_str());
+        let tool_name_arc = Arc::<str>::from(original_name.as_str());
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(EngineEvent::ToolCallStarted {
+                call_id,
+                server_id: Arc::clone(&server_id_arc),
+                tool_name: Arc::clone(&tool_name_arc),
+            });
+        }
+
+        let call_start = std::time::Instant::now();
+
         // Execute with timeout
         let result = tokio::time::timeout(timeout_duration, peer.call_tool(upstream_params)).await;
 
         // Drop semaphore permit
         drop(permit);
+
+        let duration_ms = call_start.elapsed().as_millis() as u64;
 
         // Record circuit breaker outcome
         let cb = self.server_manager.circuit_breakers.get(&server_id);
@@ -245,6 +283,15 @@ impl ToolRouter {
             Ok(Ok(response)) => {
                 if let Some(cb) = &cb {
                     cb.on_success();
+                }
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(EngineEvent::ToolCallCompleted {
+                        call_id,
+                        server_id: Arc::clone(&server_id_arc),
+                        tool_name: Arc::clone(&tool_name_arc),
+                        duration_ms,
+                        success: true,
+                    });
                 }
                 Ok(response)
             }
@@ -257,6 +304,15 @@ impl ToolRouter {
                 );
                 if let Some(cb) = &cb {
                     cb.on_failure();
+                }
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(EngineEvent::ToolCallCompleted {
+                        call_id,
+                        server_id: Arc::clone(&server_id_arc),
+                        tool_name: Arc::clone(&tool_name_arc),
+                        duration_ms,
+                        success: false,
+                    });
                 }
                 match e {
                     rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
@@ -272,6 +328,15 @@ impl ToolRouter {
                 );
                 if let Some(cb) = &cb {
                     cb.on_failure();
+                }
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(EngineEvent::ToolCallCompleted {
+                        call_id,
+                        server_id: server_id_arc,
+                        tool_name: tool_name_arc,
+                        duration_ms,
+                        success: false,
+                    });
                 }
                 Err(McpError::from(ProtocolError::Timeout {
                     duration: timeout_duration,
