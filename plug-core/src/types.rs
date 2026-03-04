@@ -1,5 +1,35 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
+
+/// A string that redacts its value in Debug output to prevent secret leakage.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
 
 /// Unique identifier for a client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,6 +106,70 @@ pub enum ServerHealth {
     Degraded,
     /// Server is not responding.
     Failed,
+}
+
+/// Tracked health state with consecutive failure counting for state machine transitions.
+///
+/// State machine:
+/// - Healthy → 3 consecutive failures → Degraded
+/// - Degraded → 3 more failures → Failed
+/// - Failed → 1 success → Degraded
+/// - Degraded → 1 success → Healthy
+#[derive(Debug, Clone)]
+pub struct HealthState {
+    pub health: ServerHealth,
+    pub consecutive_failures: u32,
+}
+
+impl HealthState {
+    pub fn new() -> Self {
+        Self {
+            health: ServerHealth::Healthy,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Record a successful health check. Returns true if health state changed.
+    pub fn record_success(&mut self) -> bool {
+        self.consecutive_failures = 0;
+        let old = self.health;
+        self.health = match old {
+            ServerHealth::Healthy => ServerHealth::Healthy,
+            ServerHealth::Degraded => ServerHealth::Healthy,
+            ServerHealth::Failed => ServerHealth::Degraded,
+        };
+        old != self.health
+    }
+
+    /// Record a failed health check. Returns true if health state changed.
+    pub fn record_failure(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        let old = self.health;
+        self.health = match old {
+            ServerHealth::Healthy => {
+                if self.consecutive_failures >= 3 {
+                    ServerHealth::Degraded
+                } else {
+                    ServerHealth::Healthy
+                }
+            }
+            ServerHealth::Degraded => {
+                if self.consecutive_failures >= 6 {
+                    ServerHealth::Failed
+                } else {
+                    ServerHealth::Degraded
+                }
+            }
+            ServerHealth::Failed => ServerHealth::Failed,
+        };
+        old != self.health
+    }
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Status information for an upstream server.

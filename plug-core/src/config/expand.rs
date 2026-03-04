@@ -40,8 +40,9 @@ pub fn expand_env_vars(input: &str) -> String {
                 }
             }
         }
-        result.push(input[i..].chars().next().unwrap());
-        i += 1;
+        let ch = input[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     result

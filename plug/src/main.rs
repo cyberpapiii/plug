@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod daemon;
+mod tui;
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -33,8 +36,24 @@ enum OutputFormat {
 enum Commands {
     /// Start the MCP stdio bridge (what clients invoke)
     Connect,
-    /// Show server health status
+    /// Start the HTTP server for web-based MCP clients
+    Serve {
+        /// Also start stdio bridge on stdin/stdout
+        #[arg(long)]
+        stdio: bool,
+        /// Run as headless daemon with IPC socket
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Launch the TUI dashboard
+    Tui,
+    /// Show server health status (queries daemon if running)
     Status,
+    /// Daemon management
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     /// Server management
     Server {
         #[command(subcommand)]
@@ -50,6 +69,12 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Stop the running daemon
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -95,9 +120,24 @@ async fn main() -> anyhow::Result<()> {
         Commands::Connect => {
             cmd_connect(cli.config.as_ref()).await?;
         }
+        Commands::Serve { stdio, daemon } => {
+            if daemon {
+                cmd_daemon(cli.config.as_ref()).await?;
+            } else {
+                cmd_serve(cli.config.as_ref(), stdio).await?;
+            }
+        }
+        Commands::Tui => {
+            cmd_tui(cli.config.as_ref()).await?;
+        }
         Commands::Status => {
             cmd_status(cli.config.as_ref(), &cli.output).await?;
         }
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Stop => {
+                cmd_daemon_stop().await?;
+            }
+        },
         Commands::Server { command } => match command {
             ServerCommands::List => {
                 cmd_server_list(cli.config.as_ref(), &cli.output).await?;
@@ -141,11 +181,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build a `RouterConfig` from the global `Config`.
+fn router_config(config: &plug_core::config::Config) -> plug_core::proxy::RouterConfig {
+    plug_core::proxy::RouterConfig {
+        prefix_delimiter: config.prefix_delimiter.clone(),
+        priority_tools: config.priority_tools.clone(),
+        tool_description_max_chars: config.tool_description_max_chars,
+        tool_search_threshold: config.tool_search_threshold,
+        tool_filter_enabled: config.tool_filter_enabled,
+    }
+}
+
 /// `plug connect` — the primary stdio bridge mode.
 ///
-/// Loads config, starts all upstream servers, builds the ProxyHandler,
-/// then serves MCP over stdin/stdout using rmcp's stdio transport.
-/// Handles SIGINT/SIGTERM for graceful shutdown.
+/// Creates an Engine, starts it, builds a ProxyHandler from the Engine's
+/// ToolRouter, then serves MCP over stdin/stdout using rmcp's stdio transport.
+/// Handles SIGINT/SIGTERM for graceful shutdown via Engine.
 async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     let config = plug_core::config::load_config(config_path)?;
 
@@ -157,16 +208,11 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
         anyhow::bail!("config validation failed with {} error(s)", errors.len());
     }
 
-    // Start all upstream servers
-    let server_manager = Arc::new(plug_core::server::ServerManager::new());
-    server_manager.start_all(&config).await?;
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
 
-    // Build the proxy handler and refresh tool cache
-    let proxy = plug_core::proxy::ProxyHandler::new(
-        server_manager.clone(),
-        config.prefix_delimiter.clone(),
-    );
-    proxy.refresh_tools().await;
+    // Build the proxy handler from Engine's ToolRouter
+    let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
 
     tracing::info!("starting stdio bridge");
 
@@ -191,46 +237,118 @@ async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
         }
     }
 
-    tracing::info!("shutting down upstream servers");
-    server_manager.shutdown_all().await;
+    tracing::info!("shutting down");
+    engine.shutdown().await;
+
+    Ok(())
+}
+
+/// `plug tui` — launch the TUI dashboard.
+///
+/// Creates an Engine, starts it, then runs the TUI event loop.
+async fn cmd_tui(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
+
+    tui::run(&engine).await?;
+
+    tracing::info!("shutting down");
+    engine.shutdown().await;
 
     Ok(())
 }
 
 /// `plug status` — show health of all upstream servers.
+///
+/// Tries to query a running daemon via IPC first. If no daemon is running,
+/// falls back to starting servers directly and querying them.
 async fn cmd_status(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
+    // Try daemon IPC first
+    if let Ok(response) = daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
+        match response {
+            plug_core::ipc::IpcResponse::Status {
+                servers,
+                clients,
+                uptime_secs,
+            } => {
+                match output {
+                    OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "source": "daemon",
+                            "uptime_secs": uptime_secs,
+                            "clients": clients,
+                            "servers": servers,
+                        }))?);
+                    }
+                    OutputFormat::Text => {
+                        println!("connected to daemon (uptime: {}s, clients: {})", uptime_secs, clients);
+                        if servers.is_empty() {
+                            println!("no servers configured");
+                        } else {
+                            println!("{:<20} {:<10} {:<6}", "NAME", "STATUS", "TOOLS");
+                            for status in &servers {
+                                let health = format!("{:?}", status.health);
+                                println!(
+                                    "{:<20} {:<10} {:<6}",
+                                    status.server_id, health, status.tool_count
+                                );
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            plug_core::ipc::IpcResponse::Error { message, .. } => {
+                tracing::debug!(error = %message, "daemon status query failed, falling back");
+            }
+            _ => {}
+        }
+    }
+
+    // No daemon running — show configured servers from config only
     let config = plug_core::config::load_config(config_path)?;
-
-    let server_manager = Arc::new(plug_core::server::ServerManager::new());
-    server_manager.start_all(&config).await?;
-
-    let statuses = server_manager.server_statuses().await;
 
     match output {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&statuses)?);
+            let servers: Vec<serde_json::Value> = config
+                .servers
+                .keys()
+                .map(|name| serde_json::json!({"name": name, "status": "not_running"}))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "source": "config",
+                "daemon_running": false,
+                "servers": servers,
+            }))?);
         }
         OutputFormat::Text => {
-            if statuses.is_empty() {
+            eprintln!("no daemon running — showing configured servers");
+            if config.servers.is_empty() {
                 println!("no servers configured");
             } else {
-                // Print table header
-                println!("{:<20} {:<10} {:<6}", "NAME", "STATUS", "TOOLS");
-                for status in &statuses {
-                    let health = format!("{:?}", status.health);
-                    println!(
-                        "{:<20} {:<10} {:<6}",
-                        status.server_id, health, status.tool_count
-                    );
+                let mut names: Vec<&String> = config.servers.keys().collect();
+                names.sort();
+                println!("{:<20} {:<10}", "NAME", "STATUS");
+                for name in names {
+                    println!("{:<20} {:<10}", name, "not_running");
                 }
             }
         }
     }
 
-    server_manager.shutdown_all().await;
     Ok(())
 }
 
@@ -290,6 +408,185 @@ async fn cmd_server_list(
     Ok(())
 }
 
+/// `plug serve --daemon` — start headless daemon with IPC socket.
+///
+/// Creates an Engine, starts it, sets up file logging, then runs the
+/// Unix socket IPC listener until shutdown.
+async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    let engine = plug_core::engine::Engine::new(config);
+    engine.start().await?;
+
+    let cancel = engine.cancel_token().clone();
+
+    // Run daemon IPC listener + signal handler
+    tokio::select! {
+        result = daemon::run_daemon(&engine) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "daemon error");
+            }
+        }
+        _ = daemon::shutdown_signal(cancel) => {}
+    }
+
+    tracing::info!("shutting down");
+    engine.shutdown().await;
+
+    Ok(())
+}
+
+/// `plug daemon stop` — tell the running daemon to shut down.
+async fn cmd_daemon_stop() -> anyhow::Result<()> {
+    let auth_token = match daemon::read_auth_token() {
+        Ok(token) => token,
+        Err(_) => {
+            eprintln!("no plug daemon running");
+            std::process::exit(1);
+        }
+    };
+
+    let request = plug_core::ipc::IpcRequest::Shutdown { auth_token };
+    match daemon::ipc_request(&request).await {
+        Ok(plug_core::ipc::IpcResponse::Ok) => {
+            eprintln!("daemon shutting down");
+        }
+        Ok(plug_core::ipc::IpcResponse::Error { message, .. }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("unexpected response from daemon");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("failed to connect to daemon: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// `plug serve` — start the HTTP server for web-based MCP clients.
+///
+/// Creates an Engine, starts it, builds HttpState from the Engine's
+/// ToolRouter, and serves MCP over HTTP (Streamable HTTP transport).
+/// Optionally also runs the stdio bridge via `--stdio`.
+async fn cmd_serve(
+    config_path: Option<&std::path::PathBuf>,
+    with_stdio: bool,
+) -> anyhow::Result<()> {
+    let config = plug_core::config::load_config(config_path)?;
+
+    let errors = plug_core::config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            tracing::error!("{err}");
+        }
+        anyhow::bail!("config validation failed with {} error(s)", errors.len());
+    }
+
+    // Warn on non-loopback bind address
+    let bind_addr = &config.http.bind_address;
+    if bind_addr != "127.0.0.1" && bind_addr != "::1" && bind_addr != "localhost" {
+        tracing::warn!(
+            bind_address = %bind_addr,
+            "binding to non-loopback address — ensure this is intentional"
+        );
+    }
+
+    let engine = plug_core::engine::Engine::new(config.clone());
+    engine.start().await?;
+
+    let cancel = engine.cancel_token().clone();
+
+    // Build HTTP server state (SessionManager is transport-specific, stays outside Engine)
+    let http_state = Arc::new(plug_core::http::server::HttpState {
+        router: engine.tool_router().clone(),
+        sessions: plug_core::http::session::SessionManager::new(
+            config.http.session_timeout_secs,
+            config.http.max_sessions,
+        ),
+        cancel: cancel.clone(),
+        sse_channel_capacity: config.http.sse_channel_capacity,
+    });
+
+    // Start session cleanup background task
+    http_state.sessions.spawn_cleanup_task(cancel.clone());
+
+    let axum_router = plug_core::http::server::build_router(http_state);
+    let listen_addr = format!("{}:{}", config.http.bind_address, config.http.port);
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {listen_addr}: {e}"))?;
+
+    tracing::info!("HTTP server listening on http://{listen_addr}");
+
+    if with_stdio {
+        // Run HTTP server + stdio bridge simultaneously
+        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+
+        use rmcp::ServiceExt as _;
+        let transport = rmcp::transport::io::stdio();
+        let service = proxy
+            .serve(transport)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start stdio service: {e}"))?;
+
+        tracing::info!("stdio bridge active");
+
+        tokio::select! {
+            result = axum::serve(listener, axum_router)
+                .with_graceful_shutdown(cancel.clone().cancelled_owned()) =>
+            {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "HTTP server error");
+                }
+            }
+            result = service.waiting() => {
+                tracing::info!("stdio client disconnected");
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "stdio service error");
+                }
+                cancel.cancel();
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal");
+                cancel.cancel();
+            }
+        }
+    } else {
+        // HTTP server only
+        tokio::select! {
+            result = axum::serve(listener, axum_router)
+                .with_graceful_shutdown(cancel.clone().cancelled_owned()) =>
+            {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "HTTP server error");
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal");
+                cancel.cancel();
+            }
+        }
+    }
+
+    tracing::info!("shutting down");
+    engine.shutdown().await;
+
+    Ok(())
+}
+
 /// `plug tool list` — list all available tools from upstream servers.
 async fn cmd_tool_list(
     config_path: Option<&std::path::PathBuf>,
@@ -303,7 +600,7 @@ async fn cmd_tool_list(
     // Use ProxyHandler to get the prefixed tool list
     let proxy = plug_core::proxy::ProxyHandler::new(
         server_manager.clone(),
-        config.prefix_delimiter.clone(),
+        router_config(&config),
     );
     proxy.refresh_tools().await;
 
