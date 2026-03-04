@@ -10,27 +10,30 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use dashmap::DashMap;
 use fs2::FileExt as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
-use plug_core::ipc::{self, IpcRequest, IpcResponse, MAX_FRAME_SIZE};
+use plug_core::ipc::{self, IpcRequest, IpcResponse};
 
 /// Maximum concurrent IPC connections.
 const MAX_IPC_CONNECTIONS: usize = 32;
 
-/// Idle timeout for IPC connections (no complete message received).
+/// Idle timeout for short-lived IPC connections (status queries, admin commands).
+/// Proxy connections (those that have called Register) are exempt from this timeout.
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ──────────────────────── Client Registry ─────────────────────────────────────
 
 /// Tracks proxy client sessions connected to the daemon.
+///
+/// Uses a `watch` channel to broadcast client count changes for the grace
+/// period shutdown logic (avoids missed-wakeup races that `Notify` has).
 pub struct ClientRegistry {
     sessions: DashMap<String, ClientSession>,
-    /// Notified whenever the client count changes (for grace period logic).
-    changed: Notify,
+    /// Sends current client count on every change.
+    count_tx: tokio::sync::watch::Sender<usize>,
 }
 
 /// Metadata for a connected proxy client.
@@ -40,11 +43,15 @@ struct ClientSession {
 }
 
 impl ClientRegistry {
-    fn new() -> Self {
-        Self {
-            sessions: DashMap::new(),
-            changed: Notify::new(),
-        }
+    fn new() -> (Self, tokio::sync::watch::Receiver<usize>) {
+        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
+        (
+            Self {
+                sessions: DashMap::new(),
+                count_tx,
+            },
+            count_rx,
+        )
     }
 
     /// Register a new client, returning the assigned session ID.
@@ -62,7 +69,7 @@ impl ClientRegistry {
                 connected_at: Instant::now(),
             },
         );
-        self.changed.notify_waiters();
+        self.count_tx.send_modify(|c| *c = self.sessions.len());
         session_id
     }
 
@@ -75,7 +82,17 @@ impl ClientRegistry {
                 duration_secs = duration.as_secs(),
                 "client deregistered"
             );
-            self.changed.notify_waiters();
+            self.count_tx.send_modify(|c| *c = self.sessions.len());
+        }
+    }
+
+    /// Update client_info for an existing session.
+    fn update_client_info(&self, session_id: &str, client_info: String) -> bool {
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            entry.client_info = Some(client_info);
+            true
+        } else {
+            false
         }
     }
 
@@ -235,69 +252,6 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
-// ──────────────────────── Length-prefixed framing ─────────────────────────────
-
-/// Read a length-prefixed JSON frame from a Unix socket (public for IPC proxy).
-pub async fn read_frame_pub(
-    stream: &mut tokio::net::unix::OwnedReadHalf,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    read_frame(stream).await
-}
-
-/// Read a length-prefixed JSON frame from a Unix socket.
-///
-/// Wire format: 4-byte big-endian u32 length + JSON payload.
-/// Returns None on clean EOF (connection closed).
-async fn read_frame(
-    stream: &mut tokio::net::unix::OwnedReadHalf,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    // Read length prefix
-    let len = match stream.read_u32().await {
-        Ok(len) => len,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-
-    // Enforce max frame size before allocating
-    if len > MAX_FRAME_SIZE {
-        anyhow::bail!("frame too large: {len} bytes (max {MAX_FRAME_SIZE})");
-    }
-
-    let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).await?;
-    Ok(Some(buf))
-}
-
-/// Write a length-prefixed JSON frame to a Unix socket (public for IPC proxy).
-pub async fn write_frame_pub(
-    stream: &mut tokio::net::unix::OwnedWriteHalf,
-    payload: &[u8],
-) -> anyhow::Result<()> {
-    write_frame(stream, payload).await
-}
-
-/// Write a length-prefixed JSON frame to a Unix socket.
-async fn write_frame(
-    stream: &mut tokio::net::unix::OwnedWriteHalf,
-    payload: &[u8],
-) -> anyhow::Result<()> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| anyhow::anyhow!("payload too large: {} bytes", payload.len()))?;
-    stream.write_u32(len).await?;
-    stream.write_all(payload).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Send an IpcResponse as a length-prefixed JSON frame.
-async fn send_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &IpcResponse,
-) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(response)?;
-    write_frame(writer, &payload).await
-}
-
 // ─────────────────────────── Daemon entry point ──────────────────────────────
 
 /// Start the daemon: Engine + Unix socket IPC listener + file logging.
@@ -338,7 +292,12 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
         }
     }
 
-    // Clean up stale socket if it exists
+    // Acquire PID file lock BEFORE socket operations to prevent TOCTOU races.
+    // Two concurrent auto_start_daemon calls: the loser fails here, retries connecting.
+    let pid_file_path = pid_path();
+    let _pid_lock = acquire_pid_lock(&pid_file_path)?;
+
+    // Clean up stale socket if it exists (safe now — we hold the PID lock)
     let sock_path = socket_path();
     if std::fs::symlink_metadata(&sock_path).is_ok() {
         // Try connecting to check if another daemon is alive
@@ -352,16 +311,12 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
         std::fs::remove_file(&sock_path).ok();
     }
 
-    // Bind Unix socket BEFORE writing PID file
+    // Bind Unix socket
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind Unix socket: {}", sock_path.display()))?;
 
     #[cfg(unix)]
     set_file_permissions_0600(&sock_path)?;
-
-    // Acquire PID file lock AFTER socket bind
-    let pid_file_path = pid_path();
-    let _pid_lock = acquire_pid_lock(&pid_file_path)?;
 
     tracing::info!(
         socket = %sock_path.display(),
@@ -372,24 +327,27 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
     let cancel = engine.cancel_token().clone();
     let semaphore = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
-    let client_registry = Arc::new(ClientRegistry::new());
+    let (client_registry, count_rx) = ClientRegistry::new();
+    let client_registry = Arc::new(client_registry);
 
     // Grace period: when the last proxy client disconnects, start a countdown.
     // If no new client connects before it fires, shut down the daemon.
-    // A grace_period_secs of 0 means never auto-shutdown (explicit shutdown only).
+    // A grace_period_secs of 0 means disable auto-shutdown (explicit shutdown only).
     let grace_cancel = CancellationToken::new();
-    let grace_registry = client_registry.clone();
 
     if grace_period_secs > 0 {
         let grace_token = grace_cancel.clone();
         let daemon_cancel = cancel.clone();
+        let mut count_rx = count_rx;
         tokio::spawn(async move {
             loop {
                 // Wait for a change in client count
-                grace_registry.changed.notified().await;
+                if count_rx.changed().await.is_err() {
+                    return; // Sender dropped (registry gone)
+                }
 
-                // If no clients remain, start the grace timer
-                if grace_registry.count() == 0 {
+                let count = *count_rx.borrow();
+                if count == 0 {
                     tracing::info!(
                         grace_secs = grace_period_secs,
                         "last client disconnected, starting grace period"
@@ -397,20 +355,20 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
 
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
-                            // Grace period expired — check again (a client may have connected
-                            // and disconnected without us seeing the notify)
-                            if grace_registry.count() == 0 {
+                            // Grace period expired — recheck count
+                            if *count_rx.borrow() == 0 {
                                 tracing::info!("grace period expired with no clients, shutting down");
                                 daemon_cancel.cancel();
                                 return;
                             }
                         }
-                        _ = grace_registry.changed.notified() => {
-                            // Client count changed — re-check
-                            if grace_registry.count() > 0 {
+                        result = count_rx.changed() => {
+                            if result.is_err() {
+                                return;
+                            }
+                            if *count_rx.borrow() > 0 {
                                 tracing::info!("client reconnected, grace period cancelled");
                             }
-                            // Either way, loop back to the outer wait
                         }
                         _ = grace_token.cancelled() => return,
                     }
@@ -523,23 +481,31 @@ async fn handle_ipc_loop(
     ctx: &mut ConnectionContext,
 ) -> anyhow::Result<()> {
     loop {
-        // Read with idle timeout
-        let frame = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, read_frame(reader)).await;
+        // Proxy connections (those that have Registered) are long-lived and should
+        // not be subject to the idle timeout. Short-lived admin/query connections use
+        // the timeout to reclaim resources.
+        let frame = if ctx.session_id.is_some() {
+            ipc::read_frame(reader).await
+        } else {
+            match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, ipc::read_frame(reader)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::debug!("IPC connection idle timeout");
+                    break;
+                }
+            }
+        };
 
         let frame = match frame {
-            Ok(Ok(Some(data))) => data,
-            Ok(Ok(None)) => break, // clean EOF
-            Ok(Err(e)) => {
+            Ok(Some(data)) => data,
+            Ok(None) => break, // clean EOF
+            Err(e) => {
+                tracing::debug!(error = %e, "IPC frame read error");
                 let resp = IpcResponse::Error {
                     code: "FRAME_ERROR".to_string(),
-                    message: e.to_string(),
+                    message: "malformed frame".to_string(),
                 };
-                send_response(writer, &resp).await.ok();
-                break;
-            }
-            Err(_) => {
-                // Idle timeout
-                tracing::debug!("IPC connection idle timeout");
+                ipc::send_response(writer, &resp).await.ok();
                 break;
             }
         };
@@ -548,11 +514,12 @@ async fn handle_ipc_loop(
         let request: IpcRequest = match serde_json::from_slice(&frame) {
             Ok(req) => req,
             Err(e) => {
+                tracing::debug!(error = %e, "IPC parse error");
                 let resp = IpcResponse::Error {
                     code: "PARSE_ERROR".to_string(),
-                    message: format!("invalid JSON: {e}"),
+                    message: "invalid request format".to_string(),
                 };
-                send_response(writer, &resp).await.ok();
+                ipc::send_response(writer, &resp).await.ok();
                 break;
             }
         };
@@ -566,7 +533,7 @@ async fn handle_ipc_loop(
                             code: "AUTH_FAILED".to_string(),
                             message: "invalid auth token".to_string(),
                         };
-                        send_response(writer, &resp).await?;
+                        ipc::send_response(writer, &resp).await?;
                         continue;
                     }
                 }
@@ -575,7 +542,7 @@ async fn handle_ipc_loop(
                         code: "AUTH_REQUIRED".to_string(),
                         message: "auth_token required for this command".to_string(),
                     };
-                    send_response(writer, &resp).await?;
+                    ipc::send_response(writer, &resp).await?;
                     continue;
                 }
             }
@@ -584,7 +551,7 @@ async fn handle_ipc_loop(
         // Dispatch request
         let response = dispatch_request(&request, ctx).await;
 
-        send_response(writer, &response).await?;
+        ipc::send_response(writer, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
         if matches!(request, IpcRequest::Shutdown { .. }) {
@@ -644,17 +611,25 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::Shutdown { .. } => IpcResponse::Ok,
 
         IpcRequest::Register { client_info } => {
+            // Enforce one registration per connection — deregister previous if exists
+            if let Some(ref old_session) = ctx.session_id {
+                ctx.client_registry.deregister(old_session);
+            }
             let session_id = ctx.client_registry.register(client_info.clone());
-            // Track session on this connection for auto-deregister
             ctx.session_id = Some(session_id.clone());
             IpcResponse::Registered { session_id }
         }
 
         IpcRequest::Deregister { session_id } => {
-            ctx.client_registry.deregister(session_id);
-            if ctx.session_id.as_deref() == Some(session_id.as_str()) {
-                ctx.session_id = None; // Already deregistered, don't double-deregister
+            // Enforce session ownership — only deregister your own session
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
             }
+            ctx.client_registry.deregister(session_id);
+            ctx.session_id = None;
             IpcResponse::Ok
         }
 
@@ -662,8 +637,17 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             client_info,
         } => {
-            if let Some(mut entry) = ctx.client_registry.sessions.get_mut(session_id) {
-                entry.client_info = Some(client_info.clone());
+            // Enforce session ownership
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if ctx
+                .client_registry
+                .update_client_info(session_id, client_info.clone())
+            {
                 tracing::info!(
                     session_id = %session_id,
                     client_info = %client_info,
@@ -673,7 +657,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             } else {
                 IpcResponse::Error {
                     code: "UNKNOWN_SESSION".to_string(),
-                    message: format!("session '{session_id}' not found"),
+                    message: "session not found".to_string(),
                 }
             }
         }
@@ -682,7 +666,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             method,
             params,
-        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await,
+        } => {
+            // Enforce session ownership
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await
+        }
     }
 }
 
@@ -889,10 +882,10 @@ pub async fn ipc_request(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
 
     // Send request
     let payload = serde_json::to_vec(request)?;
-    write_frame(&mut writer, &payload).await?;
+    ipc::write_frame(&mut writer, &payload).await?;
 
     // Read response
-    let frame = read_frame(&mut reader)
+    let frame = ipc::read_frame(&mut reader)
         .await?
         .ok_or_else(|| anyhow::anyhow!("daemon closed connection"))?;
 
@@ -910,6 +903,7 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn auth_token_generation_is_64_hex_chars() {
@@ -976,11 +970,11 @@ mod tests {
         let payload = b"hello world";
 
         let write_task = tokio::spawn(async move {
-            write_frame(&mut w1, payload).await.unwrap();
+            ipc::write_frame(&mut w1, payload).await.unwrap();
         });
 
         let read_task = tokio::spawn(async move {
-            let data = read_frame(&mut r2).await.unwrap().unwrap();
+            let data = ipc::read_frame(&mut r2).await.unwrap().unwrap();
             assert_eq!(data, payload);
         });
 
@@ -995,9 +989,10 @@ mod tests {
         let (mut r2, _w2) = server.into_split();
 
         // Write a length prefix that exceeds MAX_FRAME_SIZE
+        use plug_core::ipc::MAX_FRAME_SIZE;
         w1.write_u32(MAX_FRAME_SIZE + 1).await.unwrap();
 
-        let result = read_frame(&mut r2).await;
+        let result = ipc::read_frame(&mut r2).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("frame too large"));
     }
@@ -1013,17 +1008,17 @@ mod tests {
         let payload = serde_json::to_vec(&request).unwrap();
 
         let client_task = tokio::spawn(async move {
-            write_frame(&mut w_client, &payload).await.unwrap();
+            ipc::write_frame(&mut w_client, &payload).await.unwrap();
 
             // Read response
-            let frame = read_frame(&mut r_client).await.unwrap().unwrap();
+            let frame = ipc::read_frame(&mut r_client).await.unwrap().unwrap();
             let resp: IpcResponse = serde_json::from_slice(&frame).unwrap();
             resp
         });
 
         // Server reads request and sends response
         let server_task = tokio::spawn(async move {
-            let frame = read_frame(&mut r_server).await.unwrap().unwrap();
+            let frame = ipc::read_frame(&mut r_server).await.unwrap().unwrap();
             let req: IpcRequest = serde_json::from_slice(&frame).unwrap();
             assert!(matches!(req, IpcRequest::Status));
 
@@ -1032,7 +1027,7 @@ mod tests {
                 clients: 2,
                 uptime_secs: 100,
             };
-            send_response(&mut w_server, &response).await.unwrap();
+            ipc::send_response(&mut w_server, &response).await.unwrap();
         });
 
         server_task.await.unwrap();

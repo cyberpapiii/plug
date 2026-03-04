@@ -288,9 +288,9 @@ async fn connect_via_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow:
         client_info: None, // Will be updated in Phase 4 via initialize
     };
     let payload = serde_json::to_vec(&register_req)?;
-    daemon::write_frame_pub(&mut writer, &payload).await?;
+    plug_core::ipc::write_frame(&mut writer, &payload).await?;
 
-    let frame = daemon::read_frame_pub(&mut reader)
+    let frame = plug_core::ipc::read_frame(&mut reader)
         .await?
         .ok_or_else(|| anyhow::anyhow!("daemon closed connection during registration"))?;
 
@@ -391,6 +391,20 @@ fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
     cmd.arg("serve").arg("--daemon");
     if let Some(path) = config_path {
         cmd.arg("--config").arg(path);
+    }
+
+    // Sanitize environment: don't leak caller's env vars into the long-lived daemon.
+    // Preserve only what's needed for the daemon to function.
+    let path = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    cmd.env_clear();
+    cmd.env("PATH", &path);
+    cmd.env("HOME", &home);
+    // Pass through SSL cert paths if set (needed for HTTPS upstreams)
+    for key in &["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
     }
 
     // Detach: redirect stdio to /dev/null so the daemon doesn't inherit our stdin/stdout

@@ -10,17 +10,21 @@ use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use tokio::sync::Mutex;
 
-use plug_core::ipc::{IpcRequest, IpcResponse};
-
-use crate::daemon;
+use plug_core::ipc::{self, IpcRequest, IpcResponse};
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
 ///
 /// Holds a persistent IPC connection to the daemon. The connection is
 /// established during `cmd_connect` and reused for all MCP traffic.
+///
+/// A single mutex guards the entire round-trip (write + read) to prevent
+/// concurrent requests from reading each other's responses.
 pub struct IpcProxyHandler {
-    reader: Mutex<tokio::net::unix::OwnedReadHalf>,
-    writer: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    /// Guarded together to ensure request-response pairing.
+    conn: Mutex<(
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+    )>,
     session_id: String,
 }
 
@@ -34,41 +38,33 @@ impl IpcProxyHandler {
         session_id: String,
     ) -> Self {
         Self {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
+            conn: Mutex::new((reader, writer)),
             session_id,
         }
     }
 
     /// Send an IPC request and read the response.
+    ///
+    /// Holds the connection lock for the entire round-trip to ensure
+    /// request-response pairing under concurrent MCP calls.
     async fn ipc_round_trip(&self, request: &IpcRequest) -> Result<IpcResponse, McpError> {
         let payload = serde_json::to_vec(request)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        // Serialize IPC access — one request at a time per connection
-        let mut writer = self.writer.lock().await;
-        daemon::write_frame_pub(&mut writer, &payload)
+        let mut conn = self.conn.lock().await;
+        let (ref mut reader, ref mut writer) = *conn;
+
+        ipc::write_frame(writer, &payload)
             .await
             .map_err(|e| McpError::internal_error(format!("IPC write failed: {e}"), None))?;
-        drop(writer);
 
-        let mut reader = self.reader.lock().await;
-        let frame = daemon::read_frame_pub(&mut reader)
+        let frame = ipc::read_frame(reader)
             .await
             .map_err(|e| McpError::internal_error(format!("IPC read failed: {e}"), None))?
             .ok_or_else(|| McpError::internal_error("daemon closed connection", None))?;
 
         serde_json::from_slice(&frame)
             .map_err(|e| McpError::internal_error(format!("invalid IPC response: {e}"), None))
-    }
-
-    /// Send a deregister request (best-effort, used during shutdown).
-    #[allow(dead_code)]
-    pub async fn deregister(&self) {
-        let request = IpcRequest::Deregister {
-            session_id: self.session_id.clone(),
-        };
-        let _ = self.ipc_round_trip(&request).await;
     }
 }
 
@@ -78,10 +74,6 @@ impl ServerHandler for IpcProxyHandler {
         let mut capabilities = ServerCapabilities::default();
         capabilities.tools = Some(ToolsCapability {
             list_changed: Some(true),
-        });
-        capabilities.resources = Some(ResourcesCapability {
-            list_changed: Some(false),
-            subscribe: None,
         });
 
         InitializeResult::new(capabilities)
@@ -162,18 +154,18 @@ impl ServerHandler for IpcProxyHandler {
 
             match self.ipc_round_trip(&ipc_request).await? {
                 IpcResponse::McpResponse { payload } => {
-                    // The payload might be a successful CallToolResult or an MCP error
-                    // Try CallToolResult first, then try as error
-                    if let Ok(result) = serde_json::from_value::<CallToolResult>(payload.clone()) {
-                        Ok(result)
-                    } else if let Ok(err) = serde_json::from_value::<McpError>(payload) {
-                        Err(err)
-                    } else {
-                        Err(McpError::internal_error(
-                            "unexpected tool call response",
-                            None,
-                        ))
+                    // Check if this is an error response before attempting CallToolResult parse
+                    if payload.get("code").is_some() {
+                        if let Ok(err) = serde_json::from_value::<McpError>(payload.clone()) {
+                            return Err(err);
+                        }
                     }
+                    serde_json::from_value::<CallToolResult>(payload).map_err(|e| {
+                        McpError::internal_error(
+                            format!("unexpected tool call response: {e}"),
+                            None,
+                        )
+                    })
                 }
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))

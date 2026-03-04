@@ -152,6 +152,52 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     }
 }
 
+// ──────────────────────── Length-prefixed framing ─────────────────────────────
+
+/// Read a length-prefixed JSON frame from an async reader.
+///
+/// Wire format: 4-byte big-endian u32 length + JSON payload.
+/// Returns None on clean EOF (connection closed).
+pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let len = match reader.read_u32().await {
+        Ok(len) => len,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    if len > MAX_FRAME_SIZE {
+        anyhow::bail!("frame too large: {len} bytes (max {MAX_FRAME_SIZE})");
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf).await?;
+    Ok(Some(buf))
+}
+
+/// Write a length-prefixed JSON frame to an async writer.
+pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("payload too large: {} bytes", payload.len()))?;
+    writer.write_u32(len).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Send an IpcResponse as a length-prefixed JSON frame.
+pub async fn send_response<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    response: &IpcResponse,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(response)?;
+    write_frame(writer, &payload).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

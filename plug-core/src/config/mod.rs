@@ -35,7 +35,7 @@ pub struct Config {
     #[serde(default)]
     pub http: HttpConfig,
     /// Seconds to keep daemon alive after last client disconnects (default: 60).
-    /// Set to 0 to shut down immediately when no clients remain.
+    /// Set to 0 to disable auto-shutdown (daemon stays alive indefinitely).
     #[serde(default = "default_grace_period")]
     pub daemon_grace_period_secs: u64,
     /// Upstream server definitions.
