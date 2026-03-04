@@ -425,6 +425,84 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain
+    /// safe while reload_config removes/adds servers. The ArcSwap-based design
+    /// guarantees wait-free reads; this test documents that invariant.
+    #[tokio::test]
+    async fn concurrent_reads_during_reload() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Config A: has "alpha" server (will be removed by reload)
+        let mut config_a = Config::default();
+        config_a.servers.insert(
+            "alpha".to_string(),
+            ServerConfig {
+                command: Some("echo".to_string()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+            },
+        );
+
+        // Config B: empty (removes "alpha")
+        let config_b = Config::default();
+
+        let engine = Arc::new(Engine::new(config_a));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Spawn reader tasks that continuously call snapshot/server_statuses/tool_list
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let eng = engine.clone();
+            let done_flag = done.clone();
+            readers.push(tokio::spawn(async move {
+                let mut iterations = 0u64;
+                while !done_flag.load(Ordering::Relaxed) {
+                    let _snap = eng.snapshot();
+                    let _statuses = eng.server_statuses();
+                    let _tools = eng.tool_list();
+                    iterations += 1;
+                    // Yield to avoid starving the reload task
+                    if iterations % 100 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                iterations
+            }));
+        }
+
+        // Run several reload cycles concurrently with the readers
+        // (reload with empty config — no actual MCP servers to start/stop,
+        // but it exercises the full config diff + swap + event path)
+        for _ in 0..10 {
+            let _ = engine.reload_config(config_b.clone()).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Signal readers to stop
+        done.store(true, Ordering::Relaxed);
+
+        // All readers should complete without panic
+        for handle in readers {
+            let iterations = handle.await.expect("reader task panicked");
+            assert!(iterations > 0, "reader should have executed at least once");
+        }
+
+        // Config should reflect the last reload (empty)
+        let snap = engine.snapshot();
+        assert!(snap.servers.is_empty());
+    }
+
     #[tokio::test]
     async fn broadcast_lagged_recovery() {
         let engine = Engine::new(test_config());

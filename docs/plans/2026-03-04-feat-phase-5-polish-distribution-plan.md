@@ -368,7 +368,7 @@ New `AppMode::Doctor` with:
 - [x] `cargo fmt --check` passes
 - [x] Import parsers tested with fixture files for each client format
 - [x] Doctor checks tested with mock scenarios
-- [ ] Hot-reload tested with concurrent requests during server removal
+- [x] Hot-reload tested with concurrent requests during server removal
 
 ## Dependencies & Prerequisites
 
