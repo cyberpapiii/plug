@@ -36,3 +36,6 @@ fs2.workspace = true
 subtle.workspace = true
 hex.workspace = true
 directories.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+dirs.workspace = true
