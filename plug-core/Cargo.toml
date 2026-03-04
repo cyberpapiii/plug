@@ -30,6 +30,10 @@ tokio-util.workspace = true
 http.workspace = true
 bytes.workspace = true
 
+# Import/Export (Phase 5)
+dirs.workspace = true
+toml.workspace = true
+
 # Resilience (Phase 3)
 backon.workspace = true
 rand.workspace = true

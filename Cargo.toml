@@ -55,6 +55,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Paths
 directories = "6"
+dirs = "6"
+
+# TOML parsing (import/export)
+toml = "0.8"
 
 # Async utilities
 futures = "0.3"
