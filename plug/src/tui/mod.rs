@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 
 use plug_core::engine::Engine;
 
-use self::app::{App, AppMode};
+use self::app::{App, AppMode, PendingAction};
 use self::theme::Theme;
 
 /// Run the TUI dashboard event loop.
@@ -48,6 +48,24 @@ pub async fn run(engine: &Engine) -> anyhow::Result<()> {
 
             Some(Ok(event)) = crossterm_events.next() => {
                 app.handle_input(event);
+
+                // Dispatch confirmed actions (e.g., server restart)
+                if let Some(action) = app.take_confirmed_action() {
+                    match action {
+                        PendingAction::RestartServer(id) => {
+                            let result = engine.restart_server(&id).await;
+                            if let Err(e) = result {
+                                tracing::error!(server = %id, error = %e, "restart failed");
+                            }
+                        }
+                        PendingAction::ToggleServer(id, enabled) => {
+                            let result = engine.set_server_enabled(&id, enabled).await;
+                            if let Err(e) = result {
+                                tracing::error!(server = %id, error = %e, "toggle failed");
+                            }
+                        }
+                    }
+                }
             }
 
             result = engine_rx.recv() => {
@@ -95,17 +113,23 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
     let main_area = chunks[0];
     let status_area = chunks[1];
 
-    // Render confirmation prompt if active
+    // Render confirmation prompt, search bar, or context status bar
     if let Some(ref confirm) = app.confirm {
         render_status_bar(f, status_area, &confirm.message, theme);
+    } else if app.search_active {
+        let query = app.search_query.as_deref().unwrap_or("");
+        let status = format!(" /{query}▏");
+        render_status_bar(f, status_area, &status, theme);
     } else {
+        let search_hint = if app.search_query.is_some() { " [filtered]" } else { "" };
         let status = match &app.mode {
             AppMode::Dashboard => format!(
-                " {} servers | {} tools | Tab: cycle panels | ?: help | q: quit",
+                " {} servers | {} tools | Tab: cycle | /: search | ?: help | q: quit{}",
                 app.servers.len(),
                 app.tool_count,
+                search_hint,
             ),
-            AppMode::Tools => " Tools | j/k: navigate | Enter: details | Esc: back".to_string(),
+            AppMode::Tools => format!(" Tools | j/k: navigate | Enter: details | /: search | Esc: back{search_hint}"),
             AppMode::ToolDetail(name) => format!(" Tool: {name} | Esc: back"),
             AppMode::Logs => " Logs | Esc: back".to_string(),
             AppMode::Help => " Help | press any key to dismiss".to_string(),

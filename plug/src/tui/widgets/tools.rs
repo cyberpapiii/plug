@@ -12,13 +12,22 @@ use crate::tui::theme::Theme;
 
 /// Render the tools view (full-screen mode).
 pub fn render(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let filtered = app.filtered_tools();
+    let total = app.tools.len();
+    let shown = filtered.len();
+
+    let title = if shown < total {
+        format!(" Tools ({shown}/{total}) ")
+    } else {
+        format!(" Tools ({total}) ")
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_focused)
-        .title(Line::from(format!(" Tools ({}) ", app.tools.len())));
+        .title(Line::from(title));
 
-    let items: Vec<ListItem> = app
-        .tools
+    let items: Vec<ListItem> = filtered
         .iter()
         .map(|tool| {
             let desc = if tool.description.len() > 60 {

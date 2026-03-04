@@ -110,9 +110,13 @@ pub struct App {
 
     // Search
     pub search_query: Option<String>,
+    pub search_active: bool,
 
     // Confirmation prompt
     pub confirm: Option<ConfirmAction>,
+
+    // Confirmed action ready for dispatch
+    pending_confirmed: Option<PendingAction>,
 
     // Totals
     pub tool_count: usize,
@@ -153,7 +157,9 @@ impl App {
             tools: Vec::new(),
             tool_state: ListState::default(),
             search_query: None,
+            search_active: false,
             confirm: None,
+            pending_confirmed: None,
             tool_count: snapshot.tool_count,
         }
     }
@@ -198,6 +204,39 @@ impl App {
             }
             return;
         };
+
+        // If search is active, handle search input
+        if self.search_active {
+            match code {
+                KeyCode::Esc => {
+                    self.search_active = false;
+                    self.search_query = None;
+                    self.dirty = true;
+                }
+                KeyCode::Enter => {
+                    self.search_active = false;
+                    // Keep search_query for filtering
+                    self.dirty = true;
+                }
+                KeyCode::Backspace => {
+                    if let Some(ref mut q) = self.search_query {
+                        q.pop();
+                        if q.is_empty() {
+                            self.search_query = None;
+                        }
+                    }
+                    self.dirty = true;
+                }
+                KeyCode::Char(c) => {
+                    self.search_query
+                        .get_or_insert_with(String::new)
+                        .push(c);
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // If confirmation is pending, handle y/n/Esc
         if let Some(ref confirm) = self.confirm {
@@ -330,6 +369,11 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('/') => {
+                self.search_active = true;
+                self.search_query = Some(String::new());
+                self.dirty = true;
+            }
             _ => {}
         }
     }
@@ -397,10 +441,14 @@ impl App {
         }
     }
 
-    fn execute_confirmed_action(&mut self, _action: PendingAction) {
-        // Action execution happens in the TUI event loop (needs &Engine).
-        // The app stores the confirmed action for the loop to pick up.
-        // This is handled in the main TUI loop, not here.
+    fn execute_confirmed_action(&mut self, action: PendingAction) {
+        // Store the action for the TUI event loop to pick up and dispatch.
+        self.pending_confirmed = Some(action);
+    }
+
+    /// Take a confirmed action if one is pending (for the TUI loop to dispatch).
+    pub fn take_confirmed_action(&mut self) -> Option<PendingAction> {
+        self.pending_confirmed.take()
     }
 
     /// Process an Engine event and update local state.
@@ -532,6 +580,24 @@ impl App {
         }
 
         changed
+    }
+
+    /// Return tools filtered by search query (if any).
+    pub fn filtered_tools(&self) -> Vec<&ToolInfo> {
+        match &self.search_query {
+            Some(q) if !q.is_empty() => {
+                let q_lower = q.to_lowercase();
+                self.tools
+                    .iter()
+                    .filter(|t| {
+                        t.name.to_lowercase().contains(&q_lower)
+                            || t.server_id.to_lowercase().contains(&q_lower)
+                            || t.description.to_lowercase().contains(&q_lower)
+                    })
+                    .collect()
+            }
+            _ => self.tools.iter().collect(),
+        }
     }
 
     /// Return the selected server ID (if any).
@@ -718,5 +784,95 @@ mod tests {
         app.handle_input(q);
         assert!(!app.should_quit);
         assert_eq!(app.mode, AppMode::Dashboard);
+    }
+
+    #[test]
+    fn search_filters_tools() {
+        let mut app = App::new(test_snapshot());
+        app.tools = vec![
+            ToolInfo {
+                name: "create_issue".to_string(),
+                server_id: "github".to_string(),
+                description: "Create a GitHub issue".to_string(),
+            },
+            ToolInfo {
+                name: "read_file".to_string(),
+                server_id: "filesystem".to_string(),
+                description: "Read a file".to_string(),
+            },
+            ToolInfo {
+                name: "write_file".to_string(),
+                server_id: "filesystem".to_string(),
+                description: "Write a file".to_string(),
+            },
+        ];
+
+        // No filter — all tools
+        assert_eq!(app.filtered_tools().len(), 3);
+
+        // Filter by name
+        app.search_query = Some("file".to_string());
+        assert_eq!(app.filtered_tools().len(), 2);
+
+        // Filter by server
+        app.search_query = Some("github".to_string());
+        assert_eq!(app.filtered_tools().len(), 1);
+        assert_eq!(app.filtered_tools()[0].name, "create_issue");
+
+        // Filter with no matches
+        app.search_query = Some("zzzzz".to_string());
+        assert_eq!(app.filtered_tools().len(), 0);
+
+        // Clear filter
+        app.search_query = None;
+        assert_eq!(app.filtered_tools().len(), 3);
+    }
+
+    #[test]
+    fn search_mode_activation() {
+        let mut app = App::new(test_snapshot());
+        assert!(!app.search_active);
+
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // Activate search with /
+        let slash = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_input(slash);
+        assert!(app.search_active);
+        assert_eq!(app.search_query, Some(String::new()));
+
+        // Type a character
+        let a = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_input(a);
+        assert_eq!(app.search_query, Some("a".to_string()));
+
+        // Escape cancels search
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input(esc);
+        assert!(!app.search_active);
+        assert_eq!(app.search_query, None);
+    }
+
+    #[test]
+    fn confirm_action_flow() {
+        let mut app = App::new(test_snapshot());
+
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // Select first server and press 'r'
+        app.server_state.select(Some(0));
+        let r = Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_input(r);
+        assert!(app.confirm.is_some());
+
+        // Press 'y' to confirm
+        let y = Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_input(y);
+        assert!(app.confirm.is_none());
+        assert!(app.pending_confirmed.is_some());
+
+        // Take the action
+        let action = app.take_confirmed_action();
+        assert!(matches!(action, Some(PendingAction::RestartServer(_))));
     }
 }
