@@ -207,7 +207,7 @@ async fn cmd_status(
     let server_manager = Arc::new(plug_core::server::ServerManager::new());
     server_manager.start_all(&config).await?;
 
-    let statuses = server_manager.server_statuses().await;
+    let statuses = server_manager.server_statuses();
 
     match output {
         OutputFormat::Json => {

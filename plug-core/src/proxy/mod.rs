@@ -14,14 +14,13 @@ use crate::server::ServerManager;
 
 /// Atomically-swapped tool cache: tool list + routing table together.
 /// Stored in a single ArcSwap to prevent torn reads between list_tools and call_tool.
-struct ToolCache {
-    routes: HashMap<String, String>,
-    tools: Vec<Tool>,
+pub(crate) struct ToolCache {
+    pub routes: HashMap<String, String>,
+    pub tools: Arc<Vec<Tool>>,
 }
 
-/// MCP proxy handler that aggregates tools from multiple upstream servers
-/// and routes tool calls to the correct upstream.
-pub struct ProxyHandler {
+/// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
+pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
     /// Combined tool cache (routes + definitions) swapped atomically
     cache: Arc<ArcSwap<ToolCache>>,
@@ -29,13 +28,13 @@ pub struct ProxyHandler {
     prefix_delimiter: String,
 }
 
-impl ProxyHandler {
+impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, prefix_delimiter: String) -> Self {
         Self {
             server_manager,
             cache: Arc::new(ArcSwap::from_pointee(ToolCache {
                 routes: HashMap::new(),
-                tools: Vec::new(),
+                tools: Arc::new(Vec::new()),
             })),
             prefix_delimiter,
         }
@@ -67,7 +66,108 @@ impl ProxyHandler {
         );
 
         // Atomic swap of both routes and tools together
-        self.cache.store(Arc::new(ToolCache { routes, tools }));
+        self.cache.store(Arc::new(ToolCache {
+            routes,
+            tools: Arc::new(tools),
+        }));
+    }
+
+    /// Get the current list of tools (zero-copy via Arc).
+    pub fn list_tools(&self) -> Arc<Vec<Tool>> {
+        Arc::clone(&self.cache.load().tools)
+    }
+
+    /// Call a tool by its prefixed name, routing to the correct upstream server.
+    pub async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        // Look up the server for this prefixed tool name
+        let cache = self.cache.load();
+        let server_id = cache.routes.get(tool_name).ok_or_else(|| {
+            McpError::from(ProtocolError::ToolNotFound {
+                tool_name: tool_name.to_string(),
+            })
+        })?;
+
+        // Strip the prefix to get the original tool name
+        let original_name = tool_name
+            .strip_prefix(server_id.as_str())
+            .and_then(|s| s.strip_prefix(&self.prefix_delimiter))
+            .unwrap_or(tool_name);
+
+        let server_id = server_id.clone();
+        let original_name = original_name.to_string();
+        drop(cache);
+
+        // Get the upstream server — wait-free via ArcSwap
+        let upstream = self.server_manager.get_upstream(&server_id).ok_or_else(|| {
+            McpError::from(ProtocolError::ServerUnavailable {
+                server_id: server_id.clone(),
+            })
+        })?;
+
+        let peer = upstream.client.peer().clone();
+        drop(upstream); // Release Arc early
+
+        // Build the upstream call with the original (unprefixed) tool name
+        let mut upstream_params = CallToolRequestParams::new(original_name.clone());
+        if let Some(args) = arguments {
+            upstream_params = upstream_params.with_arguments(args);
+        }
+
+        let result: CallToolResult = peer
+            .call_tool(upstream_params)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    server = %server_id,
+                    tool = %original_name,
+                    error = %e,
+                    "upstream tool call failed"
+                );
+                match e {
+                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                    other => McpError::internal_error(other.to_string(), None),
+                }
+            })?;
+
+        Ok(result)
+    }
+
+    /// Get a reference to the underlying ServerManager.
+    pub fn server_manager(&self) -> &Arc<ServerManager> {
+        &self.server_manager
+    }
+}
+
+/// MCP proxy handler that aggregates tools from multiple upstream servers
+/// and routes tool calls to the correct upstream. Used for stdio transport.
+pub struct ProxyHandler {
+    router: Arc<ToolRouter>,
+}
+
+impl ProxyHandler {
+    pub fn new(server_manager: Arc<ServerManager>, prefix_delimiter: String) -> Self {
+        Self {
+            router: Arc::new(ToolRouter::new(server_manager, prefix_delimiter)),
+        }
+    }
+
+    /// Create a ProxyHandler from an existing shared ToolRouter.
+    pub fn from_router(router: Arc<ToolRouter>) -> Self {
+        Self { router }
+    }
+
+    /// Refresh the merged tool list and routing table from all upstream servers.
+    pub async fn refresh_tools(&self) {
+        self.router.refresh_tools().await;
+    }
+
+    /// Get a reference to the underlying ToolRouter.
+    pub fn router(&self) -> &Arc<ToolRouter> {
+        &self.router
     }
 }
 
@@ -112,8 +212,8 @@ impl ServerHandler for ProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
-            let cache = self.cache.load();
-            Ok(ListToolsResult::with_all_items(cache.tools.clone()))
+            let tools = self.router.list_tools();
+            Ok(ListToolsResult::with_all_items((*tools).clone()))
         }
     }
 
@@ -123,61 +223,9 @@ impl ServerHandler for ProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
-            let tool_name = request.name.as_ref();
-
-            // Look up the server for this prefixed tool name
-            let cache = self.cache.load();
-            let server_id = cache.routes.get(tool_name).ok_or_else(|| {
-                McpError::from(ProtocolError::ToolNotFound {
-                    tool_name: tool_name.to_string(),
-                })
-            })?;
-
-            // Strip the prefix to get the original tool name
-            let original_name = tool_name
-                .strip_prefix(server_id.as_str())
-                .and_then(|s| s.strip_prefix(&self.prefix_delimiter))
-                .unwrap_or(tool_name);
-
-            let server_id = server_id.clone();
-            let original_name = original_name.to_string();
-            drop(cache);
-
-            // Get the upstream server's peer — clone and release lock immediately
-            let peer = {
-                let guard = self.server_manager.get_server(&server_id).await.ok_or_else(|| {
-                    McpError::from(ProtocolError::ServerUnavailable {
-                        server_id: server_id.clone(),
-                    })
-                })?;
-                let upstream = &guard[&server_id];
-                upstream.client.peer().clone()
-            };
-            // Lock is released here
-
-            // Build the upstream call with the original (unprefixed) tool name
-            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-            if let Some(args) = request.arguments {
-                upstream_params = upstream_params.with_arguments(args);
-            }
-
-            let result: CallToolResult = peer
-                .call_tool(upstream_params)
+            self.router
+                .call_tool(request.name.as_ref(), request.arguments)
                 .await
-                .map_err(|e| {
-                    tracing::error!(
-                        server = %server_id,
-                        tool = %original_name,
-                        error = %e,
-                        "upstream tool call failed"
-                    );
-                    match e {
-                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
-                    }
-                })?;
-
-            Ok(result)
         }
     }
 
@@ -224,8 +272,19 @@ mod tests {
         let handler = ProxyHandler::new(sm, "__".to_string());
         handler.refresh_tools().await;
 
-        let cache = handler.cache.load();
-        assert!(cache.tools.is_empty());
-        assert!(cache.routes.is_empty());
+        let tools = handler.router().list_tools();
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_router_list_tools_returns_arc() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, "__".to_string());
+        router.refresh_tools().await;
+
+        let tools1 = router.list_tools();
+        let tools2 = router.list_tools();
+        // Both should point to the same allocation (Arc)
+        assert!(Arc::ptr_eq(&tools1, &tools2));
     }
 }
