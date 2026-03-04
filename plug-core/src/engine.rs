@@ -301,20 +301,26 @@ impl Engine {
         }
     }
 
-    /// Enable or disable a server. Data-in pattern — caller specifies
-    /// the desired state explicitly.
+    /// Enable or disable a server. Clones the current config, toggles the
+    /// `enabled` field, and applies via `reload_config` for a clean diff.
     pub async fn set_server_enabled(
         &self,
-        _server_id: &str,
-        _enabled: bool,
+        server_id: &str,
+        enabled: bool,
     ) -> Result<(), anyhow::Error> {
-        // TODO: Implement in Sub-phase C when config hot-reload is added.
-        // For now, this is a placeholder that validates the server exists.
-        let config = self.config.load();
-        if !config.servers.contains_key(_server_id) {
-            anyhow::bail!("unknown server: {_server_id}");
+        let mut new_config = (**self.config.load()).clone();
+        let server = new_config
+            .servers
+            .get_mut(server_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?;
+
+        if server.enabled == enabled {
+            return Ok(()); // No change needed
         }
-        anyhow::bail!("set_server_enabled not yet implemented — requires config hot-reload")
+
+        server.enabled = enabled;
+        self.reload_config(new_config).await?;
+        Ok(())
     }
 
     /// Reload configuration from a new Config.

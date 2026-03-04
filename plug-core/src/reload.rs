@@ -3,7 +3,7 @@
 //! Reload is triggered by:
 //! - SIGHUP signal (Unix only)
 //! - `plug reload` CLI command via daemon IPC
-//! - File watcher (optional, future)
+//! - File watcher (`watcher.rs`, 500ms debounce via `notify`)
 
 use std::collections::HashSet;
 
