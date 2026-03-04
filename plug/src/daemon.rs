@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use dashmap::DashMap;
 use fs2::FileExt as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -22,6 +23,69 @@ const MAX_IPC_CONNECTIONS: usize = 32;
 
 /// Idle timeout for IPC connections (no complete message received).
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ──────────────────────── Client Registry ─────────────────────────────────────
+
+/// Tracks proxy client sessions connected to the daemon.
+pub struct ClientRegistry {
+    sessions: DashMap<String, ClientSession>,
+}
+
+/// Metadata for a connected proxy client.
+struct ClientSession {
+    client_info: Option<String>,
+    connected_at: Instant,
+}
+
+impl ClientRegistry {
+    fn new() -> Self {
+        Self {
+            sessions: DashMap::new(),
+        }
+    }
+
+    /// Register a new client, returning the assigned session ID.
+    fn register(&self, client_info: Option<String>) -> String {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        tracing::info!(
+            session_id = %session_id,
+            client_info = ?client_info,
+            "client registered"
+        );
+        self.sessions.insert(
+            session_id.clone(),
+            ClientSession {
+                client_info,
+                connected_at: Instant::now(),
+            },
+        );
+        session_id
+    }
+
+    /// Deregister a client session.
+    fn deregister(&self, session_id: &str) {
+        if let Some((_, session)) = self.sessions.remove(session_id) {
+            let duration = session.connected_at.elapsed();
+            tracing::info!(
+                session_id = %session_id,
+                duration_secs = duration.as_secs(),
+                "client deregistered"
+            );
+        }
+    }
+
+    /// Get the client_info string for a session (for client type detection).
+    fn client_info(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.client_info.clone())
+    }
+
+    /// Number of currently connected clients.
+    fn count(&self) -> usize {
+        self.sessions.len()
+    }
+}
 
 // ──────────────────────────────── Path helpers ────────────────────────────────
 
@@ -288,6 +352,7 @@ pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
     let cancel = engine.cancel_token().clone();
     let semaphore = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
+    let client_registry = Arc::new(ClientRegistry::new());
 
     // Accept IPC connections until shutdown
     loop {
@@ -312,6 +377,7 @@ pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
                         let snapshot = engine.snapshot();
                         let auth = auth_token.clone();
                         let engine_clone = engine.clone();
+                        let registry = client_registry.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit; // held for connection lifetime
@@ -324,6 +390,8 @@ pub async fn run_daemon(engine: Arc<Engine>) -> anyhow::Result<()> {
                                 server_manager,
                                 engine: engine_clone,
                                 started_at,
+                                client_registry: registry,
+                                session_id: None,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
@@ -355,18 +423,40 @@ struct ConnectionContext {
     server_manager: Arc<plug_core::server::ServerManager>,
     engine: Arc<Engine>,
     started_at: Instant,
+    client_registry: Arc<ClientRegistry>,
+    /// Session ID assigned during Register (for auto-deregister on disconnect).
+    session_id: Option<String>,
 }
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
+///
+/// Auto-deregisters any session created via `Register` when the connection closes
+/// (clean EOF, error, or idle timeout).
 async fn handle_ipc_connection(
     stream: tokio::net::UnixStream,
-    ctx: ConnectionContext,
+    mut ctx: ConnectionContext,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
+    let result = handle_ipc_loop(&mut reader, &mut writer, &mut ctx).await;
+
+    // Auto-deregister on disconnect (clean or crash)
+    if let Some(ref session_id) = ctx.session_id {
+        ctx.client_registry.deregister(session_id);
+    }
+
+    result
+}
+
+/// Inner loop for IPC connection handling.
+async fn handle_ipc_loop(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &mut ConnectionContext,
+) -> anyhow::Result<()> {
     loop {
         // Read with idle timeout
-        let frame = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, read_frame(&mut reader)).await;
+        let frame = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, read_frame(reader)).await;
 
         let frame = match frame {
             Ok(Ok(Some(data))) => data,
@@ -376,7 +466,7 @@ async fn handle_ipc_connection(
                     code: "FRAME_ERROR".to_string(),
                     message: e.to_string(),
                 };
-                send_response(&mut writer, &resp).await.ok();
+                send_response(writer, &resp).await.ok();
                 break;
             }
             Err(_) => {
@@ -394,12 +484,12 @@ async fn handle_ipc_connection(
                     code: "PARSE_ERROR".to_string(),
                     message: format!("invalid JSON: {e}"),
                 };
-                send_response(&mut writer, &resp).await.ok();
+                send_response(writer, &resp).await.ok();
                 break;
             }
         };
 
-        // Auth check for mutating commands
+        // Auth check for admin commands
         if ipc::requires_auth(&request) {
             match ipc::extract_auth_token(&request) {
                 Some(provided) => {
@@ -408,7 +498,7 @@ async fn handle_ipc_connection(
                             code: "AUTH_FAILED".to_string(),
                             message: "invalid auth token".to_string(),
                         };
-                        send_response(&mut writer, &resp).await?;
+                        send_response(writer, &resp).await?;
                         continue;
                     }
                 }
@@ -417,16 +507,16 @@ async fn handle_ipc_connection(
                         code: "AUTH_REQUIRED".to_string(),
                         message: "auth_token required for this command".to_string(),
                     };
-                    send_response(&mut writer, &resp).await?;
+                    send_response(writer, &resp).await?;
                     continue;
                 }
             }
         }
 
         // Dispatch request
-        let response = dispatch_request(&request, &ctx).await;
+        let response = dispatch_request(&request, ctx).await;
 
-        send_response(&mut writer, &response).await?;
+        send_response(writer, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
         if matches!(request, IpcRequest::Shutdown { .. }) {
@@ -439,27 +529,23 @@ async fn handle_ipc_connection(
 }
 
 /// Dispatch a single IPC request to the appropriate Engine query.
-async fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcResponse {
+async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     match request {
         IpcRequest::Status => {
             let servers = ctx.server_manager.server_statuses();
             IpcResponse::Status {
                 servers,
-                clients: 0, // TODO: track client count in Engine
+                clients: ctx.client_registry.count(),
                 uptime_secs: ctx.started_at.elapsed().as_secs(),
             }
         }
         IpcRequest::RestartServer { server_id, .. } => {
-            let statuses = ctx.server_manager.server_statuses();
-            if !statuses.iter().any(|s| s.server_id == *server_id) {
-                return IpcResponse::Error {
-                    code: "UNKNOWN_SERVER".to_string(),
-                    message: format!("server '{server_id}' not found"),
-                };
-            }
-            IpcResponse::Error {
-                code: "NOT_IMPLEMENTED".to_string(),
-                message: "server restart via IPC not yet supported".to_string(),
+            match ctx.engine.restart_server(server_id).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(e) => IpcResponse::Error {
+                    code: "RESTART_FAILED".to_string(),
+                    message: e.to_string(),
+                },
             }
         }
         IpcRequest::Reload { .. } => {
@@ -488,6 +574,113 @@ async fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcR
             }
         }
         IpcRequest::Shutdown { .. } => IpcResponse::Ok,
+
+        IpcRequest::Register { client_info } => {
+            let session_id = ctx.client_registry.register(client_info.clone());
+            // Track session on this connection for auto-deregister
+            ctx.session_id = Some(session_id.clone());
+            IpcResponse::Registered { session_id }
+        }
+
+        IpcRequest::Deregister { session_id } => {
+            ctx.client_registry.deregister(session_id);
+            if ctx.session_id.as_deref() == Some(session_id.as_str()) {
+                ctx.session_id = None; // Already deregistered, don't double-deregister
+            }
+            IpcResponse::Ok
+        }
+
+        IpcRequest::McpRequest {
+            session_id,
+            method,
+            params,
+        } => {
+            dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await
+        }
+    }
+}
+
+/// Dispatch an MCP JSON-RPC request through the daemon's shared ToolRouter.
+async fn dispatch_mcp_request(
+    ctx: &ConnectionContext,
+    session_id: &str,
+    method: &str,
+    params: Option<&serde_json::Value>,
+) -> IpcResponse {
+    let tool_router = ctx.engine.tool_router();
+
+    match method {
+        "tools/list" => {
+            // Determine client type from session's client_info
+            let client_type = ctx
+                .client_registry
+                .client_info(session_id)
+                .map(|info| plug_core::client_detect::detect_client(&info))
+                .unwrap_or(plug_core::types::ClientType::Unknown);
+
+            let tools = tool_router.list_tools_for_client(client_type);
+            let result = rmcp::model::ListToolsResult::with_all_items((*tools).clone());
+            match serde_json::to_value(result) {
+                Ok(payload) => IpcResponse::McpResponse { payload },
+                Err(e) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        "tools/call" => {
+            // Extract tool name and arguments from params
+            let (name, arguments) = match params {
+                Some(p) => {
+                    let name = p
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = p
+                        .get("arguments")
+                        .and_then(|v| v.as_object())
+                        .cloned();
+                    (name, arguments)
+                }
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "tools/call requires 'name' in params".to_string(),
+                    };
+                }
+            };
+
+            if name.is_empty() {
+                return IpcResponse::Error {
+                    code: "INVALID_PARAMS".to_string(),
+                    message: "tools/call requires non-empty 'name'".to_string(),
+                };
+            }
+
+            match tool_router.call_tool(&name, arguments).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        _ => IpcResponse::Error {
+            code: "UNSUPPORTED_METHOD".to_string(),
+            message: format!("MCP method '{method}' not supported via IPC proxy"),
+        },
     }
 }
 
