@@ -22,13 +22,16 @@ use rmcp::handler::server::ServerHandler;
 #[tokio::test]
 async fn test_proxy_handler_refresh_tools_empty() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig {
-        prefix_delimiter: "__".to_string(),
-        priority_tools: Vec::new(),
-        tool_description_max_chars: None,
-        tool_search_threshold: 50,
-        tool_filter_enabled: true,
-    });
+    let handler = ProxyHandler::new(
+        sm,
+        plug_core::proxy::RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            tool_filter_enabled: true,
+        },
+    );
     handler.refresh_tools().await;
 
     // Verify the handler still works (get_info returns valid info)
@@ -43,13 +46,16 @@ async fn test_proxy_handler_refresh_tools_empty() {
 #[test]
 fn test_proxy_handler_get_info() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig {
-        prefix_delimiter: "__".to_string(),
-        priority_tools: Vec::new(),
-        tool_description_max_chars: None,
-        tool_search_threshold: 50,
-        tool_filter_enabled: true,
-    });
+    let handler = ProxyHandler::new(
+        sm,
+        plug_core::proxy::RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            tool_filter_enabled: true,
+        },
+    );
     let info = handler.get_info();
 
     assert_eq!(info.server_info.name, "plug");
@@ -69,7 +75,10 @@ fn test_proxy_handler_get_info() {
 async fn test_server_manager_tools_empty() {
     let sm = Arc::new(ServerManager::new());
     let tools = sm.get_tools().await;
-    assert!(tools.is_empty(), "expected no tools from empty ServerManager");
+    assert!(
+        tools.is_empty(),
+        "expected no tools from empty ServerManager"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -80,13 +89,16 @@ async fn test_server_manager_tools_empty() {
 fn test_resources_capability_present() {
     // The ProxyHandler advertises resources capability (returns empty list, not error).
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig {
-        prefix_delimiter: "__".to_string(),
-        priority_tools: Vec::new(),
-        tool_description_max_chars: None,
-        tool_search_threshold: 50,
-        tool_filter_enabled: true,
-    });
+    let handler = ProxyHandler::new(
+        sm,
+        plug_core::proxy::RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            tool_filter_enabled: true,
+        },
+    );
     let info = handler.get_info();
 
     assert!(
@@ -100,13 +112,16 @@ fn test_prompts_not_advertised() {
     // The ProxyHandler does not advertise prompts capability in server info,
     // but the trait default returns Ok(empty) so it won't error if called.
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig {
-        prefix_delimiter: "__".to_string(),
-        priority_tools: Vec::new(),
-        tool_description_max_chars: None,
-        tool_search_threshold: 50,
-        tool_filter_enabled: true,
-    });
+    let handler = ProxyHandler::new(
+        sm,
+        plug_core::proxy::RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            tool_filter_enabled: true,
+        },
+    );
     let info = handler.get_info();
 
     // prompts is None in capabilities (default), which means list_prompts
@@ -181,8 +196,8 @@ fn test_config_loading_defaults() {
 
 #[test]
 fn test_config_loading_from_toml() {
-    use figment::providers::{Format, Serialized, Toml};
     use figment::Figment;
+    use figment::providers::{Format, Serialized, Toml};
 
     let toml_str = r#"
         log_level = "debug"

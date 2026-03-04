@@ -76,7 +76,10 @@ impl Theme {
     }
 
     /// Return the health indicator symbol and style for a given health status.
-    pub fn health_indicator(&self, health: &plug_core::types::ServerHealth) -> (&'static str, Style) {
+    pub fn health_indicator(
+        &self,
+        health: &plug_core::types::ServerHealth,
+    ) -> (&'static str, Style) {
         match health {
             plug_core::types::ServerHealth::Healthy => (HEALTHY_SYMBOL, self.healthy),
             plug_core::types::ServerHealth::Degraded => (DEGRADED_SYMBOL, self.degraded),

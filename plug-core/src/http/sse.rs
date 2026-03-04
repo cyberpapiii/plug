@@ -57,9 +57,7 @@ pub fn sse_stream(
     };
 
     Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text(""), // SSE comment, not event — won't confuse MCP clients
+        KeepAlive::new().interval(Duration::from_secs(15)).text(""), // SSE comment, not event — won't confuse MCP clients
     )
 }
 
@@ -136,7 +134,10 @@ mod tests {
         assert!(events.len() >= 3, "expected 3 events, got: {events:?}");
         assert!(events[1].contains("id: 1"), "second event should be id 1");
         assert!(events[2].contains("id: 2"), "third event should be id 2");
-        assert!(events[1].contains("hello"), "event 1 should contain message");
+        assert!(
+            events[1].contains("hello"),
+            "event 1 should contain message"
+        );
     }
 
     #[tokio::test]

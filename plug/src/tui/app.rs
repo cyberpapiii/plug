@@ -230,9 +230,7 @@ impl App {
                     self.dirty = true;
                 }
                 KeyCode::Char(c) => {
-                    self.search_query
-                        .get_or_insert_with(String::new)
-                        .push(c);
+                    self.search_query.get_or_insert_with(String::new).push(c);
                     self.dirty = true;
                 }
                 _ => {}
@@ -346,12 +344,14 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.navigate_focused_panel(1);
-                self.dirty = true;
+                if self.navigate_focused_panel(1) {
+                    self.dirty = true;
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.navigate_focused_panel(-1);
-                self.dirty = true;
+                if self.navigate_focused_panel(-1) {
+                    self.dirty = true;
+                }
             }
             KeyCode::Char('r') => {
                 if self.focused_panel == 0 {
@@ -378,14 +378,20 @@ impl App {
                 let len = self.tools.len();
                 if len > 0 {
                     let i = self.tool_state.selected().unwrap_or(0);
-                    self.tool_state.select(Some((i + 1).min(len - 1)));
-                    self.dirty = true;
+                    let next = (i + 1).min(len - 1);
+                    if next != i {
+                        self.tool_state.select(Some(next));
+                        self.dirty = true;
+                    }
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let i = self.tool_state.selected().unwrap_or(0);
-                self.tool_state.select(Some(i.saturating_sub(1)));
-                self.dirty = true;
+                let next = i.saturating_sub(1);
+                if next != i {
+                    self.tool_state.select(Some(next));
+                    self.dirty = true;
+                }
             }
             KeyCode::Enter => {
                 if let Some(idx) = self.tool_state.selected() {
@@ -404,14 +410,18 @@ impl App {
         }
     }
 
-    fn navigate_focused_panel(&mut self, direction: i32) {
+    fn navigate_focused_panel(&mut self, direction: i32) -> bool {
+        let mut changed = false;
         match self.focused_panel {
             0 => {
                 let len = self.servers.len();
                 if len > 0 {
                     let i = self.server_state.selected().unwrap_or(0) as i32;
                     let next = (i + direction).clamp(0, len as i32 - 1) as usize;
-                    self.server_state.select(Some(next));
+                    if next != i as usize {
+                        self.server_state.select(Some(next));
+                        changed = true;
+                    }
                 }
             }
             1 => {
@@ -419,7 +429,10 @@ impl App {
                 if len > 0 {
                     let i = self.client_state.selected().unwrap_or(0) as i32;
                     let next = (i + direction).clamp(0, len as i32 - 1) as usize;
-                    self.client_state.select(Some(next));
+                    if next != i as usize {
+                        self.client_state.select(Some(next));
+                        changed = true;
+                    }
                 }
             }
             2 => {
@@ -427,11 +440,16 @@ impl App {
                 if len > 0 {
                     let i = self.activity_state.selected().unwrap_or(0) as i32;
                     let next = (i + direction).clamp(0, len as i32 - 1) as usize;
-                    self.activity_state.select(Some(next));
+                    if next != i as usize {
+                        self.activity_state.select(Some(next));
+                        changed = true;
+                    }
                 }
             }
             _ => {}
         }
+
+        changed
     }
 
     fn execute_confirmed_action(&mut self, action: PendingAction) {
@@ -447,9 +465,7 @@ impl App {
     /// Process an Engine event and update local state.
     pub fn handle_engine_event(&mut self, event: EngineEvent) {
         match event {
-            EngineEvent::ServerHealthChanged {
-                server_id, new, ..
-            } => {
+            EngineEvent::ServerHealthChanged { server_id, new, .. } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.id == *server_id) {
                     server.health = new;
                     server.flash_remaining = FLASH_TICKS;
@@ -540,9 +556,7 @@ impl App {
                 }
                 self.dirty = true;
             }
-            EngineEvent::ConfigReloaded | EngineEvent::CircuitBreakerTripped { .. } => {
-                self.dirty = true;
-            }
+            EngineEvent::ConfigReloaded | EngineEvent::CircuitBreakerTripped { .. } => {}
         }
     }
 

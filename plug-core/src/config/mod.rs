@@ -231,12 +231,10 @@ pub fn default_config_path() -> PathBuf {
 /// Load config with Figment layered resolution.
 #[allow(clippy::result_large_err)]
 pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Error> {
-    use figment::providers::{Env, Format, Serialized, Toml};
     use figment::Figment;
+    use figment::providers::{Env, Format, Serialized, Toml};
 
-    let path = config_path
-        .cloned()
-        .unwrap_or_else(default_config_path);
+    let path = config_path.cloned().unwrap_or_else(default_config_path);
 
     let mut config: Config = Figment::new()
         .merge(Serialized::defaults(Config::default()))
@@ -269,8 +267,8 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use figment::providers::{Format, Serialized, Toml};
     use figment::Figment;
+    use figment::providers::{Format, Serialized, Toml};
 
     /// Helper to load a Config from a TOML string merged over defaults.
     fn config_from_toml(toml: &str) -> Config {
@@ -414,7 +412,11 @@ mod tests {
             },
         );
         let errors = validate_config(&cfg);
-        assert!(errors.iter().any(|e| e.contains("stdio") && e.contains("command")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("stdio") && e.contains("command"))
+        );
     }
 
     #[test]
@@ -437,7 +439,11 @@ mod tests {
             },
         );
         let errors = validate_config(&cfg);
-        assert!(errors.iter().any(|e| e.contains("http") && e.contains("url")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("http") && e.contains("url"))
+        );
     }
 
     #[test]

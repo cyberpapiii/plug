@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -114,9 +114,9 @@ async fn post_mcp(
             validate_session_header(&headers, &state.sessions)?;
             Ok(StatusCode::ACCEPTED.into_response())
         }
-        JsonRpcMessage::Error(_) => {
-            Err(HttpError::BadRequest("unexpected error message from client".into()))
-        }
+        JsonRpcMessage::Error(_) => Err(HttpError::BadRequest(
+            "unexpected error message from client".into(),
+        )),
     }
 }
 
@@ -145,14 +145,12 @@ async fn get_mcp(
     // 4. Build SSE response with appropriate headers
     let sse = sse_stream(rx, state.cancel.clone());
     let mut response = sse.into_response();
-    response.headers_mut().insert(
-        "X-Accel-Buffering",
-        HeaderValue::from_static("no"),
-    );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         "X-Content-Type-Options",
         HeaderValue::from_static("nosniff"),
@@ -206,10 +204,8 @@ async fn handle_request(
 
             let result = build_initialize_result();
 
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::InitializeResult(result),
-                request_id,
-            );
+            let response_msg =
+                ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
 
             json_response_with_session(&session_id, &response_msg)
         }
@@ -226,14 +222,14 @@ async fn handle_request(
         ClientRequest::ListToolsRequest(_) => {
             let session_id_str = extract_session_id(headers)?;
             validate_session_header(headers, &state.sessions)?;
-            let client_type = state.sessions.get_client_type(&session_id_str)
+            let client_type = state
+                .sessions
+                .get_client_type(&session_id_str)
                 .unwrap_or(crate::types::ClientType::Unknown);
             let tools = state.router.list_tools_for_client(client_type);
             let result = ListToolsResult::with_all_items((*tools).clone());
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::ListToolsResult(result),
-                request_id,
-            );
+            let response_msg =
+                ServerJsonRpcMessage::response(ServerResult::ListToolsResult(result), request_id);
             json_response(&response_msg)
         }
 
@@ -271,21 +267,15 @@ async fn handle_request(
         ClientRequest::ListPromptsRequest(_) => {
             validate_session_header(headers, &state.sessions)?;
             let result = ListPromptsResult::default();
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::ListPromptsResult(result),
-                request_id,
-            );
+            let response_msg =
+                ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
             json_response(&response_msg)
         }
 
         _ => {
             // Unsupported method — return JSON-RPC method not found error
             validate_session_header(headers, &state.sessions)?;
-            let error = ErrorData::new(
-                ErrorCode::METHOD_NOT_FOUND,
-                "method not supported",
-                None,
-            );
+            let error = ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not supported", None);
             let response_msg = ServerJsonRpcMessage::error(error, request_id);
             json_response(&response_msg)
         }
@@ -325,11 +315,7 @@ fn extract_origin_host(origin: &str) -> Option<&str> {
         .split('/')
         .next()
         .unwrap_or(after_scheme);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
+    if host.is_empty() { None } else { Some(host) }
 }
 
 /// Extract session ID from request headers.
@@ -364,10 +350,9 @@ fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
         "X-Content-Type-Options",
         HeaderValue::from_static("nosniff"),
     );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     Ok(response)
 }

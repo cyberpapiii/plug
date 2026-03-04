@@ -9,11 +9,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use clap::Parser;
+use rmcp::ErrorData as McpError;
+use rmcp::ServiceExt as _;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::ErrorData as McpError;
-use rmcp::ServiceExt as _;
 
 #[derive(Parser)]
 #[command(name = "mock-mcp-server")]

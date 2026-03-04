@@ -27,9 +27,7 @@ pub enum IpcRequest {
         auth_token: String,
     },
     /// Graceful daemon shutdown.
-    Shutdown {
-        auth_token: String,
-    },
+    Shutdown { auth_token: String },
 }
 
 /// Custom Debug that redacts auth_token fields to prevent log leakage.
@@ -63,10 +61,7 @@ pub enum IpcResponse {
     /// Success acknowledgement for mutating commands.
     Ok,
     /// Error with machine-parseable code and human-readable message.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 /// Check whether a request requires authentication.
@@ -80,8 +75,9 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
 /// Extract the auth_token from a request, if present.
 pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     match request {
-        IpcRequest::RestartServer { auth_token, .. }
-        | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
+        IpcRequest::RestartServer { auth_token, .. } | IpcRequest::Shutdown { auth_token, .. } => {
+            Some(auth_token.as_str())
+        }
         _ => None,
     }
 }

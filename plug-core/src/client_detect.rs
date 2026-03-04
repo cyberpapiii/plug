@@ -53,8 +53,14 @@ mod tests {
         assert_eq!(detect_client("claude-ai"), ClientType::ClaudeDesktop);
         assert_eq!(detect_client("cursor-vscode"), ClientType::Cursor);
         assert_eq!(detect_client("windsurf-client"), ClientType::Windsurf);
-        assert_eq!(detect_client("Visual-Studio-Code"), ClientType::VSCodeCopilot);
-        assert_eq!(detect_client("gemini-cli-mcp-client"), ClientType::GeminiCli);
+        assert_eq!(
+            detect_client("Visual-Studio-Code"),
+            ClientType::VSCodeCopilot
+        );
+        assert_eq!(
+            detect_client("gemini-cli-mcp-client"),
+            ClientType::GeminiCli
+        );
         assert_eq!(detect_client("opencode"), ClientType::OpenCode);
         assert_eq!(detect_client("Zed"), ClientType::Zed);
     }

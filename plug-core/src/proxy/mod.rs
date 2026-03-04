@@ -12,7 +12,8 @@ use tokio::sync::broadcast;
 
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
-use crate::engine::{next_call_id, EngineEvent};
+use crate::config::Config;
+use crate::engine::{EngineEvent, next_call_id};
 use crate::error::ProtocolError;
 use crate::server::ServerManager;
 use crate::types::{ClientType, ServerHealth};
@@ -39,6 +40,18 @@ pub struct RouterConfig {
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
     pub tool_filter_enabled: bool,
+}
+
+impl From<&Config> for RouterConfig {
+    fn from(config: &Config) -> Self {
+        Self {
+            prefix_delimiter: config.prefix_delimiter.clone(),
+            priority_tools: config.priority_tools.clone(),
+            tool_description_max_chars: config.tool_description_max_chars,
+            tool_search_threshold: config.tool_search_threshold,
+            tool_filter_enabled: config.tool_filter_enabled,
+        }
+    }
 }
 
 /// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
@@ -106,10 +119,7 @@ impl ToolRouter {
         // Add search_tools meta-tool if tool count exceeds threshold
         if tools.len() >= self.config.tool_search_threshold {
             let meta_tool = build_search_tools_meta_tool();
-            routes.insert(
-                meta_tool.name.to_string(),
-                "__plug_internal__".to_string(),
-            );
+            routes.insert(meta_tool.name.to_string(), "__plug_internal__".to_string());
             // Insert at position 0 so it's always visible
             tools.insert(0, meta_tool);
         }
@@ -220,16 +230,11 @@ impl ToolRouter {
 
         // Acquire concurrency semaphore
         let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
-            Some(
-                sem.clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| {
-                        McpError::from(ProtocolError::ServerUnavailable {
-                            server_id: server_id.clone(),
-                        })
-                    })?,
-            )
+            Some(sem.clone().acquire_owned().await.map_err(|_| {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            })?)
         } else {
             None
         };
@@ -358,7 +363,9 @@ impl ToolRouter {
             .to_lowercase();
 
         if query.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text("Please provide a search query.")]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Please provide a search query.",
+            )]));
         }
 
         let snapshot = self.cache.load();
@@ -367,11 +374,7 @@ impl ToolRouter {
             .iter()
             .filter(|tool| {
                 let name = tool.name.to_lowercase();
-                let desc = tool
-                    .description
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_lowercase();
+                let desc = tool.description.as_deref().unwrap_or("").to_lowercase();
                 name.contains(&query) || desc.contains(&query)
             })
             .take(10)
@@ -665,25 +668,16 @@ mod tests {
         );
 
         // Priority tool should come before non-priority
-        assert_eq!(
-            priority_sort(&a, &b, &priority),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(priority_sort(&a, &b, &priority), std::cmp::Ordering::Less);
         // Non-priority after priority
         assert_eq!(
             priority_sort(&b, &a, &priority),
             std::cmp::Ordering::Greater
         );
         // Higher priority before lower priority
-        assert_eq!(
-            priority_sort(&a, &c, &priority),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(priority_sort(&a, &c, &priority), std::cmp::Ordering::Less);
         // Same priority: alphabetical
-        assert_eq!(
-            priority_sort(&b, &b, &priority),
-            std::cmp::Ordering::Equal
-        );
+        assert_eq!(priority_sort(&b, &b, &priority), std::cmp::Ordering::Equal);
     }
 
     #[test]
@@ -735,7 +729,10 @@ mod tests {
             tools_copilot,
         }));
 
-        assert_eq!(router.list_tools_for_client(ClientType::Windsurf).len(), 100);
+        assert_eq!(
+            router.list_tools_for_client(ClientType::Windsurf).len(),
+            100
+        );
         assert_eq!(
             router
                 .list_tools_for_client(ClientType::VSCodeCopilot)
@@ -746,10 +743,7 @@ mod tests {
             router.list_tools_for_client(ClientType::ClaudeCode).len(),
             150
         );
-        assert_eq!(
-            router.list_tools_for_client(ClientType::Cursor).len(),
-            150
-        );
+        assert_eq!(router.list_tools_for_client(ClientType::Cursor).len(), 150);
     }
 
     #[test]

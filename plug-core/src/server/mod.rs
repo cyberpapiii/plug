@@ -121,10 +121,7 @@ impl ServerManager {
         }
 
         let servers = self.servers.load();
-        tracing::info!(
-            started = servers.len(),
-            "server startup complete"
-        );
+        tracing::info!(started = servers.len(), "server startup complete");
 
         Ok(())
     }
@@ -281,7 +278,9 @@ impl ServerManager {
         let servers = self.servers.load();
         let mut result = Vec::new();
         for (server_name, upstream) in servers.iter() {
-            let health_ok = self.health.get(server_name)
+            let health_ok = self
+                .health
+                .get(server_name)
                 .map(|h| h.health != ServerHealth::Failed)
                 .unwrap_or(true);
             if health_ok {
@@ -354,7 +353,9 @@ impl ServerManager {
         servers
             .values()
             .map(|upstream| {
-                let health = self.health.get(&upstream.name)
+                let health = self
+                    .health
+                    .get(&upstream.name)
                     .map(|h| h.health)
                     .unwrap_or(upstream.health);
                 ServerStatus {

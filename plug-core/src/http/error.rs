@@ -40,20 +40,18 @@ impl IntoResponse for HttpError {
             HttpError::InvalidOrigin => (StatusCode::FORBIDDEN, "forbidden"),
             HttpError::SessionRequired => (StatusCode::BAD_REQUEST, "session ID required"),
             HttpError::SessionNotFound => (StatusCode::NOT_FOUND, "session not found"),
-            HttpError::InvalidContentType => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "content type must be application/json")
-            }
-            HttpError::InvalidAcceptHeader => {
-                (StatusCode::NOT_ACCEPTABLE, "accept header must include text/event-stream")
-            }
+            HttpError::InvalidContentType => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "content type must be application/json",
+            ),
+            HttpError::InvalidAcceptHeader => (
+                StatusCode::NOT_ACCEPTABLE,
+                "accept header must include text/event-stream",
+            ),
             HttpError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
             HttpError::TooManySessions => (StatusCode::TOO_MANY_REQUESTS, "too many sessions"),
-            HttpError::BodyTooLarge => {
-                (StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
-            }
-            HttpError::Internal(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
-            }
+            HttpError::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+            HttpError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
         };
 
         (status, message.to_string()).into_response()
@@ -70,12 +68,21 @@ mod tests {
             (HttpError::InvalidOrigin, StatusCode::FORBIDDEN),
             (HttpError::SessionRequired, StatusCode::BAD_REQUEST),
             (HttpError::SessionNotFound, StatusCode::NOT_FOUND),
-            (HttpError::InvalidContentType, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                HttpError::InvalidContentType,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
             (HttpError::InvalidAcceptHeader, StatusCode::NOT_ACCEPTABLE),
-            (HttpError::BadRequest("test".into()), StatusCode::BAD_REQUEST),
+            (
+                HttpError::BadRequest("test".into()),
+                StatusCode::BAD_REQUEST,
+            ),
             (HttpError::TooManySessions, StatusCode::TOO_MANY_REQUESTS),
             (HttpError::BodyTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
-            (HttpError::Internal("err".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                HttpError::Internal("err".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
 
         for (error, expected_status) in cases {

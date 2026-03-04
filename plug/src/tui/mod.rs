@@ -104,11 +104,7 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
     let area = f.area();
 
     // Status bar at bottom
-    let chunks = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
 
     let main_area = chunks[0];
     let status_area = chunks[1];
@@ -121,7 +117,11 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
         let status = format!(" /{query}▏");
         render_status_bar(f, status_area, &status, theme);
     } else {
-        let search_hint = if app.search_query.is_some() { " [filtered]" } else { "" };
+        let search_hint = if app.search_query.is_some() {
+            " [filtered]"
+        } else {
+            ""
+        };
         let status = match &app.mode {
             AppMode::Dashboard => format!(
                 " {} servers | {} tools | Tab: cycle | /: search | ?: help | q: quit{}",
@@ -129,7 +129,9 @@ fn view(f: &mut ratatui::Frame, app: &mut App, theme: &Theme) {
                 app.tool_count,
                 search_hint,
             ),
-            AppMode::Tools => format!(" Tools | j/k: navigate | Enter: details | /: search | Esc: back{search_hint}"),
+            AppMode::Tools => format!(
+                " Tools | j/k: navigate | Enter: details | /: search | Esc: back{search_hint}"
+            ),
             AppMode::ToolDetail(name) => format!(" Tool: {name} | Esc: back"),
             AppMode::Help => " Help | press any key to dismiss".to_string(),
         };
@@ -185,16 +187,10 @@ fn compute_layout(area: Rect) -> Vec<Rect> {
         .split(area)
         .to_vec()
     } else if area.width >= 80 {
-        let rows = Layout::vertical([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ])
-        .split(area);
-        let cols = Layout::horizontal([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
-        .split(rows[0]);
+        let rows =
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
         vec![cols[0], cols[1], rows[1]]
     } else {
         // Tabbed: render only focused panel in full area

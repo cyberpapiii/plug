@@ -7,8 +7,8 @@
 //! All fields are private — consumers access state through methods that
 //! return value types, never through direct field access.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -121,17 +121,10 @@ impl Engine {
     /// Does NOT start any servers — call `start()` to begin.
     pub fn new(config: Config) -> Self {
         let server_manager = Arc::new(ServerManager::new());
-        let router_config = RouterConfig {
-            prefix_delimiter: config.prefix_delimiter.clone(),
-            priority_tools: config.priority_tools.clone(),
-            tool_description_max_chars: config.tool_description_max_chars,
-            tool_search_threshold: config.tool_search_threshold,
-            tool_filter_enabled: config.tool_filter_enabled,
-        };
+        let router_config = RouterConfig::from(&config);
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let tool_router = Arc::new(
-            ToolRouter::new(server_manager.clone(), router_config)
-                .with_event_tx(event_tx.clone()),
+            ToolRouter::new(server_manager.clone(), router_config).with_event_tx(event_tx.clone()),
         );
 
         Self {
@@ -160,7 +153,9 @@ impl Engine {
         self.tool_router.refresh_tools().await;
 
         let tool_count = self.tool_router.tool_count();
-        let _ = self.event_tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
+        let _ = self
+            .event_tx
+            .send(EngineEvent::ToolCacheRefreshed { tool_count });
 
         // Emit ServerStarted events for each running server
         for status in self.server_manager.server_statuses() {
@@ -418,9 +413,9 @@ mod tests {
 
         // Fill the buffer beyond capacity to trigger Lagged
         for i in 0..200 {
-            let _ = engine.event_tx.send(EngineEvent::ToolCacheRefreshed {
-                tool_count: i,
-            });
+            let _ = engine
+                .event_tx
+                .send(EngineEvent::ToolCacheRefreshed { tool_count: i });
         }
 
         // First recv should be Lagged

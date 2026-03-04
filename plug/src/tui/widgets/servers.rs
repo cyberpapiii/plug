@@ -2,10 +2,10 @@
 //!
 //! Displays upstream MCP servers with health indicator, tool count, and name.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
-use ratatui::Frame;
 
 use crate::tui::app::App;
 use crate::tui::theme::Theme;

@@ -245,15 +245,12 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
                     use std::io::Write;
                     f.write_all(auth_token.as_bytes())
                 })
-                .with_context(|| {
-                    format!("failed to write auth token: {}", token_file.display())
-                })?;
+                .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(&token_file, &auth_token).with_context(|| {
-                format!("failed to write auth token: {}", token_file.display())
-            })?;
+            std::fs::write(&token_file, &auth_token)
+                .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
         }
     }
 
@@ -262,7 +259,10 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
     if std::fs::symlink_metadata(&sock_path).is_ok() {
         // Try connecting to check if another daemon is alive
         if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
-            anyhow::bail!("another plug daemon is already running on {}", sock_path.display());
+            anyhow::bail!(
+                "another plug daemon is already running on {}",
+                sock_path.display()
+            );
         }
         // Stale socket — remove it
         std::fs::remove_file(&sock_path).ok();
@@ -459,9 +459,7 @@ fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcRespons
                 message: "server restart via IPC not yet supported".to_string(),
             }
         }
-        IpcRequest::Shutdown { .. } => {
-            IpcResponse::Ok
-        }
+        IpcRequest::Shutdown { .. } => IpcResponse::Ok,
     }
 }
 
@@ -504,11 +502,7 @@ pub async fn shutdown_signal(cancel: CancellationToken) {
 /// Set up file logging with daily rotation for daemon mode.
 ///
 /// Returns the non-blocking guard that MUST be held for the daemon's lifetime.
-/// Note: must be called BEFORE any other tracing subscriber is initialized.
-/// Currently not wired into cmd_daemon because main() initializes stderr logging
-/// before command dispatch. Will be integrated when main() is refactored to
-/// defer tracing setup based on command.
-#[allow(dead_code)]
+/// Must be called BEFORE any other tracing subscriber is initialized.
 pub fn setup_file_logging(
     log_directory: &std::path::Path,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {

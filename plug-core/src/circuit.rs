@@ -132,8 +132,7 @@ impl CircuitBreaker {
                         // Drain leftover permits from previous half-open cycle
                         // to avoid permit accumulation across multiple cycles.
                         while self.probe_semaphore.try_acquire().is_ok() {}
-                        self.probe_semaphore
-                            .add_permits(self.config.probe_count);
+                        self.probe_semaphore.add_permits(self.config.probe_count);
                     }
                     // Whether we won the CAS or someone else did, try a probe.
                     self.try_acquire_probe()

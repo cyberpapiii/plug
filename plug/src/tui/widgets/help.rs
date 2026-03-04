@@ -2,10 +2,10 @@
 //!
 //! Rendered as a centered overlay on top of the current view.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use crate::tui::theme::Theme;
 

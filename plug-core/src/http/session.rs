@@ -89,15 +89,25 @@ impl SessionManager {
     }
 
     /// Set the client type for a session (called during initialize).
-    pub fn set_client_type(&self, session_id: &str, client_type: crate::types::ClientType) -> Result<(), HttpError> {
-        let mut entry = self.sessions.get_mut(session_id).ok_or(HttpError::SessionNotFound)?;
+    pub fn set_client_type(
+        &self,
+        session_id: &str,
+        client_type: crate::types::ClientType,
+    ) -> Result<(), HttpError> {
+        let mut entry = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
         entry.client_type = client_type;
         Ok(())
     }
 
     /// Get the client type for a session.
     pub fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
-        let entry = self.sessions.get(session_id).ok_or(HttpError::SessionNotFound)?;
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
         Ok(entry.client_type)
     }
 

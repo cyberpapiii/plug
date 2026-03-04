@@ -8,7 +8,11 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "plug", version, about = "MCP multiplexer — one config, every client connected")]
+#[command(
+    name = "plug",
+    version,
+    about = "MCP multiplexer — one config, every client connected"
+)]
 struct Cli {
     /// Path to config file
     #[arg(long, global = true)]
@@ -101,20 +105,16 @@ enum ConfigCommands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Set up tracing — all output to stderr (stdout is MCP protocol only)
-    let level = match cli.verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+    // Initialize tracing based on command:
+    // - daemon mode logs to file
+    // - all other commands log to stderr (stdout is protocol output)
+    let daemon_mode = matches!(&cli.command, Commands::Serve { daemon: true, .. });
+    let _daemon_log_guard = if daemon_mode {
+        Some(daemon::setup_file_logging(&daemon::log_dir())?)
+    } else {
+        init_stderr_tracing(cli.verbose);
+        None
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .compact()
-        .init();
 
     match cli.command {
         Commands::Connect => {
@@ -181,15 +181,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build a `RouterConfig` from the global `Config`.
-fn router_config(config: &plug_core::config::Config) -> plug_core::proxy::RouterConfig {
-    plug_core::proxy::RouterConfig {
-        prefix_delimiter: config.prefix_delimiter.clone(),
-        priority_tools: config.priority_tools.clone(),
-        tool_description_max_chars: config.tool_description_max_chars,
-        tool_search_threshold: config.tool_search_threshold,
-        tool_filter_enabled: config.tool_filter_enabled,
-    }
+fn init_stderr_tracing(verbose: u8) {
+    let level = match verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .compact()
+        .init();
 }
 
 /// `plug connect` — the primary stdio bridge mode.
@@ -286,15 +291,21 @@ async fn cmd_status(
             } => {
                 match output {
                     OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "source": "daemon",
-                            "uptime_secs": uptime_secs,
-                            "clients": clients,
-                            "servers": servers,
-                        }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "source": "daemon",
+                                "uptime_secs": uptime_secs,
+                                "clients": clients,
+                                "servers": servers,
+                            }))?
+                        );
                     }
                     OutputFormat::Text => {
-                        println!("connected to daemon (uptime: {}s, clients: {})", uptime_secs, clients);
+                        println!(
+                            "connected to daemon (uptime: {}s, clients: {})",
+                            uptime_secs, clients
+                        );
                         if servers.is_empty() {
                             println!("no servers configured");
                         } else {
@@ -328,11 +339,14 @@ async fn cmd_status(
                 .keys()
                 .map(|name| serde_json::json!({"name": name, "status": "not_running"}))
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "source": "config",
-                "daemon_running": false,
-                "servers": servers,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": "config",
+                    "daemon_running": false,
+                    "servers": servers,
+                }))?
+            );
         }
         OutputFormat::Text => {
             eprintln!("no daemon running — showing configured servers");
@@ -600,7 +614,7 @@ async fn cmd_tool_list(
     // Use ProxyHandler to get the prefixed tool list
     let proxy = plug_core::proxy::ProxyHandler::new(
         server_manager.clone(),
-        router_config(&config),
+        plug_core::proxy::RouterConfig::from(&config),
     );
     proxy.refresh_tools().await;
 
@@ -611,10 +625,8 @@ async fn cmd_tool_list(
             let tool_list: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|(server_name, tool)| {
-                    let prefixed = format!(
-                        "{}{}{}",
-                        server_name, config.prefix_delimiter, tool.name
-                    );
+                    let prefixed =
+                        format!("{}{}{}", server_name, config.prefix_delimiter, tool.name);
                     serde_json::json!({
                         "name": prefixed,
                         "server": server_name,
@@ -629,15 +641,10 @@ async fn cmd_tool_list(
                 println!("no tools available");
             } else {
                 let desc_header = "DESCRIPTION";
-                println!(
-                    "{:<40} {:<20} {}",
-                    "NAME", "SERVER", desc_header
-                );
+                println!("{:<40} {:<20} {}", "NAME", "SERVER", desc_header);
                 for (server_name, tool) in &tools {
-                    let prefixed = format!(
-                        "{}{}{}",
-                        server_name, config.prefix_delimiter, tool.name
-                    );
+                    let prefixed =
+                        format!("{}{}{}", server_name, config.prefix_delimiter, tool.name);
                     let desc = tool
                         .description
                         .as_deref()
