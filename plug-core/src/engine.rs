@@ -431,6 +431,82 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn engine_set_server_enabled_noop() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.servers.insert(
+            "test".to_string(),
+            ServerConfig {
+                command: Some("echo".to_string()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+            },
+        );
+
+        let engine = Engine::new(config);
+        // Already enabled — should be a no-op
+        let result = engine.set_server_enabled("test", true).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn engine_set_server_enabled_toggle() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.servers.insert(
+            "test".to_string(),
+            ServerConfig {
+                command: Some("echo".to_string()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                timeout_secs: 30,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+            },
+        );
+
+        let engine = Engine::new(config);
+        let mut rx = engine.subscribe();
+
+        // Disable the server — triggers reload which emits ConfigReloaded
+        let result = engine.set_server_enabled("test", false).await;
+        assert!(result.is_ok());
+
+        // Config should reflect the change
+        let cfg = engine.config();
+        assert!(!cfg.servers["test"].enabled);
+
+        // Should have emitted ConfigReloaded (possibly after other events)
+        let mut found_reloaded = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, EngineEvent::ConfigReloaded) {
+                found_reloaded = true;
+                break;
+            }
+        }
+        assert!(found_reloaded, "expected ConfigReloaded event");
+    }
+
     /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain
     /// safe while reload_config removes/adds servers. The ArcSwap-based design
     /// guarantees wait-free reads; this test documents that invariant.
