@@ -224,13 +224,34 @@ pub async fn run_daemon(engine: &Engine) -> anyhow::Result<()> {
     ensure_dir(&rt_dir)?;
     ensure_dir(&log_directory)?;
 
-    // Generate auth token and write to file
+    // Generate auth token and write to file with restricted permissions from creation
     let auth_token = generate_auth_token();
     let token_file = token_path();
-    std::fs::write(&token_file, &auth_token)
-        .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
-    #[cfg(unix)]
-    set_file_permissions_0600(&token_file)?;
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&token_file)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(auth_token.as_bytes())
+                })
+                .with_context(|| {
+                    format!("failed to write auth token: {}", token_file.display())
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&token_file, &auth_token).with_context(|| {
+                format!("failed to write auth token: {}", token_file.display())
+            })?;
+        }
+    }
 
     // Clean up stale socket if it exists
     let sock_path = socket_path();
@@ -376,11 +397,21 @@ async fn handle_ipc_connection(
 
         // Auth check for mutating commands
         if ipc::requires_auth(&request) {
-            if let Some(provided) = ipc::extract_auth_token(&request) {
-                if !verify_auth_token(provided, &ctx.auth_token) {
+            match ipc::extract_auth_token(&request) {
+                Some(provided) => {
+                    if !verify_auth_token(provided, &ctx.auth_token) {
+                        let resp = IpcResponse::Error {
+                            code: "AUTH_FAILED".to_string(),
+                            message: "invalid auth token".to_string(),
+                        };
+                        send_response(&mut writer, &resp).await?;
+                        continue;
+                    }
+                }
+                None => {
                     let resp = IpcResponse::Error {
-                        code: "AUTH_FAILED".to_string(),
-                        message: "invalid auth token".to_string(),
+                        code: "AUTH_REQUIRED".to_string(),
+                        message: "auth_token required for this command".to_string(),
                     };
                     send_response(&mut writer, &resp).await?;
                     continue;
@@ -481,9 +512,10 @@ fn dispatch_request(request: &IpcRequest, ctx: &ConnectionContext) -> IpcRespons
                     message: format!("server '{server_id}' not found"),
                 };
             }
-            // Note: actual restart is async; we'd need the Engine reference.
-            // For now, return Ok — full restart integration requires Engine in the task.
-            IpcResponse::Ok
+            IpcResponse::Error {
+                code: "NOT_IMPLEMENTED".to_string(),
+                message: "server restart via IPC not yet supported".to_string(),
+            }
         }
         IpcRequest::SetServerEnabled { server_id, .. } => {
             let statuses = ctx.server_manager.server_statuses();

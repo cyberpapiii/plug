@@ -55,6 +55,8 @@ pub struct ToolInfo {
 /// An activity log entry.
 #[derive(Debug, Clone)]
 pub struct ActivityEntry {
+    /// Correlation ID for matching start/complete events.
+    pub call_id: u64,
     #[allow(dead_code)] // Used for display formatting in Sub-phase C
     pub timestamp: Instant,
     pub server_id: String,
@@ -100,9 +102,6 @@ pub struct App {
     // Activity log
     pub activity_log: VecDeque<ActivityEntry>,
     pub activity_state: ListState,
-
-    // In-flight tool calls (call_id -> entry index placeholder)
-    pub in_flight: std::collections::HashMap<u64, usize>,
 
     // Tools view
     pub tools: Vec<ToolInfo>,
@@ -153,7 +152,6 @@ impl App {
             client_state: ListState::default(),
             activity_log: VecDeque::with_capacity(MAX_ACTIVITY_ENTRIES),
             activity_state: ListState::default(),
-            in_flight: std::collections::HashMap::new(),
             tools: Vec::new(),
             tool_state: ListState::default(),
             search_query: None,
@@ -487,6 +485,7 @@ impl App {
                 tool_name,
             } => {
                 let entry = ActivityEntry {
+                    call_id,
                     timestamp: Instant::now(),
                     server_id: server_id.to_string(),
                     tool_name: tool_name.to_string(),
@@ -495,7 +494,6 @@ impl App {
                     flash_remaining: FLASH_TICKS,
                 };
                 self.activity_log.push_front(entry);
-                self.in_flight.insert(call_id, 0); // index 0 = front
                 if self.activity_log.len() > MAX_ACTIVITY_ENTRIES {
                     self.activity_log.pop_back();
                 }
@@ -507,17 +505,13 @@ impl App {
                 success,
                 ..
             } => {
-                // Find the in-flight entry and update it
-                if self.in_flight.remove(&call_id).is_some() {
-                    // The entry is at the front of the log (most recent)
-                    // Search for it by call_id correlation
-                    if let Some(entry) = self.activity_log.front_mut() {
-                        entry.duration_ms = Some(duration_ms);
-                        entry.success = Some(success);
-                        entry.flash_remaining = FLASH_TICKS;
-                    }
+                // Find the matching entry by call_id and update it
+                if let Some(entry) = self.activity_log.iter_mut().find(|e| e.call_id == call_id) {
+                    entry.duration_ms = Some(duration_ms);
+                    entry.success = Some(success);
+                    entry.flash_remaining = FLASH_TICKS;
+                    self.dirty = true;
                 }
-                self.dirty = true;
             }
             EngineEvent::ServerStarted { server_id } => {
                 if !self.servers.iter().any(|s| s.id == *server_id) {
@@ -535,8 +529,9 @@ impl App {
                 self.dirty = true;
             }
             EngineEvent::Error { context, message } => {
-                // Add error to activity log as a special entry
+                // Add error to activity log as a special entry (call_id 0 = not a tool call)
                 let entry = ActivityEntry {
+                    call_id: 0,
                     timestamp: Instant::now(),
                     server_id: context.to_string(),
                     tool_name: format!("ERROR: {message}"),
