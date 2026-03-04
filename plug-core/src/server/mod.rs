@@ -439,37 +439,34 @@ impl Default for ServerManager {
     }
 }
 
-/// Check if a hostname or IP address is blocked for SSRF prevention.
+/// Check if a hostname or IP address is a cloud metadata endpoint.
 ///
-/// Blocks: loopback, private (RFC 1918), link-local, cloud metadata endpoints.
+/// Only blocks cloud metadata endpoints (169.254.169.254, metadata.google.internal).
+/// Loopback and private IPs are allowed because all servers in config.toml are
+/// explicitly user-configured — blocking them prevents legitimate local servers.
 fn is_blocked_host(host: &str) -> bool {
     // Known metadata hostnames
     if host == "metadata.google.internal" {
         return true;
     }
 
-    // Try parsing as IP address
+    // Try parsing as IP address — only block cloud metadata IP
     let host_trimmed = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = host_trimmed.parse::<std::net::IpAddr>() {
-        return is_blocked_ip(&ip);
+        return is_metadata_ip(&ip);
     }
 
     false
 }
 
-fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+/// Returns true only for cloud metadata IPs (169.254.169.254).
+fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()          // 127.0.0.0/8
-                || v4.is_private()    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                || v4.is_link_local() // 169.254.0.0/16 (covers cloud metadata)
-                || v4.is_broadcast()  // 255.255.255.255
-                || v4.is_unspecified() // 0.0.0.0
+            // AWS/GCP/Azure metadata endpoint
+            *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
         }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()      // ::1
-                || v6.is_unspecified() // ::
-        }
+        std::net::IpAddr::V6(_) => false,
     }
 }
 
@@ -478,24 +475,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ssrf_blocks_loopback() {
-        assert!(is_blocked_host("127.0.0.1"));
-        assert!(is_blocked_host("127.0.0.2"));
-        assert!(is_blocked_host("[::1]"));
+    fn ssrf_allows_loopback() {
+        // Loopback is allowed — user-configured local servers are legitimate
+        assert!(!is_blocked_host("127.0.0.1"));
+        assert!(!is_blocked_host("127.0.0.2"));
+        assert!(!is_blocked_host("[::1]"));
     }
 
     #[test]
-    fn ssrf_blocks_private_ranges() {
-        assert!(is_blocked_host("10.0.0.1"));
-        assert!(is_blocked_host("172.16.0.1"));
-        assert!(is_blocked_host("192.168.1.1"));
+    fn ssrf_allows_private_ranges() {
+        // Private IPs are allowed — user-configured local servers are legitimate
+        assert!(!is_blocked_host("10.0.0.1"));
+        assert!(!is_blocked_host("172.16.0.1"));
+        assert!(!is_blocked_host("192.168.1.1"));
     }
 
     #[test]
-    fn ssrf_blocks_link_local_and_metadata() {
+    fn ssrf_blocks_cloud_metadata() {
         assert!(is_blocked_host("169.254.169.254"));
-        assert!(is_blocked_host("169.254.0.1"));
         assert!(is_blocked_host("metadata.google.internal"));
+        // Other link-local IPs are NOT blocked (only the specific metadata IP)
+        assert!(!is_blocked_host("169.254.0.1"));
     }
 
     #[test]
@@ -503,5 +503,6 @@ mod tests {
         assert!(!is_blocked_host("8.8.8.8"));
         assert!(!is_blocked_host("1.1.1.1"));
         assert!(!is_blocked_host("example.com"));
+        assert!(!is_blocked_host("localhost"));
     }
 }

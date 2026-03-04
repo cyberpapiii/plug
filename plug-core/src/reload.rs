@@ -90,6 +90,7 @@ fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
         || old.transport != new.transport
         || old.url != new.url
         || old.timeout_secs != new.timeout_secs
+        || old.call_timeout_secs != new.call_timeout_secs
         || old.enabled != new.enabled
 }
 
@@ -195,6 +196,7 @@ mod tests {
             url: None,
             auth_token: None,
             timeout_secs: 30,
+            call_timeout_secs: 300,
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,

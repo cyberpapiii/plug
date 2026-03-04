@@ -686,6 +686,7 @@ mod tests {
             url: None,
             auth_token: None,
             timeout_secs: 30,
+            call_timeout_secs: 300,
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,

@@ -263,7 +263,7 @@ impl ToolRouter {
                 })
             })?;
 
-        let timeout_duration = Duration::from_secs(upstream.config.timeout_secs);
+        let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
         let peer = upstream.client.peer().clone();
         drop(upstream); // Release Arc early
 
@@ -345,9 +345,9 @@ impl ToolRouter {
                     timeout_secs = timeout_duration.as_secs(),
                     "upstream tool call timed out"
                 );
-                if let Some(cb) = &cb {
-                    cb.on_failure();
-                }
+                // Timeouts do NOT trip the circuit breaker — a slow tool (e.g. Slack
+                // conversations_unreads taking 2+ min) is not a server failure. Tripping
+                // the CB here would lock out ALL tools on the server after a few slow calls.
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(EngineEvent::ToolCallCompleted {
                         call_id,
