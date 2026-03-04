@@ -437,6 +437,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
             },
         ));
         Arc::new(HttpState {

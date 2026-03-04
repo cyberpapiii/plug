@@ -407,6 +407,7 @@ fn json_entry_to_server_config(entry: &serde_json::Value) -> Option<ServerConfig
         max_concurrent: 1,
         health_check_interval_secs: 60,
         circuit_breaker_enabled: true,
+        enrichment: false,
     })
 }
 
@@ -496,6 +497,7 @@ fn toml_entry_to_server_config(entry: &toml::Value) -> Option<ServerConfig> {
         max_concurrent: 1,
         health_check_interval_secs: 60,
         circuit_breaker_enabled: true,
+        enrichment: false,
     })
 }
 
@@ -842,6 +844,7 @@ GITHUB_TOKEN = "$GITHUB_TOKEN"
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
+            enrichment: false,
         }
     }
 }

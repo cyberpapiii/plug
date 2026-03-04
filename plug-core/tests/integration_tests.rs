@@ -30,6 +30,7 @@ async fn test_proxy_handler_refresh_tools_empty() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
         },
     );
     handler.refresh_tools().await;
@@ -54,6 +55,7 @@ fn test_proxy_handler_get_info() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
         },
     );
     let info = handler.get_info();
@@ -97,6 +99,7 @@ fn test_resources_capability_present() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
         },
     );
     let info = handler.get_info();
@@ -120,6 +123,7 @@ fn test_prompts_not_advertised() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
         },
     );
     let info = handler.get_info();
@@ -250,6 +254,7 @@ fn test_config_validation_valid() {
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
+            enrichment: false,
         },
     );
     let errors = validate_config(&cfg);
@@ -273,6 +278,7 @@ fn test_config_validation_catches_missing_command() {
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
+            enrichment: false,
         },
     );
     let errors = validate_config(&cfg);

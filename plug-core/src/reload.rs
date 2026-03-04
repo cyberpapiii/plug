@@ -195,6 +195,7 @@ mod tests {
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
+            enrichment: false,
         }
     }
 

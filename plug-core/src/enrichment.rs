@@ -80,7 +80,7 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{Tool, ToolAnnotations};
+    use rmcp::model::Tool;
     use serde_json::json;
 
     fn make_tool(name: &str) -> Tool {
