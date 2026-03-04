@@ -56,6 +56,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Paths
 directories = "6"
 
+# Async utilities
+futures = "0.3"
+tower = { version = "0.5", features = ["util"] }
+
 # HTTP Server (Phase 2)
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit"] }

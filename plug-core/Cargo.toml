@@ -19,6 +19,7 @@ arc-swap.workspace = true
 uuid.workspace = true
 directories.workspace = true
 dashmap.workspace = true
+futures.workspace = true
 
 # HTTP Server (Phase 2)
 axum.workspace = true
@@ -31,4 +32,5 @@ bytes.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true
 plug-test-harness = { path = "../plug-test-harness" }
