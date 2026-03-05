@@ -261,8 +261,8 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
         }
         ClientSource::Nanobot => {
             vec![
-                home.join(".nanobot/config.toml"),
-                PathBuf::from(".nanobot.toml"),
+                home.join(".nanobot/config.json"),
+                PathBuf::from(".nanobot/config.json"),
             ]
         }
         ClientSource::Junie => {
@@ -350,7 +350,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
 
     match source {
         // TOML clients: cleanse "plug" entries first to avoid parse errors from duplicates
-        ClientSource::CodexCli | ClientSource::Nanobot => {
+        ClientSource::CodexCli => {
             let cleansed = unlink_toml(&content);
             parse_toml_mcp_servers(&cleansed, source, "mcp_servers")
         }
@@ -369,6 +369,9 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::Junie
         | ClientSource::Kilo
         | ClientSource::Antigravity => parse_json_mcp_servers(&content, source, "mcpServers"),
+
+        // Nanobot uses tools.mcpServers
+        ClientSource::Nanobot => parse_nanobot_config(&content, source),
 
         // VS Code uses nested "mcp.servers" (or "servers" under "mcp" key)
         ClientSource::VSCodeCopilot => parse_vscode_config(&content, source),
@@ -472,6 +475,7 @@ fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig>
         circuit_breaker_enabled: true,
         enrichment: false,
         tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
     })
 }
 
@@ -503,6 +507,39 @@ fn parse_json_mcp_servers(
         }
     }
     Ok(servers)
+}
+
+/// Parse Nanobot config which nests servers under "tools" -> "mcpServers".
+fn parse_nanobot_config(
+    content: &str,
+    source: ClientSource,
+) -> Result<Vec<DiscoveredServer>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("JSON parse error: {e}"))?;
+
+    let servers = value
+        .get("tools")
+        .and_then(|t| t.get("mcpServers"))
+        .and_then(|s| s.as_object());
+
+    if let Some(obj) = servers {
+        let mut result = Vec::new();
+        for (name, entry) in obj {
+            if name == "plug" {
+                continue;
+            }
+            if let Some(config) = json_entry_to_server_config(entry) {
+                result.push(DiscoveredServer {
+                    name: name.clone(),
+                    config,
+                    source,
+                });
+            }
+        }
+        return Ok(result);
+    }
+
+    Ok(Vec::new())
 }
 
 /// Parse VS Code config which nests servers under "mcp" -> "servers".
@@ -620,6 +657,7 @@ fn json_entry_to_server_config(entry: &serde_json::Value) -> Option<ServerConfig
         circuit_breaker_enabled: true,
         enrichment: false,
         tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
     })
 }
 
@@ -715,6 +753,7 @@ fn toml_entry_to_server_config(entry: &toml::Value) -> Option<ServerConfig> {
         circuit_breaker_enabled: true,
         enrichment: false,
         tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
     })
 }
 
@@ -1098,6 +1137,7 @@ GITHUB_TOKEN = "$GITHUB_TOKEN"
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
         }
     }
 }

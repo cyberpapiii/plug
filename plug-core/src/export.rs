@@ -153,9 +153,35 @@ pub fn export_config(options: &ExportOptions) -> String {
         // YAML clients
         ExportTarget::Goose => export_yaml_mcp_extensions(options, "extensions"),
 
+        // Nanobot uses tools.mcpServers
+        ExportTarget::Nanobot => export_nanobot(options),
+
         // TOML clients
-        ExportTarget::CodexCli | ExportTarget::Nanobot => export_toml(options),
+        ExportTarget::CodexCli => export_toml(options),
     }
+}
+
+/// Generate Nanobot config with nested "tools" -> "mcpServers".
+fn export_nanobot(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => serde_json::json!({
+            "command": options.command,
+            "args": ["connect"]
+        }),
+        ExportTransport::Http => serde_json::json!({
+            "url": format!("http://localhost:{}/mcp", options.port)
+        }),
+    };
+
+    let config = serde_json::json!({
+        "tools": {
+            "mcpServers": {
+                "plug": server_entry
+            }
+        }
+    });
+
+    serde_json::to_string_pretty(&config).unwrap()
 }
 
 /// Generate JSON config with standard `mcpServers` key.
@@ -320,9 +346,9 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
         ExportTarget::Factory => Some(home.join(".factory/config.json")),
         ExportTarget::Nanobot => {
             if project {
-                Some(std::path::PathBuf::from(".nanobot.toml"))
+                Some(std::path::PathBuf::from(".nanobot/config.json"))
             } else {
-                Some(home.join(".nanobot/config.toml"))
+                Some(home.join(".nanobot/config.json"))
             }
         }
         ExportTarget::Junie => {

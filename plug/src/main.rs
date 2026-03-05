@@ -677,15 +677,49 @@ fn is_linked(target: &str, project: bool) -> bool {
     match ext {
         Some("toml") => content.contains("[mcp_servers.plug]"),
         Some("yaml") | Some("yml") => content.contains("plug:"),
-        _ => content.contains("\"plug\":")
+        _ => {
+            // For JSON, be more precise to avoid false positives in large configs
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                match target_enum {
+                    plug_core::export::ExportTarget::Nanobot => {
+                        json.get("tools").and_then(|t| t.get("mcpServers")).and_then(|s| s.get("plug")).is_some()
+                    }
+                    plug_core::export::ExportTarget::VSCodeCopilot => {
+                        json.get("mcp").and_then(|m| m.get("servers")).and_then(|s| s.get("plug")).is_some()
+                    }
+                    _ => {
+                        json.get("mcpServers").and_then(|s| s.get("plug")).is_some() ||
+                        json.get("context_servers").and_then(|s| s.get("plug")).is_some()
+                    }
+                }
+            } else {
+                content.contains("\"plug\":")
+            }
+        }
     }
 }
 
 fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
     let mut json: serde_json::Value = serde_json::from_str(existing).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = json.as_object_mut() {
-        for key in ["mcpServers", "context_servers"] { if let Some(inner) = obj.get_mut(key).and_then(|v| v.as_object_mut()) { inner.remove("plug"); } }
-        if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) { if let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut()) { srv.remove("plug"); } }
+        // Location 1: Top-level standard keys
+        for key in ["mcpServers", "context_servers"] {
+            if let Some(inner) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+                inner.remove("plug");
+            }
+        }
+        // Location 2: VS Code style (mcp.servers)
+        if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+            if let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut()) {
+                srv.remove("plug");
+            }
+        }
+        // Location 3: Nanobot / OpenCode style (tools.mcpServers)
+        if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_object_mut()) {
+            if let Some(srv) = tools.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+                srv.remove("plug");
+            }
+        }
     }
     Ok(serde_json::to_string_pretty(&json)?)
 }
@@ -695,7 +729,16 @@ fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
     let snippet_json: serde_json::Value = serde_json::from_str(snippet)?;
     if let (Some(e_obj), Some(s_obj)) = (existing_json.as_object_mut(), snippet_json.as_object()) {
         for (k, v) in s_obj {
-            if let (Some(e_inner), Some(s_inner)) = (e_obj.get_mut(k).and_then(|v| v.as_object_mut()), v.as_object()) {
+            // Specialized deep merge for nested keys: mcpServers, mcp.servers, tools.mcpServers
+            if k == "mcp" || k == "tools" {
+                if let (Some(e_inner), Some(s_inner)) = (e_obj.get_mut(k).and_then(|v| v.as_object_mut()), v.as_object()) {
+                    for (ik, iv) in s_inner {
+                        if let (Some(e_deep), Some(s_deep)) = (e_inner.get_mut(ik).and_then(|v| v.as_object_mut()), iv.as_object()) {
+                            for (dk, dv) in s_deep { e_deep.insert(dk.clone(), dv.clone()); }
+                        } else { e_inner.insert(ik.clone(), iv.clone()); }
+                    }
+                } else { e_obj.insert(k.clone(), v.clone()); }
+            } else if let (Some(e_inner), Some(s_inner)) = (e_obj.get_mut(k).and_then(|v| v.as_object_mut()), v.as_object()) {
                 for (ik, iv) in s_inner { e_inner.insert(ik.clone(), iv.clone()); }
             } else { e_obj.insert(k.clone(), v.clone()); }
         }

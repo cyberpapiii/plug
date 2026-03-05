@@ -523,6 +523,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
 
@@ -555,6 +556,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
 
@@ -608,6 +610,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
 

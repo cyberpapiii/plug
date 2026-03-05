@@ -113,8 +113,18 @@ impl ToolRouter {
     pub async fn refresh_tools(&self) {
         let upstream_tools = self.server_manager.get_tools().await;
 
-        let mut routes = HashMap::new();
-        let mut tools = Vec::new();
+        // ── Pass 1: classify, sanitize, and try keyword stripping ──
+        // Each entry: (server_name, tool, prefix, stripped_name, full_name, matched_keyword)
+        struct Classified {
+            server_name: String,
+            tool: Tool,
+            prefix: String,
+            stripped_name: String,
+            full_name: String,
+            has_strip_keywords: bool,
+        }
+
+        let mut classified: Vec<Classified> = Vec::new();
 
         for (server_name, tool) in upstream_tools {
             let mut exposed_name = tool.name.to_string();
@@ -129,59 +139,125 @@ impl ToolRouter {
             // 2. Sanitize to snake_case (hyphens, camelCase, dots -> snake_case)
             let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
-            // 3. Determine prefix and cleaned tool name
-            let (prefix, cleaned_name) = if server_name == "workspace" {
-                // Workspace tools get sub-service classification
-                let (sub_service, cleaned) =
-                    crate::tool_naming::classify_workspace_tool(&sanitized);
-                (sub_service.to_string(), cleaned)
+            // 3. Determine prefix and tool name via rules or server name
+            let tool_group_rules: Option<Vec<crate::config::ToolGroupRule>> =
+                self.server_manager.get_upstream(&server_name).and_then(|u| {
+                    if !u.config.tool_groups.is_empty() {
+                        Some(u.config.tool_groups.clone())
+                    } else if server_name == "workspace" {
+                        Some(crate::tool_naming::default_workspace_rules())
+                    } else {
+                        None
+                    }
+                });
+
+            let (prefix, full_name, stripped_name, has_strip_keywords) =
+                if let Some(ref rules) = tool_group_rules {
+                    match crate::tool_naming::classify_with_rules(&sanitized, rules) {
+                        Some(result) => {
+                            let stripped = crate::tool_naming::strip_keywords(&result.name, &result.strip_keywords);
+                            let has_strip = !result.strip_keywords.is_empty();
+                            (result.prefix, result.name, stripped, has_strip)
+                        }
+                        None => {
+                            let prefix =
+                                crate::tool_naming::format_server_prefix(&server_name);
+                            (prefix, sanitized.clone(), sanitized.clone(), false)
+                        }
+                    }
+                } else {
+                    let prefix = crate::tool_naming::format_server_prefix(&server_name);
+                    let mut name = sanitized.clone();
+
+                    // Dedup: strip server_name prefix/suffix if redundant
+                    if name.starts_with(&server_name) && name.len() > server_name.len() {
+                        let rest = &name[server_name.len()..];
+                        if rest.starts_with('_') || rest.starts_with('-') {
+                            name = rest[1..].to_string();
+                        }
+                    }
+                    if name.ends_with(&server_name) && name.len() > server_name.len() {
+                        let prefix_len = name.len() - server_name.len();
+                        let rest = &name[..prefix_len];
+                        if rest.ends_with('_') || rest.ends_with('-') {
+                            name = rest[..rest.len() - 1].to_string();
+                        }
+                    }
+
+                    (prefix, name.clone(), name, false)
+                };
+
+            classified.push(Classified {
+                server_name,
+                tool,
+                prefix,
+                stripped_name,
+                full_name,
+                has_strip_keywords,
+            });
+        }
+
+        // ── Pass 2: detect collisions in stripped wire names ──
+        // Count how many tools map to each (prefix, stripped_name) pair.
+        let mut wire_name_counts: HashMap<String, usize> = HashMap::new();
+        for c in &classified {
+            let wire = crate::tool_naming::build_wire_name(
+                &c.prefix,
+                &c.stripped_name,
+                &self.config.prefix_delimiter,
+            );
+            *wire_name_counts.entry(wire).or_insert(0) += 1;
+        }
+
+        // ── Pass 3: build final tools with collision-safe names ──
+        let mut routes = HashMap::new();
+        let mut tools = Vec::new();
+
+        for c in classified {
+            let stripped_wire = crate::tool_naming::build_wire_name(
+                &c.prefix,
+                &c.stripped_name,
+                &self.config.prefix_delimiter,
+            );
+
+            // Use stripped name unless it would collide, then fall back to full name
+            let use_stripped = wire_name_counts.get(&stripped_wire).copied().unwrap_or(1) == 1;
+
+            let final_name = if use_stripped {
+                c.stripped_name.clone()
             } else {
-                let prefix = crate::tool_naming::format_server_prefix(&server_name);
-                let mut name = sanitized.clone();
-
-                // Existing deduplication: strip server_name prefix if redundant
-                if name.starts_with(&server_name) && name.len() > server_name.len() {
-                    let rest = &name[server_name.len()..];
-                    if rest.starts_with('_') || rest.starts_with('-') {
-                        name = rest[1..].to_string();
-                    }
-                }
-                // Strip server_name suffix if redundant
-                if name.ends_with(&server_name) && name.len() > server_name.len() {
-                    let prefix_len = name.len() - server_name.len();
-                    let rest = &name[..prefix_len];
-                    if rest.ends_with('_') || rest.ends_with('-') {
-                        name = rest[..rest.len() - 1].to_string();
-                    }
-                }
-
-                (prefix, name)
+                c.full_name.clone()
             };
 
-            // 4. Build wire name
             let prefixed_name = crate::tool_naming::build_wire_name(
-                &prefix,
-                &cleaned_name,
+                &c.prefix,
+                &final_name,
                 &self.config.prefix_delimiter,
             );
 
             routes.insert(
                 prefixed_name.clone(),
-                (server_name.clone(), tool.name.to_string()),
+                (c.server_name.clone(), c.tool.name.to_string()),
             );
 
-            let mut prefixed_tool = tool.clone();
+            let mut prefixed_tool = c.tool.clone();
 
-            // 5. Enrich BEFORE setting wire name (so get_* patterns match cleaned name)
-            if self.config.enrichment_servers.contains(&server_name) {
-                prefixed_tool.name = Cow::Owned(cleaned_name.clone());
+            // Enrich BEFORE setting wire name (so get_* patterns match)
+            if self.config.enrichment_servers.contains(&c.server_name) {
+                prefixed_tool.name = Cow::Owned(final_name.clone());
                 crate::enrichment::enrich_tool(&mut prefixed_tool);
             }
 
-            // 6. Set the wire name and title
+            // Title always uses stripped name (display-only, no collision risk)
+            let title_name = if c.has_strip_keywords {
+                crate::tool_naming::generate_title(&c.prefix, &c.stripped_name)
+            } else {
+                crate::tool_naming::generate_title(&c.prefix, &final_name)
+            };
+
+            // Set wire name and title
             prefixed_tool.name = Cow::Owned(prefixed_name);
-            prefixed_tool.title =
-                Some(crate::tool_naming::generate_title(&prefix, &cleaned_name));
+            prefixed_tool.title = Some(title_name);
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);

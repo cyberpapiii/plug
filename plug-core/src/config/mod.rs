@@ -131,7 +131,12 @@ pub struct ServerConfig {
     /// Manual tool renames (original_name -> new_name).
     #[serde(default)]
     pub tool_renames: HashMap<String, String>,
-    }
+    /// Tool group classification for sub-service decomposition.
+    /// Maps group prefix (e.g. "Gmail") to match rules.
+    /// When set, tools matching a rule get `GroupPrefix__tool_name` instead of `ServerName__tool_name`.
+    #[serde(default)]
+    pub tool_groups: Vec<ToolGroupRule>,
+}
 
     fn default_true() -> bool {
     true
@@ -168,6 +173,40 @@ pub enum TransportType {
     #[default]
     Stdio,
     Http,
+}
+
+/// A rule for classifying tools into named groups (sub-services).
+///
+/// Tools whose name contains any of the `contains` keywords are assigned
+/// the `prefix` as their group name. Rules are evaluated in order; first match wins.
+///
+/// Only keywords listed in `strip` are removed from the tool name to avoid redundancy.
+/// Classification keywords that aren't in `strip` are kept (e.g., "event" classifies
+/// a tool as Calendar but shouldn't be stripped from `manage_event`).
+///
+/// Example TOML:
+/// ```toml
+/// [[servers.workspace.tool_groups]]
+/// prefix = "Gmail"
+/// contains = ["gmail"]
+/// strip = ["gmail"]
+///
+/// [[servers.workspace.tool_groups]]
+/// prefix = "GoogleCalendar"
+/// contains = ["event", "calendar", "freebusy"]
+/// strip = ["calendar"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolGroupRule {
+    /// The group prefix (e.g. "Gmail", "GoogleDrive").
+    pub prefix: String,
+    /// Keywords to match in the tool name. Any match triggers this rule.
+    pub contains: Vec<String>,
+    /// Keywords to strip from the tool name to avoid redundancy.
+    /// Only these are removed; other `contains` keywords are kept.
+    /// If empty, no stripping is performed.
+    #[serde(default)]
+    pub strip: Vec<String>,
 }
 
 /// Validate a config and return a list of error messages.
@@ -449,6 +488,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -475,6 +515,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -505,6 +546,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -535,6 +577,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -569,6 +612,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -599,6 +643,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);

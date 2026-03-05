@@ -717,11 +717,27 @@ async fn check_client_configs() -> CheckResult {
                     issues.push(format!("{} (invalid YAML in {}: {})", target, path.display(), e));
                 }
             } else {
-                // For JSON, check for multiple "plug" keys
-                if let Ok(_json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    // Current merge logic is safe, but we'll flag if it looks broken
-                    if content.matches("\"plug\":").count() > 1 {
-                         issues.push(format!("{} (potential duplicate entries in {})", target, path.display()));
+                // For JSON, check for multiple "plug" keys in valid MCP locations
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let mut plug_locations = 0;
+                    
+                    // Location 1: mcpServers / context_servers
+                    for key in ["mcpServers", "context_servers"] {
+                        if json.get(key).and_then(|v| v.get("plug")).is_some() {
+                            plug_locations += 1;
+                        }
+                    }
+                    // Location 2: mcp.servers
+                    if json.get("mcp").and_then(|v| v.get("servers")).and_then(|s| s.get("plug")).is_some() {
+                        plug_locations += 1;
+                    }
+                    // Location 3: tools.mcpServers
+                    if json.get("tools").and_then(|v| v.get("mcpServers")).and_then(|s| s.get("plug")).is_some() {
+                        plug_locations += 1;
+                    }
+
+                    if plug_locations > 1 {
+                         issues.push(format!("{} ({} duplicate plug entries in {})", target, plug_locations, path.display()));
                     }
                 } else {
                     issues.push(format!("{} (invalid JSON in {})", target, path.display()));
@@ -774,6 +790,7 @@ mod tests {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
         }
     }
 

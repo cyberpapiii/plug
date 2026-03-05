@@ -109,89 +109,184 @@ pub fn build_wire_name(server_prefix: &str, tool_name: &str, delimiter: &str) ->
     format!("{}{}{}", server_prefix, delimiter, tool_name)
 }
 
-/// Clean up a tool name after stripping: trim leading/trailing underscores,
-/// collapse double underscores. If result is empty, return the original.
-fn clean_stripped(name: &str, original: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_underscore = true; // trim leading
-    for c in name.chars() {
-        if c == '_' {
-            if !prev_underscore {
-                out.push('_');
-            }
-            prev_underscore = true;
-        } else {
-            out.push(c);
-            prev_underscore = false;
+
+/// Result of classifying a tool with rules.
+pub struct ClassifyResult {
+    /// The group prefix (e.g. "Gmail", "GoogleDrive").
+    pub prefix: String,
+    /// The original tool name (unmodified).
+    pub name: String,
+    /// Keywords to strip from the name to avoid redundancy.
+    pub strip_keywords: Vec<String>,
+}
+
+/// Classify a tool using config-driven group rules.
+/// Returns `Some(ClassifyResult)` if a rule matches, `None` otherwise.
+pub fn classify_with_rules(
+    tool_name: &str,
+    rules: &[crate::config::ToolGroupRule],
+) -> Option<ClassifyResult> {
+    for rule in rules {
+        if rule.contains.iter().any(|kw| tool_name.contains(kw.as_str())) {
+            return Some(ClassifyResult {
+                prefix: rule.prefix.clone(),
+                name: tool_name.to_string(),
+                strip_keywords: rule.strip.clone(),
+            });
         }
     }
-    if out.ends_with('_') {
-        out.pop();
+    None
+}
+
+/// Strip multiple keywords from a tool name, applying each in order.
+pub fn strip_keywords(tool_name: &str, keywords: &[String]) -> String {
+    let mut result = tool_name.to_string();
+    for kw in keywords {
+        let stripped = strip_keyword(&result, kw);
+        if stripped != result {
+            result = stripped;
+            break; // Only strip one keyword to avoid over-stripping
+        }
     }
-    if out.is_empty() {
-        original.to_string()
+    result
+}
+
+/// Strip a matched keyword from a tool name at word boundaries (underscore-delimited).
+/// Returns the stripped name, or the original if stripping would produce an empty string.
+///
+/// The keyword must appear as a complete word segment bounded by underscores or
+/// string boundaries. This prevents partial matches (e.g. "sheet" inside "spreadsheets").
+///
+/// Examples:
+/// - ("get_gmail_message_content", "gmail") -> "get_message_content"
+/// - ("search_drive_files", "drive") -> "search_files"
+/// - ("create_sheet", "sheet") -> "create"
+/// - ("get_page", "get_page") -> "get_page" (full match, keep original)
+/// - ("list_spreadsheets", "spreadsheet") -> "list_spreadsheets" (no word boundary match)
+pub fn strip_keyword(tool_name: &str, keyword: &str) -> String {
+    // Don't strip if the keyword IS the entire name
+    if tool_name == keyword {
+        return tool_name.to_string();
+    }
+
+    // Split into underscore-delimited words, filtering out empty segments
+    // (handles keywords like "doc_" or "_doc" that have leading/trailing underscores)
+    let words: Vec<&str> = tool_name.split('_').filter(|w| !w.is_empty()).collect();
+    let kw_words: Vec<&str> = keyword.split('_').filter(|w| !w.is_empty()).collect();
+    let kw_len = kw_words.len();
+
+    // Find a contiguous run of words matching the keyword words
+    if words.len() >= kw_len {
+        for start in 0..=(words.len() - kw_len) {
+            if words[start..start + kw_len] == kw_words[..] {
+                // Found a match — remove these words
+                let mut remaining: Vec<&str> = Vec::new();
+                remaining.extend_from_slice(&words[..start]);
+                remaining.extend_from_slice(&words[start + kw_len..]);
+                let result = remaining.join("_");
+                if result.is_empty() {
+                    return tool_name.to_string();
+                }
+                return result;
+            }
+        }
+    }
+
+    // No word-boundary match found — return original
+    tool_name.to_string()
+}
+
+/// Strip keywords from a title string (display-only, collisions don't matter).
+/// Removes the keyword and cleans up spacing.
+pub fn strip_keyword_from_title(title_part: &str, keyword: &str) -> String {
+    // Title words are space-separated and Title Cased
+    // Convert keyword to title case for matching
+    let kw_title: String = keyword
+        .split('_')
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let mut s = first.to_uppercase().to_string();
+                    s.extend(chars);
+                    s
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let result = title_part.replace(&kw_title, "");
+    // Clean up double spaces and trim
+    let cleaned: String = result.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        title_part.to_string()
     } else {
-        out
+        cleaned
     }
 }
 
-/// Strip a suffix word from the end of a name (including any preceding underscore).
-fn strip_suffix_word(name: &str, suffix: &str) -> String {
-    if let Some(before) = name.strip_suffix(suffix) {
-        before.to_string()
-    } else {
-        name.to_string()
-    }
+/// Returns the built-in tool group rules for the Google Workspace MCP server.
+/// Used as defaults when no `tool_groups` config is specified for the `workspace` server.
+pub fn default_workspace_rules() -> Vec<crate::config::ToolGroupRule> {
+    use crate::config::ToolGroupRule;
+    vec![
+        ToolGroupRule { prefix: "Gmail".into(), contains: vec!["gmail".into()], strip: vec!["gmail".into()] },
+        ToolGroupRule { prefix: "GoogleDrive".into(), contains: vec!["drive".into()], strip: vec!["drive".into()] },
+        ToolGroupRule { prefix: "GoogleSheets".into(), contains: vec!["spreadsheet".into(), "sheet".into(), "conditional_formatting".into()], strip: vec!["spreadsheet".into(), "sheet".into()] },
+        ToolGroupRule { prefix: "GoogleSlides".into(), contains: vec!["presentation".into(), "page_thumbnail".into(), "get_page".into()], strip: vec!["presentation".into()] },
+        ToolGroupRule { prefix: "GoogleDocs".into(), contains: vec!["_doc".into(), "doc_".into(), "document".into(), "paragraph".into(), "table_with_data".into(), "table_structure".into(), "find_and_replace".into()], strip: vec!["doc".into(), "document".into()] },
+        ToolGroupRule { prefix: "GoogleCalendar".into(), contains: vec!["event".into(), "calendar".into(), "freebusy".into()], strip: vec!["calendar".into()] },
+        ToolGroupRule { prefix: "GoogleContacts".into(), contains: vec!["contact".into()], strip: vec!["contact".into(), "contacts".into()] },
+        ToolGroupRule { prefix: "GoogleTasks".into(), contains: vec!["task".into()], strip: vec!["task".into(), "tasks".into()] },
+        ToolGroupRule { prefix: "GoogleChat".into(), contains: vec!["spaces".into(), "reaction".into(), "chat_".into(), "send_message".into(), "get_messages".into(), "search_messages".into()], strip: vec!["chat".into()] },
+        ToolGroupRule { prefix: "GoogleForms".into(), contains: vec!["form".into()], strip: vec!["form".into()] },
+        ToolGroupRule { prefix: "GoogleAppsScript".into(), contains: vec!["script".into(), "deployment".into(), "version".into(), "trigger_code".into(), "publish_settings".into()], strip: vec!["script".into()] },
+        ToolGroupRule { prefix: "GoogleAuth".into(), contains: vec!["google_auth".into()], strip: vec!["google_auth".into()] },
+        ToolGroupRule { prefix: "GoogleSearch".into(), contains: vec!["search_engine".into(), "search_custom".into()], strip: vec![] },
+    ]
 }
 
-/// Classify a workspace tool into a sub-service and strip the service keyword.
-/// Returns (&'static str, String) = (sub_service_name, cleaned_tool_name)
+/// Classify a workspace tool into a Google sub-service using built-in defaults.
+/// Returns (&'static str, String) = (sub_service_prefix, original_tool_name)
+///
+/// The tool name is returned **unmodified** — no keyword stripping.
+/// The prefix (e.g. "GoogleSheets") is what provides disambiguation.
 pub fn classify_workspace_tool(tool_name: &str) -> (&'static str, String) {
-    // Gmail
+    // Gmail (already a distinct brand, no "Google" prefix needed)
     if tool_name.contains("gmail") {
-        let stripped = tool_name.replace("gmail_", "");
-        return ("Gmail", clean_stripped(&stripped, tool_name));
+        return ("Gmail", tool_name.to_string());
     }
 
-    // Drive
+    // Google Drive
     if tool_name.contains("drive") {
-        let stripped = tool_name.replace("drive_", "");
-        return ("Drive", clean_stripped(&stripped, tool_name));
+        return ("GoogleDrive", tool_name.to_string());
     }
 
-    // Sheets
+    // Google Sheets
     if tool_name.contains("sheet")
         || tool_name.contains("spreadsheet")
         || tool_name.contains("conditional_formatting")
     {
-        let stripped = tool_name
-            .replace("spreadsheet_", "")
-            .replace("sheet_", "");
-        // Handle trailing _sheet (e.g. "create_sheet")
-        let stripped = strip_suffix_word(&stripped, "_sheet");
-        // Handle trailing _spreadsheet (e.g. "create_spreadsheet")
-        let stripped = strip_suffix_word(&stripped, "_spreadsheet");
-        return ("Sheets", clean_stripped(&stripped, tool_name));
+        return ("GoogleSheets", tool_name.to_string());
     }
 
-    // Slides
+    // Google Slides
     if tool_name.contains("presentation")
         || tool_name.contains("page_thumbnail")
         || tool_name == "get_page"
     {
-        let stripped = tool_name.replace("presentation_", "");
-        // Handle trailing _presentation (e.g. "batch_update_presentation", "get_presentation")
-        let stripped = strip_suffix_word(&stripped, "_presentation");
-        return ("Slides", clean_stripped(&stripped, tool_name));
+        return ("GoogleSlides", tool_name.to_string());
     }
 
-    // Docs
+    // Google Docs
     if tool_name.contains("doc_")
         || tool_name.contains("docs_")
         || tool_name.ends_with("_doc")
         || tool_name.ends_with("_docs")
         || tool_name.contains("document")
-        || tool_name.contains("paragraph_style")
+        || tool_name.contains("paragraph")
         || tool_name == "import_to_google_doc"
         || tool_name.contains("table_with_data")
         || tool_name.contains("table_structure")
@@ -200,43 +295,28 @@ pub fn classify_workspace_tool(tool_name: &str) -> (&'static str, String) {
         || tool_name == "batch_update_doc"
         || tool_name == "create_doc"
     {
-        let stripped = tool_name
-            .replace("document_", "")
-            .replace("docs_", "")
-            .replace("doc_", "");
-        let stripped = strip_suffix_word(&stripped, "_doc");
-        let stripped = strip_suffix_word(&stripped, "_docs");
-        return ("Docs", clean_stripped(&stripped, tool_name));
+        return ("GoogleDocs", tool_name.to_string());
     }
 
-    // Calendar
+    // Google Calendar
     if tool_name.contains("event")
         || tool_name.contains("calendar")
         || tool_name.contains("freebusy")
     {
-        let stripped = tool_name.replace("calendars", "").replace("calendar", "");
-        return ("Calendar", clean_stripped(&stripped, tool_name));
+        return ("GoogleCalendar", tool_name.to_string());
     }
 
-    // Contacts
+    // Google Contacts
     if tool_name.contains("contact") {
-        let stripped = tool_name
-            .replace("contacts_", "")
-            .replace("contact_", "");
-        let stripped = strip_suffix_word(&stripped, "_contact");
-        let stripped = strip_suffix_word(&stripped, "_contacts");
-        return ("Contacts", clean_stripped(&stripped, tool_name));
+        return ("GoogleContacts", tool_name.to_string());
     }
 
-    // Tasks
+    // Google Tasks
     if tool_name.contains("task") {
-        let stripped = tool_name.replace("task_", "");
-        let stripped = strip_suffix_word(&stripped, "_tasks");
-        let stripped = strip_suffix_word(&stripped, "_task");
-        return ("Tasks", clean_stripped(&stripped, tool_name));
+        return ("GoogleTasks", tool_name.to_string());
     }
 
-    // Chat
+    // Google Chat
     if tool_name == "send_message"
         || tool_name == "get_messages"
         || tool_name == "search_messages"
@@ -244,35 +324,36 @@ pub fn classify_workspace_tool(tool_name: &str) -> (&'static str, String) {
         || tool_name.contains("reaction")
         || tool_name.contains("chat_")
     {
-        let stripped = tool_name.replace("chat_", "");
-        return ("Chat", clean_stripped(&stripped, tool_name));
+        return ("GoogleChat", tool_name.to_string());
     }
 
-    // Forms
+    // Google Forms
     if tool_name.contains("form") {
-        let stripped = tool_name.replace("form_", "");
-        return ("Forms", clean_stripped(&stripped, tool_name));
+        return ("GoogleForms", tool_name.to_string());
     }
 
-    // Scripts
+    // Google Apps Script
     if tool_name.contains("script")
         || tool_name.contains("deployment")
         || tool_name.contains("version")
         || tool_name.contains("trigger_code")
         || tool_name.contains("publish_settings")
     {
-        let stripped = tool_name.replace("script_", "");
-        return ("Scripts", clean_stripped(&stripped, tool_name));
+        return ("GoogleAppsScript", tool_name.to_string());
     }
 
-    // Auth
+    // Google Auth
     if tool_name.contains("google_auth") {
-        let stripped = tool_name.replace("google_auth", "");
-        return ("Auth", clean_stripped(&stripped, tool_name));
+        return ("GoogleAuth", tool_name.to_string());
+    }
+
+    // Google Search (Programmable Search Engine)
+    if tool_name.contains("search_engine") || tool_name == "search_custom" {
+        return ("GoogleSearch", tool_name.to_string());
     }
 
     // Fallback
-    ("Workspace", tool_name.to_string())
+    ("GoogleWorkspace", tool_name.to_string())
 }
 
 #[cfg(test)]
@@ -367,64 +448,21 @@ mod tests {
     }
 
     // ---- classify_workspace_tool tests ----
+    // Tool names are returned unmodified; only the prefix changes.
 
     #[test]
     fn classify_gmail_tools() {
         assert_eq!(
             classify_workspace_tool("search_gmail_messages"),
-            ("Gmail", "search_messages".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_gmail_message_content"),
-            ("Gmail", "get_message_content".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_gmail_messages_content_batch"),
-            ("Gmail", "get_messages_content_batch".to_string())
+            ("Gmail", "search_gmail_messages".to_string())
         );
         assert_eq!(
             classify_workspace_tool("draft_gmail_message"),
-            ("Gmail", "draft_message".to_string())
+            ("Gmail", "draft_gmail_message".to_string())
         );
         assert_eq!(
-            classify_workspace_tool("send_gmail_message"),
-            ("Gmail", "send_message".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_gmail_filters"),
-            ("Gmail", "list_filters".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_gmail_labels"),
-            ("Gmail", "list_labels".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_gmail_filter"),
-            ("Gmail", "manage_filter".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_gmail_label"),
-            ("Gmail", "manage_label".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("modify_gmail_message_labels"),
-            ("Gmail", "modify_message_labels".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("batch_modify_gmail_message_labels"),
-            ("Gmail", "batch_modify_message_labels".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_gmail_attachment_content"),
-            ("Gmail", "get_attachment_content".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_gmail_thread_content"),
-            ("Gmail", "get_thread_content".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_gmail_threads_content_batch"),
-            ("Gmail", "get_threads_content_batch".to_string())
+            classify_workspace_tool("get_gmail_messages_content_batch"),
+            ("Gmail", "get_gmail_messages_content_batch".to_string())
         );
     }
 
@@ -432,99 +470,32 @@ mod tests {
     fn classify_drive_tools() {
         assert_eq!(
             classify_workspace_tool("search_drive_files"),
-            ("Drive", "search_files".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_drive_file_content"),
-            ("Drive", "get_file_content".to_string())
+            ("GoogleDrive", "search_drive_files".to_string())
         );
         assert_eq!(
             classify_workspace_tool("create_drive_folder"),
-            ("Drive", "create_folder".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_drive_items"),
-            ("Drive", "list_items".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("check_drive_file_public_access"),
-            ("Drive", "check_file_public_access".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("copy_drive_file"),
-            ("Drive", "copy_file".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("create_drive_file"),
-            ("Drive", "create_file".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_drive_file_download_url"),
-            ("Drive", "get_file_download_url".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_drive_file_permissions"),
-            ("Drive", "get_file_permissions".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_drive_shareable_link"),
-            ("Drive", "get_shareable_link".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_drive_access"),
-            ("Drive", "manage_access".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("set_drive_file_permissions"),
-            ("Drive", "set_file_permissions".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("update_drive_file"),
-            ("Drive", "update_file".to_string())
+            ("GoogleDrive", "create_drive_folder".to_string())
         );
     }
 
     #[test]
     fn classify_sheets_tools() {
+        // No more collision — both keep their original names
         assert_eq!(
             classify_workspace_tool("create_sheet"),
-            ("Sheets", "create".to_string())
+            ("GoogleSheets", "create_sheet".to_string())
         );
         assert_eq!(
             classify_workspace_tool("create_spreadsheet"),
-            ("Sheets", "create".to_string())
+            ("GoogleSheets", "create_spreadsheet".to_string())
         );
         assert_eq!(
             classify_workspace_tool("format_sheet_range"),
-            ("Sheets", "format_range".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_spreadsheet_info"),
-            ("Sheets", "get_info".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_spreadsheets"),
-            ("Sheets", "list_spreadsheets".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_spreadsheet_comments"),
-            ("Sheets", "list_comments".to_string())
+            ("GoogleSheets", "format_sheet_range".to_string())
         );
         assert_eq!(
             classify_workspace_tool("manage_conditional_formatting"),
-            ("Sheets", "manage_conditional_formatting".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_spreadsheet_comment"),
-            ("Sheets", "manage_comment".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("modify_sheet_values"),
-            ("Sheets", "modify_values".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("read_sheet_values"),
-            ("Sheets", "read_values".to_string())
+            ("GoogleSheets", "manage_conditional_formatting".to_string())
         );
     }
 
@@ -532,31 +503,19 @@ mod tests {
     fn classify_slides_tools() {
         assert_eq!(
             classify_workspace_tool("batch_update_presentation"),
-            ("Slides", "batch_update".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("create_presentation"),
-            ("Slides", "create".to_string())
+            ("GoogleSlides", "batch_update_presentation".to_string())
         );
         assert_eq!(
             classify_workspace_tool("get_presentation"),
-            ("Slides", "get".to_string())
+            ("GoogleSlides", "get_presentation".to_string())
         );
         assert_eq!(
             classify_workspace_tool("get_page"),
-            ("Slides", "get_page".to_string())
+            ("GoogleSlides", "get_page".to_string())
         );
         assert_eq!(
             classify_workspace_tool("get_page_thumbnail"),
-            ("Slides", "get_page_thumbnail".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_presentation_comments"),
-            ("Slides", "list_comments".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_presentation_comment"),
-            ("Slides", "manage_comment".to_string())
+            ("GoogleSlides", "get_page_thumbnail".to_string())
         );
     }
 
@@ -564,91 +523,23 @@ mod tests {
     fn classify_docs_tools() {
         assert_eq!(
             classify_workspace_tool("get_doc_content"),
-            ("Docs", "get_content".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_doc_as_markdown"),
-            ("Docs", "get_as_markdown".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("batch_update_doc"),
-            ("Docs", "batch_update".to_string())
+            ("GoogleDocs", "get_doc_content".to_string())
         );
         assert_eq!(
             classify_workspace_tool("create_doc"),
-            ("Docs", "create".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_document_comments"),
-            ("Docs", "list_comments".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_document_comment"),
-            ("Docs", "manage_comment".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("update_paragraph_style"),
-            ("Docs", "update_paragraph_style".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("create_table_with_data"),
-            ("Docs", "create_table_with_data".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("debug_table_structure"),
-            ("Docs", "debug_table_structure".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("find_and_replace_doc"),
-            ("Docs", "find_and_replace".to_string())
+            ("GoogleDocs", "create_doc".to_string())
         );
         assert_eq!(
             classify_workspace_tool("import_to_google_doc"),
-            ("Docs", "import_to_google".to_string())
+            ("GoogleDocs", "import_to_google_doc".to_string())
         );
         assert_eq!(
-            classify_workspace_tool("search_docs"),
-            ("Docs", "search".to_string())
+            classify_workspace_tool("update_paragraph_style"),
+            ("GoogleDocs", "update_paragraph_style".to_string())
         );
         assert_eq!(
-            classify_workspace_tool("delete_doc_tab"),
-            ("Docs", "delete_tab".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("export_doc_to_pdf"),
-            ("Docs", "export_to_pdf".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("insert_doc_elements"),
-            ("Docs", "insert_elements".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("insert_doc_image"),
-            ("Docs", "insert_image".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("insert_doc_tab"),
-            ("Docs", "insert_tab".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("inspect_doc_structure"),
-            ("Docs", "inspect_structure".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_docs_in_folder"),
-            ("Docs", "list_in_folder".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("modify_doc_text"),
-            ("Docs", "modify_text".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("update_doc_headers_footers"),
-            ("Docs", "update_headers_footers".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("update_doc_tab"),
-            ("Docs", "update_tab".to_string())
+            classify_workspace_tool("create_table_with_data"),
+            ("GoogleDocs", "create_table_with_data".to_string())
         );
     }
 
@@ -656,19 +547,19 @@ mod tests {
     fn classify_calendar_tools() {
         assert_eq!(
             classify_workspace_tool("get_events"),
-            ("Calendar", "get_events".to_string())
+            ("GoogleCalendar", "get_events".to_string())
         );
         assert_eq!(
             classify_workspace_tool("list_calendars"),
-            ("Calendar", "list".to_string())
+            ("GoogleCalendar", "list_calendars".to_string())
         );
         assert_eq!(
             classify_workspace_tool("manage_event"),
-            ("Calendar", "manage_event".to_string())
+            ("GoogleCalendar", "manage_event".to_string())
         );
         assert_eq!(
             classify_workspace_tool("query_freebusy"),
-            ("Calendar", "query_freebusy".to_string())
+            ("GoogleCalendar", "query_freebusy".to_string())
         );
     }
 
@@ -676,35 +567,15 @@ mod tests {
     fn classify_contacts_tools() {
         assert_eq!(
             classify_workspace_tool("get_contact"),
-            ("Contacts", "get".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_contact_group"),
-            ("Contacts", "get_group".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_contact_groups"),
-            ("Contacts", "list_groups".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_contacts"),
-            ("Contacts", "list".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_contact"),
-            ("Contacts", "manage".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_contact_group"),
-            ("Contacts", "manage_group".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_contacts_batch"),
-            ("Contacts", "manage_batch".to_string())
+            ("GoogleContacts", "get_contact".to_string())
         );
         assert_eq!(
             classify_workspace_tool("search_contacts"),
-            ("Contacts", "search".to_string())
+            ("GoogleContacts", "search_contacts".to_string())
+        );
+        assert_eq!(
+            classify_workspace_tool("manage_contacts_batch"),
+            ("GoogleContacts", "manage_contacts_batch".to_string())
         );
     }
 
@@ -712,27 +583,15 @@ mod tests {
     fn classify_tasks_tools() {
         assert_eq!(
             classify_workspace_tool("get_task"),
-            ("Tasks", "get".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_task_list"),
-            ("Tasks", "get_list".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_task_lists"),
-            ("Tasks", "list_lists".to_string())
+            ("GoogleTasks", "get_task".to_string())
         );
         assert_eq!(
             classify_workspace_tool("list_tasks"),
-            ("Tasks", "list".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_task"),
-            ("Tasks", "manage".to_string())
+            ("GoogleTasks", "list_tasks".to_string())
         );
         assert_eq!(
             classify_workspace_tool("manage_task_list"),
-            ("Tasks", "manage_list".to_string())
+            ("GoogleTasks", "manage_task_list".to_string())
         );
     }
 
@@ -740,51 +599,35 @@ mod tests {
     fn classify_chat_tools() {
         assert_eq!(
             classify_workspace_tool("send_message"),
-            ("Chat", "send_message".to_string())
+            ("GoogleChat", "send_message".to_string())
         );
         assert_eq!(
             classify_workspace_tool("get_messages"),
-            ("Chat", "get_messages".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("search_messages"),
-            ("Chat", "search_messages".to_string())
+            ("GoogleChat", "get_messages".to_string())
         );
         assert_eq!(
             classify_workspace_tool("list_spaces"),
-            ("Chat", "list_spaces".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("create_reaction"),
-            ("Chat", "create_reaction".to_string())
+            ("GoogleChat", "list_spaces".to_string())
         );
         assert_eq!(
             classify_workspace_tool("download_chat_attachment"),
-            ("Chat", "download_attachment".to_string())
+            ("GoogleChat", "download_chat_attachment".to_string())
         );
     }
 
     #[test]
     fn classify_forms_tools() {
         assert_eq!(
-            classify_workspace_tool("get_form"),
-            ("Forms", "get_form".to_string())
+            classify_workspace_tool("create_form"),
+            ("GoogleForms", "create_form".to_string())
         );
         assert_eq!(
             classify_workspace_tool("get_form_response"),
-            ("Forms", "get_response".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_form_responses"),
-            ("Forms", "list_responses".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("create_form"),
-            ("Forms", "create_form".to_string())
+            ("GoogleForms", "get_form_response".to_string())
         );
         assert_eq!(
             classify_workspace_tool("batch_update_form"),
-            ("Forms", "batch_update_form".to_string())
+            ("GoogleForms", "batch_update_form".to_string())
         );
     }
 
@@ -792,67 +635,23 @@ mod tests {
     fn classify_scripts_tools() {
         assert_eq!(
             classify_workspace_tool("create_script_project"),
-            ("Scripts", "create_project".to_string())
+            ("GoogleAppsScript", "create_script_project".to_string())
         );
         assert_eq!(
             classify_workspace_tool("run_script_function"),
-            ("Scripts", "run_function".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_script_content"),
-            ("Scripts", "get_content".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_script_metrics"),
-            ("Scripts", "get_metrics".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_script_project"),
-            ("Scripts", "get_project".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("delete_script_project"),
-            ("Scripts", "delete_project".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_script_processes"),
-            ("Scripts", "list_processes".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_script_projects"),
-            ("Scripts", "list_projects".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("update_script_content"),
-            ("Scripts", "update_content".to_string())
+            ("GoogleAppsScript", "run_script_function".to_string())
         );
         assert_eq!(
             classify_workspace_tool("create_version"),
-            ("Scripts", "create_version".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("get_version"),
-            ("Scripts", "get_version".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("list_versions"),
-            ("Scripts", "list_versions".to_string())
+            ("GoogleAppsScript", "create_version".to_string())
         );
         assert_eq!(
             classify_workspace_tool("list_deployments"),
-            ("Scripts", "list_deployments".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("manage_deployment"),
-            ("Scripts", "manage_deployment".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("generate_trigger_code"),
-            ("Scripts", "generate_trigger_code".to_string())
+            ("GoogleAppsScript", "list_deployments".to_string())
         );
         assert_eq!(
             classify_workspace_tool("set_publish_settings"),
-            ("Scripts", "set_publish_settings".to_string())
+            ("GoogleAppsScript", "set_publish_settings".to_string())
         );
     }
 
@@ -860,28 +659,137 @@ mod tests {
     fn classify_auth_tool() {
         assert_eq!(
             classify_workspace_tool("start_google_auth"),
-            ("Auth", "start".to_string())
+            ("GoogleAuth", "start_google_auth".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_search_tools() {
+        assert_eq!(
+            classify_workspace_tool("get_search_engine_info"),
+            ("GoogleSearch", "get_search_engine_info".to_string())
+        );
+        assert_eq!(
+            classify_workspace_tool("search_custom"),
+            ("GoogleSearch", "search_custom".to_string())
         );
     }
 
     #[test]
     fn classify_fallback_tools() {
         assert_eq!(
-            classify_workspace_tool("get_search_engine_info"),
-            ("Workspace", "get_search_engine_info".to_string())
-        );
-        assert_eq!(
-            classify_workspace_tool("search_custom"),
-            ("Workspace", "search_custom".to_string())
+            classify_workspace_tool("some_new_tool"),
+            ("GoogleWorkspace", "some_new_tool".to_string())
         );
     }
 
     #[test]
-    fn classify_unknown_tool_falls_back() {
-        assert_eq!(
-            classify_workspace_tool("some_new_tool"),
-            ("Workspace", "some_new_tool".to_string())
-        );
+    fn classify_with_rules_matches_defaults() {
+        let rules = default_workspace_rules();
+        let test_cases = vec![
+            ("search_gmail_messages", "Gmail"),
+            ("create_drive_folder", "GoogleDrive"),
+            ("create_sheet", "GoogleSheets"),
+            ("create_spreadsheet", "GoogleSheets"),
+            ("get_presentation", "GoogleSlides"),
+            ("get_doc_content", "GoogleDocs"),
+            ("get_events", "GoogleCalendar"),
+            ("get_contact", "GoogleContacts"),
+            ("list_tasks", "GoogleTasks"),
+            ("send_message", "GoogleChat"),
+            ("create_form", "GoogleForms"),
+            ("run_script_function", "GoogleAppsScript"),
+            ("start_google_auth", "GoogleAuth"),
+            ("search_custom", "GoogleSearch"),
+        ];
+        for (tool, expected_prefix) in test_cases {
+            let result = classify_with_rules(tool, &rules);
+            assert!(result.is_some(), "rule should match: {tool}");
+            let r = result.unwrap();
+            assert_eq!(r.prefix, expected_prefix, "wrong prefix for {tool}");
+            assert_eq!(r.name, tool, "tool name should be unmodified for {tool}");
+        }
+    }
+
+    #[test]
+    fn classify_with_rules_no_match_returns_none() {
+        let rules = default_workspace_rules();
+        assert!(classify_with_rules("some_new_tool", &rules).is_none());
+    }
+
+    #[test]
+    fn classify_with_custom_rules() {
+        use crate::config::ToolGroupRule;
+        let rules = vec![
+            ToolGroupRule { prefix: "Outlook".into(), contains: vec!["mail".into(), "outlook".into()], strip: vec!["mail".into()] },
+            ToolGroupRule { prefix: "Teams".into(), contains: vec!["teams".into(), "channel".into()], strip: vec!["teams".into()] },
+        ];
+        let r = classify_with_rules("send_mail", &rules).unwrap();
+        assert_eq!(r.prefix, "Outlook");
+        assert_eq!(r.name, "send_mail");
+        assert_eq!(r.strip_keywords, vec!["mail"]);
+
+        let r = classify_with_rules("list_channels", &rules).unwrap();
+        assert_eq!(r.prefix, "Teams");
+        assert_eq!(r.name, "list_channels");
+        assert_eq!(r.strip_keywords, vec!["teams"]); // strip is "teams", not "channel"
+
+        assert!(classify_with_rules("unknown_tool", &rules).is_none());
+    }
+
+    #[test]
+    fn strip_keywords_applies_strip_list() {
+        // Gmail: strip "gmail"
+        assert_eq!(strip_keywords("get_gmail_message_content", &["gmail".into()]), "get_message_content");
+        // GoogleCalendar: strip "calendar" but NOT "event"
+        assert_eq!(strip_keywords("list_calendars", &["calendar".into()]), "list_calendars"); // "calendars" != "calendar" at word boundary
+        assert_eq!(strip_keywords("manage_event", &["calendar".into()]), "manage_event"); // no match
+        // GoogleAppsScript: strip "script" but NOT "version"/"deployment"
+        assert_eq!(strip_keywords("run_script_function", &["script".into()]), "run_function");
+        assert_eq!(strip_keywords("create_version", &["script".into()]), "create_version"); // no match
+    }
+
+    // ---- strip_keyword tests ----
+
+    #[test]
+    fn strip_keyword_prefix() {
+        assert_eq!(strip_keyword("gmail_message_content", "gmail"), "message_content");
+        assert_eq!(strip_keyword("drive_file_content", "drive"), "file_content");
+    }
+
+    #[test]
+    fn strip_keyword_suffix() {
+        assert_eq!(strip_keyword("create_sheet", "sheet"), "create");
+        assert_eq!(strip_keyword("batch_update_form", "form"), "batch_update");
+        assert_eq!(strip_keyword("get_presentation", "presentation"), "get");
+    }
+
+    #[test]
+    fn strip_keyword_infix() {
+        assert_eq!(strip_keyword("get_gmail_message_content", "gmail"), "get_message_content");
+        assert_eq!(strip_keyword("search_drive_files", "drive"), "search_files");
+    }
+
+    #[test]
+    fn strip_keyword_full_match_keeps_original() {
+        assert_eq!(strip_keyword("get_page", "get_page"), "get_page");
+        assert_eq!(strip_keyword("search_custom", "search_custom"), "search_custom");
+    }
+
+    #[test]
+    fn strip_keyword_no_word_boundary_keeps_original() {
+        // "spreadsheet" doesn't match "spreadsheets" at word boundary
+        assert_eq!(strip_keyword("list_spreadsheets", "spreadsheet"), "list_spreadsheets");
+        // "script" doesn't match at word boundary inside "create_version"
+        assert_eq!(strip_keyword("create_version", "script"), "create_version");
+    }
+
+    #[test]
+    fn strip_keyword_multi_word() {
+        // Multi-word keywords like "google_auth"
+        assert_eq!(strip_keyword("start_google_auth", "google_auth"), "start");
+        // "doc_" as keyword — only the "doc" word
+        assert_eq!(strip_keyword("get_doc_content", "doc"), "get_content");
     }
 
     #[test]
