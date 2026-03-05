@@ -675,7 +675,7 @@ async fn check_client_configs() -> CheckResult {
     let all_targets = [
         "claude-desktop", "claude-code", "cursor", "vscode", "windsurf", 
         "gemini-cli", "codex-cli", "opencode", "zed", "cline", "cline-cli",
-        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity"
+        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity", "goose"
     ];
 
     for target in all_targets {
@@ -700,9 +700,9 @@ async fn check_client_configs() -> CheckResult {
                 Err(_) => continue,
             };
 
-            let is_toml = path.extension().and_then(|e| e.to_str()) == Some("toml");
+            let ext = path.extension().and_then(|e| e.to_str());
             
-            if is_toml {
+            if ext == Some("toml") {
                 // Count occurrences of [mcp_servers.plug]
                 let count = content.lines().filter(|l| l.trim() == "[mcp_servers.plug]").count();
                 if count > 1 {
@@ -711,6 +711,15 @@ async fn check_client_configs() -> CheckResult {
                 // Also check if it's even valid TOML
                 if let Err(e) = content.parse::<toml::Value>() {
                     issues.push(format!("{} (invalid TOML in {}: {})", target, path.display(), e));
+                }
+            } else if ext == Some("yaml") || ext == Some("yml") {
+                // For YAML (Goose), check for duplicate "plug:" keys under extensions
+                let count = content.lines().filter(|l| l.trim() == "plug:").count();
+                if count > 1 {
+                    issues.push(format!("{} (duplicate entries in {})", target, path.display()));
+                }
+                if let Err(e) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    issues.push(format!("{} (invalid YAML in {}: {})", target, path.display(), e));
                 }
             } else {
                 // For JSON, check for multiple "plug" keys

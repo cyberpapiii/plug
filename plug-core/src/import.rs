@@ -43,6 +43,7 @@ pub enum ClientSource {
     Junie,
     Kilo,
     Antigravity,
+    Goose,
 }
 
 impl ClientSource {
@@ -66,6 +67,7 @@ impl ClientSource {
             Self::Junie => "JetBrains Junie",
             Self::Kilo => "Kilo Code",
             Self::Antigravity => "Google Antigravity",
+            Self::Goose => "Goose",
         }
     }
 
@@ -89,6 +91,7 @@ impl ClientSource {
             Self::Junie,
             Self::Kilo,
             Self::Antigravity,
+            Self::Goose,
         ]
     }
 }
@@ -275,7 +278,27 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
             ]
         }
         ClientSource::Antigravity => antigravity_paths(&home),
+        ClientSource::Goose => goose_paths(&home),
     }
+}
+
+/// Platform-specific config paths for Goose.
+#[allow(unused_variables)]
+fn goose_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(home.join(".config/goose/config.yaml"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(home.join(".config/goose/config.yaml"));
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        paths.push(PathBuf::from(appdata).join("Block/goose/config/config.yaml"));
+    }
+    paths
 }
 
 /// Platform-specific config paths for Claude Desktop.
@@ -352,7 +375,103 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
 
         // Zed uses "context_servers"
         ClientSource::Zed => parse_json_mcp_servers(&content, source, "context_servers"),
+
+        // YAML clients
+        ClientSource::Goose => parse_yaml_mcp_extensions(&content, source, "extensions"),
     }
+}
+
+/// Parse YAML config with a top-level key containing server definitions.
+fn parse_yaml_mcp_extensions(
+    content: &str,
+    source: ClientSource,
+    key: &str,
+) -> Result<Vec<DiscoveredServer>, String> {
+    let value: serde_yml::Value = serde_yml::from_str(content)
+        .map_err(|e| format!("YAML parse error: {e}"))?;
+
+    let servers_obj = match value.get(key).and_then(|v| v.as_mapping()) {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut servers = Vec::new();
+    for (name_val, entry) in servers_obj {
+        let name = match name_val.as_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if name == "plug" {
+            continue;
+        }
+        if let Some(config) = yaml_entry_to_server_config(entry) {
+            servers.push(DiscoveredServer {
+                name,
+                config,
+                source,
+            });
+        }
+    }
+
+    Ok(servers)
+}
+
+/// Convert a YAML entry to a ServerConfig.
+fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig> {
+    let obj = entry.as_mapping()?;
+
+    // Goose uses "type: stdio" or "sse"
+    let transport_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
+    let transport = match transport_type {
+        "stdio" => crate::config::TransportType::Stdio,
+        "sse" | "http" => crate::config::TransportType::Http,
+        _ => return None,
+    };
+
+    let command = obj.get("command").and_then(|v| v.as_str()).map(String::from);
+    let args = obj
+        .get("args")
+        .and_then(|v| v.as_sequence())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let url = obj.get("uri").or_else(|| obj.get("url")).and_then(|v| v.as_str()).map(String::from);
+
+    let env = obj
+        .get("env")
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let val = v.as_str()?.to_string();
+                    Some((key, val))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let enabled = obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    Some(ServerConfig {
+        command,
+        args,
+        env,
+        enabled,
+        transport,
+        url,
+        auth_token: None,
+        timeout_secs: 30,
+        call_timeout_secs: 300,
+        max_concurrent: 1,
+        health_check_interval_secs: 60,
+        circuit_breaker_enabled: true,
+        enrichment: false,
+    })
 }
 
 /// Parse JSON config with a top-level key containing server definitions.
@@ -678,6 +797,7 @@ pub fn resolve_name(name: &str, source: ClientSource, existing_names: &[String])
         ClientSource::Junie => "junie",
         ClientSource::Kilo => "kilo",
         ClientSource::Antigravity => "antigravity",
+        ClientSource::Goose => "goose",
     };
     format!("{name}-{suffix}")
 }

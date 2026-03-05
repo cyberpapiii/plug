@@ -108,11 +108,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let log_to_file = matches!(
-        &cli.command,
-        Commands::Serve { daemon: true, .. }
-    );
-    
+    // Determine log level before doing ANYTHING else
     let log_level = if cli.verbose > 0 {
         match cli.verbose {
             1 => "debug",
@@ -125,7 +121,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let _log_guard = if log_to_file {
+    let daemon_mode = matches!(&cli.command, Commands::Serve { daemon: true, .. });
+    
+    let _log_guard = if daemon_mode {
         Some(daemon::setup_file_logging(&daemon::log_dir())?)
     } else {
         init_stderr_tracing(log_level);
@@ -185,13 +183,9 @@ fn init_stderr_tracing(level: &str) {
     if level == "none" {
         return;
     }
-    let filter = if level == "error" {
-        // For clean commands, only show errors from our own code and be silent for dependencies
-        tracing_subscriber::EnvFilter::new("plug=error,plug_core=error")
-    } else {
-        tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level))
-    };
+    
+    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -311,26 +305,15 @@ async fn cmd_status(config_path: Option<&std::path::PathBuf>, output: &OutputFor
     Ok(())
 }
 
-/// `plug servers` — list all configured upstream servers.
-async fn cmd_server_list(
-    config_path: Option<&std::path::PathBuf>,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
+async fn cmd_server_list(config_path: Option<&std::path::PathBuf>, output: &OutputFormat) -> anyhow::Result<()> {
     use dialoguer::console::{style, Emoji};
-
-    // 1. Try daemon first for live status
-    if let Ok(response) = daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
-        if let plug_core::ipc::IpcResponse::Status { servers, .. } = response {
-            match output {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&servers)?);
-                }
-                OutputFormat::Text => {
-                    if servers.is_empty() {
-                        println!("No servers configured. Run {} to add some.", style("plug setup").cyan());
-                        return Ok(());
-                    }
-                    println!("{} {} server(s) currently active:\n", Emoji("📡", ""), style(servers.len()).bold());
+    if let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) = daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
+        match output {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&servers)?),
+            OutputFormat::Text => {
+                if servers.is_empty() { println!("No servers configured."); }
+                else {
+                    println!("{} {} server(s) active:\n", Emoji("📡", ""), style(servers.len()).bold());
                     for s in servers {
                         let (icon, health) = match s.health {
                             plug_core::types::ServerHealth::Healthy => (Emoji("🟢", ""), style("Healthy").green()),
@@ -341,28 +324,14 @@ async fn cmd_server_list(
                     }
                 }
             }
-            return Ok(());
         }
+        return Ok(());
     }
-
-    // 2. Fallback to config only
     let config = plug_core::config::load_config(config_path)?;
-    match output {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&config.servers.keys().collect::<Vec<_>>())?);
-        }
-        OutputFormat::Text => {
-            if config.servers.is_empty() {
-                println!("No servers configured in config file. Run {} to add some.", style("plug setup").cyan());
-            } else {
-                let mut names: Vec<_> = config.servers.keys().collect();
-                names.sort();
-                println!("{} {} server(s) configured (daemon not running):\n", Emoji("⚙️", ""), style(names.len()).bold());
-                for name in names {
-                    println!("  {} {}", Emoji("⚪", ""), style(name).dim());
-                }
-            }
-        }
+    if matches!(output, OutputFormat::Text) {
+        let mut names: Vec<_> = config.servers.keys().collect(); names.sort();
+        println!("{} {} server(s) configured (daemon not running):\n", Emoji("⚙️", ""), style(names.len()).bold());
+        for n in names { println!("  {} {}", Emoji("⚪", ""), style(n).dim()); }
     }
     Ok(())
 }
@@ -406,104 +375,43 @@ async fn cmd_serve(config_path: Option<&std::path::PathBuf>, _stdio: bool) -> an
     Ok(())
 }
 
-/// `plug tools` — list all available tools across all servers.
-///
-/// Tries to query a running daemon via IPC first for instant results.
-/// Falls back to starting servers locally if daemon is not running.
-async fn cmd_tool_list(
-    config_path: Option<&std::path::PathBuf>,
-    output: &OutputFormat,
-    verbose: u8,
-) -> anyhow::Result<()> {
+async fn cmd_tool_list(config_path: Option<&std::path::PathBuf>, output: &OutputFormat, _verbose: u8) -> anyhow::Result<()> {
     use dialoguer::console::{style, Emoji};
     use std::collections::BTreeMap;
-
     let mut tools_by_server = BTreeMap::new();
-
-    // 1. Try daemon IPC first (instant)
-    if let Ok(response) = daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await {
-        if let plug_core::ipc::IpcResponse::Tools { tools } = response {
-            for t in tools {
-                tools_by_server
-                    .entry(t.server_id)
-                    .or_insert_with(Vec::new)
-                    .push((t.name, t.description));
-            }
-        }
+    if let Ok(plug_core::ipc::IpcResponse::Tools { tools }) = daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await {
+        for t in tools { tools_by_server.entry(t.server_id).or_insert_with(Vec::new).push((t.name, t.description)); }
     }
-
-    // 2. Fallback: start servers locally (heavy)
     if tools_by_server.is_empty() {
         let mut config = plug_core::config::load_config(config_path)?;
-        
-        // Anti-recursion shield: remove any server named "plug"
         config.servers.remove("plug");
-
-        if verbose == 0 {
-            eprintln!("{} Local discovery in progress (starting {} servers)...", Emoji("🔍", ""), config.servers.len());
-            eprintln!("{}", style("   (Tip: Run 'plug serve --daemon' to make this instant and silent)").dim());
-        }
-        
         let mgr = Arc::new(plug_core::server::ServerManager::new());
         mgr.start_all(&config).await?;
-        let tools = mgr.get_tools().await;
-        for (srv, tool) in tools {
-            tools_by_server
-                .entry(srv)
-                .or_insert_with(Vec::new)
-                .push((tool.name.to_string(), tool.description.map(|d| d.to_string())));
-        }
+        for (srv, tool) in mgr.get_tools().await { tools_by_server.entry(srv).or_insert_with(Vec::new).push((tool.name.to_string(), tool.description.map(|d| d.to_string()))); }
         mgr.shutdown_all().await;
     }
-
-    // 3. Render
     match output {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&tools_by_server)?);
-        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&tools_by_server)?),
         OutputFormat::Text => {
-            if tools_by_server.is_empty() {
-                println!("No tools found. Run {} to add servers.", style("plug setup").cyan());
-                return Ok(());
-            }
-
+            if tools_by_server.is_empty() { println!("No tools found."); return Ok(()); }
             let term_width = console::Term::stdout().size().1 as usize;
-            let name_width = 30;
-            let padding_and_bullet = 5; // "   • "
-            let separator = 1; // " "
-            let available_width = term_width.saturating_sub(name_width + padding_and_bullet + separator + 3); // -3 for "..."
-
-            println!(
-                "{} {} tools available across {} server(s)\n",
-                Emoji("⚒️", ""),
-                style(tools_by_server.values().map(|v| v.len()).sum::<usize>()).bold().green(),
-                style(tools_by_server.len()).bold().cyan(),
-            );
-
+            let available_width = term_width.saturating_sub(40);
+            println!("{} {} tools across {} server(s)\n", Emoji("⚒️", ""), style(tools_by_server.values().map(|v| v.len()).sum::<usize>()).bold().green(), tools_by_server.len());
             for (server, mut tools) in tools_by_server {
-                // Sort tools alphabetically by name
                 tools.sort_by(|a, b| a.0.cmp(&b.0));
-
                 println!(" {} {}", Emoji("📦", ""), style(server).bold().underlined());
                 for (name, desc) in tools {
                     let name_styled = style(format!("{:<30}", name)).cyan();
                     if let Some(d) = desc {
                         let cleaned = d.replace('\n', " ").replace('\r', "");
-                        let short_desc = if cleaned.len() > available_width {
-                            format!("{}...", &cleaned[..available_width.max(0)])
-                        } else {
-                            cleaned
-                        };
-                        println!("   • {} {}", name_styled, style(short_desc).dim());
-                    } else {
-                        println!("   • {}", name_styled);
-                    }
+                        let short = if cleaned.len() > available_width { format!("{}...", &cleaned[..available_width.max(0)]) } else { cleaned };
+                        println!("   • {} {}", name_styled, style(short).dim());
+                    } else { println!("   • {}", name_styled); }
                 }
                 println!();
             }
         }
     }
-
     Ok(())
 }
 
@@ -531,6 +439,7 @@ fn cmd_import(config_path: Option<&std::path::PathBuf>, clients: Option<Vec<Stri
             "junie" => Some(ClientSource::Junie),
             "kilo" => Some(ClientSource::Kilo),
             "antigravity" => Some(ClientSource::Antigravity),
+            "goose" => Some(ClientSource::Goose),
             _ => None,
         }).collect(),
         None => ClientSource::all().to_vec(),
@@ -582,7 +491,7 @@ fn cmd_export() -> anyhow::Result<()> {
         ("Codex CLI", "codex-cli"), ("OpenCode", "opencode"), ("Zed", "zed"),
         ("Cline (VS Code)", "cline"), ("Cline CLI", "cline-cli"), ("RooCode", "roocode"),
         ("Factory", "factory"), ("Nanobot", "nanobot"), ("JetBrains Junie", "junie"),
-        ("Kilo Code", "kilo"), ("Google Antigravity", "antigravity"),
+        ("Kilo Code", "kilo"), ("Google Antigravity", "antigravity"), ("Goose", "goose"),
     ];
 
     let mut items = Vec::new();
@@ -630,16 +539,19 @@ fn cmd_export() -> anyhow::Result<()> {
     if Confirm::with_theme(&ColorfulTheme::default()).with_prompt("Configure custom client?").default(false).interact()? {
         let path_str: String = Input::with_theme(&ColorfulTheme::default()).with_prompt("Config path").interact_text()?;
         let path = if path_str.starts_with("~/") { dirs::home_dir().unwrap().join(&path_str[2..]) } else { std::path::PathBuf::from(path_str) };
-        let format = Select::with_theme(&ColorfulTheme::default()).with_prompt("Format").items(&["JSON", "JSON (VS Code style)", "TOML"]).default(0).interact()?;
-        let (snippet, is_toml) = match format {
-            0 => (serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":"plug","args":["connect"]}}})).unwrap(), false),
-            1 => (serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"command":"plug","args":["connect"]}}}})).unwrap(), false),
-            2 => ("\n[mcp_servers.plug]\ncommand = \"plug\"\nargs = [\"connect\"]\n".to_string(), true),
+        let format = Select::with_theme(&ColorfulTheme::default()).with_prompt("Format").items(&["JSON", "JSON (VS Code style)", "TOML", "YAML"]).default(0).interact()?;
+        let (snippet, is_toml, is_yaml) = match format {
+            0 => (serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":"plug","args":["connect"]}}})).unwrap(), false, false),
+            1 => (serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"command":"plug","args":["connect"]}}}})).unwrap(), false, false),
+            2 => ("\n[mcp_servers.plug]\ncommand = \"plug\"\nargs = [\"connect\"]\n".to_string(), true, false),
+            3 => ("\nextensions:\n  plug:\n    type: stdio\n    command: plug\n    args: [\"connect\"]\n    enabled: true\n".to_string(), false, true),
             _ => unreachable!(),
         };
         if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
         let existing = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
-        let updated = if is_toml { let mut un = plug_core::import::unlink_toml(&existing); if !un.ends_with('\n') { un.push('\n'); } un.push_str(&snippet); un } else { merge_json_config(&existing, &snippet)? };
+        let updated = if is_toml { let mut un = plug_core::import::unlink_toml(&existing); if !un.ends_with('\n') { un.push('\n'); } un.push_str(&snippet); un } 
+                      else if is_yaml { let mut un = unlink_yaml(&existing); if !un.ends_with('\n') { un.push('\n'); } un.push_str(&snippet); un }
+                      else { merge_json_config(&existing, &snippet)? };
         std::fs::write(&path, updated)?;
     }
     Ok(())
@@ -650,7 +562,12 @@ fn execute_unlink(target: &str, project: bool) -> anyhow::Result<()> {
     let path = plug_core::export::default_config_path(target_enum, project).ok_or_else(|| anyhow::anyhow!("no path"))?;
     if !path.exists() { return Ok(()); }
     let existing = std::fs::read_to_string(&path)?;
-    let unlinked = if path.extension().and_then(|e| e.to_str()) == Some("toml") { plug_core::import::unlink_toml(&existing) } else { unmerge_json_config(&existing)? };
+    let ext = path.extension().and_then(|e| e.to_str());
+    let unlinked = match ext {
+        Some("toml") => plug_core::import::unlink_toml(&existing),
+        Some("yaml") | Some("yml") => unlink_yaml(&existing),
+        _ => unmerge_json_config(&existing)?
+    };
     std::fs::write(&path, unlinked)?;
     Ok(())
 }
@@ -660,7 +577,12 @@ fn is_linked(target: &str, project: bool) -> bool {
     let path = match plug_core::export::default_config_path(target_enum, project) { Some(p) => p, None => return false };
     if !path.exists() { return false; }
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    if path.extension().and_then(|e| e.to_str()) == Some("toml") { content.contains("[mcp_servers.plug]") } else { content.contains("\"plug\":") }
+    let ext = path.extension().and_then(|e| e.to_str());
+    match ext {
+        Some("toml") => content.contains("[mcp_servers.plug]"),
+        Some("yaml") | Some("yml") => content.contains("plug:"),
+        _ => content.contains("\"plug\":")
+    }
 }
 
 fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
@@ -670,24 +592,6 @@ fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
         if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) { if let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut()) { srv.remove("plug"); } }
     }
     Ok(serde_json::to_string_pretty(&json)?)
-}
-
-fn execute_export(target: &str, http: bool, port: u16, write: bool, project: bool) -> anyhow::Result<()> {
-    use plug_core::export::{ExportOptions, ExportTarget, ExportTransport};
-    let target_enum: ExportTarget = target.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let transport = if http { ExportTransport::Http } else { ExportTransport::Stdio };
-    let options = ExportOptions { target: target_enum, transport, port };
-    let snippet = plug_core::export::export_config(&options);
-    if write {
-        let path = plug_core::export::default_config_path(target_enum, project).ok_or_else(|| anyhow::anyhow!("no path"))?;
-        if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-        let existing = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
-        let updated = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            let mut unlinked = plug_core::import::unlink_toml(&existing); if !unlinked.ends_with('\n') { unlinked.push('\n'); } unlinked.push_str(&snippet); unlinked
-        } else { merge_json_config(&existing, &snippet)? };
-        std::fs::write(&path, updated)?;
-    } else { println!("{snippet}"); }
-    Ok(())
 }
 
 fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
@@ -701,6 +605,59 @@ fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
         }
     }
     Ok(serde_json::to_string_pretty(&existing_json)?)
+}
+
+fn merge_yaml_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
+    let mut existing_yml: serde_yml::Value = serde_yml::from_str(existing).unwrap_or_else(|_| serde_yml::Value::Mapping(serde_yml::Mapping::new()));
+    let snippet_yml: serde_yml::Value = serde_yml::from_str(snippet)?;
+    
+    if let (Some(e_map), Some(s_map)) = (existing_yml.as_mapping_mut(), snippet_yml.as_mapping()) {
+        for (k, v) in s_map {
+            if let (Some(e_inner), Some(s_inner)) = (e_map.get_mut(k).and_then(|v| v.as_mapping_mut()), v.as_mapping()) {
+                for (ik, iv) in s_inner {
+                    e_inner.insert(ik.clone(), iv.clone());
+                }
+            } else {
+                e_map.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    
+    Ok(serde_yml::to_string(&existing_yml)?)
+}
+
+fn unlink_yaml(existing: &str) -> String {
+    let mut output = Vec::new(); let mut skipping = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == "plug:" || (skipping && (trimmed.starts_with("type:") || trimmed.starts_with("command:") || trimmed.starts_with("args:") || trimmed.starts_with("enabled:") || trimmed.starts_with("- "))) {
+            skipping = true; continue;
+        }
+        if skipping && !line.starts_with(' ') && !trimmed.is_empty() { skipping = false; }
+        if !skipping { output.push(line); }
+    }
+    output.join("\n")
+}
+
+fn execute_export(target: &str, http: bool, port: u16, write: bool, project: bool) -> anyhow::Result<()> {
+    use plug_core::export::{ExportOptions, ExportTarget, ExportTransport};
+    let target_enum: ExportTarget = target.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let transport = if http { ExportTransport::Http } else { ExportTransport::Stdio };
+    let options = ExportOptions { target: target_enum, transport, port };
+    let snippet = plug_core::export::export_config(&options);
+    if write {
+        let path = plug_core::export::default_config_path(target_enum, project).ok_or_else(|| anyhow::anyhow!("no path"))?;
+        if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
+        let existing = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
+        let ext = path.extension().and_then(|e| e.to_str());
+        let updated = match ext {
+            Some("toml") => { let mut un = plug_core::import::unlink_toml(&existing); if !un.ends_with('\n') { un.push('\n'); } un.push_str(&snippet); un }
+            Some("yaml") | Some("yml") => merge_yaml_config(&existing, &snippet)?,
+            _ => merge_json_config(&existing, &snippet)?
+        };
+        std::fs::write(&path, updated)?;
+    } else { println!("{snippet}"); }
+    Ok(())
 }
 
 async fn cmd_doctor(config_path: Option<&std::path::PathBuf>, output: &OutputFormat) -> anyhow::Result<()> {
@@ -760,7 +717,7 @@ fn cmd_repair() -> anyhow::Result<()> {
     let all_clients = [
         "claude-desktop", "claude-code", "cursor", "vscode", "windsurf", 
         "gemini-cli", "codex-cli", "opencode", "zed", "cline", "cline-cli",
-        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity"
+        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity", "goose"
     ];
 
     let mut repaired_count = 0;

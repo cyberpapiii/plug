@@ -26,6 +26,7 @@ pub enum ExportTarget {
     Junie,
     Kilo,
     Antigravity,
+    Goose,
 }
 
 impl std::str::FromStr for ExportTarget {
@@ -50,6 +51,7 @@ impl std::str::FromStr for ExportTarget {
             "junie" => Ok(Self::Junie),
             "kilo" => Ok(Self::Kilo),
             "antigravity" => Ok(Self::Antigravity),
+            "goose" => Ok(Self::Goose),
             _ => Err(format!("unknown export target: {s}")),
         }
     }
@@ -75,6 +77,7 @@ impl ExportTarget {
             Self::Junie => "JetBrains Junie",
             Self::Kilo => "Kilo Code",
             Self::Antigravity => "Google Antigravity",
+            Self::Goose => "Goose",
         }
     }
 
@@ -98,6 +101,7 @@ impl ExportTarget {
             "junie",
             "kilo",
             "antigravity",
+            "goose",
         ]
     }
 }
@@ -144,6 +148,9 @@ pub fn export_config(options: &ExportOptions) -> String {
         // Zed uses "context_servers"
         ExportTarget::Zed => export_json_mcp_servers(options, "context_servers"),
 
+        // YAML clients
+        ExportTarget::Goose => export_yaml_mcp_extensions(options, "extensions"),
+
         // TOML clients
         ExportTarget::CodexCli | ExportTarget::Nanobot => export_toml(options),
     }
@@ -168,6 +175,34 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
     });
 
     serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate a YAML MCP config snippet.
+fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
+    let mut plug = serde_yml::Mapping::new();
+    
+    match options.transport {
+        ExportTransport::Stdio => {
+            plug.insert(serde_yml::Value::from("type"), serde_yml::Value::from("stdio"));
+            plug.insert(serde_yml::Value::from("command"), serde_yml::Value::from("plug"));
+            let mut args = serde_yml::Sequence::new();
+            args.push(serde_yml::Value::from("connect"));
+            plug.insert(serde_yml::Value::from("args"), serde_yml::Value::from(args));
+        }
+        ExportTransport::Http => {
+            plug.insert(serde_yml::Value::from("type"), serde_yml::Value::from("sse"));
+            plug.insert(serde_yml::Value::from("uri"), serde_yml::Value::from(format!("http://localhost:{}/mcp", options.port)));
+        }
+    }
+    plug.insert(serde_yml::Value::from("enabled"), serde_yml::Value::from(true));
+
+    let mut extensions = serde_yml::Mapping::new();
+    extensions.insert(serde_yml::Value::from("plug"), serde_yml::Value::from(plug));
+
+    let mut config = serde_yml::Mapping::new();
+    config.insert(serde_yml::Value::from(key), serde_yml::Value::from(extensions));
+
+    serde_yml::to_string(&config).unwrap()
 }
 
 /// Generate VS Code config with nested "mcp" -> "servers".
@@ -319,6 +354,18 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
             #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
             {
                 None
+            }
+        }
+        ExportTarget::Goose => {
+            #[cfg(target_os = "windows")]
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                Some(PathBuf::from(appdata).join("Block/goose/config/config.yaml"))
+            } else {
+                None
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Some(home.join(".config/goose/config.yaml"))
             }
         }
     }

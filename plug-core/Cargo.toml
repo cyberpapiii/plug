@@ -45,6 +45,7 @@ notify-debouncer-mini.workspace = true
 # Phase 4
 subtle.workspace = true
 hex.workspace = true
+serde_yml.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
