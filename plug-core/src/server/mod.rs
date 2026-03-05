@@ -161,7 +161,7 @@ impl ServerManager {
                         full_command.push_str(&format!(" '{}'", escaped_arg));
                     }
                     full_command.push_str(" 2>/dev/null");
-                    
+
                     cmd.arg("-c").arg(full_command);
 
                     for (key, value) in &config.env {

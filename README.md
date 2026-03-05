@@ -45,11 +45,13 @@ Download the binary for your platform from the [releases page](https://github.co
 
 ## Quick Start
 
-**1. Import your existing MCP servers** (auto-discovers from all installed AI clients):
+**1. Run the guided setup flow**:
 
 ```sh
-plug import --all --yes
+plug setup
 ```
+
+This discovers existing MCP servers, imports them into `plug`, and walks you through linking your AI clients.
 
 Or create a config file manually at `~/.config/plug/config.toml`:
 
@@ -64,7 +66,19 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
 ```
 
-**2. Connect your AI client to plug** (instead of to each server individually):
+**2. Link an AI client to plug** (instead of to each server individually):
+
+Interactive:
+
+```sh
+plug link
+```
+
+Non-interactive:
+
+```sh
+plug link claude-code cursor
+```
 
 For Claude Code (`.mcp.json` in your project root):
 
@@ -98,20 +112,19 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 ## Commands
 
 ```sh
-plug connect              # Start the MCP proxy (for AI clients to invoke)
-plug status               # Show server health and connected clients
-plug server list          # List configured servers
-plug tool list            # List all available tools across all servers
-plug tool list --output json  # Machine-readable output for agent use
-plug config validate      # Validate your config file
-plug config path          # Show config file location
-plug import --all         # Import MCP servers from all installed AI clients
-plug import cursor        # Import from a specific client
-plug export claude-code   # Generate config snippet for a client
+plug                      # Show a compact overview and next actions
+plug setup                # Discover servers and link clients
+plug link                 # Link plug to your AI clients
+plug status               # Show runtime health and next useful action
+plug servers              # Show configured servers
+plug tools                # Show available tools across all servers
+plug tools --output json  # Machine-readable output for agent use
+plug import --yes         # Import every discovered server without prompting
 plug doctor               # Diagnose connectivity and configuration issues
-plug reload               # Hot-reload config without restarting
+plug repair               # Refresh linked client configuration files
+plug config --path        # Show config file location
+plug connect              # Internal stdio adapter AI clients invoke
 plug serve --daemon       # Run as headless daemon with IPC
-plug serve                # Run with TUI dashboard
 ```
 
 ## Configuration
@@ -163,7 +176,7 @@ Environment variable references (`$VAR_NAME`) in config values are expanded at s
 | [MCP-SPEC.md](docs/MCP-SPEC.md) | MCP protocol reference relevant to implementation |
 | [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | Every AI client's quirks, limits, and requirements |
 | [COMPETITIVE.md](docs/COMPETITIVE.md) | Every competitor analyzed with gap analysis |
-| [UX-DESIGN.md](docs/UX-DESIGN.md) | Human TUI + AI agent UX patterns and design |
+| [UX-DESIGN.md](docs/UX-DESIGN.md) | Guided CLI + agent UX patterns for the current product phase |
 | [CRATE-STACK.md](docs/CRATE-STACK.md) | Every dependency decision with rationale |
 | [PLAN.md](docs/PLAN.md) | Phased implementation plan |
 | [RESEARCH-BREADCRUMBS.md](docs/RESEARCH-BREADCRUMBS.md) | Open questions, edge cases, deeper research signals |
@@ -182,7 +195,6 @@ Environment variable references (`$VAR_NAME`) in config values are expanded at s
 
 - **Language**: Rust (2024 edition)
 - **MCP SDK**: rmcp (official Rust SDK)
-- **TUI**: Ratatui + Crossterm
 - **CLI**: Clap (derive pattern)
 - **HTTP**: Axum + Tower + Hyper
 - **Async**: Tokio (multi-threaded with work-stealing)
