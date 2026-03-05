@@ -883,4 +883,33 @@ mod tests {
             ("Workspace", "some_new_tool".to_string())
         );
     }
+
+    #[test]
+    fn enrichment_works_after_sanitization() {
+        // Simulate the full pipeline: original kebab-case -> sanitize -> enrich
+        use crate::enrichment::enrich_tool;
+        use rmcp::model::Tool;
+        use std::borrow::Cow;
+        use std::sync::Arc;
+
+        // Original name from Notion: "get-comments" (hyphens)
+        let original = "get-comments";
+        let sanitized = sanitize_tool_name(original);
+        assert_eq!(sanitized, "get_comments");
+
+        // Create tool with sanitized name (as refresh_tools does before enrichment)
+        let mut tool = Tool::new(
+            Cow::Owned(sanitized),
+            Cow::Borrowed("Get comments"),
+            Arc::new(serde_json::Map::new()),
+        );
+
+        // Enrich should detect get_* pattern
+        enrich_tool(&mut tool);
+        assert_eq!(
+            tool.annotations.as_ref().unwrap().read_only_hint,
+            Some(true),
+            "get_comments should be detected as read-only after sanitization"
+        );
+    }
 }
