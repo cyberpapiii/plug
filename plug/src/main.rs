@@ -176,8 +176,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_stderr_tracing(level: &str) {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    let filter = if level == "error" {
+        // For clean commands, only show errors from our own code and be silent for dependencies
+        tracing_subscriber::EnvFilter::new("plug=error,plug_core=error")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level))
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -420,16 +425,14 @@ async fn cmd_tool_list(
 
     // 2. Fallback: start servers locally (heavy)
     if tools_by_server.is_empty() {
-        let config = plug_core::config::load_config(config_path)?;
+        let mut config = plug_core::config::load_config(config_path)?;
         
-        // Check for recursion
-        if config.servers.contains_key("plug") {
-            eprintln!("{} Warning: 'plug' is listed as an upstream server in your config. This can cause recursion.", Emoji("⚠️", "!"));
-        }
+        // Anti-recursion shield: remove any server named "plug"
+        config.servers.remove("plug");
 
         if verbose == 0 {
-            eprintln!("{} Discovery in progress (starting {} servers)...", Emoji("🔍", ""), config.servers.len());
-            eprintln!("{}", style("   (Tip: Run 'plug serve --daemon' to make this instant)").dim());
+            eprintln!("{} Local discovery in progress (starting {} servers)...", Emoji("🔍", ""), config.servers.len());
+            eprintln!("{}", style("   (Tip: Run 'plug serve --daemon' to make this instant and silent)").dim());
         }
         
         let mgr = Arc::new(plug_core::server::ServerManager::new());

@@ -151,7 +151,9 @@ impl ServerManager {
                     for (key, value) in &config.env {
                         cmd.env(key, value);
                     }
-                    // Silence stderr to prevent upstream servers from cluttering the terminal
+                    // Silence both stdout and stderr to prevent upstream servers from cluttering the terminal.
+                    // RMCP's transport will override these with pipes for the actual protocol communication.
+                    cmd.stdout(std::process::Stdio::null());
                     cmd.stderr(std::process::Stdio::null());
 
                     tracing::info!(

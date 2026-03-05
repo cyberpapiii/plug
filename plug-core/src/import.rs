@@ -129,7 +129,11 @@ pub fn scan_client(source: ClientSource) -> ScanResult {
             continue;
         }
         match parse_config(source, &path) {
-            Ok(mut found) => servers.append(&mut found),
+            Ok(mut found) => {
+                // Ignore any server named "plug" to avoid recursion
+                found.retain(|s| s.name != "plug");
+                servers.append(&mut found);
+            }
             Err(e) => {
                 error = Some(format!("{}: {e}", path.display()));
             }
