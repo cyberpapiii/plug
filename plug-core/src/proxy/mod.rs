@@ -896,8 +896,8 @@ mod tests {
 
         strip_optional_fields(&mut tool, Some(10));
 
-        assert!(tool.title.is_none());
-        assert!(tool.annotations.is_none());
+        assert!(tool.title.is_some()); // title is now preserved
+        assert!(tool.annotations.is_some()); // annotations are now preserved
         assert!(tool.output_schema.is_none());
         // Description should be truncated to 10 chars
         assert_eq!(tool.description.as_deref(), Some("A long des"));

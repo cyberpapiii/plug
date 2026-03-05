@@ -187,8 +187,7 @@ fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
         ExportTransport::Stdio => {
             plug.insert(serde_yml::Value::from("type"), serde_yml::Value::from("stdio"));
             plug.insert(serde_yml::Value::from("command"), serde_yml::Value::from(options.command.clone()));
-            let mut args = serde_yml::Sequence::new();
-            args.push(serde_yml::Value::from("connect"));
+            let args = vec![serde_yml::Value::from("connect")];
             plug.insert(serde_yml::Value::from("args"), serde_yml::Value::from(args));
         }
         ExportTransport::Http => {

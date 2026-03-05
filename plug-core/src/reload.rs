@@ -188,7 +188,7 @@ mod tests {
 
     fn make_server(command: &str) -> ServerConfig {
         ServerConfig {
-            command: Some("cmd".to_string()),
+            command: Some(command.to_string()),
             args: vec![],
             env: HashMap::new(),
             enabled: true,

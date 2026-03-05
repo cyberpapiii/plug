@@ -802,6 +802,7 @@ pub async fn shutdown_signal(cancel: CancellationToken) {
 /// Runs in a loop — each SIGHUP triggers a reload. Exits when cancellation
 /// token is triggered.
 #[cfg(unix)]
+#[allow(dead_code)]
 pub async fn sighup_reload(engine: Arc<Engine>, cancel: CancellationToken) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");

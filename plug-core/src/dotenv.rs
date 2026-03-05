@@ -67,12 +67,11 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
         }
 
         // Strip matching quotes from value
-        if (value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\''))
+        if ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+            && value.len() >= 2
         {
-            if value.len() >= 2 {
-                value = &value[1..value.len() - 1];
-            }
+            value = &value[1..value.len() - 1];
         }
 
         // Strip inline comments (only for unquoted values)

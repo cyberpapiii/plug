@@ -437,6 +437,7 @@ async fn cmd_tool_list(config_path: Option<&std::path::PathBuf>, output: &Output
     }
 
     // Group by prefix (the part before "__" in the wire name)
+    #[allow(clippy::type_complexity)]
     let mut tools_by_prefix: BTreeMap<String, Vec<(String, String, Option<String>, Option<String>)>> = BTreeMap::new();
     for t in &all_tools {
         let (prefix, tool_name) = if let Some(idx) = t.name.find("__") {
@@ -611,14 +612,12 @@ fn cmd_export() -> anyhow::Result<()> {
         println!("No clients detected.");
         if !Confirm::with_theme(&ColorfulTheme::default()).with_prompt("Show all?").default(true).interact()? { return Ok(()); }
         for (display, target) in all_clients { items.push((display.to_string(), target, display, is_linked(target, false))); }
-    } else {
-        if Confirm::with_theme(&ColorfulTheme::default()).with_prompt("Show all supported clients?").default(false).interact()? {
-            items.clear();
-            for (display, target) in all_clients {
-                let linked = is_linked(target, false);
-                let label = if linked { format!("{display} (Linked)") } else { display.to_string() };
-                items.push((label, target, display, linked));
-            }
+    } else if Confirm::with_theme(&ColorfulTheme::default()).with_prompt("Show all supported clients?").default(false).interact()? {
+        items.clear();
+        for (display, target) in all_clients {
+            let linked = is_linked(target, false);
+            let label = if linked { format!("{display} (Linked)") } else { display.to_string() };
+            items.push((label, target, display, linked));
         }
     }
 
@@ -635,8 +634,8 @@ fn cmd_export() -> anyhow::Result<()> {
     println!();
     if Confirm::with_theme(&ColorfulTheme::default()).with_prompt("Configure custom client?").default(false).interact()? {
         let path_str: String = Input::with_theme(&ColorfulTheme::default()).with_prompt("Config path").interact_text()?;
-        let path = if path_str.starts_with("~/") { dirs::home_dir().unwrap().join(&path_str[2..]) } else { std::path::PathBuf::from(path_str) };
-        let format = Select::with_theme(&ColorfulTheme::default()).with_prompt("Format").items(&["JSON", "JSON (VS Code style)", "TOML", "YAML"]).default(0).interact()?;
+        let path = if let Some(stripped) = path_str.strip_prefix("~/") { dirs::home_dir().unwrap().join(stripped) } else { std::path::PathBuf::from(path_str) };
+        let format = Select::with_theme(&ColorfulTheme::default()).with_prompt("Format").items(["JSON", "JSON (VS Code style)", "TOML", "YAML"]).default(0).interact()?;
         let (snippet, is_toml, is_yaml) = match format {
             0 => (serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":"plug","args":["connect"]}}})).unwrap(), false, false),
             1 => (serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"command":"plug","args":["connect"]}}}})).unwrap(), false, false),
@@ -807,7 +806,7 @@ fn cmd_setup(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
 fn cmd_config(config_path: Option<&std::path::PathBuf>, path_only: bool) -> anyhow::Result<()> {
     let path = config_path.cloned().unwrap_or_else(plug_core::config::default_config_path);
     if path_only { println!("{}", path.display()); }
-    else { if path.exists() { open::that(&path)?; } else { println!("Config missing at {}. Run setup.", path.display()); } }
+    else if path.exists() { open::that(&path)?; } else { println!("Config missing at {}. Run setup.", path.display()); }
     Ok(())
 }
 

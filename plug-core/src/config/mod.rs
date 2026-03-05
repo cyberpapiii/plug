@@ -253,6 +253,7 @@ pub fn default_config_path() -> PathBuf {
 /// Extract all `$VAR_NAME` references from the config without expanding them.
 ///
 /// Used by `auto_start_daemon` to forward referenced env vars to the daemon process.
+#[allow(clippy::result_large_err)]
 pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figment::Error> {
     use figment::Figment;
     use figment::providers::{Format, Serialized, Toml};
