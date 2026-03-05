@@ -39,6 +39,17 @@ curl -fsSL https://get.plug.sh | sh -s -- --install-dir ~/.local/bin
 cargo install plug
 ```
 
+### Local development reinstall
+
+When working on `plug` locally, use the repo script instead of manually copying binaries:
+
+```sh
+./scripts/dev-reinstall.sh
+```
+
+This rebuilds the workspace, reinstalls `plug`, and normalizes `~/.local/bin/plug`
+to a symlink pointing at `~/.cargo/bin/plug` so the PATH binary stays in sync.
+
 ### Manual
 
 Download the binary for your platform from the [releases page](https://github.com/plug-mcp/plug/releases), verify the SHA-256 checksum, and place it in your PATH.
