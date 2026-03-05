@@ -243,7 +243,7 @@ fn test_config_validation_valid() {
     cfg.servers.insert(
         "valid".to_string(),
         ServerConfig {
-            command: Some("echo".to_string()),
+            command: Some("node".to_string()),
             args: vec![],
             env: HashMap::new(),
             enabled: true,
@@ -256,7 +256,8 @@ fn test_config_validation_valid() {
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
             enrichment: false,
-        },
+            tool_renames: HashMap::new(),
+        }
     );
     let errors = validate_config(&cfg);
     assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -281,7 +282,8 @@ fn test_config_validation_catches_missing_command() {
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
             enrichment: false,
-        },
+            tool_renames: HashMap::new(),
+        }
     );
     let errors = validate_config(&cfg);
     assert!(

@@ -243,16 +243,20 @@ async fn check_port_available(config: &Config) -> CheckResult {
 }
 
 /// Check 4: all env vars referenced in server configs are set.
+/// Core plug vars (PLUG_*) cause Fail; third-party server vars only Warn.
 async fn check_env_vars(config: &Config) -> CheckResult {
     let name = "env_vars".to_string();
-    let mut missing: Vec<String> = Vec::new();
+    let mut core_missing: Vec<String> = Vec::new();
+    let mut third_party_missing: Vec<String> = Vec::new();
 
     for (server_name, server) in &config.servers {
+        let mut server_missing: Vec<String> = Vec::new();
+
         // Check env values for $VAR references
         for (key, val) in &server.env {
             for var in extract_env_refs(val) {
                 if std::env::var(&var).is_err() {
-                    missing.push(format!("{server_name}.env.{key} references ${var}"));
+                    server_missing.push(format!("{server_name}.env.{key} references ${var}"));
                 }
             }
         }
@@ -260,7 +264,7 @@ async fn check_env_vars(config: &Config) -> CheckResult {
         if let Some(ref cmd) = server.command {
             for var in extract_env_refs(cmd) {
                 if std::env::var(&var).is_err() {
-                    missing.push(format!("{server_name}.command references ${var}"));
+                    server_missing.push(format!("{server_name}.command references ${var}"));
                 }
             }
         }
@@ -268,7 +272,7 @@ async fn check_env_vars(config: &Config) -> CheckResult {
         for arg in &server.args {
             for var in extract_env_refs(arg) {
                 if std::env::var(&var).is_err() {
-                    missing.push(format!("{server_name}.args references ${var}"));
+                    server_missing.push(format!("{server_name}.args references ${var}"));
                 }
             }
         }
@@ -276,60 +280,51 @@ async fn check_env_vars(config: &Config) -> CheckResult {
         if let Some(ref url) = server.url {
             for var in extract_env_refs(url) {
                 if std::env::var(&var).is_err() {
-                    missing.push(format!("{server_name}.url references ${var}"));
+                    server_missing.push(format!("{server_name}.url references ${var}"));
                 }
             }
         }
+
+        // Core plug servers fail; third-party servers only warn
+        if server_name.starts_with("plug") {
+            core_missing.extend(server_missing);
+        } else {
+            third_party_missing.extend(server_missing);
+        }
     }
 
-    if missing.is_empty() {
+    if core_missing.is_empty() && third_party_missing.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
             message: "All referenced env vars are set".to_string(),
             fix_suggestion: None,
         }
-    } else {
+    } else if !core_missing.is_empty() {
+        let mut all = core_missing;
+        all.extend(third_party_missing);
         CheckResult {
             name,
             status: CheckStatus::Fail,
-            message: format!("Missing env vars: {}", missing.join(", ")),
+            message: format!("Missing env vars: {}", all.join(", ")),
             fix_suggestion: Some("Set the missing environment variables".to_string()),
+        }
+    } else {
+        CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: format!(
+                "Third-party servers have missing env vars (non-blocking): {}",
+                third_party_missing.join(", ")
+            ),
+            fix_suggestion: Some("Set the missing environment variables or remove unused servers".to_string()),
         }
     }
 }
 
-/// Extract `$VAR_NAME` references from a string (same pattern as expand.rs).
+/// Extract `$VAR_NAME` references from a string.
 fn extract_env_refs(input: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    let bytes = input.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() {
-            let next = bytes[i + 1];
-            if next.is_ascii_uppercase() || next == b'_' {
-                let start = i + 1;
-                let mut end = start;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_uppercase()
-                        || bytes[end].is_ascii_digit()
-                        || bytes[end] == b'_')
-                {
-                    end += 1;
-                }
-                let var_name = &input[start..end];
-                if !var_name.is_empty() {
-                    refs.push(var_name.to_string());
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-
-    refs
+    crate::config::expand::extract_env_refs(input)
 }
 
 /// Check 5: each stdio server's command binary is found in PATH.
@@ -778,6 +773,7 @@ mod tests {
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
             enrichment: false,
+            tool_renames: HashMap::new(),
         }
     }
 
@@ -876,10 +872,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn env_vars_missing() {
+    async fn env_vars_missing_third_party_warns() {
         let mut config = test_config();
         config.servers.insert(
             "test".to_string(),
+            ServerConfig {
+                env: HashMap::from([(
+                    "API_KEY".to_string(),
+                    "$PLUG_NONEXISTENT_VAR_XYZ".to_string(),
+                )]),
+                ..stdio_server("echo")
+            },
+        );
+        let result = check_env_vars(&config).await;
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
+    }
+
+    #[tokio::test]
+    async fn env_vars_missing_core_fails() {
+        let mut config = test_config();
+        config.servers.insert(
+            "plug-internal".to_string(),
             ServerConfig {
                 env: HashMap::from([(
                     "API_KEY".to_string(),

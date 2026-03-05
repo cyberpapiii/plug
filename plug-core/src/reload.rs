@@ -188,8 +188,8 @@ mod tests {
 
     fn make_server(command: &str) -> ServerConfig {
         ServerConfig {
-            command: Some(command.to_string()),
-            args: Vec::new(),
+            command: Some("cmd".to_string()),
+            args: vec![],
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
@@ -201,6 +201,7 @@ mod tests {
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
             enrichment: false,
+            tool_renames: HashMap::new(),
         }
     }
 

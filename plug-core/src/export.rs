@@ -120,6 +120,8 @@ pub struct ExportOptions {
     pub target: ExportTarget,
     pub transport: ExportTransport,
     pub port: u16,
+    /// Command to use for stdio transport (e.g., "plug" or absolute path).
+    pub command: String,
 }
 
 // ── Export ───────────────────────────────────────────────────────────────────
@@ -160,7 +162,7 @@ pub fn export_config(options: &ExportOptions) -> String {
 fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
     let server_entry = match options.transport {
         ExportTransport::Stdio => serde_json::json!({
-            "command": "plug",
+            "command": options.command,
             "args": ["connect"]
         }),
         ExportTransport::Http => serde_json::json!({
@@ -184,7 +186,7 @@ fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
     match options.transport {
         ExportTransport::Stdio => {
             plug.insert(serde_yml::Value::from("type"), serde_yml::Value::from("stdio"));
-            plug.insert(serde_yml::Value::from("command"), serde_yml::Value::from("plug"));
+            plug.insert(serde_yml::Value::from("command"), serde_yml::Value::from(options.command.clone()));
             let mut args = serde_yml::Sequence::new();
             args.push(serde_yml::Value::from("connect"));
             plug.insert(serde_yml::Value::from("args"), serde_yml::Value::from(args));
@@ -209,7 +211,7 @@ fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
 fn export_vscode(options: &ExportOptions) -> String {
     let server_entry = match options.transport {
         ExportTransport::Stdio => serde_json::json!({
-            "command": "plug",
+            "command": options.command,
             "args": ["connect"]
         }),
         ExportTransport::Http => serde_json::json!({
@@ -231,11 +233,13 @@ fn export_vscode(options: &ExportOptions) -> String {
 /// Generate TOML config for Codex/Nanobot.
 fn export_toml(options: &ExportOptions) -> String {
     match options.transport {
-        ExportTransport::Stdio => r#"[mcp_servers.plug]
-command = "plug"
+        ExportTransport::Stdio => format!(
+            r#"[mcp_servers.plug]
+command = "{}"
 args = ["connect"]
-"#
-        .to_string(),
+"#,
+            options.command
+        ),
         ExportTransport::Http => {
             format!(
                 r#"[mcp_servers.plug]
@@ -383,6 +387,7 @@ mod tests {
             target: ExportTarget::ClaudeDesktop,
             transport: ExportTransport::Stdio,
             port: 3282,
+            command: "plug".to_string(),
         };
         let output = export_config(&options);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -396,6 +401,7 @@ mod tests {
             target: ExportTarget::Cursor,
             transport: ExportTransport::Http,
             port: 3282,
+            command: "plug".to_string(),
         };
         let output = export_config(&options);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -411,6 +417,7 @@ mod tests {
             target: ExportTarget::VSCodeCopilot,
             transport: ExportTransport::Stdio,
             port: 3282,
+            command: "plug".to_string(),
         };
         let output = export_config(&options);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -423,6 +430,7 @@ mod tests {
             target: ExportTarget::CodexCli,
             transport: ExportTransport::Stdio,
             port: 3282,
+            command: "plug".to_string(),
         };
         let output = export_config(&options);
         assert!(output.contains("[mcp_servers.plug]"));
@@ -435,6 +443,7 @@ mod tests {
             target: ExportTarget::Zed,
             transport: ExportTransport::Stdio,
             port: 3282,
+            command: "plug".to_string(),
         };
         let output = export_config(&options);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();

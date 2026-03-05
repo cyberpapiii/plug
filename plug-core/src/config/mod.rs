@@ -1,4 +1,4 @@
-mod expand;
+pub(crate) mod expand;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -125,12 +125,15 @@ pub struct ServerConfig {
     /// Enable circuit breaker for this server (default: true).
     #[serde(default = "default_true")]
     pub circuit_breaker_enabled: bool,
-    /// Enable tool enrichment (annotation inference, title normalization).
+    /// Enable tool enrichment (annotation inference + title normalization).
     #[serde(default)]
     pub enrichment: bool,
-}
+    /// Manual tool renames (original_name -> new_name).
+    #[serde(default)]
+    pub tool_renames: HashMap<String, String>,
+    }
 
-fn default_true() -> bool {
+    fn default_true() -> bool {
     true
 }
 
@@ -245,6 +248,43 @@ pub fn default_config_path() -> PathBuf {
     directories::ProjectDirs::from("", "", "plug")
         .map(|dirs| dirs.config_dir().join("config.toml"))
         .unwrap_or_else(|| PathBuf::from("~/.config/plug/config.toml"))
+}
+
+/// Extract all `$VAR_NAME` references from the config without expanding them.
+///
+/// Used by `auto_start_daemon` to forward referenced env vars to the daemon process.
+pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figment::Error> {
+    use figment::Figment;
+    use figment::providers::{Format, Serialized, Toml};
+
+    let path = config_path.unwrap_or_else(default_config_path);
+
+    let config: Config = Figment::new()
+        .merge(Serialized::defaults(Config::default()))
+        .merge(Toml::file(&path))
+        .extract()?;
+
+    let mut vars = Vec::new();
+    for server in config.servers.values() {
+        if let Some(ref cmd) = server.command {
+            vars.extend(expand::extract_env_refs(cmd));
+        }
+        for arg in &server.args {
+            vars.extend(expand::extract_env_refs(arg));
+        }
+        for val in server.env.values() {
+            vars.extend(expand::extract_env_refs(val));
+        }
+        if let Some(ref url) = server.url {
+            vars.extend(expand::extract_env_refs(url));
+        }
+        if let Some(ref token) = server.auth_token {
+            vars.extend(expand::extract_env_refs(token.as_str()));
+        }
+    }
+    vars.sort();
+    vars.dedup();
+    Ok(vars)
 }
 
 /// Load config with Figment layered resolution.
@@ -407,6 +447,7 @@ mod tests {
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -432,6 +473,7 @@ mod tests {
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -461,6 +503,7 @@ mod tests {
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -490,6 +533,7 @@ mod tests {
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -523,6 +567,7 @@ mod tests {
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -552,6 +597,7 @@ mod tests {
                 health_check_interval_secs: 60,
                 circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
         let errors = validate_config(&cfg);

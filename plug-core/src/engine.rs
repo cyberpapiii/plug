@@ -407,7 +407,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, TransportType};
 
     fn test_config() -> Config {
         Config::default()
@@ -509,19 +509,20 @@ mod tests {
         config.servers.insert(
             "test".to_string(),
             ServerConfig {
-                command: Some("echo".to_string()),
-                args: Vec::new(),
+                command: Some("test-server".to_string()),
+                args: vec![],
                 env: HashMap::new(),
                 enabled: true,
-                transport: crate::config::TransportType::Stdio,
+                transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
-                circuit_breaker_enabled: false,
+                circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
 
@@ -540,19 +541,20 @@ mod tests {
         config.servers.insert(
             "test".to_string(),
             ServerConfig {
-                command: Some("echo".to_string()),
-                args: Vec::new(),
+                command: Some("test-server".to_string()),
+                args: vec![],
                 env: HashMap::new(),
                 enabled: true,
-                transport: crate::config::TransportType::Stdio,
+                transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
-                circuit_breaker_enabled: false,
+                circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
 
@@ -592,19 +594,20 @@ mod tests {
         config_a.servers.insert(
             "alpha".to_string(),
             ServerConfig {
-                command: Some("echo".to_string()),
-                args: Vec::new(),
+                command: Some("test-server".to_string()),
+                args: vec![],
                 env: HashMap::new(),
                 enabled: true,
-                transport: crate::config::TransportType::Stdio,
+                transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
-                circuit_breaker_enabled: false,
+                circuit_breaker_enabled: true,
                 enrichment: false,
+                tool_renames: HashMap::new(),
             },
         );
 

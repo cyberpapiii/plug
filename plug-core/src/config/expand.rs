@@ -48,6 +48,42 @@ pub fn expand_env_vars(input: &str) -> String {
     result
 }
 
+/// Extract `$VAR_NAME` references from a string without expanding them.
+///
+/// Returns the list of variable names (without the `$` prefix).
+pub(crate) fn extract_env_refs(input: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next.is_ascii_uppercase() || next == b'_' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_uppercase()
+                        || bytes[end].is_ascii_digit()
+                        || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let var_name = &input[start..end];
+                if !var_name.is_empty() {
+                    refs.push(var_name.to_string());
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+
+    refs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

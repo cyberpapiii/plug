@@ -28,8 +28,8 @@ pub(crate) struct RouterSnapshot {
     pub tools_windsurf: Arc<Vec<Tool>>,
     /// Priority-sorted, truncated to 128 (VS Code Copilot).
     pub tools_copilot: Arc<Vec<Tool>>,
-    /// Tool name → server name routing table.
-    pub routes: HashMap<String, String>,
+    /// Tool name → (server name, original tool name) routing table.
+    pub routes: HashMap<String, (String, String)>,
 }
 
 /// Configuration for token efficiency and tool filtering.
@@ -117,12 +117,41 @@ impl ToolRouter {
         let mut tools = Vec::new();
 
         for (server_name, tool) in upstream_tools {
+            let mut exposed_name = tool.name.to_string();
+
+            // 1. Apply manual renames if any
+            if let Some(upstream) = self.server_manager.get_upstream(&server_name) {
+                if let Some(new_name) = upstream.config.tool_renames.get(&exposed_name) {
+                    exposed_name = new_name.clone();
+                }
+            }
+
+            // 2. Automatic deduplication
+            // Strip server_name prefix if it's redundant (e.g. "notion-search" -> "search")
+            if exposed_name.starts_with(&server_name) && exposed_name.len() > server_name.len() {
+                let rest = &exposed_name[server_name.len()..];
+                if rest.starts_with('_') || rest.starts_with('-') {
+                    exposed_name = rest[1..].to_string();
+                }
+            }
+            // Strip server_name suffix if it's redundant (e.g. "research_exa" -> "research")
+            if exposed_name.ends_with(&server_name) && exposed_name.len() > server_name.len() {
+                let prefix_len = exposed_name.len() - server_name.len();
+                let rest = &exposed_name[..prefix_len];
+                if rest.ends_with('_') || rest.ends_with('-') {
+                    exposed_name = rest[..rest.len() - 1].to_string();
+                }
+            }
+
             let prefixed_name = format!(
                 "{}{}{}",
-                server_name, self.config.prefix_delimiter, tool.name
+                server_name, self.config.prefix_delimiter, exposed_name
             );
 
-            routes.insert(prefixed_name.clone(), server_name.clone());
+            routes.insert(
+                prefixed_name.clone(),
+                (server_name.clone(), tool.name.to_string()),
+            );
 
             let mut prefixed_tool = tool.clone();
 
@@ -146,7 +175,10 @@ impl ToolRouter {
         // Add search_tools meta-tool if tool count exceeds threshold
         if tools.len() >= self.config.tool_search_threshold {
             let meta_tool = build_search_tools_meta_tool();
-            routes.insert(meta_tool.name.to_string(), "__plug_internal__".to_string());
+            routes.insert(
+                meta_tool.name.to_string(),
+                ("__plug_internal__".to_string(), meta_tool.name.to_string()),
+            );
             // Insert at position 0 so it's always visible
             tools.insert(0, meta_tool);
         }
@@ -155,6 +187,7 @@ impl ToolRouter {
             tool_count = tools.len(),
             server_count = routes
                 .values()
+                .map(|(s, _)| s)
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             "refreshed tool cache"
@@ -192,7 +225,7 @@ impl ToolRouter {
             let server_id = snapshot
                 .routes
                 .get(tool.name.as_ref())
-                .cloned()
+                .map(|(s, _)| s.clone())
                 .unwrap_or_else(|| "unknown".to_string());
 
             let mut tool = tool.clone();
@@ -256,19 +289,13 @@ impl ToolRouter {
             return self.handle_search_tools(arguments.clone());
         }
 
-        // Look up the server for this prefixed tool name
+        // Look up the server and original name for this exposed tool name
         let cache = self.cache.load();
-        let server_id = cache.routes.get(tool_name).ok_or_else(|| {
+        let (server_id, original_name) = cache.routes.get(tool_name).ok_or_else(|| {
             McpError::from(ProtocolError::ToolNotFound {
                 tool_name: tool_name.to_string(),
             })
         })?;
-
-        // Strip the prefix to get the original tool name
-        let original_name = tool_name
-            .strip_prefix(server_id.as_str())
-            .and_then(|s| s.strip_prefix(&self.config.prefix_delimiter))
-            .unwrap_or(tool_name);
 
         let server_id = server_id.clone();
         let original_name = original_name.to_string();
@@ -510,7 +537,7 @@ impl ToolRouter {
             let server = snapshot
                 .routes
                 .get(tool.name.as_ref())
-                .map(|s| s.as_str())
+                .map(|(s, _)| s.as_str())
                 .unwrap_or("unknown");
             result_text.push_str(&format!("- **{}** (server: {})\n", tool.name, server));
             if let Some(ref desc) = tool.description {
@@ -927,9 +954,18 @@ mod tests {
         ];
 
         let mut routes = HashMap::new();
-        routes.insert("git__commit".to_string(), "git".to_string());
-        routes.insert("git__push".to_string(), "git".to_string());
-        routes.insert("slack__send".to_string(), "slack".to_string());
+        routes.insert(
+            "git__commit".to_string(),
+            ("git".to_string(), "commit".to_string()),
+        );
+        routes.insert(
+            "git__push".to_string(),
+            ("git".to_string(), "push".to_string()),
+        );
+        routes.insert(
+            "slack__send".to_string(),
+            ("slack".to_string(), "send".to_string()),
+        );
 
         router.cache.store(Arc::new(RouterSnapshot {
             routes,

@@ -1,4 +1,17 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+/// Load `.env` file vars into the process environment.
+///
+/// SAFETY: Called before tokio runtime starts (single-threaded at this point).
+/// `set_var` is unsafe in Rust 2024 because it's not thread-safe, but we're
+/// guaranteed single-threaded here since this runs before `#[tokio::main]`.
+#[allow(unsafe_code)]
+fn apply_dotenv() {
+    for (key, value) in plug_core::dotenv::load_dotenv() {
+        // SAFETY: single-threaded, before async runtime starts
+        unsafe { std::env::set_var(&key, &value); }
+    }
+}
 
 mod daemon;
 mod ipc_proxy;
@@ -106,6 +119,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file FIRST — before config loading or anything else.
+    // This ensures secrets are available for $VAR expansion regardless
+    // of how plug was launched (terminal, launchd, GUI app, etc.).
+    apply_dotenv();
+
     let cli = Cli::parse();
 
     // Determine log level before doing ANYTHING else
@@ -253,11 +271,18 @@ fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve").arg("--daemon");
-    if let Some(path) = config_path { cmd.arg("--config").arg(path); }
-    cmd.env_clear();
-    cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
-    cmd.env("HOME", std::env::var("HOME").unwrap_or_default());
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    if let Some(path) = config_path {
+        cmd.arg("--config").arg(path);
+    }
+
+    // We don't env_clear here because we want to inherit the parent's PATH
+    // and other essentials. The .env file will override these values
+    // inside the daemon's own startup sequence anyway.
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    
     cmd.spawn()?;
     Ok(())
 }
@@ -275,6 +300,10 @@ async fn wait_for_daemon_ready() -> anyhow::Result<tokio::net::UnixStream> {
 
 async fn cmd_status(config_path: Option<&std::path::PathBuf>, output: &OutputFormat) -> anyhow::Result<()> {
     use dialoguer::console::{style, Emoji};
+    
+    // Ensure daemon is running so we get a live status
+    let _ = ensure_daemon(config_path).await;
+
     if let Ok(plug_core::ipc::IpcResponse::Status { servers, clients, uptime_secs }) = daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
         if matches!(output, OutputFormat::Text) {
             println!("{} {} (uptime: {}s) | {} {} client(s) connected", Emoji("🔌", ""), style("Plug Engine is running").green().bold(), uptime_secs, Emoji("👥", ""), style(clients.to_string()).bold());
@@ -283,6 +312,7 @@ async fn cmd_status(config_path: Option<&std::path::PathBuf>, output: &OutputFor
             else {
                 println!("  {:<20} {:<15} {:<6}", style("SERVER").dim(), style("STATUS").dim(), style("TOOLS").dim());
                 for s in &servers {
+                    if s.server_id == "__plug_internal__" { continue; }
                     let (icon, health) = match s.health {
                         plug_core::types::ServerHealth::Healthy => (Emoji("🟢", ""), style("Healthy").green()),
                         plug_core::types::ServerHealth::Degraded => (Emoji("🟡", ""), style("Degraded").yellow()),
@@ -296,9 +326,10 @@ async fn cmd_status(config_path: Option<&std::path::PathBuf>, output: &OutputFor
         }
         return Ok(());
     }
+    
     let config = plug_core::config::load_config(config_path)?;
     if matches!(output, OutputFormat::Text) {
-        println!("{} {}", Emoji("💤", ""), style("Plug Engine is not running.").yellow().bold());
+        println!("{} {}", Emoji("💤", ""), style("Plug Engine failed to start.").red().bold());
         let mut names: Vec<_> = config.servers.keys().collect(); names.sort();
         for n in names { println!("  {} {:<18} {}", Emoji("⚪", ""), n, style("Not Running").dim()); }
     }
@@ -307,14 +338,19 @@ async fn cmd_status(config_path: Option<&std::path::PathBuf>, output: &OutputFor
 
 async fn cmd_server_list(config_path: Option<&std::path::PathBuf>, output: &OutputFormat) -> anyhow::Result<()> {
     use dialoguer::console::{style, Emoji};
+    
+    // Try to get live status from daemon first
+    let _ = ensure_daemon(config_path).await;
+
     if let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) = daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
         match output {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&servers)?),
             OutputFormat::Text => {
                 if servers.is_empty() { println!("No servers configured."); }
                 else {
-                    println!("{} {} server(s) active:\n", Emoji("📡", ""), style(servers.len()).bold());
+                    println!("{} {} server(s) active:\n", Emoji("📡", ""), style(servers.len().saturating_sub(1)).bold());
                     for s in servers {
+                        if s.server_id == "__plug_internal__" { continue; }
                         let (icon, health) = match s.health {
                             plug_core::types::ServerHealth::Healthy => (Emoji("🟢", ""), style("Healthy").green()),
                             plug_core::types::ServerHealth::Degraded => (Emoji("🟡", ""), style("Degraded").yellow()),
@@ -332,6 +368,15 @@ async fn cmd_server_list(config_path: Option<&std::path::PathBuf>, output: &Outp
         let mut names: Vec<_> = config.servers.keys().collect(); names.sort();
         println!("{} {} server(s) configured (daemon not running):\n", Emoji("⚙️", ""), style(names.len()).bold());
         for n in names { println!("  {} {}", Emoji("⚪", ""), style(n).dim()); }
+    }
+    Ok(())
+}
+
+/// Helper to ensure the background daemon is running.
+async fn ensure_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    if daemon::connect_to_daemon().await.is_none() {
+        auto_start_daemon(config_path)?;
+        wait_for_daemon_ready().await?;
     }
     Ok(())
 }
@@ -378,22 +423,25 @@ async fn cmd_serve(config_path: Option<&std::path::PathBuf>, _stdio: bool) -> an
 async fn cmd_tool_list(config_path: Option<&std::path::PathBuf>, output: &OutputFormat, _verbose: u8) -> anyhow::Result<()> {
     use dialoguer::console::{style, Emoji};
     use std::collections::BTreeMap;
+    
+    // Ensure daemon is running so we get a live tool list
+    let _ = ensure_daemon(config_path).await;
+
     let mut tools_by_server = BTreeMap::new();
     if let Ok(plug_core::ipc::IpcResponse::Tools { tools }) = daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await {
-        for t in tools { tools_by_server.entry(t.server_id).or_insert_with(Vec::new).push((t.name, t.description)); }
+        for t in tools {
+            if t.server_id == "__plug_internal__" { continue; }
+            tools_by_server.entry(t.server_id).or_insert_with(Vec::new).push((t.name, t.description));
+        }
     }
-    if tools_by_server.is_empty() {
-        let mut config = plug_core::config::load_config(config_path)?;
-        config.servers.remove("plug");
-        let mgr = Arc::new(plug_core::server::ServerManager::new());
-        mgr.start_all(&config).await?;
-        for (srv, tool) in mgr.get_tools().await { tools_by_server.entry(srv).or_insert_with(Vec::new).push((tool.name.to_string(), tool.description.map(|d| d.to_string()))); }
-        mgr.shutdown_all().await;
-    }
+    
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&tools_by_server)?),
         OutputFormat::Text => {
-            if tools_by_server.is_empty() { println!("No tools found."); return Ok(()); }
+            if tools_by_server.is_empty() {
+                println!("No tools found. Run {} to add servers.", style("plug setup").cyan());
+                return Ok(());
+            }
             let term_width = console::Term::stdout().size().1 as usize;
             let available_width = term_width.saturating_sub(40);
             println!("{} {} tools across {} server(s)\n", Emoji("⚒️", ""), style(tools_by_server.values().map(|v| v.len()).sum::<usize>()).bold().green(), tools_by_server.len());
@@ -643,7 +691,13 @@ fn execute_export(target: &str, http: bool, port: u16, write: bool, project: boo
     use plug_core::export::{ExportOptions, ExportTarget, ExportTransport};
     let target_enum: ExportTarget = target.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let transport = if http { ExportTransport::Http } else { ExportTransport::Stdio };
-    let options = ExportOptions { target: target_enum, transport, port };
+    
+    // Get absolute path to current binary for robust stdio execution
+    let command = std::env::current_exe()?
+        .to_string_lossy()
+        .to_string();
+
+    let options = ExportOptions { target: target_enum, transport, port, command };
     let snippet = plug_core::export::export_config(&options);
     if write {
         let path = plug_core::export::default_config_path(target_enum, project).ok_or_else(|| anyhow::anyhow!("no path"))?;

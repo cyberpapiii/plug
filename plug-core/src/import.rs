@@ -471,6 +471,7 @@ fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig>
         health_check_interval_secs: 60,
         circuit_breaker_enabled: true,
         enrichment: false,
+        tool_renames: HashMap::new(),
     })
 }
 
@@ -618,6 +619,7 @@ fn json_entry_to_server_config(entry: &serde_json::Value) -> Option<ServerConfig
         health_check_interval_secs: 60,
         circuit_breaker_enabled: true,
         enrichment: false,
+        tool_renames: HashMap::new(),
     })
 }
 
@@ -712,6 +714,7 @@ fn toml_entry_to_server_config(entry: &toml::Value) -> Option<ServerConfig> {
         health_check_interval_secs: 60,
         circuit_breaker_enabled: true,
         enrichment: false,
+        tool_renames: HashMap::new(),
     })
 }
 
@@ -1094,6 +1097,7 @@ GITHUB_TOKEN = "$GITHUB_TOKEN"
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
             enrichment: false,
+            tool_renames: HashMap::new(),
         }
     }
 }
