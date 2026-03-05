@@ -295,18 +295,28 @@ impl ToolRouter {
         is_retry: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>> {
         Box::pin(async move {
-        // Intercept search_tools meta-tool
-        if tool_name == "plug__search_tools" {
+        // Intercept search_tools meta-tool (case-insensitive for LLM casing drift)
+        if tool_name.eq_ignore_ascii_case("plug__search_tools") {
             return self.handle_search_tools(arguments.clone());
         }
 
         // Look up the server and original name for this exposed tool name
         let cache = self.cache.load();
-        let (server_id, original_name) = cache.routes.get(tool_name).ok_or_else(|| {
-            McpError::from(ProtocolError::ToolNotFound {
-                tool_name: tool_name.to_string(),
+        let (server_id, original_name) = cache
+            .routes
+            .get(tool_name)
+            .or_else(|| {
+                // Case-insensitive fallback for LLM casing drift
+                // (e.g. "slack__search_messages" → "Slack__search_messages")
+                cache.routes.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(tool_name))
+                    .map(|(_, v)| v)
             })
-        })?;
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ToolNotFound {
+                    tool_name: tool_name.to_string(),
+                })
+            })?;
 
         let server_id = server_id.clone();
         let original_name = original_name.to_string();
@@ -1047,5 +1057,38 @@ mod tests {
     fn is_session_error_unexpected_response_not_session() {
         use rmcp::service::ServiceError;
         assert!(!is_session_error(&ServiceError::UnexpectedResponse));
+    }
+
+    #[test]
+    fn case_insensitive_route_lookup() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "Slack__search_messages".to_string(),
+            ("slack".to_string(), "conversations_search_messages".to_string()),
+        );
+
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+        }));
+
+        let snapshot = router.cache.load();
+        // Exact match works
+        assert!(snapshot.routes.get("Slack__search_messages").is_some());
+        // Case-insensitive fallback works
+        let lower = "slack__search_messages";
+        let found = snapshot.routes.get(lower).or_else(|| {
+            snapshot.routes.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(lower))
+                .map(|(_, v)| v)
+        });
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().0, "slack");
+        assert_eq!(found.unwrap().1, "conversations_search_messages");
     }
 }
