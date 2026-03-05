@@ -662,6 +662,20 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
+        IpcRequest::ListTools => {
+            let tool_router = ctx.engine.tool_router();
+            let tools = tool_router.list_all_tools();
+            let ipc_tools = tools
+                .into_iter()
+                .map(|(server_id, tool)| plug_core::ipc::IpcToolInfo {
+                    name: tool.name.to_string(),
+                    server_id,
+                    description: tool.description.map(|d| d.to_string()),
+                })
+                .collect();
+            IpcResponse::Tools { tools: ipc_tools }
+        }
+
         IpcRequest::McpRequest {
             session_id,
             method,

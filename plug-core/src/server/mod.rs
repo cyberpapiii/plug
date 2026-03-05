@@ -151,6 +151,8 @@ impl ServerManager {
                     for (key, value) in &config.env {
                         cmd.env(key, value);
                     }
+                    // Silence stderr to prevent upstream servers from cluttering the terminal
+                    cmd.stderr(std::process::Stdio::null());
 
                     tracing::info!(
                         server = %name,

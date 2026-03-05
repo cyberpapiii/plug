@@ -36,8 +36,13 @@ pub enum ClientSource {
     OpenCode,
     Zed,
     Cline,
+    ClineCli,
+    RooCode,
     Factory,
     Nanobot,
+    Junie,
+    Kilo,
+    Antigravity,
 }
 
 impl ClientSource {
@@ -53,9 +58,14 @@ impl ClientSource {
             Self::CodexCli => "Codex CLI",
             Self::OpenCode => "OpenCode",
             Self::Zed => "Zed",
-            Self::Cline => "Cline",
+            Self::Cline => "Cline (VS Code)",
+            Self::ClineCli => "Cline CLI",
+            Self::RooCode => "RooCode",
             Self::Factory => "Factory",
             Self::Nanobot => "Nanobot",
+            Self::Junie => "JetBrains Junie",
+            Self::Kilo => "Kilo Code",
+            Self::Antigravity => "Google Antigravity",
         }
     }
 
@@ -72,8 +82,13 @@ impl ClientSource {
             Self::OpenCode,
             Self::Zed,
             Self::Cline,
+            Self::ClineCli,
+            Self::RooCode,
             Self::Factory,
             Self::Nanobot,
+            Self::Junie,
+            Self::Kilo,
+            Self::Antigravity,
         ]
     }
 }
@@ -190,26 +205,49 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
         }
         ClientSource::VSCodeCopilot => {
             vec![
+                home.join(".copilot/mcp-config.json"),
                 home.join(".vscode/mcp.json"),
                 PathBuf::from(".vscode/mcp.json"),
+                PathBuf::from(".mcp.json"),
             ]
         }
         ClientSource::GeminiCli => {
-            vec![home.join(".gemini/settings.json")]
+            vec![
+                home.join(".gemini/settings.json"),
+                PathBuf::from(".gemini/settings.json"),
+            ]
         }
         ClientSource::CodexCli => {
-            vec![home.join(".codex/config.toml")]
+            vec![
+                home.join(".codex/config.toml"),
+                PathBuf::from(".codex/config.toml"),
+            ]
         }
         ClientSource::OpenCode => {
-            vec![home.join(".config/opencode/config.json")]
+            vec![
+                home.join(".config/opencode/opencode.json"),
+                PathBuf::from("opencode.json"),
+            ]
         }
         ClientSource::Zed => {
             vec![home.join(".config/zed/settings.json")]
         }
         ClientSource::Cline => {
-            vec![home.join(
-                ".vscode/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-            )]
+            vec![
+                home.join(".vscode/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
+            ]
+        }
+        ClientSource::ClineCli => {
+            vec![
+                home.join(".cline/data/settings/cline_mcp_settings.json"),
+            ]
+        }
+        ClientSource::RooCode => {
+            vec![
+                home.join(".vscode/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json"),
+                home.join(".roo/mcp.json"),
+                PathBuf::from(".roo/mcp.json"),
+            ]
         }
         ClientSource::Factory => {
             vec![home.join(".factory/config.json")]
@@ -220,6 +258,19 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
                 PathBuf::from(".nanobot.toml"),
             ]
         }
+        ClientSource::Junie => {
+            vec![
+                home.join(".junie/mcp/mcp.json"),
+                PathBuf::from(".junie/mcp/mcp.json"),
+            ]
+        }
+        ClientSource::Kilo => {
+            vec![
+                home.join(".config/kilo/opencode.json"),
+                PathBuf::from("opencode.json"),
+            ]
+        }
+        ClientSource::Antigravity => antigravity_paths(&home),
     }
 }
 
@@ -244,6 +295,26 @@ fn claude_desktop_paths(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Platform-specific config paths for Google Antigravity.
+#[allow(unused_variables)]
+fn antigravity_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(home.join("Library/Application Support/Antigravity/antigravity_config.json"));
+        paths.push(home.join("Library/Application Support/Google/Antigravity/config.json"));
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        paths.push(PathBuf::from(appdata).join("Antigravity/antigravity_config.json"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(home.join(".config/Antigravity/antigravity_config.json"));
+    }
+    paths
+}
+
 // ── Parsers ─────────────────────────────────────────────────────────────────
 
 /// Parse a client config file and extract server definitions.
@@ -251,6 +322,12 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
 
     match source {
+        // TOML clients: cleanse "plug" entries first to avoid parse errors from duplicates
+        ClientSource::CodexCli | ClientSource::Nanobot => {
+            let cleansed = unlink_toml(&content);
+            parse_toml_mcp_servers(&cleansed, source, "mcp_servers")
+        }
+
         // JSON clients with "mcpServers" key
         ClientSource::ClaudeDesktop
         | ClientSource::ClaudeCode
@@ -258,20 +335,19 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::Windsurf
         | ClientSource::GeminiCli
         | ClientSource::Cline
-        | ClientSource::Factory => parse_json_mcp_servers(&content, source, "mcpServers"),
+        | ClientSource::ClineCli
+        | ClientSource::RooCode
+        | ClientSource::Factory
+        | ClientSource::OpenCode
+        | ClientSource::Junie
+        | ClientSource::Kilo
+        | ClientSource::Antigravity => parse_json_mcp_servers(&content, source, "mcpServers"),
 
         // VS Code uses nested "mcp.servers" (or "servers" under "mcp" key)
         ClientSource::VSCodeCopilot => parse_vscode_config(&content, source),
 
         // Zed uses "context_servers"
         ClientSource::Zed => parse_json_mcp_servers(&content, source, "context_servers"),
-
-        // OpenCode uses "mcpServers"
-        ClientSource::OpenCode => parse_json_mcp_servers(&content, source, "mcpServers"),
-
-        // TOML clients
-        ClientSource::CodexCli => parse_toml_mcp_servers(&content, source, "mcp_servers"),
-        ClientSource::Nanobot => parse_toml_mcp_servers(&content, source, "mcp_servers"),
     }
 }
 
@@ -291,6 +367,9 @@ fn parse_json_mcp_servers(
 
     let mut servers = Vec::new();
     for (name, entry) in servers_obj {
+        if name == "plug" {
+            continue;
+        }
         if let Some(config) = json_entry_to_server_config(entry) {
             servers.push(DiscoveredServer {
                 name: name.clone(),
@@ -318,6 +397,9 @@ fn parse_vscode_config(
     {
         let mut result = Vec::new();
         for (name, entry) in servers {
+            if name == "plug" {
+                continue;
+            }
             if let Some(config) = json_entry_to_server_config(entry) {
                 result.push(DiscoveredServer {
                     name: name.clone(),
@@ -333,6 +415,9 @@ fn parse_vscode_config(
     if let Some(servers) = value.get("servers").and_then(|s| s.as_object()) {
         let mut result = Vec::new();
         for (name, entry) in servers {
+            if name == "plug" {
+                continue;
+            }
             if let Some(config) = json_entry_to_server_config(entry) {
                 result.push(DiscoveredServer {
                     name: name.clone(),
@@ -430,6 +515,9 @@ fn parse_toml_mcp_servers(
 
     let mut servers = Vec::new();
     for (name, entry) in servers_table {
+        if name == "plug" {
+            continue;
+        }
         if let Some(config) = toml_entry_to_server_config(entry) {
             servers.push(DiscoveredServer {
                 name: name.clone(),
@@ -579,10 +667,39 @@ pub fn resolve_name(name: &str, source: ClientSource, existing_names: &[String])
         ClientSource::OpenCode => "opencode",
         ClientSource::Zed => "zed",
         ClientSource::Cline => "cline",
+        ClientSource::ClineCli => "cline-cli",
+        ClientSource::RooCode => "roocode",
         ClientSource::Factory => "factory",
         ClientSource::Nanobot => "nanobot",
+        ClientSource::Junie => "junie",
+        ClientSource::Kilo => "kilo",
+        ClientSource::Antigravity => "antigravity",
     };
     format!("{name}-{suffix}")
+}
+
+/// Remove any "plug" MCP server section from a TOML string.
+/// This helps avoid parse errors if multiple plug sections were accidentally appended.
+pub fn unlink_toml(content: &str) -> String {
+    let mut output = Vec::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Skip both the header and the key-value pairs under it
+        if trimmed == "[mcp_servers.plug]" || trimmed == "[[mcp_servers.plug]]" {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if trimmed.starts_with('[') {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        output.push(line);
+    }
+    output.join("\n")
 }
 
 /// Generate TOML entries for new servers to append to config.toml.

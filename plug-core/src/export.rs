@@ -19,8 +19,13 @@ pub enum ExportTarget {
     OpenCode,
     Zed,
     Cline,
+    ClineCli,
+    RooCode,
     Factory,
     Nanobot,
+    Junie,
+    Kilo,
+    Antigravity,
 }
 
 impl std::str::FromStr for ExportTarget {
@@ -38,8 +43,13 @@ impl std::str::FromStr for ExportTarget {
             "opencode" => Ok(Self::OpenCode),
             "zed" => Ok(Self::Zed),
             "cline" => Ok(Self::Cline),
+            "cline-cli" => Ok(Self::ClineCli),
+            "roocode" => Ok(Self::RooCode),
             "factory" => Ok(Self::Factory),
             "nanobot" => Ok(Self::Nanobot),
+            "junie" => Ok(Self::Junie),
+            "kilo" => Ok(Self::Kilo),
+            "antigravity" => Ok(Self::Antigravity),
             _ => Err(format!("unknown export target: {s}")),
         }
     }
@@ -57,9 +67,14 @@ impl ExportTarget {
             Self::CodexCli => "Codex CLI",
             Self::OpenCode => "OpenCode",
             Self::Zed => "Zed",
-            Self::Cline => "Cline",
+            Self::Cline => "Cline (VS Code)",
+            Self::ClineCli => "Cline CLI",
+            Self::RooCode => "RooCode",
             Self::Factory => "Factory",
             Self::Nanobot => "Nanobot",
+            Self::Junie => "JetBrains Junie",
+            Self::Kilo => "Kilo Code",
+            Self::Antigravity => "Google Antigravity",
         }
     }
 
@@ -76,8 +91,13 @@ impl ExportTarget {
             "opencode",
             "zed",
             "cline",
+            "cline-cli",
+            "roocode",
             "factory",
             "nanobot",
+            "junie",
+            "kilo",
+            "antigravity",
         ]
     }
 }
@@ -110,8 +130,13 @@ pub fn export_config(options: &ExportOptions) -> String {
         | ExportTarget::Windsurf
         | ExportTarget::GeminiCli
         | ExportTarget::Cline
+        | ExportTarget::ClineCli
+        | ExportTarget::RooCode
         | ExportTarget::Factory
-        | ExportTarget::OpenCode => export_json_mcp_servers(options, "mcpServers"),
+        | ExportTarget::OpenCode
+        | ExportTarget::Junie
+        | ExportTarget::Kilo
+        | ExportTarget::Antigravity => export_json_mcp_servers(options, "mcpServers"),
 
         // VS Code uses nested "mcp" -> "servers"
         ExportTarget::VSCodeCopilot => export_vscode(options),
@@ -222,17 +247,37 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
             if project {
                 Some(std::path::PathBuf::from(".vscode/mcp.json"))
             } else {
-                Some(home.join(".vscode/mcp.json"))
+                Some(home.join(".copilot/mcp-config.json"))
             }
         }
-        ExportTarget::GeminiCli => Some(home.join(".gemini/settings.json")),
+        ExportTarget::GeminiCli => {
+            if project {
+                Some(std::path::PathBuf::from(".gemini/settings.json"))
+            } else {
+                Some(home.join(".gemini/settings.json"))
+            }
+        }
         ExportTarget::CodexCli => Some(home.join(".codex/config.toml")),
-        ExportTarget::OpenCode => Some(home.join(".config/opencode/config.json")),
+        ExportTarget::OpenCode => {
+            if project {
+                Some(std::path::PathBuf::from("opencode.json"))
+            } else {
+                Some(home.join(".config/opencode/opencode.json"))
+            }
+        }
         ExportTarget::Zed => Some(home.join(".config/zed/settings.json")),
         ExportTarget::Cline => {
             Some(home.join(
                 ".vscode/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
             ))
+        }
+        ExportTarget::ClineCli => Some(home.join(".cline/data/settings/cline_mcp_settings.json")),
+        ExportTarget::RooCode => {
+            if project {
+                Some(std::path::PathBuf::from(".roo/mcp.json"))
+            } else {
+                Some(home.join(".roo/mcp.json"))
+            }
         }
         ExportTarget::Factory => Some(home.join(".factory/config.json")),
         ExportTarget::Nanobot => {
@@ -240,6 +285,40 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
                 Some(std::path::PathBuf::from(".nanobot.toml"))
             } else {
                 Some(home.join(".nanobot/config.toml"))
+            }
+        }
+        ExportTarget::Junie => {
+            if project {
+                Some(std::path::PathBuf::from(".junie/mcp/mcp.json"))
+            } else {
+                Some(home.join(".junie/mcp/mcp.json"))
+            }
+        }
+        ExportTarget::Kilo => {
+            if project {
+                Some(std::path::PathBuf::from("opencode.json"))
+            } else {
+                Some(home.join(".config/kilo/opencode.json"))
+            }
+        }
+        ExportTarget::Antigravity => {
+            #[cfg(target_os = "macos")]
+            {
+                Some(home.join("Library/Application Support/Antigravity/antigravity_config.json"))
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                Some(std::path::PathBuf::from(appdata).join("Antigravity/antigravity_config.json"))
+            } else {
+                None
+            }
+            #[cfg(target_os = "linux")]
+            {
+                Some(home.join(".config/Antigravity/antigravity_config.json"))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                None
             }
         }
     }

@@ -184,6 +184,33 @@ impl ToolRouter {
         Arc::clone(&self.cache.load().tools_all)
     }
 
+    /// List all tools with their source server IDs.
+    pub fn list_all_tools(&self) -> Vec<(String, Tool)> {
+        let snapshot = self.cache.load();
+        let mut result = Vec::new();
+        for tool in snapshot.tools_all.iter() {
+            let server_id = snapshot
+                .routes
+                .get(tool.name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let mut tool = tool.clone();
+            if server_id != "unknown" && server_id != "__plug_internal__" {
+                // Strip the prefix to show the original tool name
+                let original_name = tool
+                    .name
+                    .strip_prefix(server_id.as_str())
+                    .and_then(|s| s.strip_prefix(&self.config.prefix_delimiter))
+                    .unwrap_or(&tool.name);
+                tool.name = std::borrow::Cow::Owned(original_name.to_string());
+            }
+
+            result.push((server_id, tool));
+        }
+        result
+    }
+
     /// Total number of tools in the unfiltered cache.
     pub fn tool_count(&self) -> usize {
         self.cache.load().tools_all.len()
