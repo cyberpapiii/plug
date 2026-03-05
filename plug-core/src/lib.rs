@@ -16,5 +16,6 @@ pub mod ipc;
 pub mod proxy;
 pub mod reload;
 pub mod server;
+pub mod tool_naming;
 pub mod types;
 pub mod watcher;
