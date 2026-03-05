@@ -114,6 +114,7 @@ pub struct IpcToolInfo {
     pub name: String,
     pub server_id: String,
     pub description: Option<String>,
+    pub title: Option<String>,
 }
 
 /// Responses sent from daemon → CLI over Unix socket.

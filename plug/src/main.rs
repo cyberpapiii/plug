@@ -427,34 +427,83 @@ async fn cmd_tool_list(config_path: Option<&std::path::PathBuf>, output: &Output
     // Ensure daemon is running so we get a live tool list
     let _ = ensure_daemon(config_path).await;
 
-    let mut tools_by_server = BTreeMap::new();
+    // Collect all tools from daemon
+    let mut all_tools: Vec<plug_core::ipc::IpcToolInfo> = Vec::new();
     if let Ok(plug_core::ipc::IpcResponse::Tools { tools }) = daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await {
         for t in tools {
             if t.server_id == "__plug_internal__" { continue; }
-            tools_by_server.entry(t.server_id).or_insert_with(Vec::new).push((t.name, t.description));
+            all_tools.push(t);
         }
     }
-    
+
+    // Group by prefix (the part before "__" in the wire name)
+    let mut tools_by_prefix: BTreeMap<String, Vec<(String, String, Option<String>, Option<String>)>> = BTreeMap::new();
+    for t in &all_tools {
+        let (prefix, tool_name) = if let Some(idx) = t.name.find("__") {
+            (t.name[..idx].to_string(), t.name[idx + 2..].to_string())
+        } else {
+            (t.server_id.clone(), t.name.clone())
+        };
+        tools_by_prefix
+            .entry(prefix)
+            .or_default()
+            .push((tool_name, t.server_id.clone(), t.title.clone(), t.description.clone()));
+    }
+
+    // Count unique server IDs
+    let unique_servers: std::collections::BTreeSet<&str> = all_tools.iter().map(|t| t.server_id.as_str()).collect();
+
     match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&tools_by_server)?),
+        OutputFormat::Json => {
+            // Include title in JSON output
+            let json_groups: BTreeMap<String, Vec<serde_json::Value>> = tools_by_prefix
+                .iter()
+                .map(|(prefix, tools)| {
+                    let entries: Vec<serde_json::Value> = tools
+                        .iter()
+                        .map(|(name, server_id, title, desc)| {
+                            serde_json::json!({
+                                "name": name,
+                                "server_id": server_id,
+                                "title": title,
+                                "description": desc,
+                            })
+                        })
+                        .collect();
+                    (prefix.clone(), entries)
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json_groups)?);
+        }
         OutputFormat::Text => {
-            if tools_by_server.is_empty() {
+            if tools_by_prefix.is_empty() {
                 println!("No tools found. Run {} to add servers.", style("plug setup").cyan());
                 return Ok(());
             }
             let term_width = console::Term::stdout().size().1 as usize;
             let available_width = term_width.saturating_sub(40);
-            println!("{} {} tools across {} server(s)\n", Emoji("⚒️", ""), style(tools_by_server.values().map(|v| v.len()).sum::<usize>()).bold().green(), tools_by_server.len());
-            for (server, mut tools) in tools_by_server {
+            println!("{} {} tools across {} server(s)\n", Emoji("⚒️", ""), style(all_tools.len()).bold().green(), unique_servers.len());
+            for (prefix, mut tools) in tools_by_prefix {
                 tools.sort_by(|a, b| a.0.cmp(&b.0));
-                println!(" {} {}", Emoji("📦", ""), style(server).bold().underlined());
-                for (name, desc) in tools {
-                    let name_styled = style(format!("{:<30}", name)).cyan();
-                    if let Some(d) = desc {
-                        let cleaned = d.replace('\n', " ").replace('\r', "");
+                // Check if this group's server_id differs from the prefix (sub-service)
+                let server_id = &tools[0].1;
+                let annotation = if server_id != &prefix {
+                    format!("  {}", style(format!("[{}]", server_id)).dim())
+                } else {
+                    String::new()
+                };
+                println!(" {} ({}){}", style(&prefix).bold().underlined(), style(format!("{} tools", tools.len())).dim(), annotation);
+                for (name, _server_id, title, desc) in &tools {
+                    let name_styled = style(format!("   {:<30}", name)).cyan();
+                    // Prefer title, fall back to description
+                    let display_text = title.as_deref().or(desc.as_deref());
+                    if let Some(text) = display_text {
+                        let cleaned = text.replace('\n', " ").replace('\r', "");
                         let short = if cleaned.len() > available_width { format!("{}...", &cleaned[..available_width.max(0)]) } else { cleaned };
-                        println!("   • {} {}", name_styled, style(short).dim());
-                    } else { println!("   • {}", name_styled); }
+                        println!("{}  {}", name_styled, style(short).dim());
+                    } else {
+                        println!("{}", name_styled);
+                    }
                 }
                 println!();
             }

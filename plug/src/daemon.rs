@@ -671,6 +671,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     name: tool.name.to_string(),
                     server_id,
                     description: tool.description.map(|d| d.to_string()),
+                    title: tool.title.clone(),
                 })
                 .collect();
             IpcResponse::Tools { tools: ipc_tools }
