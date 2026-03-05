@@ -126,26 +126,43 @@ impl ToolRouter {
                 }
             }
 
-            // 2. Automatic deduplication
-            // Strip server_name prefix if it's redundant (e.g. "notion-search" -> "search")
-            if exposed_name.starts_with(&server_name) && exposed_name.len() > server_name.len() {
-                let rest = &exposed_name[server_name.len()..];
-                if rest.starts_with('_') || rest.starts_with('-') {
-                    exposed_name = rest[1..].to_string();
-                }
-            }
-            // Strip server_name suffix if it's redundant (e.g. "research_exa" -> "research")
-            if exposed_name.ends_with(&server_name) && exposed_name.len() > server_name.len() {
-                let prefix_len = exposed_name.len() - server_name.len();
-                let rest = &exposed_name[..prefix_len];
-                if rest.ends_with('_') || rest.ends_with('-') {
-                    exposed_name = rest[..rest.len() - 1].to_string();
-                }
-            }
+            // 2. Sanitize to snake_case (hyphens, camelCase, dots -> snake_case)
+            let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
-            let prefixed_name = format!(
-                "{}{}{}",
-                server_name, self.config.prefix_delimiter, exposed_name
+            // 3. Determine prefix and cleaned tool name
+            let (prefix, cleaned_name) = if server_name == "workspace" {
+                // Workspace tools get sub-service classification
+                let (sub_service, cleaned) =
+                    crate::tool_naming::classify_workspace_tool(&sanitized);
+                (sub_service.to_string(), cleaned)
+            } else {
+                let prefix = crate::tool_naming::format_server_prefix(&server_name);
+                let mut name = sanitized.clone();
+
+                // Existing deduplication: strip server_name prefix if redundant
+                if name.starts_with(&server_name) && name.len() > server_name.len() {
+                    let rest = &name[server_name.len()..];
+                    if rest.starts_with('_') || rest.starts_with('-') {
+                        name = rest[1..].to_string();
+                    }
+                }
+                // Strip server_name suffix if redundant
+                if name.ends_with(&server_name) && name.len() > server_name.len() {
+                    let prefix_len = name.len() - server_name.len();
+                    let rest = &name[..prefix_len];
+                    if rest.ends_with('_') || rest.ends_with('-') {
+                        name = rest[..rest.len() - 1].to_string();
+                    }
+                }
+
+                (prefix, name)
+            };
+
+            // 4. Build wire name
+            let prefixed_name = crate::tool_naming::build_wire_name(
+                &prefix,
+                &cleaned_name,
+                &self.config.prefix_delimiter,
             );
 
             routes.insert(
@@ -155,12 +172,16 @@ impl ToolRouter {
 
             let mut prefixed_tool = tool.clone();
 
-            // Apply enrichment if enabled for this server
+            // 5. Enrich BEFORE setting wire name (so get_* patterns match cleaned name)
             if self.config.enrichment_servers.contains(&server_name) {
+                prefixed_tool.name = Cow::Owned(cleaned_name.clone());
                 crate::enrichment::enrich_tool(&mut prefixed_tool);
             }
 
+            // 6. Set the wire name and title
             prefixed_tool.name = Cow::Owned(prefixed_name);
+            prefixed_tool.title =
+                Some(crate::tool_naming::generate_title(&prefix, &cleaned_name));
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
@@ -228,18 +249,8 @@ impl ToolRouter {
                 .map(|(s, _)| s.clone())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let mut tool = tool.clone();
-            if server_id != "unknown" && server_id != "__plug_internal__" {
-                // Strip the prefix to show the original tool name
-                let original_name = tool
-                    .name
-                    .strip_prefix(server_id.as_str())
-                    .and_then(|s| s.strip_prefix(&self.config.prefix_delimiter))
-                    .unwrap_or(&tool.name);
-                tool.name = std::borrow::Cow::Owned(original_name.to_string());
-            }
-
-            result.push((server_id, tool));
+            // Return tool with wire name intact (CLI handles display)
+            result.push((server_id, tool.clone()));
         }
         result
     }
@@ -597,12 +608,12 @@ fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
 
 /// Strip optional fields from a tool for token efficiency.
 ///
-/// Removes `title`, `outputSchema`, `annotations`, and `icons`.
+/// Removes `outputSchema`. Keeps `title` (human-friendly display name) and
+/// `annotations` (readOnlyHint, etc. — useful for client parallelization).
 /// `inputSchema` is REQUIRED per MCP spec (ADR-003) — never stripped.
 fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
-    tool.title = None;
+    // Keep title (human-friendly display name) and annotations (readOnlyHint etc.)
     tool.output_schema = None;
-    tool.annotations = None;
     // Note: tool.icons doesn't exist on rmcp Tool; skip if not present
 
     if let Some(max) = max_desc_chars {
