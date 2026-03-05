@@ -23,23 +23,24 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 const HELP_OVERVIEW: &str = "\
-Get Started:
-  plug setup              Discover servers and link clients
-  plug link               Link plug to your AI clients
+Workflow:
+  Get started
+    plug setup              Discover servers and link clients
+    plug link               Link plug to your AI clients
 
-Inspect:
-  plug status             Show runtime health and next actions
-  plug servers            Show configured servers
-  plug tools              Show available tools
-  plug doctor             Diagnose setup problems
+  Inspect
+    plug status             Show runtime health and next actions
+    plug servers            Show configured servers
+    plug tools              Show available tools
+    plug doctor             Diagnose setup problems
 
-Maintain:
-  plug repair             Refresh linked client configs
-  plug config --path      Print config file path
+  Maintain
+    plug repair             Refresh linked client configs
+    plug config --path      Print config file path
 
-Internal:
-  plug connect            stdio adapter invoked by AI clients
-  plug serve --daemon     Run the background service
+  Internal
+    plug connect            stdio adapter invoked by AI clients
+    plug serve --daemon     Run the background service
 ";
 
 #[derive(Parser)]
@@ -331,28 +332,29 @@ async fn cmd_overview(
     use dialoguer::console::{Emoji, style};
 
     println!("{} {}", Emoji("🔌", ""), style("plug").bold().cyan());
+    println!("{}", style("MCP multiplexer").dim());
     println!();
 
     if !config_exists {
-        println!(
-            "No config found at {}.",
-            style(config_path.display()).yellow()
-        );
+        println!("{}", style("Overview").bold());
+        println!("  Config   {}", style("not found").yellow().bold());
+        println!("  Path     {}", style(config_path.display()).dim());
         println!();
-        println!("Next:");
-        println!("  1. {}", style("plug setup").cyan());
-        println!("  2. {}", style("plug status").cyan());
+        println!("{}", style("Next").bold());
+        println!("  1. {:<18} {}", style("plug setup").cyan(), "Create config and link clients");
+        println!("  2. {:<18} {}", style("plug status").cyan(), "Check runtime health once configured");
         return Ok(());
     }
 
     let config = plug_core::config::load_config(Some(&config_path))?;
     let daemon_running = daemon::connect_to_daemon().await.is_some();
 
+    println!("{}", style("Overview").bold());
+    println!("  Path     {}", style(config_path.display()).dim());
+    println!("  Servers  {}", style(config.servers.len()).bold());
+    println!("  Clients  {}", style(linked_clients.len()).bold());
     println!(
-        "Config: {}  Servers: {}  Linked clients: {}  Service: {}",
-        style(config_path.display()).dim(),
-        style(config.servers.len()).bold(),
-        style(linked_clients.len()).bold(),
+        "  Service  {}",
         if daemon_running {
             style("running").green().bold()
         } else {
@@ -361,20 +363,20 @@ async fn cmd_overview(
     );
 
     if !linked_clients.is_empty() {
-        println!("Linked: {}", linked_clients.join(", "));
+        println!("  Linked   {}", linked_clients.join(", "));
     }
 
     println!();
-    println!("Next:");
+    println!("{}", style("Next").bold());
     if linked_clients.is_empty() {
-        println!("  1. {}", style("plug link").cyan());
-        println!("  2. {}", style("plug status").cyan());
+        println!("  1. {:<18} {}", style("plug link").cyan(), "Link plug to your AI clients");
+        println!("  2. {:<18} {}", style("plug status").cyan(), "Check runtime health");
     } else if daemon_running {
-        println!("  1. {}", style("plug status").cyan());
-        println!("  2. {}", style("plug doctor").cyan());
+        println!("  1. {:<18} {}", style("plug status").cyan(), "Inspect runtime health");
+        println!("  2. {:<18} {}", style("plug doctor").cyan(), "Diagnose configuration issues");
     } else {
-        println!("  1. {}", style("plug status").cyan());
-        println!("  2. {}", style("plug repair").cyan());
+        println!("  1. {:<18} {}", style("plug status").cyan(), "Start and inspect the service");
+        println!("  2. {:<18} {}", style("plug repair").cyan(), "Refresh linked client configs");
     }
 
     Ok(())
@@ -481,23 +483,28 @@ async fn cmd_status(
     {
         if matches!(output, OutputFormat::Text) {
             println!(
-                "{} {} (uptime: {}s) | {} {} client(s) connected",
+                "{} {}",
                 Emoji("🔌", ""),
-                style("Plug Engine is running").green().bold(),
-                uptime_secs,
-                Emoji("👥", ""),
-                style(clients.to_string()).bold()
+                style("Runtime").green().bold(),
             );
             println!();
+            println!("  Service  {}", style("running").green().bold());
+            println!("  Uptime   {}s", style(uptime_secs).bold());
+            println!("  Clients  {}", style(clients.to_string()).bold());
+            println!();
             if servers.is_empty() {
+                println!("{}", style("Servers").bold());
                 println!("  No servers configured.");
             } else {
+                println!("{}", style("Servers").bold());
                 println!(
-                    "  {:<20} {:<15} {:<6}",
+                    "  {:<2} {:<18} {:<12} {:>5}",
+                    style("").dim(),
                     style("SERVER").dim(),
                     style("STATUS").dim(),
                     style("TOOLS").dim()
                 );
+                println!("  {}", style("------------------------------------------------").dim());
                 for s in &servers {
                     if s.server_id == "__plug_internal__" {
                         continue;
@@ -514,7 +521,7 @@ async fn cmd_status(
                         }
                     };
                     println!(
-                        "  {} {:<18} {:<23} {:<6}",
+                        "  {} {:<18} {:<12} {:>5}",
                         icon, s.server_id, health, s.tool_count
                     );
                 }
@@ -535,8 +542,10 @@ async fn cmd_status(
         println!(
             "{} {}",
             Emoji("💤", ""),
-            style("Plug Engine failed to start.").red().bold()
+            style("Runtime unavailable").red().bold()
         );
+        println!();
+        println!("{}", style("Configured servers").bold());
         let mut names: Vec<_> = config.servers.keys().collect();
         names.sort();
         for n in names {
@@ -544,7 +553,7 @@ async fn cmd_status(
                 "  {} {:<18} {}",
                 Emoji("⚪", ""),
                 n,
-                style("Not Running").dim()
+                style("not running").dim()
             );
         }
     }
