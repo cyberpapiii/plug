@@ -49,7 +49,7 @@ impl DoctorReport {
 /// Run all diagnostic checks and return an aggregated report.
 pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
     // Run independent checks concurrently
-    let (config_exists, config_perms, port, env_vars, binaries, collisions, limits, pid) = tokio::join!(
+    let (config_exists, config_perms, port, env_vars, binaries, collisions, limits, pid, clients) = tokio::join!(
         check_config_exists(config_path),
         check_config_permissions(config, config_path),
         check_port_available(config),
@@ -58,6 +58,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_tool_collisions(config),
         check_client_limits(config),
         check_pid_staleness(),
+        check_client_configs(),
     );
 
     // Server connectivity is sequential-ish internally but we run it after the rest
@@ -72,6 +73,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         collisions,
         limits,
         pid,
+        clients,
         connectivity,
     ];
 
@@ -665,6 +667,82 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
     }
 }
 
+/// Check 9: detect duplicate or corrupted plug entries in AI client configs.
+async fn check_client_configs() -> CheckResult {
+    let name = "client_configs".to_string();
+    let mut issues = Vec::new();
+
+    let all_targets = [
+        "claude-desktop", "claude-code", "cursor", "vscode", "windsurf", 
+        "gemini-cli", "codex-cli", "opencode", "zed", "cline", "cline-cli",
+        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity"
+    ];
+
+    for target in all_targets {
+        let target_enum: crate::export::ExportTarget = match target.parse() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        // Check both global and project paths (if applicable)
+        let paths = vec![
+            crate::export::default_config_path(target_enum, false),
+            crate::export::default_config_path(target_enum, true),
+        ];
+
+        for path in paths.into_iter().flatten() {
+            if !path.exists() {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let is_toml = path.extension().and_then(|e| e.to_str()) == Some("toml");
+            
+            if is_toml {
+                // Count occurrences of [mcp_servers.plug]
+                let count = content.lines().filter(|l| l.trim() == "[mcp_servers.plug]").count();
+                if count > 1 {
+                    issues.push(format!("{} (duplicate entries in {})", target, path.display()));
+                }
+                // Also check if it's even valid TOML
+                if let Err(e) = content.parse::<toml::Value>() {
+                    issues.push(format!("{} (invalid TOML in {}: {})", target, path.display(), e));
+                }
+            } else {
+                // For JSON, check for multiple "plug" keys
+                if let Ok(_json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    // Current merge logic is safe, but we'll flag if it looks broken
+                    if content.matches("\"plug\":").count() > 1 {
+                         issues.push(format!("{} (potential duplicate entries in {})", target, path.display()));
+                    }
+                } else {
+                    issues.push(format!("{} (invalid JSON in {})", target, path.display()));
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "All detected client configurations are healthy".to_string(),
+            fix_suggestion: None,
+        }
+    } else {
+        CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: format!("Issues found in client configs: {}", issues.join(", ")),
+            fix_suggestion: Some("Run `plug repair` to automatically clean up your client configurations".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -963,6 +1041,6 @@ mod tests {
     async fn run_doctor_returns_all_checks() {
         let config = test_config();
         let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 9);
+        assert_eq!(report.checks.len(), 10);
     }
 }

@@ -136,6 +136,11 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
     ) -> Result<UpstreamServer, anyhow::Error> {
+        // Recursion shield: never start a server named "plug"
+        if name == "plug" {
+            anyhow::bail!("recursion shield: ignoring upstream server named 'plug'");
+        }
+
         let timeout_duration = Duration::from_secs(config.timeout_secs);
 
         let result = tokio::time::timeout(timeout_duration, async {
@@ -146,15 +151,22 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("stdio transport requires a command"))?;
 
-                    let mut cmd = tokio::process::Command::new(command);
-                    cmd.args(&config.args);
+                    // We wrap the command in 'sh -c' to ensure stderr is redirected to /dev/null
+                    // at the OS level, preventing noisy logs from leaking.
+                    let mut cmd = tokio::process::Command::new("sh");
+                    let mut full_command = format!("'{}'", command);
+                    for arg in &config.args {
+                        // Basic escaping for the shell wrapper
+                        let escaped_arg = arg.replace("'", "'\\''");
+                        full_command.push_str(&format!(" '{}'", escaped_arg));
+                    }
+                    full_command.push_str(" 2>/dev/null");
+                    
+                    cmd.arg("-c").arg(full_command);
+
                     for (key, value) in &config.env {
                         cmd.env(key, value);
                     }
-                    // Silence both stdout and stderr to prevent upstream servers from cluttering the terminal.
-                    // RMCP's transport will override these with pipes for the actual protocol communication.
-                    cmd.stdout(std::process::Stdio::null());
-                    cmd.stderr(std::process::Stdio::null());
 
                     tracing::info!(
                         server = %name,

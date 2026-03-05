@@ -49,22 +49,25 @@ enum Commands {
     /// Run diagnostic checks on your plug setup
     Doctor,
     #[command(display_order = 4)]
+    /// Repair and clean up all AI client configuration files
+    Repair,
+    #[command(display_order = 5)]
     /// Reload config from disk (sends reload signal to daemon)
     Reload,
 
     // ─── INSPECTION ──────────────────────────────────────────────────
-    #[command(display_order = 5)]
+    #[command(display_order = 6)]
     /// List configured servers
     Servers,
-    #[command(display_order = 6)]
+    #[command(display_order = 7)]
     /// List all available tools from your servers
     Tools,
 
     // ─── SYSTEM / CLIENT COMMANDS ────────────────────────────────────
-    #[command(display_order = 7)]
+    #[command(display_order = 8)]
     /// Start the MCP stdio bridge (what clients invoke)
     Connect,
-    #[command(display_order = 8)]
+    #[command(display_order = 9)]
     /// Start the HTTP server for web-based MCP clients
     Serve {
         /// Also start stdio bridge on stdin/stdout
@@ -74,19 +77,19 @@ enum Commands {
         #[arg(long)]
         daemon: bool,
     },
-    #[command(display_order = 9)]
+    #[command(display_order = 10)]
     /// Stop the background plug engine (daemon)
     Stop,
 
     // ─── ADVANCED CONFIG ─────────────────────────────────────────────
-    #[command(display_order = 10)]
+    #[command(display_order = 11)]
     /// Open the plug configuration file in your default editor
     Config {
         /// Just print the path instead of opening it
         #[arg(long)]
         path: bool,
     },
-    #[command(display_order = 11)]
+    #[command(display_order = 12)]
     /// Import MCP servers from AI client configs
     Import {
         /// Only scan specific clients (comma-separated: claude-desktop,cursor,vscode,...)
@@ -96,7 +99,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    #[command(display_order = 12)]
+    #[command(display_order = 13)]
     /// Interactively link plug to your AI clients
     Export,
 }
@@ -117,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         match &cli.command {
-            Commands::Status | Commands::Servers | Commands::Tools => "error",
+            Commands::Status | Commands::Servers | Commands::Tools => "none",
             _ => "info",
         }
     };
@@ -161,6 +164,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doctor => {
             cmd_doctor(cli.config.as_ref(), &cli.output).await?;
         }
+        Commands::Repair => {
+            cmd_repair()?;
+        }
         Commands::Setup => {
             cmd_setup(cli.config.as_ref())?;
         }
@@ -176,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_stderr_tracing(level: &str) {
+    if level == "none" {
+        return;
+    }
     let filter = if level == "error" {
         // For clean commands, only show errors from our own code and be silent for dependencies
         tracing_subscriber::EnvFilter::new("plug=error,plug_core=error")
@@ -458,6 +467,12 @@ async fn cmd_tool_list(
                 return Ok(());
             }
 
+            let term_width = console::Term::stdout().size().1 as usize;
+            let name_width = 30;
+            let padding_and_bullet = 5; // "   • "
+            let separator = 1; // " "
+            let available_width = term_width.saturating_sub(name_width + padding_and_bullet + separator + 3); // -3 for "..."
+
             println!(
                 "{} {} tools available across {} server(s)\n",
                 Emoji("⚒️", ""),
@@ -474,8 +489,8 @@ async fn cmd_tool_list(
                     let name_styled = style(format!("{:<30}", name)).cyan();
                     if let Some(d) = desc {
                         let cleaned = d.replace('\n', " ").replace('\r', "");
-                        let short_desc = if cleaned.len() > 70 {
-                            format!("{}...", &cleaned[..67])
+                        let short_desc = if cleaned.len() > available_width {
+                            format!("{}...", &cleaned[..available_width.max(0)])
                         } else {
                             cleaned
                         };
@@ -546,7 +561,8 @@ fn cmd_import(config_path: Option<&std::path::PathBuf>, clients: Option<Vec<Stri
 
             let config_file = config_path.cloned().unwrap_or_else(plug_core::config::default_config_path);
             let to_import: Vec<plug_core::import::DiscoveredServer> = selections.iter().map(|&i| report.new_servers[i].clone()).collect();
-            let toml = import::servers_to_toml(&to_import, &existing.keys().cloned().collect::<Vec<_>>());
+            let existing_names: Vec<String> = existing.keys().cloned().collect();
+            let toml = import::servers_to_toml(&to_import, &existing_names);
             
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&config_file)?;
@@ -717,7 +733,8 @@ fn cmd_setup(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
         if Confirm::with_theme(&ColorfulTheme::default()).with_prompt("Import them?").default(true).interact()? {
             let path = config_path.cloned().unwrap_or_else(plug_core::config::default_config_path);
             if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-            let toml = plug_core::import::servers_to_toml(&report.new_servers, &existing.keys().cloned().collect::<Vec<_>>());
+            let existing_names: Vec<String> = existing.keys().cloned().collect();
+            let toml = plug_core::import::servers_to_toml(&report.new_servers, &existing_names);
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
             file.write_all(toml.as_bytes())?;
@@ -731,5 +748,41 @@ fn cmd_config(config_path: Option<&std::path::PathBuf>, path_only: bool) -> anyh
     let path = config_path.cloned().unwrap_or_else(plug_core::config::default_config_path);
     if path_only { println!("{}", path.display()); }
     else { if path.exists() { open::that(&path)?; } else { println!("Config missing at {}. Run setup.", path.display()); } }
+    Ok(())
+}
+
+/// `plug repair` — clean up and refresh all client configurations.
+fn cmd_repair() -> anyhow::Result<()> {
+    use dialoguer::console::{style, Emoji};
+    
+    println!("{} {}", Emoji("🛠️", ""), style("Repairing AI client configurations...").bold());
+
+    let all_clients = [
+        "claude-desktop", "claude-code", "cursor", "vscode", "windsurf", 
+        "gemini-cli", "codex-cli", "opencode", "zed", "cline", "cline-cli",
+        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity"
+    ];
+
+    let mut repaired_count = 0;
+
+    for target in all_clients {
+        // Only repair if it's currently linked
+        if is_linked(target, false) {
+            print!("  {} Refreshing {}... ", Emoji("🔄", ""), target);
+            if let Err(e) = execute_export(target, false, 3282, true, false) {
+                println!("{}", style(format!("failed: {e}")).red());
+            } else {
+                println!("{}", style("done").green());
+                repaired_count += 1;
+            }
+        }
+    }
+
+    if repaired_count == 0 {
+        println!("\n{} No linked clients found to repair.", Emoji("✅", ""));
+    } else {
+        println!("\n{} Successfully repaired {} client configuration(s).", Emoji("✨", ""), repaired_count);
+    }
+
     Ok(())
 }

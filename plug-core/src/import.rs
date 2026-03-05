@@ -689,15 +689,19 @@ pub fn unlink_toml(content: &str) -> String {
     let mut skipping = false;
     for line in content.lines() {
         let trimmed = line.trim();
-        // Skip both the header and the key-value pairs under it
-        if trimmed == "[mcp_servers.plug]" || trimmed == "[[mcp_servers.plug]]" {
+        
+        // Start skipping if we hit any variation of the plug header
+        if trimmed == "[mcp_servers.plug]" || trimmed == "[[mcp_servers.plug]]" || trimmed == "[mcp_servers.\"plug\"]" {
             skipping = true;
             continue;
         }
+
         if skipping {
-            if trimmed.starts_with('[') {
+            // Stop skipping ONLY if we hit a new header that is NOT a plug header
+            if trimmed.starts_with('[') && !trimmed.contains(".plug") && !trimmed.contains("\"plug\"") {
                 skipping = false;
             } else {
+                // Still skipping: either it's more plug config or another duplicate plug header
                 continue;
             }
         }
