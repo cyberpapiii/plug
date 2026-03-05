@@ -68,6 +68,47 @@ pub fn sanitize_tool_name(name: &str) -> String {
     collapsed
 }
 
+/// Capitalize the first letter of a server name for use as a wire name prefix.
+/// "slack" -> "Slack", "imessage" -> "IMessage", "context7" -> "Context7"
+pub fn format_server_prefix(server_name: &str) -> String {
+    let mut chars = server_name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let mut result = first.to_uppercase().to_string();
+            result.extend(chars);
+            result
+        }
+    }
+}
+
+/// Generate a human-readable title from a server prefix and tool name.
+/// ("Slack", "search_messages") -> "Slack: Search Messages"
+/// ("Gmail", "get_messages_content_batch") -> "Gmail: Get Messages Content Batch"
+pub fn generate_title(server_prefix: &str, tool_name: &str) -> String {
+    let words: Vec<String> = tool_name
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let mut result = first.to_uppercase().to_string();
+                    result.extend(chars);
+                    result
+                }
+            }
+        })
+        .collect();
+    format!("{}: {}", server_prefix, words.join(" "))
+}
+
+/// Build the wire name: "{ServerPrefix}{delimiter}{tool_name}"
+/// ("Slack", "search_messages", "__") -> "Slack__search_messages"
+pub fn build_wire_name(server_prefix: &str, tool_name: &str, delimiter: &str) -> String {
+    format!("{}{}{}", server_prefix, delimiter, tool_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +160,43 @@ mod tests {
         assert_eq!(
             sanitize_tool_name("get-documentation"),
             "get_documentation"
+        );
+    }
+
+    #[test]
+    fn capitalize_server_name() {
+        assert_eq!(format_server_prefix("slack"), "Slack");
+        assert_eq!(format_server_prefix("imessage"), "Imessage");
+        assert_eq!(format_server_prefix("context7"), "Context7");
+        assert_eq!(format_server_prefix("supabase"), "Supabase");
+        assert_eq!(format_server_prefix("supermemory"), "Supermemory");
+        assert_eq!(format_server_prefix("exa"), "Exa");
+        assert_eq!(format_server_prefix("Gmail"), "Gmail"); // already capitalized
+    }
+
+    #[test]
+    fn generate_title_basic() {
+        assert_eq!(
+            generate_title("Slack", "search_messages"),
+            "Slack: Search Messages"
+        );
+        assert_eq!(
+            generate_title("Gmail", "get_messages_content_batch"),
+            "Gmail: Get Messages Content Batch"
+        );
+        assert_eq!(generate_title("Notion", "search"), "Notion: Search");
+        assert_eq!(generate_title("Calendar", "list"), "Calendar: List");
+    }
+
+    #[test]
+    fn build_wire_name_basic() {
+        assert_eq!(
+            build_wire_name("Slack", "search_messages", "__"),
+            "Slack__search_messages"
+        );
+        assert_eq!(
+            build_wire_name("Gmail", "get_messages_content_batch", "__"),
+            "Gmail__get_messages_content_batch"
         );
     }
 }
