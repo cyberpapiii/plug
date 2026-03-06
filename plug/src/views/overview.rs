@@ -202,6 +202,27 @@ pub(crate) async fn cmd_status(
                 style("not running").dim()
             );
         }
+    } else {
+        let servers = config
+            .servers
+            .keys()
+            .cloned()
+            .map(|server_id| plug_core::types::ServerStatus {
+                server_id,
+                health: plug_core::types::ServerHealth::Failed,
+                tool_count: 0,
+                last_seen: None,
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "uptime": 0,
+                "clients": 0,
+                "servers": servers,
+                "daemon_running": false
+            }))?
+        );
     }
     Ok(())
 }

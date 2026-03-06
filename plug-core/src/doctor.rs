@@ -628,6 +628,7 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
 async fn check_http_reachable(url: &str) -> Result<(), String> {
     use std::net::ToSocketAddrs;
 
+    let is_https = url.starts_with("https://");
     // Parse URL to extract host:port
     let url = url
         .strip_prefix("https://")
@@ -637,7 +638,7 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
     let addr = if host_port.contains(':') {
         host_port.to_string()
     } else {
-        format!("{host_port}:443")
+        format!("{host_port}:{}", if is_https { 443 } else { 80 })
     };
 
     // DNS resolution + TCP connect with timeout
