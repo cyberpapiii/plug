@@ -123,22 +123,21 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 ## Commands
 
 ```sh
-plug                      # Show a compact overview and next actions
-plug setup                # Discover servers and link clients
-plug clients              # Show linked, detected, and live clients
-plug link                 # Link plug to your AI clients
-plug unlink               # Remove plug from selected client configs
-plug status               # Show runtime health and next useful action
-plug servers              # Show configured servers
-plug tools                # Show available tools across all servers
-plug tools --output json  # Machine-readable output for agent use
-plug import --yes         # Import every discovered server without prompting
-plug doctor               # Diagnose connectivity and configuration issues
-plug repair               # Refresh linked client configuration files
-plug config check         # Validate config syntax and core rules
-plug config --path        # Show config file location
-plug connect              # Internal stdio adapter AI clients invoke
-plug serve --daemon       # Run as headless daemon with IPC
+plug                         # Show a compact overview and next actions
+plug start                   # Start the background service
+plug setup                   # Discover servers and link clients
+plug clients                 # View and manage linked, detected, and live clients
+plug servers                 # View and manage configured servers
+plug tools                   # View and manage the effective tool surface
+plug status                  # Show runtime health and next useful action
+plug doctor                  # Diagnose connectivity and configuration issues
+plug repair                  # Refresh linked client configuration files
+plug config check            # Validate config syntax and core rules
+plug tools disable --server slack
+plug tools enable --server slack
+plug tools --output json     # Machine-readable output for agent use
+plug connect                 # Internal stdio adapter AI clients invoke
+plug serve --daemon          # Run as headless daemon with IPC
 ```
 
 ## Configuration

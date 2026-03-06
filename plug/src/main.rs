@@ -31,21 +31,21 @@ Workflow:
   Get started
     plug start              Start the background service
     plug setup              Discover servers and link clients
-    plug link               Link plug to your AI clients
+    plug clients            View and manage AI clients
 
   Inspect
     plug status             Show runtime health and next actions
     plug clients            Show linked, detected, and live clients
-    plug servers            Show configured servers
-    plug tools              Show available tools
+    plug servers            View and manage configured servers
+    plug tools              View and manage available tools
     plug doctor             Diagnose setup problems
 
   Maintain
     plug repair             Refresh linked client configs
     plug config check       Validate config syntax and rules
     plug config --path      Print config file path
-    plug server add         Add a configured server
-    plug tools disabled     Show disabled tool patterns
+    plug link               Link plug to your AI clients
+    plug unlink             Remove plug from your AI client configs
 
   Internal
     plug connect            stdio adapter invoked by AI clients
@@ -244,6 +244,19 @@ fn print_warning_line(message: impl std::fmt::Display) {
     println!("{} {}", style("!").yellow().bold(), message);
 }
 
+fn print_action_legend(title: &str, actions: &[(&str, &str)]) {
+    println!();
+    print_heading(title);
+    for (label, description) in actions {
+        println!(
+            "  {} {:<18} {}",
+            style("›").cyan().bold(),
+            style(*label).cyan(),
+            style(*description).dim()
+        );
+    }
+}
+
 fn can_prompt_interactively() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
@@ -365,13 +378,13 @@ enum Commands {
 
     // ─── INSPECTION ──────────────────────────────────────────────────
     #[command(display_order = 7)]
-    /// Show linked, detected, and live AI clients
+    /// View and manage linked, detected, and live AI clients
     Clients,
     #[command(display_order = 8)]
-    /// Show configured servers
+    /// View and manage configured servers
     Servers,
     #[command(display_order = 9)]
-    /// Show available tools from your servers
+    /// View and manage available tools from your servers
     Tools {
         #[command(subcommand)]
         command: Option<ToolCommands>,
@@ -976,8 +989,23 @@ async fn cmd_server_list(
                 }
                 OutputFormat::Text => {
                     if servers.is_empty() {
-                        println!("No servers configured.");
+                        print_banner("◆", "Servers", "No servers configured");
+                        println!();
+                        print_info_line("Use `Add server` below to create your first upstream.");
                     } else {
+                        let mut healthy = 0usize;
+                        let mut degraded = 0usize;
+                        let mut failed = 0usize;
+                        for server in &servers {
+                            if server.server_id == "__plug_internal__" {
+                                continue;
+                            }
+                            match server.health {
+                                plug_core::types::ServerHealth::Healthy => healthy += 1,
+                                plug_core::types::ServerHealth::Degraded => degraded += 1,
+                                plug_core::types::ServerHealth::Failed => failed += 1,
+                            }
+                        }
                         print_banner(
                             "◆",
                             "Servers",
@@ -986,6 +1014,12 @@ async fn cmd_server_list(
                         if started {
                             println!();
                         }
+                        print_heading("Summary");
+                        print_label_value("Healthy", style(healthy).green().bold());
+                        print_label_value("Degraded", style(degraded).yellow().bold());
+                        print_label_value("Failed", style(failed).red().bold());
+                        println!();
+                        print_heading("Inventory");
                         for s in servers {
                             if s.server_id == "__plug_internal__" {
                                 continue;
@@ -1011,6 +1045,7 @@ async fn cmd_server_list(
                     "Servers",
                     &format!("{} server(s) configured (daemon not running)", names.len()),
                 );
+                print_heading("Inventory");
                 for n in names {
                     println!("  {} {}", style("·").dim(), style(n).dim());
                 }
@@ -1020,7 +1055,17 @@ async fn cmd_server_list(
         if !interactive {
             break;
         }
-        println!();
+        print_action_legend(
+            "Actions",
+            &[
+                ("Add server", "Create a new upstream definition"),
+                ("Edit server", "Adjust a configured server"),
+                ("Remove server", "Delete a server definition"),
+                ("Enable server", "Turn a server back on"),
+                ("Disable server", "Hide a server from the tool surface"),
+                ("Done", "Exit this management view"),
+            ],
+        );
         if !prompt_server_actions(config_path, output).await? {
             break;
         }
@@ -1063,6 +1108,22 @@ async fn cmd_client_list(
             print_warning_line("Live client inspection requires restarting the background daemon after this upgrade.");
             println!();
         }
+        let linked_count = clients.iter().filter(|client| client.linked).count();
+        let detected_count = clients.iter().filter(|client| client.detected).count();
+        let live_count = clients.iter().filter(|client| client.live).count();
+        print_heading("Summary");
+        print_label_value("Linked", style(linked_count).green().bold());
+        print_label_value("Detected", style(detected_count).cyan().bold());
+        match live_client_support {
+            LiveClientSupport::Supported => {
+                print_label_value("Live", style(live_count).bold());
+            }
+            LiveClientSupport::DaemonRestartRequired => {
+                print_label_value("Live", style("restart required").yellow().bold());
+            }
+        }
+        println!();
+        print_heading("Inventory");
         println!(
             "  {:<24} {:<10} {:<10} {:<6}",
             style("CLIENT").dim(),
@@ -1099,7 +1160,14 @@ async fn cmd_client_list(
         if !interactive {
             break;
         }
-        println!();
+        print_action_legend(
+            "Actions",
+            &[
+                ("Link clients", "Add plug to one or more client configs"),
+                ("Unlink clients", "Remove plug from selected client configs"),
+                ("Done", "Exit this management view"),
+            ],
+        );
         if !prompt_client_actions()? {
             break;
         }
@@ -1247,6 +1315,9 @@ async fn cmd_tool_list(
                 }
                 let term_width = terminal_width();
                 let available_width = term_width.saturating_sub(40);
+                let disabled_count = load_editable_config(config_path)
+                    .map(|(_, config)| config.disabled_tools.len())
+                    .unwrap_or(0);
                 print_banner(
                     "◆",
                     "Tools",
@@ -1259,6 +1330,12 @@ async fn cmd_tool_list(
                 if started {
                     println!();
                 }
+                print_heading("Summary");
+                print_label_value("Tools", style(all_tools.len()).bold());
+                print_label_value("Servers", style(unique_servers.len()).bold());
+                print_label_value("Disabled", style(disabled_count).yellow().bold());
+                println!();
+                print_heading("Inventory");
                 for (prefix, mut tools) in tools_by_prefix {
                     tools.sort_by(|a, b| a.0.cmp(&b.0));
                     let server_id = &tools[0].1;
@@ -1297,6 +1374,15 @@ async fn cmd_tool_list(
         if !interactive {
             break;
         }
+        print_action_legend(
+            "Actions",
+            &[
+                ("Disable tools", "Hide individual tools or a server group"),
+                ("Enable tools", "Restore disabled tool patterns"),
+                ("Show disabled", "Inspect the current disabled list"),
+                ("Done", "Exit this management view"),
+            ],
+        );
         if !prompt_tool_actions(config_path).await? {
             break;
         }
@@ -1342,7 +1428,7 @@ fn prompt_client_actions() -> anyhow::Result<bool> {
 
     let options = ["Done", "Link clients", "Unlink clients"];
     let selection = Select::with_theme(&cli_prompt_theme())
-        .with_prompt("Manage clients")
+        .with_prompt("Choose action")
         .items(options)
         .default(0)
         .interact_opt()?;
@@ -1375,7 +1461,7 @@ async fn prompt_server_actions(
         "Disable server",
     ];
     let selection = Select::with_theme(&cli_prompt_theme())
-        .with_prompt("Manage servers")
+        .with_prompt("Choose action")
         .items(options)
         .default(0)
         .interact_opt()?;
@@ -1410,7 +1496,7 @@ async fn prompt_tool_actions(config_path: Option<&std::path::PathBuf>) -> anyhow
 
     let options = ["Done", "Disable tools", "Enable tools", "Show disabled patterns"];
     let selection = Select::with_theme(&cli_prompt_theme())
-        .with_prompt("Manage tools")
+        .with_prompt("Choose action")
         .items(options)
         .default(0)
         .interact_opt()?;

@@ -16,6 +16,7 @@ The CLI is the product surface right now.
 That means:
 
 - `plug` with no args should act like a home screen
+- `plug clients`, `plug servers`, and `plug tools` should act like management views
 - setup and linking should feel guided
 - runtime inspection should be easy without reading docs
 - plumbing commands should exist, but they should not dominate the story
@@ -40,6 +41,7 @@ Top-level commands should represent what the user is trying to do.
 
 Current human-facing jobs:
 
+- `plug start`
 - `plug setup`
 - `plug clients`
 - `plug link`
@@ -120,7 +122,19 @@ plug link
 
 - linked vs detected vs live
 - quick audit of what is actually connected
-- foundation for future interactive client management
+- interactive link/unlink from the same view
+
+`servers` is the server management surface:
+
+- health and tool counts at a glance
+- add, edit, remove, enable, disable from the same view
+- advanced schema editing can still fall back to config editing when needed
+
+`tools` is the effective tool surface:
+
+- grouped view of what clients can actually call
+- disable or re-enable tools from the same view
+- stable non-interactive commands remain available underneath
 
 ### Inspect
 
@@ -133,6 +147,14 @@ plug doctor
 ```
 
 These commands should be the calm, reliable operating surface for the product.
+
+The management view pattern should be consistent:
+
+- banner
+- summary
+- inventory
+- actions
+- one `Choose action` prompt grammar across views
 
 ### Maintain
 
