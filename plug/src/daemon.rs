@@ -466,7 +466,6 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
                                 started_at,
                                 client_registry: registry,
                                 session_id: None,
-                                client_id: None,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
@@ -504,7 +503,6 @@ struct ConnectionContext {
     client_registry: Arc<ClientRegistry>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
-    client_id: Option<String>,
 }
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
@@ -694,7 +692,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 );
             }
             let session_id = registration.session_id;
-            ctx.client_id = Some(client_id.clone());
             ctx.session_id = Some(session_id.clone());
             IpcResponse::Registered {
                 protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
@@ -719,7 +716,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
             ctx.client_registry.deregister(session_id);
             ctx.session_id = None;
-            ctx.client_id = None;
             IpcResponse::Ok
         }
 

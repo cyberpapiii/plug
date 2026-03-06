@@ -147,9 +147,6 @@ impl IpcProxyHandler {
         }
     }
 
-    async fn remember_client_info(&self, client_info: String) {
-        self.conn.lock().await.client_info = Some(client_info);
-    }
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -175,7 +172,7 @@ impl ServerHandler for IpcProxyHandler {
                 client = %client_name,
                 "client connected via IPC proxy"
             );
-            self.remember_client_info(client_name.clone()).await;
+            self.conn.lock().await.client_info = Some(client_name.clone());
 
             // Forward client info to daemon for client-type-aware tool filtering
             if let Err(e) = self
