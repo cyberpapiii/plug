@@ -30,6 +30,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 128;
 
 /// Minimum interval between restarts of the same server.
 const RESTART_COOLDOWN: Duration = Duration::from_secs(10);
+const RECONNECT_RETRY_MAX_ATTEMPTS: u32 = 5;
+const RECONNECT_RETRY_MIN_DELAY: Duration = Duration::from_millis(100);
+const RECONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Monotonic counter for correlating ToolCallStarted/ToolCallCompleted events.
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -348,26 +351,46 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?
             .clone();
 
-        match ServerManager::start_server(server_id, &server_config).await {
-            Ok(upstream) => {
-                self.server_manager.replace_server(server_id, upstream);
-                self.tool_router.refresh_tools().await;
-
-                let _ = self.event_tx.send(EngineEvent::ServerStarted {
-                    server_id: Arc::from(server_id),
-                });
-
-                tracing::info!(server = %server_id, "server reconnected");
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.event_tx.send(EngineEvent::Error {
-                    context: Arc::from("reconnect_server"),
-                    message: Arc::from(e.to_string().as_str()),
-                });
+        let mut attempt = 1;
+        let mut delay = RECONNECT_RETRY_MIN_DELAY;
+        let upstream = loop {
+            match ServerManager::start_server(server_id, &server_config).await {
+                Ok(upstream) => break upstream,
                 Err(e)
+                    if attempt < RECONNECT_RETRY_MAX_ATTEMPTS
+                        && is_retryable_reconnect_error(&e) =>
+                {
+                    tracing::warn!(
+                        server = %server_id,
+                        attempt,
+                        max_attempts = RECONNECT_RETRY_MAX_ATTEMPTS,
+                        retry_in_ms = delay.as_millis(),
+                        error = %e,
+                        "reconnect attempt failed during upstream readiness window"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    delay = (delay * 2).min(RECONNECT_RETRY_MAX_DELAY);
+                }
+                Err(e) => {
+                    let _ = self.event_tx.send(EngineEvent::Error {
+                        context: Arc::from("reconnect_server"),
+                        message: Arc::from(e.to_string()),
+                    });
+                    return Err(e);
+                }
             }
-        }
+        };
+
+        self.server_manager.replace_server(server_id, upstream);
+        self.tool_router.refresh_tools().await;
+
+        let _ = self.event_tx.send(EngineEvent::ServerStarted {
+            server_id: Arc::from(server_id),
+        });
+
+        tracing::info!(server = %server_id, "server reconnected");
+        Ok(())
     }
 
     /// Enable or disable a server. Clones the current config, toggles the
@@ -402,6 +425,19 @@ impl Engine {
     ) -> Result<crate::reload::ReloadReport, anyhow::Error> {
         crate::reload::apply_reload(self, new_config).await
     }
+}
+
+fn is_retryable_reconnect_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("connection refused")
+        || message.contains("connection reset")
+        || message.contains("broken pipe")
+        || message.contains("timed out")
+        || message.contains("timed out waiting")
+        || message.contains("session not found")
+        || message.contains("404")
+        || message.contains("failed to connect to http upstream")
+        || message.contains("failed to list tools")
 }
 
 #[cfg(test)]
@@ -523,7 +559,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
 
@@ -556,7 +592,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
 
@@ -610,7 +646,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
 
@@ -692,5 +728,19 @@ mod tests {
                 panic!("channel should not be closed");
             }
         }
+    }
+
+    #[test]
+    fn retryable_reconnect_error_classifier_matches_restart_window_failures() {
+        let err = anyhow::anyhow!(
+            "failed to connect to HTTP upstream: error sending request for url (http://localhost:8000/mcp): connection refused"
+        );
+        assert!(is_retryable_reconnect_error(&err));
+
+        let err = anyhow::anyhow!("failed to list tools: HTTP 404 Not Found: Session not found");
+        assert!(is_retryable_reconnect_error(&err));
+
+        let err = anyhow::anyhow!("stdio transport requires a command");
+        assert!(!is_retryable_reconnect_error(&err));
     }
 }

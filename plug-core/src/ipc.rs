@@ -56,6 +56,9 @@ pub enum IpcRequest {
         client_info: String,
     },
 
+    /// Liveness probe for long-lived proxy connections.
+    Ping { session_id: String },
+
     /// List all available tools across all servers.
     ListTools,
     /// List live proxy client sessions connected to the daemon.
@@ -111,6 +114,10 @@ impl fmt::Debug for IpcRequest {
                 .field("session_id", session_id)
                 .field("client_info", client_info)
                 .finish(),
+            Self::Ping { session_id } => f
+                .debug_struct("Ping")
+                .field("session_id", session_id)
+                .finish(),
             Self::ListTools => write!(f, "ListTools"),
             Self::ListClients => write!(f, "ListClients"),
             Self::McpRequest {
@@ -156,6 +163,8 @@ pub enum IpcResponse {
     Clients { clients: Vec<IpcClientInfo> },
     /// Success acknowledgement for mutating commands.
     Ok,
+    /// Liveness acknowledgement for long-lived proxy connections.
+    Pong,
     /// Error with machine-parseable code and human-readable message.
     Error { code: String, message: String },
 

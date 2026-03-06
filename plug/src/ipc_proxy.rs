@@ -5,14 +5,25 @@
 //! This is what `plug connect` uses when a daemon is running.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use plug_core::ipc::{self, IpcRequest, IpcResponse};
+
+const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
+
+struct SharedConnection {
+    conn: Mutex<crate::runtime::DaemonProxySession>,
+    config_path: Option<PathBuf>,
+}
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
 ///
@@ -22,8 +33,8 @@ use plug_core::ipc::{self, IpcRequest, IpcResponse};
 /// A single mutex guards the entire round-trip (write + read) to prevent
 /// concurrent requests from reading each other's responses.
 pub struct IpcProxyHandler {
-    conn: Mutex<crate::runtime::DaemonProxySession>,
-    config_path: Option<PathBuf>,
+    shared: Arc<SharedConnection>,
+    heartbeat: JoinHandle<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -40,10 +51,12 @@ struct TransportFailure {
 impl IpcProxyHandler {
     /// Create a new proxy handler from an established IPC connection.
     pub fn new(session: crate::runtime::DaemonProxySession, config_path: Option<PathBuf>) -> Self {
-        Self {
+        let shared = Arc::new(SharedConnection {
             conn: Mutex::new(session),
             config_path,
-        }
+        });
+        let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
+        Self { shared, heartbeat }
     }
 
     /// Send an IPC request and read the response.
@@ -58,7 +71,7 @@ impl IpcProxyHandler {
     where
         F: Fn(&str) -> IpcRequest,
     {
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.shared.conn.lock().await;
         let request = build_request(&conn.session_id);
         let payload = serde_json::to_vec(&request)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -118,8 +131,58 @@ impl IpcProxyHandler {
         &self,
         conn: &mut crate::runtime::DaemonProxySession,
     ) -> Result<(), McpError> {
+        Self::refresh_session_locked(self.shared.config_path.as_ref(), conn).await
+    }
+
+    async fn heartbeat_loop(shared: Arc<SharedConnection>) {
+        let mut tick = tokio::time::interval(DAEMON_PING_INTERVAL);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tick.tick().await;
+
+        loop {
+            tick.tick().await;
+            if let Err(error) = Self::ping_once(&shared).await {
+                tracing::debug!(error = %error, "daemon heartbeat ping failed");
+            }
+        }
+    }
+
+    async fn ping_once(shared: &Arc<SharedConnection>) -> Result<(), McpError> {
+        let mut conn = shared.conn.lock().await;
+        let payload = serde_json::to_vec(&IpcRequest::Ping {
+            session_id: conn.session_id.clone(),
+        })
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match Self::try_round_trip_locked(&mut conn, &payload).await {
+            Ok(IpcResponse::Pong) => Ok(()),
+            Ok(IpcResponse::Error { code, message }) => {
+                if matches!(code.as_str(), "SESSION_REPLACED" | "SESSION_MISMATCH") {
+                    tracing::warn!(code = %code, message = %message, "daemon heartbeat detected stale session; reconnecting");
+                    Self::refresh_session_locked(shared.config_path.as_ref(), &mut conn).await?;
+                    return Ok(());
+                }
+                Err(McpError::internal_error(format!("{code}: {message}"), None))
+            }
+            Ok(other) => Err(McpError::internal_error(
+                format!("unexpected IPC ping response: {other:?}"),
+                None,
+            )),
+            Err(failure) if failure.reconnectable => {
+                tracing::warn!(error = %failure.message, "daemon heartbeat lost connection; reconnecting");
+                Self::refresh_session_locked(shared.config_path.as_ref(), &mut conn).await?;
+                Ok(())
+            }
+            Err(failure) => Err(McpError::internal_error(failure.message, None)),
+        }
+    }
+
+    async fn refresh_session_locked(
+        config_path: Option<&PathBuf>,
+        conn: &mut crate::runtime::DaemonProxySession,
+    ) -> Result<(), McpError> {
         let session = crate::runtime::establish_daemon_proxy_session(
-            self.config_path.as_ref(),
+            config_path,
             conn.client_id.clone(),
             conn.client_info.clone(),
         )
@@ -146,7 +209,12 @@ impl IpcProxyHandler {
             reconnectable,
         }
     }
+}
 
+impl Drop for IpcProxyHandler {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+    }
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -172,7 +240,7 @@ impl ServerHandler for IpcProxyHandler {
                 client = %client_name,
                 "client connected via IPC proxy"
             );
-            self.conn.lock().await.client_info = Some(client_name.clone());
+            self.shared.conn.lock().await.client_info = Some(client_name.clone());
 
             // Forward client info to daemon for client-type-aware tool filtering
             if let Err(e) = self

@@ -754,6 +754,22 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
+        IpcRequest::Ping { session_id } => {
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            IpcResponse::Pong
+        }
+
         IpcRequest::ListTools => {
             let tool_router = ctx.engine.tool_router();
             let tools = tool_router.list_all_tools();
@@ -1225,5 +1241,15 @@ mod tests {
             response,
             IpcResponse::Error { ref code, .. } if code == "PROTOCOL_VERSION_UNSUPPORTED"
         ));
+    }
+
+    #[test]
+    fn ping_request_round_trips_in_json() {
+        let request = IpcRequest::Ping {
+            session_id: "session-123".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"Ping\""));
+        assert!(json.contains("\"session_id\":\"session-123\""));
     }
 }
