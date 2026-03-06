@@ -434,6 +434,7 @@ mod tests {
             crate::proxy::RouterConfig {
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 tool_filter_enabled: true,

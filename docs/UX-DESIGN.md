@@ -41,12 +41,15 @@ Top-level commands should represent what the user is trying to do.
 Current human-facing jobs:
 
 - `plug setup`
+- `plug clients`
 - `plug link`
+- `plug unlink`
 - `plug status`
 - `plug servers`
 - `plug tools`
 - `plug doctor`
 - `plug repair`
+- `plug config check`
 - `plug config --path`
 
 Internal/plumbing commands stay available:
@@ -98,6 +101,7 @@ Expected behavior:
 
 ```text
 plug setup
+plug clients
 plug link
 ```
 
@@ -112,10 +116,17 @@ plug link
 - interactive by default
 - direct targets supported for scripting
 
+`clients` is the client state surface:
+
+- linked vs detected vs live
+- quick audit of what is actually connected
+- foundation for future interactive client management
+
 ### Inspect
 
 ```text
 plug status
+plug clients
 plug servers
 plug tools
 plug doctor
@@ -127,6 +138,7 @@ These commands should be the calm, reliable operating surface for the product.
 
 ```text
 plug repair
+plug config check
 plug config --path
 ```
 

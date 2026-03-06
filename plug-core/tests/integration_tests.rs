@@ -27,6 +27,7 @@ async fn test_proxy_handler_refresh_tools_empty() {
         plug_core::proxy::RouterConfig {
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
@@ -52,6 +53,7 @@ fn test_proxy_handler_get_info() {
         plug_core::proxy::RouterConfig {
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
@@ -96,6 +98,7 @@ fn test_resources_capability_present() {
         plug_core::proxy::RouterConfig {
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
@@ -120,6 +123,7 @@ fn test_prompts_not_advertised() {
         plug_core::proxy::RouterConfig {
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,

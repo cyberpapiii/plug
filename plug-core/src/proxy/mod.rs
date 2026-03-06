@@ -37,6 +37,7 @@ pub(crate) struct RouterSnapshot {
 pub struct RouterConfig {
     pub prefix_delimiter: String,
     pub priority_tools: Vec<String>,
+    pub disabled_tools: Vec<String>,
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
     pub tool_filter_enabled: bool,
@@ -49,6 +50,7 @@ impl From<&Config> for RouterConfig {
         Self {
             prefix_delimiter: config.prefix_delimiter.clone(),
             priority_tools: config.priority_tools.clone(),
+            disabled_tools: config.disabled_tools.clone(),
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
             tool_filter_enabled: config.tool_filter_enabled,
@@ -234,6 +236,10 @@ impl ToolRouter {
                 &final_name,
                 &self.config.prefix_delimiter,
             );
+
+            if is_disabled_tool(&self.config.disabled_tools, &prefixed_name) {
+                continue;
+            }
 
             routes.insert(
                 prefixed_name.clone(),
@@ -729,6 +735,53 @@ fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> std::cmp::Ord
     }
 }
 
+fn is_disabled_tool(patterns: &[String], tool_name: &str) -> bool {
+    let tool_name = tool_name.to_ascii_lowercase();
+    patterns.iter().any(|pattern| wildcard_match(&pattern.to_ascii_lowercase(), &tool_name))
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+
+    let mut remainder = text;
+    let mut first = true;
+
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+
+        if first && !pattern.starts_with('*') {
+            if !remainder.starts_with(part) {
+                return false;
+            }
+            remainder = &remainder[part.len()..];
+            first = false;
+            continue;
+        }
+
+        if index == parts.len() - 1 && !pattern.ends_with('*') {
+            return remainder.ends_with(part);
+        }
+
+        if let Some(found) = remainder.find(part) {
+            remainder = &remainder[found + part.len()..];
+            first = false;
+        } else {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Build the search_tools meta-tool definition.
 fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
@@ -882,6 +935,7 @@ mod tests {
         RouterConfig {
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             tool_filter_enabled: true,
@@ -958,6 +1012,14 @@ mod tests {
         assert_eq!(priority_sort(&a, &c, &priority), std::cmp::Ordering::Less);
         // Same priority: alphabetical
         assert_eq!(priority_sort(&b, &b, &priority), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn disabled_tool_patterns_support_exact_and_wildcard_matches() {
+        assert!(is_disabled_tool(&["slack__search_messages".into()], "Slack__search_messages"));
+        assert!(is_disabled_tool(&["slack__*".into()], "Slack__search_messages"));
+        assert!(is_disabled_tool(&["*search*".into()], "Slack__search_messages"));
+        assert!(!is_disabled_tool(&["gmail__*".into()], "Slack__search_messages"));
     }
 
     #[test]

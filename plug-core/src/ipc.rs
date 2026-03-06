@@ -52,6 +52,8 @@ pub enum IpcRequest {
 
     /// List all available tools across all servers.
     ListTools,
+    /// List live proxy client sessions connected to the daemon.
+    ListClients,
 
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
@@ -98,6 +100,7 @@ impl fmt::Debug for IpcRequest {
                 .field("client_info", client_info)
                 .finish(),
             Self::ListTools => write!(f, "ListTools"),
+            Self::ListClients => write!(f, "ListClients"),
             Self::McpRequest {
                 session_id, method, ..
             } => f
@@ -117,6 +120,13 @@ pub struct IpcToolInfo {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcClientInfo {
+    pub session_id: String,
+    pub client_info: Option<String>,
+    pub connected_secs: u64,
+}
+
 /// Responses sent from daemon → CLI over Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -130,6 +140,10 @@ pub enum IpcResponse {
     /// List of all tools available.
     Tools {
         tools: Vec<IpcToolInfo>,
+    },
+    /// List of live client sessions connected to the daemon.
+    Clients {
+        clients: Vec<IpcClientInfo>,
     },
     /// Success acknowledgement for mutating commands.
     Ok,

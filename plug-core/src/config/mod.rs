@@ -31,6 +31,9 @@ pub struct Config {
     /// Priority tools served first when filtering (tool names).
     #[serde(default)]
     pub priority_tools: Vec<String>,
+    /// Disabled tool names or wildcard patterns (e.g. "Slack__*" or "plug__search_tools").
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -54,6 +57,7 @@ impl Default for Config {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             http: HttpConfig::default(),
             daemon_grace_period_secs: 60,
             servers: HashMap::new(),
@@ -392,6 +396,7 @@ mod tests {
         assert_eq!(cfg.prefix_delimiter, "__");
         assert!(cfg.enable_prefix);
         assert_eq!(cfg.startup_concurrency, 3);
+        assert!(cfg.disabled_tools.is_empty());
         assert!(cfg.servers.is_empty());
     }
 

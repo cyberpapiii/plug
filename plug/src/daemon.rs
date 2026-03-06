@@ -107,6 +107,21 @@ impl ClientRegistry {
     fn count(&self) -> usize {
         self.sessions.len()
     }
+
+    /// Snapshot all live sessions for CLI inspection.
+    fn list(&self) -> Vec<plug_core::ipc::IpcClientInfo> {
+        let mut clients = self
+            .sessions
+            .iter()
+            .map(|entry| plug_core::ipc::IpcClientInfo {
+                session_id: entry.key().clone(),
+                client_info: entry.client_info.clone(),
+                connected_secs: entry.connected_at.elapsed().as_secs(),
+            })
+            .collect::<Vec<_>>();
+        clients.sort_by(|a, b| a.client_info.cmp(&b.client_info).then(a.session_id.cmp(&b.session_id)));
+        clients
+    }
 }
 
 // ──────────────────────────────── Path helpers ────────────────────────────────
@@ -676,6 +691,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .collect();
             IpcResponse::Tools { tools: ipc_tools }
         }
+        IpcRequest::ListClients => IpcResponse::Clients {
+            clients: ctx.client_registry.list(),
+        },
 
         IpcRequest::McpRequest {
             session_id,
