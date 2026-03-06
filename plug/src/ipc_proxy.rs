@@ -4,6 +4,8 @@
 //! all tool calls through the daemon's shared Engine via Unix socket IPC.
 //! This is what `plug connect` uses when a daemon is running.
 
+use std::path::PathBuf;
+
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
@@ -20,26 +22,27 @@ use plug_core::ipc::{self, IpcRequest, IpcResponse};
 /// A single mutex guards the entire round-trip (write + read) to prevent
 /// concurrent requests from reading each other's responses.
 pub struct IpcProxyHandler {
-    /// Guarded together to ensure request-response pairing.
-    conn: Mutex<(
-        tokio::net::unix::OwnedReadHalf,
-        tokio::net::unix::OwnedWriteHalf,
-    )>,
-    session_id: String,
+    conn: Mutex<crate::runtime::DaemonProxySession>,
+    config_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum RetryPolicy {
+    SafeToRetry,
+    UnsafeToRetry,
+}
+
+struct TransportFailure {
+    message: String,
+    reconnectable: bool,
 }
 
 impl IpcProxyHandler {
     /// Create a new proxy handler from an established IPC connection.
-    ///
-    /// The `session_id` is obtained from a prior `Register` IPC call.
-    pub fn new(
-        reader: tokio::net::unix::OwnedReadHalf,
-        writer: tokio::net::unix::OwnedWriteHalf,
-        session_id: String,
-    ) -> Self {
+    pub fn new(session: crate::runtime::DaemonProxySession, config_path: Option<PathBuf>) -> Self {
         Self {
-            conn: Mutex::new((reader, writer)),
-            session_id,
+            conn: Mutex::new(session),
+            config_path,
         }
     }
 
@@ -47,24 +50,105 @@ impl IpcProxyHandler {
     ///
     /// Holds the connection lock for the entire round-trip to ensure
     /// request-response pairing under concurrent MCP calls.
-    async fn ipc_round_trip(&self, request: &IpcRequest) -> Result<IpcResponse, McpError> {
-        let payload = serde_json::to_vec(request)
+    async fn session_round_trip<F>(
+        &self,
+        retry_policy: RetryPolicy,
+        build_request: F,
+    ) -> Result<IpcResponse, McpError>
+    where
+        F: Fn(&str) -> IpcRequest,
+    {
+        let mut conn = self.conn.lock().await;
+        let request = build_request(&conn.session_id);
+        let payload = serde_json::to_vec(&request)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let mut conn = self.conn.lock().await;
-        let (ref mut reader, ref mut writer) = *conn;
+        match Self::try_round_trip_locked(&mut conn, &payload).await {
+            Ok(response) => Ok(response),
+            Err(failure) if failure.reconnectable => {
+                tracing::warn!(error = %failure.message, "daemon IPC connection lost; reconnecting");
+                self.reconnect_locked(&mut conn).await?;
+                match retry_policy {
+                    RetryPolicy::SafeToRetry => {
+                        let rebound = build_request(&conn.session_id);
+                        let retry_payload = serde_json::to_vec(&rebound)
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        Self::try_round_trip_locked(&mut conn, &retry_payload)
+                            .await
+                            .map_err(|e| {
+                                McpError::internal_error(
+                                    format!("IPC retry failed after reconnect: {}", e.message),
+                                    None,
+                                )
+                            })
+                    }
+                    RetryPolicy::UnsafeToRetry => Err(McpError::internal_error(
+                        "REQUEST_RETRY_UNSAFE: daemon connection recovered; retry the tool call",
+                        None,
+                    )),
+                }
+            }
+            Err(failure) => Err(McpError::internal_error(failure.message, None)),
+        }
+    }
 
-        ipc::write_frame(writer, &payload)
+    async fn try_round_trip_locked(
+        conn: &mut crate::runtime::DaemonProxySession,
+        payload: &[u8],
+    ) -> Result<IpcResponse, TransportFailure> {
+        ipc::write_frame(&mut conn.writer, payload)
             .await
-            .map_err(|e| McpError::internal_error(format!("IPC write failed: {e}"), None))?;
+            .map_err(|e| Self::transport_failure("IPC write failed", e))?;
 
-        let frame = ipc::read_frame(reader)
+        let frame = ipc::read_frame(&mut conn.reader)
             .await
-            .map_err(|e| McpError::internal_error(format!("IPC read failed: {e}"), None))?
-            .ok_or_else(|| McpError::internal_error("daemon closed connection", None))?;
+            .map_err(|e| Self::transport_failure("IPC read failed", e))?
+            .ok_or_else(|| TransportFailure {
+                message: "daemon closed connection".to_string(),
+                reconnectable: true,
+            })?;
 
-        serde_json::from_slice(&frame)
-            .map_err(|e| McpError::internal_error(format!("invalid IPC response: {e}"), None))
+        serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+            message: format!("invalid IPC response: {e}"),
+            reconnectable: false,
+        })
+    }
+
+    async fn reconnect_locked(
+        &self,
+        conn: &mut crate::runtime::DaemonProxySession,
+    ) -> Result<(), McpError> {
+        let session = crate::runtime::establish_daemon_proxy_session(
+            self.config_path.as_ref(),
+            conn.client_id.clone(),
+            conn.client_info.clone(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("daemon reconnect failed: {e}"), None))?;
+        *conn = session;
+        Ok(())
+    }
+
+    fn transport_failure(context: &str, error: anyhow::Error) -> TransportFailure {
+        let reconnectable = error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        });
+
+        TransportFailure {
+            message: format!("{context}: {error}"),
+            reconnectable,
+        }
+    }
+
+    async fn remember_client_info(&self, client_info: String) {
+        self.conn.lock().await.client_info = Some(client_info);
     }
 }
 
@@ -91,13 +175,18 @@ impl ServerHandler for IpcProxyHandler {
                 client = %client_name,
                 "client connected via IPC proxy"
             );
+            self.remember_client_info(client_name.clone()).await;
 
             // Forward client info to daemon for client-type-aware tool filtering
-            let update_req = IpcRequest::UpdateSession {
-                session_id: self.session_id.clone(),
-                client_info: client_name,
-            };
-            if let Err(e) = self.ipc_round_trip(&update_req).await {
+            if let Err(e) = self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::UpdateSession {
+                        session_id: session_id.to_string(),
+                        client_info: client_name.clone(),
+                    }
+                })
+                .await
+            {
                 tracing::warn!(error = %e, "failed to update session client info");
             }
 
@@ -112,13 +201,16 @@ impl ServerHandler for IpcProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
-            let request = IpcRequest::McpRequest {
-                session_id: self.session_id.clone(),
-                method: "tools/list".to_string(),
-                params: None,
-            };
-
-            match self.ipc_round_trip(&request).await? {
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tools/list".to_string(),
+                        params: None,
+                    }
+                })
+                .await?
+            {
                 IpcResponse::McpResponse { payload } => {
                     serde_json::from_value(payload).map_err(|e| {
                         McpError::internal_error(format!("failed to parse tools/list: {e}"), None)
@@ -145,14 +237,16 @@ impl ServerHandler for IpcProxyHandler {
                 "name": request.name,
                 "arguments": request.arguments,
             });
-
-            let ipc_request = IpcRequest::McpRequest {
-                session_id: self.session_id.clone(),
-                method: "tools/call".to_string(),
-                params: Some(params),
-            };
-
-            match self.ipc_round_trip(&ipc_request).await? {
+            match self
+                .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tools/call".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
                 IpcResponse::McpResponse { payload } => {
                     // Check if this is an error response before attempting CallToolResult parse
                     if payload.get("code").is_some() {

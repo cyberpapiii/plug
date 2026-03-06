@@ -11,6 +11,8 @@ use crate::types::ServerStatus;
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+/// Current daemon/client IPC protocol version.
+pub const IPC_PROTOCOL_VERSION: u16 = 2;
 
 /// Requests sent from CLI → daemon over Unix socket.
 ///
@@ -37,6 +39,10 @@ pub enum IpcRequest {
     /// Register a new proxy client session with the daemon.
     /// Returns `Registered` with an assigned session ID.
     Register {
+        /// Daemon/client IPC protocol version.
+        protocol_version: u16,
+        /// Stable logical client identity across reconnects.
+        client_id: String,
         /// Client type from MCP initialize (e.g., "claude-code", "cursor").
         client_info: Option<String>,
     },
@@ -83,8 +89,14 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("Shutdown")
                 .field("auth_token", &"[REDACTED]")
                 .finish(),
-            Self::Register { client_info } => f
+            Self::Register {
+                protocol_version,
+                client_id,
+                client_info,
+            } => f
                 .debug_struct("Register")
+                .field("protocol_version", protocol_version)
+                .field("client_id", client_id)
                 .field("client_info", client_info)
                 .finish(),
             Self::Deregister { session_id } => f
@@ -122,6 +134,7 @@ pub struct IpcToolInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcClientInfo {
+    pub client_id: String,
     pub session_id: String,
     pub client_info: Option<String>,
     pub connected_secs: u64,
@@ -138,20 +151,20 @@ pub enum IpcResponse {
         uptime_secs: u64,
     },
     /// List of all tools available.
-    Tools {
-        tools: Vec<IpcToolInfo>,
-    },
+    Tools { tools: Vec<IpcToolInfo> },
     /// List of live client sessions connected to the daemon.
-    Clients {
-        clients: Vec<IpcClientInfo>,
-    },
+    Clients { clients: Vec<IpcClientInfo> },
     /// Success acknowledgement for mutating commands.
     Ok,
     /// Error with machine-parseable code and human-readable message.
     Error { code: String, message: String },
 
     /// Registration acknowledgement with assigned session ID.
-    Registered { session_id: String },
+    Registered {
+        protocol_version: u16,
+        client_id: String,
+        session_id: String,
+    },
 
     /// MCP JSON-RPC response from the daemon's shared Engine.
     McpResponse {
@@ -244,9 +257,15 @@ mod tests {
                 auth_token: "token".to_string(),
             },
             IpcRequest::Register {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                client_id: "client-123".to_string(),
                 client_info: Some("claude-code".to_string()),
             },
-            IpcRequest::Register { client_info: None },
+            IpcRequest::Register {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                client_id: "client-456".to_string(),
+                client_info: None,
+            },
             IpcRequest::Deregister {
                 session_id: "sess-123".to_string(),
             },
@@ -289,6 +308,8 @@ mod tests {
                 uptime_secs: 42,
             },
             IpcResponse::Registered {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                client_id: "client-123".to_string(),
                 session_id: "sess-456".to_string(),
             },
             IpcResponse::McpResponse {
@@ -320,7 +341,11 @@ mod tests {
         }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)
-        assert!(!requires_auth(&IpcRequest::Register { client_info: None }));
+        assert!(!requires_auth(&IpcRequest::Register {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            client_id: "client-123".to_string(),
+            client_info: None,
+        }));
         assert!(!requires_auth(&IpcRequest::Deregister {
             session_id: "s".to_string(),
         }));
@@ -367,5 +392,35 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(!debug_str.contains("super_secret"));
         assert!(debug_str.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn register_json_includes_protocol_and_client_identity() {
+        let req = IpcRequest::Register {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            client_id: "client-123".to_string(),
+            client_info: Some("claude-code".to_string()),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+        assert_eq!(value["type"], "Register");
+        assert_eq!(value["protocol_version"], IPC_PROTOCOL_VERSION);
+        assert_eq!(value["client_id"], "client-123");
+        assert_eq!(value["client_info"], "claude-code");
+    }
+
+    #[test]
+    fn registered_json_includes_protocol_and_client_identity() {
+        let resp = IpcResponse::Registered {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            client_id: "client-123".to_string(),
+            session_id: "sess-123".to_string(),
+        };
+
+        let value = serde_json::to_value(resp).unwrap();
+        assert_eq!(value["type"], "Registered");
+        assert_eq!(value["protocol_version"], IPC_PROTOCOL_VERSION);
+        assert_eq!(value["client_id"], "client-123");
+        assert_eq!(value["session_id"], "sess-123");
     }
 }

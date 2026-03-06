@@ -32,14 +32,21 @@ const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// period shutdown logic (avoids missed-wakeup races that `Notify` has).
 pub struct ClientRegistry {
     sessions: DashMap<String, ClientSession>,
+    client_sessions: DashMap<String, String>,
     /// Sends current client count on every change.
     count_tx: tokio::sync::watch::Sender<usize>,
 }
 
 /// Metadata for a connected proxy client.
 struct ClientSession {
+    client_id: String,
     client_info: Option<String>,
     connected_at: Instant,
+}
+
+struct RegistrationResult {
+    session_id: String,
+    replaced_session_id: Option<String>,
 }
 
 impl ClientRegistry {
@@ -48,6 +55,7 @@ impl ClientRegistry {
         (
             Self {
                 sessions: DashMap::new(),
+                client_sessions: DashMap::new(),
                 count_tx,
             },
             count_rx,
@@ -55,9 +63,16 @@ impl ClientRegistry {
     }
 
     /// Register a new client, returning the assigned session ID.
-    fn register(&self, client_info: Option<String>) -> String {
+    fn register(&self, client_id: String, client_info: Option<String>) -> RegistrationResult {
         let session_id = uuid::Uuid::new_v4().to_string();
+        let replaced_session_id = self
+            .client_sessions
+            .insert(client_id.clone(), session_id.clone());
+        if let Some(ref replaced) = replaced_session_id {
+            self.sessions.remove(replaced);
+        }
         tracing::info!(
+            client_id = %client_id,
             session_id = %session_id,
             client_info = ?client_info,
             "client registered"
@@ -65,19 +80,31 @@ impl ClientRegistry {
         self.sessions.insert(
             session_id.clone(),
             ClientSession {
+                client_id,
                 client_info,
                 connected_at: Instant::now(),
             },
         );
         self.count_tx.send_modify(|c| *c = self.sessions.len());
-        session_id
+        RegistrationResult {
+            session_id,
+            replaced_session_id,
+        }
     }
 
     /// Deregister a client session.
     fn deregister(&self, session_id: &str) {
         if let Some((_, session)) = self.sessions.remove(session_id) {
+            if self
+                .client_sessions
+                .get(&session.client_id)
+                .is_some_and(|entry| entry.value() == session_id)
+            {
+                self.client_sessions.remove(&session.client_id);
+            }
             let duration = session.connected_at.elapsed();
             tracing::info!(
+                client_id = %session.client_id,
                 session_id = %session_id,
                 duration_secs = duration.as_secs(),
                 "client deregistered"
@@ -108,18 +135,27 @@ impl ClientRegistry {
         self.sessions.len()
     }
 
+    fn session_exists(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     /// Snapshot all live sessions for CLI inspection.
     fn list(&self) -> Vec<plug_core::ipc::IpcClientInfo> {
         let mut clients = self
             .sessions
             .iter()
             .map(|entry| plug_core::ipc::IpcClientInfo {
+                client_id: entry.client_id.clone(),
                 session_id: entry.key().clone(),
                 client_info: entry.client_info.clone(),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
             })
             .collect::<Vec<_>>();
-        clients.sort_by(|a, b| a.client_info.cmp(&b.client_info).then(a.session_id.cmp(&b.session_id)));
+        clients.sort_by(|a, b| {
+            a.client_info
+                .cmp(&b.client_info)
+                .then(a.session_id.cmp(&b.session_id))
+        });
         clients
     }
 }
@@ -430,6 +466,7 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
                                 started_at,
                                 client_registry: registry,
                                 session_id: None,
+                                client_id: None,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
@@ -467,6 +504,7 @@ struct ConnectionContext {
     client_registry: Arc<ClientRegistry>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
+    client_id: Option<String>,
 }
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
@@ -530,10 +568,10 @@ async fn handle_ipc_loop(
             Ok(req) => req,
             Err(e) => {
                 tracing::debug!(error = %e, "IPC parse error");
-                let resp = IpcResponse::Error {
+                let resp = protocol_parse_error_response(&frame).unwrap_or(IpcResponse::Error {
                     code: "PARSE_ERROR".to_string(),
                     message: "invalid request format".to_string(),
-                };
+                });
                 ipc::send_response(writer, &resp).await.ok();
                 break;
             }
@@ -625,14 +663,44 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
         IpcRequest::Shutdown { .. } => IpcResponse::Ok,
 
-        IpcRequest::Register { client_info } => {
+        IpcRequest::Register {
+            protocol_version,
+            client_id,
+            client_info,
+        } => {
+            if *protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+                return IpcResponse::Error {
+                    code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
+                    message: format!(
+                        "daemon supports IPC protocol v{}, got v{}",
+                        plug_core::ipc::IPC_PROTOCOL_VERSION,
+                        protocol_version
+                    ),
+                };
+            }
             // Enforce one registration per connection — deregister previous if exists
             if let Some(ref old_session) = ctx.session_id {
                 ctx.client_registry.deregister(old_session);
             }
-            let session_id = ctx.client_registry.register(client_info.clone());
+            let registration = ctx
+                .client_registry
+                .register(client_id.clone(), client_info.clone());
+            if let Some(ref replaced_session_id) = registration.replaced_session_id {
+                tracing::info!(
+                    client_id = %client_id,
+                    replaced_session_id = %replaced_session_id,
+                    new_session_id = %registration.session_id,
+                    "client transport session replaced"
+                );
+            }
+            let session_id = registration.session_id;
+            ctx.client_id = Some(client_id.clone());
             ctx.session_id = Some(session_id.clone());
-            IpcResponse::Registered { session_id }
+            IpcResponse::Registered {
+                protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+                client_id: client_id.clone(),
+                session_id,
+            }
         }
 
         IpcRequest::Deregister { session_id } => {
@@ -643,8 +711,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session_id does not match this connection".to_string(),
                 };
             }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
             ctx.client_registry.deregister(session_id);
             ctx.session_id = None;
+            ctx.client_id = None;
             IpcResponse::Ok
         }
 
@@ -657,6 +732,12 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 return IpcResponse::Error {
                     code: "SESSION_MISMATCH".to_string(),
                     message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
                 };
             }
             if ctx
@@ -707,8 +788,32 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session_id does not match this connection".to_string(),
                 };
             }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
             dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await
         }
+    }
+}
+
+fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("Register")
+            if value.get("protocol_version").is_none() || value.get("client_id").is_none() =>
+        {
+            Some(IpcResponse::Error {
+                code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
+                message: format!(
+                    "daemon requires IPC protocol v{} registration fields",
+                    plug_core::ipc::IPC_PROTOCOL_VERSION
+                ),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1079,5 +1184,50 @@ mod tests {
             }
             _ => panic!("expected Status response"),
         }
+    }
+
+    #[test]
+    fn register_replaces_existing_session_for_same_client_id() {
+        let (registry, _count_rx) = ClientRegistry::new();
+
+        let first = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+        let second = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+
+        assert!(first.replaced_session_id.is_none());
+        assert_eq!(
+            second.replaced_session_id.as_deref(),
+            Some(first.session_id.as_str())
+        );
+        assert!(!registry.session_exists(&first.session_id));
+        assert!(registry.session_exists(&second.session_id));
+        assert_eq!(registry.count(), 1);
+    }
+
+    #[test]
+    fn deregistering_replaced_session_does_not_remove_active_replacement() {
+        let (registry, _count_rx) = ClientRegistry::new();
+
+        let first = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+        let second = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+
+        registry.deregister(&first.session_id);
+
+        assert!(registry.session_exists(&second.session_id));
+        assert_eq!(registry.count(), 1);
+    }
+
+    #[test]
+    fn parse_error_for_legacy_register_maps_to_protocol_error() {
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "type": "Register",
+            "client_info": "claude-code"
+        }))
+        .unwrap();
+
+        let response = protocol_parse_error_response(&frame).unwrap();
+        assert!(matches!(
+            response,
+            IpcResponse::Error { ref code, .. } if code == "PROTOCOL_VERSION_UNSUPPORTED"
+        ));
     }
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::OutputFormat;
@@ -24,9 +25,19 @@ pub(crate) async fn fetch_live_clients() -> (Vec<plug_core::ipc::IpcClientInfo>,
     }
 }
 
-pub(crate) async fn connect_via_daemon(
-    config_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<()> {
+pub(crate) struct DaemonProxySession {
+    pub(crate) reader: tokio::net::unix::OwnedReadHalf,
+    pub(crate) writer: tokio::net::unix::OwnedWriteHalf,
+    pub(crate) client_id: String,
+    pub(crate) client_info: Option<String>,
+    pub(crate) session_id: String,
+}
+
+pub(crate) async fn establish_daemon_proxy_session(
+    config_path: Option<&PathBuf>,
+    client_id: String,
+    client_info: Option<String>,
+) -> anyhow::Result<DaemonProxySession> {
     let stream = match daemon::connect_to_daemon().await {
         Some(stream) => stream,
         None => {
@@ -36,21 +47,87 @@ pub(crate) async fn connect_via_daemon(
     };
 
     let (mut reader, mut writer) = stream.into_split();
-    let register_req = plug_core::ipc::IpcRequest::Register { client_info: None };
+    let register_req = plug_core::ipc::IpcRequest::Register {
+        protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+        client_id: client_id.clone(),
+        client_info: client_info.clone(),
+    };
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
 
     let frame = plug_core::ipc::read_frame(&mut reader)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed"))?;
+        .ok_or_else(|| anyhow::anyhow!("daemon closed during registration"))?;
 
-    let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)?;
-    let session_id = match response {
-        plug_core::ipc::IpcResponse::Registered { session_id } => session_id,
-        _ => anyhow::bail!("registration failed"),
-    };
+    let session_id = parse_registered_session(&frame, &client_id)?;
+    Ok(DaemonProxySession {
+        reader,
+        writer,
+        client_id,
+        client_info,
+        session_id,
+    })
+}
 
-    let proxy = crate::ipc_proxy::IpcProxyHandler::new(reader, writer, session_id);
+fn parse_registered_session(frame: &[u8], expected_client_id: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(frame)
+        .map_err(|e| anyhow::anyhow!("invalid daemon registration response: {e}"))?;
+
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("Error") => {
+            let response: plug_core::ipc::IpcResponse = serde_json::from_value(value)?;
+            if let plug_core::ipc::IpcResponse::Error { code, message } = response {
+                anyhow::bail!("{code}: {message}");
+            }
+            unreachable!("validated Error response")
+        }
+        Some("Registered") => {
+            let protocol_version = value
+                .get("protocol_version")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "daemon/client protocol mismatch: restart plug connect after upgrading"
+                    )
+                })?;
+            if protocol_version != u64::from(plug_core::ipc::IPC_PROTOCOL_VERSION) {
+                anyhow::bail!(
+                    "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{}",
+                    plug_core::ipc::IPC_PROTOCOL_VERSION
+                );
+            }
+
+            let response_client_id = value
+                .get("client_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "daemon/client protocol mismatch: restart plug connect after upgrading"
+                    )
+                })?;
+            if response_client_id != expected_client_id {
+                anyhow::bail!(
+                    "daemon/client registration mismatch: expected client_id {expected_client_id}, got {response_client_id}"
+                );
+            }
+
+            value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("registration failed: missing session_id"))
+        }
+        Some(other) => anyhow::bail!("registration failed: unexpected response type {other}"),
+        None => anyhow::bail!("registration failed: malformed response"),
+    }
+}
+
+pub(crate) async fn connect_via_daemon(
+    config_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let session = establish_daemon_proxy_session(config_path, client_id, None).await?;
+    let proxy = crate::ipc_proxy::IpcProxyHandler::new(session, config_path.cloned());
     use rmcp::ServiceExt as _;
     let transport = rmcp::transport::io::stdio();
     let service = proxy
