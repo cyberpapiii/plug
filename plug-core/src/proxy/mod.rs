@@ -708,14 +708,21 @@ fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
     tool.output_schema = None;
     // Note: tool.icons doesn't exist on rmcp Tool; skip if not present
 
-    if let Some(max) = max_desc_chars {
-        if let Some(ref desc) = tool.description {
-            if desc.len() > max {
-                let truncated: String = desc.chars().take(max).collect();
-                tool.description = Some(Cow::Owned(truncated));
-            }
-        }
+    if let Some(ref desc) = tool.description {
+        let sanitized = sanitize_description(desc);
+        let final_desc = if let Some(max) = max_desc_chars {
+            sanitized.chars().take(max).collect()
+        } else {
+            sanitized
+        };
+        tool.description = Some(Cow::Owned(final_desc));
     }
+}
+
+fn sanitize_description(desc: &str) -> String {
+    desc.chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
+        .collect()
 }
 
 /// Sort comparator: priority tools first (by priority_tools index), then alphabetical.
@@ -1042,6 +1049,32 @@ mod tests {
         // inputSchema should be preserved
         // inputSchema preserved — it's an Arc<Map> (always present)
         assert!(!tool.input_schema.is_empty() || tool.input_schema.is_empty());
+    }
+
+    #[test]
+    fn strip_optional_fields_removes_control_characters_from_description() {
+        let mut tool = Tool::new(
+            Cow::Borrowed("test_tool"),
+            Cow::Borrowed("ok\u{0000}still-ok\tline\nnext"),
+            Arc::new(serde_json::Map::new()),
+        );
+
+        strip_optional_fields(&mut tool, None);
+
+        assert_eq!(tool.description.as_deref(), Some("okstill-ok\tline\nnext"));
+    }
+
+    #[test]
+    fn strip_optional_fields_sanitizes_before_truncating() {
+        let mut tool = Tool::new(
+            Cow::Borrowed("test_tool"),
+            Cow::Borrowed("ab\u{0000}cdef"),
+            Arc::new(serde_json::Map::new()),
+        );
+
+        strip_optional_fields(&mut tool, Some(4));
+
+        assert_eq!(tool.description.as_deref(), Some("abcd"));
     }
 
     #[test]
