@@ -244,19 +244,6 @@ fn print_warning_line(message: impl std::fmt::Display) {
     println!("{} {}", style("!").yellow().bold(), message);
 }
 
-fn print_action_legend(title: &str, actions: &[(&str, &str)]) {
-    println!();
-    print_heading(title);
-    for (label, description) in actions {
-        println!(
-            "  {} {:<18} {}",
-            style("›").cyan().bold(),
-            style(*label).cyan(),
-            style(*description).dim()
-        );
-    }
-}
-
 fn can_prompt_interactively() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
@@ -1055,17 +1042,7 @@ async fn cmd_server_list(
         if !interactive {
             break;
         }
-        print_action_legend(
-            "Actions",
-            &[
-                ("Add server", "Create a new upstream definition"),
-                ("Edit server", "Adjust a configured server"),
-                ("Remove server", "Delete a server definition"),
-                ("Enable server", "Turn a server back on"),
-                ("Disable server", "Hide a server from the tool surface"),
-                ("Done", "Exit this management view"),
-            ],
-        );
+        println!();
         if !prompt_server_actions(config_path, output).await? {
             break;
         }
@@ -1160,14 +1137,7 @@ async fn cmd_client_list(
         if !interactive {
             break;
         }
-        print_action_legend(
-            "Actions",
-            &[
-                ("Link clients", "Add plug to one or more client configs"),
-                ("Unlink clients", "Remove plug from selected client configs"),
-                ("Done", "Exit this management view"),
-            ],
-        );
+        println!();
         if !prompt_client_actions()? {
             break;
         }
@@ -1374,15 +1344,7 @@ async fn cmd_tool_list(
         if !interactive {
             break;
         }
-        print_action_legend(
-            "Actions",
-            &[
-                ("Disable tools", "Hide individual tools or a server group"),
-                ("Enable tools", "Restore disabled tool patterns"),
-                ("Show disabled", "Inspect the current disabled list"),
-                ("Done", "Exit this management view"),
-            ],
-        );
+        println!();
         if !prompt_tool_actions(config_path).await? {
             break;
         }
@@ -1494,7 +1456,7 @@ async fn prompt_server_actions(
 async fn prompt_tool_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<bool> {
     use dialoguer::Select;
 
-    let options = ["Done", "Disable tools", "Enable tools", "Show disabled patterns"];
+    let options = ["Done", "Disable tools", "Enable tools", "Show disabled"];
     let selection = Select::with_theme(&cli_prompt_theme())
         .with_prompt("Choose action")
         .items(options)
