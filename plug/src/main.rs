@@ -514,10 +514,14 @@ enum ServerCommands {
 enum ToolCommands {
     /// Disable tools by exact name or wildcard pattern
     Disable {
+        #[arg(long)]
+        server: Option<String>,
         patterns: Vec<String>,
     },
     /// Re-enable disabled tool patterns
     Enable {
+        #[arg(long)]
+        server: Option<String>,
         patterns: Vec<String>,
     },
     /// Show disabled tool patterns
@@ -1311,9 +1315,26 @@ async fn cmd_tool_command(
     match command {
         None => cmd_tool_list(config_path, output, verbose, None).await,
         Some(ToolCommands::Disabled) => cmd_tool_disabled(config_path, output),
-        Some(ToolCommands::Disable { patterns }) => cmd_tool_disable(config_path, patterns).await,
-        Some(ToolCommands::Enable { patterns }) => cmd_tool_enable(config_path, patterns),
+        Some(ToolCommands::Disable { server, patterns }) => {
+            cmd_tool_disable(config_path, tool_patterns_for_server(server, patterns)?).await
+        }
+        Some(ToolCommands::Enable { server, patterns }) => {
+            cmd_tool_enable(config_path, tool_patterns_for_server(server, patterns)?)
+        }
     }
+}
+
+fn tool_patterns_for_server(
+    server: Option<String>,
+    mut patterns: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    if let Some(server) = server {
+        if !patterns.is_empty() {
+            anyhow::bail!("pass either patterns or `--server`, not both");
+        }
+        patterns.push(format!("{server}__*"));
+    }
+    Ok(patterns)
 }
 
 fn prompt_client_actions() -> anyhow::Result<bool> {
