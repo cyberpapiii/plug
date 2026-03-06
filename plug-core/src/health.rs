@@ -71,6 +71,22 @@ pub fn spawn_health_checks(
                         break;
                     }
                     _ = tick.tick() => {
+                        let missing_upstream = mgr.get_upstream(&name).is_none();
+                        let startup_failed = mgr
+                            .health
+                            .get(&name)
+                            .is_some_and(|entry| entry.health == ServerHealth::Failed);
+
+                        if missing_upstream && startup_failed {
+                            let engine = engine.clone();
+                            let name = name.clone();
+                            let cancel = cancel.clone();
+                            tracker_clone.spawn(async move {
+                                spawn_proactive_recovery(&engine, &name, cancel).await;
+                            });
+                            continue;
+                        }
+
                         let result = health_check_server(&mgr, &name).await;
                         if let Some((old, new)) = result {
                             tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");

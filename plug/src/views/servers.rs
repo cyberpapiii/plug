@@ -93,7 +93,13 @@ pub(crate) async fn cmd_server_list(
                         print_banner(
                             "◆",
                             "Servers",
-                            &format!("{} server(s) active", servers.len().saturating_sub(1)),
+                            &format!(
+                                "{} server(s) active",
+                                servers
+                                    .iter()
+                                    .filter(|server| server.server_id != "__plug_internal__")
+                                    .count()
+                            ),
                         );
                         if started {
                             println!();
