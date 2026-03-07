@@ -1077,6 +1077,9 @@ impl ToolRouter {
                 list_changed: Some(false),
             });
         }
+        if upstream_caps.iter().any(|caps| caps.completions.is_some()) {
+            capabilities.completions = Some(serde_json::Map::new());
+        }
 
         capabilities
     }
@@ -1212,6 +1215,60 @@ impl ToolRouter {
             .client
             .peer()
             .get_prompt(request)
+            .await
+            .map_err(|error| match error {
+                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                other => McpError::internal_error(other.to_string(), None),
+            })
+    }
+
+    /// Forward a `completion/complete` request to the correct upstream server
+    /// based on the reference type (prompt name or resource URI).
+    pub async fn complete_request(
+        &self,
+        params: CompleteRequestParams,
+    ) -> Result<CompleteResult, McpError> {
+        let server_id = match &params.r#ref {
+            Reference::Prompt(prompt_ref) => {
+                let snapshot = self.cache.load();
+                let (sid, _) = snapshot
+                    .prompt_routes
+                    .get(&prompt_ref.name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        McpError::from(ProtocolError::InvalidRequest {
+                            detail: format!("prompt not found: {}", prompt_ref.name),
+                        })
+                    })?;
+                sid
+            }
+            Reference::Resource(resource_ref) => {
+                let snapshot = self.cache.load();
+                snapshot
+                    .resource_routes
+                    .get(&resource_ref.uri)
+                    .cloned()
+                    .ok_or_else(|| {
+                        McpError::from(ProtocolError::InvalidRequest {
+                            detail: format!("resource not found: {}", resource_ref.uri),
+                        })
+                    })?
+            }
+        };
+
+        let upstream = self
+            .server_manager
+            .get_upstream(&server_id)
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            })?;
+
+        upstream
+            .client
+            .peer()
+            .complete(params)
             .await
             .map_err(|error| match error {
                 rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
@@ -2315,6 +2372,14 @@ impl ServerHandler for ProxyHandler {
                 .await
         }
     }
+
+    fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        async move { self.router.complete_request(request).await }
+    }
 }
 
 #[cfg(test)]
@@ -2929,5 +2994,33 @@ mod tests {
             "file:///other",
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn synthesized_capabilities_no_completions_without_upstream() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let caps = router.synthesized_capabilities();
+        assert!(caps.completions.is_none());
+    }
+
+    #[test]
+    fn complete_request_params_serde_roundtrip() {
+        let params = CompleteRequestParams::new(
+            Reference::for_prompt("test-prompt"),
+            ArgumentInfo {
+                name: "arg1".to_string(),
+                value: "partial".to_string(),
+            },
+        );
+
+        let json = serde_json::to_value(&params).unwrap();
+        let deserialized: CompleteRequestParams = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.argument.name, "arg1");
+        assert_eq!(deserialized.argument.value, "partial");
+        match &deserialized.r#ref {
+            Reference::Prompt(p) => assert_eq!(p.name, "test-prompt"),
+            other => panic!("expected Prompt reference, got {other:?}"),
+        }
     }
 }
