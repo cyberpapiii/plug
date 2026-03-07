@@ -1226,12 +1226,12 @@ impl ToolRouter {
     /// based on the reference type (prompt name or resource URI).
     pub async fn complete_request(
         &self,
-        params: CompleteRequestParams,
+        mut params: CompleteRequestParams,
     ) -> Result<CompleteResult, McpError> {
+        let snapshot = self.cache.load();
         let server_id = match &params.r#ref {
             Reference::Prompt(prompt_ref) => {
-                let snapshot = self.cache.load();
-                let (sid, _) = snapshot
+                let (sid, original_name) = snapshot
                     .prompt_routes
                     .get(&prompt_ref.name)
                     .cloned()
@@ -1240,21 +1240,21 @@ impl ToolRouter {
                             detail: format!("prompt not found: {}", prompt_ref.name),
                         })
                     })?;
+                // Rewrite ref to use the original upstream prompt name
+                params.r#ref = Reference::for_prompt(original_name);
                 sid
             }
-            Reference::Resource(resource_ref) => {
-                let snapshot = self.cache.load();
-                snapshot
-                    .resource_routes
-                    .get(&resource_ref.uri)
-                    .cloned()
-                    .ok_or_else(|| {
-                        McpError::from(ProtocolError::InvalidRequest {
-                            detail: format!("resource not found: {}", resource_ref.uri),
-                        })
-                    })?
-            }
+            Reference::Resource(resource_ref) => snapshot
+                .resource_routes
+                .get(&resource_ref.uri)
+                .cloned()
+                .ok_or_else(|| {
+                    McpError::from(ProtocolError::InvalidRequest {
+                        detail: format!("resource not found: {}", resource_ref.uri),
+                    })
+                })?,
         };
+        drop(snapshot);
 
         let upstream = self
             .server_manager
