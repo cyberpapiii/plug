@@ -9,7 +9,10 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Tool};
+use rmcp::model::{
+    CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Prompt, Resource,
+    ResourceTemplate, ServerCapabilities, Tool,
+};
 use rmcp::ServiceExt as _;
 use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
@@ -99,6 +102,7 @@ pub struct UpstreamServer {
     pub config: ServerConfig,
     pub(crate) client: McpClient,
     pub(crate) tools: Arc<ArcSwap<Vec<rmcp::model::Tool>>>,
+    pub capabilities: ServerCapabilities,
     pub health: ServerHealth,
 }
 
@@ -306,11 +310,18 @@ impl ServerManager {
                         );
                     }
 
+                    let capabilities = client
+                        .peer()
+                        .peer_info()
+                        .map(|info| info.capabilities.clone())
+                        .unwrap_or_default();
+
                     Ok(UpstreamServer {
                         name: name.to_string(),
                         config: config.clone(),
                         client,
                         tools,
+                        capabilities,
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -379,11 +390,18 @@ impl ServerManager {
                         );
                     }
 
+                    let capabilities = client
+                        .peer()
+                        .peer_info()
+                        .map(|info| info.capabilities.clone())
+                        .unwrap_or_default();
+
                     Ok(UpstreamServer {
                         name: name.to_string(),
                         config: config.clone(),
                         client,
                         tools,
+                        capabilities,
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -426,6 +444,107 @@ impl ServerManager {
             }
         }
         result
+    }
+
+    pub async fn get_resources(&self) -> Vec<(String, Resource)> {
+        let servers = self.servers.load();
+        let mut result = Vec::new();
+        for (server_name, upstream) in servers.iter() {
+            let health_ok = self
+                .health
+                .get(server_name)
+                .map(|h| h.health != ServerHealth::Failed)
+                .unwrap_or(true);
+            if !health_ok {
+                continue;
+            }
+            if upstream.capabilities.resources.is_none() {
+                continue;
+            }
+            match upstream.client.peer().list_all_resources().await {
+                Ok(resources) => {
+                    for resource in resources {
+                        result.push((server_name.clone(), resource));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(server = %server_name, error = %error, "failed to list resources");
+                }
+            }
+        }
+        result
+    }
+
+    pub async fn get_resource_templates(&self) -> Vec<(String, ResourceTemplate)> {
+        let servers = self.servers.load();
+        let mut result = Vec::new();
+        for (server_name, upstream) in servers.iter() {
+            let health_ok = self
+                .health
+                .get(server_name)
+                .map(|h| h.health != ServerHealth::Failed)
+                .unwrap_or(true);
+            if !health_ok {
+                continue;
+            }
+            if upstream.capabilities.resources.is_none() {
+                continue;
+            }
+            match upstream.client.peer().list_all_resource_templates().await {
+                Ok(resource_templates) => {
+                    for template in resource_templates {
+                        result.push((server_name.clone(), template));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(server = %server_name, error = %error, "failed to list resource templates");
+                }
+            }
+        }
+        result
+    }
+
+    pub async fn get_prompts(&self) -> Vec<(String, Prompt)> {
+        let servers = self.servers.load();
+        let mut result = Vec::new();
+        for (server_name, upstream) in servers.iter() {
+            let health_ok = self
+                .health
+                .get(server_name)
+                .map(|h| h.health != ServerHealth::Failed)
+                .unwrap_or(true);
+            if !health_ok {
+                continue;
+            }
+            if upstream.capabilities.prompts.is_none() {
+                continue;
+            }
+            match upstream.client.peer().list_all_prompts().await {
+                Ok(prompts) => {
+                    for prompt in prompts {
+                        result.push((server_name.clone(), prompt));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(server = %server_name, error = %error, "failed to list prompts");
+                }
+            }
+        }
+        result
+    }
+
+    pub fn healthy_capabilities(&self) -> Vec<ServerCapabilities> {
+        let servers = self.servers.load();
+        servers
+            .iter()
+            .filter(|(server_name, _)| {
+                self.health
+                    .get(*server_name)
+                    .map(|h| h.health != ServerHealth::Failed)
+                    .unwrap_or(true)
+            })
+            .map(|(_, upstream)| upstream.capabilities.clone())
+            .collect()
     }
 
     /// Get a reference to a specific upstream server by name.
@@ -660,9 +779,12 @@ mod tests {
     use crate::proxy::{ProxyHandler, RouterConfig};
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::{
-        CallToolRequest, CallToolRequestParams, CallToolResult, Content, ListToolsResult, Meta,
-        NumberOrString, ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerInfo,
-        Tool,
+        AnnotateAble,
+        CallToolRequest, CallToolRequestParams, CallToolResult, Content, GetPromptResult,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, Meta,
+        NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
+        PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceResult,
+        ResourceContents, ServerCapabilities, ServerInfo, Tool,
     };
     use rmcp::model::RequestParamsMeta;
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
@@ -874,6 +996,86 @@ mod tests {
         }
     }
 
+    struct CatalogServer;
+
+    impl ServerHandler for CatalogServer {
+        fn get_info(&self) -> ServerInfo {
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.resources = Some(rmcp::model::ResourcesCapability {
+                subscribe: None,
+                list_changed: Some(false),
+            });
+            capabilities.prompts = Some(rmcp::model::PromptsCapability {
+                list_changed: Some(false),
+            });
+            capabilities.tools = Some(rmcp::model::ToolsCapability {
+                list_changed: Some(true),
+            });
+            ServerInfo::new(capabilities)
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ListToolsResult::with_all_items(vec![make_tool("echo")])))
+        }
+
+        fn list_resources(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
+                RawResource::new("memory://notes", "notes").no_annotation(),
+            ])))
+        }
+
+        fn list_resource_templates(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
+                RawResourceTemplate::new("memory://notes/{id}", "notes_template").no_annotation(),
+            ])))
+        }
+
+        fn read_resource(
+            &self,
+            request: rmcp::model::ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ReadResourceResult::new(vec![
+                ResourceContents::text("hello", request.uri),
+            ])))
+        }
+
+        fn list_prompts(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListPromptsResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+                "summarize",
+                Some("Summarize text"),
+                None,
+            )])))
+        }
+
+        fn get_prompt(
+            &self,
+            request: rmcp::model::GetPromptRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<GetPromptResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(GetPromptResult::new(vec![PromptMessage::new(
+                PromptMessageRole::User,
+                PromptMessageContent::text(format!("prompt: {}", request.name)),
+            )])))
+        }
+    }
+
     #[test]
     fn ssrf_allows_loopback() {
         // Loopback is allowed — user-configured local servers are legitimate
@@ -1000,6 +1202,7 @@ mod tests {
                 config: test_server_config(),
                 client,
                 tools,
+                capabilities: ServerCapabilities::default(),
                 health: ServerHealth::Healthy,
             },
         );
@@ -1091,6 +1294,7 @@ mod tests {
                 config: test_server_config(),
                 client,
                 tools,
+                capabilities: ServerCapabilities::default(),
                 health: ServerHealth::Healthy,
             },
         );
@@ -1177,5 +1381,77 @@ mod tests {
             .clone()
             .expect("upstream cancellation captured");
         assert_eq!(router.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn router_refreshes_resources_and_prompts_and_routes_reads() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = CatalogServer
+                .serve(server_transport)
+                .await
+                .expect("start catalog server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("catalog"),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(&router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect catalog upstream");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        let capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+        tools.store(Arc::new(initial_tools));
+
+        server_manager.replace_server(
+            "catalog",
+            UpstreamServer {
+                name: "catalog".to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                capabilities,
+                health: ServerHealth::Healthy,
+            },
+        );
+
+        router.refresh_tools().await;
+
+        assert_eq!(router.list_resources().len(), 1);
+        assert_eq!(router.list_resource_templates().len(), 1);
+        assert_eq!(router.list_prompts().len(), 1);
+
+        let capabilities = router.synthesized_capabilities();
+        assert!(capabilities.resources.is_some());
+        assert!(capabilities.prompts.is_some());
+
+        let read = router
+            .read_resource("memory://notes")
+            .await
+            .expect("read resource");
+        assert_eq!(read.contents.len(), 1);
+
+        let prompt_name = router.list_prompts()[0].name.clone();
+        let prompt = router
+            .get_prompt(prompt_name.as_str(), None)
+            .await
+            .expect("get prompt");
+        assert_eq!(prompt.messages.len(), 1);
     }
 }

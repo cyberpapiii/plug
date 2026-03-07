@@ -40,7 +40,7 @@ async fn test_proxy_handler_refresh_tools_empty() {
 
     // Verify the handler still works (get_info returns valid info)
     let info = handler.get_info();
-    assert!(info.capabilities.tools.is_some());
+    assert!(info.capabilities.tools.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -66,11 +66,7 @@ fn test_proxy_handler_get_info() {
 
     assert_eq!(info.server_info.name, "plug");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-    assert!(info.capabilities.tools.is_some());
-    assert_eq!(
-        info.capabilities.tools.as_ref().unwrap().list_changed,
-        Some(true)
-    );
+    assert!(info.capabilities.tools.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +106,8 @@ fn test_resources_capability_present() {
     let info = handler.get_info();
 
     assert!(
-        info.capabilities.resources.is_some(),
-        "resources capability should be advertised"
+        info.capabilities.resources.is_none(),
+        "resources capability should be omitted until upstream support exists"
     );
 }
 

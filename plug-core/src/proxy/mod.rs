@@ -34,6 +34,16 @@ pub(crate) struct RouterSnapshot {
     pub tools_copilot: Arc<Vec<Tool>>,
     /// Tool name → (server name, original tool name) routing table.
     pub routes: HashMap<String, (String, String)>,
+    /// Routed resources for downstream list responses.
+    pub resources_all: Arc<Vec<Resource>>,
+    /// Routed resource templates for downstream list responses.
+    pub resource_templates_all: Arc<Vec<ResourceTemplate>>,
+    /// Routed prompts for downstream list responses.
+    pub prompts_all: Arc<Vec<Prompt>>,
+    /// Canonical resource URI → upstream server.
+    pub resource_routes: HashMap<String, String>,
+    /// Routed prompt name → (server name, original prompt name).
+    pub prompt_routes: HashMap<String, (String, String)>,
 }
 
 /// Configuration for token efficiency and tool filtering.
@@ -176,6 +186,11 @@ impl ToolRouter {
                 tools_all: Arc::new(Vec::new()),
                 tools_windsurf: Arc::new(Vec::new()),
                 tools_copilot: Arc::new(Vec::new()),
+                resources_all: Arc::new(Vec::new()),
+                resource_templates_all: Arc::new(Vec::new()),
+                prompts_all: Arc::new(Vec::new()),
+                resource_routes: HashMap::new(),
+                prompt_routes: HashMap::new(),
             })),
             config,
             event_tx: None,
@@ -478,6 +493,9 @@ impl ToolRouter {
     /// swapped atomically to prevent torn reads.
     pub async fn refresh_tools(&self) {
         let upstream_tools = self.server_manager.get_tools().await;
+        let upstream_resources = self.server_manager.get_resources().await;
+        let upstream_resource_templates = self.server_manager.get_resource_templates().await;
+        let upstream_prompts = self.server_manager.get_prompts().await;
 
         // ── Pass 1: classify, sanitize, and try keyword stripping ──
         // Each entry: (server_name, tool, prefix, stripped_name, full_name, matched_keyword)
@@ -669,6 +687,69 @@ impl ToolRouter {
         let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect());
         let tools_all = Arc::new(tools);
 
+        let mut resource_routes = HashMap::new();
+        let mut resources_vec = Vec::new();
+        for (server_name, mut resource) in upstream_resources {
+            resource_routes
+                .entry(resource.uri.clone())
+                .or_insert_with(|| server_name.clone());
+
+            let prefix = crate::tool_naming::format_server_prefix(&server_name);
+            let original_name = resource.name.clone();
+            let routed_name = crate::tool_naming::build_wire_name(
+                &prefix,
+                &original_name,
+                &self.config.prefix_delimiter,
+            );
+            if resource.title.is_none() {
+                resource.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
+            }
+            resource.name = routed_name;
+            resources_vec.push(resource);
+        }
+        resources_vec.sort_by(|a, b| a.name.cmp(&b.name));
+        let resources_all = Arc::new(resources_vec);
+
+        let mut resource_templates_vec = Vec::new();
+        for (server_name, mut template) in upstream_resource_templates {
+            let prefix = crate::tool_naming::format_server_prefix(&server_name);
+            let original_name = template.name.clone();
+            let routed_name = crate::tool_naming::build_wire_name(
+                &prefix,
+                &original_name,
+                &self.config.prefix_delimiter,
+            );
+            if template.title.is_none() {
+                template.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
+            }
+            template.name = routed_name;
+            resource_templates_vec.push(template);
+        }
+        resource_templates_vec.sort_by(|a, b| a.name.cmp(&b.name));
+        let resource_templates_all = Arc::new(resource_templates_vec);
+
+        let mut prompt_routes = HashMap::new();
+        let mut prompts_vec = Vec::new();
+        for (server_name, mut prompt) in upstream_prompts {
+            let prefix = crate::tool_naming::format_server_prefix(&server_name);
+            let original_name = prompt.name.clone();
+            let routed_name = crate::tool_naming::build_wire_name(
+                &prefix,
+                &original_name,
+                &self.config.prefix_delimiter,
+            );
+            prompt_routes
+                .entry(routed_name.clone())
+                .or_insert_with(|| (server_name.clone(), original_name.clone()));
+            if prompt.title.is_none() {
+                prompt.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
+            }
+            prompt.name = routed_name;
+            prompts_vec.push(prompt);
+        }
+        prompts_vec.sort_by(|a, b| a.name.cmp(&b.name));
+        let prompts_all = Arc::new(prompts_vec);
+
         let tool_count = tools_all.len();
 
         self.cache.store(Arc::new(RouterSnapshot {
@@ -676,6 +757,11 @@ impl ToolRouter {
             tools_all,
             tools_windsurf,
             tools_copilot,
+            resources_all,
+            resource_templates_all,
+            prompts_all,
+            resource_routes,
+            prompt_routes,
         }));
 
         if let Some(ref tx) = self.event_tx {
@@ -686,6 +772,30 @@ impl ToolRouter {
     /// Get the current list of tools (zero-copy via Arc). Returns all tools.
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
         Arc::clone(&self.cache.load().tools_all)
+    }
+
+    pub fn list_tools_page_for_client(
+        &self,
+        client_type: ClientType,
+        request: Option<PaginatedRequestParams>,
+    ) -> ListToolsResult {
+        const PAGE_SIZE: usize = 100;
+
+        let tools = self.list_tools_for_client(client_type);
+        let start = request
+            .as_ref()
+            .and_then(|params| params.cursor.as_ref())
+            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .filter(|idx| *idx < tools.len())
+            .unwrap_or(0);
+        let end = usize::min(start + PAGE_SIZE, tools.len());
+        let next_cursor = (end < tools.len()).then(|| end.to_string());
+
+        ListToolsResult {
+            meta: None,
+            next_cursor,
+            tools: tools[start..end].to_vec(),
+        }
     }
 
     /// List all tools with their source server IDs.
@@ -710,6 +820,30 @@ impl ToolRouter {
         self.cache.load().tools_all.len()
     }
 
+    pub fn synthesized_capabilities(&self) -> ServerCapabilities {
+        let upstream_caps = self.server_manager.healthy_capabilities();
+        let mut capabilities = ServerCapabilities::default();
+
+        if !self.list_tools().is_empty() || upstream_caps.iter().any(|caps| caps.tools.is_some()) {
+            capabilities.tools = Some(ToolsCapability {
+                list_changed: Some(true),
+            });
+        }
+        if upstream_caps.iter().any(|caps| caps.resources.is_some()) {
+            capabilities.resources = Some(ResourcesCapability {
+                subscribe: None,
+                list_changed: Some(false),
+            });
+        }
+        if upstream_caps.iter().any(|caps| caps.prompts.is_some()) {
+            capabilities.prompts = Some(PromptsCapability {
+                list_changed: Some(false),
+            });
+        }
+
+        capabilities
+    }
+
     /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
     pub fn list_tools_for_client(&self, client_type: ClientType) -> Arc<Vec<Tool>> {
         if !self.config.tool_filter_enabled {
@@ -721,6 +855,85 @@ impl ToolRouter {
             ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),
             _ => Arc::clone(&snapshot.tools_all),
         }
+    }
+
+    pub fn list_resources(&self) -> Arc<Vec<Resource>> {
+        Arc::clone(&self.cache.load().resources_all)
+    }
+
+    pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
+        Arc::clone(&self.cache.load().resource_templates_all)
+    }
+
+    pub fn list_prompts(&self) -> Arc<Vec<Prompt>> {
+        Arc::clone(&self.cache.load().prompts_all)
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+        let snapshot = self.cache.load();
+        let server_id = snapshot
+            .resource_routes
+            .get(uri)
+            .cloned()
+            .ok_or_else(|| McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("resource not found: {uri}"),
+            }))?;
+        drop(snapshot);
+
+        let upstream = self
+            .server_manager
+            .get_upstream(&server_id)
+            .ok_or_else(|| McpError::from(ProtocolError::ServerUnavailable {
+                server_id: server_id.clone(),
+            }))?;
+
+        upstream
+            .client
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .map_err(|error| match error {
+                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                other => McpError::internal_error(other.to_string(), None),
+            })
+    }
+
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<GetPromptResult, McpError> {
+        let snapshot = self.cache.load();
+        let (server_id, prompt_name) = snapshot
+            .prompt_routes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("prompt not found: {name}"),
+            }))?;
+        drop(snapshot);
+
+        let upstream = self
+            .server_manager
+            .get_upstream(&server_id)
+            .ok_or_else(|| McpError::from(ProtocolError::ServerUnavailable {
+                server_id: server_id.clone(),
+            }))?;
+
+        let mut request = GetPromptRequestParams::new(prompt_name);
+        if let Some(arguments) = arguments {
+            request = request.with_arguments(arguments);
+        }
+
+        upstream
+            .client
+            .peer()
+            .get_prompt(request)
+            .await
+            .map_err(|error| match error {
+                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                other => McpError::internal_error(other.to_string(), None),
+            })
     }
 
     /// Call a tool by its prefixed name, routing to the correct upstream server.
@@ -1297,16 +1510,7 @@ impl ProxyHandler {
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for ProxyHandler {
     fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::default();
-        capabilities.tools = Some(ToolsCapability {
-            list_changed: Some(true),
-        });
-        capabilities.resources = Some(ResourcesCapability {
-            list_changed: Some(false),
-            subscribe: None,
-        });
-
-        InitializeResult::new(capabilities)
+        InitializeResult::new(self.router.synthesized_capabilities())
             .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
     }
 
@@ -1386,7 +1590,7 @@ impl ServerHandler for ProxyHandler {
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
@@ -1395,8 +1599,7 @@ impl ServerHandler for ProxyHandler {
                 .read()
                 .map(|ct| *ct)
                 .unwrap_or(ClientType::Unknown);
-            let tools = self.router.list_tools_for_client(ct);
-            Ok(ListToolsResult::with_all_items((*tools).clone()))
+            Ok(self.router.list_tools_page_for_client(ct, request))
         }
     }
 
@@ -1442,7 +1645,27 @@ impl ServerHandler for ProxyHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListResourcesResult::default()))
+        async move { Ok(ListResourcesResult::with_all_items((*self.router.list_resources()).clone())) }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        async move {
+            Ok(ListResourceTemplatesResult::with_all_items(
+                (*self.router.list_resource_templates()).clone(),
+            ))
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        async move { self.router.read_resource(&request.uri).await }
     }
 
     fn list_prompts(
@@ -1450,7 +1673,15 @@ impl ServerHandler for ProxyHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListPromptsResult::default()))
+        async move { Ok(ListPromptsResult::with_all_items((*self.router.list_prompts()).clone())) }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+        async move { self.router.get_prompt(&request.name, request.arguments).await }
     }
 }
 
@@ -1478,12 +1709,8 @@ mod tests {
 
         assert_eq!(info.server_info.name, "plug");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-        assert!(info.capabilities.tools.is_some());
-        assert_eq!(
-            info.capabilities.tools.as_ref().unwrap().list_changed,
-            Some(true)
-        );
-        assert!(info.capabilities.resources.is_some());
+        assert!(info.capabilities.tools.is_none());
+        assert!(info.capabilities.resources.is_none());
     }
 
     #[tokio::test]
@@ -1634,6 +1861,11 @@ mod tests {
             tools_all,
             tools_windsurf,
             tools_copilot,
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
         }));
 
         assert_eq!(
@@ -1696,6 +1928,11 @@ mod tests {
             tools_all: Arc::new(tools),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
         }));
 
         // Search by name
@@ -1781,6 +2018,11 @@ mod tests {
             tools_all: Arc::new(Vec::new()),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
         }));
 
         let snapshot = router.cache.load();
@@ -1820,6 +2062,11 @@ mod tests {
             tools_all: Arc::new(Vec::new()),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
         }));
 
         let call = router.call_tool("Busy__tool", None);
@@ -1832,6 +2079,42 @@ mod tests {
             err.message.contains("server overloaded"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn list_tools_page_for_client_uses_cursor_pagination() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let tools: Vec<Tool> = (0..150)
+            .map(|index| {
+                Tool::new(
+                    Cow::Owned(format!("tool_{index}")),
+                    Cow::Borrowed("desc"),
+                    Arc::new(serde_json::Map::new()),
+                )
+            })
+            .collect();
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes: HashMap::new(),
+            tools_windsurf: Arc::new(tools.iter().take(100).cloned().collect()),
+            tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
+            tools_all: Arc::new(tools),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+        }));
+
+        let first = router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
+        assert_eq!(first.tools.len(), 100);
+        assert_eq!(first.next_cursor.as_deref(), Some("100"));
+
+        let mut second_request = PaginatedRequestParams::default();
+        second_request.cursor = first.next_cursor;
+        let second = router.list_tools_page_for_client(ClientType::Unknown, Some(second_request));
+        assert_eq!(second.tools.len(), 50);
+        assert!(second.next_cursor.is_none());
     }
 
     #[tokio::test]
