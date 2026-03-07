@@ -309,6 +309,9 @@ async fn delete_mcp(
             session_id: Arc::from(session_id.as_str()),
         };
         state.router.cleanup_subscriptions_for_target(&target).await;
+        // Clean up per-client log level to prevent stale entries from
+        // keeping the effective level permanently at a permissive value.
+        state.router.remove_client_log_level(&session_id);
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {

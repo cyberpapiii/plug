@@ -313,19 +313,28 @@ impl ToolRouter {
         self.effective_log_level.store(Arc::new(effective));
     }
 
-    /// Forward the current effective log level to all healthy upstream servers.
+    /// Forward the current effective log level to all healthy upstream servers concurrently.
     pub async fn forward_set_level_to_upstreams(&self) {
         let level = self.log_level();
         let params = SetLevelRequestParams::new(level);
-        for (name, upstream) in self.server_manager.healthy_upstreams() {
-            if let Err(error) = upstream.client.peer().set_level(params.clone()).await {
-                tracing::warn!(
-                    server = %name,
-                    error = %error,
-                    "failed to forward setLevel to upstream"
-                );
-            }
-        }
+        let upstreams = self.server_manager.healthy_upstreams();
+        let futures: Vec<_> = upstreams
+            .into_iter()
+            .filter(|(_, upstream)| upstream.capabilities.logging.is_some())
+            .map(|(name, upstream)| {
+                let params = params.clone();
+                async move {
+                    if let Err(error) = upstream.client.peer().set_level(params).await {
+                        tracing::warn!(
+                            server = %name,
+                            error = %error,
+                            "failed to forward setLevel to upstream"
+                        );
+                    }
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
     }
 
     pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {

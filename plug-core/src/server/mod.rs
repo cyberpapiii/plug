@@ -220,12 +220,11 @@ impl ServerManager {
                             "server started"
                         );
 
-                        // Apply current effective log level to new server
-                        if let Some(router) = self.tool_router().upgrade() {
-                            let level = router.log_level();
-                            if ToolRouter::level_severity(level)
-                                < ToolRouter::level_severity(LoggingLevel::Warning)
-                            {
+                        // Apply current effective log level to new server so all
+                        // upstreams converge to the same level regardless of start order.
+                        if upstream.capabilities.logging.is_some() {
+                            if let Some(router) = self.tool_router().upgrade() {
+                                let level = router.log_level();
                                 let params = SetLevelRequestParams::new(level);
                                 if let Err(e) =
                                     upstream.client.peer().set_level(params).await
