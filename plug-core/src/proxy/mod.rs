@@ -1794,16 +1794,12 @@ fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Strip optional fields from a tool for token efficiency.
+/// Sanitize and optionally truncate tool descriptions for token efficiency.
 ///
-/// Removes `outputSchema`. Keeps `title` (human-friendly display name) and
-/// `annotations` (readOnlyHint, etc. — useful for client parallelization).
+/// Preserves `outputSchema` (structured output), `title` (human-friendly
+/// display name), and `annotations` (readOnlyHint, etc.).
 /// `inputSchema` is REQUIRED per MCP spec (ADR-003) — never stripped.
 fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
-    // Keep title (human-friendly display name) and annotations (readOnlyHint etc.)
-    tool.output_schema = None;
-    // Note: tool.icons doesn't exist on rmcp Tool; skip if not present
-
     if let Some(ref desc) = tool.description {
         let sanitized = sanitize_description(desc);
         let final_desc = if let Some(max) = max_desc_chars {
@@ -2426,7 +2422,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_optional_fields_removes_fields() {
+    fn strip_optional_fields_preserves_schema_and_truncates_description() {
         let mut tool = Tool::new(
             Cow::Borrowed("test_tool"),
             Cow::Borrowed("A long description that should be truncated if configured"),
@@ -2434,17 +2430,17 @@ mod tests {
         );
         tool.title = Some("Title".to_string());
         tool.annotations = Some(ToolAnnotations::default());
+        tool.output_schema = Some(Arc::new(serde_json::Map::new()));
 
         strip_optional_fields(&mut tool, Some(10));
 
-        assert!(tool.title.is_some()); // title is now preserved
-        assert!(tool.annotations.is_some()); // annotations are now preserved
-        assert!(tool.output_schema.is_none());
-        // Description should be truncated to 10 chars
+        assert!(tool.title.is_some());
+        assert!(tool.annotations.is_some());
+        assert!(
+            tool.output_schema.is_some(),
+            "outputSchema must be preserved"
+        );
         assert_eq!(tool.description.as_deref(), Some("A long des"));
-        // inputSchema should be preserved
-        // inputSchema preserved — it's an Arc<Map> (always present)
-        assert!(!tool.input_schema.is_empty() || tool.input_schema.is_empty());
     }
 
     #[test]
