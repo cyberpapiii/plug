@@ -89,11 +89,6 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     );
     note_restart_required(
         &mut restart_required,
-        old.enable_prefix != new.enable_prefix,
-        "enable_prefix changed",
-    );
-    note_restart_required(
-        &mut restart_required,
         old.tool_filter_enabled != new.tool_filter_enabled,
         "tool_filter_enabled changed",
     );

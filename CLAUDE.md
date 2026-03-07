@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-`plug` is a daemon-backed MCP multiplexer written in Rust. It sits between AI clients and MCP servers so one local config and one shared runtime can serve many clients without duplicated server processes or duplicated setup.
+`plug` is a daemon-capable MCP multiplexer written in Rust. It sits between AI clients and MCP servers so one local config can serve many clients without duplicated setup. Local stdio clients normally share the daemon runtime; `plug serve` starts its own engine for downstream HTTP access unless you explicitly run daemon mode.
 
 Current product surface:
 

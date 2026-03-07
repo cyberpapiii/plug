@@ -7,12 +7,12 @@
 - `plug connect` for downstream stdio clients
 - `plug serve` for downstream Streamable HTTP clients
 
-Both front doors use the same shared `Engine` from `plug-core`. In normal use, `plug connect` prefers the background daemon and falls back to standalone mode if the daemon is unavailable.
+Both front doors use the same `Engine` type from `plug-core`, but not always the same live instance. In normal use, `plug connect` prefers the background daemon and falls back to standalone mode if the daemon is unavailable. `plug serve` starts its own engine unless you run daemon mode explicitly.
 
 ```text
 Downstream clients
   Claude Code / Cursor / Codex / Zed  ->  plug connect  -> daemon or standalone engine
-  Gemini / remote HTTP clients        ->  plug serve    -> shared engine
+  Gemini / remote HTTP clients        ->  plug serve    -> dedicated engine instance
 
 Shared engine
   Engine
@@ -94,7 +94,7 @@ The daemon currently proxies tool operations through IPC. It does not yet proxy 
 - stdio child processes
 - Streamable HTTP client transport
 
-Legacy SSE is not part of the active `v0.1` product story.
+Legacy SSE is not part of the active `v0.1` server story, although some client export formats still use legacy transport labels such as `type: sse` for compatibility.
 
 ## Configuration
 

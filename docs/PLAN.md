@@ -17,11 +17,11 @@ That means:
 
 Tracked in:
 
-- `docs/plans/2026-03-06-v0-1-stabilization-execution-plan.md`
+- `docs/plans/2026-03-06-strategic-assessment.md`
 - `todos/029-complete-p1-serve-stdio-flag-honesty.md`
 - `todos/030-complete-p1-make-prefix-behavior-explicit-for-v0-1.md`
-- `todos/031-ready-p1-rewrite-core-docs-for-v0-1.md`
-- `todos/032-ready-p1-final-v0-1-verification-and-release-boundary.md`
+- `todos/031-complete-p1-rewrite-core-docs-for-v0-1.md`
+- `todos/032-complete-p1-final-v0-1-verification-and-release-boundary.md`
 
 ## Completed Stabilization Work
 
@@ -30,6 +30,7 @@ Tracked in:
 - made runtime and daemon behavior more truthful
 - made reload semantics explicit for `v0.1`
 - made serve/prefix behavior explicit in the command/config surface
+- completed the `v0.1` verification and release boundary
 
 ## Deferred Until After v0.1
 
