@@ -13,7 +13,7 @@ use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Prompt, Resource,
-    ResourceTemplate, ServerCapabilities, Tool,
+    ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities, Tool,
 };
 use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
@@ -91,6 +91,19 @@ impl ClientHandler for UpstreamClientHandler {
         async move {
             if let Some(router) = router.upgrade() {
                 router.route_upstream_cancelled(server_id.as_ref(), params);
+            }
+        }
+    }
+
+    fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        async move {
+            if let Some(router) = router.upgrade() {
+                router.route_upstream_resource_updated(params);
             }
         }
     }
