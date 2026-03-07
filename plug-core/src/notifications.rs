@@ -33,15 +33,19 @@ impl ProtocolNotification {
     /// Convert the internal notification to a server-to-client JSON-RPC message.
     pub fn to_server_jsonrpc_message(&self) -> ServerJsonRpcMessage {
         match self {
-            ProtocolNotification::ToolListChanged => ServerJsonRpcMessage::notification(
-                ServerNotification::ToolListChangedNotification(ToolListChangedNotification::default()),
-            ),
+            ProtocolNotification::ToolListChanged => {
+                ServerJsonRpcMessage::notification(ServerNotification::ToolListChangedNotification(
+                    ToolListChangedNotification::default(),
+                ))
+            }
             ProtocolNotification::Progress { params, .. } => ServerJsonRpcMessage::notification(
                 ServerNotification::ProgressNotification(ProgressNotification::new(params.clone())),
             ),
-            ProtocolNotification::Cancelled { params, .. } => ServerJsonRpcMessage::notification(
-                ServerNotification::CancelledNotification(CancelledNotification::new(params.clone())),
-            ),
+            ProtocolNotification::Cancelled { params, .. } => {
+                ServerJsonRpcMessage::notification(ServerNotification::CancelledNotification(
+                    CancelledNotification::new(params.clone()),
+                ))
+            }
         }
     }
 

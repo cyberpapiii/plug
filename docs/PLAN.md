@@ -24,7 +24,7 @@ old `v0.1` plan:
 The current product shape is:
 
 - `plug connect` for stdio downstream clients
-- `plug serve` for Streamable HTTP downstream clients
+- `plug serve` for Streamable HTTP downstream clients, with optional HTTPS via configured cert/key paths
 - shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
 - daemon-backed local sharing with reconnecting IPC proxy sessions
 - targeted notification fan-out to stdio and HTTP

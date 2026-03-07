@@ -18,6 +18,7 @@ pub mod proxy;
 pub mod reload;
 pub mod server;
 pub mod session;
+pub mod tls;
 pub mod tool_naming;
 pub mod types;
 pub mod watcher;

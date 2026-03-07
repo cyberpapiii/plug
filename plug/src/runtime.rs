@@ -1,9 +1,12 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::OutputFormat;
 use crate::daemon;
 use crate::ui::{print_banner, print_info_line, print_success_line};
+use axum::Router;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -298,9 +301,251 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
     });
     let router = plug_core::http::server::build_router(http_state);
-    let addr = format!("{}:{}", config.http.bind_address, config.http.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("serving on http://{addr}");
-    axum::serve(listener, router).await?;
+    serve_router(router, &config.http, engine.cancel_token().clone()).await?;
     Ok(())
+}
+
+async fn serve_router(
+    router: Router,
+    http: &plug_core::config::HttpConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("{}:{}", http.bind_address, http.port).parse()?;
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        cancel.cancelled().await;
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    });
+
+    if let (Some(cert_path), Some(key_path)) = (&http.tls_cert_path, &http.tls_key_path) {
+        plug_core::tls::ensure_rustls_provider_installed();
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
+        println!("serving on https://{addr}");
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(router.into_make_service())
+            .await?;
+    } else {
+        println!("serving on http://{addr}");
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(router.into_make_service())
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use rcgen::generate_simple_self_signed;
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, RootCertStore};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+
+    async fn spawn_https_test_server(
+        router: Router,
+    ) -> anyhow::Result<(
+        SocketAddr,
+        CancellationToken,
+        rustls::pki_types::CertificateDer<'static>,
+    )> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+
+        let cert = generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
+        let cert_der = cert.cert.der().clone();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+
+        let temp = std::env::temp_dir().join(format!(
+            "plug-https-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&temp)?;
+        let cert_path = temp.join("cert.pem");
+        let key_path = temp.join("key.pem");
+        std::fs::write(&cert_path, &cert_pem)?;
+        std::fs::write(&key_path, &key_pem)?;
+
+        let cancel = CancellationToken::new();
+        let http = plug_core::config::HttpConfig {
+            bind_address: "127.0.0.1".to_string(),
+            port: addr.port(),
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            session_timeout_secs: 1800,
+            max_sessions: 100,
+            sse_channel_capacity: 32,
+        };
+
+        tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let _ = serve_router(router, &http, cancel).await;
+            }
+        });
+
+        Ok((addr, cancel, cert_der))
+    }
+
+    async fn send_https_request(
+        addr: SocketAddr,
+        cert_der: rustls::pki_types::CertificateDer<'static>,
+        request: String,
+    ) -> String {
+        let mut tls = connect_https_stream(addr, cert_der).await;
+        tls.write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        String::from_utf8(response).expect("utf8 response")
+    }
+
+    async fn connect_https_stream(
+        addr: SocketAddr,
+        cert_der: rustls::pki_types::CertificateDer<'static>,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        plug_core::tls::ensure_rustls_provider_installed();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("add test cert to roots");
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to https server");
+        let server_name = ServerName::try_from("localhost").expect("valid server name");
+        connector
+            .connect(server_name, tcp)
+            .await
+            .expect("complete tls handshake")
+    }
+
+    #[tokio::test]
+    async fn serve_router_supports_https() {
+        let engine = Arc::new(plug_core::engine::Engine::new(
+            plug_core::config::Config::default(),
+        ));
+        engine.start().await.expect("engine start");
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        sessions.spawn_cleanup_task(engine.cancel_token().clone());
+        let state = Arc::new(plug_core::http::server::HttpState {
+            router: engine.tool_router().clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            sse_channel_capacity: 32,
+            notification_task_started: AtomicBool::new(false),
+        });
+        let router = plug_core::http::server::build_router(state);
+
+        let (addr, cancel, cert_der) = spawn_https_test_server(router)
+            .await
+            .expect("start https test server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let initialize_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "https-test", "version": "1.0"}
+            }
+        })
+        .to_string();
+        let initialize_request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            initialize_body.len(),
+            initialize_body
+        );
+        let initialize_response =
+            send_https_request(addr, cert_der.clone(), initialize_request).await;
+        assert!(
+            initialize_response.contains("200 OK"),
+            "unexpected initialize response: {initialize_response}"
+        );
+        assert!(
+            initialize_response
+                .to_ascii_lowercase()
+                .contains("mcp-session-id:"),
+            "missing session id header: {initialize_response}"
+        );
+        assert!(
+            initialize_response.contains("\"serverInfo\""),
+            "missing initialize payload: {initialize_response}"
+        );
+
+        let session_header = initialize_response
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("mcp-session-id:"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_string())
+            .expect("session id header");
+
+        let list_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })
+        .to_string();
+        let list_request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nMcp-Session-Id: {}\r\nMCP-Protocol-Version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            session_header,
+            list_body.len(),
+            list_body
+        );
+        let list_response = send_https_request(addr, cert_der.clone(), list_request).await;
+        assert!(
+            list_response.contains("200 OK"),
+            "unexpected tools/list response: {list_response}"
+        );
+        assert!(
+            list_response.contains("\"tools\""),
+            "missing tools payload: {list_response}"
+        );
+
+        let mut sse = connect_https_stream(addr, cert_der).await;
+        let sse_request = format!(
+            "GET /mcp HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nMcp-Session-Id: {}\r\nConnection: close\r\n\r\n",
+            session_header
+        );
+        sse.write_all(sse_request.as_bytes())
+            .await
+            .expect("write sse request");
+        let mut buf = vec![0_u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), sse.read(&mut buf))
+            .await
+            .expect("sse read timeout")
+            .expect("read sse bytes");
+        let sse_response = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            sse_response.contains("200 OK"),
+            "unexpected sse response: {sse_response}"
+        );
+        assert!(
+            sse_response.contains("text/event-stream"),
+            "missing sse content type: {sse_response}"
+        );
+        assert!(
+            sse_response.contains("id: 0"),
+            "missing sse priming event: {sse_response}"
+        );
+
+        cancel.cancel();
+        engine.shutdown().await;
+    }
 }

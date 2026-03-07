@@ -20,6 +20,7 @@ uuid.workspace = true
 directories.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+rustls.workspace = true
 
 # HTTP Server (Phase 2)
 axum.workspace = true

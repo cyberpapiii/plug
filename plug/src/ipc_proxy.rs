@@ -358,6 +358,7 @@ impl ServerHandler for IpcProxyHandler {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
@@ -372,6 +373,30 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
+    fn ensure_mock_server_built() -> PathBuf {
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("plug crate should live under workspace root");
+            let status = std::process::Command::new("cargo")
+                .current_dir(workspace_root)
+                .args([
+                    "build",
+                    "--quiet",
+                    "-p",
+                    "plug-test-harness",
+                    "--bin",
+                    "mock-mcp-server",
+                ])
+                .status()
+                .expect("build mock-mcp-server");
+            assert!(status.success(), "mock-mcp-server build failed");
+            plug_test_harness::mock_server_path()
+        })
+        .clone()
+    }
+
     #[derive(Clone)]
     struct TestClient;
 
@@ -382,19 +407,10 @@ mod tests {
     }
 
     fn mock_server_config() -> ServerConfig {
+        let mock_server = ensure_mock_server_built();
         ServerConfig {
-            command: Some("cargo".to_string()),
-            args: vec![
-                "run".to_string(),
-                "--quiet".to_string(),
-                "-p".to_string(),
-                "plug-test-harness".to_string(),
-                "--bin".to_string(),
-                "mock-mcp-server".to_string(),
-                "--".to_string(),
-                "--tools".to_string(),
-                "echo".to_string(),
-            ],
+            command: Some(mock_server.display().to_string()),
+            args: vec!["--tools".to_string(), "echo".to_string()],
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
@@ -424,16 +440,19 @@ mod tests {
             let result = handle.await.expect("daemon task join");
             panic!("daemon exited before readiness: {result:?}");
         }
-        tokio::time::timeout(Duration::from_secs(5), crate::runtime::wait_for_daemon_ready())
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "daemon ready timeout (socket path: {}, task_finished: {})",
-                    crate::daemon::socket_path().display(),
-                    handle.is_finished()
-                )
-            })
-            .expect("daemon ready");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::runtime::wait_for_daemon_ready(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "daemon ready timeout (socket path: {}, task_finished: {})",
+                crate::daemon::socket_path().display(),
+                handle.is_finished()
+            )
+        })
+        .expect("daemon ready");
         (engine, handle)
     }
 
@@ -441,7 +460,10 @@ mod tests {
     async fn daemon_backed_proxy_recovers_after_daemon_restart() {
         let _guard = daemon_test_lock().lock().await;
 
-        let temp = std::env::temp_dir().join(format!("pdc-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        let temp = std::env::temp_dir().join(format!(
+            "pdc-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
         let runtime_root = temp.join("r");
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
@@ -453,8 +475,11 @@ mod tests {
         config
             .servers
             .insert("mock".to_string(), mock_server_config());
-        std::fs::write(&config_path, toml::to_string(&config).expect("serialize config"))
-            .expect("write config");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
 
         let (engine_a, daemon_a) = spawn_test_daemon(config.clone(), config_path.clone()).await;
 
@@ -488,10 +513,11 @@ mod tests {
 
         let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let _initial_tools = loop {
-            let tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
-                .await
-                .expect("initial tools timeout")
-                .expect("initial tools");
+            let tools =
+                tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
+                    .await
+                    .expect("initial tools timeout")
+                    .expect("initial tools");
             if tools.iter().any(|tool| tool.name == "Mock__echo") {
                 break tools;
             }
@@ -505,7 +531,10 @@ mod tests {
             Duration::from_secs(5),
             client.call_tool(
                 CallToolRequestParams::new("Mock__echo").with_arguments(
-                    serde_json::json!({"input": "before"}).as_object().unwrap().clone(),
+                    serde_json::json!({"input": "before"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 ),
             ),
         )
@@ -548,10 +577,11 @@ mod tests {
             }
         }
 
-        let repaired_tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
-            .await
-            .expect("tools after reconnect timeout")
-            .expect("tools after reconnect");
+        let repaired_tools =
+            tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
+                .await
+                .expect("tools after reconnect timeout")
+                .expect("tools after reconnect");
         assert!(
             repaired_tools.iter().any(|tool| tool.name == "Mock__echo"),
             "expected repaired proxy to expose Mock__echo"

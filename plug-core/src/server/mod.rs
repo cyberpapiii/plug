@@ -9,12 +9,12 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::future::join_all;
+use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Prompt, Resource,
     ResourceTemplate, ServerCapabilities, Tool,
 };
-use rmcp::ServiceExt as _;
 use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -25,8 +25,7 @@ use crate::config::{Config, ServerConfig, TransportType};
 use crate::proxy::ToolRouter;
 use crate::types::{HealthState, ServerHealth, ServerStatus};
 
-type McpClient =
-    rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
+type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 
 pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
@@ -327,6 +326,8 @@ impl ServerManager {
                     })
                 }
                 TransportType::Http => {
+                    crate::tls::ensure_rustls_provider_installed();
+
                     let url = config
                         .url
                         .as_deref()
@@ -463,10 +464,14 @@ impl ServerManager {
             .collect();
         targets.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let results = join_all(targets.into_iter().map(|(server_name, upstream)| async move {
-            let resources = upstream.client.peer().list_all_resources().await;
-            (server_name, resources)
-        }))
+        let results = join_all(
+            targets
+                .into_iter()
+                .map(|(server_name, upstream)| async move {
+                    let resources = upstream.client.peer().list_all_resources().await;
+                    (server_name, resources)
+                }),
+        )
         .await;
 
         let mut collected = Vec::new();
@@ -501,10 +506,14 @@ impl ServerManager {
             .collect();
         targets.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let results = join_all(targets.into_iter().map(|(server_name, upstream)| async move {
-            let templates = upstream.client.peer().list_all_resource_templates().await;
-            (server_name, templates)
-        }))
+        let results = join_all(
+            targets
+                .into_iter()
+                .map(|(server_name, upstream)| async move {
+                    let templates = upstream.client.peer().list_all_resource_templates().await;
+                    (server_name, templates)
+                }),
+        )
         .await;
 
         let mut collected = Vec::new();
@@ -539,10 +548,14 @@ impl ServerManager {
             .collect();
         targets.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let results = join_all(targets.into_iter().map(|(server_name, upstream)| async move {
-            let prompts = upstream.client.peer().list_all_prompts().await;
-            (server_name, prompts)
-        }))
+        let results = join_all(
+            targets
+                .into_iter()
+                .map(|(server_name, upstream)| async move {
+                    let prompts = upstream.client.peer().list_all_prompts().await;
+                    (server_name, prompts)
+                }),
+        )
         .await;
 
         let mut collected = Vec::new();
@@ -798,23 +811,22 @@ fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
     use rmcp::handler::server::ServerHandler;
-    use rmcp::model::{
-        AnnotateAble,
-        CallToolRequest, CallToolRequestParams, CallToolResult, Content, GetPromptResult,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, Meta,
-        NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
-        PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceResult,
-        ResourceContents, ServerCapabilities, ServerInfo, Tool,
-    };
     use rmcp::model::RequestParamsMeta;
+    use rmcp::model::{
+        AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, Content,
+        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        ListToolsResult, Meta, NumberOrString, ProgressNotificationParam, ProgressToken, Prompt,
+        PromptMessage, PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
+        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
+    };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
     use tokio::sync::{Notify, watch};
@@ -999,7 +1011,9 @@ mod tests {
             async move {
                 let _ = request.progress_token();
                 cancel_signal.notified().await;
-                Ok(CallToolResult::success(vec![Content::text("cancelled upstream")]))
+                Ok(CallToolResult::success(vec![Content::text(
+                    "cancelled upstream",
+                )]))
             }
         }
 
@@ -1063,7 +1077,8 @@ mod tests {
             &self,
             _request: Option<rmcp::model::PaginatedRequestParams>,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
+        {
             std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
                 RawResource::new("memory://notes", "notes").no_annotation(),
             ])))
@@ -1073,7 +1088,8 @@ mod tests {
             &self,
             _request: Option<rmcp::model::PaginatedRequestParams>,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + Send + '_
+        {
             std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
                 RawResourceTemplate::new("memory://notes/{id}", "notes_template").no_annotation(),
             ])))
@@ -1084,9 +1100,10 @@ mod tests {
             request: rmcp::model::ReadResourceRequestParams,
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
-            std::future::ready(Ok(ReadResourceResult::new(vec![
-                ResourceContents::text("hello", request.uri),
-            ])))
+            std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "hello",
+                request.uri,
+            )])))
         }
 
         fn list_prompts(
@@ -1214,8 +1231,14 @@ mod tests {
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         tokio::spawn(async move {
-            let handler = MutableToolServerHandler { tools_rx, peer: upstream_peer };
-            let server = handler.serve(server_transport).await.expect("start upstream test server");
+            let handler = MutableToolServerHandler {
+                tools_rx,
+                peer: upstream_peer,
+            };
+            let server = handler
+                .serve(server_transport)
+                .await
+                .expect("start upstream test server");
             let _ = server.waiting().await;
         });
 
@@ -1296,7 +1319,10 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let mut config = test_router_config();
         config.meta_tool_mode = true;
-        let router = Arc::new(crate::proxy::ToolRouter::new(server_manager.clone(), config));
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            config,
+        ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
         let (upstream_server, tools_rx) =
@@ -1360,7 +1386,10 @@ mod tests {
         .await
         .expect("connect downstream client");
 
-        let visible_tools = downstream_client.list_all_tools().await.expect("list tools");
+        let visible_tools = downstream_client
+            .list_all_tools()
+            .await
+            .expect("list tools");
         let visible_names = visible_tools
             .iter()
             .map(|tool| tool.name.to_string())
@@ -1390,7 +1419,10 @@ mod tests {
             .expect("invoke hidden tool");
 
         let rendered = format!("{result:?}");
-        assert!(rendered.contains("called echo"), "unexpected invoke result: {rendered}");
+        assert!(
+            rendered.contains("called echo"),
+            "unexpected invoke result: {rendered}"
+        );
         assert_eq!(router.active_call_count(), 0);
     }
 
@@ -1467,7 +1499,8 @@ mod tests {
             .expect("tool exists")
             .name
             .to_string();
-        let progress_token = ProgressToken(NumberOrString::String(Arc::from("downstream-progress")));
+        let progress_token =
+            ProgressToken(NumberOrString::String(Arc::from("downstream-progress")));
         let mut params = CallToolRequestParams::new(prefixed_tool_name);
         params.set_progress_token(progress_token.clone());
 
@@ -1483,13 +1516,15 @@ mod tests {
             .expect("start downstream call");
         let downstream_request_id = handle.id.clone();
 
-        router.publish_protocol_notification(crate::notifications::ProtocolNotification::Progress {
-            target: crate::notifications::NotificationTarget::Stdio {
-                client_id: proxy_client_id,
+        router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::Progress {
+                target: crate::notifications::NotificationTarget::Stdio {
+                    client_id: proxy_client_id,
+                },
+                params: ProgressNotificationParam::new(progress_token.clone(), 0.5)
+                    .with_message("halfway"),
             },
-            params: ProgressNotificationParam::new(progress_token.clone(), 0.5)
-                .with_message("halfway"),
-        });
+        );
 
         tokio::time::timeout(Duration::from_secs(5), progress_signal.notified())
             .await

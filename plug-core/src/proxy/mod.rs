@@ -1,16 +1,16 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::*;
 use rmcp::model::RequestParamsMeta;
+use rmcp::model::*;
 use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, RoleServer};
 use tokio::sync::broadcast;
 
@@ -229,7 +229,8 @@ impl ToolRouter {
     }
 
     pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
-        self.notification_refresh_pending.store(true, Ordering::SeqCst);
+        self.notification_refresh_pending
+            .store(true, Ordering::SeqCst);
 
         if self
             .notification_refresh_in_progress
@@ -309,12 +310,7 @@ impl ToolRouter {
         self.active_calls.insert(call_id, record);
     }
 
-    fn attach_upstream_request_id(
-        &self,
-        call_id: u64,
-        server_id: &str,
-        request_id: RequestId,
-    ) {
+    fn attach_upstream_request_id(&self, call_id: u64, server_id: &str, request_id: RequestId) {
         if let Some(mut entry) = self.active_calls.get_mut(&call_id) {
             entry.upstream_request_id = Some(request_id.clone());
         }
@@ -387,10 +383,10 @@ impl ToolRouter {
 
         let peer = upstream.client.peer().clone();
         tokio::spawn(async move {
-            if let Err(error) = peer.notify_cancelled(CancelledNotificationParam {
-                request_id,
-                reason,
-            }).await {
+            if let Err(error) = peer
+                .notify_cancelled(CancelledNotificationParam { request_id, reason })
+                .await
+            {
                 tracing::warn!(error = %error, "failed to forward downstream cancellation upstream");
             }
         });
@@ -704,7 +700,11 @@ impl ToolRouter {
             );
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(EngineEvent::ToolDefinitionDriftDetected {
-                    tool_names: drifted_tools.iter().cloned().map(Arc::<str>::from).collect(),
+                    tool_names: drifted_tools
+                        .iter()
+                        .cloned()
+                        .map(Arc::<str>::from)
+                        .collect(),
                 });
             }
         }
@@ -824,10 +824,12 @@ impl ToolRouter {
         request: Option<PaginatedRequestParams>,
     ) -> ListToolsResult {
         let tools = self.list_tools_for_client(client_type);
-        paginated_result((*tools).clone(), request, |tools, next_cursor| ListToolsResult {
-            meta: None,
-            next_cursor,
-            tools,
+        paginated_result((*tools).clone(), request, |tools, next_cursor| {
+            ListToolsResult {
+                meta: None,
+                next_cursor,
+                tools,
+            }
         })
     }
 
@@ -904,13 +906,15 @@ impl ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
     ) -> ListResourcesResult {
-        paginated_result((*self.list_resources()).clone(), request, |resources, next_cursor| {
-            ListResourcesResult {
+        paginated_result(
+            (*self.list_resources()).clone(),
+            request,
+            |resources, next_cursor| ListResourcesResult {
                 meta: None,
                 next_cursor,
                 resources,
-            }
-        })
+            },
+        )
     }
 
     pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
@@ -937,32 +941,34 @@ impl ToolRouter {
     }
 
     pub fn list_prompts_page(&self, request: Option<PaginatedRequestParams>) -> ListPromptsResult {
-        paginated_result((*self.list_prompts()).clone(), request, |prompts, next_cursor| {
-            ListPromptsResult {
+        paginated_result(
+            (*self.list_prompts()).clone(),
+            request,
+            |prompts, next_cursor| ListPromptsResult {
                 meta: None,
                 next_cursor,
                 prompts,
-            }
-        })
+            },
+        )
     }
 
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let snapshot = self.cache.load();
-        let server_id = snapshot
-            .resource_routes
-            .get(uri)
-            .cloned()
-            .ok_or_else(|| McpError::from(ProtocolError::InvalidRequest {
+        let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
+            McpError::from(ProtocolError::InvalidRequest {
                 detail: format!("resource not found: {uri}"),
-            }))?;
+            })
+        })?;
         drop(snapshot);
 
         let upstream = self
             .server_manager
             .get_upstream(&server_id)
-            .ok_or_else(|| McpError::from(ProtocolError::ServerUnavailable {
-                server_id: server_id.clone(),
-            }))?;
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            })?;
 
         upstream
             .client
@@ -981,21 +987,22 @@ impl ToolRouter {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<GetPromptResult, McpError> {
         let snapshot = self.cache.load();
-        let (server_id, prompt_name) = snapshot
-            .prompt_routes
-            .get(name)
-            .cloned()
-            .ok_or_else(|| McpError::from(ProtocolError::InvalidRequest {
-                detail: format!("prompt not found: {name}"),
-            }))?;
+        let (server_id, prompt_name) =
+            snapshot.prompt_routes.get(name).cloned().ok_or_else(|| {
+                McpError::from(ProtocolError::InvalidRequest {
+                    detail: format!("prompt not found: {name}"),
+                })
+            })?;
         drop(snapshot);
 
         let upstream = self
             .server_manager
             .get_upstream(&server_id)
-            .ok_or_else(|| McpError::from(ProtocolError::ServerUnavailable {
-                server_id: server_id.clone(),
-            }))?;
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            })?;
 
         let mut request = GetPromptRequestParams::new(prompt_name);
         if let Some(arguments) = arguments {
@@ -1022,7 +1029,8 @@ impl ToolRouter {
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_with_context(tool_name, arguments, None, None).await
+        self.call_tool_with_context(tool_name, arguments, None, None)
+            .await
     }
 
     pub async fn call_tool_with_context(
@@ -1122,17 +1130,17 @@ impl ToolRouter {
             let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
                 Some(
                     tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned())
-                    .await
-                    .map_err(|_| {
-                        McpError::from(ProtocolError::ServerBusy {
-                            server_id: server_id.clone(),
-                        })
-                    })?
-                    .map_err(|_| {
-                        McpError::from(ProtocolError::ServerUnavailable {
-                            server_id: server_id.clone(),
-                        })
-                    })?,
+                        .await
+                        .map_err(|_| {
+                            McpError::from(ProtocolError::ServerBusy {
+                                server_id: server_id.clone(),
+                            })
+                        })?
+                        .map_err(|_| {
+                            McpError::from(ProtocolError::ServerUnavailable {
+                                server_id: server_id.clone(),
+                            })
+                        })?,
                 )
             } else {
                 None
@@ -1166,7 +1174,9 @@ impl ToolRouter {
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
             let options = PeerRequestOptions {
                 timeout: Some(timeout_duration),
-                meta: downstream_progress_token.clone().map(Meta::with_progress_token),
+                meta: downstream_progress_token
+                    .clone()
+                    .map(Meta::with_progress_token),
             };
 
             let call_id = next_call_id();
@@ -1349,7 +1359,10 @@ impl ToolRouter {
 
         let mut lines = vec![format!("Servers ({})", statuses.len())];
         for status in statuses {
-            let tool_count = tool_counts.get(status.server_id.as_str()).copied().unwrap_or(0);
+            let tool_count = tool_counts
+                .get(status.server_id.as_str())
+                .copied()
+                .unwrap_or(0);
             lines.push(format!(
                 "- {} (health: {:?}, tools: {})",
                 status.server_id, status.health, tool_count
@@ -1421,7 +1434,9 @@ impl ToolRouter {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
     }
 
     /// Handle the `plug__search_tools` meta-tool call.
@@ -2000,7 +2015,11 @@ impl ServerHandler for ProxyHandler {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
-        async move { self.router.get_prompt(&request.name, request.arguments).await }
+        async move {
+            self.router
+                .get_prompt(&request.name, request.arguments)
+                .await
+        }
     }
 }
 
@@ -2507,7 +2526,8 @@ mod tests {
             tool_definition_fingerprints: HashMap::new(),
         }));
 
-        let first = router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
+        let first =
+            router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
         assert_eq!(first.tools.len(), 100);
         assert_eq!(first.next_cursor.as_deref(), Some("100"));
 
@@ -2540,8 +2560,7 @@ mod tests {
 
         router.route_upstream_progress(
             "upstream",
-            ProgressNotificationParam::new(progress_token.clone(), 0.5)
-                .with_message("halfway"),
+            ProgressNotificationParam::new(progress_token.clone(), 0.5).with_message("halfway"),
         );
 
         let notification = tokio::time::timeout(Duration::from_secs(1), rx.recv())

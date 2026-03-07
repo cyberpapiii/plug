@@ -5,14 +5,14 @@
 `plug` is a single Rust binary with two active downstream front doors:
 
 - `plug connect` for stdio clients
-- `plug serve` for Streamable HTTP clients
+- `plug serve` for Streamable HTTP clients, with optional HTTPS termination for remote use
 
 Both paths run on the same core runtime model:
 
 ```text
 Downstream clients
   stdio clients              -> plug connect -> daemon-backed or standalone proxy
-  HTTP / remote clients      -> plug serve   -> HTTP server + shared engine
+  HTTP / remote clients      -> plug serve   -> HTTP/HTTPS server + shared engine
 
 Core runtime
   Engine
@@ -84,7 +84,7 @@ Current downstream support includes:
 - pagination
 - meta-tool mode
 
-This applies across stdio and HTTP, with transport-specific details only at the edge.
+This applies across stdio and HTTP/HTTPS, with transport-specific details only at the edge.
 
 ## Session Model
 
@@ -104,5 +104,6 @@ The architecture does **not** currently claim:
 - a live TUI product surface
 - full stateless downstream MCP handling
 - Tasks or other future-facing post-June-2026 MCP primitives
+- automated ACME / Let's Encrypt certificate management
 
 Those are the next major architecture questions after the `v0.2.0` boundary.
