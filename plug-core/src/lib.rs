@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod circuit;
 pub mod client_detect;
 pub mod config;

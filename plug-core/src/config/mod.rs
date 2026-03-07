@@ -354,11 +354,16 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     errors
 }
 
+/// Returns the plug config directory (e.g. `~/.config/plug/`).
+pub fn config_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "plug")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("~/.config/plug"))
+}
+
 /// Returns the default config file path.
 pub fn default_config_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "plug")
-        .map(|dirs| dirs.config_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("~/.config/plug/config.toml"))
+    config_dir().join("config.toml")
 }
 
 /// Extract all `$VAR_NAME` references from the config without expanding them.
