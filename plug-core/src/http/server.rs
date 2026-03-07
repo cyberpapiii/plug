@@ -37,6 +37,9 @@ pub struct HttpState {
     pub cancel: CancellationToken,
     pub sse_channel_capacity: usize,
     pub notification_task_started: AtomicBool,
+    /// Bearer token for downstream client authentication.
+    /// `None` means no auth required (loopback-only server).
+    pub auth_token: Option<Arc<str>>,
 }
 
 impl HttpState {
@@ -171,10 +174,16 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .route("/.well-known/mcp.json", get(get_server_card))
         .with_state(state.clone());
 
-    // MCP protocol routes — protected by origin validation middleware
+    // MCP protocol routes — protected by auth + origin validation middleware
+    // Layer order (innermost first): origin validation → bearer auth → body limit
+    // Bearer auth runs first; if authenticated, origin validation is skipped.
     let mcp = Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .layer(middleware::from_fn(validate_origin))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            validate_bearer_auth,
+        ))
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
         .with_state(state);
 
@@ -185,13 +194,62 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
 // Middleware
 // ---------------------------------------------------------------------------
 
+/// Whether the request has been authenticated via bearer token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthStatus {
+    /// Request authenticated with valid bearer token.
+    Authenticated,
+    /// No auth required (loopback-only server).
+    NoAuthRequired,
+}
+
+/// Check if a request's bearer token is valid against the expected token.
+fn check_bearer_token(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| crate::auth::verify_auth_token(token, expected))
+}
+
+/// Validate bearer token for non-loopback HTTP servers.
+///
+/// When `HttpState.auth_token` is `Some`, requests must include a valid
+/// `Authorization: Bearer <token>` header. When `None`, all requests pass through.
+async fn validate_bearer_auth(
+    State(state): State<Arc<HttpState>>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, HttpError> {
+    let auth_status = match &state.auth_token {
+        None => AuthStatus::NoAuthRequired,
+        Some(expected) => {
+            if check_bearer_token(req.headers(), expected.as_ref()) {
+                AuthStatus::Authenticated
+            } else {
+                tracing::warn!("bearer auth failed from downstream client");
+                return Err(HttpError::Unauthorized);
+            }
+        }
+    };
+
+    req.extensions_mut().insert(auth_status);
+    Ok(next.run(req).await)
+}
+
 /// Validate Origin header for DNS rebinding prevention.
 ///
 /// - Missing Origin: allowed (non-browser MCP clients don't send it)
 /// - localhost/127.0.0.1/[::1]: allowed
 /// - "null" literal: rejected (DNS rebinding vector)
 /// - Anything else: rejected
+/// - Authenticated requests (via bearer token): origin check skipped
 async fn validate_origin(req: Request, next: Next) -> Result<Response, HttpError> {
+    // Skip origin check for authenticated remote clients
+    if req.extensions().get::<AuthStatus>() == Some(&AuthStatus::Authenticated) {
+        return Ok(next.run(req).await);
+    }
+
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         let origin = origin.to_str().map_err(|_| HttpError::InvalidOrigin)?;
 
@@ -332,25 +390,48 @@ async fn delete_mcp(
 
 /// GET /.well-known/mcp.json — server discovery card.
 ///
-/// Exempt from origin validation — intended for discovery by any client.
-async fn get_server_card(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let tool_count = state.router.tool_count();
-    let servers: Vec<String> = state
-        .router
-        .server_manager()
-        .server_statuses()
-        .into_iter()
-        .map(|s| s.server_id)
-        .collect();
+/// When auth is required but not provided, returns a minimal card (name,
+/// version, endpoint) to preserve discoverability without leaking server
+/// inventory details (server names, tool counts).
+async fn get_server_card(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Check if this is an authenticated request (manual check since discovery
+    // is on a separate router without the auth middleware layer)
+    let is_authenticated = match &state.auth_token {
+        None => true, // No auth required (loopback)
+        Some(expected) => check_bearer_token(&headers, expected.as_ref()),
+    };
 
-    let card = json!({
-        "name": "plug",
-        "version": env!("CARGO_PKG_VERSION"),
-        "description": "MCP multiplexer",
-        "tools": tool_count,
-        "servers": servers,
-        "transports": ["stdio", "streamable-http", "sse"],
-    });
+    let card = if is_authenticated {
+        let tool_count = state.router.tool_count();
+        let servers: Vec<String> = state
+            .router
+            .server_manager()
+            .server_statuses()
+            .into_iter()
+            .map(|s| s.server_id)
+            .collect();
+
+        json!({
+            "name": "plug",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "MCP multiplexer",
+            "tools": tool_count,
+            "servers": servers,
+            "transports": ["stdio", "streamable-http", "sse"],
+        })
+    } else {
+        // Minimal card: no server names, no tool counts
+        json!({
+            "name": "plug",
+            "version": env!("CARGO_PKG_VERSION"),
+            "endpoint": "/mcp",
+            "transport": "streamable-http",
+            "auth_required": true,
+        })
+    };
 
     let mut response = (StatusCode::OK, Json(card)).into_response();
     response.headers_mut().insert(
@@ -732,6 +813,7 @@ mod tests {
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
+            auth_token: None,
         })
     }
 
@@ -1420,5 +1502,177 @@ mod tests {
             }),
             "expected SSE stream to contain targeted progress notification, got {events:?}"
         );
+    }
+
+    // -- Bearer auth middleware tests --
+
+    fn test_state_with_auth(token: &str) -> Arc<HttpState> {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            sse_channel_capacity: 32,
+            notification_task_started: AtomicBool::new(false),
+            auth_token: Some(Arc::from(token)),
+        })
+    }
+
+    #[tokio::test]
+    async fn auth_required_no_header_returns_401() {
+        let state = test_state_with_auth("test_token_abc123");
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers().get("WWW-Authenticate").unwrap(), "Bearer");
+    }
+
+    #[tokio::test]
+    async fn auth_required_invalid_token_returns_401() {
+        let state = test_state_with_auth("correct_token");
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer wrong_token")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_required_valid_token_passes_through() {
+        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let state = test_state_with_auth(token);
+        let app = build_router(state);
+
+        // Valid token should pass auth and reach the handler (which will fail
+        // on content type, not on auth — proving auth middleware passed)
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should get past auth (not 401) — will hit content type check (415)
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn no_auth_required_loopback_passes_through() {
+        // State with auth_token = None (loopback)
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should NOT be 401 — should hit content type check instead
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_valid_token_bypasses_origin_check() {
+        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let state = test_state_with_auth(token);
+        let app = build_router(state);
+
+        // Remote origin with valid bearer token — should bypass origin check
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Origin", "https://remote-client.example.com")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should NOT be 403 (origin rejected) — should pass through to handler
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn discovery_minimal_card_when_unauth_on_protected_server() {
+        let state = test_state_with_auth("secret_token");
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Minimal card should NOT contain servers or tool count
+        assert!(card.get("servers").is_none());
+        assert!(card.get("tools").is_none());
+        assert_eq!(card["auth_required"], true);
+        assert_eq!(card["endpoint"], "/mcp");
+    }
+
+    #[tokio::test]
+    async fn discovery_full_card_when_authenticated() {
+        let token = "secret_token";
+        let state = test_state_with_auth(token);
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Full card should contain servers and tools
+        assert!(card.get("servers").is_some());
+        assert!(card.get("tools").is_some());
+        assert!(card.get("auth_required").is_none());
     }
 }

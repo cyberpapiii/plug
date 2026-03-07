@@ -262,25 +262,7 @@ pub fn token_path() -> PathBuf {
 
 // ──────────────────────────────── Auth token ─────────────────────────────────
 
-/// Generate a 256-bit (32-byte) cryptographic random auth token, hex-encoded.
-fn generate_auth_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-/// Constant-time comparison of auth tokens to prevent timing side-channel.
-fn verify_auth_token(provided: &str, expected: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    let a = provided.as_bytes();
-    let b = expected.as_bytes();
-    // Lengths must match first (not timing-sensitive since token length is public)
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
-}
+use plug_core::auth::{generate_auth_token, verify_auth_token};
 
 // ──────────────────────────── Directory setup ────────────────────────────────
 
@@ -363,28 +345,8 @@ pub async fn run_daemon(
     // Generate auth token and write to file with restricted permissions from creation
     let auth_token = generate_auth_token();
     let token_file = token_path();
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&token_file)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(auth_token.as_bytes())
-                })
-                .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&token_file, &auth_token)
-                .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
-        }
-    }
+    plug_core::auth::write_token_file(&token_file, &auth_token)
+        .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
 
     // Acquire PID file lock BEFORE socket operations to prevent TOCTOU races.
     // Two concurrent auto_start_daemon calls: the loser fails here, retries connecting.
@@ -1399,38 +1361,6 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
-
-    #[test]
-    fn auth_token_generation_is_64_hex_chars() {
-        let token = generate_auth_token();
-        assert_eq!(token.len(), 64); // 32 bytes → 64 hex chars
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn auth_token_uniqueness() {
-        let t1 = generate_auth_token();
-        let t2 = generate_auth_token();
-        assert_ne!(t1, t2);
-    }
-
-    #[test]
-    fn verify_auth_token_correct() {
-        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        assert!(verify_auth_token(token, token));
-    }
-
-    #[test]
-    fn verify_auth_token_incorrect() {
-        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(!verify_auth_token(wrong, token));
-    }
-
-    #[test]
-    fn verify_auth_token_different_lengths() {
-        assert!(!verify_auth_token("short", "longertoken"));
-    }
 
     #[test]
     fn socket_path_is_in_runtime_dir() {

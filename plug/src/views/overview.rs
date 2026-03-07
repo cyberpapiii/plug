@@ -123,9 +123,28 @@ pub(crate) async fn cmd_overview(
 pub(crate) async fn cmd_status(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
+    show_token: bool,
 ) -> anyhow::Result<()> {
     let started =
         ensure_daemon_with_feedback(config_path, matches!(output, OutputFormat::Text)).await?;
+
+    // Load config to check HTTP auth status
+    let config = plug_core::config::load_config(config_path).ok();
+    let http_auth_info = config.as_ref().and_then(|c| {
+        if plug_core::config::http_bind_is_loopback(&c.http.bind_address) {
+            None
+        } else {
+            let token_path = plug_core::auth::http_auth_token_path(c.http.port);
+            let token = if show_token {
+                std::fs::read_to_string(&token_path)
+                    .ok()
+                    .map(|t| t.trim().to_string())
+            } else {
+                None
+            };
+            Some((token_path.exists(), token))
+        }
+    });
 
     if let Ok(plug_core::ipc::IpcResponse::Status {
         servers,
@@ -142,6 +161,26 @@ pub(crate) async fn cmd_status(
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             print_label_value("Clients", style(clients.to_string()).bold());
+
+            // Show HTTP auth status
+            if let Some((token_exists, token)) = &http_auth_info {
+                if *token_exists {
+                    if let Some(t) = token {
+                        print_label_value(
+                            "HTTP Auth",
+                            style(format!("enabled | Token: {t}")).green().bold(),
+                        );
+                    } else {
+                        print_label_value(
+                            "HTTP Auth",
+                            style("enabled (use --show-token to reveal)").green().bold(),
+                        );
+                    }
+                } else {
+                    print_label_value("HTTP Auth", style("NOT CONFIGURED").red().bold());
+                }
+            }
+
             println!();
             if servers.is_empty() {
                 print_heading("Servers");
@@ -173,12 +212,14 @@ pub(crate) async fn cmd_status(
                 }
             }
         } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &serde_json::json!({ "uptime": uptime_secs, "clients": clients, "servers": servers })
-                )?
-            );
+            let mut json_obj = serde_json::json!({ "uptime": uptime_secs, "clients": clients, "servers": servers });
+            if let Some((token_exists, token)) = &http_auth_info {
+                json_obj["http_auth"] = serde_json::json!({
+                    "enabled": *token_exists,
+                    "token": token,
+                });
+            }
+            println!("{}", serde_json::to_string_pretty(&json_obj)?);
         }
         return Ok(());
     }

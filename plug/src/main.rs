@@ -93,7 +93,11 @@ enum Commands {
     },
     #[command(display_order = 3)]
     /// Show runtime health and the next useful action
-    Status,
+    Status {
+        /// Reveal the HTTP auth token (hidden by default)
+        #[arg(long)]
+        show_token: bool,
+    },
     #[command(display_order = 4)]
     /// Diagnose problems with your plug setup
     Doctor,
@@ -248,9 +252,9 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         match &cli.command {
-            Some(Commands::Status) | Some(Commands::Servers) | Some(Commands::Tools { .. }) => {
-                "none"
-            }
+            Some(Commands::Status { .. })
+            | Some(Commands::Servers)
+            | Some(Commands::Tools { .. }) => "none",
             _ => "info",
         }
     };
@@ -275,8 +279,8 @@ async fn main() -> anyhow::Result<()> {
                 runtime::cmd_serve(cli.config.as_ref()).await?;
             }
         }
-        Some(Commands::Status) => {
-            views::overview::cmd_status(cli.config.as_ref(), &cli.output).await?
+        Some(Commands::Status { show_token }) => {
+            views::overview::cmd_status(cli.config.as_ref(), &cli.output, show_token).await?
         }
         Some(Commands::Stop) => runtime::cmd_daemon_stop().await?,
         Some(Commands::Servers) => {

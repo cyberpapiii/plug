@@ -49,7 +49,18 @@ impl DoctorReport {
 /// Run all diagnostic checks and return an aggregated report.
 pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
     // Run independent checks concurrently
-    let (config_exists, config_perms, port, env_vars, binaries, collisions, limits, pid, clients) = tokio::join!(
+    let (
+        config_exists,
+        config_perms,
+        port,
+        env_vars,
+        binaries,
+        collisions,
+        limits,
+        pid,
+        clients,
+        http_auth,
+    ) = tokio::join!(
         check_config_exists(config_path),
         check_config_permissions(config, config_path),
         check_port_available(config),
@@ -59,6 +70,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_client_limits(config),
         check_pid_staleness(),
         check_client_configs(),
+        check_http_auth(config),
     );
 
     // Server connectivity is sequential-ish internally but we run it after the rest
@@ -75,6 +87,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         pid,
         clients,
         connectivity,
+        http_auth,
     ];
 
     DoctorReport::from_checks(checks)
@@ -800,6 +813,67 @@ async fn check_client_configs() -> CheckResult {
     }
 }
 
+/// Check 11: HTTP auth for non-loopback bind addresses.
+async fn check_http_auth(config: &Config) -> CheckResult {
+    let name = "http_auth".to_string();
+
+    if crate::config::http_bind_is_loopback(&config.http.bind_address) {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "HTTP server bound to loopback (auth not required)".to_string(),
+            fix_suggestion: None,
+        };
+    }
+
+    let token_path = crate::auth::http_auth_token_path(config.http.port);
+
+    if !token_path.exists() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: format!(
+                "HTTP server bound to {} (non-loopback) but auth token not yet generated — run `plug serve` to initialize",
+                config.http.bind_address
+            ),
+            fix_suggestion: Some(
+                "Run `plug serve` to auto-generate an auth token, or set bind_address = \"127.0.0.1\" for local-only access".to_string(),
+            ),
+        };
+    }
+
+    // Check file permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&token_path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return CheckResult {
+                    name,
+                    status: CheckStatus::Warn,
+                    message: format!(
+                        "Auth token file has permissions {:o} (should be 600): {}",
+                        mode,
+                        token_path.display()
+                    ),
+                    fix_suggestion: Some(format!("Run: chmod 600 {}", token_path.display())),
+                };
+            }
+        }
+    }
+
+    CheckResult {
+        name,
+        status: CheckStatus::Pass,
+        message: format!(
+            "HTTP auth token configured for non-loopback bind ({})",
+            config.http.bind_address
+        ),
+        fix_suggestion: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1119,6 +1193,6 @@ mod tests {
     async fn run_doctor_returns_all_checks() {
         let config = test_config();
         let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 10);
+        assert_eq!(report.checks.len(), 11);
     }
 }
