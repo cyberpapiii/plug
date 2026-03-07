@@ -120,53 +120,60 @@ impl SessionManager {
         removed
     }
 
+    fn try_send_to_session(&self, session_id: &str, message: &SseMessage) {
+        let mut remove_session = false;
+        let mut clear_sender = false;
+
+        if let Some(entry) = self.sessions.get(session_id) {
+            if entry.last_activity.elapsed() > self.timeout {
+                remove_session = true;
+            } else if let Some(sender) = entry.sse_sender.as_ref() {
+                match sender.try_send(message.clone()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        clear_sender = true;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "dropping slow SSE client from targeted notification delivery"
+                        );
+                        clear_sender = true;
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+
+        if remove_session {
+            self.sessions.remove(session_id);
+            return;
+        }
+
+        if clear_sender {
+            if let Some(mut entry) = self.sessions.get_mut(session_id) {
+                entry.sse_sender = None;
+            }
+        }
+    }
+
     /// Broadcast a notification to every session with an active SSE sender.
     ///
     /// Dead senders are cleared lazily so future fan-out skips them.
     pub fn broadcast(&self, message: SseMessage) {
-        let mut expired_sessions = Vec::new();
-        let senders: Vec<(String, mpsc::Sender<SseMessage>)> = self
+        let session_ids: Vec<String> = self
             .sessions
             .iter()
-            .filter_map(|entry| {
-                if entry.last_activity.elapsed() > self.timeout {
-                    expired_sessions.push(entry.key().clone());
-                    return None;
-                }
-
-                entry
-                    .sse_sender
-                    .as_ref()
-                    .map(|sender| (entry.key().clone(), sender.clone()))
-            })
+            .map(|entry| entry.key().clone())
             .collect();
-
-        let mut stale_sessions = Vec::new();
-        for (session_id, sender) in senders {
-            match sender.try_send(message.clone()) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    stale_sessions.push(session_id);
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        "dropping slow SSE client from notification fan-out"
-                    );
-                    stale_sessions.push(session_id);
-                }
-            }
+        for session_id in session_ids {
+            self.try_send_to_session(&session_id, &message);
         }
+    }
 
-        for session_id in expired_sessions {
-            self.sessions.remove(&session_id);
-        }
-
-        for session_id in stale_sessions {
-            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
-                entry.sse_sender = None;
-            }
-        }
+    pub fn send_to_session(&self, session_id: &str, message: SseMessage) {
+        self.try_send_to_session(session_id, &message);
     }
 
     /// Spawn a background task that periodically cleans up expired sessions.
