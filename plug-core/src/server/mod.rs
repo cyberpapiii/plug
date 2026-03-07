@@ -1,29 +1,80 @@
 #![allow(clippy::mutable_key_type)]
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use rmcp::handler::client::ClientHandler;
+use rmcp::model::{ClientInfo, Tool};
 use rmcp::ServiceExt as _;
+use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
+use crate::notifications::ProtocolNotification;
+use crate::proxy::ToolRouter;
 use crate::types::{HealthState, ServerHealth, ServerStatus};
 
-type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+type McpClient =
+    rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
+
+pub(crate) struct UpstreamClientHandler {
+    server_id: Arc<str>,
+    tools: Arc<ArcSwap<Vec<Tool>>>,
+    router: std::sync::Weak<ToolRouter>,
+}
+
+impl ClientHandler for UpstreamClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
+    }
+
+    fn on_tool_list_changed(
+        &self,
+        context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let server_id = Arc::clone(&self.server_id);
+        let tools = Arc::clone(&self.tools);
+        let router = self.router.clone();
+        let peer = context.peer.clone();
+
+        async move {
+            match peer.list_all_tools().await {
+                Ok(fresh_tools) => {
+                    tools.store(Arc::new(fresh_tools));
+
+                    if let Some(router) = router.upgrade() {
+                        router.refresh_tools().await;
+                        router.publish_protocol_notification(ProtocolNotification::ToolListChanged {
+                            server_id,
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        server = %server_id,
+                        error = %error,
+                        "failed to refresh tools after tools/list_changed"
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// A connected upstream MCP server with its client handle and discovered tools.
 pub struct UpstreamServer {
     pub name: String,
     pub config: ServerConfig,
-    pub client: McpClient,
-    pub tools: Vec<rmcp::model::Tool>,
+    pub(crate) client: McpClient,
+    pub(crate) tools: Arc<ArcSwap<Vec<rmcp::model::Tool>>>,
     pub health: ServerHealth,
 }
 
@@ -40,6 +91,7 @@ pub struct ServerManager {
     /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
     /// all trying to reconnect the same server simultaneously).
     reconnecting: DashMap<String, Arc<AtomicBool>>,
+    tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
 }
 
 impl ServerManager {
@@ -50,7 +102,22 @@ impl ServerManager {
             circuit_breakers: DashMap::new(),
             semaphores: DashMap::new(),
             reconnecting: DashMap::new(),
+            tool_router: std::sync::RwLock::new(None),
         }
+    }
+
+    pub fn set_tool_router(&self, router: std::sync::Weak<ToolRouter>) {
+        if let Ok(mut guard) = self.tool_router.write() {
+            *guard = Some(router);
+        }
+    }
+
+    fn tool_router(&self) -> std::sync::Weak<ToolRouter> {
+        self.tool_router
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .unwrap_or_default()
     }
 
     /// Start all enabled servers from config, batched by `config.startup_concurrency`.
@@ -80,8 +147,10 @@ impl ServerManager {
             for (name, server_config) in chunk {
                 let name_clone = name.clone();
                 let sc = server_config.clone();
+                let tool_router = self.tool_router();
                 join_set.spawn(async move {
-                    let result = Self::start_server(&name_clone, &sc).await;
+                    let result =
+                        Self::start_server_with_router(&name_clone, &sc, tool_router).await;
                     (name_clone, result)
                 });
             }
@@ -91,7 +160,7 @@ impl ServerManager {
                     Ok((name, Ok(upstream))) => {
                         tracing::info!(
                             server = %name,
-                            tools = upstream.tools.len(),
+                            tools = upstream.tools.load().len(),
                             "server started"
                         );
                         // Clone current map, insert new server, swap
@@ -133,8 +202,17 @@ impl ServerManager {
 
     /// Spawn and initialize a single upstream server.
     pub async fn start_server(
+        &self,
         name: &str,
         config: &ServerConfig,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        Self::start_server_with_router(name, config, self.tool_router()).await
+    }
+
+    async fn start_server_with_router(
+        name: &str,
+        config: &ServerConfig,
+        tool_router: std::sync::Weak<ToolRouter>,
     ) -> Result<UpstreamServer, anyhow::Error> {
         // Recursion shield: never start a server named "plug"
         if name == "plug" {
@@ -175,16 +253,24 @@ impl ServerManager {
                         rmcp::transport::child_process::TokioChildProcess::new(cmd)
                             .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
 
-                    let client: McpClient =
-                        ().serve(transport)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("failed to initialize client: {e}"))?;
+                    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+                    let handler = Arc::new(UpstreamClientHandler {
+                        server_id: Arc::from(name),
+                        tools: Arc::clone(&tools),
+                        router: tool_router.clone(),
+                    });
+
+                    let client: McpClient = handler
+                        .serve(transport)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to initialize client: {e}"))?;
 
                     let tools_result = client
                         .peer()
                         .list_all_tools()
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+                    tools.store(Arc::new(tools_result));
 
                     let server_info = client.peer().peer_info();
                     if let Some(info) = server_info {
@@ -200,7 +286,7 @@ impl ServerManager {
                         name: name.to_string(),
                         config: config.clone(),
                         client,
-                        tools: tools_result,
+                        tools,
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -241,7 +327,14 @@ impl ServerManager {
                     let transport =
                         StreamableHttpClientTransport::from_config(transport_config);
 
-                    let client: McpClient = ().serve(transport).await.map_err(|e| {
+                    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+                    let handler = Arc::new(UpstreamClientHandler {
+                        server_id: Arc::from(name),
+                        tools: Arc::clone(&tools),
+                        router: tool_router.clone(),
+                    });
+
+                    let client: McpClient = handler.serve(transport).await.map_err(|e| {
                         anyhow::anyhow!("failed to connect to HTTP upstream: {e}")
                     })?;
 
@@ -250,6 +343,7 @@ impl ServerManager {
                         .list_all_tools()
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+                    tools.store(Arc::new(tools_result));
 
                     let server_info = client.peer().peer_info();
                     if let Some(info) = server_info {
@@ -265,7 +359,7 @@ impl ServerManager {
                         name: name.to_string(),
                         config: config.clone(),
                         client,
-                        tools: tools_result,
+                        tools,
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -301,7 +395,8 @@ impl ServerManager {
                 .map(|h| h.health != ServerHealth::Failed)
                 .unwrap_or(true);
             if health_ok {
-                for tool in &upstream.tools {
+                let tools = upstream.tools.load();
+                for tool in tools.iter() {
                     result.push((server_name.clone(), tool.clone()));
                 }
             }
@@ -379,7 +474,7 @@ impl ServerManager {
                 ServerStatus {
                     server_id: upstream.name.clone(),
                     health,
-                    tool_count: upstream.tools.len(),
+                    tool_count: upstream.tools.load().len(),
                     last_seen: None,
                 }
             })
@@ -419,7 +514,7 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
     ) -> Result<(), anyhow::Error> {
-        let upstream = Self::start_server(name, config).await?;
+        let upstream = self.start_server(name, config).await?;
         let max_concurrent = upstream.config.max_concurrent;
         let cb_enabled = upstream.config.circuit_breaker_enabled;
         let mut new_map = HashMap::clone(&self.servers.load());
@@ -531,7 +626,152 @@ fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use super::*;
+    use crate::config::{ServerConfig, TransportType};
+    use crate::proxy::{ProxyHandler, RouterConfig};
+    use rmcp::handler::server::ServerHandler;
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResult, Content, ListToolsResult, ServerCapabilities,
+        ServerInfo, Tool,
+    };
+    use rmcp::service::{Peer, RequestContext, RoleClient, RoleServer};
+    use rmcp::{ClientHandler, ServiceExt};
+    use tokio::sync::{Notify, watch};
+
+    fn test_router_config() -> RouterConfig {
+        RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
+        }
+    }
+
+    fn test_server_config() -> ServerConfig {
+        ServerConfig {
+            command: Some("fake".to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            timeout_secs: 30,
+            call_timeout_secs: 30,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: false,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        }
+    }
+
+    fn make_tool(name: &str) -> Tool {
+        Tool::new(
+            std::borrow::Cow::Owned(name.to_string()),
+            std::borrow::Cow::Borrowed("test tool"),
+            Arc::new(serde_json::Map::new()),
+        )
+    }
+
+    #[derive(Clone)]
+    struct MutableToolServer {
+        tools_tx: watch::Sender<Vec<Tool>>,
+        peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    }
+
+    impl MutableToolServer {
+        fn new(initial_tools: Vec<Tool>) -> (Self, watch::Receiver<Vec<Tool>>) {
+            let (tools_tx, tools_rx) = watch::channel(initial_tools);
+            (
+                Self {
+                    tools_tx,
+                    peer: Arc::new(Mutex::new(None)),
+                },
+                tools_rx,
+            )
+        }
+
+        async fn set_tools_and_notify(&self, tools: Vec<Tool>) {
+            self.tools_tx.send(tools).expect("update tool list");
+
+            let mut attempts = 0usize;
+            loop {
+                let peer = { self.peer.lock().unwrap().clone() };
+                if let Some(peer) = peer {
+                    peer.notify_tool_list_changed()
+                        .await
+                        .expect("notify tool list changed");
+                    return;
+                }
+
+                attempts += 1;
+                assert!(attempts < 50, "server peer should be ready before notify");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    struct MutableToolServerHandler {
+        tools_rx: watch::Receiver<Vec<Tool>>,
+        peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    }
+
+    impl ServerHandler for MutableToolServerHandler {
+        fn get_info(&self) -> ServerInfo {
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.tools = Some(rmcp::model::ToolsCapability {
+                list_changed: Some(true),
+            });
+            ServerInfo::new(capabilities)
+        }
+
+        async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+            *self.peer.lock().unwrap() = Some(context.peer.clone());
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
+            let tools = self.tools_rx.borrow().clone();
+            std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+            let content = format!("called {}", request.name);
+            std::future::ready(Ok(CallToolResult::success(vec![Content::text(content)])))
+        }
+    }
+
+    struct ToolListChangedClient {
+        signal: Arc<Notify>,
+        notifications: Arc<AtomicUsize>,
+    }
+
+    impl ClientHandler for ToolListChangedClient {
+        async fn on_tool_list_changed(
+            &self,
+            _context: rmcp::service::NotificationContext<RoleClient>,
+        ) {
+            self.notifications.fetch_add(1, Ordering::SeqCst);
+            self.signal.notify_one();
+        }
+    }
 
     #[test]
     fn ssrf_allows_loopback() {
@@ -618,5 +858,95 @@ mod tests {
         assert_eq!(statuses[0].server_id, "workspace");
         assert_eq!(statuses[0].health, ServerHealth::Failed);
         assert_eq!(statuses[0].tool_count, 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_tool_list_changed_refreshes_router_and_notifies_stdio_client() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
+        let upstream_peer = Arc::clone(&upstream_server.peer);
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = MutableToolServerHandler { tools_rx, peer: upstream_peer };
+            let server = handler.serve(server_transport).await.expect("start upstream test server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("upstream"),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(&router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect upstream test client");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        tools.store(Arc::new(initial_tools));
+
+        server_manager.replace_server(
+            "upstream",
+            UpstreamServer {
+                name: "upstream".to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                health: ServerHealth::Healthy,
+            },
+        );
+        router.refresh_tools().await;
+        assert_eq!(router.tool_count(), 1);
+
+        let proxy_handler = ProxyHandler::from_router(router.clone());
+        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(proxy_server_transport)
+                .await
+                .expect("start proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let signal = Arc::new(Notify::new());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let downstream_client = ToolListChangedClient {
+            signal: Arc::clone(&signal),
+            notifications: Arc::clone(&notifications),
+        }
+        .serve(downstream_transport)
+        .await
+        .expect("connect downstream client");
+
+        upstream_server
+            .set_tools_and_notify(vec![make_tool("echo"), make_tool("extra")])
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("downstream stdio client should receive tools/list_changed");
+
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(router.tool_count(), 2);
+
+        let exposed_tool_name = router
+            .list_tools()
+            .first()
+            .expect("tool exists")
+            .name
+            .to_string();
+        let result = downstream_client
+            .call_tool(CallToolRequestParams::new(exposed_tool_name))
+            .await
+            .expect("tool call succeeds");
+        assert!(!result.content.is_empty());
+        assert_eq!(router.active_call_count(), 0);
     }
 }

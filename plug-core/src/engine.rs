@@ -129,6 +129,7 @@ impl Engine {
         let tool_router = Arc::new(
             ToolRouter::new(server_manager.clone(), router_config).with_event_tx(event_tx.clone()),
         );
+        server_manager.set_tool_router(Arc::downgrade(&tool_router));
 
         Self {
             server_manager,
@@ -298,7 +299,7 @@ impl Engine {
         });
 
         // Restart the server
-        match ServerManager::start_server(server_id, &server_config).await {
+        match self.server_manager.start_server(server_id, &server_config).await {
             Ok(upstream) => {
                 self.server_manager.replace_server(server_id, upstream);
                 self.tool_router.refresh_tools().await;
@@ -364,7 +365,7 @@ impl Engine {
         let mut attempt = 1;
         let mut delay = RECONNECT_RETRY_MIN_DELAY;
         let upstream = loop {
-            match ServerManager::start_server(server_id, &server_config).await {
+            match self.server_manager.start_server(server_id, &server_config).await {
                 Ok(upstream) => break upstream,
                 Err(e)
                     if attempt < RECONNECT_RETRY_MAX_ATTEMPTS

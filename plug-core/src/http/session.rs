@@ -120,6 +120,35 @@ impl SessionManager {
         removed
     }
 
+    /// Broadcast a notification to every session with an active SSE sender.
+    ///
+    /// Dead senders are cleared lazily so future fan-out skips them.
+    pub async fn broadcast(&self, message: SseMessage) {
+        let senders: Vec<(String, mpsc::Sender<SseMessage>)> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .sse_sender
+                    .as_ref()
+                    .map(|sender| (entry.key().clone(), sender.clone()))
+            })
+            .collect();
+
+        let mut stale_sessions = Vec::new();
+        for (session_id, sender) in senders {
+            if sender.send(message.clone()).await.is_err() {
+                stale_sessions.push(session_id);
+            }
+        }
+
+        for session_id in stale_sessions {
+            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                entry.sse_sender = None;
+            }
+        }
+    }
+
     /// Spawn a background task that periodically cleans up expired sessions.
     pub fn spawn_cleanup_task(&self, cancel: CancellationToken) {
         let sessions = Arc::clone(&self.sessions);

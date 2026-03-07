@@ -295,6 +295,7 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
         cancel: engine.cancel_token().clone(),
         sse_channel_capacity: config.http.sse_channel_capacity,
     });
+    http_state.spawn_notification_fanout();
     let router = plug_core::http::server::build_router(http_state);
     let addr = format!("{}:{}", config.http.bind_address, config.http.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
