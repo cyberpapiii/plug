@@ -12,7 +12,7 @@ use futures::future::join_all;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CancelledNotificationParam, ClientInfo, LoggingLevel, LoggingMessageNotificationParam,
+    CancelledNotificationParam, ClientInfo, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, ServerCapabilities, SetLevelRequestParams, Tool,
 };

@@ -210,10 +210,10 @@ Key design decisions:
 
 ## System-Wide Impact
 
-- **Interaction graph**: Upstream server → `on_logging_message` → `route_upstream_logging_message` (level filter + prefix) → `logging_tx.send()` → stdio/HTTP fan-out tasks → downstream clients
-- **Error propagation**: Logging is fire-and-forget. Channel send failures are logged but never block upstream server communication. `Lagged` errors emit synthetic warning to client.
-- **State lifecycle risks**: Per-client log levels tracked in `client_log_levels` DashMap. When a client disconnects, its entry is removed and the effective level recalculates. When all clients disconnect, effective level resets to `Warning` (the default).
-- **API surface parity**: Both stdio and HTTP downstream transports get logging forwarding. Both can send `setLevel`.
+- **Interaction graph**: Upstream server → `on_logging_message` → `route_upstream_logging_message` (level filter + prefix) → `logging_tx.send()` → stdio/HTTP/IPC fan-out → downstream clients
+- **Error propagation**: Logging is fire-and-forget. Channel send failures are logged but never block upstream server communication. `Lagged` errors emit synthetic warning to client on all transports.
+- **State lifecycle risks**: Per-client log levels tracked in `client_log_levels` DashMap. When a client disconnects, its entry is removed and the effective level recalculates. When all clients disconnect, effective level resets to `Warning` (the default). Session expiry callbacks ensure cleanup on all paths (explicit DELETE, timeout, prune).
+- **API surface parity**: All three downstream transports (direct stdio, HTTP, daemon-backed IPC) get logging forwarding and `setLevel` support. IPC uses push notifications via `LoggingNotification` frames interleaved with request-response traffic.
 
 ## Acceptance Criteria
 
