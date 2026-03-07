@@ -54,8 +54,9 @@ If tool call timeout is removed entirely (see todo 022 Option B), this problem d
 - Added stdio reconnect-on-timeout behavior in `plug-core/src/proxy/mod.rs`
 - Added a real integration test using a wrapper script plus `mock-mcp-server` to prove:
   - first call times out on a slow stdio server
-  - plug reconnects
+  - plug reconnects in the background
   - the next call succeeds against the clean replacement process
 
 **Learnings:**
 - The issue was real, but it needed a real stdio integration test rather than a unit-only proof because the risk was protocol-state corruption across requests.
+- Reconnect should be backgrounded after timeout so the caller still gets a prompt timeout response instead of paying reconnect latency inline.

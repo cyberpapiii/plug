@@ -76,8 +76,6 @@ pub struct ToolRouter {
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
 }
 
-const SEMAPHORE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
-
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         Self {
@@ -107,6 +105,45 @@ impl ToolRouter {
             .write()
             .expect("engine RwLock poisoned — prior panic");
         *guard = Some(engine);
+    }
+
+    fn upgrade_engine(&self) -> Option<Arc<Engine>> {
+        self.engine
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
+    }
+
+    async fn reconnect_server_now(&self, server_id: &str) -> Result<(), anyhow::Error> {
+        let engine = self
+            .upgrade_engine()
+            .ok_or_else(|| anyhow::anyhow!("engine reference unavailable"))?;
+        engine.reconnect_server(server_id).await
+    }
+
+    fn reconnect_server_in_background(&self, server_id: String) {
+        let Some(engine) = self.upgrade_engine() else {
+            tracing::warn!(
+                server = %server_id,
+                "no engine reference available for background reconnect"
+            );
+            return;
+        };
+
+        tokio::spawn(async move {
+            if let Err(reconnect_err) = engine.reconnect_server(&server_id).await {
+                tracing::warn!(
+                    server = %server_id,
+                    error = %reconnect_err,
+                    "background reconnect after timeout failed"
+                );
+            } else {
+                tracing::info!(
+                    server = %server_id,
+                    "background reconnect after timeout succeeded"
+                );
+            }
+        });
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
@@ -436,13 +473,16 @@ impl ToolRouter {
                 })?;
             }
 
+            let semaphore_timeout = self
+                .server_manager
+                .get_upstream(&server_id)
+                .map(|upstream| Duration::from_secs(upstream.config.call_timeout_secs))
+                .unwrap_or(Duration::from_secs(30));
+
             // Acquire concurrency semaphore
             let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
                 Some(
-                    tokio::time::timeout(
-                        SEMAPHORE_ACQUIRE_TIMEOUT,
-                        sem.clone().acquire_owned(),
-                    )
+                    tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned())
                     .await
                     .map_err(|_| {
                         McpError::from(ProtocolError::ServerBusy {
@@ -540,35 +580,21 @@ impl ToolRouter {
                         });
                     }
 
-                    // Attempt reconnect via Engine (AtomicBool prevents stampede)
-                    let engine_ref = self
-                        .engine
-                        .read()
-                        .ok()
-                        .and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
-                    if let Some(engine) = engine_ref {
-                        match engine.reconnect_server(&server_id).await {
-                            Ok(()) => {
-                                tracing::info!(server = %server_id, "reconnected, retrying tool call");
-                            }
-                            Err(reconnect_err) => {
-                                tracing::error!(
-                                    server = %server_id,
-                                    error = %reconnect_err,
-                                    "reconnect failed, returning original error"
-                                );
-                                if let Some(cb) = &cb {
-                                    cb.on_failure();
-                                }
-                                return Err(McpError::internal_error(e.to_string(), None));
-                            }
+                    match self.reconnect_server_now(&server_id).await {
+                        Ok(()) => {
+                            tracing::info!(server = %server_id, "reconnected, retrying tool call");
                         }
-                    } else {
-                        // No Engine reference — can't reconnect, return error
-                        if let Some(cb) = &cb {
-                            cb.on_failure();
+                        Err(reconnect_err) => {
+                            tracing::error!(
+                                server = %server_id,
+                                error = %reconnect_err,
+                                "reconnect failed, returning original error"
+                            );
+                            if let Some(cb) = &cb {
+                                cb.on_failure();
+                            }
+                            return Err(McpError::internal_error(e.to_string(), None));
                         }
-                        return Err(McpError::internal_error(e.to_string(), None));
                     }
 
                     // Retry the tool call exactly once
@@ -619,25 +645,7 @@ impl ToolRouter {
                     }
 
                     if matches!(transport_type, crate::config::TransportType::Stdio) {
-                        let engine_ref = self
-                            .engine
-                            .read()
-                            .ok()
-                            .and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
-                        if let Some(engine) = engine_ref {
-                            if let Err(reconnect_err) = engine.reconnect_server(&server_id).await {
-                                tracing::warn!(
-                                    server = %server_id,
-                                    error = %reconnect_err,
-                                    "stdio server reconnect after timeout failed"
-                                );
-                            } else {
-                                tracing::info!(
-                                    server = %server_id,
-                                    "reconnected stdio server after timeout"
-                                );
-                            }
-                        }
+                        self.reconnect_server_in_background(server_id.clone());
                     }
 
                     Err(McpError::from(ProtocolError::Timeout {
@@ -1356,7 +1364,7 @@ mod tests {
         let call = router.call_tool("Busy__tool", None);
         tokio::pin!(call);
 
-        tokio::time::advance(SEMAPHORE_ACQUIRE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
 
         let err = call.await.unwrap_err();
         assert!(
