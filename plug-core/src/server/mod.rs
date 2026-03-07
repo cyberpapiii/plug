@@ -9,7 +9,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{ClientInfo, Tool};
+use rmcp::model::{CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Tool};
 use rmcp::ServiceExt as _;
 use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
@@ -60,6 +60,34 @@ impl ClientHandler for UpstreamClientHandler {
                         "failed to refresh tools after tools/list_changed"
                     );
                 }
+            }
+        }
+    }
+
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                router.route_upstream_progress(server_id.as_ref(), params);
+            }
+        }
+    }
+
+    fn on_cancelled(
+        &self,
+        params: CancelledNotificationParam,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                router.route_upstream_cancelled(server_id.as_ref(), params);
             }
         }
     }
@@ -632,10 +660,12 @@ mod tests {
     use crate::proxy::{ProxyHandler, RouterConfig};
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::{
-        CallToolRequestParams, CallToolResult, Content, ListToolsResult, ServerCapabilities,
-        ServerInfo, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResult, Content, ListToolsResult, Meta,
+        NumberOrString, ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerInfo,
+        Tool,
     };
-    use rmcp::service::{Peer, RequestContext, RoleClient, RoleServer};
+    use rmcp::model::RequestParamsMeta;
+    use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
     use tokio::sync::{Notify, watch};
 
@@ -766,6 +796,81 @@ mod tests {
         ) {
             self.notifications.fetch_add(1, Ordering::SeqCst);
             self.signal.notify_one();
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProgressCancelServer {
+        cancel_signal: Arc<Notify>,
+        cancelled_request: Arc<Mutex<Option<rmcp::model::RequestId>>>,
+    }
+
+    impl ProgressCancelServer {
+        fn new() -> Self {
+            Self {
+                cancel_signal: Arc::new(Notify::new()),
+                cancelled_request: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl ServerHandler for ProgressCancelServer {
+        fn get_info(&self) -> ServerInfo {
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.tools = Some(rmcp::model::ToolsCapability {
+                list_changed: Some(true),
+            });
+            ServerInfo::new(capabilities)
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ListToolsResult::with_all_items(vec![make_tool("echo")])))
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+            let cancel_signal = Arc::clone(&self.cancel_signal);
+            async move {
+                let _ = request.progress_token();
+                cancel_signal.notified().await;
+                Ok(CallToolResult::success(vec![Content::text("cancelled upstream")]))
+            }
+        }
+
+        fn on_cancelled(
+            &self,
+            notification: rmcp::model::CancelledNotificationParam,
+            _context: rmcp::service::NotificationContext<RoleServer>,
+        ) -> impl Future<Output = ()> + Send + '_ {
+            let cancel_signal = Arc::clone(&self.cancel_signal);
+            let cancelled_request = Arc::clone(&self.cancelled_request);
+            async move {
+                *cancelled_request.lock().unwrap() = Some(notification.request_id);
+                cancel_signal.notify_one();
+            }
+        }
+    }
+
+    struct ProgressClient {
+        progress_signal: Arc<Notify>,
+        progress: Arc<Mutex<Vec<ProgressNotificationParam>>>,
+    }
+
+    impl ClientHandler for ProgressClient {
+        async fn on_progress(
+            &self,
+            params: ProgressNotificationParam,
+            _context: rmcp::service::NotificationContext<RoleClient>,
+        ) {
+            self.progress.lock().unwrap().push(params);
+            self.progress_signal.notify_one();
         }
     }
 
@@ -943,6 +1048,134 @@ mod tests {
             .await
             .expect("tool call succeeds");
         assert!(!result.content.is_empty());
+        assert_eq!(router.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stdio_progress_and_cancellation_route_end_to_end() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let upstream_server = ProgressCancelServer::new();
+        let cancelled_request = Arc::clone(&upstream_server.cancelled_request);
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = upstream_server
+                .serve(server_transport)
+                .await
+                .expect("start upstream progress server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("upstream"),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(&router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect upstream test client");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        tools.store(Arc::new(initial_tools));
+
+        server_manager.replace_server(
+            "upstream",
+            UpstreamServer {
+                name: "upstream".to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                health: ServerHealth::Healthy,
+            },
+        );
+        router.refresh_tools().await;
+
+        let proxy_handler = ProxyHandler::from_router(router.clone());
+        let proxy_client_id = proxy_handler.client_id();
+        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(proxy_server_transport)
+                .await
+                .expect("start proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let progress_signal = Arc::new(Notify::new());
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let downstream_client = ProgressClient {
+            progress_signal: Arc::clone(&progress_signal),
+            progress: Arc::clone(&progress),
+        }
+        .serve(downstream_transport)
+        .await
+        .expect("connect downstream progress client");
+
+        let prefixed_tool_name = router
+            .list_tools()
+            .first()
+            .expect("tool exists")
+            .name
+            .to_string();
+        let progress_token = ProgressToken(NumberOrString::String(Arc::from("downstream-progress")));
+        let mut params = CallToolRequestParams::new(prefixed_tool_name);
+        params.set_progress_token(progress_token.clone());
+
+        let handle = downstream_client
+            .send_cancellable_request(
+                rmcp::model::ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions {
+                    timeout: None,
+                    meta: Some(Meta::with_progress_token(progress_token.clone())),
+                },
+            )
+            .await
+            .expect("start downstream call");
+        let downstream_request_id = handle.id.clone();
+
+        router.publish_protocol_notification(crate::notifications::ProtocolNotification::Progress {
+            target: crate::notifications::NotificationTarget::Stdio {
+                client_id: proxy_client_id,
+            },
+            params: ProgressNotificationParam::new(progress_token.clone(), 0.5)
+                .with_message("halfway"),
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), progress_signal.notified())
+            .await
+            .expect("progress should be delivered to downstream client");
+
+        let received = progress.lock().unwrap().clone();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].progress_token, progress_token);
+        assert_eq!(received[0].message.as_deref(), Some("halfway"));
+
+        downstream_client
+            .notify_cancelled(rmcp::model::CancelledNotificationParam {
+                request_id: downstream_request_id,
+                reason: Some("user cancelled".to_string()),
+            })
+            .await
+            .expect("send downstream cancellation");
+
+        match handle.await_response().await {
+            Err(rmcp::service::ServiceError::Cancelled { reason }) => {
+                assert_eq!(reason.as_deref(), Some("user cancelled"));
+            }
+            other => panic!("unexpected response state: {other:?}"),
+        }
+
+        let _cancelled = cancelled_request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream cancellation captured");
         assert_eq!(router.active_call_count(), 0);
     }
 }

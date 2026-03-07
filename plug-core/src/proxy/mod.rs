@@ -9,7 +9,8 @@ use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
-use rmcp::service::{Peer, RequestContext, RoleServer};
+use rmcp::model::RequestParamsMeta;
+use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, RoleServer};
 use tokio::sync::broadcast;
 
 use crate::circuit::CircuitBreakerError;
@@ -17,7 +18,7 @@ use crate::client_detect::detect_client;
 use crate::config::Config;
 use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
-use crate::notifications::ProtocolNotification;
+use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::types::{ClientType, ServerHealth};
 
@@ -75,8 +76,10 @@ pub struct ToolRouter {
     /// Optional event sender for tool call observability.
     event_tx: Option<broadcast::Sender<EngineEvent>>,
     protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
-    active_calls: DashMap<u64, DownstreamCallContext>,
+    active_calls: DashMap<u64, ActiveCallRecord>,
     active_call_lookup: DashMap<DownstreamCallKey, u64>,
+    upstream_request_lookup: DashMap<UpstreamRequestKey, u64>,
+    upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
     /// Weak reference to Engine for session recovery (reconnect on error).
@@ -93,15 +96,15 @@ pub enum DownstreamTransport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownstreamCallContext {
     pub transport: DownstreamTransport,
-    pub session_id: Option<Arc<str>>,
+    pub client_id: Arc<str>,
     pub request_id: RequestId,
 }
 
 impl DownstreamCallContext {
-    pub fn stdio(request_id: RequestId) -> Self {
+    pub fn stdio(client_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
         Self {
             transport: DownstreamTransport::Stdio,
-            session_id: None,
+            client_id: client_id.into(),
             request_id,
         }
     }
@@ -109,8 +112,19 @@ impl DownstreamCallContext {
     pub fn http(session_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
         Self {
             transport: DownstreamTransport::Http,
-            session_id: Some(session_id.into()),
+            client_id: session_id.into(),
             request_id,
+        }
+    }
+
+    pub fn notification_target(&self) -> NotificationTarget {
+        match self.transport {
+            DownstreamTransport::Stdio => NotificationTarget::Stdio {
+                client_id: Arc::clone(&self.client_id),
+            },
+            DownstreamTransport::Http => NotificationTarget::Http {
+                session_id: Arc::clone(&self.client_id),
+            },
         }
     }
 }
@@ -118,7 +132,7 @@ impl DownstreamCallContext {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DownstreamCallKey {
     transport: DownstreamTransport,
-    session_id: Option<Arc<str>>,
+    client_id: Arc<str>,
     request_id: RequestId,
 }
 
@@ -126,10 +140,30 @@ impl From<&DownstreamCallContext> for DownstreamCallKey {
     fn from(value: &DownstreamCallContext) -> Self {
         Self {
             transport: value.transport,
-            session_id: value.session_id.clone(),
+            client_id: Arc::clone(&value.client_id),
             request_id: value.request_id.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UpstreamRequestKey {
+    server_id: String,
+    request_id: RequestId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UpstreamProgressKey {
+    server_id: String,
+    progress_token: ProgressToken,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveCallRecord {
+    downstream: DownstreamCallContext,
+    upstream_server_id: String,
+    upstream_request_id: Option<RequestId>,
+    progress_token: Option<ProgressToken>,
 }
 
 impl ToolRouter {
@@ -148,6 +182,8 @@ impl ToolRouter {
             protocol_notification_tx,
             active_calls: DashMap::new(),
             active_call_lookup: DashMap::new(),
+            upstream_request_lookup: DashMap::new(),
+            upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
@@ -218,6 +254,173 @@ impl ToolRouter {
     #[cfg(test)]
     pub(crate) fn active_call_count(&self) -> usize {
         self.active_calls.len()
+    }
+
+    fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
+        self.active_call_lookup
+            .insert(DownstreamCallKey::from(&record.downstream), call_id);
+        if let Some(request_id) = record.upstream_request_id.clone() {
+            self.upstream_request_lookup.insert(
+                UpstreamRequestKey {
+                    server_id: record.upstream_server_id.clone(),
+                    request_id,
+                },
+                call_id,
+            );
+        }
+        if let Some(progress_token) = record.progress_token.clone() {
+            self.upstream_progress_lookup.insert(
+                UpstreamProgressKey {
+                    server_id: record.upstream_server_id.clone(),
+                    progress_token,
+                },
+                call_id,
+            );
+        }
+        self.active_calls.insert(call_id, record);
+    }
+
+    fn attach_upstream_request_id(
+        &self,
+        call_id: u64,
+        server_id: &str,
+        request_id: RequestId,
+    ) {
+        if let Some(mut entry) = self.active_calls.get_mut(&call_id) {
+            entry.upstream_request_id = Some(request_id.clone());
+        }
+        self.upstream_request_lookup.insert(
+            UpstreamRequestKey {
+                server_id: server_id.to_string(),
+                request_id,
+            },
+            call_id,
+        );
+    }
+
+    fn remove_active_call(&self, call_id: u64) {
+        if let Some((_, record)) = self.active_calls.remove(&call_id) {
+            self.active_call_lookup
+                .remove(&DownstreamCallKey::from(&record.downstream));
+            if let Some(request_id) = record.upstream_request_id {
+                self.upstream_request_lookup.remove(&UpstreamRequestKey {
+                    server_id: record.upstream_server_id.clone(),
+                    request_id,
+                });
+            }
+            if let Some(progress_token) = record.progress_token {
+                self.upstream_progress_lookup.remove(&UpstreamProgressKey {
+                    server_id: record.upstream_server_id,
+                    progress_token,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn forward_cancel_from_downstream(
+        &self,
+        context: &DownstreamCallContext,
+        reason: Option<String>,
+    ) {
+        let Some(call_id) = self
+            .active_call_lookup
+            .get(&DownstreamCallKey::from(context))
+            .map(|entry| *entry)
+        else {
+            tracing::debug!(
+                transport = ?context.transport,
+                request_id = ?context.request_id,
+                "no active call found for downstream cancellation"
+            );
+            return;
+        };
+
+        let Some(record) = self.active_calls.get(&call_id).map(|entry| entry.clone()) else {
+            return;
+        };
+
+        let Some(upstream) = self.server_manager.get_upstream(&record.upstream_server_id) else {
+            tracing::warn!(
+                server = %record.upstream_server_id,
+                request_id = ?record.upstream_request_id,
+                "upstream missing during cancellation forward"
+            );
+            return;
+        };
+
+        let Some(request_id) = record.upstream_request_id.clone() else {
+            tracing::debug!(
+                server = %record.upstream_server_id,
+                "upstream request id not attached yet for downstream cancellation"
+            );
+            return;
+        };
+
+        let peer = upstream.client.peer().clone();
+        tokio::spawn(async move {
+            if let Err(error) = peer.notify_cancelled(CancelledNotificationParam {
+                request_id,
+                reason,
+            }).await {
+                tracing::warn!(error = %error, "failed to forward downstream cancellation upstream");
+            }
+        });
+    }
+
+    pub(crate) fn route_upstream_progress(
+        &self,
+        server_id: &str,
+        params: ProgressNotificationParam,
+    ) {
+        let key = UpstreamProgressKey {
+            server_id: server_id.to_string(),
+            progress_token: params.progress_token.clone(),
+        };
+        let Some(call_id) = self.upstream_progress_lookup.get(&key).map(|entry| *entry) else {
+            tracing::debug!(
+                server = %server_id,
+                progress_token = ?params.progress_token,
+                "no active call found for upstream progress"
+            );
+            return;
+        };
+
+        let Some(record) = self.active_calls.get(&call_id).map(|entry| entry.clone()) else {
+            return;
+        };
+
+        self.publish_protocol_notification(ProtocolNotification::Progress {
+            target: record.downstream.notification_target(),
+            params,
+        });
+    }
+
+    pub(crate) fn route_upstream_cancelled(
+        &self,
+        server_id: &str,
+        params: CancelledNotificationParam,
+    ) {
+        let key = UpstreamRequestKey {
+            server_id: server_id.to_string(),
+            request_id: params.request_id.clone(),
+        };
+        let Some(call_id) = self.upstream_request_lookup.get(&key).map(|entry| *entry) else {
+            tracing::debug!(
+                server = %server_id,
+                request_id = ?params.request_id,
+                "no active call found for upstream cancellation"
+            );
+            return;
+        };
+
+        let Some(record) = self.active_calls.get(&call_id).map(|entry| entry.clone()) else {
+            return;
+        };
+
+        self.publish_protocol_notification(ProtocolNotification::Cancelled {
+            target: record.downstream.notification_target(),
+            params,
+        });
     }
 
     /// Set the Engine reference for session recovery.
@@ -529,16 +732,18 @@ impl ToolRouter {
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_with_context(tool_name, arguments, None).await
+        self.call_tool_with_context(tool_name, arguments, None, None).await
     }
 
     pub async fn call_tool_with_context(
         &self,
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_inner(tool_name, arguments, downstream, false).await
+        self.call_tool_inner(tool_name, arguments, progress_token, downstream, false)
+            .await
     }
 
     /// Inner tool call implementation with retry support.
@@ -548,6 +753,7 @@ impl ToolRouter {
         &'a self,
         tool_name: &'a str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
         is_retry: bool,
     ) -> std::pin::Pin<
@@ -651,16 +857,43 @@ impl ToolRouter {
             if let Some(ref args) = arguments {
                 upstream_params = upstream_params.with_arguments(args.clone());
             }
+            if let Some(token) = progress_token.clone() {
+                upstream_params.set_progress_token(token);
+            }
+            let downstream_progress_token = upstream_params.progress_token();
 
-            // Emit ToolCallStarted event
+            let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
+            let options = PeerRequestOptions {
+                timeout: Some(timeout_duration),
+                meta: downstream_progress_token.clone().map(Meta::with_progress_token),
+            };
+
             let call_id = next_call_id();
             let server_id_arc = Arc::<str>::from(server_id.as_str());
             let tool_name_arc = Arc::<str>::from(original_name.as_str());
             if let Some(call_context) = downstream.clone() {
-                self.active_call_lookup
-                    .insert(DownstreamCallKey::from(&call_context), call_id);
-                self.active_calls.insert(call_id, call_context);
+                self.register_active_call(
+                    call_id,
+                    ActiveCallRecord {
+                        downstream: call_context,
+                        upstream_server_id: server_id.clone(),
+                        upstream_request_id: None,
+                        progress_token: downstream_progress_token.clone(),
+                    },
+                );
             }
+            let request_handle = peer
+                .send_cancellable_request(request, options)
+                .await
+                .map_err(|error| {
+                    self.remove_active_call(call_id);
+                    match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    }
+                })?;
+
+            self.attach_upstream_request_id(call_id, &server_id, request_handle.id.clone());
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(EngineEvent::ToolCallStarted {
                     call_id,
@@ -671,9 +904,8 @@ impl ToolRouter {
 
             let call_start = std::time::Instant::now();
 
-            // Execute with timeout
-            let result =
-                tokio::time::timeout(timeout_duration, peer.call_tool(upstream_params)).await;
+            // Execute with timeout via rmcp RequestHandle so we retain upstream request ID.
+            let result = request_handle.await_response().await;
 
             // Drop semaphore permit
             drop(permit);
@@ -684,15 +916,11 @@ impl ToolRouter {
             let cb = self.server_manager.circuit_breakers.get(&server_id);
 
             match result {
-                Ok(Ok(response)) => {
+                Ok(ServerResult::CallToolResult(response)) => {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
-                    if let Some(call_context) = downstream.as_ref() {
-                        self.active_call_lookup
-                            .remove(&DownstreamCallKey::from(call_context));
-                    }
-                    self.active_calls.remove(&call_id);
+                    self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -704,7 +932,7 @@ impl ToolRouter {
                     }
                     Ok(response)
                 }
-                Ok(Err(e)) if is_session_error(&e) && !is_retry => {
+                Err(e) if is_session_error(&e) && !is_retry => {
                     // Session/transport error on first attempt — try to reconnect and retry
                     tracing::warn!(
                         server = %server_id,
@@ -712,11 +940,7 @@ impl ToolRouter {
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
-                    if let Some(call_context) = downstream.as_ref() {
-                        self.active_call_lookup
-                            .remove(&DownstreamCallKey::from(call_context));
-                    }
-                    self.active_calls.remove(&call_id);
+                    self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -745,10 +969,34 @@ impl ToolRouter {
                     }
 
                     // Retry the tool call exactly once
-                    self.call_tool_inner(tool_name, arguments, downstream, true)
+                    self.call_tool_inner(tool_name, arguments, progress_token, downstream, true)
                         .await
                 }
-                Ok(Err(e)) => {
+                Err(rmcp::service::ServiceError::Timeout { timeout }) => {
+                    tracing::error!(
+                        server = %server_id,
+                        tool = %original_name,
+                        timeout_secs = timeout.as_secs(),
+                        "upstream tool call timed out"
+                    );
+                    self.remove_active_call(call_id);
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(EngineEvent::ToolCallCompleted {
+                            call_id,
+                            server_id: Arc::clone(&server_id_arc),
+                            tool_name: Arc::clone(&tool_name_arc),
+                            duration_ms,
+                            success: false,
+                        });
+                    }
+
+                    if matches!(transport_type, crate::config::TransportType::Stdio) {
+                        self.reconnect_server_in_background(server_id.clone());
+                    }
+
+                    Err(McpError::from(ProtocolError::Timeout { duration: timeout }))
+                }
+                Err(e) => {
                     tracing::error!(
                         server = %server_id,
                         tool = %original_name,
@@ -758,11 +1006,7 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
-                    if let Some(call_context) = downstream.as_ref() {
-                        self.active_call_lookup
-                            .remove(&DownstreamCallKey::from(call_context));
-                    }
-                    self.active_calls.remove(&call_id);
+                    self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -777,38 +1021,12 @@ impl ToolRouter {
                         other => Err(McpError::internal_error(other.to_string(), None)),
                     }
                 }
-                Err(_) => {
-                    tracing::error!(
-                        server = %server_id,
-                        tool = %original_name,
-                        timeout_secs = timeout_duration.as_secs(),
-                        "upstream tool call timed out"
-                    );
-                    // Timeouts do NOT trip the circuit breaker — a slow tool (e.g. Slack
-                    // conversations_unreads taking 2+ min) is not a server failure. Tripping
-                    // the CB here would lock out ALL tools on the server after a few slow calls.
-                    if let Some(call_context) = downstream.as_ref() {
-                        self.active_call_lookup
-                            .remove(&DownstreamCallKey::from(call_context));
-                    }
-                    self.active_calls.remove(&call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            server_id: server_id_arc,
-                            tool_name: tool_name_arc,
-                            duration_ms,
-                            success: false,
-                        });
-                    }
-
-                    if matches!(transport_type, crate::config::TransportType::Stdio) {
-                        self.reconnect_server_in_background(server_id.clone());
-                    }
-
-                    Err(McpError::from(ProtocolError::Timeout {
-                        duration: timeout_duration,
-                    }))
+                Ok(other) => {
+                    self.remove_active_call(call_id);
+                    Err(McpError::internal_error(
+                        format!("unexpected response type from upstream tool call: {other:?}"),
+                        None,
+                    ))
                 }
             }
         })
@@ -1036,6 +1254,7 @@ fn build_search_tools_meta_tool() -> Tool {
 pub struct ProxyHandler {
     router: Arc<ToolRouter>,
     client_type: std::sync::RwLock<ClientType>,
+    client_id: Arc<str>,
     notification_task_started: AtomicBool,
 }
 
@@ -1044,6 +1263,7 @@ impl ProxyHandler {
         Self {
             router: Arc::new(ToolRouter::new(server_manager, config)),
             client_type: std::sync::RwLock::new(ClientType::Unknown),
+            client_id: Arc::from(uuid::Uuid::new_v4().to_string()),
             notification_task_started: AtomicBool::new(false),
         }
     }
@@ -1053,6 +1273,7 @@ impl ProxyHandler {
         Self {
             router,
             client_type: std::sync::RwLock::new(ClientType::Unknown),
+            client_id: Arc::from(uuid::Uuid::new_v4().to_string()),
             notification_task_started: AtomicBool::new(false),
         }
     }
@@ -1065,6 +1286,11 @@ impl ProxyHandler {
     /// Get a reference to the underlying ToolRouter.
     pub fn router(&self) -> &Arc<ToolRouter> {
         &self.router
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_id(&self) -> Arc<str> {
+        Arc::clone(&self.client_id)
     }
 }
 
@@ -1111,6 +1337,7 @@ impl ServerHandler for ProxyHandler {
                 .is_ok()
             {
                 let peer: Peer<RoleServer> = context.peer.clone();
+                let client_id = Arc::clone(&self.client_id);
                 let mut rx = self.router.subscribe_notifications();
                 tokio::spawn(async move {
                     loop {
@@ -1121,6 +1348,26 @@ impl ServerHandler for ProxyHandler {
                                         error = %error,
                                         "stopping stdio notification fan-out after peer send failure"
                                     );
+                                    break;
+                                }
+                            }
+                            Ok(ProtocolNotification::Progress { target, params }) => {
+                                if matches!(
+                                    target,
+                                    NotificationTarget::Stdio { client_id: target_id }
+                                        if target_id == client_id
+                                ) && peer.notify_progress(params).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(ProtocolNotification::Cancelled { target, params }) => {
+                                if matches!(
+                                    target,
+                                    NotificationTarget::Stdio { client_id: target_id }
+                                        if target_id == client_id
+                                ) && peer.notify_cancelled(params).await.is_err()
+                                {
                                     break;
                                 }
                             }
@@ -1159,13 +1406,34 @@ impl ServerHandler for ProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
+            let progress_token = request.progress_token();
             self.router
                 .call_tool_with_context(
                     request.name.as_ref(),
                     request.arguments,
-                    Some(DownstreamCallContext::stdio(context.id.clone())),
+                    progress_token,
+                    Some(DownstreamCallContext::stdio(
+                        Arc::clone(&self.client_id),
+                        context.id.clone(),
+                    )),
                 )
                 .await
+        }
+    }
+
+    fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        async move {
+            self.router.forward_cancel_from_downstream(
+                &DownstreamCallContext::stdio(
+                    Arc::clone(&self.client_id),
+                    notification.request_id.clone(),
+                ),
+                notification.reason,
+            );
         }
     }
 
@@ -1564,5 +1832,51 @@ mod tests {
             err.message.contains("server overloaded"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_upstream_progress_publishes_targeted_notification() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let mut rx = router.subscribe_notifications();
+        let progress_token = ProgressToken(NumberOrString::String(Arc::from("progress-1")));
+
+        router.register_active_call(
+            42,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-1"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "upstream".to_string(),
+                upstream_request_id: None,
+                progress_token: Some(progress_token.clone()),
+            },
+        );
+
+        router.route_upstream_progress(
+            "upstream",
+            ProgressNotificationParam::new(progress_token.clone(), 0.5)
+                .with_message("halfway"),
+        );
+
+        let notification = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("notification arrives")
+            .expect("notification channel open");
+
+        match notification {
+            ProtocolNotification::Progress { target, params } => {
+                assert_eq!(
+                    target,
+                    NotificationTarget::Stdio {
+                        client_id: Arc::from("client-1"),
+                    }
+                );
+                assert_eq!(params.progress_token, progress_token);
+                assert_eq!(params.message.as_deref(), Some("halfway"));
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
     }
 }

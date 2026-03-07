@@ -18,6 +18,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use super::error::HttpError;
 use super::session::SessionManager;
 use super::sse::sse_stream;
+use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 
 /// rmcp header constant for session ID.
@@ -58,7 +59,43 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                state.sessions.broadcast(notification.to_json_value());
+                                match notification {
+                                    ProtocolNotification::ToolListChanged => {
+                                        state.sessions.broadcast(
+                                            ProtocolNotification::ToolListChanged.to_json_value(),
+                                        );
+                                    }
+                                    ProtocolNotification::Progress { target, params } => {
+                                        if let NotificationTarget::Http { session_id } = target {
+                                            let session_key = session_id.to_string();
+                                            state.sessions.send_to_session(
+                                                &session_key,
+                                                ProtocolNotification::Progress {
+                                                    target: NotificationTarget::Http {
+                                                        session_id,
+                                                    },
+                                                    params,
+                                                }
+                                                .to_json_value(),
+                                            );
+                                        }
+                                    }
+                                    ProtocolNotification::Cancelled { target, params } => {
+                                        if let NotificationTarget::Http { session_id } = target {
+                                            let session_key = session_id.to_string();
+                                            state.sessions.send_to_session(
+                                                &session_key,
+                                                ProtocolNotification::Cancelled {
+                                                    target: NotificationTarget::Http {
+                                                        session_id,
+                                                    },
+                                                    params,
+                                                }
+                                                .to_json_value(),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
@@ -157,9 +194,18 @@ async fn post_mcp(
             validate_session_header(&headers, &state.sessions)?;
             Ok(StatusCode::ACCEPTED.into_response())
         }
-        JsonRpcMessage::Notification(_) => {
-            // Notification (e.g. initialized, cancelled) — validate session
+        JsonRpcMessage::Notification(notification) => {
+            let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, &state.sessions)?;
+            if let ClientNotification::CancelledNotification(cancelled) = notification.notification {
+                state.router.forward_cancel_from_downstream(
+                    &DownstreamCallContext::http(
+                        Arc::<str>::from(session_id.as_str()),
+                        cancelled.params.request_id.clone(),
+                    ),
+                    cancelled.params.reason,
+                );
+            }
             Ok(StatusCode::ACCEPTED.into_response())
         }
         JsonRpcMessage::Error(_) => Err(HttpError::BadRequest(
@@ -318,11 +364,13 @@ async fn handle_request(
         ClientRequest::CallToolRequest(call_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, &state.sessions)?;
+            let progress_token = call_req.params.progress_token();
             match state
                 .router
                 .call_tool_with_context(
                     call_req.params.name.as_ref(),
                     call_req.params.arguments,
+                    progress_token,
                     Some(DownstreamCallContext::http(
                         Arc::<str>::from(session_id.as_str()),
                         request_id.clone(),
@@ -1035,6 +1083,76 @@ mod tests {
                 .iter()
                 .any(|event| event.contains("notifications/tools/list_changed")),
             "expected SSE stream to contain tools/list_changed notification, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_progress_reaches_http_sse_session() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::Progress {
+                target: crate::notifications::NotificationTarget::Http {
+                    session_id: Arc::from(session_id),
+                },
+                params: ProgressNotificationParam::new(
+                    ProgressToken(NumberOrString::String(Arc::from("http-progress"))),
+                    0.5,
+                )
+                .with_message("halfway"),
+            },
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events.iter().any(|event| {
+                event.contains("notifications/progress")
+                    && event.contains("http-progress")
+                    && event.contains("halfway")
+            }),
+            "expected SSE stream to contain targeted progress notification, got {events:?}"
         );
     }
 }
