@@ -261,7 +261,7 @@ mod tests {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+            tool_groups: Vec::new(),
         }
     }
 
@@ -334,26 +334,31 @@ mod tests {
     #[test]
     fn diff_marks_router_settings_restart_required() {
         let old = Config::default();
-        let mut new = Config::default();
-        new.priority_tools = vec!["plug__search_tools".into()];
-        new.tool_description_max_chars = Some(128);
-        new.tool_filter_enabled = false;
+        let new = Config {
+            priority_tools: vec!["plug__search_tools".into()],
+            tool_description_max_chars: Some(128),
+            tool_filter_enabled: false,
+            ..Config::default()
+        };
 
         let diff = diff_configs(&old, &new);
 
         assert!(diff.settings_changed);
-        assert!(diff
-            .restart_required
-            .iter()
-            .any(|item| item.contains("priority_tools")));
-        assert!(diff
-            .restart_required
-            .iter()
-            .any(|item| item.contains("tool_description_max_chars")));
-        assert!(diff
-            .restart_required
-            .iter()
-            .any(|item| item.contains("tool_filter_enabled")));
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("priority_tools"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("tool_description_max_chars"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("tool_filter_enabled"))
+        );
     }
 
     #[test]
@@ -367,18 +372,21 @@ mod tests {
         let diff = diff_configs(&old, &new);
 
         assert!(diff.settings_changed);
-        assert!(diff
-            .restart_required
-            .iter()
-            .any(|item| item.contains("http.session_timeout_secs")));
-        assert!(diff
-            .restart_required
-            .iter()
-            .any(|item| item.contains("http.max_sessions")));
-        assert!(diff
-            .restart_required
-            .iter()
-            .any(|item| item.contains("http.sse_channel_capacity")));
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("http.session_timeout_secs"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("http.max_sessions"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("http.sse_channel_capacity"))
+        );
     }
 
     #[test]

@@ -240,14 +240,12 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
             vec![home.join(".config/zed/settings.json")]
         }
         ClientSource::Cline => {
-            vec![
-                home.join(".vscode/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
-            ]
+            vec![home.join(
+                ".vscode/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+            )]
         }
         ClientSource::ClineCli => {
-            vec![
-                home.join(".cline/data/settings/cline_mcp_settings.json"),
-            ]
+            vec![home.join(".cline/data/settings/cline_mcp_settings.json")]
         }
         ClientSource::RooCode => {
             vec![
@@ -390,8 +388,8 @@ fn parse_yaml_mcp_extensions(
     source: ClientSource,
     key: &str,
 ) -> Result<Vec<DiscoveredServer>, String> {
-    let value: serde_yml::Value = serde_yml::from_str(content)
-        .map_err(|e| format!("YAML parse error: {e}"))?;
+    let value: serde_yml::Value =
+        serde_yml::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
 
     let servers_obj = match value.get(key).and_then(|v| v.as_mapping()) {
         Some(s) => s,
@@ -431,7 +429,10 @@ fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig>
         _ => return None,
     };
 
-    let command = obj.get("command").and_then(|v| v.as_str()).map(String::from);
+    let command = obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let args = obj
         .get("args")
         .and_then(|v| v.as_sequence())
@@ -442,7 +443,11 @@ fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig>
         })
         .unwrap_or_default();
 
-    let url = obj.get("uri").or_else(|| obj.get("url")).and_then(|v| v.as_str()).map(String::from);
+    let url = obj
+        .get("uri")
+        .or_else(|| obj.get("url"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let env = obj
         .get("env")
@@ -851,16 +856,22 @@ pub fn unlink_toml(content: &str) -> String {
     let mut skipping = false;
     for line in content.lines() {
         let trimmed = line.trim();
-        
+
         // Start skipping if we hit any variation of the plug header
-        if trimmed == "[mcp_servers.plug]" || trimmed == "[[mcp_servers.plug]]" || trimmed == "[mcp_servers.\"plug\"]" {
+        if trimmed == "[mcp_servers.plug]"
+            || trimmed == "[[mcp_servers.plug]]"
+            || trimmed == "[mcp_servers.\"plug\"]"
+        {
             skipping = true;
             continue;
         }
 
         if skipping {
             // Stop skipping ONLY if we hit a new header that is NOT a plug header
-            if trimmed.starts_with('[') && !trimmed.contains(".plug") && !trimmed.contains("\"plug\"") {
+            if trimmed.starts_with('[')
+                && !trimmed.contains(".plug")
+                && !trimmed.contains("\"plug\"")
+            {
                 skipping = false;
             } else {
                 // Still skipping: either it's more plug config or another duplicate plug header
@@ -1137,7 +1148,7 @@ GITHUB_TOKEN = "$GITHUB_TOKEN"
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+            tool_groups: Vec::new(),
         }
     }
 }

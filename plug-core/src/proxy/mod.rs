@@ -142,8 +142,10 @@ impl ToolRouter {
             let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
             // 3. Determine prefix and tool name via rules or server name
-            let tool_group_rules: Option<Vec<crate::config::ToolGroupRule>> =
-                self.server_manager.get_upstream(&server_name).and_then(|u| {
+            let tool_group_rules: Option<Vec<crate::config::ToolGroupRule>> = self
+                .server_manager
+                .get_upstream(&server_name)
+                .and_then(|u| {
                     if !u.config.tool_groups.is_empty() {
                         Some(u.config.tool_groups.clone())
                     } else if server_name == "workspace" {
@@ -157,13 +159,15 @@ impl ToolRouter {
                 if let Some(ref rules) = tool_group_rules {
                     match crate::tool_naming::classify_with_rules(&sanitized, rules) {
                         Some(result) => {
-                            let stripped = crate::tool_naming::strip_keywords(&result.name, &result.strip_keywords);
+                            let stripped = crate::tool_naming::strip_keywords(
+                                &result.name,
+                                &result.strip_keywords,
+                            );
                             let has_strip = !result.strip_keywords.is_empty();
                             (result.prefix, result.name, stripped, has_strip)
                         }
                         None => {
-                            let prefix =
-                                crate::tool_naming::format_server_prefix(&server_name);
+                            let prefix = crate::tool_naming::format_server_prefix(&server_name);
                             (prefix, sanitized.clone(), sanitized.clone(), false)
                         }
                     }
@@ -375,227 +379,234 @@ impl ToolRouter {
         tool_name: &'a str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         is_retry: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
+    > {
         Box::pin(async move {
-        // Intercept search_tools meta-tool (case-insensitive for LLM casing drift)
-        if tool_name.eq_ignore_ascii_case("plug__search_tools") {
-            return self.handle_search_tools(arguments.clone());
-        }
-
-        // Look up the server and original name for this exposed tool name
-        let cache = self.cache.load();
-        let (server_id, original_name) = cache
-            .routes
-            .get(tool_name)
-            .or_else(|| {
-                // Case-insensitive fallback for LLM casing drift
-                // (e.g. "slack__search_messages" → "Slack__search_messages")
-                cache.routes.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(tool_name))
-                    .map(|(_, v)| v)
-            })
-            .ok_or_else(|| {
-                McpError::from(ProtocolError::ToolNotFound {
-                    tool_name: tool_name.to_string(),
-                })
-            })?;
-
-        let server_id = server_id.clone();
-        let original_name = original_name.to_string();
-        drop(cache);
-
-        // Health gate — reject calls to Failed servers
-        let health_ok = self
-            .server_manager
-            .health
-            .get(&server_id)
-            .map(|h| h.health != ServerHealth::Failed)
-            .unwrap_or(true);
-        if !health_ok {
-            return Err(McpError::from(ProtocolError::ServerUnavailable {
-                server_id: server_id.clone(),
-            }));
-        }
-
-        // Circuit breaker gate
-        if let Some(cb) = self.server_manager.circuit_breakers.get(&server_id) {
-            cb.call_allowed().map_err(|_: CircuitBreakerError| {
-                McpError::from(ProtocolError::ServerUnavailable {
-                    server_id: server_id.clone(),
-                })
-            })?;
-        }
-
-        // Acquire concurrency semaphore
-        let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
-            Some(sem.clone().acquire_owned().await.map_err(|_| {
-                McpError::from(ProtocolError::ServerUnavailable {
-                    server_id: server_id.clone(),
-                })
-            })?)
-        } else {
-            None
-        };
-
-        // Get the upstream server
-        let upstream = self
-            .server_manager
-            .get_upstream(&server_id)
-            .ok_or_else(|| {
-                McpError::from(ProtocolError::ServerUnavailable {
-                    server_id: server_id.clone(),
-                })
-            })?;
-
-        let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
-        let peer = upstream.client.peer().clone();
-        drop(upstream); // Release Arc early
-
-        // Build the upstream call with the original (unprefixed) tool name
-        let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-        if let Some(ref args) = arguments {
-            upstream_params = upstream_params.with_arguments(args.clone());
-        }
-
-        // Emit ToolCallStarted event
-        let call_id = next_call_id();
-        let server_id_arc = Arc::<str>::from(server_id.as_str());
-        let tool_name_arc = Arc::<str>::from(original_name.as_str());
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(EngineEvent::ToolCallStarted {
-                call_id,
-                server_id: Arc::clone(&server_id_arc),
-                tool_name: Arc::clone(&tool_name_arc),
-            });
-        }
-
-        let call_start = std::time::Instant::now();
-
-        // Execute with timeout
-        let result = tokio::time::timeout(timeout_duration, peer.call_tool(upstream_params)).await;
-
-        // Drop semaphore permit
-        drop(permit);
-
-        let duration_ms = call_start.elapsed().as_millis() as u64;
-
-        // Record circuit breaker outcome
-        let cb = self.server_manager.circuit_breakers.get(&server_id);
-
-        match result {
-            Ok(Ok(response)) => {
-                if let Some(cb) = &cb {
-                    cb.on_success();
-                }
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(EngineEvent::ToolCallCompleted {
-                        call_id,
-                        server_id: Arc::clone(&server_id_arc),
-                        tool_name: Arc::clone(&tool_name_arc),
-                        duration_ms,
-                        success: true,
-                    });
-                }
-                Ok(response)
+            // Intercept search_tools meta-tool (case-insensitive for LLM casing drift)
+            if tool_name.eq_ignore_ascii_case("plug__search_tools") {
+                return self.handle_search_tools(arguments.clone());
             }
-            Ok(Err(e)) if is_session_error(&e) && !is_retry => {
-                // Session/transport error on first attempt — try to reconnect and retry
-                tracing::warn!(
-                    server = %server_id,
-                    tool = %original_name,
-                    error = %e,
-                    "session error detected, attempting reconnect"
-                );
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(EngineEvent::ToolCallCompleted {
-                        call_id,
-                        server_id: Arc::clone(&server_id_arc),
-                        tool_name: Arc::clone(&tool_name_arc),
-                        duration_ms,
-                        success: false,
-                    });
-                }
 
-                // Attempt reconnect via Engine (AtomicBool prevents stampede)
-                let engine_ref = self.engine.read().ok().and_then(|g| {
-                    g.as_ref().and_then(|w| w.upgrade())
+            // Look up the server and original name for this exposed tool name
+            let cache = self.cache.load();
+            let (server_id, original_name) = cache
+                .routes
+                .get(tool_name)
+                .or_else(|| {
+                    // Case-insensitive fallback for LLM casing drift
+                    // (e.g. "slack__search_messages" → "Slack__search_messages")
+                    cache
+                        .routes
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(tool_name))
+                        .map(|(_, v)| v)
+                })
+                .ok_or_else(|| {
+                    McpError::from(ProtocolError::ToolNotFound {
+                        tool_name: tool_name.to_string(),
+                    })
+                })?;
+
+            let server_id = server_id.clone();
+            let original_name = original_name.to_string();
+            drop(cache);
+
+            // Health gate — reject calls to Failed servers
+            let health_ok = self
+                .server_manager
+                .health
+                .get(&server_id)
+                .map(|h| h.health != ServerHealth::Failed)
+                .unwrap_or(true);
+            if !health_ok {
+                return Err(McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                }));
+            }
+
+            // Circuit breaker gate
+            if let Some(cb) = self.server_manager.circuit_breakers.get(&server_id) {
+                cb.call_allowed().map_err(|_: CircuitBreakerError| {
+                    McpError::from(ProtocolError::ServerUnavailable {
+                        server_id: server_id.clone(),
+                    })
+                })?;
+            }
+
+            // Acquire concurrency semaphore
+            let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
+                Some(sem.clone().acquire_owned().await.map_err(|_| {
+                    McpError::from(ProtocolError::ServerUnavailable {
+                        server_id: server_id.clone(),
+                    })
+                })?)
+            } else {
+                None
+            };
+
+            // Get the upstream server
+            let upstream = self
+                .server_manager
+                .get_upstream(&server_id)
+                .ok_or_else(|| {
+                    McpError::from(ProtocolError::ServerUnavailable {
+                        server_id: server_id.clone(),
+                    })
+                })?;
+
+            let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
+            let peer = upstream.client.peer().clone();
+            drop(upstream); // Release Arc early
+
+            // Build the upstream call with the original (unprefixed) tool name
+            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
+            if let Some(ref args) = arguments {
+                upstream_params = upstream_params.with_arguments(args.clone());
+            }
+
+            // Emit ToolCallStarted event
+            let call_id = next_call_id();
+            let server_id_arc = Arc::<str>::from(server_id.as_str());
+            let tool_name_arc = Arc::<str>::from(original_name.as_str());
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx.send(EngineEvent::ToolCallStarted {
+                    call_id,
+                    server_id: Arc::clone(&server_id_arc),
+                    tool_name: Arc::clone(&tool_name_arc),
                 });
-                if let Some(engine) = engine_ref {
-                    match engine.reconnect_server(&server_id).await {
-                        Ok(()) => {
-                            tracing::info!(server = %server_id, "reconnected, retrying tool call");
-                        }
-                        Err(reconnect_err) => {
-                            tracing::error!(
-                                server = %server_id,
-                                error = %reconnect_err,
-                                "reconnect failed, returning original error"
-                            );
-                            if let Some(cb) = &cb {
-                                cb.on_failure();
-                            }
-                            return Err(McpError::internal_error(e.to_string(), None));
-                        }
+            }
+
+            let call_start = std::time::Instant::now();
+
+            // Execute with timeout
+            let result =
+                tokio::time::timeout(timeout_duration, peer.call_tool(upstream_params)).await;
+
+            // Drop semaphore permit
+            drop(permit);
+
+            let duration_ms = call_start.elapsed().as_millis() as u64;
+
+            // Record circuit breaker outcome
+            let cb = self.server_manager.circuit_breakers.get(&server_id);
+
+            match result {
+                Ok(Ok(response)) => {
+                    if let Some(cb) = &cb {
+                        cb.on_success();
                     }
-                } else {
-                    // No Engine reference — can't reconnect, return error
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(EngineEvent::ToolCallCompleted {
+                            call_id,
+                            server_id: Arc::clone(&server_id_arc),
+                            tool_name: Arc::clone(&tool_name_arc),
+                            duration_ms,
+                            success: true,
+                        });
+                    }
+                    Ok(response)
+                }
+                Ok(Err(e)) if is_session_error(&e) && !is_retry => {
+                    // Session/transport error on first attempt — try to reconnect and retry
+                    tracing::warn!(
+                        server = %server_id,
+                        tool = %original_name,
+                        error = %e,
+                        "session error detected, attempting reconnect"
+                    );
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(EngineEvent::ToolCallCompleted {
+                            call_id,
+                            server_id: Arc::clone(&server_id_arc),
+                            tool_name: Arc::clone(&tool_name_arc),
+                            duration_ms,
+                            success: false,
+                        });
+                    }
+
+                    // Attempt reconnect via Engine (AtomicBool prevents stampede)
+                    let engine_ref = self
+                        .engine
+                        .read()
+                        .ok()
+                        .and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
+                    if let Some(engine) = engine_ref {
+                        match engine.reconnect_server(&server_id).await {
+                            Ok(()) => {
+                                tracing::info!(server = %server_id, "reconnected, retrying tool call");
+                            }
+                            Err(reconnect_err) => {
+                                tracing::error!(
+                                    server = %server_id,
+                                    error = %reconnect_err,
+                                    "reconnect failed, returning original error"
+                                );
+                                if let Some(cb) = &cb {
+                                    cb.on_failure();
+                                }
+                                return Err(McpError::internal_error(e.to_string(), None));
+                            }
+                        }
+                    } else {
+                        // No Engine reference — can't reconnect, return error
+                        if let Some(cb) = &cb {
+                            cb.on_failure();
+                        }
+                        return Err(McpError::internal_error(e.to_string(), None));
+                    }
+
+                    // Retry the tool call exactly once
+                    self.call_tool_inner(tool_name, arguments, true).await
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        server = %server_id,
+                        tool = %original_name,
+                        error = %e,
+                        "upstream tool call failed"
+                    );
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
-                    return Err(McpError::internal_error(e.to_string(), None));
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(EngineEvent::ToolCallCompleted {
+                            call_id,
+                            server_id: Arc::clone(&server_id_arc),
+                            tool_name: Arc::clone(&tool_name_arc),
+                            duration_ms,
+                            success: false,
+                        });
+                    }
+                    match e {
+                        rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
+                        other => Err(McpError::internal_error(other.to_string(), None)),
+                    }
                 }
-
-                // Retry the tool call exactly once
-                self.call_tool_inner(tool_name, arguments, true).await
+                Err(_) => {
+                    tracing::error!(
+                        server = %server_id,
+                        tool = %original_name,
+                        timeout_secs = timeout_duration.as_secs(),
+                        "upstream tool call timed out"
+                    );
+                    // Timeouts do NOT trip the circuit breaker — a slow tool (e.g. Slack
+                    // conversations_unreads taking 2+ min) is not a server failure. Tripping
+                    // the CB here would lock out ALL tools on the server after a few slow calls.
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(EngineEvent::ToolCallCompleted {
+                            call_id,
+                            server_id: server_id_arc,
+                            tool_name: tool_name_arc,
+                            duration_ms,
+                            success: false,
+                        });
+                    }
+                    Err(McpError::from(ProtocolError::Timeout {
+                        duration: timeout_duration,
+                    }))
+                }
             }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    server = %server_id,
-                    tool = %original_name,
-                    error = %e,
-                    "upstream tool call failed"
-                );
-                if let Some(cb) = &cb {
-                    cb.on_failure();
-                }
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(EngineEvent::ToolCallCompleted {
-                        call_id,
-                        server_id: Arc::clone(&server_id_arc),
-                        tool_name: Arc::clone(&tool_name_arc),
-                        duration_ms,
-                        success: false,
-                    });
-                }
-                match e {
-                    rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
-                    other => Err(McpError::internal_error(other.to_string(), None)),
-                }
-            }
-            Err(_) => {
-                tracing::error!(
-                    server = %server_id,
-                    tool = %original_name,
-                    timeout_secs = timeout_duration.as_secs(),
-                    "upstream tool call timed out"
-                );
-                // Timeouts do NOT trip the circuit breaker — a slow tool (e.g. Slack
-                // conversations_unreads taking 2+ min) is not a server failure. Tripping
-                // the CB here would lock out ALL tools on the server after a few slow calls.
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(EngineEvent::ToolCallCompleted {
-                        call_id,
-                        server_id: server_id_arc,
-                        tool_name: tool_name_arc,
-                        duration_ms,
-                        success: false,
-                    });
-                }
-                Err(McpError::from(ProtocolError::Timeout {
-                    duration: timeout_duration,
-                }))
-            }
-        }
         })
     }
 
@@ -744,7 +755,9 @@ fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> std::cmp::Ord
 
 fn is_disabled_tool(patterns: &[String], tool_name: &str) -> bool {
     let tool_name = tool_name.to_ascii_lowercase();
-    patterns.iter().any(|pattern| wildcard_match(&pattern.to_ascii_lowercase(), &tool_name))
+    patterns
+        .iter()
+        .any(|pattern| wildcard_match(&pattern.to_ascii_lowercase(), &tool_name))
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -1023,10 +1036,22 @@ mod tests {
 
     #[test]
     fn disabled_tool_patterns_support_exact_and_wildcard_matches() {
-        assert!(is_disabled_tool(&["slack__search_messages".into()], "Slack__search_messages"));
-        assert!(is_disabled_tool(&["slack__*".into()], "Slack__search_messages"));
-        assert!(is_disabled_tool(&["*search*".into()], "Slack__search_messages"));
-        assert!(!is_disabled_tool(&["gmail__*".into()], "Slack__search_messages"));
+        assert!(is_disabled_tool(
+            &["slack__search_messages".into()],
+            "Slack__search_messages"
+        ));
+        assert!(is_disabled_tool(
+            &["slack__*".into()],
+            "Slack__search_messages"
+        ));
+        assert!(is_disabled_tool(
+            &["*search*".into()],
+            "Slack__search_messages"
+        ));
+        assert!(!is_disabled_tool(
+            &["gmail__*".into()],
+            "Slack__search_messages"
+        ));
     }
 
     #[test]
@@ -1238,7 +1263,10 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert(
             "Slack__search_messages".to_string(),
-            ("slack".to_string(), "conversations_search_messages".to_string()),
+            (
+                "slack".to_string(),
+                "conversations_search_messages".to_string(),
+            ),
         );
 
         router.cache.store(Arc::new(RouterSnapshot {
@@ -1250,11 +1278,13 @@ mod tests {
 
         let snapshot = router.cache.load();
         // Exact match works
-        assert!(snapshot.routes.get("Slack__search_messages").is_some());
+        assert!(snapshot.routes.contains_key("Slack__search_messages"));
         // Case-insensitive fallback works
         let lower = "slack__search_messages";
         let found = snapshot.routes.get(lower).or_else(|| {
-            snapshot.routes.iter()
+            snapshot
+                .routes
+                .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(lower))
                 .map(|(_, v)| v)
         });

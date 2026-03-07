@@ -109,7 +109,6 @@ pub fn build_wire_name(server_prefix: &str, tool_name: &str, delimiter: &str) ->
     format!("{}{}{}", server_prefix, delimiter, tool_name)
 }
 
-
 /// Result of classifying a tool with rules.
 pub struct ClassifyResult {
     /// The group prefix (e.g. "Gmail", "GoogleDrive").
@@ -127,7 +126,11 @@ pub fn classify_with_rules(
     rules: &[crate::config::ToolGroupRule],
 ) -> Option<ClassifyResult> {
     for rule in rules {
-        if rule.contains.iter().any(|kw| tool_name.contains(kw.as_str())) {
+        if rule
+            .contains
+            .iter()
+            .any(|kw| tool_name.contains(kw.as_str()))
+        {
             return Some(ClassifyResult {
                 prefix: rule.prefix.clone(),
                 name: tool_name.to_string(),
@@ -232,19 +235,100 @@ pub fn strip_keyword_from_title(title_part: &str, keyword: &str) -> String {
 pub fn default_workspace_rules() -> Vec<crate::config::ToolGroupRule> {
     use crate::config::ToolGroupRule;
     vec![
-        ToolGroupRule { prefix: "Gmail".into(), contains: vec!["gmail".into()], strip: vec!["gmail".into()] },
-        ToolGroupRule { prefix: "GoogleDrive".into(), contains: vec!["drive".into()], strip: vec!["drive".into()] },
-        ToolGroupRule { prefix: "GoogleSheets".into(), contains: vec!["spreadsheet".into(), "sheet".into(), "conditional_formatting".into()], strip: vec!["spreadsheet".into(), "sheet".into()] },
-        ToolGroupRule { prefix: "GoogleSlides".into(), contains: vec!["presentation".into(), "page_thumbnail".into(), "get_page".into()], strip: vec!["presentation".into()] },
-        ToolGroupRule { prefix: "GoogleDocs".into(), contains: vec!["_doc".into(), "doc_".into(), "document".into(), "paragraph".into(), "table_with_data".into(), "table_structure".into(), "find_and_replace".into()], strip: vec!["doc".into(), "document".into()] },
-        ToolGroupRule { prefix: "GoogleCalendar".into(), contains: vec!["event".into(), "calendar".into(), "freebusy".into()], strip: vec!["calendar".into()] },
-        ToolGroupRule { prefix: "GoogleContacts".into(), contains: vec!["contact".into()], strip: vec!["contact".into(), "contacts".into()] },
-        ToolGroupRule { prefix: "GoogleTasks".into(), contains: vec!["task".into()], strip: vec!["task".into(), "tasks".into()] },
-        ToolGroupRule { prefix: "GoogleChat".into(), contains: vec!["spaces".into(), "reaction".into(), "chat_".into(), "send_message".into(), "get_messages".into(), "search_messages".into()], strip: vec!["chat".into()] },
-        ToolGroupRule { prefix: "GoogleForms".into(), contains: vec!["form".into()], strip: vec!["form".into()] },
-        ToolGroupRule { prefix: "GoogleAppsScript".into(), contains: vec!["script".into(), "deployment".into(), "version".into(), "trigger_code".into(), "publish_settings".into()], strip: vec!["script".into()] },
-        ToolGroupRule { prefix: "GoogleAuth".into(), contains: vec!["google_auth".into()], strip: vec!["google_auth".into()] },
-        ToolGroupRule { prefix: "GoogleSearch".into(), contains: vec!["search_engine".into(), "search_custom".into()], strip: vec![] },
+        ToolGroupRule {
+            prefix: "Gmail".into(),
+            contains: vec!["gmail".into()],
+            strip: vec!["gmail".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleDrive".into(),
+            contains: vec!["drive".into()],
+            strip: vec!["drive".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleSheets".into(),
+            contains: vec![
+                "spreadsheet".into(),
+                "sheet".into(),
+                "conditional_formatting".into(),
+            ],
+            strip: vec!["spreadsheet".into(), "sheet".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleSlides".into(),
+            contains: vec![
+                "presentation".into(),
+                "page_thumbnail".into(),
+                "get_page".into(),
+            ],
+            strip: vec!["presentation".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleDocs".into(),
+            contains: vec![
+                "_doc".into(),
+                "doc_".into(),
+                "document".into(),
+                "paragraph".into(),
+                "table_with_data".into(),
+                "table_structure".into(),
+                "find_and_replace".into(),
+            ],
+            strip: vec!["doc".into(), "document".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleCalendar".into(),
+            contains: vec!["event".into(), "calendar".into(), "freebusy".into()],
+            strip: vec!["calendar".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleContacts".into(),
+            contains: vec!["contact".into()],
+            strip: vec!["contact".into(), "contacts".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleTasks".into(),
+            contains: vec!["task".into()],
+            strip: vec!["task".into(), "tasks".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleChat".into(),
+            contains: vec![
+                "spaces".into(),
+                "reaction".into(),
+                "chat_".into(),
+                "send_message".into(),
+                "get_messages".into(),
+                "search_messages".into(),
+            ],
+            strip: vec!["chat".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleForms".into(),
+            contains: vec!["form".into()],
+            strip: vec!["form".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleAppsScript".into(),
+            contains: vec![
+                "script".into(),
+                "deployment".into(),
+                "version".into(),
+                "trigger_code".into(),
+                "publish_settings".into(),
+            ],
+            strip: vec!["script".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleAuth".into(),
+            contains: vec!["google_auth".into()],
+            strip: vec!["google_auth".into()],
+        },
+        ToolGroupRule {
+            prefix: "GoogleSearch".into(),
+            contains: vec!["search_engine".into(), "search_custom".into()],
+            strip: vec![],
+        },
     ]
 }
 
@@ -373,18 +457,12 @@ mod tests {
     fn sanitize_camel_case_to_snake() {
         assert_eq!(sanitize_tool_name("listProjects"), "list_projects");
         assert_eq!(sanitize_tool_name("whoAmI"), "who_am_i");
-        assert_eq!(
-            sanitize_tool_name("getHTTPResponse"),
-            "get_http_response"
-        );
+        assert_eq!(sanitize_tool_name("getHTTPResponse"), "get_http_response");
     }
 
     #[test]
     fn sanitize_dots_to_underscores() {
-        assert_eq!(
-            sanitize_tool_name("admin.tools.list"),
-            "admin_tools_list"
-        );
+        assert_eq!(sanitize_tool_name("admin.tools.list"), "admin_tools_list");
     }
 
     #[test]
@@ -400,14 +478,8 @@ mod tests {
 
     #[test]
     fn sanitize_mixed() {
-        assert_eq!(
-            sanitize_tool_name("fetch-graph-data"),
-            "fetch_graph_data"
-        );
-        assert_eq!(
-            sanitize_tool_name("get-documentation"),
-            "get_documentation"
-        );
+        assert_eq!(sanitize_tool_name("fetch-graph-data"), "fetch_graph_data");
+        assert_eq!(sanitize_tool_name("get-documentation"), "get_documentation");
     }
 
     #[test]
@@ -721,8 +793,16 @@ mod tests {
     fn classify_with_custom_rules() {
         use crate::config::ToolGroupRule;
         let rules = vec![
-            ToolGroupRule { prefix: "Outlook".into(), contains: vec!["mail".into(), "outlook".into()], strip: vec!["mail".into()] },
-            ToolGroupRule { prefix: "Teams".into(), contains: vec!["teams".into(), "channel".into()], strip: vec!["teams".into()] },
+            ToolGroupRule {
+                prefix: "Outlook".into(),
+                contains: vec!["mail".into(), "outlook".into()],
+                strip: vec!["mail".into()],
+            },
+            ToolGroupRule {
+                prefix: "Teams".into(),
+                contains: vec!["teams".into(), "channel".into()],
+                strip: vec!["teams".into()],
+            },
         ];
         let r = classify_with_rules("send_mail", &rules).unwrap();
         assert_eq!(r.prefix, "Outlook");
@@ -740,20 +820,38 @@ mod tests {
     #[test]
     fn strip_keywords_applies_strip_list() {
         // Gmail: strip "gmail"
-        assert_eq!(strip_keywords("get_gmail_message_content", &["gmail".into()]), "get_message_content");
+        assert_eq!(
+            strip_keywords("get_gmail_message_content", &["gmail".into()]),
+            "get_message_content"
+        );
         // GoogleCalendar: strip "calendar" but NOT "event"
-        assert_eq!(strip_keywords("list_calendars", &["calendar".into()]), "list_calendars"); // "calendars" != "calendar" at word boundary
-        assert_eq!(strip_keywords("manage_event", &["calendar".into()]), "manage_event"); // no match
+        assert_eq!(
+            strip_keywords("list_calendars", &["calendar".into()]),
+            "list_calendars"
+        ); // "calendars" != "calendar" at word boundary
+        assert_eq!(
+            strip_keywords("manage_event", &["calendar".into()]),
+            "manage_event"
+        ); // no match
         // GoogleAppsScript: strip "script" but NOT "version"/"deployment"
-        assert_eq!(strip_keywords("run_script_function", &["script".into()]), "run_function");
-        assert_eq!(strip_keywords("create_version", &["script".into()]), "create_version"); // no match
+        assert_eq!(
+            strip_keywords("run_script_function", &["script".into()]),
+            "run_function"
+        );
+        assert_eq!(
+            strip_keywords("create_version", &["script".into()]),
+            "create_version"
+        ); // no match
     }
 
     // ---- strip_keyword tests ----
 
     #[test]
     fn strip_keyword_prefix() {
-        assert_eq!(strip_keyword("gmail_message_content", "gmail"), "message_content");
+        assert_eq!(
+            strip_keyword("gmail_message_content", "gmail"),
+            "message_content"
+        );
         assert_eq!(strip_keyword("drive_file_content", "drive"), "file_content");
     }
 
@@ -766,20 +864,29 @@ mod tests {
 
     #[test]
     fn strip_keyword_infix() {
-        assert_eq!(strip_keyword("get_gmail_message_content", "gmail"), "get_message_content");
+        assert_eq!(
+            strip_keyword("get_gmail_message_content", "gmail"),
+            "get_message_content"
+        );
         assert_eq!(strip_keyword("search_drive_files", "drive"), "search_files");
     }
 
     #[test]
     fn strip_keyword_full_match_keeps_original() {
         assert_eq!(strip_keyword("get_page", "get_page"), "get_page");
-        assert_eq!(strip_keyword("search_custom", "search_custom"), "search_custom");
+        assert_eq!(
+            strip_keyword("search_custom", "search_custom"),
+            "search_custom"
+        );
     }
 
     #[test]
     fn strip_keyword_no_word_boundary_keeps_original() {
         // "spreadsheet" doesn't match "spreadsheets" at word boundary
-        assert_eq!(strip_keyword("list_spreadsheets", "spreadsheet"), "list_spreadsheets");
+        assert_eq!(
+            strip_keyword("list_spreadsheets", "spreadsheet"),
+            "list_spreadsheets"
+        );
         // "script" doesn't match at word boundary inside "create_version"
         assert_eq!(strip_keyword("create_version", "script"), "create_version");
     }

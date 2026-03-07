@@ -38,7 +38,6 @@ pub(crate) fn cli_prompt_theme() -> ColorfulTheme {
         unchecked_item_prefix: style("○".to_string()).for_stderr().black().bright(),
         picked_item_prefix: style("›".to_string()).for_stderr().cyan().bold(),
         unpicked_item_prefix: style(" ".to_string()).for_stderr(),
-        ..ColorfulTheme::default()
     }
 }
 

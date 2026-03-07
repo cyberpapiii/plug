@@ -360,6 +360,9 @@ mod tests {
     #[test]
     fn serve_command_accepts_daemon_flag() {
         let cli = Cli::try_parse_from(["plug", "serve", "--daemon"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Serve { daemon: true })));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve { daemon: true })
+        ));
     }
 }

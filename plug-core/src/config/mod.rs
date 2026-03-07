@@ -143,7 +143,7 @@ pub struct ServerConfig {
     pub tool_groups: Vec<ToolGroupRule>,
 }
 
-    fn default_true() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -494,7 +494,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -521,7 +521,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -552,7 +552,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -583,7 +583,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -618,7 +618,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -649,7 +649,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);

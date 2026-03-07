@@ -261,8 +261,8 @@ fn test_config_validation_valid() {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        }
+            tool_groups: Vec::new(),
+        },
     );
     let errors = validate_config(&cfg);
     assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -288,8 +288,8 @@ fn test_config_validation_catches_missing_command() {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        }
+            tool_groups: Vec::new(),
+        },
     );
     let errors = validate_config(&cfg);
     assert!(

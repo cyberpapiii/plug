@@ -10,6 +10,8 @@ use crate::ui::{
     can_prompt_interactively, print_banner, print_heading, print_label_value, terminal_width,
 };
 
+type ToolInventoryGroup = Vec<(String, String, Option<String>, Option<String>)>;
+
 pub(crate) async fn cmd_tool_list(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
@@ -37,10 +39,7 @@ pub(crate) async fn cmd_tool_list(
             }
         }
 
-        let mut tools_by_prefix: BTreeMap<
-            String,
-            Vec<(String, String, Option<String>, Option<String>)>,
-        > = BTreeMap::new();
+        let mut tools_by_prefix: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
         for t in &all_tools {
             let (prefix, tool_name) = if let Some(idx) = t.name.find("__") {
                 (t.name[..idx].to_string(), t.name[idx + 2..].to_string())

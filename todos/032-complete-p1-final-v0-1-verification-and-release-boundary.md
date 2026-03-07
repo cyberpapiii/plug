@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p1
 issue_id: "032"
 tags: [v0-1, verification, release]
@@ -41,11 +41,11 @@ Use this as the explicit last task in the `v0.1` sequence. If verification passe
 
 ## Acceptance Criteria
 
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes
-- [ ] `cargo test` passes
-- [ ] Manual smoke checks for `plug start`, `plug status`, `plug serve`, and `plug connect` complete
-- [ ] Core docs are already rewritten before this step starts
+- [x] `cargo fmt --check` passes
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes
+- [x] `cargo test` passes
+- [x] Manual smoke checks for `plug start`, `plug status`, `plug serve`, and `plug connect` complete
+- [x] Core docs are already rewritten before this step starts
 
 ## Work Log
 
@@ -58,3 +58,22 @@ Use this as the explicit last task in the `v0.1` sequence. If verification passe
 
 **Learnings:**
 - The most important release discipline here is to stop after `v0.1` instead of letting Phase 2 work begin opportunistically
+
+### 2026-03-06 - Completed In Worktree Execution
+
+**By:** Codex
+
+**Actions:**
+- Ran `cargo fmt --check`
+- Ran `cargo clippy --all-targets --all-features -- -D warnings`
+- Ran `cargo test`
+- Ran smoke checks for:
+  - `cargo run --bin plug -- start`
+  - `cargo run --bin plug -- status --output json`
+  - short-lived `cargo run --bin plug -- serve`
+  - `cargo run --bin plug -- connect </dev/null`
+- Applied `cargo fmt` and a small set of clippy-driven cleanup fixes needed to satisfy the strict lint gate
+
+**Learnings:**
+- The strict release boundary surfaced a handful of pre-existing lint issues that were cheap to fix and worth resolving now.
+- The `connect </dev/null` smoke path is useful for exercising startup and clean shutdown behavior, but it is not a substitute for an interactive client session.

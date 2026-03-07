@@ -124,11 +124,7 @@ pub fn spawn_health_checks(
 /// Uses `backon` to retry `Engine::reconnect_server()` up to 5 times
 /// with delays from 1s to 60s. On success, the server is replaced and
 /// health/circuit breaker state is reset via `replace_server()`.
-async fn spawn_proactive_recovery(
-    engine: &Engine,
-    server_name: &str,
-    cancel: CancellationToken,
-) {
+async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: CancellationToken) {
     tracing::info!(server = %server_name, "starting proactive recovery");
 
     let reconnect = || async { engine.reconnect_server(server_name).await };

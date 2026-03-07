@@ -280,10 +280,7 @@ pub(crate) async fn cmd_daemon_stop() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn cmd_serve(
-    config_path: Option<&std::path::PathBuf>,
-    _stdio: bool,
-) -> anyhow::Result<()> {
+pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     let config = plug_core::config::load_config(config_path)?;
     let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;

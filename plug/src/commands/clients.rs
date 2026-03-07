@@ -38,7 +38,8 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
 pub(crate) fn linked_client_targets() -> Vec<String> {
     all_client_targets()
         .iter()
-        .filter_map(|(_, target)| is_linked(target, false).then(|| (*target).to_string()))
+        .filter(|(_, target)| is_linked(target, false))
+        .map(|(_, target)| (*target).to_string())
         .collect()
 }
 

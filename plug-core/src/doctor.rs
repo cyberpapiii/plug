@@ -317,7 +317,9 @@ async fn check_env_vars(config: &Config) -> CheckResult {
                 "Third-party servers have missing env vars (non-blocking): {}",
                 third_party_missing.join(", ")
             ),
-            fix_suggestion: Some("Set the missing environment variables or remove unused servers".to_string()),
+            fix_suggestion: Some(
+                "Set the missing environment variables or remove unused servers".to_string(),
+            ),
         }
     }
 }
@@ -649,9 +651,24 @@ async fn check_client_configs() -> CheckResult {
     let mut issues = Vec::new();
 
     let all_targets = [
-        "claude-desktop", "claude-code", "cursor", "vscode", "windsurf", 
-        "gemini-cli", "codex-cli", "opencode", "zed", "cline", "cline-cli",
-        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity", "goose"
+        "claude-desktop",
+        "claude-code",
+        "cursor",
+        "vscode",
+        "windsurf",
+        "gemini-cli",
+        "codex-cli",
+        "opencode",
+        "zed",
+        "cline",
+        "cline-cli",
+        "roocode",
+        "factory",
+        "nanobot",
+        "junie",
+        "kilo",
+        "antigravity",
+        "goose",
     ];
 
     for target in all_targets {
@@ -677,31 +694,52 @@ async fn check_client_configs() -> CheckResult {
             };
 
             let ext = path.extension().and_then(|e| e.to_str());
-            
+
             if ext == Some("toml") {
                 // Count occurrences of [mcp_servers.plug]
-                let count = content.lines().filter(|l| l.trim() == "[mcp_servers.plug]").count();
+                let count = content
+                    .lines()
+                    .filter(|l| l.trim() == "[mcp_servers.plug]")
+                    .count();
                 if count > 1 {
-                    issues.push(format!("{} (duplicate entries in {})", target, path.display()));
+                    issues.push(format!(
+                        "{} (duplicate entries in {})",
+                        target,
+                        path.display()
+                    ));
                 }
                 // Also check if it's even valid TOML
                 if let Err(e) = content.parse::<toml::Value>() {
-                    issues.push(format!("{} (invalid TOML in {}: {})", target, path.display(), e));
+                    issues.push(format!(
+                        "{} (invalid TOML in {}: {})",
+                        target,
+                        path.display(),
+                        e
+                    ));
                 }
             } else if ext == Some("yaml") || ext == Some("yml") {
                 // For YAML (Goose), check for duplicate "plug:" keys under extensions
                 let count = content.lines().filter(|l| l.trim() == "plug:").count();
                 if count > 1 {
-                    issues.push(format!("{} (duplicate entries in {})", target, path.display()));
+                    issues.push(format!(
+                        "{} (duplicate entries in {})",
+                        target,
+                        path.display()
+                    ));
                 }
                 if let Err(e) = serde_yml::from_str::<serde_yml::Value>(&content) {
-                    issues.push(format!("{} (invalid YAML in {}: {})", target, path.display(), e));
+                    issues.push(format!(
+                        "{} (invalid YAML in {}: {})",
+                        target,
+                        path.display(),
+                        e
+                    ));
                 }
             } else {
                 // For JSON, check for multiple "plug" keys in valid MCP locations
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                     let mut plug_locations = 0;
-                    
+
                     // Location 1: mcpServers / context_servers
                     for key in ["mcpServers", "context_servers"] {
                         if json.get(key).and_then(|v| v.get("plug")).is_some() {
@@ -709,16 +747,31 @@ async fn check_client_configs() -> CheckResult {
                         }
                     }
                     // Location 2: mcp.servers
-                    if json.get("mcp").and_then(|v| v.get("servers")).and_then(|s| s.get("plug")).is_some() {
+                    if json
+                        .get("mcp")
+                        .and_then(|v| v.get("servers"))
+                        .and_then(|s| s.get("plug"))
+                        .is_some()
+                    {
                         plug_locations += 1;
                     }
                     // Location 3: tools.mcpServers
-                    if json.get("tools").and_then(|v| v.get("mcpServers")).and_then(|s| s.get("plug")).is_some() {
+                    if json
+                        .get("tools")
+                        .and_then(|v| v.get("mcpServers"))
+                        .and_then(|s| s.get("plug"))
+                        .is_some()
+                    {
                         plug_locations += 1;
                     }
 
                     if plug_locations > 1 {
-                         issues.push(format!("{} ({} duplicate plug entries in {})", target, plug_locations, path.display()));
+                        issues.push(format!(
+                            "{} ({} duplicate plug entries in {})",
+                            target,
+                            plug_locations,
+                            path.display()
+                        ));
                     }
                 } else {
                     issues.push(format!("{} (invalid JSON in {})", target, path.display()));
@@ -739,7 +792,10 @@ async fn check_client_configs() -> CheckResult {
             name,
             status: CheckStatus::Warn,
             message: format!("Issues found in client configs: {}", issues.join(", ")),
-            fix_suggestion: Some("Run `plug repair` to automatically clean up your client configurations".to_string()),
+            fix_suggestion: Some(
+                "Run `plug repair` to automatically clean up your client configurations"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -771,7 +827,7 @@ mod tests {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+            tool_groups: Vec::new(),
         }
     }
 
