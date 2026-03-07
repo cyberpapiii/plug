@@ -63,6 +63,8 @@ pub enum IpcRequest {
     ListTools,
     /// List live proxy client sessions connected to the daemon.
     ListClients,
+    /// Get the daemon runtime's synthesized MCP capabilities.
+    Capabilities { session_id: String },
 
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
@@ -120,6 +122,10 @@ impl fmt::Debug for IpcRequest {
                 .finish(),
             Self::ListTools => write!(f, "ListTools"),
             Self::ListClients => write!(f, "ListClients"),
+            Self::Capabilities { session_id } => f
+                .debug_struct("Capabilities")
+                .field("session_id", session_id)
+                .finish(),
             Self::McpRequest {
                 session_id, method, ..
             } => f
@@ -161,6 +167,8 @@ pub enum IpcResponse {
     Tools { tools: Vec<IpcToolInfo> },
     /// List of live client sessions connected to the daemon.
     Clients { clients: Vec<IpcClientInfo> },
+    /// Synthesized MCP capabilities for the daemon-backed shared runtime.
+    Capabilities { capabilities: serde_json::Value },
     /// Success acknowledgement for mutating commands.
     Ok,
     /// Liveness acknowledgement for long-lived proxy connections.
@@ -321,6 +329,9 @@ mod tests {
                 client_id: "client-123".to_string(),
                 session_id: "sess-456".to_string(),
             },
+            IpcResponse::Capabilities {
+                capabilities: serde_json::json!({"tools": {"listChanged": true}}),
+            },
             IpcResponse::McpResponse {
                 payload: serde_json::json!({"tools": []}),
             },
@@ -356,6 +367,9 @@ mod tests {
             client_info: None,
         }));
         assert!(!requires_auth(&IpcRequest::Deregister {
+            session_id: "s".to_string(),
+        }));
+        assert!(!requires_auth(&IpcRequest::Capabilities {
             session_id: "s".to_string(),
         }));
         assert!(!requires_auth(&IpcRequest::UpdateSession {
@@ -431,5 +445,25 @@ mod tests {
         assert_eq!(value["protocol_version"], IPC_PROTOCOL_VERSION);
         assert_eq!(value["client_id"], "client-123");
         assert_eq!(value["session_id"], "sess-123");
+    }
+
+    #[test]
+    fn capabilities_json_round_trips() {
+        let req = IpcRequest::Capabilities {
+            session_id: "sess-123".to_string(),
+        };
+        let req_json = serde_json::to_value(req).unwrap();
+        assert_eq!(req_json["type"], "Capabilities");
+        assert_eq!(req_json["session_id"], "sess-123");
+
+        let resp = IpcResponse::Capabilities {
+            capabilities: serde_json::json!({
+                "tools": { "listChanged": true },
+                "resources": { "listChanged": false }
+            }),
+        };
+        let resp_json = serde_json::to_value(resp).unwrap();
+        assert_eq!(resp_json["type"], "Capabilities");
+        assert!(resp_json["capabilities"]["tools"].is_object());
     }
 }

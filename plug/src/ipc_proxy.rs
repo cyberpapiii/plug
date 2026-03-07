@@ -23,6 +23,7 @@ const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 struct SharedConnection {
     conn: Mutex<crate::runtime::DaemonProxySession>,
     config_path: Option<PathBuf>,
+    capabilities: std::sync::RwLock<ServerCapabilities>,
 }
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
@@ -52,6 +53,7 @@ impl IpcProxyHandler {
     /// Create a new proxy handler from an established IPC connection.
     pub fn new(session: crate::runtime::DaemonProxySession, config_path: Option<PathBuf>) -> Self {
         let shared = Arc::new(SharedConnection {
+            capabilities: std::sync::RwLock::new(session.capabilities.clone()),
             conn: Mutex::new(session),
             config_path,
         });
@@ -131,7 +133,8 @@ impl IpcProxyHandler {
         &self,
         conn: &mut crate::runtime::DaemonProxySession,
     ) -> Result<(), McpError> {
-        Self::refresh_session_locked(self.shared.config_path.as_ref(), conn).await
+        self.refresh_session_locked(self.shared.config_path.as_ref(), conn)
+            .await
     }
 
     async fn heartbeat_loop(shared: Arc<SharedConnection>) {
@@ -159,7 +162,7 @@ impl IpcProxyHandler {
             Ok(IpcResponse::Error { code, message }) => {
                 if matches!(code.as_str(), "SESSION_REPLACED" | "SESSION_MISMATCH") {
                     tracing::warn!(code = %code, message = %message, "daemon heartbeat detected stale session; reconnecting");
-                    Self::refresh_session_locked(shared.config_path.as_ref(), &mut conn).await?;
+                    Self::refresh_session(shared, &mut conn).await?;
                     return Ok(());
                 }
                 Err(McpError::internal_error(format!("{code}: {message}"), None))
@@ -170,7 +173,7 @@ impl IpcProxyHandler {
             )),
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon heartbeat lost connection; reconnecting");
-                Self::refresh_session_locked(shared.config_path.as_ref(), &mut conn).await?;
+                Self::refresh_session(shared, &mut conn).await?;
                 Ok(())
             }
             Err(failure) => Err(McpError::internal_error(failure.message, None)),
@@ -178,6 +181,7 @@ impl IpcProxyHandler {
     }
 
     async fn refresh_session_locked(
+        &self,
         config_path: Option<&PathBuf>,
         conn: &mut crate::runtime::DaemonProxySession,
     ) -> Result<(), McpError> {
@@ -188,6 +192,27 @@ impl IpcProxyHandler {
         )
         .await
         .map_err(|e| McpError::internal_error(format!("daemon reconnect failed: {e}"), None))?;
+        if let Ok(mut caps) = self.shared.capabilities.write() {
+            *caps = session.capabilities.clone();
+        }
+        *conn = session;
+        Ok(())
+    }
+
+    async fn refresh_session(
+        shared: &Arc<SharedConnection>,
+        conn: &mut crate::runtime::DaemonProxySession,
+    ) -> Result<(), McpError> {
+        let session = crate::runtime::establish_daemon_proxy_session(
+            shared.config_path.as_ref(),
+            conn.client_id.clone(),
+            conn.client_info.clone(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("daemon reconnect failed: {e}"), None))?;
+        if let Ok(mut caps) = shared.capabilities.write() {
+            *caps = session.capabilities.clone();
+        }
         *conn = session;
         Ok(())
     }
@@ -220,11 +245,12 @@ impl Drop for IpcProxyHandler {
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for IpcProxyHandler {
     fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::default();
-        capabilities.tools = Some(ToolsCapability {
-            list_changed: Some(true),
-        });
-
+        let capabilities = self
+            .shared
+            .capabilities
+            .read()
+            .map(|caps| caps.clone())
+            .unwrap_or_default();
         InitializeResult::new(capabilities)
             .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
     }
@@ -339,18 +365,187 @@ impl ServerHandler for IpcProxyHandler {
 
     fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListResourcesResult::default()))
+        async move {
+            let params = request
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/list".to_string(),
+                        params: params.clone(),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(
+                            format!("failed to parse resources/list: {e}"),
+                            None,
+                        )
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        async move {
+            let params = request
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/templates/list".to_string(),
+                        params: params.clone(),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(
+                            format!("failed to parse resources/templates/list: {e}"),
+                            None,
+                        )
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/read".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(
+                            format!("failed to parse resources/read: {e}"),
+                            None,
+                        )
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
     }
 
     fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListPromptsResult::default()))
+        async move {
+            let params = request
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "prompts/list".to_string(),
+                        params: params.clone(),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("failed to parse prompts/list: {e}"), None)
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "prompts/get".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("failed to parse prompts/get: {e}"), None)
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
     }
 }
 

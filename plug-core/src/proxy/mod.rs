@@ -727,6 +727,16 @@ impl ToolRouter {
         let mut resource_routes = HashMap::new();
         let mut resources_vec = Vec::new();
         for (server_name, mut resource) in upstream_resources {
+            if let Some(existing_server) = resource_routes.get(&resource.uri) {
+                if existing_server != &server_name {
+                    tracing::warn!(
+                        uri = %resource.uri,
+                        first_server = %existing_server,
+                        ignored_server = %server_name,
+                        "resource URI collision detected; keeping first route"
+                    );
+                }
+            }
             resource_routes
                 .entry(resource.uri.clone())
                 .or_insert_with(|| server_name.clone());
@@ -1180,8 +1190,26 @@ impl ToolRouter {
             };
 
             let call_id = next_call_id();
+            struct ActiveCallGuard<'a> {
+                router: &'a ToolRouter,
+                call_id: u64,
+                armed: bool,
+            }
+            impl<'a> ActiveCallGuard<'a> {
+                fn disarm(&mut self) {
+                    self.armed = false;
+                }
+            }
+            impl Drop for ActiveCallGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.router.remove_active_call(self.call_id);
+                    }
+                }
+            }
             let server_id_arc = Arc::<str>::from(server_id.as_str());
             let tool_name_arc = Arc::<str>::from(original_name.as_str());
+            let mut active_call_guard = None;
             if let Some(call_context) = downstream.clone() {
                 self.register_active_call(
                     call_id,
@@ -1192,11 +1220,19 @@ impl ToolRouter {
                         progress_token: downstream_progress_token.clone(),
                     },
                 );
+                active_call_guard = Some(ActiveCallGuard {
+                    router: self,
+                    call_id,
+                    armed: true,
+                });
             }
             let request_handle = peer
                 .send_cancellable_request(request, options)
                 .await
                 .map_err(|error| {
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
                     self.remove_active_call(call_id);
                     match error {
                         rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
@@ -1231,6 +1267,9 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
                     self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -1251,6 +1290,9 @@ impl ToolRouter {
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
                     self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -1290,6 +1332,9 @@ impl ToolRouter {
                         timeout_secs = timeout.as_secs(),
                         "upstream tool call timed out"
                     );
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
                     self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -1317,6 +1362,9 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
                     self.remove_active_call(call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -1333,6 +1381,9 @@ impl ToolRouter {
                     }
                 }
                 Ok(other) => {
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
                     self.remove_active_call(call_id);
                     Err(McpError::internal_error(
                         format!("unexpected response type from upstream tool call: {other:?}"),
