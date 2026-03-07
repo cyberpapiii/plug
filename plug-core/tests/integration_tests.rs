@@ -9,13 +9,87 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::Request as HttpRequest;
+use plug_core::http::server::{HttpState, build_router};
+use plug_core::http::session::SessionManager;
 use plug_core::client_detect::detect_client;
 use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
 use plug_core::engine::Engine;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::types::ClientType;
+use rmcp::ServiceExt as _;
+use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::ServerHandler;
+use rmcp::model::{CallToolRequestParams, ClientInfo};
+use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
+
+const HTTP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
+#[derive(Clone)]
+struct TestClient;
+
+impl ClientHandler for TestClient {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
+    }
+}
+
+fn mock_server_config(tools: &str) -> ServerConfig {
+    ServerConfig {
+        command: Some("cargo".to_string()),
+        args: vec![
+            "run".to_string(),
+            "--quiet".to_string(),
+            "-p".to_string(),
+            "plug-test-harness".to_string(),
+            "--bin".to_string(),
+            "mock-mcp-server".to_string(),
+            "--".to_string(),
+            "--tools".to_string(),
+            tools.to_string(),
+        ],
+        env: HashMap::new(),
+        enabled: true,
+        transport: TransportType::Stdio,
+        url: None,
+        auth_token: None,
+        timeout_secs: 10,
+        call_timeout_secs: 5,
+        max_concurrent: 4,
+        health_check_interval_secs: 60,
+        circuit_breaker_enabled: true,
+        enrichment: false,
+        tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
+    }
+}
+
+async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut stream = body.into_data_stream();
+    use futures::StreamExt;
+
+    let timeout = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            for part in text.split("\n\n") {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    events.push(trimmed.to_string());
+                }
+            }
+            if events.len() >= max_events {
+                break;
+            }
+        }
+    });
+
+    let _ = timeout.await;
+    events
+}
 
 // ---------------------------------------------------------------------------
 // ProxyHandler: list_tools with no upstream servers
@@ -374,4 +448,230 @@ async fn test_stdio_timeout_reconnects_cleanly() {
 
     engine.shutdown().await;
     let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[tokio::test]
+async fn test_stdio_end_to_end_proxy_path() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("echo,greet"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let tools = client.peer().list_all_tools().await.expect("list tools");
+    let names = tools.iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
+    assert!(names.contains(&"Mock__echo".to_string()), "tools: {names:?}");
+    assert!(names.contains(&"Mock__greet".to_string()), "tools: {names:?}");
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("Mock__echo").with_arguments(
+                serde_json::json!({"input": "hello"}).as_object().unwrap().clone(),
+            ),
+        )
+        .await
+        .expect("call tool");
+    let rendered = format!("{result:?}");
+    assert!(
+        rendered.contains("Called echo with"),
+        "unexpected stdio result: {rendered}"
+    );
+    assert!(
+        rendered.contains("hello"),
+        "unexpected stdio result: {rendered}"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_http_end_to_end_proxy_path_with_sse() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("echo"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let state = Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: SessionManager::new(1800, 100),
+        cancel: CancellationToken::new(),
+        sse_channel_capacity: 32,
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let app = build_router(state.clone());
+
+    let initialize_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "http-e2e", "version": "1.0" }
+        }
+    });
+    let initialize_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&initialize_body).unwrap()))
+        .unwrap();
+    let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+    let session_id = initialize_resp
+        .headers()
+        .get(HTTP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let sse_req = HttpRequest::builder()
+        .method("GET")
+        .uri("/mcp")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header("accept", "text/event-stream")
+        .body(Body::empty())
+        .unwrap();
+    let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+    let events = collect_sse_events(sse_resp.into_body(), 1).await;
+    assert!(
+        events.iter().any(|event| event.contains("id: 0")),
+        "expected priming SSE event, got {events:?}"
+    );
+
+    let list_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+    });
+    let list_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .body(Body::from(serde_json::to_vec(&list_body).unwrap()))
+        .unwrap();
+    let list_resp = app.clone().oneshot(list_req).await.unwrap();
+    let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+    let tool_names = list_json["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.contains(&"Mock__echo".to_string()),
+        "tool names: {tool_names:?}"
+    );
+
+    let call_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "Mock__echo",
+            "arguments": { "input": "http" }
+        }
+    });
+    let call_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+        .unwrap();
+    let call_resp = app.oneshot(call_req).await.unwrap();
+    let call_bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let call_json: serde_json::Value = serde_json::from_slice(&call_bytes).unwrap();
+    let response_text = call_json["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(response_text.contains("Called echo with {\"input\":\"http\"}"));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_multi_client_shared_engine_isolation() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("echo"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    async fn connect_client(
+        router: Arc<plug_core::proxy::ToolRouter>,
+    ) -> rmcp::service::RunningService<rmcp::RoleClient, TestClient> {
+        let proxy_handler = ProxyHandler::from_router(router);
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(server_transport)
+                .await
+                .expect("start proxy server");
+            let _ = server.waiting().await;
+        });
+        TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect client")
+    }
+
+    let client_a = connect_client(engine.tool_router().clone()).await;
+    let client_b = connect_client(engine.tool_router().clone()).await;
+
+    let call_a = tokio::spawn(async move {
+        client_a
+            .call_tool(
+                CallToolRequestParams::new("Mock__echo").with_arguments(
+                    serde_json::json!({"input": "from-a"}).as_object().unwrap().clone(),
+                ),
+            )
+            .await
+            .expect("client a call")
+    });
+    let call_b = tokio::spawn(async move {
+        client_b
+            .call_tool(
+                CallToolRequestParams::new("Mock__echo").with_arguments(
+                    serde_json::json!({"input": "from-b"}).as_object().unwrap().clone(),
+                ),
+            )
+            .await
+            .expect("client b call")
+    });
+
+    let result_a = call_a.await.unwrap();
+    let result_b = call_b.await.unwrap();
+    let text_a = format!("{result_a:?}");
+    let text_b = format!("{result_b:?}");
+    assert!(text_a.contains("from-a"), "client a got wrong result: {text_a}");
+    assert!(text_b.contains("from-b"), "client b got wrong result: {text_b}");
+
+    engine.shutdown().await;
 }
