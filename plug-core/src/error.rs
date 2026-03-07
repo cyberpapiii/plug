@@ -9,6 +9,9 @@ pub enum ProtocolError {
     #[error("server unavailable: {server_id}")]
     ServerUnavailable { server_id: String },
 
+    #[error("server overloaded while waiting for capacity: {server_id}")]
+    ServerBusy { server_id: String },
+
     #[error("request timed out after {duration:?}")]
     Timeout { duration: Duration },
 
@@ -22,6 +25,7 @@ impl ProtocolError {
         match self {
             ProtocolError::ToolNotFound { .. } => -32601, // Method not found
             ProtocolError::ServerUnavailable { .. } => -32603, // Internal error
+            ProtocolError::ServerBusy { .. } => -32603,   // Internal error
             ProtocolError::Timeout { .. } => -32603,      // Internal error
             ProtocolError::InvalidRequest { .. } => -32600, // Invalid request
         }

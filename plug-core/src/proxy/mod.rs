@@ -76,6 +76,8 @@ pub struct ToolRouter {
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
 }
 
+const SEMAPHORE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         Self {
@@ -436,11 +438,23 @@ impl ToolRouter {
 
             // Acquire concurrency semaphore
             let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
-                Some(sem.clone().acquire_owned().await.map_err(|_| {
-                    McpError::from(ProtocolError::ServerUnavailable {
-                        server_id: server_id.clone(),
-                    })
-                })?)
+                Some(
+                    tokio::time::timeout(
+                        SEMAPHORE_ACQUIRE_TIMEOUT,
+                        sem.clone().acquire_owned(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        McpError::from(ProtocolError::ServerBusy {
+                            server_id: server_id.clone(),
+                        })
+                    })?
+                    .map_err(|_| {
+                        McpError::from(ProtocolError::ServerUnavailable {
+                            server_id: server_id.clone(),
+                        })
+                    })?,
+                )
             } else {
                 None
             };
@@ -1291,5 +1305,39 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().0, "slack");
         assert_eq!(found.unwrap().1, "conversations_search_messages");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_tool_times_out_waiting_for_semaphore() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(server_manager.clone(), test_router_config());
+
+        server_manager.semaphores.insert(
+            "busy-server".to_string(),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+        );
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "Busy__tool".to_string(),
+            ("busy-server".to_string(), "tool".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+        }));
+
+        let call = router.call_tool("Busy__tool", None);
+        tokio::pin!(call);
+
+        tokio::time::advance(SEMAPHORE_ACQUIRE_TIMEOUT + Duration::from_secs(1)).await;
+
+        let err = call.await.unwrap_err();
+        assert!(
+            err.message.contains("server overloaded"),
+            "unexpected error: {err:?}"
+        );
     }
 }
