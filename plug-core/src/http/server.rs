@@ -1504,4 +1504,176 @@ mod tests {
             "expected SSE stream to contain targeted progress notification, got {events:?}"
         );
     }
+
+    // -- Bearer auth middleware tests --
+
+    fn test_state_with_auth(token: &str) -> Arc<HttpState> {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            sse_channel_capacity: 32,
+            notification_task_started: AtomicBool::new(false),
+            auth_token: Some(Arc::from(token)),
+        })
+    }
+
+    #[tokio::test]
+    async fn auth_required_no_header_returns_401() {
+        let state = test_state_with_auth("test_token_abc123");
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers().get("WWW-Authenticate").unwrap(), "Bearer");
+    }
+
+    #[tokio::test]
+    async fn auth_required_invalid_token_returns_401() {
+        let state = test_state_with_auth("correct_token");
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer wrong_token")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_required_valid_token_passes_through() {
+        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let state = test_state_with_auth(token);
+        let app = build_router(state);
+
+        // Valid token should pass auth and reach the handler (which will fail
+        // on content type, not on auth — proving auth middleware passed)
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should get past auth (not 401) — will hit content type check (415)
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn no_auth_required_loopback_passes_through() {
+        // State with auth_token = None (loopback)
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should NOT be 401 — should hit content type check instead
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_valid_token_bypasses_origin_check() {
+        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let state = test_state_with_auth(token);
+        let app = build_router(state);
+
+        // Remote origin with valid bearer token — should bypass origin check
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Origin", "https://remote-client.example.com")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should NOT be 403 (origin rejected) — should pass through to handler
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn discovery_minimal_card_when_unauth_on_protected_server() {
+        let state = test_state_with_auth("secret_token");
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Minimal card should NOT contain servers or tool count
+        assert!(card.get("servers").is_none());
+        assert!(card.get("tools").is_none());
+        assert_eq!(card["auth_required"], true);
+        assert_eq!(card["endpoint"], "/mcp");
+    }
+
+    #[tokio::test]
+    async fn discovery_full_card_when_authenticated() {
+        let token = "secret_token";
+        let state = test_state_with_auth(token);
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Full card should contain servers and tools
+        assert!(card.get("servers").is_some());
+        assert!(card.get("tools").is_some());
+        assert!(card.get("auth_required").is_none());
+    }
 }

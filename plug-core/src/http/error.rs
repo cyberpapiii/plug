@@ -46,10 +46,9 @@ impl IntoResponse for HttpError {
                 "id": null
             });
             let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Bearer"),
-            );
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             return response;
         }
 

@@ -252,9 +252,9 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         match &cli.command {
-            Some(Commands::Status { .. }) | Some(Commands::Servers) | Some(Commands::Tools { .. }) => {
-                "none"
-            }
+            Some(Commands::Status { .. })
+            | Some(Commands::Servers)
+            | Some(Commands::Tools { .. }) => "none",
             _ => "info",
         }
     };

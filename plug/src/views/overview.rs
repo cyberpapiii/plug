@@ -136,7 +136,9 @@ pub(crate) async fn cmd_status(
         } else {
             let token_path = plug_core::auth::http_auth_token_path(c.http.port);
             let token = if show_token {
-                std::fs::read_to_string(&token_path).ok().map(|t| t.trim().to_string())
+                std::fs::read_to_string(&token_path)
+                    .ok()
+                    .map(|t| t.trim().to_string())
             } else {
                 None
             };
@@ -164,9 +166,15 @@ pub(crate) async fn cmd_status(
             if let Some((token_exists, token)) = &http_auth_info {
                 if *token_exists {
                     if let Some(t) = token {
-                        print_label_value("HTTP Auth", style(format!("enabled | Token: {t}")).green().bold());
+                        print_label_value(
+                            "HTTP Auth",
+                            style(format!("enabled | Token: {t}")).green().bold(),
+                        );
                     } else {
-                        print_label_value("HTTP Auth", style("enabled (use --show-token to reveal)").green().bold());
+                        print_label_value(
+                            "HTTP Auth",
+                            style("enabled (use --show-token to reveal)").green().bold(),
+                        );
                     }
                 } else {
                     print_label_value("HTTP Auth", style("NOT CONFIGURED").red().bold());

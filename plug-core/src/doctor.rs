@@ -49,7 +49,18 @@ impl DoctorReport {
 /// Run all diagnostic checks and return an aggregated report.
 pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
     // Run independent checks concurrently
-    let (config_exists, config_perms, port, env_vars, binaries, collisions, limits, pid, clients, http_auth) = tokio::join!(
+    let (
+        config_exists,
+        config_perms,
+        port,
+        env_vars,
+        binaries,
+        collisions,
+        limits,
+        pid,
+        clients,
+        http_auth,
+    ) = tokio::join!(
         check_config_exists(config_path),
         check_config_permissions(config, config_path),
         check_port_available(config),
@@ -846,10 +857,7 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                         mode,
                         token_path.display()
                     ),
-                    fix_suggestion: Some(format!(
-                        "Run: chmod 600 {}",
-                        token_path.display()
-                    )),
+                    fix_suggestion: Some(format!("Run: chmod 600 {}", token_path.display())),
                 };
             }
         }
