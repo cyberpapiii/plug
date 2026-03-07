@@ -141,6 +141,17 @@ impl HttpState {
                             Ok(_) => {} // non-logging notifications on wrong channel
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP logging fan-out lagged");
+                                // Emit synthetic warning to all connected clients
+                                let synthetic = ProtocolNotification::LoggingMessage {
+                                    params: rmcp::model::LoggingMessageNotificationParam {
+                                        level: rmcp::model::LoggingLevel::Warning,
+                                        logger: Some("plug".to_string()),
+                                        data: serde_json::json!(format!(
+                                            "skipped {skipped} log messages"
+                                        )),
+                                    },
+                                };
+                                log_state.sessions.broadcast(synthetic.to_json_value());
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }

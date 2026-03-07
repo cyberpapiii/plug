@@ -245,12 +245,17 @@ impl Drop for IpcProxyHandler {
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for IpcProxyHandler {
     fn get_info(&self) -> ServerInfo {
-        let capabilities = self
+        let mut capabilities = self
             .shared
             .capabilities
             .read()
             .map(|caps| caps.clone())
             .unwrap_or_default();
+        // Strip logging capability — IPC protocol is request-response only
+        // and cannot push logging notifications to clients. Advertising it
+        // would be a lie. setLevel is still forwarded to the daemon (benefits
+        // HTTP/stdio clients) but this IPC client won't receive log messages.
+        capabilities.logging = None;
         InitializeResult::new(capabilities)
             .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
     }
@@ -352,6 +357,35 @@ impl ServerHandler for IpcProxyHandler {
                         )
                     })
                 }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::json!({ "level": request.level });
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "logging/setLevel".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { .. } => Ok(()),
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
                 }

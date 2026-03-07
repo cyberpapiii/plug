@@ -566,6 +566,7 @@ async fn handle_ipc_connection(
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
         ctx.client_registry.deregister(session_id);
+        ctx.engine.tool_router().remove_client_log_level(session_id);
     }
 
     result
@@ -768,6 +769,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             ctx.client_registry.deregister(session_id);
+            ctx.engine.tool_router().remove_client_log_level(session_id);
             ctx.session_id = None;
             IpcResponse::Ok
         }
@@ -1066,6 +1068,48 @@ async fn dispatch_mcp_request(
                         code: "SERIALIZE_ERROR".to_string(),
                         message: e.to_string(),
                     },
+                },
+            }
+        }
+
+        "logging/setLevel" => {
+            let level = match params
+                .and_then(|p| p.get("level"))
+                .and_then(|v| v.as_str())
+            {
+                Some(level_str) => {
+                    match serde_json::from_value::<rmcp::model::LoggingLevel>(
+                        serde_json::json!(level_str),
+                    ) {
+                        Ok(level) => level,
+                        Err(_) => {
+                            return IpcResponse::Error {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: format!("invalid logging level: {level_str}"),
+                            };
+                        }
+                    }
+                }
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "logging/setLevel requires 'level' in params".to_string(),
+                    };
+                }
+            };
+
+            tracing::info!(
+                session_id = %session_id,
+                level = ?level,
+                "IPC client set log level"
+            );
+            tool_router.set_client_log_level(session_id, level);
+            tool_router.forward_set_level_to_upstreams().await;
+            match serde_json::to_value(serde_json::json!({})) {
+                Ok(payload) => IpcResponse::McpResponse { payload },
+                Err(e) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: e.to_string(),
                 },
             }
         }
