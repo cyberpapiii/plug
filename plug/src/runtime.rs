@@ -322,12 +322,23 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     );
     sessions.spawn_cleanup_task(engine.cancel_token().clone());
     let tool_router = engine.tool_router().clone();
+    // Generate or load auth token for non-loopback bind addresses
+    let auth_token = if !plug_core::config::http_bind_is_loopback(&config.http.bind_address) {
+        let token_path = plug_core::auth::http_auth_token_path(config.http.port);
+        let token = plug_core::auth::load_or_generate_token(&token_path)?;
+        tracing::info!("HTTP auth enabled (non-loopback bind address)");
+        Some(Arc::<str>::from(token.as_str()))
+    } else {
+        None
+    };
+
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: tool_router.clone(),
         sessions,
         cancel: engine.cancel_token().clone(),
         sse_channel_capacity: config.http.sse_channel_capacity,
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token,
     });
 
     // Spawn cleanup listener for expired HTTP sessions — handles both
@@ -488,6 +499,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
+            auth_token: None,
         });
         let router = plug_core::http::server::build_router(state);
 

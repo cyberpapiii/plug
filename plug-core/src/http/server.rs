@@ -37,6 +37,9 @@ pub struct HttpState {
     pub cancel: CancellationToken,
     pub sse_channel_capacity: usize,
     pub notification_task_started: AtomicBool,
+    /// Bearer token for downstream client authentication.
+    /// `None` means no auth required (loopback-only server).
+    pub auth_token: Option<Arc<str>>,
 }
 
 impl HttpState {
@@ -171,10 +174,16 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .route("/.well-known/mcp.json", get(get_server_card))
         .with_state(state.clone());
 
-    // MCP protocol routes — protected by origin validation middleware
+    // MCP protocol routes — protected by auth + origin validation middleware
+    // Layer order (innermost first): origin validation → bearer auth → body limit
+    // Bearer auth runs first; if authenticated, origin validation is skipped.
     let mcp = Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .layer(middleware::from_fn(validate_origin))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            validate_bearer_auth,
+        ))
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
         .with_state(state);
 
@@ -185,13 +194,59 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
 // Middleware
 // ---------------------------------------------------------------------------
 
+/// Whether the request has been authenticated via bearer token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthStatus {
+    /// Request authenticated with valid bearer token.
+    Authenticated,
+    /// No auth required (loopback-only server).
+    NoAuthRequired,
+}
+
+/// Validate bearer token for non-loopback HTTP servers.
+///
+/// When `HttpState.auth_token` is `Some`, requests must include a valid
+/// `Authorization: Bearer <token>` header. When `None`, all requests pass through.
+async fn validate_bearer_auth(
+    State(state): State<Arc<HttpState>>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, HttpError> {
+    let auth_status = match &state.auth_token {
+        None => AuthStatus::NoAuthRequired,
+        Some(expected) => {
+            let provided = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+
+            match provided {
+                Some(token) if crate::auth::verify_auth_token(token, expected.as_ref()) => {
+                    AuthStatus::Authenticated
+                }
+                _ => return Err(HttpError::Unauthorized),
+            }
+        }
+    };
+
+    req.extensions_mut().insert(auth_status);
+    Ok(next.run(req).await)
+}
+
 /// Validate Origin header for DNS rebinding prevention.
 ///
 /// - Missing Origin: allowed (non-browser MCP clients don't send it)
 /// - localhost/127.0.0.1/[::1]: allowed
 /// - "null" literal: rejected (DNS rebinding vector)
 /// - Anything else: rejected
+/// - Authenticated requests (via bearer token): origin check skipped
 async fn validate_origin(req: Request, next: Next) -> Result<Response, HttpError> {
+    // Skip origin check for authenticated remote clients
+    if req.extensions().get::<AuthStatus>() == Some(&AuthStatus::Authenticated) {
+        return Ok(next.run(req).await);
+    }
+
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         let origin = origin.to_str().map_err(|_| HttpError::InvalidOrigin)?;
 
@@ -732,6 +787,7 @@ mod tests {
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
+            auth_token: None,
         })
     }
 

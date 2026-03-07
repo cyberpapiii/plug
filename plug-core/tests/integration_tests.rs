@@ -606,6 +606,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         cancel: CancellationToken::new(),
         sse_channel_capacity: 32,
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
     });
     let app = build_router(state.clone());
 

@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 /// HTTP-layer errors that map to HTTP status codes.
@@ -20,6 +20,9 @@ pub enum HttpError {
     #[error("accept header must include text/event-stream")]
     InvalidAcceptHeader,
 
+    #[error("unauthorized: authentication required")]
+    Unauthorized,
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -36,7 +39,22 @@ pub enum HttpError {
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         // SECURITY: Do NOT include session IDs or internal details in error bodies.
+        if matches!(self, HttpError::Unauthorized) {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32001, "message": "authentication required" },
+                "id": null
+            });
+            let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer"),
+            );
+            return response;
+        }
+
         let (status, message) = match &self {
+            HttpError::Unauthorized => unreachable!(),
             HttpError::InvalidOrigin => (StatusCode::FORBIDDEN, "forbidden"),
             HttpError::SessionRequired => (StatusCode::BAD_REQUEST, "session ID required"),
             HttpError::SessionNotFound => (StatusCode::NOT_FOUND, "session not found"),
@@ -65,6 +83,7 @@ mod tests {
     #[test]
     fn error_status_codes() {
         let cases: Vec<(HttpError, StatusCode)> = vec![
+            (HttpError::Unauthorized, StatusCode::UNAUTHORIZED),
             (HttpError::InvalidOrigin, StatusCode::FORBIDDEN),
             (HttpError::SessionRequired, StatusCode::BAD_REQUEST),
             (HttpError::SessionNotFound, StatusCode::NOT_FOUND),

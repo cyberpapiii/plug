@@ -181,7 +181,8 @@ fn default_grace_period() -> u64 {
     60
 }
 
-fn http_bind_is_loopback(bind_address: &str) -> bool {
+/// Check whether a bind address refers to loopback (localhost-only).
+pub fn http_bind_is_loopback(bind_address: &str) -> bool {
     matches!(bind_address, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 
