@@ -146,8 +146,6 @@ enum Commands {
     /// Internal: run plug as an HTTP/background service
     Serve {
         #[arg(long)]
-        stdio: bool,
-        #[arg(long)]
         daemon: bool,
     },
     #[command(display_order = 15)]
@@ -269,11 +267,11 @@ async fn main() -> anyhow::Result<()> {
         None => views::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Start) => runtime::cmd_start(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Connect) => runtime::cmd_connect(cli.config.as_ref()).await?,
-        Some(Commands::Serve { stdio, daemon }) => {
+        Some(Commands::Serve { daemon }) => {
             if daemon {
                 runtime::cmd_daemon(cli.config.as_ref()).await?;
             } else {
-                runtime::cmd_serve(cli.config.as_ref(), stdio).await?;
+                runtime::cmd_serve(cli.config.as_ref()).await?;
             }
         }
         Some(Commands::Status) => {
@@ -347,4 +345,21 @@ fn init_stderr_tracing(level: &str) {
         .with_writer(std::io::stderr)
         .compact()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_command_rejects_stdio_flag() {
+        let result = Cli::try_parse_from(["plug", "serve", "--stdio"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serve_command_accepts_daemon_flag() {
+        let cli = Cli::try_parse_from(["plug", "serve", "--daemon"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Serve { daemon: true })));
+    }
 }
