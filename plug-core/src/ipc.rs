@@ -12,7 +12,7 @@ use crate::types::ServerStatus;
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 /// Current daemon/client IPC protocol version.
-pub const IPC_PROTOCOL_VERSION: u16 = 2;
+pub const IPC_PROTOCOL_VERSION: u16 = 3;
 
 /// Requests sent from CLI → daemon over Unix socket.
 ///
@@ -58,6 +58,12 @@ pub enum IpcRequest {
 
     /// Liveness probe for long-lived proxy connections.
     Ping { session_id: String },
+
+    /// Attach a dedicated daemon -> client notification stream for a proxy session.
+    AttachNotifications {
+        session_id: String,
+        client_id: String,
+    },
 
     /// List all available tools across all servers.
     ListTools,
@@ -119,6 +125,14 @@ impl fmt::Debug for IpcRequest {
             Self::Ping { session_id } => f
                 .debug_struct("Ping")
                 .field("session_id", session_id)
+                .finish(),
+            Self::AttachNotifications {
+                session_id,
+                client_id,
+            } => f
+                .debug_struct("AttachNotifications")
+                .field("session_id", session_id)
+                .field("client_id", client_id)
                 .finish(),
             Self::ListTools => write!(f, "ListTools"),
             Self::ListClients => write!(f, "ListClients"),
@@ -186,6 +200,11 @@ pub enum IpcResponse {
     /// MCP JSON-RPC response from the daemon's shared Engine.
     McpResponse {
         /// The JSON-RPC result payload.
+        payload: serde_json::Value,
+    },
+    /// MCP JSON-RPC notification from the daemon's shared Engine.
+    McpNotification {
+        /// The JSON-RPC notification payload.
         payload: serde_json::Value,
     },
 }
@@ -290,6 +309,10 @@ mod tests {
                 session_id: "sess-123".to_string(),
                 client_info: "claude-code".to_string(),
             },
+            IpcRequest::AttachNotifications {
+                session_id: "sess-123".to_string(),
+                client_id: "client-123".to_string(),
+            },
             IpcRequest::McpRequest {
                 session_id: "sess-123".to_string(),
                 method: "tools/list".to_string(),
@@ -335,6 +358,9 @@ mod tests {
             IpcResponse::McpResponse {
                 payload: serde_json::json!({"tools": []}),
             },
+            IpcResponse::McpNotification {
+                payload: serde_json::json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"memory://notes"}}),
+            },
         ];
 
         for resp in &responses {
@@ -375,6 +401,10 @@ mod tests {
         assert!(!requires_auth(&IpcRequest::UpdateSession {
             session_id: "s".to_string(),
             client_info: "claude-code".to_string(),
+        }));
+        assert!(!requires_auth(&IpcRequest::AttachNotifications {
+            session_id: "s".to_string(),
+            client_id: "c".to_string(),
         }));
         assert!(!requires_auth(&IpcRequest::McpRequest {
             session_id: "s".to_string(),

@@ -13,7 +13,7 @@ use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Prompt, Resource,
-    ResourceTemplate, ServerCapabilities, Tool,
+    ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities, Tool,
 };
 use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
@@ -91,6 +91,20 @@ impl ClientHandler for UpstreamClientHandler {
         async move {
             if let Some(router) = router.upgrade() {
                 router.route_upstream_cancelled(server_id.as_ref(), params);
+            }
+        }
+    }
+
+    fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                router.route_upstream_resource_updated(server_id.as_ref(), params);
             }
         }
     }
@@ -825,7 +839,8 @@ mod tests {
         GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
         ListToolsResult, Meta, NumberOrString, ProgressNotificationParam, ProgressToken, Prompt,
         PromptMessage, PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
+        ReadResourceResult, ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
+        ServerInfo, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -885,6 +900,11 @@ mod tests {
             std::borrow::Cow::Owned(description.to_string()),
             Arc::new(serde_json::Map::new()),
         )
+    }
+
+    fn make_unsubscribe_request(uri: &str) -> UnsubscribeRequestParams {
+        serde_json::from_value(serde_json::json!({ "uri": uri }))
+            .expect("unsubscribe request params deserialize")
     }
 
     #[derive(Clone)]
@@ -1051,6 +1071,108 @@ mod tests {
         ) {
             self.progress.lock().unwrap().push(params);
             self.progress_signal.notify_one();
+        }
+    }
+
+    #[derive(Clone)]
+    struct ResourceSubscriptionServer {
+        subscribe_calls: Arc<AtomicUsize>,
+        unsubscribe_calls: Arc<AtomicUsize>,
+        peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    }
+
+    impl ResourceSubscriptionServer {
+        fn new() -> Self {
+            Self {
+                subscribe_calls: Arc::new(AtomicUsize::new(0)),
+                unsubscribe_calls: Arc::new(AtomicUsize::new(0)),
+                peer: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        async fn notify_update(&self, uri: &str) {
+            let mut attempts = 0usize;
+            loop {
+                let peer = { self.peer.lock().unwrap().clone() };
+                if let Some(peer) = peer {
+                    peer.notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                        .await
+                        .expect("notify resource updated");
+                    return;
+                }
+
+                attempts += 1;
+                assert!(attempts < 50, "server peer should be ready before notify");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn subscribe_count(&self) -> usize {
+            self.subscribe_calls.load(Ordering::SeqCst)
+        }
+
+        fn unsubscribe_count(&self) -> usize {
+            self.unsubscribe_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ServerHandler for ResourceSubscriptionServer {
+        fn get_info(&self) -> ServerInfo {
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.resources = Some(rmcp::model::ResourcesCapability {
+                subscribe: Some(true),
+                list_changed: Some(false),
+            });
+            ServerInfo::new(capabilities)
+        }
+
+        async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+            *self.peer.lock().unwrap() = Some(context.peer.clone());
+        }
+
+        fn list_resources(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
+        {
+            std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
+                RawResource::new("memory://notes", "notes").no_annotation(),
+            ])))
+        }
+
+        fn subscribe(
+            &self,
+            _request: SubscribeRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+
+        fn unsubscribe(
+            &self,
+            _request: UnsubscribeRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            self.unsubscribe_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    struct ResourceUpdatedClient {
+        signal: Arc<Notify>,
+        updates: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ClientHandler for ResourceUpdatedClient {
+        async fn on_resource_updated(
+            &self,
+            params: ResourceUpdatedNotificationParam,
+            _context: rmcp::service::NotificationContext<RoleClient>,
+        ) {
+            self.updates.lock().unwrap().push(params.uri);
+            self.signal.notify_one();
         }
     }
 
@@ -1319,6 +1441,158 @@ mod tests {
             .expect("tool call succeeds");
         assert!(!result.content.is_empty());
         assert_eq!(router.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_subscriptions_refcount_and_fan_out_updates() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let upstream_server = ResourceSubscriptionServer::new();
+        let upstream_server_task = upstream_server.clone();
+        let upstream_peer = Arc::clone(&upstream_server.peer);
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = ResourceSubscriptionServer {
+                subscribe_calls: Arc::clone(&upstream_server_task.subscribe_calls),
+                unsubscribe_calls: Arc::clone(&upstream_server_task.unsubscribe_calls),
+                peer: upstream_peer,
+            };
+            let server = handler
+                .serve(server_transport)
+                .await
+                .expect("start resource subscription upstream");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("catalog"),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(&router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect subscription upstream");
+        let capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+
+        server_manager.replace_server(
+            "catalog",
+            UpstreamServer {
+                name: "catalog".to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                capabilities,
+                health: ServerHealth::Healthy,
+            },
+        );
+
+        router.refresh_tools().await;
+        assert_eq!(
+            router
+                .synthesized_capabilities()
+                .resources
+                .and_then(|caps| caps.subscribe),
+            Some(true)
+        );
+
+        let proxy_handler = ProxyHandler::from_router(router.clone());
+        let (proxy_server_transport_a, downstream_transport_a) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(proxy_server_transport_a)
+                .await
+                .expect("start proxy server a");
+            let _ = server.waiting().await;
+        });
+
+        let proxy_handler_b = ProxyHandler::from_router(router.clone());
+        let (proxy_server_transport_b, downstream_transport_b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler_b
+                .serve(proxy_server_transport_b)
+                .await
+                .expect("start proxy server b");
+            let _ = server.waiting().await;
+        });
+
+        let signal_a = Arc::new(Notify::new());
+        let updates_a = Arc::new(Mutex::new(Vec::new()));
+        let downstream_client_a = ResourceUpdatedClient {
+            signal: Arc::clone(&signal_a),
+            updates: Arc::clone(&updates_a),
+        }
+        .serve(downstream_transport_a)
+        .await
+        .expect("connect downstream client a");
+
+        let signal_b = Arc::new(Notify::new());
+        let updates_b = Arc::new(Mutex::new(Vec::new()));
+        let downstream_client_b = ResourceUpdatedClient {
+            signal: Arc::clone(&signal_b),
+            updates: Arc::clone(&updates_b),
+        }
+        .serve(downstream_transport_b)
+        .await
+        .expect("connect downstream client b");
+
+        downstream_client_a
+            .peer()
+            .subscribe(SubscribeRequestParams::new("memory://notes"))
+            .await
+            .expect("first subscribe succeeds");
+        downstream_client_b
+            .peer()
+            .subscribe(SubscribeRequestParams::new("memory://notes"))
+            .await
+            .expect("second subscribe succeeds");
+
+        assert_eq!(upstream_server.subscribe_count(), 1);
+
+        upstream_server.notify_update("memory://notes").await;
+
+        tokio::time::timeout(Duration::from_secs(5), signal_a.notified())
+            .await
+            .expect("client a should receive update");
+        tokio::time::timeout(Duration::from_secs(5), signal_b.notified())
+            .await
+            .expect("client b should receive update");
+
+        assert_eq!(updates_a.lock().unwrap().as_slice(), ["memory://notes"]);
+        assert_eq!(updates_b.lock().unwrap().as_slice(), ["memory://notes"]);
+
+        downstream_client_a
+            .peer()
+            .unsubscribe(make_unsubscribe_request("memory://notes"))
+            .await
+            .expect("first unsubscribe succeeds");
+        assert_eq!(upstream_server.unsubscribe_count(), 0);
+
+        upstream_server.notify_update("memory://notes").await;
+        tokio::time::timeout(Duration::from_secs(5), signal_b.notified())
+            .await
+            .expect("client b should still receive update");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(updates_a.lock().unwrap().len(), 1);
+        assert_eq!(updates_b.lock().unwrap().len(), 2);
+
+        downstream_client_b
+            .peer()
+            .unsubscribe(make_unsubscribe_request("memory://notes"))
+            .await
+            .expect("final unsubscribe succeeds");
+        assert_eq!(upstream_server.unsubscribe_count(), 1);
     }
 
     #[tokio::test]

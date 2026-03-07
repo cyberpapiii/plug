@@ -37,6 +37,11 @@ pub(crate) struct DaemonProxySession {
     pub(crate) capabilities: rmcp::model::ServerCapabilities,
 }
 
+pub(crate) struct DaemonNotificationStream {
+    pub(crate) reader: tokio::net::unix::OwnedReadHalf,
+    pub(crate) _writer: tokio::net::unix::OwnedWriteHalf,
+}
+
 pub(crate) async fn establish_daemon_proxy_session(
     config_path: Option<&PathBuf>,
     client_id: String,
@@ -81,6 +86,35 @@ pub(crate) async fn establish_daemon_proxy_session(
         session_id,
         capabilities,
     })
+}
+
+pub(crate) async fn establish_daemon_notification_stream(
+    session_id: &str,
+    client_id: &str,
+) -> anyhow::Result<DaemonNotificationStream> {
+    let stream = daemon::connect_to_daemon()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("daemon unavailable for notification attachment"))?;
+    let (mut reader, mut writer) = stream.into_split();
+    let request = plug_core::ipc::IpcRequest::AttachNotifications {
+        session_id: session_id.to_string(),
+        client_id: client_id.to_string(),
+    };
+    let payload = serde_json::to_vec(&request)?;
+    plug_core::ipc::write_frame(&mut writer, &payload).await?;
+
+    let frame = plug_core::ipc::read_frame(&mut reader)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed while attaching notifications"))?;
+    let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)?;
+    match response {
+        plug_core::ipc::IpcResponse::Ok => Ok(DaemonNotificationStream {
+            reader,
+            _writer: writer,
+        }),
+        plug_core::ipc::IpcResponse::Error { code, message } => anyhow::bail!("{code}: {message}"),
+        other => anyhow::bail!("unexpected daemon notification attach response: {other:?}"),
+    }
 }
 
 fn parse_registered_session(frame: &[u8], expected_client_id: &str) -> anyhow::Result<String> {
@@ -312,11 +346,21 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     let config = plug_core::config::load_config(config_path)?;
     let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;
-    let sessions: Arc<dyn plug_core::session::SessionStore> =
-        Arc::new(plug_core::session::StatefulSessionStore::new(
-            config.http.session_timeout_secs,
-            config.http.max_sessions,
-        ));
+    let concrete_sessions = Arc::new(plug_core::session::StatefulSessionStore::new(
+        config.http.session_timeout_secs,
+        config.http.max_sessions,
+    ));
+    {
+        let router = engine.tool_router().clone();
+        concrete_sessions.set_remove_hook(Arc::new(move |session_id| {
+            router.cleanup_resource_subscriptions_for_target(
+                &plug_core::notifications::NotificationTarget::Http {
+                    session_id: Arc::from(session_id.to_string()),
+                },
+            );
+        }));
+    }
+    let sessions: Arc<dyn plug_core::session::SessionStore> = concrete_sessions;
     sessions.spawn_cleanup_task(engine.cancel_token().clone());
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: engine.tool_router().clone(),
@@ -463,8 +507,18 @@ mod tests {
             plug_core::config::Config::default(),
         ));
         engine.start().await.expect("engine start");
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let concrete_sessions = Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        {
+            let router = engine.tool_router().clone();
+            concrete_sessions.set_remove_hook(Arc::new(move |session_id| {
+                router.cleanup_resource_subscriptions_for_target(
+                    &plug_core::notifications::NotificationTarget::Http {
+                        session_id: Arc::from(session_id.to_string()),
+                    },
+                );
+            }));
+        }
+        let sessions: Arc<dyn plug_core::session::SessionStore> = concrete_sessions;
         sessions.spawn_cleanup_task(engine.cancel_token().clone());
         let state = Arc::new(plug_core::http::server::HttpState {
             router: engine.tool_router().clone(),

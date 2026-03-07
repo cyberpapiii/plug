@@ -78,11 +78,11 @@ This document reflects the dependency picture of the current merged codebase.
 - `dialoguer`, `console`, `open`
   Guided CLI flows and local config opening.
 
-## Present But Not Active Product Surface
+## Deferred Product Surface
 
+There is currently no active TUI dependency stack in the merged binary.
+
+If a TUI returns in a future tranche, re-evaluate:
 - `ratatui`
 - `crossterm`
 - `color-eyre`
-
-These remain in the manifests from earlier TUI work, but there is still no active TUI product
-surface in the current merged codepath.

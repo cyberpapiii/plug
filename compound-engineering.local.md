@@ -10,6 +10,6 @@ plan_review_agents: [code-simplicity-reviewer, architecture-strategist]
 - Concurrency model: ArcSwap for immutable snapshots, DashMap for mutable state, tokio::sync primitives
 - All string fields in broadcast events use `Arc<str>` for O(1) clone
 - Config via Figment with TOML
-- TUI uses ratatui 0.30 + crossterm 0.29
+- No live TUI stack is currently linked in the shipped binary; terminal management views are plain CLI output
 - IPC uses length-prefixed JSON over Unix sockets
 - Auth tokens use constant-time comparison (subtle crate)

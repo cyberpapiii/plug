@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CancelledNotification, CancelledNotificationParam, ProgressNotification,
-    ProgressNotificationParam, ServerJsonRpcMessage, ServerNotification,
-    ToolListChangedNotification,
+    ProgressNotificationParam, ResourceUpdatedNotification, ResourceUpdatedNotificationParam,
+    ServerJsonRpcMessage, ServerNotification, ToolListChangedNotification,
 };
 
 /// Internal protocol notifications used for downstream transport fan-out.
@@ -21,12 +21,17 @@ pub enum ProtocolNotification {
         target: NotificationTarget,
         params: CancelledNotificationParam,
     },
+    ResourceUpdated {
+        target: NotificationTarget,
+        params: ResourceUpdatedNotificationParam,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotificationTarget {
     Stdio { client_id: Arc<str> },
     Http { session_id: Arc<str> },
+    Ipc { session_id: Arc<str> },
 }
 
 impl ProtocolNotification {
@@ -44,6 +49,11 @@ impl ProtocolNotification {
             ProtocolNotification::Cancelled { params, .. } => {
                 ServerJsonRpcMessage::notification(ServerNotification::CancelledNotification(
                     CancelledNotification::new(params.clone()),
+                ))
+            }
+            ProtocolNotification::ResourceUpdated { params, .. } => {
+                ServerJsonRpcMessage::notification(ServerNotification::ResourceUpdatedNotification(
+                    ResourceUpdatedNotification::new(params.clone()),
                 ))
             }
         }

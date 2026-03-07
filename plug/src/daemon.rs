@@ -11,11 +11,12 @@ use anyhow::Context as _;
 use dashmap::DashMap;
 use fs2::FileExt as _;
 use tokio::net::UnixListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
 use plug_core::ipc::{self, IpcRequest, IpcResponse};
+use plug_core::notifications::{NotificationTarget, ProtocolNotification};
 
 /// Maximum concurrent IPC connections.
 const MAX_IPC_CONNECTIONS: usize = 32;
@@ -35,6 +36,46 @@ pub struct ClientRegistry {
     client_sessions: DashMap<String, String>,
     /// Sends current client count on every change.
     count_tx: tokio::sync::watch::Sender<usize>,
+}
+
+struct NotificationHub {
+    sinks: DashMap<String, mpsc::Sender<IpcResponse>>,
+}
+
+impl NotificationHub {
+    fn new() -> Self {
+        Self {
+            sinks: DashMap::new(),
+        }
+    }
+
+    fn attach(&self, session_id: String) -> mpsc::Receiver<IpcResponse> {
+        let (tx, rx) = mpsc::channel(32);
+        self.sinks.insert(session_id, tx);
+        rx
+    }
+
+    fn detach(&self, session_id: &str) {
+        self.sinks.remove(session_id);
+    }
+
+    fn broadcast_notification(&self, payload: serde_json::Value) {
+        for entry in self.sinks.iter() {
+            if let Err(error) = entry.try_send(IpcResponse::McpNotification {
+                payload: payload.clone(),
+            }) {
+                tracing::warn!(session_id = %entry.key(), error = %error, "dropping daemon IPC broadcast notification");
+            }
+        }
+    }
+
+    fn send_targeted(&self, session_id: &str, payload: serde_json::Value) {
+        if let Some(entry) = self.sinks.get(session_id) {
+            if let Err(error) = entry.try_send(IpcResponse::McpNotification { payload }) {
+                tracing::warn!(session_id = %entry.key(), error = %error, "dropping daemon IPC targeted notification");
+            }
+        }
+    }
 }
 
 /// Metadata for a connected proxy client.
@@ -137,6 +178,12 @@ impl ClientRegistry {
 
     fn session_exists(&self, session_id: &str) -> bool {
         self.sessions.contains_key(session_id)
+    }
+
+    fn session_belongs_to_client(&self, session_id: &str, client_id: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|session| session.client_id == client_id)
     }
 
     /// Snapshot all live sessions for CLI inspection.
@@ -423,6 +470,79 @@ pub async fn run_daemon(
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
     let (client_registry, count_rx) = ClientRegistry::new();
     let client_registry = Arc::new(client_registry);
+    let notification_hub = Arc::new(NotificationHub::new());
+
+    {
+        let cancel = cancel.clone();
+        let notification_hub = Arc::clone(&notification_hub);
+        let mut rx = engine.tool_router().subscribe_notifications();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    recv = rx.recv() => {
+                        match recv {
+                            Ok(ProtocolNotification::ToolListChanged) => {
+                                notification_hub.broadcast_notification(
+                                    ProtocolNotification::ToolListChanged.to_json_value(),
+                                );
+                            }
+                            Ok(ProtocolNotification::Progress { target, params }) => {
+                                if let NotificationTarget::Ipc { session_id } = target {
+                                    let payload = ProtocolNotification::Progress {
+                                        target: NotificationTarget::Ipc {
+                                            session_id: Arc::clone(&session_id),
+                                        },
+                                        params,
+                                    }
+                                    .to_json_value();
+                                    notification_hub.send_targeted(
+                                        &session_id,
+                                        payload,
+                                    );
+                                }
+                            }
+                            Ok(ProtocolNotification::Cancelled { target, params }) => {
+                                if let NotificationTarget::Ipc { session_id } = target {
+                                    let payload = ProtocolNotification::Cancelled {
+                                        target: NotificationTarget::Ipc {
+                                            session_id: Arc::clone(&session_id),
+                                        },
+                                        params,
+                                    }
+                                    .to_json_value();
+                                    notification_hub.send_targeted(
+                                        &session_id,
+                                        payload,
+                                    );
+                                }
+                            }
+                            Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
+                                if let NotificationTarget::Ipc { session_id } = target {
+                                    let payload = ProtocolNotification::ResourceUpdated {
+                                        target: NotificationTarget::Ipc {
+                                            session_id: Arc::clone(&session_id),
+                                        },
+                                        params,
+                                    }
+                                    .to_json_value();
+                                    notification_hub.send_targeted(
+                                        &session_id,
+                                        payload,
+                                    );
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "daemon notification fan-out lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Grace period: when the last proxy client disconnects, start a countdown.
     // If no new client connects before it fires, shut down the daemon.
@@ -495,6 +615,7 @@ pub async fn run_daemon(
                         let auth = auth_token.clone();
                         let engine_clone = engine.clone();
                         let registry = client_registry.clone();
+                        let notification_hub = notification_hub.clone();
                         let config_path = config_path.clone();
 
                         tokio::spawn(async move {
@@ -510,7 +631,10 @@ pub async fn run_daemon(
                                 config_path: config_path.clone(),
                                 started_at,
                                 client_registry: registry,
+                                notification_hub: notification_hub.clone(),
                                 session_id: None,
+                                notification_session_id: None,
+                                notification_rx: None,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
@@ -547,8 +671,12 @@ struct ConnectionContext {
     config_path: PathBuf,
     started_at: Instant,
     client_registry: Arc<ClientRegistry>,
+    notification_hub: Arc<NotificationHub>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
+    /// Session ID for a notification-only attachment, if this connection is one.
+    notification_session_id: Option<String>,
+    notification_rx: Option<mpsc::Receiver<IpcResponse>>,
 }
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
@@ -565,7 +693,15 @@ async fn handle_ipc_connection(
 
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
+        ctx.engine
+            .tool_router()
+            .cleanup_resource_subscriptions_for_target(&NotificationTarget::Ipc {
+                session_id: Arc::from(session_id.as_str()),
+            });
         ctx.client_registry.deregister(session_id);
+    }
+    if let Some(ref session_id) = ctx.notification_session_id {
+        ctx.notification_hub.detach(session_id);
     }
 
     result
@@ -658,10 +794,59 @@ async fn handle_ipc_loop(
 
         ipc::send_response(writer, &response).await?;
 
+        if matches!(request, IpcRequest::AttachNotifications { .. })
+            && matches!(response, IpcResponse::Ok)
+        {
+            handle_notification_stream(reader, writer, ctx).await?;
+            break;
+        }
+
         // Shutdown request — send OK then trigger cancel
         if matches!(request, IpcRequest::Shutdown { .. }) {
             ctx.cancel.cancel();
             break;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_notification_stream(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &mut ConnectionContext,
+) -> anyhow::Result<()> {
+    let Some(rx) = ctx.notification_rx.as_mut() else {
+        return Ok(());
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => break,
+            frame = ipc::read_frame(reader) => {
+                match frame {
+                    Ok(None) => break,
+                    Ok(Some(_)) => {
+                        let resp = IpcResponse::Error {
+                            code: "UNEXPECTED_REQUEST".to_string(),
+                            message: "notification attachment connections are read-only".to_string(),
+                        };
+                        ipc::send_response(writer, &resp).await?;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "notification attachment frame read error");
+                        break;
+                    }
+                }
+            }
+            maybe_response = rx.recv() => {
+                let Some(response) = maybe_response else { break; };
+                if let Err(error) = ipc::send_response(writer, &response).await {
+                    tracing::debug!(error = %error, "notification attachment send failed");
+                    break;
+                }
+            }
         }
     }
 
@@ -767,6 +952,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session is no longer active for this client".to_string(),
                 };
             }
+            ctx.engine
+                .tool_router()
+                .cleanup_resource_subscriptions_for_target(&NotificationTarget::Ipc {
+                    session_id: Arc::from(session_id.as_str()),
+                });
             ctx.client_registry.deregister(session_id);
             ctx.session_id = None;
             IpcResponse::Ok
@@ -821,6 +1011,31 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             IpcResponse::Pong
+        }
+
+        IpcRequest::AttachNotifications {
+            session_id,
+            client_id,
+        } => {
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_NOT_FOUND".to_string(),
+                    message: "session not registered".to_string(),
+                };
+            }
+            if !ctx
+                .client_registry
+                .session_belongs_to_client(session_id, client_id)
+            {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session does not belong to the supplied client_id".to_string(),
+                };
+            }
+            ctx.notification_hub.detach(session_id);
+            ctx.notification_rx = Some(ctx.notification_hub.attach(session_id.clone()));
+            ctx.notification_session_id = Some(session_id.clone());
+            IpcResponse::Ok
         }
 
         IpcRequest::ListTools => {
@@ -972,6 +1187,72 @@ async fn dispatch_mcp_request(
                         code: "SERIALIZE_ERROR".to_string(),
                         message: e.to_string(),
                     },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "resources/subscribe" => {
+            let uri = match params.and_then(|p| p.get("uri")).and_then(|v| v.as_str()) {
+                Some(uri) => uri,
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "resources/subscribe requires 'uri' in params".to_string(),
+                    };
+                }
+            };
+
+            match tool_router
+                .subscribe_resource(
+                    uri,
+                    NotificationTarget::Ipc {
+                        session_id: Arc::from(session_id),
+                    },
+                )
+                .await
+            {
+                Ok(()) => IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "resources/unsubscribe" => {
+            let uri = match params.and_then(|p| p.get("uri")).and_then(|v| v.as_str()) {
+                Some(uri) => uri,
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "resources/unsubscribe requires 'uri' in params".to_string(),
+                    };
+                }
+            };
+
+            match tool_router
+                .unsubscribe_resource(
+                    uri,
+                    NotificationTarget::Ipc {
+                        session_id: Arc::from(session_id),
+                    },
+                )
+                .await
+            {
+                Ok(()) => IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
                 },
                 Err(mcp_err) => match serde_json::to_value(&mcp_err) {
                     Ok(payload) => IpcResponse::McpResponse { payload },

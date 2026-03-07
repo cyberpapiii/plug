@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -10,11 +11,14 @@ use crate::http::error::HttpError;
 
 use super::{SessionStore, SseMessage};
 
+type SessionRemoveHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Current in-memory stateful downstream session store.
 pub struct StatefulSessionStore {
     sessions: Arc<DashMap<String, SessionState>>,
     max_sessions: usize,
     timeout: Duration,
+    on_remove: RwLock<Option<SessionRemoveHook>>,
 }
 
 struct SessionState {
@@ -30,6 +34,21 @@ impl StatefulSessionStore {
             sessions: Arc::new(DashMap::new()),
             max_sessions,
             timeout: Duration::from_secs(timeout_secs),
+            on_remove: RwLock::new(None),
+        }
+    }
+
+    pub fn set_remove_hook(&self, hook: SessionRemoveHook) {
+        if let Ok(mut guard) = self.on_remove.write() {
+            *guard = Some(hook);
+        }
+    }
+
+    fn notify_removed(&self, session_id: &str) {
+        if let Ok(guard) = self.on_remove.read() {
+            if let Some(hook) = guard.as_ref() {
+                hook(session_id);
+            }
         }
     }
 
@@ -61,6 +80,7 @@ impl StatefulSessionStore {
 
         if remove_session {
             self.sessions.remove(session_id);
+            self.notify_removed(session_id);
             return;
         }
 
@@ -110,6 +130,7 @@ impl SessionStore for StatefulSessionStore {
         if entry.last_activity.elapsed() > self.timeout {
             drop(entry);
             self.sessions.remove(session_id);
+            self.notify_removed(session_id);
             return Err(HttpError::SessionNotFound);
         }
 
@@ -166,6 +187,7 @@ impl SessionStore for StatefulSessionStore {
         let removed = self.sessions.remove(session_id).is_some();
         if removed {
             tracing::debug!(session_id = %session_id, "session removed");
+            self.notify_removed(session_id);
         }
         removed
     }
@@ -188,6 +210,7 @@ impl SessionStore for StatefulSessionStore {
     fn spawn_cleanup_task(&self, cancel: CancellationToken) {
         let sessions = Arc::clone(&self.sessions);
         let timeout = self.timeout;
+        let on_remove = self.on_remove.read().ok().and_then(|guard| guard.clone());
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -201,9 +224,20 @@ impl SessionStore for StatefulSessionStore {
                         break;
                     }
                     _ = interval.tick() => {
-                        let before = sessions.len();
-                        sessions.retain(|_, state| state.last_activity.elapsed() <= timeout);
-                        let expired = before - sessions.len();
+                        let expired_ids = sessions
+                            .iter()
+                            .filter(|entry| entry.last_activity.elapsed() > timeout)
+                            .map(|entry| entry.key().clone())
+                            .collect::<Vec<_>>();
+                        for session_id in &expired_ids {
+                            sessions.remove(session_id);
+                        }
+                        let expired = expired_ids.len();
+                        for session_id in expired_ids {
+                            if let Some(hook) = on_remove.as_ref() {
+                                hook(&session_id);
+                            }
+                        }
                         if expired > 0 {
                             tracing::info!(expired, remaining = sessions.len(), "cleaned up expired sessions");
                         }

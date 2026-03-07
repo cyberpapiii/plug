@@ -4,6 +4,7 @@
 //! all tool calls through the daemon's shared Engine via Unix socket IPC.
 //! This is what `plug connect` uses when a daemon is running.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use std::time::Duration;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -24,6 +25,9 @@ struct SharedConnection {
     conn: Mutex<crate::runtime::DaemonProxySession>,
     config_path: Option<PathBuf>,
     capabilities: std::sync::RwLock<ServerCapabilities>,
+    peer: std::sync::RwLock<Option<Peer<RoleServer>>>,
+    notification_task: Mutex<Option<JoinHandle<()>>>,
+    resource_subscriptions: Mutex<HashSet<String>>,
 }
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
@@ -56,6 +60,9 @@ impl IpcProxyHandler {
             capabilities: std::sync::RwLock::new(session.capabilities.clone()),
             conn: Mutex::new(session),
             config_path,
+            peer: std::sync::RwLock::new(None),
+            notification_task: Mutex::new(None),
+            resource_subscriptions: Mutex::new(HashSet::new()),
         });
         let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
         Self { shared, heartbeat }
@@ -195,7 +202,20 @@ impl IpcProxyHandler {
         if let Ok(mut caps) = self.shared.capabilities.write() {
             *caps = session.capabilities.clone();
         }
+        let session_id = session.session_id.clone();
+        let client_id = session.client_id.clone();
         *conn = session;
+        self.replay_resource_subscriptions_locked(conn).await?;
+        let peer = self.shared.peer.read().ok().and_then(|guard| guard.clone());
+        if let Some(peer) = peer {
+            Self::restart_notification_task_for_shared_with_ids(
+                &self.shared,
+                peer,
+                session_id,
+                client_id,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -213,7 +233,17 @@ impl IpcProxyHandler {
         if let Ok(mut caps) = shared.capabilities.write() {
             *caps = session.capabilities.clone();
         }
+        let session_id = session.session_id.clone();
+        let client_id = session.client_id.clone();
         *conn = session;
+        Self::replay_resource_subscriptions_for_shared(shared, conn).await?;
+        let peer = shared.peer.read().ok().and_then(|guard| guard.clone());
+        if let Some(peer) = peer {
+            Self::restart_notification_task_for_shared_with_ids(
+                shared, peer, session_id, client_id,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -234,11 +264,199 @@ impl IpcProxyHandler {
             reconnectable,
         }
     }
+
+    async fn restart_notification_task(&self) -> Result<(), McpError> {
+        Self::restart_notification_task_for_shared(&self.shared).await
+    }
+
+    async fn restart_notification_task_for_shared(
+        shared: &Arc<SharedConnection>,
+    ) -> Result<(), McpError> {
+        let maybe_peer = shared.peer.read().ok().and_then(|guard| guard.clone());
+        let Some(peer) = maybe_peer else {
+            return Ok(());
+        };
+
+        if let Some(task) = shared.notification_task.lock().await.take() {
+            task.abort();
+        }
+
+        let (session_id, client_id) = {
+            let conn = shared.conn.lock().await;
+            (conn.session_id.clone(), conn.client_id.clone())
+        };
+        Self::restart_notification_task_for_shared_with_ids(shared, peer, session_id, client_id)
+            .await
+    }
+
+    async fn restart_notification_task_for_shared_with_ids(
+        shared: &Arc<SharedConnection>,
+        peer: Peer<RoleServer>,
+        session_id: String,
+        client_id: String,
+    ) -> Result<(), McpError> {
+        let shared_for_task = Arc::clone(shared);
+        let task = tokio::spawn(async move {
+            Self::notification_supervisor(shared_for_task, peer, session_id, client_id).await;
+        });
+        *shared.notification_task.lock().await = Some(task);
+        Ok(())
+    }
+
+    async fn notification_supervisor(
+        shared: Arc<SharedConnection>,
+        peer: Peer<RoleServer>,
+        mut session_id: String,
+        client_id: String,
+    ) {
+        loop {
+            let mut stream = match crate::runtime::establish_daemon_notification_stream(
+                &session_id,
+                &client_id,
+            )
+            .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to attach daemon notification stream");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let conn = shared.conn.lock().await;
+                    session_id = conn.session_id.clone();
+                    continue;
+                }
+            };
+
+            loop {
+                let frame = match ipc::read_frame(&mut stream.reader).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(error = %error, "daemon notification stream read failed");
+                        break;
+                    }
+                };
+
+                let response: IpcResponse = match serde_json::from_slice(&frame) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to parse daemon notification frame");
+                        continue;
+                    }
+                };
+
+                let IpcResponse::McpNotification { payload } = response else {
+                    tracing::debug!(
+                        "ignoring non-notification frame on daemon notification stream"
+                    );
+                    continue;
+                };
+
+                let message: ServerJsonRpcMessage = match serde_json::from_value(payload) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to decode daemon MCP notification");
+                        continue;
+                    }
+                };
+
+                if let ServerJsonRpcMessage::Notification(notification) = message {
+                    match notification.notification {
+                        ServerNotification::ToolListChangedNotification(_) => {
+                            if peer.notify_tool_list_changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        ServerNotification::ProgressNotification(progress) => {
+                            if peer.notify_progress(progress.params).await.is_err() {
+                                return;
+                            }
+                        }
+                        ServerNotification::CancelledNotification(cancelled) => {
+                            if peer.notify_cancelled(cancelled.params).await.is_err() {
+                                return;
+                            }
+                        }
+                        ServerNotification::ResourceUpdatedNotification(updated) => {
+                            if peer.notify_resource_updated(updated.params).await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let conn = shared.conn.lock().await;
+            session_id = conn.session_id.clone();
+        }
+    }
+
+    async fn replay_resource_subscriptions_locked(
+        &self,
+        conn: &mut crate::runtime::DaemonProxySession,
+    ) -> Result<(), McpError> {
+        Self::replay_resource_subscriptions_for_shared(&self.shared, conn).await
+    }
+
+    async fn replay_resource_subscriptions_for_shared(
+        shared: &Arc<SharedConnection>,
+        conn: &mut crate::runtime::DaemonProxySession,
+    ) -> Result<(), McpError> {
+        let uris = shared
+            .resource_subscriptions
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for uri in uris {
+            let payload = serde_json::to_vec(&IpcRequest::McpRequest {
+                session_id: conn.session_id.clone(),
+                method: "resources/subscribe".to_string(),
+                params: Some(serde_json::json!({ "uri": uri })),
+            })
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            match Self::try_round_trip_locked(conn, &payload).await {
+                Ok(IpcResponse::McpResponse { payload }) => {
+                    if payload.get("code").is_some() {
+                        if let Ok(err) = serde_json::from_value::<McpError>(payload) {
+                            return Err(err);
+                        }
+                    }
+                }
+                Ok(IpcResponse::Error { code, message }) => {
+                    return Err(McpError::internal_error(format!("{code}: {message}"), None));
+                }
+                Ok(other) => {
+                    return Err(McpError::internal_error(
+                        format!("unexpected IPC replay response: {other:?}"),
+                        None,
+                    ));
+                }
+                Err(error) => {
+                    return Err(McpError::internal_error(
+                        format!("failed to replay resource subscriptions: {}", error.message),
+                        None,
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for IpcProxyHandler {
     fn drop(&mut self) {
         self.heartbeat.abort();
+        if let Ok(mut guard) = self.shared.notification_task.try_lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -267,6 +485,9 @@ impl ServerHandler for IpcProxyHandler {
                 "client connected via IPC proxy"
             );
             self.shared.conn.lock().await.client_info = Some(client_name.clone());
+            if let Ok(mut guard) = self.shared.peer.write() {
+                *guard = Some(context.peer.clone());
+            }
 
             // Forward client info to daemon for client-type-aware tool filtering
             if let Err(e) = self
@@ -282,6 +503,9 @@ impl ServerHandler for IpcProxyHandler {
             }
 
             context.peer.set_peer_info(request);
+            if let Err(error) = self.restart_notification_task().await {
+                tracing::warn!(error = %error, "failed to attach daemon notification stream");
+            }
             Ok(self.get_info())
         }
     }
@@ -466,6 +690,90 @@ impl ServerHandler for IpcProxyHandler {
                             None,
                         )
                     })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/subscribe".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    if payload.get("code").is_some() {
+                        if let Ok(err) = serde_json::from_value::<McpError>(payload.clone()) {
+                            return Err(err);
+                        }
+                    }
+                    self.shared
+                        .resource_subscriptions
+                        .lock()
+                        .await
+                        .insert(request.uri.clone());
+                    Ok(())
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/unsubscribe".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    if payload.get("code").is_some() {
+                        if let Ok(err) = serde_json::from_value::<McpError>(payload.clone()) {
+                            return Err(err);
+                        }
+                    }
+                    self.shared
+                        .resource_subscriptions
+                        .lock()
+                        .await
+                        .remove(&request.uri);
+                    Ok(())
                 }
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))

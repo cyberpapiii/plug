@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
-use crate::server::ServerManager;
+use crate::server::{ServerManager, UpstreamServer};
 use crate::types::{ClientType, ServerHealth};
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
@@ -97,6 +97,8 @@ pub struct ToolRouter {
     active_call_lookup: DashMap<DownstreamCallKey, u64>,
     upstream_request_lookup: DashMap<UpstreamRequestKey, u64>,
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
+    resource_subscribers: DashMap<String, HashSet<NotificationTarget>>,
+    target_resource_subscriptions: DashMap<NotificationTarget, HashSet<String>>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
     /// Weak reference to Engine for session recovery (reconnect on error).
@@ -208,6 +210,8 @@ impl ToolRouter {
             active_call_lookup: DashMap::new(),
             upstream_request_lookup: DashMap::new(),
             upstream_progress_lookup: DashMap::new(),
+            resource_subscribers: DashMap::new(),
+            target_resource_subscriptions: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
@@ -446,6 +450,231 @@ impl ToolRouter {
             target: record.downstream.notification_target(),
             params,
         });
+    }
+
+    pub(crate) fn route_upstream_resource_updated(
+        &self,
+        server_id: &str,
+        params: ResourceUpdatedNotificationParam,
+    ) {
+        let snapshot = self.cache.load();
+        let Some(route_server) = snapshot.resource_routes.get(&params.uri) else {
+            tracing::debug!(
+                server = %server_id,
+                uri = %params.uri,
+                "ignoring upstream resource update for unrouted URI"
+            );
+            return;
+        };
+        if route_server != server_id {
+            tracing::debug!(
+                server = %server_id,
+                routed_server = %route_server,
+                uri = %params.uri,
+                "ignoring upstream resource update from non-owning server"
+            );
+            return;
+        }
+        drop(snapshot);
+
+        let Some(subscribers) = self
+            .resource_subscribers
+            .get(&params.uri)
+            .map(|entry| entry.iter().cloned().collect::<Vec<_>>())
+        else {
+            tracing::debug!(
+                server = %server_id,
+                uri = %params.uri,
+                "ignoring upstream resource update with no downstream subscribers"
+            );
+            return;
+        };
+
+        for target in subscribers {
+            self.publish_protocol_notification(ProtocolNotification::ResourceUpdated {
+                target,
+                params: params.clone(),
+            });
+        }
+    }
+
+    fn local_subscribe_resource(&self, uri: &str, target: &NotificationTarget) -> bool {
+        let mut subscribers = self
+            .resource_subscribers
+            .entry(uri.to_string())
+            .or_default();
+        let should_subscribe_upstream = subscribers.is_empty();
+        subscribers.insert(target.clone());
+        drop(subscribers);
+
+        self.target_resource_subscriptions
+            .entry(target.clone())
+            .or_default()
+            .insert(uri.to_string());
+
+        should_subscribe_upstream
+    }
+
+    fn local_unsubscribe_resource(&self, uri: &str, target: &NotificationTarget) -> bool {
+        let mut should_unsubscribe_upstream = false;
+
+        if let Some(mut subscribers) = self.resource_subscribers.get_mut(uri) {
+            subscribers.remove(target);
+            should_unsubscribe_upstream = subscribers.is_empty();
+            drop(subscribers);
+        }
+        if should_unsubscribe_upstream {
+            self.resource_subscribers.remove(uri);
+        }
+
+        let mut remove_target_entry = false;
+        if let Some(mut subscriptions) = self.target_resource_subscriptions.get_mut(target) {
+            subscriptions.remove(uri);
+            remove_target_entry = subscriptions.is_empty();
+        }
+        if remove_target_entry {
+            self.target_resource_subscriptions.remove(target);
+        }
+
+        should_unsubscribe_upstream
+    }
+
+    fn resolve_resource_subscription(
+        &self,
+        uri: &str,
+    ) -> Result<(String, Arc<UpstreamServer>), McpError> {
+        let snapshot = self.cache.load();
+        let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
+            McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("resource not found: {uri}"),
+            })
+        })?;
+        drop(snapshot);
+
+        let upstream = self
+            .server_manager
+            .get_upstream(&server_id)
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            })?;
+
+        let supports_subscribe = upstream
+            .capabilities
+            .resources
+            .as_ref()
+            .and_then(|caps| caps.subscribe)
+            .unwrap_or(false);
+        if !supports_subscribe {
+            return Err(McpError::method_not_found::<SubscribeRequestMethod>());
+        }
+
+        Ok((server_id, upstream))
+    }
+
+    pub async fn subscribe_resource(
+        &self,
+        uri: &str,
+        target: NotificationTarget,
+    ) -> Result<(), McpError> {
+        let (_server_id, upstream) = self.resolve_resource_subscription(uri)?;
+        let should_subscribe_upstream = self.local_subscribe_resource(uri, &target);
+        if !should_subscribe_upstream {
+            return Ok(());
+        }
+
+        if let Err(error) = upstream
+            .client
+            .peer()
+            .subscribe(SubscribeRequestParams::new(uri))
+            .await
+        {
+            self.local_unsubscribe_resource(uri, &target);
+            return Err(match error {
+                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                other => McpError::internal_error(other.to_string(), None),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub async fn unsubscribe_resource(
+        &self,
+        uri: &str,
+        target: NotificationTarget,
+    ) -> Result<(), McpError> {
+        let (_server_id, upstream) = self.resolve_resource_subscription(uri)?;
+        let should_unsubscribe_upstream = self.local_unsubscribe_resource(uri, &target);
+        if !should_unsubscribe_upstream {
+            return Ok(());
+        }
+
+        if let Err(error) = upstream
+            .client
+            .peer()
+            .unsubscribe(make_unsubscribe_request(uri))
+            .await
+        {
+            self.local_subscribe_resource(uri, &target);
+            return Err(match error {
+                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                other => McpError::internal_error(other.to_string(), None),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn cleanup_resource_subscriptions_for_target(&self, target: &NotificationTarget) {
+        let Some((_, subscriptions)) = self.target_resource_subscriptions.remove(target) else {
+            return;
+        };
+
+        let uris = subscriptions.into_iter().collect::<Vec<_>>();
+        for uri in uris {
+            let should_unsubscribe_upstream =
+                if let Some(mut subscribers) = self.resource_subscribers.get_mut(&uri) {
+                    subscribers.remove(target);
+                    let last = subscribers.is_empty();
+                    drop(subscribers);
+                    if last {
+                        self.resource_subscribers.remove(&uri);
+                    }
+                    last
+                } else {
+                    false
+                };
+
+            if !should_unsubscribe_upstream {
+                continue;
+            }
+
+            let server_id = self.cache.load().resource_routes.get(&uri).cloned();
+            let Some(server_id) = server_id else {
+                continue;
+            };
+            let Some(upstream) = self.server_manager.get_upstream(&server_id) else {
+                continue;
+            };
+            let uri_clone = uri.clone();
+            tokio::spawn(async move {
+                if let Err(error) = upstream
+                    .client
+                    .peer()
+                    .unsubscribe(make_unsubscribe_request(&uri_clone))
+                    .await
+                {
+                    tracing::debug!(
+                        error = %error,
+                        uri = %uri_clone,
+                        server = %server_id,
+                        "best-effort upstream unsubscribe during target cleanup failed"
+                    );
+                }
+            });
+        }
     }
 
     /// Set the Engine reference for session recovery.
@@ -879,7 +1108,15 @@ impl ToolRouter {
         }
         if upstream_caps.iter().any(|caps| caps.resources.is_some()) {
             capabilities.resources = Some(ResourcesCapability {
-                subscribe: None,
+                subscribe: upstream_caps
+                    .iter()
+                    .any(|caps| {
+                        caps.resources
+                            .as_ref()
+                            .and_then(|resource_caps| resource_caps.subscribe)
+                            .unwrap_or(false)
+                    })
+                    .then_some(true),
                 list_changed: Some(false),
             });
         }
@@ -1717,6 +1954,11 @@ fn paginated_result<T: Clone, R>(
     build(items[start..end].to_vec(), next_cursor)
 }
 
+fn make_unsubscribe_request(uri: &str) -> UnsubscribeRequestParams {
+    serde_json::from_value(serde_json::json!({ "uri": uri }))
+        .expect("unsubscribe request params deserialize")
+}
+
 fn detect_tool_definition_drift(
     previous: &HashMap<String, u64>,
     current: &HashMap<String, u64>,
@@ -1896,6 +2138,15 @@ impl ProxyHandler {
     }
 }
 
+impl Drop for ProxyHandler {
+    fn drop(&mut self) {
+        self.router
+            .cleanup_resource_subscriptions_for_target(&NotificationTarget::Stdio {
+                client_id: Arc::clone(&self.client_id),
+            });
+    }
+}
+
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for ProxyHandler {
     fn get_info(&self) -> ServerInfo {
@@ -1960,6 +2211,16 @@ impl ServerHandler for ProxyHandler {
                                     NotificationTarget::Stdio { client_id: target_id }
                                         if target_id == client_id
                                 ) && peer.notify_cancelled(params).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
+                                if matches!(
+                                    target,
+                                    NotificationTarget::Stdio { client_id: target_id }
+                                        if target_id == client_id
+                                ) && peer.notify_resource_updated(params).await.is_err()
                                 {
                                     break;
                                 }
@@ -2051,6 +2312,40 @@ impl ServerHandler for ProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move { self.router.read_resource(&request.uri).await }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            self.router
+                .subscribe_resource(
+                    &request.uri,
+                    NotificationTarget::Stdio {
+                        client_id: Arc::clone(&self.client_id),
+                    },
+                )
+                .await
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            self.router
+                .unsubscribe_resource(
+                    &request.uri,
+                    NotificationTarget::Stdio {
+                        client_id: Arc::clone(&self.client_id),
+                    },
+                )
+                .await
+        }
     }
 
     fn list_prompts(

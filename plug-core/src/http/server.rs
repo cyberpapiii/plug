@@ -95,6 +95,27 @@ impl HttpState {
                                             );
                                         }
                                     }
+                                    ProtocolNotification::ResourceUpdated { target, params } => {
+                                        if let NotificationTarget::Http { session_id } = target {
+                                            let session_key = session_id.to_string();
+                                            if state.sessions.validate(&session_key).is_err() {
+                                                state.router.cleanup_resource_subscriptions_for_target(
+                                                    &NotificationTarget::Http { session_id },
+                                                );
+                                                continue;
+                                            }
+                                            state.sessions.send_to_session(
+                                                &session_key,
+                                                ProtocolNotification::ResourceUpdated {
+                                                    target: NotificationTarget::Http {
+                                                        session_id,
+                                                    },
+                                                    params,
+                                                }
+                                                .to_json_value(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -260,6 +281,11 @@ async fn delete_mcp(
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let session_id = extract_session_id(&headers)?;
+    state
+        .router
+        .cleanup_resource_subscriptions_for_target(&NotificationTarget::Http {
+            session_id: Arc::from(session_id.as_str()),
+        });
 
     if state.sessions.remove(&session_id) {
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
@@ -431,6 +457,60 @@ async fn handle_request(
             }
         }
 
+        ClientRequest::SubscribeRequest(subscribe_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            match state
+                .router
+                .subscribe_resource(
+                    &subscribe_req.params.uri,
+                    NotificationTarget::Http {
+                        session_id: Arc::from(session_id.as_str()),
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::EmptyResult(EmptyResult {}),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::UnsubscribeRequest(unsubscribe_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            match state
+                .router
+                .unsubscribe_resource(
+                    &unsubscribe_req.params.uri,
+                    NotificationTarget::Http {
+                        session_id: Arc::from(session_id.as_str()),
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::EmptyResult(EmptyResult {}),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
         ClientRequest::ListPromptsRequest(list_req) => {
             validate_session_header(headers, state.sessions.as_ref())?;
             let result = state.router.list_prompts_page(list_req.params);
@@ -566,8 +646,9 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http::Request as HttpRequest;
+    use rmcp::model::ResourceUpdatedNotificationParam;
     use std::time::Duration;
-    use tower::ServiceExt;
+    use tower::ServiceExt as TowerServiceExt;
 
     async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
         let mut events = Vec::new();
@@ -596,9 +677,20 @@ mod tests {
     fn test_state_with_router_config(router_config: crate::proxy::RouterConfig) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, router_config));
+        let concrete_sessions = Arc::new(crate::session::StatefulSessionStore::new(1800, 100));
+        {
+            let router = router.clone();
+            concrete_sessions.set_remove_hook(Arc::new(move |session_id| {
+                router.cleanup_resource_subscriptions_for_target(
+                    &crate::notifications::NotificationTarget::Http {
+                        session_id: Arc::from(session_id.to_string()),
+                    },
+                );
+            }));
+        }
         Arc::new(HttpState {
             router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            sessions: concrete_sessions,
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
@@ -1289,6 +1381,71 @@ mod tests {
                     && event.contains("halfway")
             }),
             "expected SSE stream to contain targeted progress notification, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_resource_update_reaches_http_sse_session() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ResourceUpdated {
+                target: crate::notifications::NotificationTarget::Http {
+                    session_id: Arc::from(session_id),
+                },
+                params: ResourceUpdatedNotificationParam::new("memory://notes"),
+            },
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events.iter().any(|event| {
+                event.contains("notifications/resources/updated")
+                    && event.contains("memory://notes")
+            }),
+            "expected SSE stream to contain resource updated notification, got {events:?}"
         );
     }
 }
