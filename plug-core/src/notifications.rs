@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CancelledNotification, CancelledNotificationParam, ProgressNotification,
-    ProgressNotificationParam, ResourceUpdatedNotification, ResourceUpdatedNotificationParam,
+    CancelledNotification, CancelledNotificationParam, LoggingMessageNotification,
+    LoggingMessageNotificationParam, ProgressNotification, ProgressNotificationParam,
+    ResourceUpdatedNotification, ResourceUpdatedNotificationParam,
     ServerJsonRpcMessage, ServerNotification, ToolListChangedNotification,
 };
 
@@ -24,6 +25,9 @@ pub enum ProtocolNotification {
     ResourceUpdated {
         target: NotificationTarget,
         params: ResourceUpdatedNotificationParam,
+    },
+    LoggingMessage {
+        params: LoggingMessageNotificationParam,
     },
 }
 
@@ -54,6 +58,13 @@ impl ProtocolNotification {
                 ServerJsonRpcMessage::notification(ServerNotification::ResourceUpdatedNotification(
                     ResourceUpdatedNotification::new(params.clone()),
                 ))
+            }
+            ProtocolNotification::LoggingMessage { params } => {
+                ServerJsonRpcMessage::notification(
+                    ServerNotification::LoggingMessageNotification(
+                        LoggingMessageNotification::new(params.clone()),
+                    ),
+                )
             }
         }
     }
