@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use rmcp::model::{ServerJsonRpcMessage, ServerNotification, ToolListChangedNotification};
 
 /// Internal protocol notifications used for downstream transport fan-out.
@@ -8,14 +6,14 @@ use rmcp::model::{ServerJsonRpcMessage, ServerNotification, ToolListChangedNotif
 /// observability and UI/daemon consumers rather than wire-level MCP messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtocolNotification {
-    ToolListChanged { server_id: Arc<str> },
+    ToolListChanged,
 }
 
 impl ProtocolNotification {
     /// Convert the internal notification to a server-to-client JSON-RPC message.
     pub fn to_server_jsonrpc_message(&self) -> ServerJsonRpcMessage {
         match self {
-            ProtocolNotification::ToolListChanged { .. } => ServerJsonRpcMessage::notification(
+            ProtocolNotification::ToolListChanged => ServerJsonRpcMessage::notification(
                 ServerNotification::ToolListChangedNotification(ToolListChangedNotification::default()),
             ),
         }

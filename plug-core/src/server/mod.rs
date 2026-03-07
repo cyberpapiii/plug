@@ -18,7 +18,6 @@ use rmcp::transport::streamable_http_client::{
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
-use crate::notifications::ProtocolNotification;
 use crate::proxy::ToolRouter;
 use crate::types::{HealthState, ServerHealth, ServerStatus};
 
@@ -40,10 +39,10 @@ impl ClientHandler for UpstreamClientHandler {
         &self,
         context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let server_id = Arc::clone(&self.server_id);
         let tools = Arc::clone(&self.tools);
         let router = self.router.clone();
         let peer = context.peer.clone();
+        let server_id = Arc::clone(&self.server_id);
 
         async move {
             match peer.list_all_tools().await {
@@ -51,10 +50,7 @@ impl ClientHandler for UpstreamClientHandler {
                     tools.store(Arc::new(fresh_tools));
 
                     if let Some(router) = router.upgrade() {
-                        router.refresh_tools().await;
-                        router.publish_protocol_notification(ProtocolNotification::ToolListChanged {
-                            server_id,
-                        });
+                        router.schedule_tool_list_changed_refresh();
                     }
                 }
                 Err(error) => {

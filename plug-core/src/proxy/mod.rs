@@ -76,12 +76,15 @@ pub struct ToolRouter {
     event_tx: Option<broadcast::Sender<EngineEvent>>,
     protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
     active_calls: DashMap<u64, DownstreamCallContext>,
+    active_call_lookup: DashMap<DownstreamCallKey, u64>,
+    notification_refresh_in_progress: AtomicBool,
+    notification_refresh_pending: AtomicBool,
     /// Weak reference to Engine for session recovery (reconnect on error).
     /// Set after Engine construction via `set_engine()`.
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DownstreamTransport {
     Stdio,
     Http,
@@ -112,6 +115,23 @@ impl DownstreamCallContext {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DownstreamCallKey {
+    transport: DownstreamTransport,
+    session_id: Option<Arc<str>>,
+    request_id: RequestId,
+}
+
+impl From<&DownstreamCallContext> for DownstreamCallKey {
+    fn from(value: &DownstreamCallContext) -> Self {
+        Self {
+            transport: value.transport,
+            session_id: value.session_id.clone(),
+            request_id: value.request_id.clone(),
+        }
+    }
+}
+
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
@@ -127,6 +147,9 @@ impl ToolRouter {
             event_tx: None,
             protocol_notification_tx,
             active_calls: DashMap::new(),
+            active_call_lookup: DashMap::new(),
+            notification_refresh_in_progress: AtomicBool::new(false),
+            notification_refresh_pending: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
         }
     }
@@ -145,11 +168,55 @@ impl ToolRouter {
         let _ = self.protocol_notification_tx.send(notification);
     }
 
-    pub fn active_call_context(&self, call_id: u64) -> Option<DownstreamCallContext> {
-        self.active_calls.get(&call_id).map(|entry| entry.clone())
+    pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
+        self.notification_refresh_pending.store(true, Ordering::SeqCst);
+
+        if self
+            .notification_refresh_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let router = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                router
+                    .notification_refresh_pending
+                    .store(false, Ordering::SeqCst);
+                router.refresh_tools().await;
+                router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+
+                if router
+                    .notification_refresh_pending
+                    .swap(false, Ordering::SeqCst)
+                {
+                    continue;
+                }
+
+                router
+                    .notification_refresh_in_progress
+                    .store(false, Ordering::SeqCst);
+
+                if router
+                    .notification_refresh_pending
+                    .swap(false, Ordering::SeqCst)
+                    && router
+                        .notification_refresh_in_progress
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    continue;
+                }
+
+                break;
+            }
+        });
     }
 
-    pub fn active_call_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn active_call_count(&self) -> usize {
         self.active_calls.len()
     }
 
@@ -590,6 +657,8 @@ impl ToolRouter {
             let server_id_arc = Arc::<str>::from(server_id.as_str());
             let tool_name_arc = Arc::<str>::from(original_name.as_str());
             if let Some(call_context) = downstream.clone() {
+                self.active_call_lookup
+                    .insert(DownstreamCallKey::from(&call_context), call_id);
                 self.active_calls.insert(call_id, call_context);
             }
             if let Some(ref tx) = self.event_tx {
@@ -619,6 +688,10 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
                     self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -639,6 +712,10 @@ impl ToolRouter {
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
                     self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -681,6 +758,10 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
                     self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -706,6 +787,10 @@ impl ToolRouter {
                     // Timeouts do NOT trip the circuit breaker — a slow tool (e.g. Slack
                     // conversations_unreads taking 2+ min) is not a server failure. Tripping
                     // the CB here would lock out ALL tools on the server after a few slow calls.
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
                     self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
@@ -1030,7 +1115,7 @@ impl ServerHandler for ProxyHandler {
                 tokio::spawn(async move {
                     loop {
                         match rx.recv().await {
-                            Ok(ProtocolNotification::ToolListChanged { .. }) => {
+                            Ok(ProtocolNotification::ToolListChanged) => {
                                 if let Err(error) = peer.notify_tool_list_changed().await {
                                     tracing::debug!(
                                         error = %error,

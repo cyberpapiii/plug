@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -34,10 +35,19 @@ pub struct HttpState {
     pub sessions: SessionManager,
     pub cancel: CancellationToken,
     pub sse_channel_capacity: usize,
+    pub notification_task_started: AtomicBool,
 }
 
 impl HttpState {
     pub fn spawn_notification_fanout(self: &Arc<Self>) {
+        if self
+            .notification_task_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
         let state = Arc::clone(self);
         let mut rx = state.router.subscribe_notifications();
         tokio::spawn(async move {
@@ -48,7 +58,7 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                state.sessions.broadcast(notification.to_json_value()).await;
+                                state.sessions.broadcast(notification.to_json_value());
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
@@ -64,6 +74,8 @@ impl HttpState {
 
 /// Build the axum Router with all middleware and handlers.
 pub fn build_router(state: Arc<HttpState>) -> Router {
+    state.spawn_notification_fanout();
+
     // Discovery endpoint — exempt from origin validation
     let discovery = Router::new()
         .route("/.well-known/mcp.json", get(get_server_card))
@@ -511,6 +523,7 @@ mod tests {
             sessions: SessionManager::new(1800, 100),
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
+            notification_task_started: AtomicBool::new(false),
         })
     }
 
@@ -969,7 +982,6 @@ mod tests {
     #[tokio::test]
     async fn tools_list_changed_reaches_http_sse_client() {
         let state = test_state();
-        state.spawn_notification_fanout();
         let app = build_router(state.clone());
 
         let init_body = serde_json::json!({
@@ -1013,11 +1025,9 @@ mod tests {
         assert_eq!(sse_resp.status(), StatusCode::OK);
         let body = sse_resp.into_body();
 
-        state.router.publish_protocol_notification(
-            crate::notifications::ProtocolNotification::ToolListChanged {
-                server_id: Arc::from("upstream"),
-            },
-        );
+        state
+            .router
+            .publish_protocol_notification(crate::notifications::ProtocolNotification::ToolListChanged);
 
         let events = collect_sse_events(body, 3).await;
         assert!(

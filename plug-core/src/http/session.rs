@@ -123,11 +123,17 @@ impl SessionManager {
     /// Broadcast a notification to every session with an active SSE sender.
     ///
     /// Dead senders are cleared lazily so future fan-out skips them.
-    pub async fn broadcast(&self, message: SseMessage) {
+    pub fn broadcast(&self, message: SseMessage) {
+        let mut expired_sessions = Vec::new();
         let senders: Vec<(String, mpsc::Sender<SseMessage>)> = self
             .sessions
             .iter()
             .filter_map(|entry| {
+                if entry.last_activity.elapsed() > self.timeout {
+                    expired_sessions.push(entry.key().clone());
+                    return None;
+                }
+
                 entry
                     .sse_sender
                     .as_ref()
@@ -137,9 +143,23 @@ impl SessionManager {
 
         let mut stale_sessions = Vec::new();
         for (session_id, sender) in senders {
-            if sender.send(message.clone()).await.is_err() {
-                stale_sessions.push(session_id);
+            match sender.try_send(message.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    stale_sessions.push(session_id);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "dropping slow SSE client from notification fan-out"
+                    );
+                    stale_sessions.push(session_id);
+                }
             }
+        }
+
+        for session_id in expired_sessions {
+            self.sessions.remove(&session_id);
         }
 
         for session_id in stale_sessions {
@@ -187,6 +207,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     #[test]
     fn create_session_returns_uuid() {
@@ -244,5 +265,43 @@ mod tests {
         // Sleep briefly to ensure expiry
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(mgr.validate(&id).is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcast_prunes_expired_sessions_before_delivery() {
+        let mgr = SessionManager::new(0, 100);
+        let id = mgr.create_session().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        mgr.set_sse_sender(&id, tx).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        mgr.broadcast(serde_json::json!({"type": "test"}));
+
+        assert!(mgr.validate(&id).is_err());
+        assert!(rx.try_recv().is_err(), "expired session should not receive messages");
+    }
+
+    #[tokio::test]
+    async fn broadcast_skips_full_senders_without_blocking_other_sessions() {
+        let mgr = SessionManager::new(1800, 100);
+        let slow_id = mgr.create_session().unwrap();
+        let fast_id = mgr.create_session().unwrap();
+
+        let (slow_tx, _slow_rx) = mpsc::channel(1);
+        let (fast_tx, mut fast_rx) = mpsc::channel(1);
+        mgr.set_sse_sender(&slow_id, slow_tx.clone()).unwrap();
+        mgr.set_sse_sender(&fast_id, fast_tx).unwrap();
+
+        slow_tx
+            .try_send(serde_json::json!({"type": "already-buffered"}))
+            .unwrap();
+
+        mgr.broadcast(serde_json::json!({"type": "broadcast"}));
+
+        let received = tokio::time::timeout(Duration::from_secs(1), fast_rx.recv())
+            .await
+            .expect("fast receiver should not be blocked")
+            .expect("fast receiver message present");
+        assert_eq!(received["type"], "broadcast");
     }
 }
