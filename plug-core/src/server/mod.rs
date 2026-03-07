@@ -326,6 +326,8 @@ impl ServerManager {
                     })
                 }
                 TransportType::Http => {
+                    crate::tls::ensure_rustls_provider_installed();
+
                     let url = config
                         .url
                         .as_deref()

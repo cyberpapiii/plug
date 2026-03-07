@@ -11,7 +11,7 @@ repository = "https://github.com/plug-mcp/plug"
 
 [workspace.dependencies]
 # MCP SDK
-rmcp = { version = "1.0.0", features = [
+rmcp = { version = "1.1.0", features = [
     "client",
     "server",
     "macros",
@@ -24,7 +24,7 @@ rmcp = { version = "1.0.0", features = [
     "transport-streamable-http-server",
     "server-side-http",
     # TLS support for HTTPS upstream servers
-    "reqwest-native-tls",
+    "reqwest-tls-no-provider",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 

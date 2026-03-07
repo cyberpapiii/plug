@@ -27,7 +27,7 @@ The codebase also had no explicit operator configuration for certificates or key
 - Keep the shared engine/router/session model unchanged.
 - Keep TLS concerns at the transport edge.
 - Do not introduce ACME/Let's Encrypt automation in the first tranche.
-- Do not reintroduce OpenSSL/native-tls for the new downstream server path.
+- Do not reintroduce OpenSSL/native-tls for either the downstream server path or the upstream HTTP transport path.
 
 ## Solution
 
@@ -59,7 +59,7 @@ pub fn ensure_rustls_provider_installed() {
 }
 ```
 
-This gives the process a single ring-backed rustls bootstrap convention instead of hiding provider installation inside one specific transport path.
+This gives the process a single ring-backed rustls bootstrap convention instead of hiding provider installation inside one specific transport path. The branch also aligns rmcp's upstream HTTP client path to `reqwest-tls-no-provider`, so the same provider policy now applies in both directions.
 
 ### 3. Install the provider at process startup and use HTTPS only at the serve edge
 
@@ -111,8 +111,9 @@ The router and session model did not need to know whether the socket was HTTP or
 
 When adding transport security to `plug` in the future:
 
-1. Add config validation that blocks unsafe remote defaults.
-2. Test the real network path, not only in-process router logic.
-3. For MCP over HTTPS, cover both request/response and SSE attach.
-4. Keep TLS termination at the serving edge unless protocol logic truly depends on it.
-5. If a branch inherits a known flake from `main`, stabilize it before claiming the new feature is finished.
+1. Keep upstream and downstream TLS dependency choices aligned; otherwise one path will quietly keep dragging in native crypto.
+2. Add config validation that blocks unsafe remote defaults.
+3. Test the real network path, not only in-process router logic.
+4. For MCP over HTTPS, cover both request/response and SSE attach.
+5. Keep TLS termination at the serving edge unless protocol logic truly depends on it.
+6. If a branch inherits a known flake from `main`, stabilize it before claiming the new feature is finished.
