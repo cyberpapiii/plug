@@ -853,7 +853,13 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session is no longer active for this client".to_string(),
                 };
             }
-            match serde_json::to_value(ctx.engine.tool_router().synthesized_capabilities()) {
+            let mut caps = ctx.engine.tool_router().synthesized_capabilities();
+            // Mask resource subscriptions for IPC clients — the daemon IPC
+            // transport has no push channel for targeted notifications.
+            if let Some(ref mut resources) = caps.resources {
+                resources.subscribe = None;
+            }
+            match serde_json::to_value(caps) {
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },
                 Err(error) => IpcResponse::Error {
                     code: "SERIALIZE_ERROR".to_string(),
@@ -1071,6 +1077,13 @@ async fn dispatch_mcp_request(
                 },
             }
         }
+
+        "resources/subscribe" | "resources/unsubscribe" => IpcResponse::Error {
+            code: "UNSUPPORTED_METHOD".to_string(),
+            message: format!(
+                "'{method}' not supported via IPC proxy (no push channel for notifications)"
+            ),
+        },
 
         _ => IpcResponse::Error {
             code: "UNSUPPORTED_METHOD".to_string(),

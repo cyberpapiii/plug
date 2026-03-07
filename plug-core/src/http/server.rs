@@ -95,6 +95,21 @@ impl HttpState {
                                             );
                                         }
                                     }
+                                    ProtocolNotification::ResourceUpdated { target, params } => {
+                                        if let NotificationTarget::Http { session_id } = target {
+                                            let session_key = session_id.to_string();
+                                            state.sessions.send_to_session(
+                                                &session_key,
+                                                ProtocolNotification::ResourceUpdated {
+                                                    target: NotificationTarget::Http {
+                                                        session_id,
+                                                    },
+                                                    params,
+                                                }
+                                                .to_json_value(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

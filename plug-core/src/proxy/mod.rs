@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -102,6 +102,8 @@ pub struct ToolRouter {
     /// Weak reference to Engine for session recovery (reconnect on error).
     /// Set after Engine construction via `set_engine()`.
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    /// Resource subscription registry: upstream URI → set of downstream subscribers.
+    resource_subscriptions: DashMap<String, HashSet<NotificationTarget>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -211,6 +213,7 @@ impl ToolRouter {
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
+            resource_subscriptions: DashMap::new(),
         }
     }
 
@@ -446,6 +449,129 @@ impl ToolRouter {
             target: record.downstream.notification_target(),
             params,
         });
+    }
+
+    /// Subscribe a downstream client to resource updates for a given URI.
+    ///
+    /// On the first subscriber for a URI, forwards the subscribe request to the
+    /// upstream server. Returns an error if the upstream does not support subscriptions
+    /// or the resource URI is unknown.
+    pub async fn subscribe_resource(
+        &self,
+        uri: &str,
+        target: NotificationTarget,
+    ) -> Result<(), McpError> {
+        let snapshot = self.cache.load();
+        let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
+            McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("resource not found: {uri}"),
+            })
+        })?;
+        drop(snapshot);
+
+        // Check upstream supports subscriptions
+        let upstream = self
+            .server_manager
+            .get_upstream(&server_id)
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            })?;
+        let supports_subscribe = upstream
+            .capabilities
+            .resources
+            .as_ref()
+            .and_then(|r| r.subscribe)
+            .unwrap_or(false);
+        if !supports_subscribe {
+            return Err(McpError::invalid_request(
+                format!("server {server_id} does not support resource subscriptions"),
+                None,
+            ));
+        }
+
+        let mut entry = self
+            .resource_subscriptions
+            .entry(uri.to_string())
+            .or_default();
+        let is_first = entry.is_empty();
+        entry.insert(target);
+        drop(entry);
+
+        if is_first {
+            upstream
+                .client
+                .peer()
+                .subscribe(SubscribeRequestParams::new(uri))
+                .await
+                .map_err(|error| match error {
+                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                    other => McpError::internal_error(other.to_string(), None),
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Unsubscribe a downstream client from resource updates.
+    ///
+    /// When the last subscriber is removed, forwards the unsubscribe to upstream.
+    pub async fn unsubscribe_resource(
+        &self,
+        uri: &str,
+        target: &NotificationTarget,
+    ) -> Result<(), McpError> {
+        let snapshot = self.cache.load();
+        let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
+            McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("resource not found: {uri}"),
+            })
+        })?;
+        drop(snapshot);
+
+        let should_unsubscribe_upstream = {
+            let mut entry = match self.resource_subscriptions.get_mut(uri) {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+            entry.remove(target);
+            entry.is_empty()
+        };
+
+        if should_unsubscribe_upstream {
+            self.resource_subscriptions.remove(uri);
+
+            if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
+                let _ = upstream
+                    .client
+                    .peer()
+                    .unsubscribe(
+                        serde_json::from_value::<UnsubscribeRequestParams>(
+                            serde_json::json!({ "uri": uri }),
+                        )
+                        .expect("UnsubscribeRequestParams from known-good JSON"),
+                    )
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Route an upstream resource-updated notification to subscribed downstream clients.
+    pub(crate) fn route_upstream_resource_updated(&self, params: ResourceUpdatedNotificationParam) {
+        let subscribers = match self.resource_subscriptions.get(&params.uri) {
+            Some(entry) => entry.clone(),
+            None => return,
+        };
+
+        for target in subscribers {
+            self.publish_protocol_notification(ProtocolNotification::ResourceUpdated {
+                target,
+                params: params.clone(),
+            });
+        }
     }
 
     /// Set the Engine reference for session recovery.
@@ -878,8 +1004,14 @@ impl ToolRouter {
             });
         }
         if upstream_caps.iter().any(|caps| caps.resources.is_some()) {
+            let any_subscribe = upstream_caps.iter().any(|caps| {
+                caps.resources
+                    .as_ref()
+                    .and_then(|r| r.subscribe)
+                    .unwrap_or(false)
+            });
             capabilities.resources = Some(ResourcesCapability {
-                subscribe: None,
+                subscribe: if any_subscribe { Some(true) } else { None },
                 list_changed: Some(false),
             });
         }
@@ -1964,6 +2096,16 @@ impl ServerHandler for ProxyHandler {
                                     break;
                                 }
                             }
+                            Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
+                                if matches!(
+                                    target,
+                                    NotificationTarget::Stdio { client_id: target_id }
+                                        if target_id == client_id
+                                ) && peer.notify_resource_updated(params).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "stdio notification fan-out lagged");
                             }
@@ -2069,6 +2211,32 @@ impl ServerHandler for ProxyHandler {
         async move {
             self.router
                 .get_prompt(&request.name, request.arguments)
+                .await
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::clone(&self.client_id),
+        };
+        async move { self.router.subscribe_resource(&request.uri, target).await }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::clone(&self.client_id),
+        };
+        async move {
+            self.router
+                .unsubscribe_resource(&request.uri, &target)
                 .await
         }
     }
@@ -2632,5 +2800,60 @@ mod tests {
             }
             other => panic!("unexpected notification: {other:?}"),
         }
+    }
+
+    #[test]
+    fn synthesized_capabilities_advertises_subscribe_when_upstream_supports_it() {
+        let sm = Arc::new(ServerManager::new());
+        let config = test_router_config();
+        let router = ToolRouter::new(sm, config);
+
+        // No upstreams → no resources capability at all
+        let caps = router.synthesized_capabilities();
+        assert!(caps.resources.is_none());
+    }
+
+    #[test]
+    fn resource_subscription_registry_lifecycle() {
+        let sm = Arc::new(ServerManager::new());
+        let config = test_router_config();
+        let router = ToolRouter::new(sm, config);
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("test-client"),
+        };
+
+        // Registry starts empty
+        assert!(router.resource_subscriptions.is_empty());
+
+        // Insert directly (bypassing upstream check for unit test)
+        router
+            .resource_subscriptions
+            .entry("file:///test".to_string())
+            .or_default()
+            .insert(target.clone());
+        assert_eq!(router.resource_subscriptions.len(), 1);
+
+        // Route notification should publish to subscriber
+        let mut rx = router.subscribe_notifications();
+        router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new(
+            "file:///test",
+        ));
+
+        match rx.try_recv() {
+            Ok(ProtocolNotification::ResourceUpdated {
+                target: t, params, ..
+            }) => {
+                assert_eq!(t, target);
+                assert_eq!(params.uri, "file:///test");
+            }
+            other => panic!("expected ResourceUpdated, got: {other:?}"),
+        }
+
+        // Route notification for unsubscribed URI → no notification
+        router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new(
+            "file:///other",
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }
