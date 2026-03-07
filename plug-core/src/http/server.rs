@@ -364,11 +364,13 @@ async fn handle_request(
         ClientRequest::CallToolRequest(call_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, &state.sessions)?;
+            let progress_token = call_req.params.progress_token();
             match state
                 .router
                 .call_tool_with_context(
                     call_req.params.name.as_ref(),
                     call_req.params.arguments,
+                    progress_token,
                     Some(DownstreamCallContext::http(
                         Arc::<str>::from(session_id.as_str()),
                         request_id.clone(),

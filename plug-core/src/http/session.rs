@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ struct SessionState {
     last_activity: Instant,
     /// SSE sender for this session (at most one active SSE stream per session).
     sse_sender: Option<mpsc::Sender<SseMessage>>,
+    pending_notifications: VecDeque<SseMessage>,
     client_type: crate::types::ClientType,
 }
 
@@ -49,6 +51,7 @@ impl SessionManager {
             SessionState {
                 last_activity: Instant::now(),
                 sse_sender: None,
+                pending_notifications: VecDeque::new(),
                 client_type: crate::types::ClientType::Unknown,
             },
         );
@@ -85,6 +88,17 @@ impl SessionManager {
             .get_mut(session_id)
             .ok_or(HttpError::SessionNotFound)?;
         entry.sse_sender = Some(sender);
+        while let Some(message) = entry.pending_notifications.pop_front() {
+            if let Some(active_sender) = entry.sse_sender.as_ref() {
+                match active_sender.try_send(message) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -141,6 +155,8 @@ impl SessionManager {
                         clear_sender = true;
                     }
                 }
+            } else {
+                clear_sender = false;
             }
         } else {
             return;
@@ -154,6 +170,14 @@ impl SessionManager {
         if clear_sender {
             if let Some(mut entry) = self.sessions.get_mut(session_id) {
                 entry.sse_sender = None;
+            }
+        } else if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            if entry.sse_sender.is_none() {
+                const PENDING_LIMIT: usize = 32;
+                if entry.pending_notifications.len() >= PENDING_LIMIT {
+                    entry.pending_notifications.pop_front();
+                }
+                entry.pending_notifications.push_back(message.clone());
             }
         }
     }
