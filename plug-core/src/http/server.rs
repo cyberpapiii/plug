@@ -277,6 +277,11 @@ async fn delete_mcp(
     let session_id = extract_session_id(&headers)?;
 
     if state.sessions.remove(&session_id) {
+        // Clean up resource subscriptions for this departing session
+        let target = NotificationTarget::Http {
+            session_id: Arc::from(session_id.as_str()),
+        };
+        state.router.cleanup_subscriptions_for_target(&target).await;
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
@@ -464,6 +469,56 @@ async fn handle_request(
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
                         ServerResult::GetPromptResult(result),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::SubscribeRequest(sub_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            let target = NotificationTarget::Http {
+                session_id: Arc::from(session_id.as_str()),
+            };
+            match state
+                .router
+                .subscribe_resource(&sub_req.params.uri, target)
+                .await
+            {
+                Ok(()) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::EmptyResult(().into()),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::UnsubscribeRequest(unsub_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            let target = NotificationTarget::Http {
+                session_id: Arc::from(session_id.as_str()),
+            };
+            match state
+                .router
+                .unsubscribe_resource(&unsub_req.params.uri, &target)
+                .await
+            {
+                Ok(()) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::EmptyResult(().into()),
                         request_id,
                     );
                     json_response(&response_msg)
