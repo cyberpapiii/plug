@@ -1,52 +1,52 @@
 # Risk Register
 
-This risk register reflects the current post-stabilization direction, not the original research-only state.
+This register reflects the current post-Phase-3 state rather than the earlier stabilization-era
+gaps.
 
 ## High
 
-### Notification infrastructure is still missing
-
-**Impact:** High  
-**Likelihood:** High
-
-`plug` still does not forward the full server-initiated MCP notification surface. This is the next major architectural tranche after `v0.1`.
-
-### Capability surface is still incomplete
+### Stateless MCP evolution may outpace the current session boundary
 
 **Impact:** High  
 **Likelihood:** Medium
 
-The current product is strongest on tools. Resources/prompts/notifications are not yet at parity with the tool path.
+The new `SessionStore` seam and design notes prepare for stateless downstream handling, but they do
+not implement it. If the ecosystem moves quickly toward stateless-by-default clients, `plug` will
+need a deliberate follow-on tranche.
 
-### June 2026 MCP changes may outpace the current abstractions
+### Tasks / post-June-2026 MCP features remain unimplemented
 
 **Impact:** High  
 **Likelihood:** Medium
 
-Stateless-first MCP and Tasks will require careful boundary work. The correct near-term response is preparation, not premature implementation.
+`plug` now covers the core current protocol surface well, but future-facing spec work such as Tasks
+and adjacent workflow primitives remains deferred.
 
 ## Medium
 
-### Shared-runtime truth can drift again if docs are not maintained
+### Shared-runtime truth can drift again if the docs stop moving with the code
 
 **Impact:** Medium  
 **Likelihood:** Medium
 
-The repo recently had major code/doc drift. Keeping docs accurate is now part of the release gate.
+The codebase already went through one major truth pass. The risk now is regression: merged behavior
+changes faster than the tracked docs are updated.
 
-### Tool-scaling strategy is still basic
-
-**Impact:** Medium  
-**Likelihood:** Medium
-
-Client-aware filtering exists, but the larger dynamic-discovery/meta-tool strategy is still future work.
-
-### Upstream server diversity
+### Upstream server diversity is still a practical reliability challenge
 
 **Impact:** Medium  
 **Likelihood:** Medium
 
-Some MCP servers are slow, stateful, or operationally noisy. The current runtime mitigates part of this, but not all of it.
+`plug` now has much better continuity and resilience, but upstream MCP servers remain uneven in
+quality, latency, and shutdown behavior.
+
+### Meta-tool strategy is still intentionally minimal
+
+**Impact:** Medium  
+**Likelihood:** Medium
+
+The current meta-tool mode is useful and truthful, but it is not a full dynamic tool-management or
+quarantine system.
 
 ## Low
 
@@ -55,11 +55,11 @@ Some MCP servers are slow, stateful, or operationally noisy. The current runtime
 **Impact:** Low  
 **Likelihood:** Medium
 
-The manifests still include TUI-era crates. This is mostly a maintenance/documentation issue until a future cleanup removes or justifies them.
+Some TUI-era crates remain in the manifests even though there is no active TUI product surface.
 
 ### Windows parity
 
 **Impact:** Low  
 **Likelihood:** Medium
 
-The current development focus is not Windows-specific parity in daemon/process semantics.
+The current daemon/process model is still primarily exercised on Unix-like systems.

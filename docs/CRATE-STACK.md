@@ -1,14 +1,14 @@
 # Crate Stack
 
-This is the current dependency picture for the code that exists today.
+This document reflects the dependency picture of the current merged codebase.
 
 ## Core Runtime
 
-- `rmcp` 1.0.0
-  Used for both upstream client connections and downstream MCP server handlers.
+- `rmcp` 1.1.x
+  MCP protocol implementation for both downstream server handlers and upstream client sessions.
 
 - `tokio`
-  Shared async runtime across daemon, CLI, and HTTP paths.
+  Shared async runtime across daemon, stdio proxying, and HTTP serving.
 
 - `serde`, `serde_json`, `serde_yml`
   Config, IPC, and MCP payload serialization.
@@ -19,10 +19,11 @@ This is the current dependency picture for the code that exists today.
 ## State And Concurrency
 
 - `dashmap`
-  Mutable concurrent state: health, circuit-breakers, semaphores, session registries.
+  Mutable concurrent state such as health, circuit breakers, semaphores, and stateful session
+  storage.
 
 - `arc-swap`
-  Snapshot-style reads for config/tool cache.
+  Snapshot-style reads for config and routing state.
 
 - `uuid`
   Session IDs and logical client IDs.
@@ -44,10 +45,10 @@ This is the current dependency picture for the code that exists today.
   Layered config loading.
 
 - `toml`
-  Config import/export and serialization.
+  Config serialization and import/export.
 
 - `directories`, `dirs`
-  Config/runtime path discovery.
+  Runtime/config path discovery.
 
 - `notify`, `notify-debouncer-mini`
   Config file watching.
@@ -83,9 +84,5 @@ This is the current dependency picture for the code that exists today.
 - `crossterm`
 - `color-eyre`
 
-These remain in the manifests from earlier TUI work, but there is no active TUI implementation in the current `v0.1` codepath.
-
-## Notes
-
-- The workspace currently pins `rmcp = 1.0.0` in `Cargo.toml`.
-- A future update to `1.1.x` is planned, but not part of the `v0.1` stabilization gate.
+These remain in the manifests from earlier TUI work, but there is still no active TUI product
+surface in the current merged codepath.

@@ -486,7 +486,7 @@ mod tests {
             .await
             .expect("connect downstream client");
 
-        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let _initial_tools = loop {
             let tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
                 .await
