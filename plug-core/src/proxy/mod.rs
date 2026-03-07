@@ -94,6 +94,13 @@ pub struct ToolRouter {
     /// Optional event sender for tool call observability.
     event_tx: Option<broadcast::Sender<EngineEvent>>,
     protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
+    /// Separate channel for logging notifications to prevent log volume
+    /// from causing Lagged errors that drop Progress/Cancelled delivery.
+    logging_tx: broadcast::Sender<ProtocolNotification>,
+    /// Per-client requested log levels. Effective level = most permissive (lowest severity).
+    client_log_levels: DashMap<Arc<str>, LoggingLevel>,
+    /// The effective (most permissive) log level across all connected clients.
+    effective_log_level: ArcSwap<LoggingLevel>,
     active_calls: DashMap<u64, ActiveCallRecord>,
     active_call_lookup: DashMap<DownstreamCallKey, u64>,
     upstream_request_lookup: DashMap<UpstreamRequestKey, u64>,
@@ -189,6 +196,7 @@ struct ActiveCallRecord {
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
+        let (logging_tx, _) = broadcast::channel(512);
         Self {
             server_manager,
             cache: Arc::new(ArcSwap::from_pointee(RouterSnapshot {
@@ -207,6 +215,9 @@ impl ToolRouter {
             config,
             event_tx: None,
             protocol_notification_tx,
+            logging_tx,
+            client_log_levels: DashMap::new(),
+            effective_log_level: ArcSwap::from_pointee(LoggingLevel::Warning),
             active_calls: DashMap::new(),
             active_call_lookup: DashMap::new(),
             upstream_request_lookup: DashMap::new(),
@@ -230,6 +241,100 @@ impl ToolRouter {
 
     pub fn publish_protocol_notification(&self, notification: ProtocolNotification) {
         let _ = self.protocol_notification_tx.send(notification);
+    }
+
+    // ── Logging channel ──────────────────────────────────────────────────
+
+    pub fn subscribe_logging(&self) -> broadcast::Receiver<ProtocolNotification> {
+        self.logging_tx.subscribe()
+    }
+
+    /// Map LoggingLevel to numeric severity (Debug=0 .. Emergency=7).
+    pub fn level_severity(level: LoggingLevel) -> u8 {
+        match level {
+            LoggingLevel::Debug => 0,
+            LoggingLevel::Info => 1,
+            LoggingLevel::Notice => 2,
+            LoggingLevel::Warning => 3,
+            LoggingLevel::Error => 4,
+            LoggingLevel::Critical => 5,
+            LoggingLevel::Alert => 6,
+            LoggingLevel::Emergency => 7,
+        }
+    }
+
+    /// Route a logging message from an upstream server to all downstream clients.
+    /// Filters by current effective log level and prefixes logger with server_id.
+    pub fn route_upstream_logging_message(
+        &self,
+        server_id: &str,
+        mut params: LoggingMessageNotificationParam,
+    ) {
+        // Filter by effective log level
+        let effective = **self.effective_log_level.load();
+        if Self::level_severity(params.level) < Self::level_severity(effective) {
+            return;
+        }
+
+        // Prefix logger with server_id for disambiguation
+        let original_logger = params.logger.as_deref().unwrap_or("default");
+        params.logger = Some(format!("{server_id}:{original_logger}"));
+
+        let _ = self.logging_tx.send(ProtocolNotification::LoggingMessage { params });
+    }
+
+    /// Get the current effective log level.
+    pub fn log_level(&self) -> LoggingLevel {
+        **self.effective_log_level.load()
+    }
+
+    /// Set a client's requested log level and recalculate the effective level.
+    pub fn set_client_log_level(&self, client_id: &str, level: LoggingLevel) {
+        self.client_log_levels
+            .insert(Arc::from(client_id), level);
+        self.recalculate_effective_level();
+    }
+
+    /// Remove a client's log level (on disconnect) and recalculate.
+    pub fn remove_client_log_level(&self, client_id: &str) {
+        self.client_log_levels.remove(client_id);
+        self.recalculate_effective_level();
+    }
+
+    /// Recalculate effective level as the most permissive (lowest severity) across all clients.
+    /// Defaults to Warning when no clients have set a level.
+    fn recalculate_effective_level(&self) {
+        let effective = self
+            .client_log_levels
+            .iter()
+            .map(|entry| *entry.value())
+            .min_by_key(|level| Self::level_severity(*level))
+            .unwrap_or(LoggingLevel::Warning);
+        self.effective_log_level.store(Arc::new(effective));
+    }
+
+    /// Forward the current effective log level to all healthy upstream servers concurrently.
+    pub async fn forward_set_level_to_upstreams(&self) {
+        let level = self.log_level();
+        let params = SetLevelRequestParams::new(level);
+        let upstreams = self.server_manager.healthy_upstreams();
+        let futures: Vec<_> = upstreams
+            .into_iter()
+            .filter(|(_, upstream)| upstream.capabilities.logging.is_some())
+            .map(|(name, upstream)| {
+                let params = params.clone();
+                async move {
+                    if let Err(error) = upstream.client.peer().set_level(params).await {
+                        tracing::warn!(
+                            server = %name,
+                            error = %error,
+                            "failed to forward setLevel to upstream"
+                        );
+                    }
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
     }
 
     pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
@@ -1079,6 +1184,9 @@ impl ToolRouter {
         }
         if upstream_caps.iter().any(|caps| caps.completions.is_some()) {
             capabilities.completions = Some(serde_json::Map::new());
+        }
+        if upstream_caps.iter().any(|caps| caps.logging.is_some()) {
+            capabilities.logging = Some(serde_json::Map::new());
         }
 
         capabilities
@@ -2233,6 +2341,9 @@ impl ServerHandler for ProxyHandler {
                                     break;
                                 }
                             }
+                            Ok(ProtocolNotification::LoggingMessage { .. }) => {
+                                // Logging is handled by the dedicated logging fan-out task below
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "stdio notification fan-out lagged");
                             }
@@ -2244,6 +2355,42 @@ impl ServerHandler for ProxyHandler {
                         client_id: Arc::clone(&client_id),
                     };
                     router.cleanup_subscriptions_for_target(&target).await;
+                });
+
+                // Separate logging fan-out task (isolated from control notifications)
+                let log_peer: Peer<RoleServer> = context.peer.clone();
+                let log_router = Arc::clone(&self.router);
+                let log_client_id = Arc::clone(&self.client_id);
+                let mut log_rx = self.router.subscribe_logging();
+                tokio::spawn(async move {
+                    loop {
+                        match log_rx.recv().await {
+                            Ok(ProtocolNotification::LoggingMessage { params }) => {
+                                if log_peer.notify_logging_message(params).await.is_err() {
+                                    tracing::debug!(
+                                        "stopping stdio logging fan-out after peer send failure"
+                                    );
+                                    break;
+                                }
+                            }
+                            Ok(_) => {} // non-logging notifications on wrong channel
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "stdio logging fan-out lagged");
+                                let _ = log_peer
+                                    .notify_logging_message(LoggingMessageNotificationParam {
+                                        level: LoggingLevel::Warning,
+                                        logger: Some("plug".to_string()),
+                                        data: serde_json::json!(format!(
+                                            "skipped {skipped} log messages"
+                                        )),
+                                    })
+                                    .await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    // Clean up per-client log level on disconnect
+                    log_router.remove_client_log_level(&log_client_id);
                 });
             }
 
@@ -2300,6 +2447,25 @@ impl ServerHandler for ProxyHandler {
                 ),
                 notification.reason,
             );
+        }
+    }
+
+    fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let client_id = Arc::clone(&self.client_id);
+        async move {
+            tracing::info!(
+                client_id = %client_id,
+                level = ?request.level,
+                "downstream client set log level"
+            );
+            router.set_client_log_level(&client_id, request.level);
+            router.forward_set_level_to_upstreams().await;
+            Ok(())
         }
     }
 
@@ -3022,5 +3188,157 @@ mod tests {
             Reference::Prompt(p) => assert_eq!(p.name, "test-prompt"),
             other => panic!("expected Prompt reference, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn route_upstream_logging_message_publishes_with_server_prefix() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        // Default level is Warning, so send a warning-level message
+        let mut rx = router.subscribe_logging();
+
+        router.route_upstream_logging_message(
+            "github",
+            LoggingMessageNotificationParam {
+                level: LoggingLevel::Warning,
+                logger: Some("default".to_string()),
+                data: serde_json::json!("something happened"),
+            },
+        );
+
+        match rx.try_recv() {
+            Ok(ProtocolNotification::LoggingMessage { params }) => {
+                assert_eq!(params.logger.as_deref(), Some("github:default"));
+                assert_eq!(params.level, LoggingLevel::Warning);
+            }
+            other => panic!("expected LoggingMessage, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_upstream_logging_message_filters_below_threshold() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let mut rx = router.subscribe_logging();
+
+        // Default level is Warning — debug should be filtered
+        router.route_upstream_logging_message(
+            "github",
+            LoggingMessageNotificationParam {
+                level: LoggingLevel::Debug,
+                logger: None,
+                data: serde_json::json!("debug noise"),
+            },
+        );
+
+        assert!(rx.try_recv().is_err(), "debug message should be filtered");
+    }
+
+    #[test]
+    fn set_client_log_level_changes_effective_level() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        // Default is Warning
+        assert_eq!(router.log_level(), LoggingLevel::Warning);
+
+        // Client A sets Debug
+        router.set_client_log_level("client-a", LoggingLevel::Debug);
+        assert_eq!(router.log_level(), LoggingLevel::Debug);
+
+        // Client B sets Error — most permissive (Debug) should win
+        router.set_client_log_level("client-b", LoggingLevel::Error);
+        assert_eq!(router.log_level(), LoggingLevel::Debug);
+
+        // Client A disconnects — should fall to Error
+        router.remove_client_log_level("client-a");
+        assert_eq!(router.log_level(), LoggingLevel::Error);
+
+        // Client B disconnects — should reset to Warning
+        router.remove_client_log_level("client-b");
+        assert_eq!(router.log_level(), LoggingLevel::Warning);
+    }
+
+    #[test]
+    fn route_upstream_logging_respects_changed_level() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let mut rx = router.subscribe_logging();
+
+        // Lower threshold to Debug
+        router.set_client_log_level("client-a", LoggingLevel::Debug);
+
+        // Now debug messages should pass through
+        router.route_upstream_logging_message(
+            "server1",
+            LoggingMessageNotificationParam {
+                level: LoggingLevel::Debug,
+                logger: None,
+                data: serde_json::json!("debug info"),
+            },
+        );
+
+        match rx.try_recv() {
+            Ok(ProtocolNotification::LoggingMessage { params }) => {
+                assert_eq!(params.level, LoggingLevel::Debug);
+                assert_eq!(params.logger.as_deref(), Some("server1:default"));
+            }
+            other => panic!("expected LoggingMessage, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logging_channel_is_separate_from_control_channel() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let mut control_rx = router.subscribe_notifications();
+        let mut logging_rx = router.subscribe_logging();
+
+        // Send a logging message
+        router.route_upstream_logging_message(
+            "server1",
+            LoggingMessageNotificationParam {
+                level: LoggingLevel::Warning,
+                logger: None,
+                data: serde_json::json!("log msg"),
+            },
+        );
+
+        // Control channel should NOT receive it
+        assert!(
+            control_rx.try_recv().is_err(),
+            "logging should not appear on control channel"
+        );
+
+        // Logging channel should receive it
+        assert!(
+            logging_rx.try_recv().is_ok(),
+            "logging should appear on logging channel"
+        );
+
+        // Send a control notification
+        router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+
+        // Control channel should receive it
+        assert!(
+            control_rx.try_recv().is_ok(),
+            "tool list changed should appear on control channel"
+        );
+
+        // Logging channel should NOT receive it
+        assert!(
+            logging_rx.try_recv().is_err(),
+            "tool list changed should not appear on logging channel"
+        );
+    }
+
+    #[test]
+    fn synthesized_capabilities_includes_logging_when_upstream_supports_it() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        // Without any upstream servers, no logging capability
+        let caps = router.synthesized_capabilities();
+        assert!(caps.logging.is_none());
     }
 }

@@ -12,8 +12,9 @@ use futures::future::join_all;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Prompt, Resource,
-    ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities, Tool,
+    CancelledNotificationParam, ClientInfo, LoggingMessageNotificationParam,
+    ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
+    ResourceUpdatedNotificationParam, ServerCapabilities, SetLevelRequestParams, Tool,
 };
 use rmcp::service::NotificationContext;
 use rmcp::transport::streamable_http_client::{
@@ -104,6 +105,20 @@ impl ClientHandler for UpstreamClientHandler {
         async move {
             if let Some(router) = router.upgrade() {
                 router.route_upstream_resource_updated(params);
+            }
+        }
+    }
+
+    fn on_logging_message(
+        &self,
+        params: LoggingMessageNotificationParam,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                router.route_upstream_logging_message(server_id.as_ref(), params);
             }
         }
     }
@@ -204,6 +219,25 @@ impl ServerManager {
                             tools = upstream.tools.load().len(),
                             "server started"
                         );
+
+                        // Apply current effective log level to new server so all
+                        // upstreams converge to the same level regardless of start order.
+                        if upstream.capabilities.logging.is_some() {
+                            if let Some(router) = self.tool_router().upgrade() {
+                                let level = router.log_level();
+                                let params = SetLevelRequestParams::new(level);
+                                if let Err(e) =
+                                    upstream.client.peer().set_level(params).await
+                                {
+                                    tracing::debug!(
+                                        server = %name,
+                                        error = %e,
+                                        "failed to apply initial log level"
+                                    );
+                                }
+                            }
+                        }
+
                         // Clone current map, insert new server, swap
                         let max_concurrent = upstream.config.max_concurrent;
                         let cb_enabled = upstream.config.circuit_breaker_enabled;
@@ -606,6 +640,21 @@ impl ServerManager {
     pub fn get_upstream(&self, server_name: &str) -> Option<Arc<UpstreamServer>> {
         let servers = self.servers.load();
         servers.get(server_name).cloned()
+    }
+
+    /// Get all healthy upstream servers as (name, server) pairs.
+    pub fn healthy_upstreams(&self) -> Vec<(String, Arc<UpstreamServer>)> {
+        let servers = self.servers.load();
+        servers
+            .iter()
+            .filter(|(name, _)| {
+                self.health
+                    .get(name.as_str())
+                    .map(|h| h.health != ServerHealth::Failed)
+                    .unwrap_or(true)
+            })
+            .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
+            .collect()
     }
 
     /// Gracefully shutdown all upstream servers.

@@ -11,7 +11,7 @@ use std::time::Duration;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -24,6 +24,9 @@ struct SharedConnection {
     conn: Mutex<crate::runtime::DaemonProxySession>,
     config_path: Option<PathBuf>,
     capabilities: std::sync::RwLock<ServerCapabilities>,
+    /// Downstream peer — set during initialize, used to forward logging
+    /// notifications pushed by the daemon over IPC.
+    peer: std::sync::OnceLock<Peer<RoleServer>>,
 }
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
@@ -56,6 +59,7 @@ impl IpcProxyHandler {
             capabilities: std::sync::RwLock::new(session.capabilities.clone()),
             conn: Mutex::new(session),
             config_path,
+            peer: std::sync::OnceLock::new(),
         });
         let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
         Self { shared, heartbeat }
@@ -74,11 +78,12 @@ impl IpcProxyHandler {
         F: Fn(&str) -> IpcRequest,
     {
         let mut conn = self.shared.conn.lock().await;
+        let peer = self.shared.peer.get();
         let request = build_request(&conn.session_id);
         let payload = serde_json::to_vec(&request)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        match Self::try_round_trip_locked(&mut conn, &payload).await {
+        match Self::try_round_trip_locked(&mut conn, &payload, peer).await {
             Ok(response) => Ok(response),
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon IPC connection lost; reconnecting");
@@ -88,7 +93,7 @@ impl IpcProxyHandler {
                         let rebound = build_request(&conn.session_id);
                         let retry_payload = serde_json::to_vec(&rebound)
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        Self::try_round_trip_locked(&mut conn, &retry_payload)
+                        Self::try_round_trip_locked(&mut conn, &retry_payload, peer)
                             .await
                             .map_err(|e| {
                                 McpError::internal_error(
@@ -110,23 +115,44 @@ impl IpcProxyHandler {
     async fn try_round_trip_locked(
         conn: &mut crate::runtime::DaemonProxySession,
         payload: &[u8],
+        peer: Option<&Peer<RoleServer>>,
     ) -> Result<IpcResponse, TransportFailure> {
         ipc::write_frame(&mut conn.writer, payload)
             .await
             .map_err(|e| Self::transport_failure("IPC write failed", e))?;
 
-        let frame = ipc::read_frame(&mut conn.reader)
-            .await
-            .map_err(|e| Self::transport_failure("IPC read failed", e))?
-            .ok_or_else(|| TransportFailure {
-                message: "daemon closed connection".to_string(),
-                reconnectable: true,
-            })?;
+        // Read frames in a loop — the daemon may interleave push notifications
+        // (logging) with the actual response. Forward notifications to the
+        // downstream peer and keep reading until we get a non-notification frame.
+        loop {
+            let frame = ipc::read_frame(&mut conn.reader)
+                .await
+                .map_err(|e| Self::transport_failure("IPC read failed", e))?
+                .ok_or_else(|| TransportFailure {
+                    message: "daemon closed connection".to_string(),
+                    reconnectable: true,
+                })?;
 
-        serde_json::from_slice(&frame).map_err(|e| TransportFailure {
-            message: format!("invalid IPC response: {e}"),
-            reconnectable: false,
-        })
+            let response: IpcResponse =
+                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                    message: format!("invalid IPC response: {e}"),
+                    reconnectable: false,
+                })?;
+
+            match response {
+                IpcResponse::LoggingNotification { params } => {
+                    if let Some(peer) = peer {
+                        if let Ok(notif_params) =
+                            serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                        {
+                            let _ = peer.notify_logging_message(notif_params).await;
+                        }
+                    }
+                    continue; // keep reading for the actual response
+                }
+                other => return Ok(other),
+            }
+        }
     }
 
     async fn reconnect_locked(
@@ -152,12 +178,13 @@ impl IpcProxyHandler {
 
     async fn ping_once(shared: &Arc<SharedConnection>) -> Result<(), McpError> {
         let mut conn = shared.conn.lock().await;
+        let peer = shared.peer.get();
         let payload = serde_json::to_vec(&IpcRequest::Ping {
             session_id: conn.session_id.clone(),
         })
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        match Self::try_round_trip_locked(&mut conn, &payload).await {
+        match Self::try_round_trip_locked(&mut conn, &payload, peer).await {
             Ok(IpcResponse::Pong) => Ok(()),
             Ok(IpcResponse::Error { code, message }) => {
                 if matches!(code.as_str(), "SESSION_REPLACED" | "SESSION_MISMATCH") {
@@ -281,6 +308,11 @@ impl ServerHandler for IpcProxyHandler {
                 tracing::warn!(error = %e, "failed to update session client info");
             }
 
+            // Store peer for logging notification forwarding. The daemon
+            // pushes LoggingNotification frames after registration; the
+            // heartbeat and request round-trips forward them to this peer.
+            let _ = self.shared.peer.set(context.peer.clone());
+
             context.peer.set_peer_info(request);
             Ok(self.get_info())
         }
@@ -352,6 +384,35 @@ impl ServerHandler for IpcProxyHandler {
                         )
                     })
                 }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::json!({ "level": request.level });
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "logging/setLevel".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { .. } => Ok(()),
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
                 }

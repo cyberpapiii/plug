@@ -188,6 +188,15 @@ pub enum IpcResponse {
         /// The JSON-RPC result payload.
         payload: serde_json::Value,
     },
+
+    /// Push notification: logging message from an upstream server.
+    ///
+    /// Sent asynchronously by the daemon (interleaved with responses) after
+    /// a proxy client registers. The payload is a serialized
+    /// `LoggingMessageNotificationParam`.
+    LoggingNotification {
+        params: serde_json::Value,
+    },
 }
 
 /// Check whether a request requires the daemon master auth token.

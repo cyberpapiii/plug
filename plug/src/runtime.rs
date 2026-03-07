@@ -330,13 +330,15 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
     });
 
-    // Spawn subscription cleanup listener for expired HTTP sessions
+    // Spawn cleanup listener for expired HTTP sessions — handles both
+    // resource subscription cleanup and per-client log level removal.
     tokio::spawn(async move {
         while let Some(session_id) = expiry_rx.recv().await {
             let target = plug_core::notifications::NotificationTarget::Http {
                 session_id: Arc::from(session_id.as_str()),
             };
             tool_router.cleanup_subscriptions_for_target(&target).await;
+            tool_router.remove_client_log_level(&session_id);
         }
     });
     let router = plug_core::http::server::build_router(http_state);

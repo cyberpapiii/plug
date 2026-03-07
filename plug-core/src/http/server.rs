@@ -110,10 +110,48 @@ impl HttpState {
                                             );
                                         }
                                     }
+                                    ProtocolNotification::LoggingMessage { .. } => {
+                                        // Logging is handled by the dedicated logging fan-out task below
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        // Separate logging fan-out task (isolated from control notifications)
+        let log_state = Arc::clone(self);
+        let mut log_rx = log_state.router.subscribe_logging();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = log_state.cancel.cancelled() => break,
+                    recv = log_rx.recv() => {
+                        match recv {
+                            Ok(ref notif @ ProtocolNotification::LoggingMessage { .. }) => {
+                                log_state.sessions.broadcast(notif.to_json_value());
+                            }
+                            Ok(_) => {} // non-logging notifications on wrong channel
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "HTTP logging fan-out lagged");
+                                // Emit synthetic warning to all connected clients
+                                let synthetic = ProtocolNotification::LoggingMessage {
+                                    params: rmcp::model::LoggingMessageNotificationParam {
+                                        level: rmcp::model::LoggingLevel::Warning,
+                                        logger: Some("plug".to_string()),
+                                        data: serde_json::json!(format!(
+                                            "skipped {skipped} log messages"
+                                        )),
+                                    },
+                                };
+                                log_state.sessions.broadcast(synthetic.to_json_value());
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
@@ -282,6 +320,9 @@ async fn delete_mcp(
             session_id: Arc::from(session_id.as_str()),
         };
         state.router.cleanup_subscriptions_for_target(&target).await;
+        // Clean up per-client log level to prevent stale entries from
+        // keeping the effective level permanently at a permissive value.
+        state.router.remove_client_log_level(&session_id);
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
@@ -528,6 +569,25 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
             }
+        }
+
+        ClientRequest::SetLevelRequest(set_level_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            tracing::info!(
+                session = %session_id,
+                level = ?set_level_req.params.level,
+                "HTTP client set log level"
+            );
+            state
+                .router
+                .set_client_log_level(&session_id, set_level_req.params.level);
+            state.router.forward_set_level_to_upstreams().await;
+            let response_msg = ServerJsonRpcMessage::response(
+                ServerResult::EmptyResult(EmptyResult {}),
+                request_id,
+            );
+            json_response(&response_msg)
         }
 
         _ => {

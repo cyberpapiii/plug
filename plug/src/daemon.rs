@@ -566,6 +566,7 @@ async fn handle_ipc_connection(
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
         ctx.client_registry.deregister(session_id);
+        ctx.engine.tool_router().remove_client_log_level(session_id);
     }
 
     result
@@ -577,11 +578,31 @@ async fn handle_ipc_loop(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &mut ConnectionContext,
 ) -> anyhow::Result<()> {
+    use plug_core::notifications::ProtocolNotification;
+
+    // Logging subscription — activated after Register so the daemon can push
+    // logging notifications to this IPC client in real time.
+    let mut log_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
+
     loop {
         // Proxy connections (those that have Registered) are long-lived and should
         // not be subject to the idle timeout. Short-lived admin/query connections use
         // the timeout to reclaim resources.
-        let frame = if ctx.session_id.is_some() {
+        let frame = if let Some(ref mut rx) = log_rx {
+            // Registered with logging — multiplex request reads and notifications.
+            // Notifications are sent immediately when idle. During a request dispatch,
+            // they queue in the broadcast channel and get drained after the response.
+            'select: loop {
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => return Ok(()),
+                    recv = rx.recv() => {
+                        send_ipc_logging_notification(writer, recv).await?;
+                    }
+                    result = ipc::read_frame(reader) => break 'select result,
+                }
+            }
+        } else if ctx.session_id.is_some() {
             tokio::select! {
                 _ = ctx.cancel.cancelled() => break,
                 result = ipc::read_frame(reader) => result,
@@ -663,8 +684,69 @@ async fn handle_ipc_loop(
             ctx.cancel.cancel();
             break;
         }
+
+        // After registration, subscribe to logging channel for push notifications
+        if ctx.session_id.is_some() && log_rx.is_none() {
+            log_rx = Some(ctx.engine.tool_router().subscribe_logging());
+        }
+
+        // Drain any notifications that queued during request dispatch
+        if let Some(ref mut rx) = log_rx {
+            use tokio::sync::broadcast::error::TryRecvError;
+            loop {
+                match rx.try_recv() {
+                    Ok(notif) => {
+                        send_ipc_logging_notification(writer, Ok(notif)).await?;
+                    }
+                    Err(TryRecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "IPC logging notification lagged");
+                        let synthetic = IpcResponse::LoggingNotification {
+                            params: serde_json::json!({
+                                "level": "warning",
+                                "logger": "plug",
+                                "data": format!("skipped {skipped} log messages")
+                            }),
+                        };
+                        ipc::send_response(writer, &synthetic).await.ok();
+                    }
+                    Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Send a logging notification to the IPC client, handling broadcast errors.
+async fn send_ipc_logging_notification(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    recv: Result<plug_core::notifications::ProtocolNotification, tokio::sync::broadcast::error::RecvError>,
+) -> anyhow::Result<()> {
+    use plug_core::notifications::ProtocolNotification;
+    use tokio::sync::broadcast::error::RecvError;
+
+    match recv {
+        Ok(ProtocolNotification::LoggingMessage { params }) => {
+            let notif = IpcResponse::LoggingNotification {
+                params: serde_json::to_value(params).unwrap_or_default(),
+            };
+            ipc::send_response(writer, &notif).await.ok();
+        }
+        Ok(_) => {} // non-logging notification on wrong channel
+        Err(RecvError::Lagged(skipped)) => {
+            tracing::warn!(skipped, "IPC logging notification lagged");
+            let synthetic = IpcResponse::LoggingNotification {
+                params: serde_json::json!({
+                    "level": "warning",
+                    "logger": "plug",
+                    "data": format!("skipped {skipped} log messages")
+                }),
+            };
+            ipc::send_response(writer, &synthetic).await.ok();
+        }
+        Err(RecvError::Closed) => {}
+    }
     Ok(())
 }
 
@@ -768,6 +850,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             ctx.client_registry.deregister(session_id);
+            ctx.engine.tool_router().remove_client_log_level(session_id);
             ctx.session_id = None;
             IpcResponse::Ok
         }
@@ -1066,6 +1149,48 @@ async fn dispatch_mcp_request(
                         code: "SERIALIZE_ERROR".to_string(),
                         message: e.to_string(),
                     },
+                },
+            }
+        }
+
+        "logging/setLevel" => {
+            let level = match params
+                .and_then(|p| p.get("level"))
+                .and_then(|v| v.as_str())
+            {
+                Some(level_str) => {
+                    match serde_json::from_value::<rmcp::model::LoggingLevel>(
+                        serde_json::json!(level_str),
+                    ) {
+                        Ok(level) => level,
+                        Err(_) => {
+                            return IpcResponse::Error {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: format!("invalid logging level: {level_str}"),
+                            };
+                        }
+                    }
+                }
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "logging/setLevel requires 'level' in params".to_string(),
+                    };
+                }
+            };
+
+            tracing::info!(
+                session_id = %session_id,
+                level = ?level,
+                "IPC client set log level"
+            );
+            tool_router.set_client_log_level(session_id, level);
+            tool_router.forward_set_level_to_upstreams().await;
+            match serde_json::to_value(serde_json::json!({})) {
+                Ok(payload) => IpcResponse::McpResponse { payload },
+                Err(e) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: e.to_string(),
                 },
             }
         }
