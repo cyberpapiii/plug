@@ -4,9 +4,50 @@ type: feat
 status: active
 date: 2026-03-07
 deepened: 2026-03-07
+last_audit: 2026-03-07
 ---
 
 # MCP Spec Compliance Roadmap
+
+## Current Status (audited 2026-03-07)
+
+### Merged on main
+
+| Feature | PRs | Evidence |
+|---------|-----|----------|
+| Pre-phase: downstream HTTP bearer auth | #25 | `auth.rs`, `http/server.rs:219` |
+| Phase A1: logging notification forwarding | #26 | `server/mod.rs:99`, `proxy/mod.rs:2179`, `ipc_proxy.rs:409` |
+| Phase A2: structured output pass-through | #27 | `proxy/mod.rs:1614`, `proxy/mod.rs:1734` |
+| Phase A3: completion forwarding | #28 | `proxy/mod.rs:1333`, `proxy/mod.rs:2542`, `ipc_proxy.rs:612` |
+| Resource subscribe/unsubscribe forwarding | #30 | `proxy/mod.rs:2293`, `http/server.rs:491` |
+| Resources/prompts/templates forwarding | (pre-existing) | `proxy/mod.rs:1215`, `proxy/mod.rs:1286`, `daemon.rs:952` |
+| Progress/cancellation routing | (pre-existing) | `proxy/mod.rs:504`, `proxy/mod.rs:532` |
+| tools/list_changed forwarding | (pre-existing) | `server/mod.rs:36`, `http/server.rs:58` |
+| Downstream HTTPS serving | #22 | `runtime.rs:339` |
+| Dead TUI dependency removal | #29 | ratatui/crossterm/color-eyre removed from Cargo.toml |
+
+### Partially implemented / follow-up needed
+
+| Item | Status | Tracking |
+|------|--------|----------|
+| resources/subscribe over daemon IPC | Intentionally unsupported (returns honest error) | `daemon.rs:1205` |
+| Stale subscriptions after route refresh | Open bug | `todos/039` |
+| resources/list_changed forwarding | Capability advertised as `list_changed: false` (honest but limited) | -- |
+| prompts/list_changed forwarding | Same | -- |
+| Runtime hot-reload beyond server add/remove | "restart required" boundary | `reload.rs:135` |
+
+### Not implemented in code yet
+
+- resource_link explicit handling / validation
+- sampling/createMessage
+- elicitation/create
+- roots/list
+- Legacy SSE upstream transport
+- OAuth / remote commercial MCP auth flows
+- MCP-Protocol-Version header validation
+- Broader Stream B connectivity-expansion work
+
+---
 
 ## Enhancement Summary
 
@@ -103,121 +144,80 @@ All changes build on existing patterns in the codebase:
 
 ---
 
-#### Phase A1: Logging & Notification Forwarding
+#### Phase A1: Logging & Notification Forwarding -- COMPLETE
 
-**Goal**: Forward `notifications/message` (logging) from upstream servers to downstream clients. Add `logging/setLevel` forwarding.
-
-**Why first**: Logging is the highest-adoption server feature plug drops today. Every MCP SDK emits log notifications by default. This is the single most impactful protocol correctness fix.
+**Status**: Merged -- PR #26 (`feat/phase-a1-logging-forwarding`)
 
 **Tasks:**
 
-- [ ] **Create a separate logging broadcast channel** -- do NOT add logging to the existing control notification channel
-  - New: `tokio::broadcast::channel::<LogNotification>(512)` in `ToolRouter` for logging messages
-  - Existing: `tokio::broadcast::channel::<ProtocolNotification>(128)` stays for ToolListChanged, Progress, Cancelled
-  - Rationale: at 10+ upstream servers, logging can produce 100+ messages/sec at debug level. Mixing with Progress/Cancelled causes `Lagged` errors that drop delivery-critical notifications.
-- [ ] Implement `on_logging_message` callback in `UpstreamClientHandler` at `plug-core/src/server/mod.rs:36-97`
-  - **Confirmed**: rmcp 1.1.0 `ClientHandler` has `on_logging_message(params: LoggingMessageNotificationParam, context: NotificationContext<RoleClient>)` -- default is no-op
-  - Prefix the logger name with the server name/ID so clients can distinguish sources (e.g., `github:default` instead of `default`)
-  - Publish to the logging broadcast channel (not the control channel)
-- [ ] Add fan-out branch for logging in stdio consumer at `plug-core/src/proxy/mod.rs:1927-1974`
-  - Subscribe to the logging channel separately from the control channel
-  - Use `try_send()` for non-blocking delivery -- do NOT await `send()` sequentially (institutional learning: one slow client stalls all others)
-  - Handle `Lagged` gracefully: log a warning, emit synthetic "plug: skipped N log messages" notification downstream
-- [ ] Add fan-out branch for logging in HTTP consumer at `plug-core/src/http/server.rs:43-109`
-  - Same non-blocking `try_send()` pattern as stdio
-  - Broadcast to all active HTTP sessions
-- [ ] Forward `logging/setLevel` requests from downstream clients to all upstream servers
-  - Add handler in `ProxyHandler` that receives `logging/setLevel` and calls `peer.set_logging_level()` on each healthy upstream server
-  - Store the current level in `ToolRouter` so new server connections inherit it
-  - **Default level should be `warning`** -- only forward debug/trace if client explicitly requests it via `setLevel`
-- [ ] Add `logging` capability to `synthesized_capabilities()` when any upstream server supports it
-- [ ] Test: upstream server emits log message -> downstream stdio client receives it with server prefix
-- [ ] Test: downstream client sends `setLevel(warning)` -> upstream servers receive it -> only warning+ messages forwarded
-- [ ] Test: burst of 200+ log messages does NOT cause Progress/Cancelled to be dropped on the control channel
-
-**Key files:**
-- `plug-core/src/notifications.rs` (add LogNotification type + separate channel)
-- `plug-core/src/server/mod.rs` (upstream handler)
-- `plug-core/src/proxy/mod.rs` (downstream fan-out + setLevel handler)
-- `plug-core/src/http/server.rs` (HTTP fan-out)
+- [x] **Create a separate logging broadcast channel** -- isolated from control notification channel
+- [x] Implement `on_logging_message` callback in `UpstreamClientHandler` with server-prefixed logger names
+- [x] Add fan-out branch for logging in stdio consumer with `Lagged` handling
+- [x] Add fan-out branch for logging in HTTP consumer (broadcast to all sessions)
+- [x] Forward `logging/setLevel` requests from downstream clients to all upstream servers (stdio, HTTP, IPC)
+- [x] Multi-client level tracking with most-permissive-wins semantics
+- [x] Add `logging` capability to `synthesized_capabilities()` when any upstream supports it
+- [x] Per-client log level cleanup on session expiry/disconnect
+- [x] IPC push notifications for logging (daemon transport parity)
+- [x] Tests: server prefix, level filtering, level lifecycle, channel isolation
 
 **Acceptance criteria:**
-- [ ] `notifications/message` from any healthy upstream server reaches all connected downstream clients
-- [ ] Logger name includes server identifier for disambiguation
-- [ ] `logging/setLevel` propagates to all upstream servers
-- [ ] `logging` capability correctly advertised downstream
-- [ ] Log volume does not cause loss of Progress/Cancelled signals (separate channels)
+- [x] `notifications/message` from any healthy upstream server reaches all connected downstream clients
+- [x] Logger name includes server identifier for disambiguation
+- [x] `logging/setLevel` propagates to all upstream servers
+- [x] `logging` capability correctly advertised downstream
+- [x] Log volume does not cause loss of Progress/Cancelled signals (separate channels)
 
 ---
 
-#### Phase A2: Structured Output Pass-Through
+#### Phase A2: Structured Output Pass-Through -- COMPLETE
 
-**Goal**: Stop stripping `outputSchema` from tool definitions. Verify `structuredContent` passes through in tool results.
-
-**Why second**: outputSchema + structuredContent is the fastest-growing spec feature (all three official SDKs have landed support). plug actively breaks it today by stripping `outputSchema` in `strip_optional_fields()`.
-
-**Research insights:**
-- **Confirmed**: rmcp 1.1.0 `Tool` struct has `output_schema: Option<Arc<JsonObject>>` -- serializes as `camelCase` via `#[serde(rename_all = "camelCase")]`
-- **Confirmed**: rmcp 1.1.0 `CallToolResult` has `structured_content: Option<Value>` -- with `into_typed::<T>()` convenience method
-- **Confirmed**: rmcp 1.1.0 `RawContent` enum has `ResourceLink(RawResource)` variant
-- All pass-through is automatic once stripping is removed. No custom serde handling needed.
+**Status**: Merged -- PR #27 (`feat/phase-a2-structured-output`), plan at `docs/plans/2026-03-07-feat-structured-output-pass-through-plan.md`
 
 **Tasks:**
 
-- [ ] Remove `tool.output_schema = None` from `strip_optional_fields()` at `plug-core/src/proxy/mod.rs:1608-1627`
-  - Keep the rest of the function (title generation, description sanitization -- these are deliberate value-adds for token efficiency)
-- [ ] Verify pass-through with integration test: upstream tool with outputSchema -> downstream client sees it
-- [ ] Verify `structuredContent` in tool results passes through (already automatic since `call_tool_inner` returns `CallToolResult` unmodified)
-- [ ] Verify `resource_link` content items pass through (already automatic via `RawContent::ResourceLink` variant)
-- [ ] Test: upstream server declares tool with `outputSchema` -> downstream client sees `outputSchema` in tool list
-- [ ] Test: upstream server returns `structuredContent` in tool result -> downstream client receives it alongside `content`
-
-**Key files:**
-- `plug-core/src/proxy/mod.rs` (remove stripping)
+- [x] Remove `tool.output_schema = None` from `strip_optional_fields()`
+- [x] Update doc comment on `strip_optional_fields` to reflect preserved fields
+- [x] Update test to verify `output_schema` is preserved
+- [x] `structuredContent` in `CallToolResult` passes through (automatic -- proxy returns upstream result as-is)
+- [x] `resource_link` content items pass through (automatic via `RawContent::ResourceLink` variant)
 
 **Acceptance criteria:**
-- [ ] `outputSchema` preserved on all forwarded tool definitions
-- [ ] `structuredContent` in `CallToolResult` passes through unmodified
-- [ ] `resource_link` content items in tool results pass through unmodified
-- [ ] No regression in existing tool forwarding behavior
+- [x] `outputSchema` preserved on all forwarded tool definitions
+- [x] `structuredContent` in `CallToolResult` passes through unmodified
+- [x] `resource_link` content items in tool results pass through unmodified
+- [x] No regression in existing tool forwarding behavior
 
 ---
 
-#### Phase A3: Protocol Version & Capability Gating
+#### Phase A3: Completion Forwarding -- COMPLETE
 
-**Goal**: Send and validate `MCP-Protocol-Version` headers. Fix capability over-advertisement.
+**Status**: Merged -- PR #28 (`feat/phase-a3-completion-pass-through`)
 
-**Why third**: These are MUST-level spec requirements that become more important as the ecosystem matures. Low effort, high correctness value.
-
-**Research insights:**
-- Architecture review found that `list_resources`, `read_resource`, `list_prompts`, `get_prompt` ARE forwarded by ProxyHandler (lines 2032-2074). The capabilities are not as over-advertised as initially thought. The real fix is `list_changed` for resources/prompts notifications.
-- Consider also forwarding `resources/list_changed` and `prompts/list_changed` notifications (currently only `tools/list_changed` is forwarded).
+**Note**: The original plan called this "Protocol Version & Capability Gating". Completion forwarding was prioritized instead as a higher-value protocol correctness fix. Protocol version headers and list_changed forwarding remain as follow-up items (see "Partially implemented" section above).
 
 **Tasks:**
 
-- [ ] **MCP-Protocol-Version on upstream requests**: When plug connects to upstream Streamable HTTP servers, ensure the `MCP-Protocol-Version: 2025-11-25` header is sent on all HTTP requests after initialization
-  - Check if rmcp's `StreamableHttpClientTransport` already does this
-  - If not, add it in the transport configuration at `plug-core/src/server/mod.rs:340-360`
-- [ ] **MCP-Protocol-Version validation on downstream**: In the HTTP server, validate the `MCP-Protocol-Version` header on incoming POST requests
-  - If missing, default to `2025-03-26` per spec guidance (at `plug-core/src/http/server.rs`)
-  - If present but unsupported, return appropriate error
-  - Store the negotiated version per session for future version-aware behavior
-- [ ] **Capability gating -- resources**: Audit forwarding completeness. Resources are forwarded but `list_changed` is `Some(false)`. Either forward resource list changes or keep `list_changed: false` (honest).
-- [ ] **Capability gating -- prompts**: Same audit. Prompts are forwarded but `list_changed` is `Some(false)`.
-- [ ] **Capability gating -- logging**: Now advertised (after Phase A1). Verify `setLevel` is included.
-- [ ] Test: downstream client sends request without `MCP-Protocol-Version` header -> plug accepts with 2025-03-26 default
-- [ ] Test: plug only advertises capabilities it actually supports in initialize response
-
-**Key files:**
-- `plug-core/src/http/server.rs` (header validation)
-- `plug-core/src/server/mod.rs` (header on upstream requests)
-- `plug-core/src/proxy/mod.rs` (capability synthesis)
+- [x] Forward `completion/complete` requests to the upstream server that owns the referenced prompt/resource
+- [x] Advertise `completions` capability when any upstream supports it
+- [x] Wire up completion forwarding over stdio, HTTP, and IPC transports
+- [x] Tests: capability synthesis, serde roundtrip
 
 **Acceptance criteria:**
-- [ ] `MCP-Protocol-Version` header sent on all upstream HTTP requests
-- [ ] `MCP-Protocol-Version` header validated on incoming downstream HTTP requests
-- [ ] Capabilities advertised downstream accurately reflect what plug forwards
-- [ ] No capability is advertised that plug cannot fulfill
+- [x] `completion/complete` requests route to correct upstream server
+- [x] `completions` capability correctly advertised downstream
+- [x] All three transports (stdio, HTTP, IPC) support completion forwarding
+
+---
+
+#### Remaining Stream A Follow-ups (not yet implemented)
+
+These items from the original A3 plan were deferred:
+
+- [ ] **MCP-Protocol-Version on upstream requests**: Ensure header sent on all upstream HTTP requests
+- [ ] **MCP-Protocol-Version validation on downstream**: Validate header on incoming POST requests
+- [ ] **resources/list_changed forwarding**: Currently `list_changed: false` (honest but limited)
+- [ ] **prompts/list_changed forwarding**: Same
 
 ---
 
@@ -435,8 +435,8 @@ These 10 features are deferred based on research findings. Each has a "revisit w
 | Feature | Rationale | Revisit When |
 |---------|-----------|--------------|
 | **sampling/createMessage** | 12% client support, stagnant. No major client (Claude, Cursor) supports it. | Claude Desktop or Cursor ships sampling support |
-| **resources/subscribe** | Resources underadopted (39%). Subscriptions even rarer. 0/6 competitors. | Resource adoption exceeds 60% of clients |
-| **completion/complete** | Zero client adoption for AI coding assistants. LLMs generate arguments. | An AI coding client ships completion UI |
+| ~~**resources/subscribe**~~ | ~~Deferred~~ **Now implemented** (PR #30). Stdio + HTTP supported, IPC returns honest error. | -- |
+| ~~**completion/complete**~~ | ~~Deferred~~ **Now implemented** (PR #28). All three transports supported. | -- |
 | **resource_link namespacing** | Pass-through works today. URI namespacing only needed if plug resolves resources. | Plug adds resource resolution/caching |
 | **JSON-RPC batch requests** | Removed from spec in June 2025. Implementing it is non-compliant. | Never (removed from spec) |
 | **Dynamic Client Registration** | Deprecated in favor of CIMD (Nov 2025 spec). Ecosystem moved on. | Never (superseded by CIMD) |
@@ -478,11 +478,13 @@ These 10 features are deferred based on research findings. Each has a "revisit w
 
 ### Functional Requirements
 
-- [ ] Downstream HTTP requires bearer token when bound to non-loopback address
-- [ ] Server log messages flow through plug to downstream clients with server identification
-- [ ] `logging/setLevel` propagates to upstream servers
-- [ ] Tool `outputSchema` preserved in forwarded tool definitions (not stripped)
-- [ ] `structuredContent` in tool results passes through unmodified
+- [x] Downstream HTTP requires bearer token when bound to non-loopback address
+- [x] Server log messages flow through plug to downstream clients with server identification
+- [x] `logging/setLevel` propagates to upstream servers
+- [x] Tool `outputSchema` preserved in forwarded tool definitions (not stripped)
+- [x] `structuredContent` in tool results passes through unmodified
+- [x] `completion/complete` requests forwarded to correct upstream server
+- [x] Resource subscribe/unsubscribe forwarded with lifecycle cleanup
 - [ ] `MCP-Protocol-Version` header sent on upstream HTTP requests and validated on downstream
 - [ ] Capabilities advertised downstream accurately reflect plug's actual forwarding ability
 - [ ] Legacy SSE upstream servers connectable via `transport = "sse"` config (or auto-detected)

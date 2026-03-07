@@ -1,7 +1,7 @@
 ---
 title: "feat: Logging & Notification Forwarding"
 type: feat
-status: active
+status: completed
 date: 2026-03-07
 parent: docs/plans/2026-03-07-feat-mcp-spec-compliance-roadmap-plan.md
 ---
