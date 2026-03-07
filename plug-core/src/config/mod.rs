@@ -29,6 +29,9 @@ pub struct Config {
     /// Tool count threshold to activate search_tools meta-tool (default: 50).
     #[serde(default = "default_tool_search_threshold")]
     pub tool_search_threshold: usize,
+    /// Expose only plug meta-tools instead of the full merged tool catalog.
+    #[serde(default)]
+    pub meta_tool_mode: bool,
     /// Priority tools served first when filtering (tool names).
     #[serde(default)]
     pub priority_tools: Vec<String>,
@@ -57,6 +60,7 @@ impl Default for Config {
             tool_filter_enabled: true,
             tool_description_max_chars: None,
             tool_search_threshold: 50,
+            meta_tool_mode: false,
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
             http: HttpConfig::default(),
