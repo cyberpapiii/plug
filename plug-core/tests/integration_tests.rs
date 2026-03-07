@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use plug_core::http::server::{HttpState, build_router};
 use plug_core::http::session::SessionManager;
+use plug_core::session::SessionStore;
 use plug_core::client_detect::detect_client;
 use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
 use plug_core::engine::Engine;
@@ -513,7 +514,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: SessionManager::new(1800, 100),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         sse_channel_capacity: 32,
         notification_task_started: std::sync::atomic::AtomicBool::new(false),

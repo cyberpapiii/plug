@@ -284,10 +284,11 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     let config = plug_core::config::load_config(config_path)?;
     let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;
-    let sessions = plug_core::http::session::SessionManager::new(
-        config.http.session_timeout_secs,
-        config.http.max_sessions,
-    );
+    let sessions: Arc<dyn plug_core::session::SessionStore> =
+        Arc::new(plug_core::session::StatefulSessionStore::new(
+            config.http.session_timeout_secs,
+            config.http.max_sessions,
+        ));
     sessions.spawn_cleanup_task(engine.cancel_token().clone());
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: engine.tool_router().clone(),
