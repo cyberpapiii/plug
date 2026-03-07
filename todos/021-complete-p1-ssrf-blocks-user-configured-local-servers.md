@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "021"
 tags: [code-review, security, architecture, issue-7]
@@ -47,7 +47,20 @@ Keep full SSRF check but add opt-out per server.
 
 ## Acceptance Criteria
 
-- [ ] `http://127.0.0.1:8080` connects successfully when configured by user
-- [ ] `http://192.168.x.x` and other private IPs work for user-configured servers
-- [ ] Cloud metadata endpoints (169.254.169.254) are either blocked or documented as risk
-- [ ] No regression in existing SSRF test assertions (or tests removed/updated)
+- [x] `http://127.0.0.1:8080` connects successfully when configured by user
+- [x] `http://192.168.x.x` and other private IPs work for user-configured servers
+- [x] Cloud metadata endpoints (169.254.169.254) remain blocked
+- [x] No regression in existing SSRF test assertions
+
+## Work Log
+
+### 2026-03-06 - Completed In Worktree Execution
+
+**By:** Codex
+
+**Actions:**
+- Verified the current implementation in `plug-core/src/server/mod.rs` already allows loopback and private IPs while still blocking metadata endpoints
+- Confirmed the active behavior with `cargo test -p plug-core server::tests`
+
+**Learnings:**
+- This todo was already resolved in the branch baseline; the remaining work was to reconcile the tracked backlog with the shipped behavior.
