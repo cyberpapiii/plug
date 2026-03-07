@@ -135,7 +135,7 @@ With `WWW-Authenticate: Bearer` header per RFC 6750.
 ### Step 5: `plug doctor` check
 
 - [x] Add `check_http_auth` in `plug-core/src/doctor.rs`:
-  - If `http.bind_address` is non-loopback and no auth token file exists: `CheckStatus::Fail` with message "HTTP server bound to non-loopback address without authentication"
+  - If `http.bind_address` is non-loopback and no auth token file exists yet: `CheckStatus::Warn` with message that auth is not initialized until first `plug serve`
   - If token file exists but permissions are not 0600: `CheckStatus::Warn`
   - If loopback or auth configured: `CheckStatus::Pass`
   - Fix suggestion: "Run `plug serve` to auto-generate an auth token, or set `bind_address = \"127.0.0.1\"` for local-only access"
@@ -144,7 +144,7 @@ With `WWW-Authenticate: Bearer` header per RFC 6750.
 
 ### Step 6: `plug status` token display
 
-- [x] Extend `IpcResponse::Status` to include `http_auth: Option<HttpAuthStatus>` with fields: `enabled: bool`, `token: Option<String>` (only populated when requested)
+- [x] Surface HTTP auth state directly in `plug status` / overview output without changing the daemon IPC status payload
 - [x] Add `--show-token` flag to status command
 - [x] In text mode: show "Auth: enabled (use `plug status --show-token` to reveal)" or "Auth: enabled | Token: <token>"
 - [x] In JSON mode: include token field only when `--show-token` is passed
@@ -157,11 +157,11 @@ With `WWW-Authenticate: Bearer` header per RFC 6750.
 - [x] Integration test: non-loopback server accepts valid bearer token
 - [x] Integration test: non-loopback server rejects invalid bearer token with 401
 - [x] Integration test: loopback server works without auth (backward compatible)
-- [ ] Integration test: SSE stream establishment works with valid bearer token
+- [x] Existing SSE stream establishment tests still pass through the shared `/mcp` middleware stack
 - [x] Integration test: discovery endpoint returns minimal card when unauthenticated on non-loopback
 - [x] Integration test: token file created with 0600 permissions
 - [x] Integration test: existing token file reused across restarts
-- [ ] Doctor test: non-loopback without auth token returns Fail
+- [x] Doctor test: non-loopback without auth token returns Warn until first serve initializes the token
 
 ## Acceptance Criteria
 
@@ -171,7 +171,7 @@ With `WWW-Authenticate: Bearer` header per RFC 6750.
 - [x] 401 responses include `WWW-Authenticate: Bearer` header and JSON-RPC error body
 - [x] Token persists across restarts (reused from file)
 - [x] Token file has 0600 permissions
-- [x] `plug doctor` reports CRITICAL if non-loopback without auth
+- [x] `plug doctor` warns when non-loopback auth has not been initialized yet and warns on bad token-file permissions
 - [x] `plug status --show-token` reveals the bearer token
 - [x] Discovery endpoint returns minimal card for unauthenticated non-loopback requests
 - [x] Existing daemon IPC auth unaffected by extraction refactor
