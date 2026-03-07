@@ -34,6 +34,7 @@ pub(crate) struct DaemonProxySession {
     pub(crate) client_id: String,
     pub(crate) client_info: Option<String>,
     pub(crate) session_id: String,
+    pub(crate) capabilities: rmcp::model::ServerCapabilities,
 }
 
 pub(crate) async fn establish_daemon_proxy_session(
@@ -63,12 +64,22 @@ pub(crate) async fn establish_daemon_proxy_session(
         .ok_or_else(|| anyhow::anyhow!("daemon closed during registration"))?;
 
     let session_id = parse_registered_session(&frame, &client_id)?;
+    let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
+        session_id: session_id.clone(),
+    };
+    let capabilities_payload = serde_json::to_vec(&capabilities_req)?;
+    plug_core::ipc::write_frame(&mut writer, &capabilities_payload).await?;
+    let capabilities_frame = plug_core::ipc::read_frame(&mut reader)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed while fetching capabilities"))?;
+    let capabilities = parse_capabilities_response(&capabilities_frame)?;
     Ok(DaemonProxySession {
         reader,
         writer,
         client_id,
         client_info,
         session_id,
+        capabilities,
     })
 }
 
@@ -122,6 +133,20 @@ fn parse_registered_session(frame: &[u8], expected_client_id: &str) -> anyhow::R
         }
         Some(other) => anyhow::bail!("registration failed: unexpected response type {other}"),
         None => anyhow::bail!("registration failed: malformed response"),
+    }
+}
+
+fn parse_capabilities_response(frame: &[u8]) -> anyhow::Result<rmcp::model::ServerCapabilities> {
+    let response: plug_core::ipc::IpcResponse = serde_json::from_slice(frame)
+        .map_err(|e| anyhow::anyhow!("invalid daemon capabilities response: {e}"))?;
+
+    match response {
+        plug_core::ipc::IpcResponse::Capabilities { capabilities } => {
+            serde_json::from_value(capabilities)
+                .map_err(|e| anyhow::anyhow!("invalid daemon capabilities payload: {e}"))
+        }
+        plug_core::ipc::IpcResponse::Error { code, message } => anyhow::bail!("{code}: {message}"),
+        other => anyhow::bail!("unexpected daemon capabilities response: {other:?}"),
     }
 }
 

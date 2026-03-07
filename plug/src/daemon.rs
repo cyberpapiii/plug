@@ -840,6 +840,27 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::ListClients => IpcResponse::Clients {
             clients: ctx.client_registry.list(),
         },
+        IpcRequest::Capabilities { session_id } => {
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            match serde_json::to_value(ctx.engine.tool_router().synthesized_capabilities()) {
+                Ok(capabilities) => IpcResponse::Capabilities { capabilities },
+                Err(error) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
 
         IpcRequest::McpRequest {
             session_id,
@@ -907,6 +928,101 @@ async fn dispatch_mcp_request(
                 Err(e) => IpcResponse::Error {
                     code: "SERIALIZE_ERROR".to_string(),
                     message: e.to_string(),
+                },
+            }
+        }
+
+        "resources/list" => {
+            let result = tool_router.list_resources_page(None);
+            match serde_json::to_value(result) {
+                Ok(payload) => IpcResponse::McpResponse { payload },
+                Err(e) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        "resources/templates/list" => {
+            let result = tool_router.list_resource_templates_page(None);
+            match serde_json::to_value(result) {
+                Ok(payload) => IpcResponse::McpResponse { payload },
+                Err(e) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        "resources/read" => {
+            let uri = match params.and_then(|p| p.get("uri")).and_then(|v| v.as_str()) {
+                Some(uri) => uri,
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "resources/read requires 'uri' in params".to_string(),
+                    };
+                }
+            };
+
+            match tool_router.read_resource(uri).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "prompts/list" => {
+            let result = tool_router.list_prompts_page(None);
+            match serde_json::to_value(result) {
+                Ok(payload) => IpcResponse::McpResponse { payload },
+                Err(e) => IpcResponse::Error {
+                    code: "SERIALIZE_ERROR".to_string(),
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        "prompts/get" => {
+            let name = match params.and_then(|p| p.get("name")).and_then(|v| v.as_str()) {
+                Some(name) if !name.is_empty() => name,
+                _ => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "prompts/get requires non-empty 'name'".to_string(),
+                    };
+                }
+            };
+            let arguments = params
+                .and_then(|p| p.get("arguments"))
+                .and_then(|v| v.as_object())
+                .cloned();
+
+            match tool_router.get_prompt(name, arguments).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
                 },
             }
         }

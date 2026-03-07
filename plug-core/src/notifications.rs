@@ -51,7 +51,19 @@ impl ProtocolNotification {
 
     /// Convert the internal notification to a JSON value suitable for SSE.
     pub fn to_json_value(&self) -> serde_json::Value {
-        serde_json::to_value(self.to_server_jsonrpc_message())
-            .expect("protocol notification should always serialize")
+        match serde_json::to_value(self.to_server_jsonrpc_message()) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize protocol notification");
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "error",
+                        "message": "failed to serialize protocol notification"
+                    }
+                })
+            }
+        }
     }
 }

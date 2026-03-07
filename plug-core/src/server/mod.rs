@@ -352,7 +352,7 @@ impl ServerManager {
 
                     if let Some(ref token) = config.auth_token {
                         transport_config =
-                            transport_config.auth_header(format!("Bearer {token}"));
+                            transport_config.auth_header(format!("Bearer {}", token.as_str()));
                     }
 
                     tracing::info!(
@@ -830,6 +830,13 @@ mod tests {
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
     use tokio::sync::{Notify, watch};
+
+    #[test]
+    fn secret_string_as_str_preserves_auth_header_value() {
+        let token = crate::types::SecretString::from("real-token".to_string());
+        assert_eq!(format!("Bearer {}", token.as_str()), "Bearer real-token");
+        assert_eq!(format!("{token}"), "[REDACTED]");
+    }
 
     fn test_router_config() -> RouterConfig {
         RouterConfig {
