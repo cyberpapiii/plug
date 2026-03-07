@@ -148,7 +148,7 @@ Full configuration reference:
 # ~/.config/plug/config.toml
 
 # Global settings
-enable_prefix = true       # Prefix tool names with server name (default: true)
+enable_prefix = true       # Legacy compatibility field; tool names are always prefixed in v0.1
 prefix_delimiter = "__"    # Delimiter between server name and tool name
 
 [http]

@@ -26,7 +26,7 @@ const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 
 /// The MCP protocol version we implement.
-const PROTOCOL_VERSION: &str = "2025-11-05";
+const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Shared state for all HTTP handlers.
 pub struct HttpState {
@@ -351,6 +351,12 @@ fn build_initialize_result() -> InitializeResult {
 /// pulling in the `url` crate dependency for this single use case.
 fn extract_origin_host(origin: &str) -> Option<&str> {
     let after_scheme = origin.split("://").nth(1)?;
+    // Handle IPv6 bracket notation: [::1]:port
+    if after_scheme.starts_with('[') {
+        let end = after_scheme.find(']')?;
+        let host = &after_scheme[..=end]; // includes brackets
+        return if host.len() > 2 { Some(host) } else { None };
+    }
     // Strip port and path: take everything before ':' or '/'
     let host = after_scheme
         .split(':')
@@ -492,6 +498,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(SESSION_ID_HEADER).is_some());
         assert!(resp.headers().get(PROTOCOL_VERSION_HEADER).is_some());
+        assert_eq!(
+            resp.headers()
+                .get(PROTOCOL_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROTOCOL_VERSION)
+        );
     }
 
     #[tokio::test]
@@ -856,6 +868,37 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("origin", "http://localhost:3282")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn origin_ipv6_localhost_accepted() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("origin", "http://[::1]:3282")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();

@@ -157,6 +157,16 @@ impl Engine {
         // Start all upstream servers
         self.server_manager.start_all(&config).await?;
 
+        // Startup failures are currently non-fatal. Preserve them in daemon
+        // state so status output is honest and proactive recovery can retry
+        // local services that come up shortly after boot/login.
+        for (name, server_config) in &config.servers {
+            if !server_config.enabled || self.server_manager.get_upstream(name).is_some() {
+                continue;
+            }
+            self.server_manager.mark_start_failure(name);
+        }
+
         // Refresh tool cache after startup
         self.tool_router.refresh_tools().await;
 

@@ -238,13 +238,29 @@ pub(crate) async fn cmd_start(
 }
 
 pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    let config = plug_core::config::load_config(config_path)?;
+    let config_path = config_path
+        .cloned()
+        .unwrap_or_else(plug_core::config::default_config_path);
+    let config = plug_core::config::load_config(Some(&config_path))?;
     let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
     let cancel = engine.cancel_token().clone();
-    plug_core::watcher::spawn_config_watcher(engine.clone(), cancel.clone(), engine.tracker());
+    plug_core::watcher::spawn_config_watcher(
+        engine.clone(),
+        config_path.clone(),
+        cancel.clone(),
+        engine.tracker(),
+    );
+    let daemon_future = daemon::run_daemon(
+        engine.clone(),
+        config_path,
+        engine.config().daemon_grace_period_secs,
+    );
+    tokio::pin!(daemon_future);
     tokio::select! {
-        _ = daemon::run_daemon(engine.clone(), 30) => {}
+        result = &mut daemon_future => {
+            result?;
+        }
         _ = daemon::shutdown_signal(cancel) => {}
     }
     engine.shutdown().await;
@@ -254,24 +270,30 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
 pub(crate) async fn cmd_daemon_stop() -> anyhow::Result<()> {
     let auth_token = daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Shutdown { auth_token };
-    if let Ok(plug_core::ipc::IpcResponse::Ok) = daemon::ipc_request(&req).await {
-        println!("stopped");
+    match daemon::ipc_request(&req).await? {
+        plug_core::ipc::IpcResponse::Ok => println!("stopped"),
+        plug_core::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!("{code}: {message}");
+        }
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
     }
     Ok(())
 }
 
-pub(crate) async fn cmd_serve(
-    config_path: Option<&std::path::PathBuf>,
-    _stdio: bool,
-) -> anyhow::Result<()> {
+pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     let config = plug_core::config::load_config(config_path)?;
     let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;
+    let sessions = plug_core::http::session::SessionManager::new(
+        config.http.session_timeout_secs,
+        config.http.max_sessions,
+    );
+    sessions.spawn_cleanup_task(engine.cancel_token().clone());
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: engine.tool_router().clone(),
-        sessions: plug_core::http::session::SessionManager::new(3600, 100),
+        sessions,
         cancel: engine.cancel_token().clone(),
-        sse_channel_capacity: 100,
+        sse_channel_capacity: config.http.sse_channel_capacity,
     });
     let router = plug_core::http::server::build_router(http_state);
     let addr = format!("{}:{}", config.http.bind_address, config.http.port);

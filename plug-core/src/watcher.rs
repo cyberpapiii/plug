@@ -23,11 +23,10 @@ const DEBOUNCE_MS: u64 = 500;
 /// cancellation token is triggered.
 pub fn spawn_config_watcher(
     engine: Arc<Engine>,
+    config_path: PathBuf,
     cancel: CancellationToken,
     tracker: &tokio_util::task::TaskTracker,
 ) {
-    let config_path = config::default_config_path();
-
     tracker.spawn(async move {
         if let Err(e) = run_watcher(engine, config_path, cancel).await {
             tracing::error!(error = %e, "config watcher failed");

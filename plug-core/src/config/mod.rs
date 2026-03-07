@@ -15,7 +15,8 @@ pub struct Config {
     pub log_level: String,
     /// Tool name prefix delimiter.
     pub prefix_delimiter: String,
-    /// Whether to prefix tool names with server name.
+    /// Legacy setting retained for compatibility.
+    /// Tool names are always prefixed in v0.1 to avoid collisions.
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     pub startup_concurrency: usize,
@@ -142,7 +143,7 @@ pub struct ServerConfig {
     pub tool_groups: Vec<ToolGroupRule>,
 }
 
-    fn default_true() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -493,7 +494,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -520,7 +521,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -551,7 +552,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -582,7 +583,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -617,7 +618,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -648,7 +649,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 enrichment: false,
                 tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+                tool_groups: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);

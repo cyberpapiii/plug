@@ -57,20 +57,68 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
 
     // Check non-server settings
     let mut restart_required = Vec::new();
-    if old.http.bind_address != new.http.bind_address {
-        restart_required.push("http.bind_address changed (restart required)".into());
-    }
-    if old.http.port != new.http.port {
-        restart_required.push("http.port changed (restart required)".into());
-    }
+    note_restart_required(
+        &mut restart_required,
+        old.http.bind_address != new.http.bind_address,
+        "http.bind_address changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.http.port != new.http.port,
+        "http.port changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.http.session_timeout_secs != new.http.session_timeout_secs,
+        "http.session_timeout_secs changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.http.max_sessions != new.http.max_sessions,
+        "http.max_sessions changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.http.sse_channel_capacity != new.http.sse_channel_capacity,
+        "http.sse_channel_capacity changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.prefix_delimiter != new.prefix_delimiter,
+        "prefix_delimiter changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.tool_filter_enabled != new.tool_filter_enabled,
+        "tool_filter_enabled changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.tool_description_max_chars != new.tool_description_max_chars,
+        "tool_description_max_chars changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.tool_search_threshold != new.tool_search_threshold,
+        "tool_search_threshold changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.priority_tools != new.priority_tools,
+        "priority_tools changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.disabled_tools != new.disabled_tools,
+        "disabled_tools changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.daemon_grace_period_secs != new.daemon_grace_period_secs,
+        "daemon_grace_period_secs changed",
+    );
 
-    let settings_changed = old.prefix_delimiter != new.prefix_delimiter
-        || old.enable_prefix != new.enable_prefix
-        || old.tool_filter_enabled != new.tool_filter_enabled
-        || old.tool_description_max_chars != new.tool_description_max_chars
-        || old.tool_search_threshold != new.tool_search_threshold
-        || old.priority_tools != new.priority_tools
-        || !restart_required.is_empty();
+    let settings_changed = !restart_required.is_empty();
 
     ConfigDiff {
         added,
@@ -79,6 +127,12 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         unchanged,
         settings_changed,
         restart_required,
+    }
+}
+
+fn note_restart_required(restart_required: &mut Vec<String>, changed: bool, setting: &str) {
+    if changed {
+        restart_required.push(format!("{setting} (restart required)"));
     }
 }
 
@@ -202,7 +256,7 @@ mod tests {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+            tool_groups: Vec::new(),
         }
     }
 
@@ -270,6 +324,64 @@ mod tests {
         let diff = diff_configs(&old, &new);
         assert!(diff.settings_changed);
         assert!(!diff.restart_required.is_empty());
+    }
+
+    #[test]
+    fn diff_marks_router_settings_restart_required() {
+        let old = Config::default();
+        let new = Config {
+            priority_tools: vec!["plug__search_tools".into()],
+            tool_description_max_chars: Some(128),
+            tool_filter_enabled: false,
+            ..Config::default()
+        };
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(diff.settings_changed);
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("priority_tools"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("tool_description_max_chars"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("tool_filter_enabled"))
+        );
+    }
+
+    #[test]
+    fn diff_marks_http_session_settings_restart_required() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.http.session_timeout_secs = 60;
+        new.http.max_sessions = 5;
+        new.http.sse_channel_capacity = 8;
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(diff.settings_changed);
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("http.session_timeout_secs"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("http.max_sessions"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("http.sse_channel_capacity"))
+        );
     }
 
     #[test]

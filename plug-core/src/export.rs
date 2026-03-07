@@ -208,26 +208,44 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
 /// Generate a YAML MCP config snippet.
 fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
     let mut plug = serde_yml::Mapping::new();
-    
+
     match options.transport {
         ExportTransport::Stdio => {
-            plug.insert(serde_yml::Value::from("type"), serde_yml::Value::from("stdio"));
-            plug.insert(serde_yml::Value::from("command"), serde_yml::Value::from(options.command.clone()));
+            plug.insert(
+                serde_yml::Value::from("type"),
+                serde_yml::Value::from("stdio"),
+            );
+            plug.insert(
+                serde_yml::Value::from("command"),
+                serde_yml::Value::from(options.command.clone()),
+            );
             let args = vec![serde_yml::Value::from("connect")];
             plug.insert(serde_yml::Value::from("args"), serde_yml::Value::from(args));
         }
         ExportTransport::Http => {
-            plug.insert(serde_yml::Value::from("type"), serde_yml::Value::from("sse"));
-            plug.insert(serde_yml::Value::from("uri"), serde_yml::Value::from(format!("http://localhost:{}/mcp", options.port)));
+            plug.insert(
+                serde_yml::Value::from("type"),
+                serde_yml::Value::from("sse"),
+            );
+            plug.insert(
+                serde_yml::Value::from("uri"),
+                serde_yml::Value::from(format!("http://localhost:{}/mcp", options.port)),
+            );
         }
     }
-    plug.insert(serde_yml::Value::from("enabled"), serde_yml::Value::from(true));
+    plug.insert(
+        serde_yml::Value::from("enabled"),
+        serde_yml::Value::from(true),
+    );
 
     let mut extensions = serde_yml::Mapping::new();
     extensions.insert(serde_yml::Value::from("plug"), serde_yml::Value::from(plug));
 
     let mut config = serde_yml::Mapping::new();
-    config.insert(serde_yml::Value::from(key), serde_yml::Value::from(extensions));
+    config.insert(
+        serde_yml::Value::from(key),
+        serde_yml::Value::from(extensions),
+    );
 
     serde_yml::to_string(&config).unwrap()
 }

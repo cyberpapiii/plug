@@ -317,7 +317,9 @@ async fn check_env_vars(config: &Config) -> CheckResult {
                 "Third-party servers have missing env vars (non-blocking): {}",
                 third_party_missing.join(", ")
             ),
-            fix_suggestion: Some("Set the missing environment variables or remove unused servers".to_string()),
+            fix_suggestion: Some(
+                "Set the missing environment variables or remove unused servers".to_string(),
+            ),
         }
     }
 }
@@ -392,37 +394,17 @@ fn which(binary: &str) -> Option<std::path::PathBuf> {
 async fn check_tool_collisions(config: &Config) -> CheckResult {
     let name = "tool_collisions".to_string();
 
-    if config.enable_prefix {
-        return CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "Tool prefixing is enabled — collisions are avoided".to_string(),
-            fix_suggestion: None,
-        };
-    }
-
-    // Without prefixing enabled, we can only warn that collisions are possible
-    // since we don't have tool names without actually starting servers.
-    let server_count = config.servers.values().filter(|s| s.enabled).count();
-    if server_count > 1 {
-        CheckResult {
-            name,
-            status: CheckStatus::Warn,
-            message: format!(
-                "{server_count} servers configured with prefixing disabled — tool name collisions possible"
-            ),
-            fix_suggestion: Some(
-                "Enable `enable_prefix = true` or ensure servers have unique tool names"
-                    .to_string(),
-            ),
-        }
+    let message = if config.enable_prefix {
+        "Tool prefixing is enabled — collisions are avoided".to_string()
     } else {
-        CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "Tool collision check passed".to_string(),
-            fix_suggestion: None,
-        }
+        "Tool prefixing is always on in v0.1; `enable_prefix = false` is ignored".to_string()
+    };
+
+    CheckResult {
+        name,
+        status: CheckStatus::Pass,
+        message,
+        fix_suggestion: None,
     }
 }
 
@@ -628,6 +610,7 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
 async fn check_http_reachable(url: &str) -> Result<(), String> {
     use std::net::ToSocketAddrs;
 
+    let is_https = url.starts_with("https://");
     // Parse URL to extract host:port
     let url = url
         .strip_prefix("https://")
@@ -637,7 +620,7 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
     let addr = if host_port.contains(':') {
         host_port.to_string()
     } else {
-        format!("{host_port}:443")
+        format!("{host_port}:{}", if is_https { 443 } else { 80 })
     };
 
     // DNS resolution + TCP connect with timeout
@@ -668,9 +651,24 @@ async fn check_client_configs() -> CheckResult {
     let mut issues = Vec::new();
 
     let all_targets = [
-        "claude-desktop", "claude-code", "cursor", "vscode", "windsurf", 
-        "gemini-cli", "codex-cli", "opencode", "zed", "cline", "cline-cli",
-        "roocode", "factory", "nanobot", "junie", "kilo", "antigravity", "goose"
+        "claude-desktop",
+        "claude-code",
+        "cursor",
+        "vscode",
+        "windsurf",
+        "gemini-cli",
+        "codex-cli",
+        "opencode",
+        "zed",
+        "cline",
+        "cline-cli",
+        "roocode",
+        "factory",
+        "nanobot",
+        "junie",
+        "kilo",
+        "antigravity",
+        "goose",
     ];
 
     for target in all_targets {
@@ -696,31 +694,52 @@ async fn check_client_configs() -> CheckResult {
             };
 
             let ext = path.extension().and_then(|e| e.to_str());
-            
+
             if ext == Some("toml") {
                 // Count occurrences of [mcp_servers.plug]
-                let count = content.lines().filter(|l| l.trim() == "[mcp_servers.plug]").count();
+                let count = content
+                    .lines()
+                    .filter(|l| l.trim() == "[mcp_servers.plug]")
+                    .count();
                 if count > 1 {
-                    issues.push(format!("{} (duplicate entries in {})", target, path.display()));
+                    issues.push(format!(
+                        "{} (duplicate entries in {})",
+                        target,
+                        path.display()
+                    ));
                 }
                 // Also check if it's even valid TOML
                 if let Err(e) = content.parse::<toml::Value>() {
-                    issues.push(format!("{} (invalid TOML in {}: {})", target, path.display(), e));
+                    issues.push(format!(
+                        "{} (invalid TOML in {}: {})",
+                        target,
+                        path.display(),
+                        e
+                    ));
                 }
             } else if ext == Some("yaml") || ext == Some("yml") {
                 // For YAML (Goose), check for duplicate "plug:" keys under extensions
                 let count = content.lines().filter(|l| l.trim() == "plug:").count();
                 if count > 1 {
-                    issues.push(format!("{} (duplicate entries in {})", target, path.display()));
+                    issues.push(format!(
+                        "{} (duplicate entries in {})",
+                        target,
+                        path.display()
+                    ));
                 }
                 if let Err(e) = serde_yml::from_str::<serde_yml::Value>(&content) {
-                    issues.push(format!("{} (invalid YAML in {}: {})", target, path.display(), e));
+                    issues.push(format!(
+                        "{} (invalid YAML in {}: {})",
+                        target,
+                        path.display(),
+                        e
+                    ));
                 }
             } else {
                 // For JSON, check for multiple "plug" keys in valid MCP locations
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                     let mut plug_locations = 0;
-                    
+
                     // Location 1: mcpServers / context_servers
                     for key in ["mcpServers", "context_servers"] {
                         if json.get(key).and_then(|v| v.get("plug")).is_some() {
@@ -728,16 +747,31 @@ async fn check_client_configs() -> CheckResult {
                         }
                     }
                     // Location 2: mcp.servers
-                    if json.get("mcp").and_then(|v| v.get("servers")).and_then(|s| s.get("plug")).is_some() {
+                    if json
+                        .get("mcp")
+                        .and_then(|v| v.get("servers"))
+                        .and_then(|s| s.get("plug"))
+                        .is_some()
+                    {
                         plug_locations += 1;
                     }
                     // Location 3: tools.mcpServers
-                    if json.get("tools").and_then(|v| v.get("mcpServers")).and_then(|s| s.get("plug")).is_some() {
+                    if json
+                        .get("tools")
+                        .and_then(|v| v.get("mcpServers"))
+                        .and_then(|s| s.get("plug"))
+                        .is_some()
+                    {
                         plug_locations += 1;
                     }
 
                     if plug_locations > 1 {
-                         issues.push(format!("{} ({} duplicate plug entries in {})", target, plug_locations, path.display()));
+                        issues.push(format!(
+                            "{} ({} duplicate plug entries in {})",
+                            target,
+                            plug_locations,
+                            path.display()
+                        ));
                     }
                 } else {
                     issues.push(format!("{} (invalid JSON in {})", target, path.display()));
@@ -758,7 +792,10 @@ async fn check_client_configs() -> CheckResult {
             name,
             status: CheckStatus::Warn,
             message: format!("Issues found in client configs: {}", issues.join(", ")),
-            fix_suggestion: Some("Run `plug repair` to automatically clean up your client configurations".to_string()),
+            fix_suggestion: Some(
+                "Run `plug repair` to automatically clean up your client configurations"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -790,7 +827,7 @@ mod tests {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
+            tool_groups: Vec::new(),
         }
     }
 
@@ -965,7 +1002,8 @@ mod tests {
         config.servers.insert("a".to_string(), stdio_server("echo"));
         config.servers.insert("b".to_string(), stdio_server("echo"));
         let result = check_tool_collisions(&config).await;
-        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("always on"));
     }
 
     // -- check_client_limits --

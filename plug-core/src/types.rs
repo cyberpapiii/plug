@@ -21,7 +21,7 @@ impl fmt::Debug for SecretString {
 
 impl fmt::Display for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "[REDACTED]")
     }
 }
 
@@ -50,6 +50,23 @@ impl Default for SessionId {
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SecretString;
+
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        let secret = SecretString::from("super-secret".to_string());
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn secret_string_display_is_redacted() {
+        let secret = SecretString::from("super-secret".to_string());
+        assert_eq!(format!("{secret}"), "[REDACTED]");
     }
 }
 

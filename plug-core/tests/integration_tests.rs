@@ -7,9 +7,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use plug_core::client_detect::detect_client;
 use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
+use plug_core::engine::Engine;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::types::ClientType;
@@ -261,8 +263,8 @@ fn test_config_validation_valid() {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        }
+            tool_groups: Vec::new(),
+        },
     );
     let errors = validate_config(&cfg);
     assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -288,8 +290,8 @@ fn test_config_validation_catches_missing_command() {
             circuit_breaker_enabled: true,
             enrichment: false,
             tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        }
+            tool_groups: Vec::new(),
+        },
     );
     let errors = validate_config(&cfg);
     assert!(
@@ -309,4 +311,67 @@ fn test_mock_server_path_is_reasonable() {
         path.ends_with("mock-mcp-server"),
         "unexpected mock server path: {path:?}"
     );
+}
+
+#[tokio::test]
+async fn test_stdio_timeout_reconnects_cleanly() {
+    let temp = std::env::temp_dir().join(format!("plug-timeout-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp).expect("create temp dir");
+    let marker = temp.join("first-run.marker");
+    let script = temp.join("mock-wrapper.sh");
+
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  touch \"$1\"\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --delay-ms 1500\nelse\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --delay-ms 0\nfi\n",
+    )
+    .expect("write wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+
+    let mut config = Config::default();
+    config.servers.insert(
+        "mock".to_string(),
+        ServerConfig {
+            command: Some(script.display().to_string()),
+            args: vec![marker.display().to_string()],
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            timeout_secs: 10,
+            call_timeout_secs: 1,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        },
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let first = engine.tool_router().call_tool("Mock__echo", None).await;
+    assert!(first.is_err(), "first call should time out");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second = engine
+        .tool_router()
+        .call_tool(
+            "Mock__echo",
+            Some(serde_json::json!({"input": "ok"}).as_object().unwrap().clone()),
+        )
+        .await;
+    assert!(second.is_ok(), "second call should succeed after reconnect");
+
+    engine.shutdown().await;
+    let _ = std::fs::remove_dir_all(&temp);
 }

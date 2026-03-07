@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "025"
 tags: [code-review, security]
@@ -28,6 +28,20 @@ Change `Display` to write `[REDACTED]`, matching `Debug` behavior. Raw access re
 
 ## Acceptance Criteria
 
-- [ ] `format!("{}", secret_string)` returns `[REDACTED]`
-- [ ] `format!("{:?}", secret_string)` returns `[REDACTED]`
-- [ ] `.as_str()` still returns the raw value for legitimate use
+- [x] `format!("{}", secret_string)` returns `[REDACTED]`
+- [x] `format!("{:?}", secret_string)` returns `[REDACTED]`
+- [x] `.as_str()` still returns the raw value for legitimate use
+
+## Work Log
+
+### 2026-03-06 - Completed During v0.1 Stabilization
+
+**By:** Codex
+
+**Actions:**
+- Updated `Display` redaction in [types.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/types.rs)
+- Added regression tests for both `Debug` and `Display` redaction paths
+- Verified with focused `cargo test -p plug-core types::tests`
+
+**Learnings:**
+- This was a true latent defect rather than an active exploit path, but it was low-cost and worth eliminating immediately.

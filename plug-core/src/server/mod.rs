@@ -151,18 +151,14 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("stdio transport requires a command"))?;
 
-                    // We wrap the command in 'sh -c' to ensure stderr is redirected to /dev/null
-                    // at the OS level, preventing noisy logs from leaking.
-                    let mut cmd = tokio::process::Command::new("sh");
-                    let mut full_command = format!("'{}'", command);
+                    // Use native Command — no shell wrapper, no injection risk.
+                    // Arguments are passed directly without shell interpretation.
+                    let mut cmd = tokio::process::Command::new(command);
                     for arg in &config.args {
-                        // Basic escaping for the shell wrapper
-                        let escaped_arg = arg.replace("'", "'\\''");
-                        full_command.push_str(&format!(" '{}'", escaped_arg));
+                        cmd.arg(arg);
                     }
-                    full_command.push_str(" 2>/dev/null");
-
-                    cmd.arg("-c").arg(full_command);
+                    // Suppress stderr at the OS level to prevent noisy server logs
+                    cmd.stderr(std::process::Stdio::null());
 
                     for (key, value) in &config.env {
                         cmd.env(key, value);
@@ -372,7 +368,7 @@ impl ServerManager {
     /// Return health/status information for all servers.
     pub fn server_statuses(&self) -> Vec<ServerStatus> {
         let servers = self.servers.load();
-        servers
+        let mut statuses: Vec<ServerStatus> = servers
             .values()
             .map(|upstream| {
                 let health = self
@@ -387,7 +383,34 @@ impl ServerManager {
                     last_seen: None,
                 }
             })
-            .collect()
+            .collect();
+
+        for entry in &self.health {
+            if servers.contains_key(entry.key()) {
+                continue;
+            }
+            statuses.push(ServerStatus {
+                server_id: entry.key().clone(),
+                health: entry.health,
+                tool_count: 0,
+                last_seen: None,
+            });
+        }
+
+        statuses.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        statuses
+    }
+
+    /// Record that a configured server failed during startup so it appears in
+    /// status output and becomes eligible for proactive recovery.
+    pub fn mark_start_failure(&self, name: &str) {
+        self.health.insert(
+            name.to_string(),
+            HealthState {
+                health: ServerHealth::Failed,
+                consecutive_failures: 6,
+            },
+        );
     }
 
     /// Start a single server and register it in the manager.
@@ -583,5 +606,17 @@ mod tests {
         let flag_b = mgr.get_reconnecting_flag("server-b");
         // Different servers should have different flags
         assert!(!Arc::ptr_eq(&flag_a, &flag_b));
+    }
+
+    #[test]
+    fn server_statuses_include_failed_startups_without_upstreams() {
+        let mgr = ServerManager::new();
+        mgr.mark_start_failure("workspace");
+
+        let statuses = mgr.server_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].server_id, "workspace");
+        assert_eq!(statuses[0].health, ServerHealth::Failed);
+        assert_eq!(statuses[0].tool_count, 0);
     }
 }

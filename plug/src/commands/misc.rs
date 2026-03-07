@@ -183,7 +183,13 @@ pub(crate) async fn cmd_doctor(
 pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
     let auth = crate::daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Reload { auth_token: auth };
-    crate::daemon::ipc_request(&req).await?;
+    match crate::daemon::ipc_request(&req).await? {
+        plug_core::ipc::IpcResponse::Ok => {}
+        plug_core::ipc::IpcResponse::Error { code, message } => {
+            anyhow::bail!("{code}: {message}");
+        }
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
     Ok(())
 }
 

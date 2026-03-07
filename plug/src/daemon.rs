@@ -309,7 +309,11 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
 ///
 /// Returns the tracing-appender guard that MUST be held for the daemon's lifetime
 /// (dropping it flushes and closes the log file).
-pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::Result<()> {
+pub async fn run_daemon(
+    engine: Arc<Engine>,
+    config_path: PathBuf,
+    grace_period_secs: u64,
+) -> anyhow::Result<()> {
     let rt_dir = runtime_dir();
     let log_directory = log_dir();
 
@@ -452,6 +456,7 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
                         let auth = auth_token.clone();
                         let engine_clone = engine.clone();
                         let registry = client_registry.clone();
+                        let config_path = config_path.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit; // held for connection lifetime
@@ -463,6 +468,7 @@ pub async fn run_daemon(engine: Arc<Engine>, grace_period_secs: u64) -> anyhow::
                                 auth_token: auth,
                                 server_manager,
                                 engine: engine_clone,
+                                config_path: config_path.clone(),
                                 started_at,
                                 client_registry: registry,
                                 session_id: None,
@@ -499,6 +505,7 @@ struct ConnectionContext {
     auth_token: Arc<str>,
     server_manager: Arc<plug_core::server::ServerManager>,
     engine: Arc<Engine>,
+    config_path: PathBuf,
     started_at: Instant,
     client_registry: Arc<ClientRegistry>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
@@ -636,8 +643,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
         IpcRequest::Reload { .. } => {
             // Load fresh config from disk and apply via Engine
-            let config_path = plug_core::config::default_config_path();
-            match plug_core::config::load_config(Some(&config_path)) {
+            match plug_core::config::load_config(Some(&ctx.config_path)) {
                 Ok(new_config) => match ctx.engine.reload_config(new_config).await {
                     Ok(report) => {
                         tracing::info!(
