@@ -831,9 +831,9 @@ async fn check_http_auth(config: &Config) -> CheckResult {
     if !token_path.exists() {
         return CheckResult {
             name,
-            status: CheckStatus::Fail,
+            status: CheckStatus::Warn,
             message: format!(
-                "HTTP server bound to {} (non-loopback) without authentication",
+                "HTTP server bound to {} (non-loopback) but auth token not yet generated — run `plug serve` to initialize",
                 config.http.bind_address
             ),
             fix_suggestion: Some(

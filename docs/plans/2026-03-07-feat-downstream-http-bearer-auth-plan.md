@@ -1,7 +1,7 @@
 ---
 title: "feat: Downstream HTTP Bearer Token Authentication"
 type: feat
-status: complete
+status: complete (2 test items deferred to integration phase)
 date: 2026-03-07
 parent: docs/plans/2026-03-07-feat-mcp-spec-compliance-roadmap-plan.md
 ---
