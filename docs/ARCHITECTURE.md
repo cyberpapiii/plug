@@ -2,122 +2,107 @@
 
 ## System Overview
 
-`plug` is a single Rust binary with two active front doors:
+`plug` is a single Rust binary with two active downstream front doors:
 
-- `plug connect` for downstream stdio clients
-- `plug serve` for downstream Streamable HTTP clients
+- `plug connect` for stdio clients
+- `plug serve` for Streamable HTTP clients
 
-Both front doors use the same `Engine` type from `plug-core`, but not always the same live instance. In normal use, `plug connect` prefers the background daemon and falls back to standalone mode if the daemon is unavailable. `plug serve` starts its own engine unless you run daemon mode explicitly.
+Both paths run on the same core runtime model:
 
 ```text
 Downstream clients
-  Claude Code / Cursor / Codex / Zed  ->  plug connect  -> daemon or standalone engine
-  Gemini / remote HTTP clients        ->  plug serve    -> dedicated engine instance
+  stdio clients              -> plug connect -> daemon-backed or standalone proxy
+  HTTP / remote clients      -> plug serve   -> HTTP server + shared engine
 
-Shared engine
+Core runtime
   Engine
     -> ServerManager
     -> ToolRouter
-    -> Config snapshot
-    -> Event bus
-    -> Health / recovery tasks
+    -> config snapshot
+    -> event bus
+    -> health / reconnect tasks
 
 Upstream servers
-  stdio child processes
-  streamable-http upstreams
+  stdio child-process servers
+  streamable-http upstream servers
 ```
 
 ## Runtime Model
 
 ### Engine
 
-`Engine` is the single owner of runtime state:
+`Engine` is the single owner of shared runtime truth:
 
 - current config snapshot
 - upstream server registry
-- merged tool cache
+- merged tool/resource/prompt routing state
 - event bus
 - shutdown coordination
 
-The CLI, daemon, and HTTP server query the engine rather than owning parallel state.
-
 ### ServerManager
 
-`ServerManager` owns upstream server lifecycle:
+`ServerManager` owns upstream lifecycle:
 
-- starts configured upstream servers
-- tracks health/circuit-breaker state
-- stores per-server semaphores
-- returns server-status snapshots for CLI and daemon callers
-
-Reads are optimized through `ArcSwap` snapshots and mutable per-server state is kept in `DashMap`.
+- startup/shutdown
+- health state
+- circuit breakers
+- per-server semaphores
+- server-status snapshots
 
 ### ToolRouter
 
-`ToolRouter` merges and exposes tool inventory and routes `tools/call` requests to the right upstream server.
+`ToolRouter` owns the shared downstream-facing protocol surface:
 
-Current behavior:
-
-- tool names are always prefixed in `v0.1`
-- client-aware filtering is applied for known client caps
-- `plug__search_tools` is available when the configured threshold is exceeded
-- reconnect-on-session-error is handled in the tool-call path
-
-Not yet implemented:
-
-- notification forwarding
-- pagination
-- full resources/prompts routing
+- merged tools/resources/prompts
+- capability synthesis
+- tool/resource/prompt routing
+- progress/cancellation correlation
+- notification fan-out substrate
+- meta-tool mode
 
 ### Daemon
 
-The daemon is the authoritative shared runtime for local clients:
+The daemon is the authoritative shared local runtime for `plug connect`:
 
-- Unix socket IPC for CLI and `plug connect`
-- auth token for admin commands
-- client session registry for live downstream connections
-- graceful idle shutdown controlled by config
+- Unix socket IPC
+- admin auth token for control commands
+- downstream client registry
+- reconnecting IPC proxy sessions
 
-The daemon currently proxies tool operations through IPC. It does not yet proxy the full MCP surface.
+The daemon-backed path now covers the real shared runtime, not just basic tool calls.
 
-## Transports
+## Downstream Capabilities
 
-### Downstream
+Current downstream support includes:
 
-- `plug connect`: stdio adapter invoked by local AI clients
-- `plug serve`: Streamable HTTP server on configured bind address / port
-- `DELETE /mcp`: HTTP session termination
-- `GET /mcp`: SSE notification stream for HTTP clients
+- tools
+- resources
+- prompts
+- notifications
+- progress
+- cancellation
+- pagination
+- meta-tool mode
 
-### Upstream
+This applies across stdio and HTTP, with transport-specific details only at the edge.
 
-- stdio child processes
-- Streamable HTTP client transport
+## Session Model
 
-Legacy SSE is not part of the active `v0.1` server story, although some client export formats still use legacy transport labels such as `type: sse` for compatibility.
+Current HTTP downstream handling uses a `SessionStore` abstraction with one concrete
+`StatefulSessionStore` implementation.
 
-## Configuration
+That means:
 
-Config is loaded through Figment layering:
+- today’s behavior remains stateful
+- the seam for future stateless downstream handling is now explicit
+- stateless handling is still design-only, not implemented
 
-1. defaults
-2. config file
-3. environment
+## Honest Limitations
 
-The runtime supports:
+The architecture does **not** currently claim:
 
-- server add/remove/change reload
-- explicit restart-required warnings for settings that are not truly hot-applied
+- a live TUI product surface
+- full stateless downstream MCP handling
+- Tasks or other future-facing post-June-2026 MCP primitives
 
-`v0.1` does **not** promise full live reconfiguration of router/runtime semantics.
-
-## Truthful Limitations
-
-The current architecture intentionally does not claim:
-
-- a live TUI
-- full MCP capability parity
-- complete notification forwarding
-- fully stateless MCP support
-
-Those are future work. The `v0.1` architecture is the daemon-backed CLI product plus the current shared runtime.
+Those are the next major architecture questions after the `v0.2.0` boundary.

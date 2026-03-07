@@ -1,47 +1,48 @@
 # Current Plan
 
-This document tracks the active product direction, not the original speculative phase map.
+This document tracks the current product state and the next remaining work after the merged Phase
+1-3 tranches.
 
-## Current Objective
+## Current State
 
-Ship a truthful, stable `v0.1` of `plug`.
+`plug` has completed the major stabilization and protocol-surface work that used to sit behind the
+old `v0.1` plan:
 
-That means:
-
-- the current daemon-backed CLI product is reliable
-- security/truth bugs are fixed
-- the docs match the code
-- unsupported runtime changes are called out honestly
-
-## Active v0.1 Work
-
-Tracked in:
-
-- `docs/plans/2026-03-06-strategic-assessment.md`
-- `todos/029-complete-p1-serve-stdio-flag-honesty.md`
-- `todos/030-complete-p1-make-prefix-behavior-explicit-for-v0-1.md`
-- `todos/031-complete-p1-rewrite-core-docs-for-v0-1.md`
-- `todos/032-complete-p1-final-v0-1-verification-and-release-boundary.md`
-
-## Completed Stabilization Work
-
-- recovered interrupted Phase 1 stability patch set
-- sanitized tool descriptions in the tool cache
-- made runtime and daemon behavior more truthful
-- made reload semantics explicit for `v0.1`
-- made serve/prefix behavior explicit in the command/config surface
-- completed the `v0.1` verification and release boundary
-
-## Deferred Until After v0.1
-
-- bidirectional notification forwarding
-- cancellation and progress propagation
-- full resources/prompts forwarding
+- stabilization and truth fixes
+- notification forwarding
+- progress and cancellation routing
+- resources/prompts forwarding
 - pagination
-- meta-tool discovery mode
-- `rmcp` upgrade
-- stateless/session abstraction work
+- capability synthesis
+- meta-tool mode
+- end-to-end transport coverage
+- daemon continuity recovery
+- session-store abstraction seam and stateless design prep
 
-## Next Phase After v0.1
+## What Exists Today
 
-After `v0.1` is verified and the docs gate is complete, the next implementation plan should focus on notification infrastructure first, then cancellation/progress, and only then the larger spec-surface work.
+The current product shape is:
+
+- `plug connect` for stdio downstream clients
+- `plug serve` for Streamable HTTP downstream clients
+- shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
+- daemon-backed local sharing with reconnecting IPC proxy sessions
+- targeted notification fan-out to stdio and HTTP
+- meta-tool mode as an opt-in reduced discovery surface
+
+## Remaining Work Before `v0.2.0`
+
+The main remaining release-closeout work is documentation and release hygiene:
+
+- bring the tracked operating docs in sync with the merged code
+- update the risk register to current remaining risks
+- reduce the research breadcrumb list to the still-open questions
+- choose and create the `v0.2.0` tag after merge
+
+## Post-`v0.2.0` Work
+
+Likely next roadmap areas after the release boundary:
+
+- additional upstream restart / recovery proof
+- deeper stateless downstream design or implementation
+- broader ecosystem-forward work such as Tasks support once the spec direction settles
