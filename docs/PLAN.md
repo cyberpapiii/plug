@@ -43,7 +43,7 @@ Five phases, each delivering a working increment. Each phase can be validated in
 ### 1.5 Fan-Out & Merge
 - [ ] `tools/list`: parallel fan-out to all servers, merge results, cache
 - [ ] Merge-based cache: preserve last-known tools when a server times out
-- [ ] Tool name prefixing (configurable: on by default, `__` delimiter)
+- [ ] Tool name prefixing (`__` delimiter, always on in v0.1)
 - [ ] Collision detection: warn if two servers define the same unprefixed tool name
 - [ ] `resources/list`: merge (always return `{resources: []}` if none — Codex compatibility)
 - [ ] `prompts/list`: merge

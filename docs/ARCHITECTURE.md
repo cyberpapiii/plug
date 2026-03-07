@@ -133,7 +133,8 @@ Aggregates responses from multiple upstream servers into a single response.
 **For `tools/list`**:
 - Fan-out to all healthy servers (parallel, with per-server timeout)
 - Merge results into one list
-- Apply tool name prefixing (if enabled) for collision avoidance
+- Apply tool name prefixing for collision avoidance
+  In `v0.1`, prefixing is always on. The legacy `enable_prefix` config field is ignored.
 - Apply client-specific filtering (tool limits, priority tools)
 - Cache the merged result
 

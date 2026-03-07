@@ -392,37 +392,17 @@ fn which(binary: &str) -> Option<std::path::PathBuf> {
 async fn check_tool_collisions(config: &Config) -> CheckResult {
     let name = "tool_collisions".to_string();
 
-    if config.enable_prefix {
-        return CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "Tool prefixing is enabled — collisions are avoided".to_string(),
-            fix_suggestion: None,
-        };
-    }
-
-    // Without prefixing enabled, we can only warn that collisions are possible
-    // since we don't have tool names without actually starting servers.
-    let server_count = config.servers.values().filter(|s| s.enabled).count();
-    if server_count > 1 {
-        CheckResult {
-            name,
-            status: CheckStatus::Warn,
-            message: format!(
-                "{server_count} servers configured with prefixing disabled — tool name collisions possible"
-            ),
-            fix_suggestion: Some(
-                "Enable `enable_prefix = true` or ensure servers have unique tool names"
-                    .to_string(),
-            ),
-        }
+    let message = if config.enable_prefix {
+        "Tool prefixing is enabled — collisions are avoided".to_string()
     } else {
-        CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "Tool collision check passed".to_string(),
-            fix_suggestion: None,
-        }
+        "Tool prefixing is always on in v0.1; `enable_prefix = false` is ignored".to_string()
+    };
+
+    CheckResult {
+        name,
+        status: CheckStatus::Pass,
+        message,
+        fix_suggestion: None,
     }
 }
 
@@ -966,7 +946,8 @@ mod tests {
         config.servers.insert("a".to_string(), stdio_server("echo"));
         config.servers.insert("b".to_string(), stdio_server("echo"));
         let result = check_tool_collisions(&config).await;
-        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("always on"));
     }
 
     // -- check_client_limits --

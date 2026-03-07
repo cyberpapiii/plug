@@ -15,7 +15,8 @@ pub struct Config {
     pub log_level: String,
     /// Tool name prefix delimiter.
     pub prefix_delimiter: String,
-    /// Whether to prefix tool names with server name.
+    /// Legacy setting retained for compatibility.
+    /// Tool names are always prefixed in v0.1 to avoid collisions.
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     pub startup_concurrency: usize,
