@@ -826,6 +826,7 @@ mod tests {
             disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
+            meta_tool_mode: false,
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         }
@@ -855,6 +856,14 @@ mod tests {
         Tool::new(
             std::borrow::Cow::Owned(name.to_string()),
             std::borrow::Cow::Borrowed("test tool"),
+            Arc::new(serde_json::Map::new()),
+        )
+    }
+
+    fn make_tool_with_description(name: &str, description: &str) -> Tool {
+        Tool::new(
+            std::borrow::Cow::Owned(name.to_string()),
+            std::borrow::Cow::Owned(description.to_string()),
             Arc::new(serde_json::Map::new()),
         )
     }
@@ -1279,6 +1288,109 @@ mod tests {
             .await
             .expect("tool call succeeds");
         assert!(!result.content.is_empty());
+        assert_eq!(router.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn meta_tool_mode_exposes_only_meta_tools_and_invokes_hidden_tool() {
+        let server_manager = Arc::new(ServerManager::new());
+        let mut config = test_router_config();
+        config.meta_tool_mode = true;
+        let router = Arc::new(crate::proxy::ToolRouter::new(server_manager.clone(), config));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (upstream_server, tools_rx) =
+            MutableToolServer::new(vec![make_tool_with_description("echo", "Echo input")]);
+        let upstream_peer = Arc::clone(&upstream_server.peer);
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = MutableToolServerHandler {
+                tools_rx,
+                peer: upstream_peer,
+            };
+            let server = handler
+                .serve(server_transport)
+                .await
+                .expect("start upstream test server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("upstream"),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(&router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect upstream test client");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        tools.store(Arc::new(initial_tools));
+
+        server_manager.replace_server(
+            "upstream",
+            UpstreamServer {
+                name: "upstream".to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                capabilities: ServerCapabilities::default(),
+                health: ServerHealth::Healthy,
+            },
+        );
+        router.refresh_tools().await;
+
+        let proxy_handler = ProxyHandler::from_router(router.clone());
+        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(proxy_server_transport)
+                .await
+                .expect("start proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let downstream_client = ToolListChangedClient {
+            signal: Arc::new(Notify::new()),
+            notifications: Arc::new(AtomicUsize::new(0)),
+        }
+        .serve(downstream_transport)
+        .await
+        .expect("connect downstream client");
+
+        let visible_tools = downstream_client.list_all_tools().await.expect("list tools");
+        let visible_names = visible_tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_names,
+            vec![
+                "plug__list_servers",
+                "plug__list_tools",
+                "plug__search_tools",
+                "plug__invoke_tool",
+            ]
+        );
+
+        let mut invoke_args = serde_json::Map::new();
+        invoke_args.insert(
+            "tool_name".to_string(),
+            serde_json::Value::String("Upstream__echo".to_string()),
+        );
+        invoke_args.insert(
+            "arguments".to_string(),
+            serde_json::json!({"message": "hello"}),
+        );
+        let result = downstream_client
+            .call_tool(CallToolRequestParams::new("plug__invoke_tool").with_arguments(invoke_args))
+            .await
+            .expect("invoke hidden tool");
+
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("called echo"), "unexpected invoke result: {rendered}");
         assert_eq!(router.active_call_count(), 0);
     }
 

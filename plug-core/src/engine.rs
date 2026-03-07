@@ -60,6 +60,9 @@ pub enum EngineEvent {
     ToolCacheRefreshed {
         tool_count: usize,
     },
+    ToolDefinitionDriftDetected {
+        tool_names: Vec<Arc<str>>,
+    },
     ClientConnected {
         session_id: Arc<str>,
         client_type: ClientType,

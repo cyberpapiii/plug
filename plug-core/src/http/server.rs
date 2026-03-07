@@ -592,26 +592,28 @@ mod tests {
         events
     }
 
-    fn test_state() -> Arc<HttpState> {
+    fn test_state_with_router_config(router_config: crate::proxy::RouterConfig) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, router_config));
         Arc::new(HttpState {
             router,
             sessions: SessionManager::new(1800, 100),
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
+        })
+    }
+
+    fn test_state() -> Arc<HttpState> {
+        test_state_with_router_config(crate::proxy::RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            meta_tool_mode: false,
+            tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
         })
     }
 
@@ -861,6 +863,97 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_tools_list_uses_meta_tool_mode_surface() {
+        let state = test_state_with_router_config(crate::proxy::RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            meta_tool_mode: true,
+            tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
+        });
+
+        state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes: std::collections::HashMap::from([(
+                "Git__commit".to_string(),
+                ("git".to_string(), "commit".to_string()),
+            )]),
+            tools_all: Arc::new(vec![Tool::new(
+                std::borrow::Cow::Borrowed("Git__commit"),
+                std::borrow::Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(vec![
+                Tool::new(
+                    std::borrow::Cow::Borrowed("plug__list_servers"),
+                    std::borrow::Cow::Borrowed("List servers"),
+                    Arc::new(serde_json::Map::new()),
+                ),
+                Tool::new(
+                    std::borrow::Cow::Borrowed("plug__list_tools"),
+                    std::borrow::Cow::Borrowed("List tools"),
+                    Arc::new(serde_json::Map::new()),
+                ),
+                Tool::new(
+                    std::borrow::Cow::Borrowed("plug__search_tools"),
+                    std::borrow::Cow::Borrowed("Search tools"),
+                    Arc::new(serde_json::Map::new()),
+                ),
+                Tool::new(
+                    std::borrow::Cow::Borrowed("plug__invoke_tool"),
+                    std::borrow::Cow::Borrowed("Invoke tool"),
+                    Arc::new(serde_json::Map::new()),
+                ),
+            ]),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: std::collections::HashMap::new(),
+            prompt_routes: std::collections::HashMap::new(),
+            tool_definition_fingerprints: std::collections::HashMap::new(),
+        });
+
+        let app = build_router(state.clone());
+        let session_id = state.sessions.create_session().unwrap();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names = json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "plug__list_servers",
+                "plug__list_tools",
+                "plug__search_tools",
+                "plug__invoke_tool",
+            ]
+        );
     }
 
     #[tokio::test]

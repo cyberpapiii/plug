@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,6 +29,8 @@ use crate::types::{ClientType, ServerHealth};
 pub(crate) struct RouterSnapshot {
     /// Full sorted tool list (for clients with no limit).
     pub tools_all: Arc<Vec<Tool>>,
+    /// Meta-tool-only list exposed when meta-tool mode is enabled.
+    pub meta_tools_all: Arc<Vec<Tool>>,
     /// Priority-sorted, truncated to 100 (Windsurf).
     pub tools_windsurf: Arc<Vec<Tool>>,
     /// Priority-sorted, truncated to 128 (VS Code Copilot).
@@ -44,6 +47,8 @@ pub(crate) struct RouterSnapshot {
     pub resource_routes: HashMap<String, String>,
     /// Routed prompt name → (server name, original prompt name).
     pub prompt_routes: HashMap<String, (String, String)>,
+    /// Fingerprints for routed tool definitions to detect material drift.
+    pub tool_definition_fingerprints: HashMap<String, u64>,
 }
 
 /// Configuration for token efficiency and tool filtering.
@@ -54,6 +59,7 @@ pub struct RouterConfig {
     pub disabled_tools: Vec<String>,
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
+    pub meta_tool_mode: bool,
     pub tool_filter_enabled: bool,
     /// Servers with enrichment enabled (annotation inference + title normalization).
     pub enrichment_servers: std::collections::HashSet<String>,
@@ -67,6 +73,7 @@ impl From<&Config> for RouterConfig {
             disabled_tools: config.disabled_tools.clone(),
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
+            meta_tool_mode: config.meta_tool_mode,
             tool_filter_enabled: config.tool_filter_enabled,
             enrichment_servers: config
                 .servers
@@ -184,6 +191,7 @@ impl ToolRouter {
             cache: Arc::new(ArcSwap::from_pointee(RouterSnapshot {
                 routes: HashMap::new(),
                 tools_all: Arc::new(Vec::new()),
+                meta_tools_all: Arc::new(build_meta_tools()),
                 tools_windsurf: Arc::new(Vec::new()),
                 tools_copilot: Arc::new(Vec::new()),
                 resources_all: Arc::new(Vec::new()),
@@ -191,6 +199,7 @@ impl ToolRouter {
                 prompts_all: Arc::new(Vec::new()),
                 resource_routes: HashMap::new(),
                 prompt_routes: HashMap::new(),
+                tool_definition_fingerprints: HashMap::new(),
             })),
             config,
             event_tx: None,
@@ -269,6 +278,11 @@ impl ToolRouter {
     #[cfg(test)]
     pub(crate) fn active_call_count(&self) -> usize {
         self.active_calls.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_snapshot(&self, snapshot: RouterSnapshot) {
+        self.cache.store(Arc::new(snapshot));
     }
 
     fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
@@ -672,6 +686,29 @@ impl ToolRouter {
             tools.insert(0, meta_tool);
         }
 
+        let tool_definition_fingerprints = tools
+            .iter()
+            .map(|tool| (tool.name.to_string(), fingerprint_tool_definition(tool)))
+            .collect::<HashMap<_, _>>();
+
+        let previous_snapshot = self.cache.load();
+        let drifted_tools = detect_tool_definition_drift(
+            &previous_snapshot.tool_definition_fingerprints,
+            &tool_definition_fingerprints,
+        );
+
+        if !drifted_tools.is_empty() {
+            tracing::warn!(
+                tools = ?drifted_tools,
+                "detected material tool definition drift during refresh"
+            );
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx.send(EngineEvent::ToolDefinitionDriftDetected {
+                    tool_names: drifted_tools.iter().cloned().map(Arc::<str>::from).collect(),
+                });
+            }
+        }
+
         tracing::info!(
             tool_count = tools.len(),
             server_count = routes
@@ -755,6 +792,7 @@ impl ToolRouter {
         self.cache.store(Arc::new(RouterSnapshot {
             routes,
             tools_all,
+            meta_tools_all: Arc::new(build_meta_tools()),
             tools_windsurf,
             tools_copilot,
             resources_all,
@@ -762,6 +800,7 @@ impl ToolRouter {
             prompts_all,
             resource_routes,
             prompt_routes,
+            tool_definition_fingerprints,
         }));
 
         if let Some(ref tx) = self.event_tx {
@@ -771,7 +810,12 @@ impl ToolRouter {
 
     /// Get the current list of tools (zero-copy via Arc). Returns all tools.
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
-        Arc::clone(&self.cache.load().tools_all)
+        let snapshot = self.cache.load();
+        if self.config.meta_tool_mode {
+            Arc::clone(&snapshot.meta_tools_all)
+        } else {
+            Arc::clone(&snapshot.tools_all)
+        }
     }
 
     pub fn list_tools_page_for_client(
@@ -813,7 +857,10 @@ impl ToolRouter {
         let upstream_caps = self.server_manager.healthy_capabilities();
         let mut capabilities = ServerCapabilities::default();
 
-        if !self.list_tools().is_empty() || upstream_caps.iter().any(|caps| caps.tools.is_some()) {
+        if self.config.meta_tool_mode
+            || !self.list_tools().is_empty()
+            || upstream_caps.iter().any(|caps| caps.tools.is_some())
+        {
             capabilities.tools = Some(ToolsCapability {
                 list_changed: Some(true),
             });
@@ -835,6 +882,9 @@ impl ToolRouter {
 
     /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
     pub fn list_tools_for_client(&self, client_type: ClientType) -> Arc<Vec<Tool>> {
+        if self.config.meta_tool_mode {
+            return Arc::clone(&self.cache.load().meta_tools_all);
+        }
         if !self.config.tool_filter_enabled {
             return self.list_tools();
         }
@@ -1000,9 +1050,20 @@ impl ToolRouter {
         Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Intercept search_tools meta-tool (case-insensitive for LLM casing drift)
+            // Intercept plug meta-tools (case-insensitive for LLM casing drift).
+            if tool_name.eq_ignore_ascii_case("plug__list_servers") {
+                return Ok(self.handle_list_servers());
+            }
+            if tool_name.eq_ignore_ascii_case("plug__list_tools") {
+                return self.handle_list_tools(arguments.clone());
+            }
             if tool_name.eq_ignore_ascii_case("plug__search_tools") {
                 return self.handle_search_tools(arguments.clone());
+            }
+            if tool_name.eq_ignore_ascii_case("plug__invoke_tool") {
+                return self
+                    .handle_invoke_tool(arguments.clone(), progress_token, downstream, is_retry)
+                    .await;
             }
 
             // Look up the server and original name for this exposed tool name
@@ -1272,6 +1333,97 @@ impl ToolRouter {
         })
     }
 
+    fn handle_list_servers(&self) -> CallToolResult {
+        let snapshot = self.cache.load();
+        let mut tool_counts: HashMap<&str, usize> = HashMap::new();
+        for (server_id, _) in snapshot.routes.values() {
+            if server_id != "__plug_internal__" {
+                *tool_counts.entry(server_id.as_str()).or_insert(0) += 1;
+            }
+        }
+
+        let statuses = self.server_manager.server_statuses();
+        if statuses.is_empty() {
+            return CallToolResult::success(vec![Content::text("No upstream servers configured.")]);
+        }
+
+        let mut lines = vec![format!("Servers ({})", statuses.len())];
+        for status in statuses {
+            let tool_count = tool_counts.get(status.server_id.as_str()).copied().unwrap_or(0);
+            lines.push(format!(
+                "- {} (health: {:?}, tools: {})",
+                status.server_id, status.health, tool_count
+            ));
+        }
+
+        CallToolResult::success(vec![Content::text(lines.join("\n"))])
+    }
+
+    fn handle_list_tools(
+        &self,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let server_filter = arguments
+            .as_ref()
+            .and_then(|args| args.get("server_id"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_lowercase());
+        let query = arguments
+            .as_ref()
+            .and_then(|args| args.get("query"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_lowercase());
+        let limit = arguments
+            .as_ref()
+            .and_then(|args| args.get("limit"))
+            .and_then(|value| value.as_u64())
+            .map(|value| value.min(100) as usize)
+            .unwrap_or(25);
+
+        let snapshot = self.cache.load();
+        let mut matches = Vec::new();
+        for tool in snapshot.tools_all.iter() {
+            let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
+                continue;
+            };
+            if server_id == "__plug_internal__" {
+                continue;
+            }
+            if let Some(filter) = server_filter.as_ref() {
+                if server_id.to_lowercase() != *filter {
+                    continue;
+                }
+            }
+            if let Some(query) = query.as_ref() {
+                let name = tool.name.to_lowercase();
+                let desc = tool.description.as_deref().unwrap_or("").to_lowercase();
+                if !name.contains(query) && !desc.contains(query) {
+                    continue;
+                }
+            }
+            matches.push((server_id.clone(), tool.clone()));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+
+        if matches.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No tools matched the requested filters.",
+            )]));
+        }
+
+        let mut lines = vec![format!("Tools ({})", matches.len())];
+        for (server_id, tool) in matches {
+            lines.push(format!("- {} (server: {})", tool.name, server_id));
+            if let Some(desc) = tool.description.as_deref() {
+                lines.push(format!("  {}", desc));
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
+    }
+
     /// Handle the `plug__search_tools` meta-tool call.
     fn handle_search_tools(
         &self,
@@ -1290,39 +1442,55 @@ impl ToolRouter {
             )]));
         }
 
-        let snapshot = self.cache.load();
-        let matches: Vec<&Tool> = snapshot
-            .tools_all
-            .iter()
-            .filter(|tool| {
-                let name = tool.name.to_lowercase();
-                let desc = tool.description.as_deref().unwrap_or("").to_lowercase();
-                name.contains(&query) || desc.contains(&query)
-            })
-            .take(10)
-            .collect();
+        let mut args = arguments.unwrap_or_default();
+        args.insert("query".to_string(), serde_json::Value::String(query));
+        args.insert("limit".to_string(), serde_json::Value::Number(10.into()));
+        self.handle_list_tools(Some(args))
+    }
 
-        if matches.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No tools found matching '{query}'."
-            ))]));
-        }
-
-        let mut result_text = format!("Found {} tool(s) matching '{query}':\n\n", matches.len());
-        for tool in &matches {
-            let server = snapshot
-                .routes
-                .get(tool.name.as_ref())
-                .map(|(s, _)| s.as_str())
-                .unwrap_or("unknown");
-            result_text.push_str(&format!("- **{}** (server: {})\n", tool.name, server));
-            if let Some(ref desc) = tool.description {
-                result_text.push_str(&format!("  {}\n", desc));
+    fn handle_invoke_tool<'a>(
+        &'a self,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        progress_token: Option<ProgressToken>,
+        downstream: Option<DownstreamCallContext>,
+        is_retry: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let args = arguments.ok_or_else(|| {
+                McpError::from(ProtocolError::InvalidRequest {
+                    detail: "plug__invoke_tool requires arguments".to_string(),
+                })
+            })?;
+            let target = args
+                .get("tool_name")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    McpError::from(ProtocolError::InvalidRequest {
+                        detail: "plug__invoke_tool requires a string tool_name".to_string(),
+                    })
+                })?;
+            if target.eq_ignore_ascii_case("plug__invoke_tool") {
+                return Err(McpError::from(ProtocolError::InvalidRequest {
+                    detail: "plug__invoke_tool cannot invoke itself".to_string(),
+                }));
             }
-            result_text.push('\n');
-        }
 
-        Ok(CallToolResult::success(vec![Content::text(result_text)]))
+            let forwarded_arguments = args
+                .get("arguments")
+                .and_then(|value| value.as_object())
+                .cloned();
+
+            self.call_tool_inner(
+                target,
+                forwarded_arguments,
+                progress_token,
+                downstream,
+                is_retry,
+            )
+            .await
+        })
     }
 
     /// Get a reference to the underlying ServerManager.
@@ -1483,6 +1651,87 @@ fn paginated_result<T: Clone, R>(
     build(items[start..end].to_vec(), next_cursor)
 }
 
+fn detect_tool_definition_drift(
+    previous: &HashMap<String, u64>,
+    current: &HashMap<String, u64>,
+) -> Vec<String> {
+    let mut drifted = current
+        .iter()
+        .filter_map(|(tool_name, fingerprint)| {
+            previous
+                .get(tool_name)
+                .filter(|previous_fingerprint| *previous_fingerprint != fingerprint)
+                .map(|_| tool_name.clone())
+        })
+        .collect::<Vec<_>>();
+    drifted.sort();
+    drifted
+}
+
+fn fingerprint_tool_definition(tool: &Tool) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tool.name.hash(&mut hasher);
+    tool.description.as_deref().unwrap_or("").hash(&mut hasher);
+    tool.title.as_deref().unwrap_or("").hash(&mut hasher);
+    serde_json::to_string(&tool.input_schema)
+        .expect("tool input schema serializes")
+        .hash(&mut hasher);
+    serde_json::to_string(&tool.annotations)
+        .expect("tool annotations serialize")
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn build_meta_tools() -> Vec<Tool> {
+    vec![
+        build_list_servers_meta_tool(),
+        build_list_tools_meta_tool(),
+        build_search_tools_meta_tool(),
+        build_invoke_tool_meta_tool(),
+    ]
+}
+
+fn build_list_servers_meta_tool() -> Tool {
+    Tool::new(
+        Cow::Borrowed("plug__list_servers"),
+        Cow::Borrowed("List upstream server IDs, health, and current routed tool counts."),
+        Arc::new(serde_json::Map::new()),
+    )
+}
+
+fn build_list_tools_meta_tool() -> Tool {
+    Tool::new(
+        Cow::Borrowed("plug__list_tools"),
+        Cow::Borrowed(
+            "List routed tools hidden behind meta-tool mode, optionally filtered by server or query.",
+        ),
+        Arc::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Optional upstream server ID filter"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional substring filter on tool name or description"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum tools to return (default: 25)"
+                    }
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ),
+    )
+}
+
 /// Build the search_tools meta-tool definition.
 fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
@@ -1500,6 +1749,34 @@ fn build_search_tools_meta_tool() -> Tool {
                     }
                 },
                 "required": ["query"]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ),
+    )
+}
+
+fn build_invoke_tool_meta_tool() -> Tool {
+    Tool::new(
+        Cow::Borrowed("plug__invoke_tool"),
+        Cow::Borrowed(
+            "Invoke a specific routed tool by prefixed name and return the raw upstream result.",
+        ),
+        Arc::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Exact prefixed tool name to invoke"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments object to forward to the target tool"
+                    }
+                },
+                "required": ["tool_name"]
             })
             .as_object()
             .unwrap()
@@ -1738,6 +2015,7 @@ mod tests {
             disabled_tools: Vec::new(),
             tool_description_max_chars: None,
             tool_search_threshold: 50,
+            meta_tool_mode: false,
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         }
@@ -1901,6 +2179,7 @@ mod tests {
         router.cache.store(Arc::new(RouterSnapshot {
             routes: HashMap::new(),
             tools_all,
+            meta_tools_all: Arc::new(build_meta_tools()),
             tools_windsurf,
             tools_copilot,
             resources_all: Arc::new(Vec::new()),
@@ -1908,6 +2187,7 @@ mod tests {
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
         }));
 
         assert_eq!(
@@ -1968,6 +2248,7 @@ mod tests {
         router.cache.store(Arc::new(RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
+            meta_tools_all: Arc::new(build_meta_tools()),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
@@ -1975,6 +2256,7 @@ mod tests {
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
         }));
 
         // Search by name
@@ -1997,7 +2279,78 @@ mod tests {
         args.insert("query".to_string(), serde_json::json!("nonexistent"));
         let result = router.handle_search_tools(Some(args)).unwrap();
         let text = format!("{result:?}");
-        assert!(text.contains("No tools found"));
+        assert!(text.contains("No tools matched"));
+    }
+
+    #[test]
+    fn meta_tool_mode_lists_only_meta_tools() {
+        let sm = Arc::new(ServerManager::new());
+        let mut config = test_router_config();
+        config.meta_tool_mode = true;
+        let router = ToolRouter::new(sm, config);
+
+        let tools = vec![Tool::new(
+            Cow::Borrowed("git__commit"),
+            Cow::Borrowed("Create a git commit"),
+            Arc::new(serde_json::Map::new()),
+        )];
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "git__commit".to_string(),
+            ("git".to_string(), "commit".to_string()),
+        );
+
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(tools),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let visible_tools = router.list_tools_for_client(ClientType::ClaudeCode);
+        let names = visible_tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "plug__list_servers",
+                "plug__list_tools",
+                "plug__search_tools",
+                "plug__invoke_tool",
+            ]
+        );
+
+        let full_tools = router.list_all_tools();
+        assert_eq!(full_tools.len(), 1);
+        assert_eq!(full_tools[0].1.name.as_ref(), "git__commit");
+    }
+
+    #[test]
+    fn detect_tool_definition_drift_reports_changed_tools_only() {
+        let previous = HashMap::from([
+            ("git__commit".to_string(), 1_u64),
+            ("git__push".to_string(), 2_u64),
+        ]);
+        let current = HashMap::from([
+            ("git__commit".to_string(), 3_u64),
+            ("git__push".to_string(), 2_u64),
+            ("git__status".to_string(), 4_u64),
+        ]);
+
+        assert_eq!(
+            detect_tool_definition_drift(&previous, &current),
+            vec!["git__commit".to_string()]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2058,6 +2411,7 @@ mod tests {
         router.cache.store(Arc::new(RouterSnapshot {
             routes,
             tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(build_meta_tools()),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
@@ -2065,6 +2419,7 @@ mod tests {
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
         }));
 
         let snapshot = router.cache.load();
@@ -2102,6 +2457,7 @@ mod tests {
         router.cache.store(Arc::new(RouterSnapshot {
             routes,
             tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(build_meta_tools()),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
@@ -2109,6 +2465,7 @@ mod tests {
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
         }));
 
         let call = router.call_tool("Busy__tool", None);
@@ -2141,11 +2498,13 @@ mod tests {
             tools_windsurf: Arc::new(tools.iter().take(100).cloned().collect()),
             tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
             tools_all: Arc::new(tools),
+            meta_tools_all: Arc::new(build_meta_tools()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
         }));
 
         let first = router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
