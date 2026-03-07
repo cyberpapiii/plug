@@ -312,18 +312,32 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     let config = plug_core::config::load_config(config_path)?;
     let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;
-    let sessions: Arc<dyn plug_core::session::SessionStore> =
-        Arc::new(plug_core::session::StatefulSessionStore::new(
+    let (expiry_tx, mut expiry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sessions: Arc<dyn plug_core::session::SessionStore> = Arc::new(
+        plug_core::session::StatefulSessionStore::new(
             config.http.session_timeout_secs,
             config.http.max_sessions,
-        ));
+        )
+        .with_expiry_notifier(expiry_tx),
+    );
     sessions.spawn_cleanup_task(engine.cancel_token().clone());
+    let tool_router = engine.tool_router().clone();
     let http_state = Arc::new(plug_core::http::server::HttpState {
-        router: engine.tool_router().clone(),
+        router: tool_router.clone(),
         sessions,
         cancel: engine.cancel_token().clone(),
         sse_channel_capacity: config.http.sse_channel_capacity,
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
+    });
+
+    // Spawn subscription cleanup listener for expired HTTP sessions
+    tokio::spawn(async move {
+        while let Some(session_id) = expiry_rx.recv().await {
+            let target = plug_core::notifications::NotificationTarget::Http {
+                session_id: Arc::from(session_id.as_str()),
+            };
+            tool_router.cleanup_subscriptions_for_target(&target).await;
+        }
     });
     let router = plug_core::http::server::build_router(http_state);
     serve_router(router, &config.http, engine.cancel_token().clone()).await?;

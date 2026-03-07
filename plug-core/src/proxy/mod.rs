@@ -13,6 +13,7 @@ use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
 use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, RoleServer};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
@@ -2046,6 +2047,14 @@ pub struct ProxyHandler {
     client_type: std::sync::RwLock<ClientType>,
     client_id: Arc<str>,
     notification_task_started: AtomicBool,
+    /// Cancelled on drop to signal the notification fan-out task to exit.
+    shutdown: CancellationToken,
+}
+
+impl Drop for ProxyHandler {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 impl ProxyHandler {
@@ -2055,6 +2064,7 @@ impl ProxyHandler {
             client_type: std::sync::RwLock::new(ClientType::Unknown),
             client_id: Arc::from(uuid::Uuid::new_v4().to_string()),
             notification_task_started: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -2065,6 +2075,7 @@ impl ProxyHandler {
             client_type: std::sync::RwLock::new(ClientType::Unknown),
             client_id: Arc::from(uuid::Uuid::new_v4().to_string()),
             notification_task_started: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -2121,9 +2132,15 @@ impl ServerHandler for ProxyHandler {
                 let client_id = Arc::clone(&self.client_id);
                 let router = Arc::clone(&self.router);
                 let mut rx = self.router.subscribe_notifications();
+                let shutdown = self.shutdown.clone();
                 tokio::spawn(async move {
                     loop {
-                        match rx.recv().await {
+                        let msg = tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break,
+                            msg = rx.recv() => msg,
+                        };
+                        match msg {
                             Ok(ProtocolNotification::ToolListChanged) => {
                                 if let Err(error) = peer.notify_tool_list_changed().await {
                                     tracing::debug!(

@@ -1,7 +1,7 @@
 ---
 title: "feat: roadmap tail closeout"
 type: feat
-status: active
+status: completed
 date: 2026-03-07
 origin: docs/brainstorms/2026-03-07-roadmap-tail-closeout-brainstorm.md
 ---
