@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -17,7 +18,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use super::error::HttpError;
 use super::session::SessionManager;
 use super::sse::sse_stream;
-use crate::proxy::ToolRouter;
+use crate::proxy::{DownstreamCallContext, ToolRouter};
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -34,10 +35,47 @@ pub struct HttpState {
     pub sessions: SessionManager,
     pub cancel: CancellationToken,
     pub sse_channel_capacity: usize,
+    pub notification_task_started: AtomicBool,
+}
+
+impl HttpState {
+    pub fn spawn_notification_fanout(self: &Arc<Self>) {
+        if self
+            .notification_task_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let state = Arc::clone(self);
+        let mut rx = state.router.subscribe_notifications();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = state.cancel.cancelled() => break,
+                    recv = rx.recv() => {
+                        match recv {
+                            Ok(notification) => {
+                                state.sessions.broadcast(notification.to_json_value());
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "HTTP notification fan-out lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Build the axum Router with all middleware and handlers.
 pub fn build_router(state: Arc<HttpState>) -> Router {
+    state.spawn_notification_fanout();
+
     // Discovery endpoint — exempt from origin validation
     let discovery = Router::new()
         .route("/.well-known/mcp.json", get(get_server_card))
@@ -278,10 +316,18 @@ async fn handle_request(
         }
 
         ClientRequest::CallToolRequest(call_req) => {
+            let session_id = extract_session_id(headers)?;
             validate_session_header(headers, &state.sessions)?;
             match state
                 .router
-                .call_tool(call_req.params.name.as_ref(), call_req.params.arguments)
+                .call_tool_with_context(
+                    call_req.params.name.as_ref(),
+                    call_req.params.arguments,
+                    Some(DownstreamCallContext::http(
+                        Arc::<str>::from(session_id.as_str()),
+                        request_id.clone(),
+                    )),
+                )
                 .await
             {
                 Ok(result) => {
@@ -431,7 +477,32 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http::Request as HttpRequest;
+    use std::time::Duration;
     use tower::ServiceExt;
+
+    async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
+        let mut events = Vec::new();
+        let mut stream = body.into_data_stream();
+        use futures::StreamExt;
+
+        let timeout = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Ok(chunk)) = stream.next().await {
+                let text = String::from_utf8_lossy(&chunk).to_string();
+                for part in text.split("\n\n") {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        events.push(trimmed.to_string());
+                    }
+                }
+                if events.len() >= max_events {
+                    break;
+                }
+            }
+        });
+
+        let _ = timeout.await;
+        events
+    }
 
     fn test_state() -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
@@ -452,6 +523,7 @@ mod tests {
             sessions: SessionManager::new(1800, 100),
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
+            notification_task_started: AtomicBool::new(false),
         })
     }
 
@@ -905,5 +977,64 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tools_list_changed_reaches_http_sse_client() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state
+            .router
+            .publish_protocol_notification(crate::notifications::ProtocolNotification::ToolListChanged);
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("notifications/tools/list_changed")),
+            "expected SSE stream to contain tools/list_changed notification, got {events:?}"
+        );
     }
 }

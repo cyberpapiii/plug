@@ -1,13 +1,15 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use tokio::sync::broadcast;
 
 use crate::circuit::CircuitBreakerError;
@@ -15,6 +17,7 @@ use crate::client_detect::detect_client;
 use crate::config::Config;
 use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
+use crate::notifications::ProtocolNotification;
 use crate::server::ServerManager;
 use crate::types::{ClientType, ServerHealth};
 
@@ -71,13 +74,67 @@ pub struct ToolRouter {
     config: RouterConfig,
     /// Optional event sender for tool call observability.
     event_tx: Option<broadcast::Sender<EngineEvent>>,
+    protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
+    active_calls: DashMap<u64, DownstreamCallContext>,
+    active_call_lookup: DashMap<DownstreamCallKey, u64>,
+    notification_refresh_in_progress: AtomicBool,
+    notification_refresh_pending: AtomicBool,
     /// Weak reference to Engine for session recovery (reconnect on error).
     /// Set after Engine construction via `set_engine()`.
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DownstreamTransport {
+    Stdio,
+    Http,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownstreamCallContext {
+    pub transport: DownstreamTransport,
+    pub session_id: Option<Arc<str>>,
+    pub request_id: RequestId,
+}
+
+impl DownstreamCallContext {
+    pub fn stdio(request_id: RequestId) -> Self {
+        Self {
+            transport: DownstreamTransport::Stdio,
+            session_id: None,
+            request_id,
+        }
+    }
+
+    pub fn http(session_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
+        Self {
+            transport: DownstreamTransport::Http,
+            session_id: Some(session_id.into()),
+            request_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DownstreamCallKey {
+    transport: DownstreamTransport,
+    session_id: Option<Arc<str>>,
+    request_id: RequestId,
+}
+
+impl From<&DownstreamCallContext> for DownstreamCallKey {
+    fn from(value: &DownstreamCallContext) -> Self {
+        Self {
+            transport: value.transport,
+            session_id: value.session_id.clone(),
+            request_id: value.request_id.clone(),
+        }
+    }
+}
+
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
+        let (protocol_notification_tx, _) = broadcast::channel(128);
         Self {
             server_manager,
             cache: Arc::new(ArcSwap::from_pointee(RouterSnapshot {
@@ -88,6 +145,11 @@ impl ToolRouter {
             })),
             config,
             event_tx: None,
+            protocol_notification_tx,
+            active_calls: DashMap::new(),
+            active_call_lookup: DashMap::new(),
+            notification_refresh_in_progress: AtomicBool::new(false),
+            notification_refresh_pending: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
         }
     }
@@ -96,6 +158,66 @@ impl ToolRouter {
     pub fn with_event_tx(mut self, tx: broadcast::Sender<EngineEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<ProtocolNotification> {
+        self.protocol_notification_tx.subscribe()
+    }
+
+    pub fn publish_protocol_notification(&self, notification: ProtocolNotification) {
+        let _ = self.protocol_notification_tx.send(notification);
+    }
+
+    pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
+        self.notification_refresh_pending.store(true, Ordering::SeqCst);
+
+        if self
+            .notification_refresh_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let router = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                router
+                    .notification_refresh_pending
+                    .store(false, Ordering::SeqCst);
+                router.refresh_tools().await;
+                router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+
+                if router
+                    .notification_refresh_pending
+                    .swap(false, Ordering::SeqCst)
+                {
+                    continue;
+                }
+
+                router
+                    .notification_refresh_in_progress
+                    .store(false, Ordering::SeqCst);
+
+                if router
+                    .notification_refresh_pending
+                    .swap(false, Ordering::SeqCst)
+                    && router
+                        .notification_refresh_in_progress
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    continue;
+                }
+
+                break;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_call_count(&self) -> usize {
+        self.active_calls.len()
     }
 
     /// Set the Engine reference for session recovery.
@@ -407,7 +529,16 @@ impl ToolRouter {
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_inner(tool_name, arguments, false).await
+        self.call_tool_with_context(tool_name, arguments, None).await
+    }
+
+    pub async fn call_tool_with_context(
+        &self,
+        tool_name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        downstream: Option<DownstreamCallContext>,
+    ) -> Result<CallToolResult, McpError> {
+        self.call_tool_inner(tool_name, arguments, downstream, false).await
     }
 
     /// Inner tool call implementation with retry support.
@@ -417,6 +548,7 @@ impl ToolRouter {
         &'a self,
         tool_name: &'a str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        downstream: Option<DownstreamCallContext>,
         is_retry: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
@@ -524,6 +656,11 @@ impl ToolRouter {
             let call_id = next_call_id();
             let server_id_arc = Arc::<str>::from(server_id.as_str());
             let tool_name_arc = Arc::<str>::from(original_name.as_str());
+            if let Some(call_context) = downstream.clone() {
+                self.active_call_lookup
+                    .insert(DownstreamCallKey::from(&call_context), call_id);
+                self.active_calls.insert(call_id, call_context);
+            }
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(EngineEvent::ToolCallStarted {
                     call_id,
@@ -551,6 +688,11 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
+                    self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -570,6 +712,11 @@ impl ToolRouter {
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
+                    self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -598,7 +745,8 @@ impl ToolRouter {
                     }
 
                     // Retry the tool call exactly once
-                    self.call_tool_inner(tool_name, arguments, true).await
+                    self.call_tool_inner(tool_name, arguments, downstream, true)
+                        .await
                 }
                 Ok(Err(e)) => {
                     tracing::error!(
@@ -610,6 +758,11 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
+                    self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -634,6 +787,11 @@ impl ToolRouter {
                     // Timeouts do NOT trip the circuit breaker — a slow tool (e.g. Slack
                     // conversations_unreads taking 2+ min) is not a server failure. Tripping
                     // the CB here would lock out ALL tools on the server after a few slow calls.
+                    if let Some(call_context) = downstream.as_ref() {
+                        self.active_call_lookup
+                            .remove(&DownstreamCallKey::from(call_context));
+                    }
+                    self.active_calls.remove(&call_id);
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
@@ -878,6 +1036,7 @@ fn build_search_tools_meta_tool() -> Tool {
 pub struct ProxyHandler {
     router: Arc<ToolRouter>,
     client_type: std::sync::RwLock<ClientType>,
+    notification_task_started: AtomicBool,
 }
 
 impl ProxyHandler {
@@ -885,6 +1044,7 @@ impl ProxyHandler {
         Self {
             router: Arc::new(ToolRouter::new(server_manager, config)),
             client_type: std::sync::RwLock::new(ClientType::Unknown),
+            notification_task_started: AtomicBool::new(false),
         }
     }
 
@@ -893,6 +1053,7 @@ impl ProxyHandler {
         Self {
             router,
             client_type: std::sync::RwLock::new(ClientType::Unknown),
+            notification_task_started: AtomicBool::new(false),
         }
     }
 
@@ -944,6 +1105,34 @@ impl ServerHandler for ProxyHandler {
 
             context.peer.set_peer_info(request);
 
+            if self
+                .notification_task_started
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let peer: Peer<RoleServer> = context.peer.clone();
+                let mut rx = self.router.subscribe_notifications();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(ProtocolNotification::ToolListChanged) => {
+                                if let Err(error) = peer.notify_tool_list_changed().await {
+                                    tracing::debug!(
+                                        error = %error,
+                                        "stopping stdio notification fan-out after peer send failure"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "stdio notification fan-out lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             Ok(self.get_info())
         }
     }
@@ -967,11 +1156,15 @@ impl ServerHandler for ProxyHandler {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
             self.router
-                .call_tool(request.name.as_ref(), request.arguments)
+                .call_tool_with_context(
+                    request.name.as_ref(),
+                    request.arguments,
+                    Some(DownstreamCallContext::stdio(context.id.clone())),
+                )
                 .await
         }
     }
