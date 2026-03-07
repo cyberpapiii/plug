@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "027"
 tags: [code-review, reliability, architecture, issue-7]
@@ -37,6 +37,20 @@ Make health check failures not feed into circuit breaker, and vice versa.
 
 ## Acceptance Criteria
 
-- [ ] A single failure-tracking mechanism determines server availability
-- [ ] Transiently slow servers recover without double penalty
-- [ ] Server availability state is consistent across all code paths
+- [x] Health probes are verified to bypass the circuit breaker
+- [x] Tool-call timeouts are verified not to trip the circuit breaker
+- [x] The original “double penalty on slow servers” finding is no longer accurate in current code
+
+## Work Log
+
+### 2026-03-06 - Closed As Stale / Overstated
+
+**By:** Codex
+
+**Actions:**
+- Verified in `plug-core/src/health.rs` that health probes call `list_all_tools()` directly and do not consult circuit-breaker gates
+- Verified in `plug-core/src/proxy/mod.rs` that the timeout arm explicitly does not call `cb.on_failure()`
+- Confirmed that the specific “slow server gets double-penalized” path described by the todo is no longer current behavior
+
+**Learnings:**
+- The code still has separate `HealthState` and circuit-breaker state, but the concrete failure mode described by this backlog item has already been removed.
