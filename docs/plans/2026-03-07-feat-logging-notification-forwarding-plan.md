@@ -53,21 +53,10 @@ Key design decisions:
 - **Broadcast to all clients** — logging is not request-scoped (unlike Progress/Cancelled which target a specific client). All connected clients see all server logs.
 - **Server-prefixed logger names** — `github:default` instead of `default` so clients can distinguish sources.
 - **Default level `warning`** — only forward debug/trace if client explicitly requests via `setLevel`.
+- **Multi-client setLevel semantics** — use the most permissive (lowest) level across all connected clients. If client A sets `debug` and client B sets `warning`, upstream servers get `debug`. Rationale: logging is observability; over-deliver beats under-deliver. Clients can filter locally. When all clients disconnect, level resets to `warning`.
+- **LoggingLevel ordering** — rmcp's `LoggingLevel` does not implement `PartialOrd`. Add a manual `fn level_severity(level: LoggingLevel) -> u8` mapping (Debug=0, Info=1, Notice=2, Warning=3, Error=4, Critical=5, Alert=6, Emergency=7) for threshold comparison.
 
 ## Technical Approach
-
-### rmcp 1.1.0 Types (Confirmed)
-
-```rust
-// Already available in rmcp 1.1.0:
-LoggingMessageNotificationParam { level: LoggingLevel, logger: Option<String>, data: Value }
-LoggingLevel { Debug, Info, Notice, Warning, Error, Critical, Alert, Emergency }
-SetLevelRequestParams { meta: Option<Meta>, level: LoggingLevel }
-
-// Peer methods:
-peer.notify_logging_message(params)  // Server peer → downstream client
-// For upstream: need to check if peer.set_logging_level() exists or if we send raw request
-```
 
 ### Institutional Learnings Applied
 
@@ -104,10 +93,14 @@ peer.notify_logging_message(params)  // Server peer → downstream client
 - [ ] Initialize in `ToolRouter::new()`: `broadcast::channel(512)`
 - [ ] Add `subscribe_logging(&self) -> broadcast::Receiver<ProtocolNotification>` method
 - [ ] Add `publish_logging(&self, notification: ProtocolNotification)` method
-- [ ] Add `current_log_level: ArcSwap<LoggingLevel>` field, default `LoggingLevel::Warning`
-- [ ] Add `set_log_level(&self, level: LoggingLevel)` and `log_level(&self) -> LoggingLevel` accessors
+- [ ] Add `effective_log_level: ArcSwap<LoggingLevel>` field, default `LoggingLevel::Warning`
+- [ ] Add `client_log_levels: DashMap<Arc<str>, LoggingLevel>` for per-client tracking
+- [ ] Add `fn level_severity(level: LoggingLevel) -> u8` helper (Debug=0 .. Emergency=7)
+- [ ] Add `set_client_log_level(&self, client_id: &str, level: LoggingLevel)` — inserts into `client_log_levels`, recalculates effective level as min severity across all clients
+- [ ] Add `remove_client_log_level(&self, client_id: &str)` — removes entry, recalculates (defaults to Warning if empty)
+- [ ] Add `log_level(&self) -> LoggingLevel` accessor
 - [ ] Add `route_upstream_logging_message(&self, server_id: &str, params: LoggingMessageNotificationParam)` method:
-  - Check if `params.level` meets the current threshold (level >= current_log_level)
+  - Check if `level_severity(params.level) >= level_severity(effective_log_level)`
   - Prefix logger: `params.logger = Some(format!("{server_id}:{}", params.logger.as_deref().unwrap_or("default")))`
   - Publish to logging channel
 
@@ -184,13 +177,14 @@ peer.notify_logging_message(params)  // Server peer → downstream client
 
 **File:** `plug-core/src/proxy/mod.rs` (ProxyHandler)
 
-- [ ] Handle `logging/setLevel` in the request router (check if rmcp routes this to a specific handler method or if we need to intercept it)
+- [ ] Check if rmcp's `ServerHandler` trait has a `set_logging_level` handler method. If yes, implement it in `ProxyHandler`. If not, intercept `logging/setLevel` in the raw request router.
 - [ ] When received:
   1. Parse `SetLevelRequestParams` to get the desired `LoggingLevel`
-  2. Store in `ToolRouter` via `router.set_log_level(level)`
-  3. Fan out to all healthy upstream servers: iterate `server_manager().healthy_servers()`, call `peer.set_logging_level(level)` on each (or send raw JSON-RPC request if no convenience method)
+  2. Store in `ToolRouter` via `router.set_log_level(level)` — this computes the most permissive level across all clients
+  3. Fan out the effective level to all healthy upstream servers via raw JSON-RPC request: `{"jsonrpc":"2.0","method":"logging/setLevel","params":{"level":"debug"}}` (safest approach — avoids depending on unverified peer method)
   4. Return success response
-- [ ] New upstream server connections should inherit the current log level: after connect, call `set_logging_level` with `router.log_level()`
+- [ ] New upstream server connections should inherit the current log level: after connect, send `logging/setLevel` with `router.log_level()`
+- [ ] Track per-client requested levels (e.g., `DashMap<Arc<str>, LoggingLevel>`) so disconnection can recalculate the effective level
 
 ### Step 7: Advertise logging capability
 
@@ -218,7 +212,7 @@ peer.notify_logging_message(params)  // Server peer → downstream client
 
 - **Interaction graph**: Upstream server → `on_logging_message` → `route_upstream_logging_message` (level filter + prefix) → `logging_tx.send()` → stdio/HTTP fan-out tasks → downstream clients
 - **Error propagation**: Logging is fire-and-forget. Channel send failures are logged but never block upstream server communication. `Lagged` errors emit synthetic warning to client.
-- **State lifecycle risks**: `current_log_level` in `ToolRouter` persists for the daemon lifetime. If all clients disconnect and reconnect, the level stays at whatever was last set. This is intentional — the level is a server-side concern.
+- **State lifecycle risks**: Per-client log levels tracked in `client_log_levels` DashMap. When a client disconnects, its entry is removed and the effective level recalculates. When all clients disconnect, effective level resets to `Warning` (the default).
 - **API surface parity**: Both stdio and HTTP downstream transports get logging forwarding. Both can send `setLevel`.
 
 ## Acceptance Criteria
