@@ -393,9 +393,9 @@ async fn handle_request(
             }
         }
 
-        ClientRequest::ListResourcesRequest(_) => {
+        ClientRequest::ListResourcesRequest(list_req) => {
             validate_session_header(headers, &state.sessions)?;
-            let result = ListResourcesResult::with_all_items((*state.router.list_resources()).clone());
+            let result = state.router.list_resources_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourcesResult(result),
                 request_id,
@@ -403,11 +403,9 @@ async fn handle_request(
             json_response(&response_msg)
         }
 
-        ClientRequest::ListResourceTemplatesRequest(_) => {
+        ClientRequest::ListResourceTemplatesRequest(list_req) => {
             validate_session_header(headers, &state.sessions)?;
-            let result = ListResourceTemplatesResult::with_all_items(
-                (*state.router.list_resource_templates()).clone(),
-            );
+            let result = state.router.list_resource_templates_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourceTemplatesResult(result),
                 request_id,
@@ -432,9 +430,9 @@ async fn handle_request(
             }
         }
 
-        ClientRequest::ListPromptsRequest(_) => {
+        ClientRequest::ListPromptsRequest(list_req) => {
             validate_session_header(headers, &state.sessions)?;
-            let result = ListPromptsResult::with_all_items((*state.router.list_prompts()).clone());
+            let result = state.router.list_prompts_page(list_req.params);
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
             json_response(&response_msg)

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use futures::future::join_all;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, ProgressNotificationParam, Prompt, Resource,
@@ -448,23 +449,32 @@ impl ServerManager {
 
     pub async fn get_resources(&self) -> Vec<(String, Resource)> {
         let servers = self.servers.load();
-        let mut result = Vec::new();
-        for (server_name, upstream) in servers.iter() {
-            let health_ok = self
-                .health
-                .get(server_name)
-                .map(|h| h.health != ServerHealth::Failed)
-                .unwrap_or(true);
-            if !health_ok {
-                continue;
-            }
-            if upstream.capabilities.resources.is_none() {
-                continue;
-            }
-            match upstream.client.peer().list_all_resources().await {
+        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
+            .iter()
+            .filter_map(|(server_name, upstream)| {
+                let health_ok = self
+                    .health
+                    .get(server_name)
+                    .map(|h| h.health != ServerHealth::Failed)
+                    .unwrap_or(true);
+                (health_ok && upstream.capabilities.resources.is_some())
+                    .then(|| (server_name.clone(), Arc::clone(upstream)))
+            })
+            .collect();
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let results = join_all(targets.into_iter().map(|(server_name, upstream)| async move {
+            let resources = upstream.client.peer().list_all_resources().await;
+            (server_name, resources)
+        }))
+        .await;
+
+        let mut collected = Vec::new();
+        for (server_name, resources) in results {
+            match resources {
                 Ok(resources) => {
                     for resource in resources {
-                        result.push((server_name.clone(), resource));
+                        collected.push((server_name.clone(), resource));
                     }
                 }
                 Err(error) => {
@@ -472,28 +482,37 @@ impl ServerManager {
                 }
             }
         }
-        result
+        collected
     }
 
     pub async fn get_resource_templates(&self) -> Vec<(String, ResourceTemplate)> {
         let servers = self.servers.load();
-        let mut result = Vec::new();
-        for (server_name, upstream) in servers.iter() {
-            let health_ok = self
-                .health
-                .get(server_name)
-                .map(|h| h.health != ServerHealth::Failed)
-                .unwrap_or(true);
-            if !health_ok {
-                continue;
-            }
-            if upstream.capabilities.resources.is_none() {
-                continue;
-            }
-            match upstream.client.peer().list_all_resource_templates().await {
+        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
+            .iter()
+            .filter_map(|(server_name, upstream)| {
+                let health_ok = self
+                    .health
+                    .get(server_name)
+                    .map(|h| h.health != ServerHealth::Failed)
+                    .unwrap_or(true);
+                (health_ok && upstream.capabilities.resources.is_some())
+                    .then(|| (server_name.clone(), Arc::clone(upstream)))
+            })
+            .collect();
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let results = join_all(targets.into_iter().map(|(server_name, upstream)| async move {
+            let templates = upstream.client.peer().list_all_resource_templates().await;
+            (server_name, templates)
+        }))
+        .await;
+
+        let mut collected = Vec::new();
+        for (server_name, templates) in results {
+            match templates {
                 Ok(resource_templates) => {
                     for template in resource_templates {
-                        result.push((server_name.clone(), template));
+                        collected.push((server_name.clone(), template));
                     }
                 }
                 Err(error) => {
@@ -501,28 +520,37 @@ impl ServerManager {
                 }
             }
         }
-        result
+        collected
     }
 
     pub async fn get_prompts(&self) -> Vec<(String, Prompt)> {
         let servers = self.servers.load();
-        let mut result = Vec::new();
-        for (server_name, upstream) in servers.iter() {
-            let health_ok = self
-                .health
-                .get(server_name)
-                .map(|h| h.health != ServerHealth::Failed)
-                .unwrap_or(true);
-            if !health_ok {
-                continue;
-            }
-            if upstream.capabilities.prompts.is_none() {
-                continue;
-            }
-            match upstream.client.peer().list_all_prompts().await {
+        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
+            .iter()
+            .filter_map(|(server_name, upstream)| {
+                let health_ok = self
+                    .health
+                    .get(server_name)
+                    .map(|h| h.health != ServerHealth::Failed)
+                    .unwrap_or(true);
+                (health_ok && upstream.capabilities.prompts.is_some())
+                    .then(|| (server_name.clone(), Arc::clone(upstream)))
+            })
+            .collect();
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let results = join_all(targets.into_iter().map(|(server_name, upstream)| async move {
+            let prompts = upstream.client.peer().list_all_prompts().await;
+            (server_name, prompts)
+        }))
+        .await;
+
+        let mut collected = Vec::new();
+        for (server_name, prompts) in results {
+            match prompts {
                 Ok(prompts) => {
                     for prompt in prompts {
-                        result.push((server_name.clone(), prompt));
+                        collected.push((server_name.clone(), prompt));
                     }
                 }
                 Err(error) => {
@@ -530,7 +558,7 @@ impl ServerManager {
                 }
             }
         }
-        result
+        collected
     }
 
     pub fn healthy_capabilities(&self) -> Vec<ServerCapabilities> {

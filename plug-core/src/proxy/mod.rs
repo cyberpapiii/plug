@@ -779,23 +779,12 @@ impl ToolRouter {
         client_type: ClientType,
         request: Option<PaginatedRequestParams>,
     ) -> ListToolsResult {
-        const PAGE_SIZE: usize = 100;
-
         let tools = self.list_tools_for_client(client_type);
-        let start = request
-            .as_ref()
-            .and_then(|params| params.cursor.as_ref())
-            .and_then(|cursor| cursor.parse::<usize>().ok())
-            .filter(|idx| *idx < tools.len())
-            .unwrap_or(0);
-        let end = usize::min(start + PAGE_SIZE, tools.len());
-        let next_cursor = (end < tools.len()).then(|| end.to_string());
-
-        ListToolsResult {
+        paginated_result((*tools).clone(), request, |tools, next_cursor| ListToolsResult {
             meta: None,
             next_cursor,
-            tools: tools[start..end].to_vec(),
-        }
+            tools,
+        })
     }
 
     /// List all tools with their source server IDs.
@@ -861,12 +850,50 @@ impl ToolRouter {
         Arc::clone(&self.cache.load().resources_all)
     }
 
+    pub fn list_resources_page(
+        &self,
+        request: Option<PaginatedRequestParams>,
+    ) -> ListResourcesResult {
+        paginated_result((*self.list_resources()).clone(), request, |resources, next_cursor| {
+            ListResourcesResult {
+                meta: None,
+                next_cursor,
+                resources,
+            }
+        })
+    }
+
     pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
         Arc::clone(&self.cache.load().resource_templates_all)
     }
 
+    pub fn list_resource_templates_page(
+        &self,
+        request: Option<PaginatedRequestParams>,
+    ) -> ListResourceTemplatesResult {
+        paginated_result(
+            (*self.list_resource_templates()).clone(),
+            request,
+            |resource_templates, next_cursor| ListResourceTemplatesResult {
+                meta: None,
+                next_cursor,
+                resource_templates,
+            },
+        )
+    }
+
     pub fn list_prompts(&self) -> Arc<Vec<Prompt>> {
         Arc::clone(&self.cache.load().prompts_all)
+    }
+
+    pub fn list_prompts_page(&self, request: Option<PaginatedRequestParams>) -> ListPromptsResult {
+        paginated_result((*self.list_prompts()).clone(), request, |prompts, next_cursor| {
+            ListPromptsResult {
+                meta: None,
+                next_cursor,
+                prompts,
+            }
+        })
     }
 
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
@@ -1437,6 +1464,25 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     true
 }
 
+fn paginated_result<T: Clone, R>(
+    items: Vec<T>,
+    request: Option<PaginatedRequestParams>,
+    build: impl FnOnce(Vec<T>, Option<String>) -> R,
+) -> R {
+    const PAGE_SIZE: usize = 100;
+
+    let start = request
+        .as_ref()
+        .and_then(|params| params.cursor.as_ref())
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .filter(|idx| *idx < items.len())
+        .unwrap_or(0);
+    let end = usize::min(start + PAGE_SIZE, items.len());
+    let next_cursor = (end < items.len()).then(|| end.to_string());
+
+    build(items[start..end].to_vec(), next_cursor)
+}
+
 /// Build the search_tools meta-tool definition.
 fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
@@ -1642,22 +1688,18 @@ impl ServerHandler for ProxyHandler {
 
     fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async move { Ok(ListResourcesResult::with_all_items((*self.router.list_resources()).clone())) }
+        async move { Ok(self.router.list_resources_page(request)) }
     }
 
     fn list_resource_templates(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
-        async move {
-            Ok(ListResourceTemplatesResult::with_all_items(
-                (*self.router.list_resource_templates()).clone(),
-            ))
-        }
+        async move { Ok(self.router.list_resource_templates_page(request)) }
     }
 
     fn read_resource(
@@ -1670,10 +1712,10 @@ impl ServerHandler for ProxyHandler {
 
     fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
-        async move { Ok(ListPromptsResult::with_all_items((*self.router.list_prompts()).clone())) }
+        async move { Ok(self.router.list_prompts_page(request)) }
     }
 
     fn get_prompt(
