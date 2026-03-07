@@ -470,6 +470,7 @@ impl ToolRouter {
                 })?;
 
             let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
+            let transport_type = upstream.config.transport.clone();
             let peer = upstream.client.peer().clone();
             drop(upstream); // Release Arc early
 
@@ -616,6 +617,29 @@ impl ToolRouter {
                             success: false,
                         });
                     }
+
+                    if matches!(transport_type, crate::config::TransportType::Stdio) {
+                        let engine_ref = self
+                            .engine
+                            .read()
+                            .ok()
+                            .and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
+                        if let Some(engine) = engine_ref {
+                            if let Err(reconnect_err) = engine.reconnect_server(&server_id).await {
+                                tracing::warn!(
+                                    server = %server_id,
+                                    error = %reconnect_err,
+                                    "stdio server reconnect after timeout failed"
+                                );
+                            } else {
+                                tracing::info!(
+                                    server = %server_id,
+                                    "reconnected stdio server after timeout"
+                                );
+                            }
+                        }
+                    }
+
                     Err(McpError::from(ProtocolError::Timeout {
                         duration: timeout_duration,
                     }))
