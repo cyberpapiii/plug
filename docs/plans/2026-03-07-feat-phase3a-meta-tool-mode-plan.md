@@ -1,7 +1,7 @@
 ---
 title: "feat: phase 3a meta tool mode"
 type: feat
-status: active
+status: completed
 date: 2026-03-07
 origin: docs/brainstorms/2026-03-07-phase3a-meta-tool-mode-brainstorm.md
 ---
