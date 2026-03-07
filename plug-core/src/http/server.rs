@@ -330,7 +330,7 @@ async fn handle_request(
             // Store client type in session
             let _ = state.sessions.set_client_type(&session_id, client_type);
 
-            let result = build_initialize_result();
+            let result = build_initialize_result(state.router.as_ref());
 
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
@@ -347,15 +347,16 @@ async fn handle_request(
             json_response(&response_msg)
         }
 
-        ClientRequest::ListToolsRequest(_) => {
+        ClientRequest::ListToolsRequest(list_req) => {
             let session_id_str = extract_session_id(headers)?;
             validate_session_header(headers, &state.sessions)?;
             let client_type = state
                 .sessions
                 .get_client_type(&session_id_str)
                 .unwrap_or(crate::types::ClientType::Unknown);
-            let tools = state.router.list_tools_for_client(client_type);
-            let result = ListToolsResult::with_all_items((*tools).clone());
+            let result = state
+                .router
+                .list_tools_page_for_client(client_type, list_req.params);
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListToolsResult(result), request_id);
             json_response(&response_msg)
@@ -392,9 +393,9 @@ async fn handle_request(
             }
         }
 
-        ClientRequest::ListResourcesRequest(_) => {
+        ClientRequest::ListResourcesRequest(list_req) => {
             validate_session_header(headers, &state.sessions)?;
-            let result = ListResourcesResult::default();
+            let result = state.router.list_resources_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourcesResult(result),
                 request_id,
@@ -402,12 +403,60 @@ async fn handle_request(
             json_response(&response_msg)
         }
 
-        ClientRequest::ListPromptsRequest(_) => {
+        ClientRequest::ListResourceTemplatesRequest(list_req) => {
             validate_session_header(headers, &state.sessions)?;
-            let result = ListPromptsResult::default();
+            let result = state.router.list_resource_templates_page(list_req.params);
+            let response_msg = ServerJsonRpcMessage::response(
+                ServerResult::ListResourceTemplatesResult(result),
+                request_id,
+            );
+            json_response(&response_msg)
+        }
+
+        ClientRequest::ReadResourceRequest(read_req) => {
+            validate_session_header(headers, &state.sessions)?;
+            match state.router.read_resource(&read_req.params.uri).await {
+                Ok(result) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::ReadResourceResult(result),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::ListPromptsRequest(list_req) => {
+            validate_session_header(headers, &state.sessions)?;
+            let result = state.router.list_prompts_page(list_req.params);
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
             json_response(&response_msg)
+        }
+
+        ClientRequest::GetPromptRequest(prompt_req) => {
+            validate_session_header(headers, &state.sessions)?;
+            match state
+                .router
+                .get_prompt(&prompt_req.params.name, prompt_req.params.arguments)
+                .await
+            {
+                Ok(result) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::GetPromptResult(result),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
         }
 
         _ => {
@@ -425,17 +474,8 @@ async fn handle_request(
 // ---------------------------------------------------------------------------
 
 /// Build the InitializeResult (same as ProxyHandler::get_info).
-fn build_initialize_result() -> InitializeResult {
-    let mut capabilities = ServerCapabilities::default();
-    capabilities.tools = Some(ToolsCapability {
-        list_changed: Some(true),
-    });
-    capabilities.resources = Some(ResourcesCapability {
-        list_changed: Some(false),
-        subscribe: None,
-    });
-
-    InitializeResult::new(capabilities)
+fn build_initialize_result(router: &ToolRouter) -> InitializeResult {
+    InitializeResult::new(router.synthesized_capabilities())
         .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
 }
 
@@ -890,7 +930,7 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(json["result"]["serverInfo"]["name"], "plug");
-        assert!(json["result"]["capabilities"]["tools"].is_object());
+        assert!(json["result"]["capabilities"]["tools"].is_null());
     }
 
     #[tokio::test]
