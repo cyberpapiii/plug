@@ -1,7 +1,7 @@
 ---
 title: "feat: phase 2a notification infrastructure"
 type: feat
-status: active
+status: completed
 date: 2026-03-07
 origin: docs/brainstorms/2026-03-07-phase2a-notification-infrastructure-brainstorm.md
 ---
