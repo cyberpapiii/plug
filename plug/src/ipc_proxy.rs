@@ -353,3 +353,215 @@ impl ServerHandler for IpcProxyHandler {
         std::future::ready(Ok(ListPromptsResult::default()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
+    use plug_core::config::{Config, ServerConfig, TransportType};
+    use plug_core::engine::Engine;
+    use rmcp::ServiceExt as _;
+    use rmcp::handler::client::ClientHandler;
+    use tokio::task::JoinHandle;
+
+    fn daemon_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[derive(Clone)]
+    struct TestClient;
+
+    impl ClientHandler for TestClient {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default()
+        }
+    }
+
+    fn mock_server_config() -> ServerConfig {
+        ServerConfig {
+            command: Some("cargo".to_string()),
+            args: vec![
+                "run".to_string(),
+                "--quiet".to_string(),
+                "-p".to_string(),
+                "plug-test-harness".to_string(),
+                "--bin".to_string(),
+                "mock-mcp-server".to_string(),
+                "--".to_string(),
+                "--tools".to_string(),
+                "echo".to_string(),
+            ],
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            timeout_secs: 10,
+            call_timeout_secs: 5,
+            max_concurrent: 4,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        }
+    }
+
+    async fn spawn_test_daemon(
+        config: Config,
+        config_path: std::path::PathBuf,
+    ) -> (Arc<Engine>, JoinHandle<anyhow::Result<()>>) {
+        let engine = Arc::new(Engine::new(config));
+        engine.start().await.expect("engine start");
+        let engine_for_task = Arc::clone(&engine);
+        let handle = tokio::spawn(async move { run_daemon(engine_for_task, config_path, 0).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if handle.is_finished() {
+            let result = handle.await.expect("daemon task join");
+            panic!("daemon exited before readiness: {result:?}");
+        }
+        tokio::time::timeout(Duration::from_secs(5), crate::runtime::wait_for_daemon_ready())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "daemon ready timeout (socket path: {}, task_finished: {})",
+                    crate::daemon::socket_path().display(),
+                    handle.is_finished()
+                )
+            })
+            .expect("daemon ready");
+        (engine, handle)
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_recovers_after_daemon_restart() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!("pdc-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server_config());
+        std::fs::write(&config_path, toml::to_string(&config).expect("serialize config"))
+            .expect("write config");
+
+        let (engine_a, daemon_a) = spawn_test_daemon(config.clone(), config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-continuity".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
+        let shared = Arc::clone(&proxy.shared);
+        let initial_session_id = {
+            let conn = shared.conn.lock().await;
+            conn.session_id.clone()
+        };
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let initial_tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
+            .await
+            .expect("initial tools timeout")
+            .expect("initial tools");
+        assert!(
+            initial_tools.iter().any(|tool| tool.name == "Mock__echo"),
+            "expected daemon-backed proxy to expose Mock__echo"
+        );
+        let initial_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(
+                CallToolRequestParams::new("Mock__echo").with_arguments(
+                    serde_json::json!({"input": "before"}).as_object().unwrap().clone(),
+                ),
+            ),
+        )
+        .await
+        .expect("initial tool call timeout")
+        .expect("initial tool call");
+        assert!(format!("{initial_result:?}").contains("before"));
+
+        engine_a.shutdown().await;
+        daemon_a
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        let (engine_b, daemon_b) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let engine_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match engine_b
+                .tool_router()
+                .call_tool(
+                    "Mock__echo",
+                    Some(
+                        serde_json::json!({"input": "engine-ready"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if error.message.contains("server unavailable")
+                        && tokio::time::Instant::now() < engine_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("restarted daemon never became ready: {error:?}"),
+            }
+        }
+
+        let repaired_tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
+            .await
+            .expect("tools after reconnect timeout")
+            .expect("tools after reconnect");
+        assert!(
+            repaired_tools.iter().any(|tool| tool.name == "Mock__echo"),
+            "expected repaired proxy to expose Mock__echo"
+        );
+        let repaired_session_id = { shared.conn.lock().await.session_id.clone() };
+        assert_ne!(
+            repaired_session_id, initial_session_id,
+            "reconnect should replace the daemon session"
+        );
+
+        engine_b.shutdown().await;
+        daemon_b
+            .await
+            .expect("restarted daemon task join")
+            .expect("restarted daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+}

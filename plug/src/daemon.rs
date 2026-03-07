@@ -167,6 +167,15 @@ impl ClientRegistry {
 /// - macOS: `~/Library/Application Support/plug/`
 /// - Linux: `$XDG_RUNTIME_DIR/plug/` (fallback: `~/.local/state/plug/`)
 pub fn runtime_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some((runtime, _)) = test_runtime_paths()
+        .lock()
+        .expect("test runtime path mutex poisoned")
+        .clone()
+    {
+        return runtime.join("plug");
+    }
+
     #[cfg(target_os = "macos")]
     {
         dirs_path("Library/Application Support/plug")
@@ -187,6 +196,15 @@ pub fn runtime_dir() -> PathBuf {
 /// - macOS: `~/Library/Logs/plug/`
 /// - Linux: `$XDG_STATE_HOME/plug/logs/` (fallback: `~/.local/state/plug/logs/`)
 pub fn log_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some((_, state)) = test_runtime_paths()
+        .lock()
+        .expect("test runtime path mutex poisoned")
+        .clone()
+    {
+        return state.join("plug/logs");
+    }
+
     #[cfg(target_os = "macos")]
     {
         dirs_path("Library/Logs/plug")
@@ -207,6 +225,27 @@ fn dirs_path(subpath: &str) -> PathBuf {
     directories::BaseDirs::new()
         .map(|d| d.home_dir().join(subpath))
         .unwrap_or_else(|| PathBuf::from(".").join(subpath))
+}
+
+#[cfg(test)]
+fn test_runtime_paths() -> &'static std::sync::Mutex<Option<(PathBuf, PathBuf)>> {
+    static TEST_RUNTIME_PATHS: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, PathBuf)>>> =
+        std::sync::OnceLock::new();
+    TEST_RUNTIME_PATHS.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_runtime_paths(runtime: PathBuf, state: PathBuf) {
+    *test_runtime_paths()
+        .lock()
+        .expect("test runtime path mutex poisoned") = Some((runtime, state));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_runtime_paths() {
+    *test_runtime_paths()
+        .lock()
+        .expect("test runtime path mutex poisoned") = None;
 }
 
 pub fn socket_path() -> PathBuf {
@@ -543,13 +582,21 @@ async fn handle_ipc_loop(
         // not be subject to the idle timeout. Short-lived admin/query connections use
         // the timeout to reclaim resources.
         let frame = if ctx.session_id.is_some() {
-            ipc::read_frame(reader).await
+            tokio::select! {
+                _ = ctx.cancel.cancelled() => break,
+                result = ipc::read_frame(reader) => result,
+            }
         } else {
-            match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, ipc::read_frame(reader)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::debug!("IPC connection idle timeout");
-                    break;
+            tokio::select! {
+                _ = ctx.cancel.cancelled() => break,
+                result = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, ipc::read_frame(reader)) => {
+                    match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::debug!("IPC connection idle timeout");
+                            break;
+                        }
+                    }
                 }
             }
         };
