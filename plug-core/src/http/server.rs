@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
-use super::session::SessionManager;
 use super::sse::sse_stream;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamCallContext, ToolRouter};
+use crate::session::SessionStore;
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -33,7 +33,7 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 /// Shared state for all HTTP handlers.
 pub struct HttpState {
     pub router: Arc<ToolRouter>,
-    pub sessions: SessionManager,
+    pub sessions: Arc<dyn SessionStore>,
     pub cancel: CancellationToken,
     pub sse_channel_capacity: usize,
     pub notification_task_started: AtomicBool,
@@ -191,12 +191,12 @@ async fn post_mcp(
         JsonRpcMessage::Request(req) => handle_request(req, &headers, &state).await,
         JsonRpcMessage::Response(_) => {
             // Client response for sampling/elicitation — validate session
-            validate_session_header(&headers, &state.sessions)?;
+            validate_session_header(&headers, state.sessions.as_ref())?;
             Ok(StatusCode::ACCEPTED.into_response())
         }
         JsonRpcMessage::Notification(notification) => {
             let session_id = extract_session_id(&headers)?;
-            validate_session_header(&headers, &state.sessions)?;
+            validate_session_header(&headers, state.sessions.as_ref())?;
             if let ClientNotification::CancelledNotification(cancelled) = notification.notification {
                 state.router.forward_cancel_from_downstream(
                     &DownstreamCallContext::http(
@@ -339,7 +339,7 @@ async fn handle_request(
         }
 
         ClientRequest::PingRequest(_) => {
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::EmptyResult(EmptyResult {}),
                 request_id,
@@ -349,7 +349,7 @@ async fn handle_request(
 
         ClientRequest::ListToolsRequest(list_req) => {
             let session_id_str = extract_session_id(headers)?;
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let client_type = state
                 .sessions
                 .get_client_type(&session_id_str)
@@ -364,7 +364,7 @@ async fn handle_request(
 
         ClientRequest::CallToolRequest(call_req) => {
             let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let progress_token = call_req.params.progress_token();
             match state
                 .router
@@ -394,7 +394,7 @@ async fn handle_request(
         }
 
         ClientRequest::ListResourcesRequest(list_req) => {
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let result = state.router.list_resources_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourcesResult(result),
@@ -404,7 +404,7 @@ async fn handle_request(
         }
 
         ClientRequest::ListResourceTemplatesRequest(list_req) => {
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let result = state.router.list_resource_templates_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourceTemplatesResult(result),
@@ -414,7 +414,7 @@ async fn handle_request(
         }
 
         ClientRequest::ReadResourceRequest(read_req) => {
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             match state.router.read_resource(&read_req.params.uri).await {
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
@@ -431,7 +431,7 @@ async fn handle_request(
         }
 
         ClientRequest::ListPromptsRequest(list_req) => {
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let result = state.router.list_prompts_page(list_req.params);
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
@@ -439,7 +439,7 @@ async fn handle_request(
         }
 
         ClientRequest::GetPromptRequest(prompt_req) => {
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             match state
                 .router
                 .get_prompt(&prompt_req.params.name, prompt_req.params.arguments)
@@ -461,7 +461,7 @@ async fn handle_request(
 
         _ => {
             // Unsupported method — return JSON-RPC method not found error
-            validate_session_header(headers, &state.sessions)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
             let error = ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not supported", None);
             let response_msg = ServerJsonRpcMessage::error(error, request_id);
             json_response(&response_msg)
@@ -514,7 +514,7 @@ fn extract_session_id(headers: &HeaderMap) -> Result<String, HttpError> {
 /// Validate that the session exists and is not expired.
 fn validate_session_header(
     headers: &HeaderMap,
-    sessions: &SessionManager,
+    sessions: &dyn SessionStore,
 ) -> Result<(), HttpError> {
     let session_id = extract_session_id(headers)?;
     sessions.validate(&session_id)
@@ -597,7 +597,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(sm, router_config));
         Arc::new(HttpState {
             router,
-            sessions: SessionManager::new(1800, 100),
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),

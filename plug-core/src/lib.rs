@@ -17,6 +17,7 @@ pub mod notifications;
 pub mod proxy;
 pub mod reload;
 pub mod server;
+pub mod session;
 pub mod tool_naming;
 pub mod types;
 pub mod watcher;

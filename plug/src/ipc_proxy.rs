@@ -486,14 +486,21 @@ mod tests {
             .await
             .expect("connect downstream client");
 
-        let initial_tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
-            .await
-            .expect("initial tools timeout")
-            .expect("initial tools");
-        assert!(
-            initial_tools.iter().any(|tool| tool.name == "Mock__echo"),
-            "expected daemon-backed proxy to expose Mock__echo"
-        );
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let _initial_tools = loop {
+            let tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
+                .await
+                .expect("initial tools timeout")
+                .expect("initial tools");
+            if tools.iter().any(|tool| tool.name == "Mock__echo") {
+                break tools;
+            }
+            assert!(
+                tokio::time::Instant::now() < initial_deadline,
+                "expected daemon-backed proxy to expose Mock__echo"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         let initial_result = tokio::time::timeout(
             Duration::from_secs(5),
             client.call_tool(
