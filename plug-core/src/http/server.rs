@@ -387,25 +387,52 @@ async fn delete_mcp(
 
 /// GET /.well-known/mcp.json — server discovery card.
 ///
-/// Exempt from origin validation — intended for discovery by any client.
-async fn get_server_card(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let tool_count = state.router.tool_count();
-    let servers: Vec<String> = state
-        .router
-        .server_manager()
-        .server_statuses()
-        .into_iter()
-        .map(|s| s.server_id)
-        .collect();
+/// When auth is required but not provided, returns a minimal card (name,
+/// version, endpoint) to preserve discoverability without leaking server
+/// inventory details (server names, tool counts).
+async fn get_server_card(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Check if this is an authenticated request (manual check since discovery
+    // is on a separate router without the auth middleware layer)
+    let is_authenticated = match &state.auth_token {
+        None => true, // No auth required (loopback)
+        Some(expected) => headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|token| crate::auth::verify_auth_token(token, expected.as_ref())),
+    };
 
-    let card = json!({
-        "name": "plug",
-        "version": env!("CARGO_PKG_VERSION"),
-        "description": "MCP multiplexer",
-        "tools": tool_count,
-        "servers": servers,
-        "transports": ["stdio", "streamable-http", "sse"],
-    });
+    let card = if is_authenticated {
+        let tool_count = state.router.tool_count();
+        let servers: Vec<String> = state
+            .router
+            .server_manager()
+            .server_statuses()
+            .into_iter()
+            .map(|s| s.server_id)
+            .collect();
+
+        json!({
+            "name": "plug",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "MCP multiplexer",
+            "tools": tool_count,
+            "servers": servers,
+            "transports": ["stdio", "streamable-http", "sse"],
+        })
+    } else {
+        // Minimal card: no server names, no tool counts
+        json!({
+            "name": "plug",
+            "version": env!("CARGO_PKG_VERSION"),
+            "endpoint": "/mcp",
+            "transport": "streamable-http",
+            "auth_required": true,
+        })
+    };
 
     let mut response = (StatusCode::OK, Json(card)).into_response();
     response.headers_mut().insert(
