@@ -25,30 +25,52 @@ pub fn verify_auth_token(provided: &str, expected: &str) -> bool {
 /// If the file exists with correct permissions (0600 on Unix), its contents are reused.
 /// Otherwise a fresh token is generated, written with 0600 permissions, and returned.
 pub fn load_or_generate_token(path: &Path) -> anyhow::Result<String> {
-    if path.exists() {
-        // Check permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(path)?;
-            let mode = meta.permissions().mode() & 0o777;
-            if mode != 0o600 {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:o}"),
-                    "auth token file has incorrect permissions, fixing to 0600"
-                );
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
-        let token = std::fs::read_to_string(path)?.trim().to_string();
-        if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(token);
-        }
-        tracing::warn!(path = %path.display(), "auth token file has invalid content, regenerating");
+    // Try to load from existing file (open once to avoid TOCTOU race)
+    if let Ok(token) = try_load_token(path) {
+        return Ok(token);
     }
 
     let token = generate_auth_token();
+    write_token_file(path, &token)?;
+    Ok(token)
+}
+
+/// Try to load and validate a token from an existing file.
+/// Opens the file once and checks permissions on the fd to avoid TOCTOU races.
+fn try_load_token(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = file.metadata()?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "auth token file has incorrect permissions, fixing to 0600"
+            );
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let token = contents.trim().to_string();
+    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(token)
+    } else {
+        tracing::warn!(path = %path.display(), "auth token file has invalid content, regenerating");
+        anyhow::bail!("invalid token content")
+    }
+}
+
+/// Write a token to a file with secure permissions.
+/// Uses create_new to prevent symlink attacks on initial creation,
+/// falling back to truncate if the file already exists.
+pub fn write_token_file(path: &Path, token: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -57,19 +79,31 @@ pub fn load_or_generate_token(path: &Path) -> anyhow::Result<String> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
+        // Try exclusive create first (prevents symlink attacks)
+        let file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)?;
+            .open(path);
+        let mut file = match file {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // File exists — truncate and overwrite
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
         file.write_all(token.as_bytes())?;
     }
 
     #[cfg(not(unix))]
-    std::fs::write(path, &token)?;
+    std::fs::write(path, token)?;
 
-    Ok(token)
+    Ok(())
 }
 
 /// Return the path for an HTTP auth token file for a given port.

@@ -203,6 +203,15 @@ enum AuthStatus {
     NoAuthRequired,
 }
 
+/// Check if a request's bearer token is valid against the expected token.
+fn check_bearer_token(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| crate::auth::verify_auth_token(token, expected))
+}
+
 /// Validate bearer token for non-loopback HTTP servers.
 ///
 /// When `HttpState.auth_token` is `Some`, requests must include a valid
@@ -215,17 +224,11 @@ async fn validate_bearer_auth(
     let auth_status = match &state.auth_token {
         None => AuthStatus::NoAuthRequired,
         Some(expected) => {
-            let provided = req
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "));
-
-            match provided {
-                Some(token) if crate::auth::verify_auth_token(token, expected.as_ref()) => {
-                    AuthStatus::Authenticated
-                }
-                _ => return Err(HttpError::Unauthorized),
+            if check_bearer_token(req.headers(), expected.as_ref()) {
+                AuthStatus::Authenticated
+            } else {
+                tracing::warn!("bearer auth failed from downstream client");
+                return Err(HttpError::Unauthorized);
             }
         }
     };
@@ -398,11 +401,7 @@ async fn get_server_card(
     // is on a separate router without the auth middleware layer)
     let is_authenticated = match &state.auth_token {
         None => true, // No auth required (loopback)
-        Some(expected) => headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|token| crate::auth::verify_auth_token(token, expected.as_ref())),
+        Some(expected) => check_bearer_token(&headers, expected.as_ref()),
     };
 
     let card = if is_authenticated {

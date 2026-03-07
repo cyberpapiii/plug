@@ -39,21 +39,19 @@ pub enum HttpError {
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         // SECURITY: Do NOT include session IDs or internal details in error bodies.
-        if matches!(self, HttpError::Unauthorized) {
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": { "code": -32001, "message": "authentication required" },
-                "id": null
-            });
-            let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-            return response;
-        }
-
         let (status, message) = match &self {
-            HttpError::Unauthorized => unreachable!(),
+            HttpError::Unauthorized => {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32001, "message": "authentication required" },
+                    "id": null
+                });
+                let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                return response;
+            }
             HttpError::InvalidOrigin => (StatusCode::FORBIDDEN, "forbidden"),
             HttpError::SessionRequired => (StatusCode::BAD_REQUEST, "session ID required"),
             HttpError::SessionNotFound => (StatusCode::NOT_FOUND, "session not found"),

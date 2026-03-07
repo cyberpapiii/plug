@@ -345,28 +345,8 @@ pub async fn run_daemon(
     // Generate auth token and write to file with restricted permissions from creation
     let auth_token = generate_auth_token();
     let token_file = token_path();
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&token_file)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(auth_token.as_bytes())
-                })
-                .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&token_file, &auth_token)
-                .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
-        }
-    }
+    plug_core::auth::write_token_file(&token_file, &auth_token)
+        .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
 
     // Acquire PID file lock BEFORE socket operations to prevent TOCTOU races.
     // Two concurrent auto_start_daemon calls: the loser fails here, retries connecting.
