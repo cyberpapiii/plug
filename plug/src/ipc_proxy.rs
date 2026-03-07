@@ -547,6 +547,43 @@ impl ServerHandler for IpcProxyHandler {
             }
         }
     }
+
+    fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "completion/complete".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(
+                            format!("failed to parse completion/complete: {e}"),
+                            None,
+                        )
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1033,6 +1033,43 @@ async fn dispatch_mcp_request(
             }
         }
 
+        "completion/complete" => {
+            let params: rmcp::model::CompleteRequestParams = match params
+                .map(|p| serde_json::from_value::<rmcp::model::CompleteRequestParams>(p.clone()))
+            {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: format!("completion/complete: {e}"),
+                    };
+                }
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "completion/complete requires params".to_string(),
+                    };
+                }
+            };
+
+            match tool_router.complete_request(params).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
         "tools/call" => {
             // Extract tool name and arguments from params
             let (name, arguments) = match params {
