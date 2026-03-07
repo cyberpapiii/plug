@@ -61,6 +61,9 @@ Internal/plumbing commands stay available:
 - `plug stop`
 - `plug reload`
 
+For remote use, `plug serve` should support optional HTTPS when the operator configures a
+certificate and private key. Plain HTTP remains valid for localhost and test environments.
+
 ### 3. Interactive When Helpful, Scriptable When Needed
 
 Interactive flows are useful for humans, but the main paths must also work without prompts.

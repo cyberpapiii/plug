@@ -237,6 +237,7 @@ pub(crate) enum ToolCommands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     apply_dotenv();
+    plug_core::tls::ensure_rustls_provider_installed();
 
     let cli = Cli::parse();
 

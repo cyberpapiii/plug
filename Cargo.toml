@@ -26,6 +26,7 @@ rmcp = { version = "1.0.0", features = [
     # TLS support for HTTPS upstream servers
     "reqwest-native-tls",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -94,6 +95,7 @@ async-stream = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 http = "1"
 bytes = "1"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 
 [profile.release]
 strip = true

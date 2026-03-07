@@ -78,6 +78,10 @@ pub struct HttpConfig {
     pub bind_address: String,
     /// Port for HTTP server.
     pub port: u16,
+    /// PEM-encoded certificate chain for HTTPS serving.
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM-encoded private key for HTTPS serving.
+    pub tls_key_path: Option<PathBuf>,
     /// Session timeout in seconds.
     pub session_timeout_secs: u64,
     /// Maximum number of concurrent sessions.
@@ -91,6 +95,8 @@ impl Default for HttpConfig {
         Self {
             bind_address: "127.0.0.1".to_string(),
             port: 3282,
+            tls_cert_path: None,
+            tls_key_path: None,
             session_timeout_secs: 1800,
             max_sessions: 100,
             sse_channel_capacity: 32,
@@ -175,6 +181,10 @@ fn default_grace_period() -> u64 {
     60
 }
 
+fn http_bind_is_loopback(bind_address: &str) -> bool {
+    matches!(bind_address, "127.0.0.1" | "::1" | "[::1]" | "localhost")
+}
+
 /// Transport type for upstream servers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -226,6 +236,59 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
     if config.http.port == 0 {
         errors.push("http.port must be in range 1-65535".to_string());
+    }
+
+    if !http_bind_is_loopback(&config.http.bind_address) && config.http.tls_cert_path.is_none() {
+        errors.push(
+            "http.tls_cert_path and http.tls_key_path are required when binding a non-loopback downstream address".to_string(),
+        );
+    }
+
+    match (&config.http.tls_cert_path, &config.http.tls_key_path) {
+        (Some(_), None) | (None, Some(_)) => {
+            errors.push("http.tls_cert_path and http.tls_key_path must be set together".to_string())
+        }
+        (Some(cert), Some(key)) => {
+            if !cert.exists() {
+                errors.push(format!(
+                    "http.tls_cert_path '{}' does not exist",
+                    cert.display()
+                ));
+            }
+            if !key.exists() {
+                errors.push(format!(
+                    "http.tls_key_path '{}' does not exist",
+                    key.display()
+                ));
+            }
+            if cert.exists() && std::fs::File::open(cert).is_err() {
+                errors.push(format!(
+                    "http.tls_cert_path '{}' is not readable",
+                    cert.display()
+                ));
+            }
+            if key.exists() && std::fs::File::open(key).is_err() {
+                errors.push(format!(
+                    "http.tls_key_path '{}' is not readable",
+                    key.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                if let Ok(metadata) = std::fs::metadata(key) {
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o077 != 0 {
+                        errors.push(format!(
+                            "http.tls_key_path '{}' must not be group/world readable",
+                            key.display()
+                        ));
+                    }
+                }
+            }
+        }
+        (None, None) => {}
     }
 
     if config.startup_concurrency == 0 {
@@ -394,6 +457,8 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.http.bind_address, "127.0.0.1");
         assert_eq!(cfg.http.port, 3282);
+        assert_eq!(cfg.http.tls_cert_path, None);
+        assert_eq!(cfg.http.tls_key_path, None);
         assert_eq!(cfg.http.session_timeout_secs, 1800);
         assert_eq!(cfg.http.max_sessions, 100);
         assert_eq!(cfg.http.sse_channel_capacity, 32);
@@ -416,9 +481,19 @@ mod tests {
 
             [http]
             port = 8080
+            tls_cert_path = "/tmp/plug-cert.pem"
+            tls_key_path = "/tmp/plug-key.pem"
             "#,
         );
         assert_eq!(cfg.http.port, 8080);
+        assert_eq!(
+            cfg.http.tls_cert_path.as_deref(),
+            Some(std::path::Path::new("/tmp/plug-cert.pem"))
+        );
+        assert_eq!(
+            cfg.http.tls_key_path.as_deref(),
+            Some(std::path::Path::new("/tmp/plug-key.pem"))
+        );
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.startup_concurrency, 5);
         // Non-overridden fields keep defaults
@@ -600,6 +675,62 @@ mod tests {
         cfg.http.port = 0;
         let errors = validate_config(&cfg);
         assert!(errors.iter().any(|e| e.contains("port")));
+    }
+
+    #[test]
+    fn validate_tls_paths_must_be_paired() {
+        let mut cfg = Config::default();
+        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
+        let errors = validate_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("must be set together")));
+    }
+
+    #[test]
+    fn validate_tls_paths_must_exist() {
+        let mut cfg = Config::default();
+        cfg.http.tls_cert_path = Some(PathBuf::from("/definitely/missing-cert.pem"));
+        cfg.http.tls_key_path = Some(PathBuf::from("/definitely/missing-key.pem"));
+        let errors = validate_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("tls_cert_path")));
+        assert!(errors.iter().any(|e| e.contains("tls_key_path")));
+    }
+
+    #[test]
+    fn validate_non_loopback_bind_requires_tls() {
+        let mut cfg = Config::default();
+        cfg.http.bind_address = "0.0.0.0".to_string();
+        let errors = validate_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("non-loopback")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_tls_key_must_not_be_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "plug-key-perms-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let cert = temp.join("cert.pem");
+        let key = temp.join("key.pem");
+        std::fs::write(&cert, "cert").expect("write cert");
+        std::fs::write(&key, "key").expect("write key");
+        let mut perms = std::fs::metadata(&key).expect("key metadata").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&key, perms).expect("set key perms");
+
+        let mut cfg = Config::default();
+        cfg.http.tls_cert_path = Some(cert);
+        cfg.http.tls_key_path = Some(key);
+
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must not be group/world readable"))
+        );
     }
 
     #[test]

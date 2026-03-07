@@ -197,7 +197,8 @@ async fn post_mcp(
         JsonRpcMessage::Notification(notification) => {
             let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
-            if let ClientNotification::CancelledNotification(cancelled) = notification.notification {
+            if let ClientNotification::CancelledNotification(cancelled) = notification.notification
+            {
                 state.router.forward_cancel_from_downstream(
                     &DownstreamCallContext::http(
                         Arc::<str>::from(session_id.as_str()),
@@ -937,7 +938,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let names = json["result"]["tools"]
             .as_array()
@@ -1206,9 +1209,9 @@ mod tests {
         assert_eq!(sse_resp.status(), StatusCode::OK);
         let body = sse_resp.into_body();
 
-        state
-            .router
-            .publish_protocol_notification(crate::notifications::ProtocolNotification::ToolListChanged);
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ToolListChanged,
+        );
 
         let events = collect_sse_events(body, 3).await;
         assert!(

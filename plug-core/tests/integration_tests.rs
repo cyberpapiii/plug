@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
-use plug_core::http::server::{HttpState, build_router};
-use plug_core::http::session::SessionManager;
-use plug_core::session::SessionStore;
 use plug_core::client_detect::detect_client;
 use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
 use plug_core::engine::Engine;
+use plug_core::http::server::{HttpState, build_router};
+use plug_core::http::session::SessionManager;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
+use plug_core::session::SessionStore;
 use plug_core::types::ClientType;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
@@ -442,7 +442,12 @@ async fn test_stdio_timeout_reconnects_cleanly() {
         .tool_router()
         .call_tool(
             "Mock__echo",
-            Some(serde_json::json!({"input": "ok"}).as_object().unwrap().clone()),
+            Some(
+                serde_json::json!({"input": "ok"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
         )
         .await;
     assert!(second.is_ok(), "second call should succeed after reconnect");
@@ -500,7 +505,12 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
         .tool_router()
         .call_tool(
             "Mock__echo",
-            Some(serde_json::json!({"input": "recover"}).as_object().unwrap().clone()),
+            Some(
+                serde_json::json!({"input": "recover"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
         )
         .await;
     assert!(
@@ -508,7 +518,10 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
         "tool call should recover after upstream restart: {result:?}"
     );
     let rendered = format!("{:?}", result.unwrap());
-    assert!(rendered.contains("recover"), "unexpected result: {rendered}");
+    assert!(
+        rendered.contains("recover"),
+        "unexpected result: {rendered}"
+    );
 
     engine.shutdown().await;
     let _ = std::fs::remove_dir_all(&temp);
@@ -540,14 +553,26 @@ async fn test_stdio_end_to_end_proxy_path() {
         .expect("connect stdio client");
 
     let tools = client.peer().list_all_tools().await.expect("list tools");
-    let names = tools.iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
-    assert!(names.contains(&"Mock__echo".to_string()), "tools: {names:?}");
-    assert!(names.contains(&"Mock__greet".to_string()), "tools: {names:?}");
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"Mock__echo".to_string()),
+        "tools: {names:?}"
+    );
+    assert!(
+        names.contains(&"Mock__greet".to_string()),
+        "tools: {names:?}"
+    );
 
     let result = client
         .call_tool(
             CallToolRequestParams::new("Mock__echo").with_arguments(
-                serde_json::json!({"input": "hello"}).as_object().unwrap().clone(),
+                serde_json::json!({"input": "hello"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
             ),
         )
         .await
@@ -713,7 +738,10 @@ async fn test_multi_client_shared_engine_isolation() {
         client_a
             .call_tool(
                 CallToolRequestParams::new("Mock__echo").with_arguments(
-                    serde_json::json!({"input": "from-a"}).as_object().unwrap().clone(),
+                    serde_json::json!({"input": "from-a"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 ),
             )
             .await
@@ -723,7 +751,10 @@ async fn test_multi_client_shared_engine_isolation() {
         client_b
             .call_tool(
                 CallToolRequestParams::new("Mock__echo").with_arguments(
-                    serde_json::json!({"input": "from-b"}).as_object().unwrap().clone(),
+                    serde_json::json!({"input": "from-b"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 ),
             )
             .await
@@ -734,8 +765,14 @@ async fn test_multi_client_shared_engine_isolation() {
     let result_b = call_b.await.unwrap();
     let text_a = format!("{result_a:?}");
     let text_b = format!("{result_b:?}");
-    assert!(text_a.contains("from-a"), "client a got wrong result: {text_a}");
-    assert!(text_b.contains("from-b"), "client b got wrong result: {text_b}");
+    assert!(
+        text_a.contains("from-a"),
+        "client a got wrong result: {text_a}"
+    );
+    assert!(
+        text_b.contains("from-b"),
+        "client b got wrong result: {text_b}"
+    );
 
     engine.shutdown().await;
 }
