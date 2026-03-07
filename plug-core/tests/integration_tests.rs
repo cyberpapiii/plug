@@ -452,6 +452,69 @@ async fn test_stdio_timeout_reconnects_cleanly() {
 }
 
 #[tokio::test]
+async fn test_stdio_crash_restart_recovers_cleanly() {
+    let temp = std::env::temp_dir().join(format!("plug-crash-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp).expect("create temp dir");
+    let marker = temp.join("first-run.marker");
+    let script = temp.join("mock-wrapper.sh");
+
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  touch \"$1\"\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --fail-mode crash\nelse\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --delay-ms 0\nfi\n",
+    )
+    .expect("write wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+
+    let mut config = Config::default();
+    config.servers.insert(
+        "mock".to_string(),
+        ServerConfig {
+            command: Some(script.display().to_string()),
+            args: vec![marker.display().to_string()],
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            timeout_secs: 10,
+            call_timeout_secs: 5,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        },
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let result = engine
+        .tool_router()
+        .call_tool(
+            "Mock__echo",
+            Some(serde_json::json!({"input": "recover"}).as_object().unwrap().clone()),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "tool call should recover after upstream restart: {result:?}"
+    );
+    let rendered = format!("{:?}", result.unwrap());
+    assert!(rendered.contains("recover"), "unexpected result: {rendered}");
+
+    engine.shutdown().await;
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[tokio::test]
 async fn test_stdio_end_to_end_proxy_path() {
     let mut config = Config::default();
     config
