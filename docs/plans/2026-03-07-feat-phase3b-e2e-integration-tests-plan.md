@@ -1,7 +1,7 @@
 ---
 title: "feat: phase 3b end-to-end integration tests"
 type: feat
-status: active
+status: completed
 date: 2026-03-07
 origin: docs/brainstorms/2026-03-07-phase3b-e2e-integration-tests-brainstorm.md
 ---
