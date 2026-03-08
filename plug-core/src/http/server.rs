@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -9,9 +9,12 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, extract::Request};
+use dashmap::DashMap;
+use rmcp::ErrorData as McpError;
 use rmcp::model::*;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -40,6 +43,12 @@ pub struct HttpState {
     /// Bearer token for downstream client authentication.
     /// `None` means no auth required (loopback-only server).
     pub auth_token: Option<Arc<str>>,
+    /// Sessions whose clients advertise `roots` capability.
+    pub roots_capable_sessions: DashMap<String, ()>,
+    /// Pending reverse requests sent to HTTP clients (keyed by session_id + request_id).
+    pub pending_client_requests: DashMap<(String, i64), oneshot::Sender<ClientResult>>,
+    /// Counter for generating unique reverse-request IDs.
+    pub reverse_request_counter: AtomicU64,
 }
 
 impl HttpState {
@@ -313,23 +322,32 @@ async fn post_mcp(
     // 3. Route based on message type
     match message {
         JsonRpcMessage::Request(req) => handle_request(req, &headers, &state).await,
-        JsonRpcMessage::Response(_) => {
-            // Client response for sampling/elicitation — validate session
+        JsonRpcMessage::Response(response) => {
+            let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
+            handle_client_response(response, &session_id, &state).await?;
             Ok(StatusCode::ACCEPTED.into_response())
         }
         JsonRpcMessage::Notification(notification) => {
             let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
-            if let ClientNotification::CancelledNotification(cancelled) = notification.notification
-            {
-                state.router.forward_cancel_from_downstream(
-                    &DownstreamCallContext::http(
-                        Arc::<str>::from(session_id.as_str()),
-                        cancelled.params.request_id.clone(),
-                    ),
-                    cancelled.params.reason,
-                );
+            match notification.notification {
+                ClientNotification::CancelledNotification(cancelled) => {
+                    state.router.forward_cancel_from_downstream(
+                        &DownstreamCallContext::http(
+                            Arc::<str>::from(session_id.as_str()),
+                            cancelled.params.request_id.clone(),
+                        ),
+                        cancelled.params.reason,
+                    );
+                }
+                ClientNotification::InitializedNotification(_) => {
+                    maybe_request_http_roots(Arc::clone(&state), session_id.clone());
+                }
+                ClientNotification::RootsListChangedNotification(_) => {
+                    maybe_request_http_roots(Arc::clone(&state), session_id.clone());
+                }
+                _ => {}
             }
             Ok(StatusCode::ACCEPTED.into_response())
         }
@@ -362,6 +380,88 @@ fn validate_protocol_version_for_post(
         None if require_header => Err(HttpError::MissingProtocolVersion),
         None => Ok(()),
     }
+}
+
+/// Send a reverse JSON-RPC request to an HTTP client via its SSE stream and
+/// await the response posted back via POST.
+async fn send_http_client_request(
+    state: &HttpState,
+    session_id: &str,
+    request: ServerRequest,
+) -> Result<ClientResult, McpError> {
+    let id = state.reverse_request_counter.fetch_add(1, Ordering::SeqCst) as i64;
+    let request_id = RequestId::from(NumberOrString::Number(id));
+    let (tx, rx) = oneshot::channel();
+    state
+        .pending_client_requests
+        .insert((session_id.to_string(), id), tx);
+    let message = ServerJsonRpcMessage::request(request, request_id);
+    state.sessions.send_to_session(
+        session_id,
+        serde_json::to_value(message).map_err(|e| McpError::internal_error(e.to_string(), None))?,
+    );
+    rx.await.map_err(|_| {
+        McpError::internal_error("HTTP client response channel closed".to_string(), None)
+    })
+}
+
+/// Handle a client response (POST) that is the answer to a reverse request
+/// we sent via SSE (e.g. roots/list).
+async fn handle_client_response(
+    response: JsonRpcResponse<ClientResult>,
+    session_id: &str,
+    state: &HttpState,
+) -> Result<(), HttpError> {
+    let request_id = match response.id {
+        RequestId::Number(id) => id,
+        RequestId::String(_) => return Ok(()),
+    };
+
+    if let Some((_, tx)) = state
+        .pending_client_requests
+        .remove(&(session_id.to_string(), request_id))
+    {
+        let _ = tx.send(response.result);
+    }
+
+    Ok(())
+}
+
+/// If the session supports roots, spawn a task to request roots via SSE
+/// and cache the result.
+fn maybe_request_http_roots(state: Arc<HttpState>, session_id: String) {
+    if !state.roots_capable_sessions.contains_key(&session_id) {
+        return;
+    }
+    tokio::spawn(async move {
+        match send_http_client_request(
+            &state,
+            &session_id,
+            ServerRequest::ListRootsRequest(ListRootsRequest {
+                method: Default::default(),
+                extensions: Default::default(),
+            }),
+        )
+        .await
+        {
+            Ok(ClientResult::ListRootsResult(result)) => {
+                let target = NotificationTarget::Http {
+                    session_id: Arc::from(session_id.as_str()),
+                };
+                if state.router.set_roots_for_target(target, result.roots) {
+                    state.router.forward_roots_list_changed_to_upstreams().await;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    session_id = %session_id,
+                    "failed to refresh HTTP roots"
+                );
+            }
+        }
+    });
 }
 
 /// GET /mcp — open SSE stream for server-initiated notifications.
@@ -416,6 +516,13 @@ async fn delete_mcp(
             session_id: Arc::from(session_id.as_str()),
         };
         state.router.cleanup_subscriptions_for_target(&target).await;
+        state.roots_capable_sessions.remove(&session_id);
+        state
+            .pending_client_requests
+            .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
+        if state.router.clear_roots_for_target(&target) {
+            state.router.forward_roots_list_changed_to_upstreams().await;
+        }
         // Clean up per-client log level to prevent stale entries from
         // keeping the effective level permanently at a permissive value.
         state.router.remove_client_log_level(&session_id);
@@ -491,7 +598,7 @@ async fn get_server_card(
 async fn handle_request(
     req: JsonRpcRequest<ClientRequest>,
     headers: &HeaderMap,
-    state: &HttpState,
+    state: &Arc<HttpState>,
 ) -> Result<Response, HttpError> {
     let request_id = req.id.clone();
 
@@ -510,6 +617,11 @@ async fn handle_request(
             );
             // Store client type in session
             let _ = state.sessions.set_client_type(&session_id, client_type);
+
+            // Track roots capability for reverse-request roots fetching
+            if init_req.params.capabilities.roots.is_some() {
+                state.roots_capable_sessions.insert(session_id.clone(), ());
+            }
 
             let result = build_initialize_result(state.router.as_ref());
 
@@ -869,6 +981,9 @@ mod tests {
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
             auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
         })
     }
 
@@ -1588,6 +1703,9 @@ mod tests {
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
             auth_token: Some(Arc::from(token)),
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
         })
     }
 

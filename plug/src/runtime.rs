@@ -339,16 +339,29 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
         sse_channel_capacity: config.http.sse_channel_capacity,
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
         auth_token,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
     });
 
-    // Spawn cleanup listener for expired HTTP sessions — handles both
-    // resource subscription cleanup and per-client log level removal.
+    // Spawn cleanup listener for expired HTTP sessions — handles
+    // resource subscription cleanup, roots cache cleanup, and per-client log level removal.
+    let http_state_for_expiry = Arc::clone(&http_state);
     tokio::spawn(async move {
         while let Some(session_id) = expiry_rx.recv().await {
             let target = plug_core::notifications::NotificationTarget::Http {
                 session_id: Arc::from(session_id.as_str()),
             };
             tool_router.cleanup_subscriptions_for_target(&target).await;
+            http_state_for_expiry
+                .roots_capable_sessions
+                .remove(&session_id);
+            http_state_for_expiry
+                .pending_client_requests
+                .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
+            if tool_router.clear_roots_for_target(&target) {
+                tool_router.forward_roots_list_changed_to_upstreams().await;
+            }
             tool_router.remove_client_log_level(&session_id);
         }
     });
@@ -500,6 +513,9 @@ mod tests {
             sse_channel_capacity: 32,
             notification_task_started: AtomicBool::new(false),
             auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
         });
         let router = plug_core::http::server::build_router(state);
 

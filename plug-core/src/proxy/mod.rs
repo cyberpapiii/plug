@@ -115,6 +115,8 @@ pub struct ToolRouter {
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
     /// Resource subscription registry: upstream URI → set of downstream subscribers.
     resource_subscriptions: DashMap<String, HashSet<NotificationTarget>>,
+    /// Cached downstream roots per client. Upstream servers see the union via `list_roots_union()`.
+    client_roots: DashMap<NotificationTarget, Vec<Root>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -232,6 +234,7 @@ impl ToolRouter {
             pending_prompt_list_changed: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
             resource_subscriptions: DashMap::new(),
+            client_roots: DashMap::new(),
         }
     }
 
@@ -338,6 +341,58 @@ impl ToolRouter {
                             "failed to forward setLevel to upstream"
                         );
                     }
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    // ── Roots cache ──────────────────────────────────────────────────────
+
+    /// Update cached roots for a downstream client. Returns true if the roots changed.
+    pub fn set_roots_for_target(&self, target: NotificationTarget, roots: Vec<Root>) -> bool {
+        let changed = self
+            .client_roots
+            .get(&target)
+            .is_none_or(|existing| *existing != roots);
+        self.client_roots.insert(target, roots);
+        changed
+    }
+
+    /// Remove cached roots for a disconnected client. Returns true if entry existed.
+    pub fn clear_roots_for_target(&self, target: &NotificationTarget) -> bool {
+        self.client_roots.remove(target).is_some()
+    }
+
+    /// Return the union of all connected clients' roots, deduplicated by URI.
+    pub fn list_roots_union(&self) -> ListRootsResult {
+        let mut by_uri: HashMap<String, Root> = HashMap::new();
+        for entry in self.client_roots.iter() {
+            for root in entry.value().iter() {
+                by_uri
+                    .entry(root.uri.clone())
+                    .or_insert_with(|| root.clone());
+            }
+        }
+        let mut roots: Vec<Root> = by_uri.into_values().collect();
+        roots.sort_by(|a, b| a.uri.cmp(&b.uri));
+        let mut result = ListRootsResult::default();
+        result.roots = roots;
+        result
+    }
+
+    /// Notify all healthy upstream servers that roots have changed.
+    pub async fn forward_roots_list_changed_to_upstreams(&self) {
+        let upstreams = self.server_manager.healthy_upstreams();
+        let futures: Vec<_> = upstreams
+            .into_iter()
+            .map(|(name, upstream)| async move {
+                if let Err(error) = upstream.client.peer().notify_roots_list_changed().await {
+                    tracing::debug!(
+                        server = %name,
+                        error = %error,
+                        "failed to forward roots/list_changed to upstream"
+                    );
                 }
             })
             .collect();
@@ -2436,6 +2491,10 @@ pub struct ProxyHandler {
     notification_task_started: AtomicBool,
     /// Cancelled on drop to signal the notification fan-out task to exit.
     shutdown: CancellationToken,
+    /// Peer reference for reverse requests (roots queries).
+    downstream_peer: std::sync::OnceLock<Peer<RoleServer>>,
+    /// Whether the downstream client advertises roots capability.
+    roots_supported: AtomicBool,
 }
 
 impl Drop for ProxyHandler {
@@ -2452,6 +2511,8 @@ impl ProxyHandler {
             client_id: Arc::from(uuid::Uuid::new_v4().to_string()),
             notification_task_started: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
+            downstream_peer: std::sync::OnceLock::new(),
+            roots_supported: AtomicBool::new(false),
         }
     }
 
@@ -2463,6 +2524,8 @@ impl ProxyHandler {
             client_id: Arc::from(uuid::Uuid::new_v4().to_string()),
             notification_task_started: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
+            downstream_peer: std::sync::OnceLock::new(),
+            roots_supported: AtomicBool::new(false),
         }
     }
 
@@ -2507,6 +2570,10 @@ impl ServerHandler for ProxyHandler {
                 Ok(mut ct) => *ct = client_type,
                 Err(e) => tracing::warn!("client_type lock poisoned: {e}"),
             }
+
+            self.roots_supported
+                .store(request.capabilities.roots.is_some(), Ordering::SeqCst);
+            let _ = self.downstream_peer.set(context.peer.clone());
 
             context.peer.set_peer_info(request);
 
@@ -2594,11 +2661,14 @@ impl ServerHandler for ProxyHandler {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    // Clean up resource subscriptions for this disconnected client
+                    // Clean up resource subscriptions and roots cache for this disconnected client
                     let target = NotificationTarget::Stdio {
                         client_id: Arc::clone(&client_id),
                     };
                     router.cleanup_subscriptions_for_target(&target).await;
+                    if router.clear_roots_for_target(&target) {
+                        router.forward_roots_list_changed_to_upstreams().await;
+                    }
                 });
 
                 // Separate logging fan-out task (isolated from control notifications)
@@ -2639,6 +2709,69 @@ impl ServerHandler for ProxyHandler {
             }
 
             Ok(self.get_info())
+        }
+    }
+
+    fn on_initialized(
+        &self,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let client_id = Arc::clone(&self.client_id);
+        let peer = self.downstream_peer.get().cloned();
+        let roots_supported = self.roots_supported.load(Ordering::SeqCst);
+        async move {
+            if !roots_supported {
+                return;
+            }
+            if let Some(peer) = peer {
+                tokio::spawn(async move {
+                    match peer.list_roots().await {
+                        Ok(result) => {
+                            let target = NotificationTarget::Stdio { client_id };
+                            if router.set_roots_for_target(target, result.roots) {
+                                router.forward_roots_list_changed_to_upstreams().await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(error = %error, "failed to fetch initial stdio roots");
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn on_roots_list_changed(
+        &self,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let client_id = Arc::clone(&self.client_id);
+        let peer = self.downstream_peer.get().cloned();
+        let roots_supported = self.roots_supported.load(Ordering::SeqCst);
+        async move {
+            if !roots_supported {
+                return;
+            }
+            if let Some(peer) = peer {
+                tokio::spawn(async move {
+                    match peer.list_roots().await {
+                        Ok(result) => {
+                            let target = NotificationTarget::Stdio { client_id };
+                            if router.set_roots_for_target(target, result.roots) {
+                                router.forward_roots_list_changed_to_upstreams().await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %error,
+                                "failed to re-fetch stdio roots after list_changed"
+                            );
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -3584,5 +3717,185 @@ mod tests {
         // Without any upstream servers, no logging capability
         let caps = router.synthesized_capabilities();
         assert!(caps.logging.is_none());
+    }
+
+    // ── Roots cache tests ──────────────────────────────────────────────
+
+    /// Helper to construct `Root` (which is `#[non_exhaustive]` in rmcp 1.1).
+    fn make_root(uri: &str, name: Option<&str>) -> Root {
+        serde_json::from_value(serde_json::json!({
+            "uri": uri,
+            "name": name,
+        }))
+        .expect("valid Root JSON")
+    }
+
+    #[test]
+    fn list_roots_union_empty_when_no_clients() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let result = router.list_roots_union();
+        assert!(result.roots.is_empty());
+    }
+
+    #[test]
+    fn set_roots_for_target_returns_true_on_first_insert() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        let roots = vec![make_root("file:///project-a", Some("Project A"))];
+
+        assert!(router.set_roots_for_target(target, roots));
+    }
+
+    #[test]
+    fn set_roots_for_target_returns_false_when_unchanged() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        let roots = vec![make_root("file:///project-a", Some("Project A"))];
+
+        router.set_roots_for_target(target.clone(), roots.clone());
+        // Second call with same roots should report no change
+        assert!(!router.set_roots_for_target(target, roots));
+    }
+
+    #[test]
+    fn set_roots_for_target_returns_true_when_changed() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        let roots_a = vec![make_root("file:///project-a", Some("Project A"))];
+        let roots_b = vec![make_root("file:///project-b", Some("Project B"))];
+
+        router.set_roots_for_target(target.clone(), roots_a);
+        assert!(router.set_roots_for_target(target, roots_b));
+    }
+
+    #[test]
+    fn clear_roots_for_target_returns_true_when_existed() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        let roots = vec![make_root("file:///project-a", None)];
+
+        router.set_roots_for_target(target.clone(), roots);
+        assert!(router.clear_roots_for_target(&target));
+    }
+
+    #[test]
+    fn clear_roots_for_target_returns_false_when_not_existed() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("client-nonexistent"),
+        };
+        assert!(!router.clear_roots_for_target(&target));
+    }
+
+    #[test]
+    fn list_roots_union_deduplicates_by_uri() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        // Client 1 has roots A and B
+        let target1 = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        router.set_roots_for_target(
+            target1,
+            vec![
+                make_root("file:///shared", Some("Shared from 1")),
+                make_root("file:///only-1", Some("Only 1")),
+            ],
+        );
+
+        // Client 2 has roots A (duplicate URI) and C
+        let target2 = NotificationTarget::Http {
+            session_id: Arc::from("session-2"),
+        };
+        router.set_roots_for_target(
+            target2,
+            vec![
+                make_root("file:///shared", Some("Shared from 2")),
+                make_root("file:///only-2", Some("Only 2")),
+            ],
+        );
+
+        let result = router.list_roots_union();
+        // Should have 3 unique URIs: /shared, /only-1, /only-2
+        assert_eq!(result.roots.len(), 3);
+
+        let uris: Vec<&str> = result.roots.iter().map(|r| r.uri.as_str()).collect();
+        assert!(uris.contains(&"file:///shared"));
+        assert!(uris.contains(&"file:///only-1"));
+        assert!(uris.contains(&"file:///only-2"));
+    }
+
+    #[test]
+    fn list_roots_union_is_sorted_by_uri() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        router.set_roots_for_target(
+            target,
+            vec![
+                make_root("file:///z-project", None),
+                make_root("file:///a-project", None),
+                make_root("file:///m-project", None),
+            ],
+        );
+
+        let result = router.list_roots_union();
+        let uris: Vec<&str> = result.roots.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            vec![
+                "file:///a-project",
+                "file:///m-project",
+                "file:///z-project"
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_roots_removes_from_union() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let target1 = NotificationTarget::Stdio {
+            client_id: Arc::from("client-1"),
+        };
+        let target2 = NotificationTarget::Http {
+            session_id: Arc::from("session-2"),
+        };
+
+        router.set_roots_for_target(target1.clone(), vec![make_root("file:///project-1", None)]);
+        router.set_roots_for_target(target2, vec![make_root("file:///project-2", None)]);
+
+        assert_eq!(router.list_roots_union().roots.len(), 2);
+
+        // Clear client 1's roots
+        router.clear_roots_for_target(&target1);
+        let result = router.list_roots_union();
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.roots[0].uri, "file:///project-2");
     }
 }

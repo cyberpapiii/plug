@@ -14,9 +14,10 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
-    ResourceUpdatedNotificationParam, ServerCapabilities, SetLevelRequestParams, Tool,
+    ResourceUpdatedNotificationParam, RootsCapabilities, ServerCapabilities, SetLevelRequestParams,
+    Tool,
 };
-use rmcp::service::NotificationContext;
+use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -36,7 +37,29 @@ pub(crate) struct UpstreamClientHandler {
 
 impl ClientHandler for UpstreamClientHandler {
     fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+        let mut info = ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("plug", env!("CARGO_PKG_VERSION")),
+        );
+        info.capabilities.roots = Some(RootsCapabilities {
+            list_changed: Some(true),
+        });
+        info
+    }
+
+    fn list_roots(
+        &self,
+        _context: RequestContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = Result<rmcp::model::ListRootsResult, rmcp::ErrorData>> + Send + '_
+    {
+        let router = self.router.clone();
+        async move {
+            if let Some(router) = router.upgrade() {
+                Ok(router.list_roots_union())
+            } else {
+                Ok(rmcp::model::ListRootsResult::default())
+            }
+        }
     }
 
     fn on_tool_list_changed(
