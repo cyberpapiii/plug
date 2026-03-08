@@ -528,6 +528,15 @@ async fn handle_ipc_connection(
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
         ctx.client_registry.deregister(session_id);
+        let target = plug_core::notifications::NotificationTarget::Stdio {
+            client_id: std::sync::Arc::from(session_id.as_str()),
+        };
+        if ctx.engine.tool_router().clear_roots_for_target(&target) {
+            ctx.engine
+                .tool_router()
+                .forward_roots_list_changed_to_upstreams()
+                .await;
+        }
         ctx.engine.tool_router().remove_client_log_level(session_id);
     }
 
@@ -815,6 +824,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             ctx.client_registry.deregister(session_id);
+            let target = plug_core::notifications::NotificationTarget::Stdio {
+                client_id: std::sync::Arc::from(session_id.as_str()),
+            };
+            if ctx.engine.tool_router().clear_roots_for_target(&target) {
+                ctx.engine
+                    .tool_router()
+                    .forward_roots_list_changed_to_upstreams()
+                    .await;
+            }
             ctx.engine.tool_router().remove_client_log_level(session_id);
             ctx.session_id = None;
             IpcResponse::Ok
@@ -916,6 +934,44 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },
                 Err(error) => IpcResponse::Error {
                     code: "SERIALIZE_ERROR".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
+
+        IpcRequest::UpdateRoots { session_id, roots } => {
+            // Enforce session ownership
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            match serde_json::from_value::<Vec<rmcp::model::Root>>(roots.clone()) {
+                Ok(parsed_roots) => {
+                    let target = plug_core::notifications::NotificationTarget::Stdio {
+                        client_id: std::sync::Arc::from(session_id.as_str()),
+                    };
+                    if ctx
+                        .engine
+                        .tool_router()
+                        .set_roots_for_target(target, parsed_roots)
+                    {
+                        ctx.engine
+                            .tool_router()
+                            .forward_roots_list_changed_to_upstreams()
+                            .await;
+                    }
+                    IpcResponse::Ok
+                }
+                Err(error) => IpcResponse::Error {
+                    code: "INVALID_ROOTS".to_string(),
                     message: error.to_string(),
                 },
             }

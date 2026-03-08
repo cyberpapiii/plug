@@ -74,6 +74,13 @@ pub enum IpcRequest {
         /// JSON-RPC params object.
         params: Option<serde_json::Value>,
     },
+
+    /// Push updated workspace roots from a downstream client to the daemon.
+    UpdateRoots {
+        session_id: String,
+        /// Serialized `Vec<Root>` from the downstream client.
+        roots: serde_json::Value,
+    },
 }
 
 /// Custom Debug that redacts auth_token fields to prevent log leakage.
@@ -132,6 +139,10 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("McpRequest")
                 .field("session_id", session_id)
                 .field("method", method)
+                .finish(),
+            Self::UpdateRoots { session_id, .. } => f
+                .debug_struct("UpdateRoots")
+                .field("session_id", session_id)
                 .finish(),
         }
     }

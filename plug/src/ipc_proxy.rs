@@ -11,7 +11,7 @@ use std::time::Duration;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
-use rmcp::service::{Peer, RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, Peer, RequestContext, RoleServer};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -27,6 +27,8 @@ struct SharedConnection {
     /// Downstream peer — set during initialize, used to forward logging
     /// notifications pushed by the daemon over IPC.
     peer: std::sync::OnceLock<Peer<RoleServer>>,
+    /// Whether the downstream client advertises roots capability.
+    roots_supported: std::sync::atomic::AtomicBool,
 }
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
@@ -60,6 +62,7 @@ impl IpcProxyHandler {
             conn: Mutex::new(session),
             config_path,
             peer: std::sync::OnceLock::new(),
+            roots_supported: std::sync::atomic::AtomicBool::new(false),
         });
         let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
         Self { shared, heartbeat }
@@ -308,6 +311,12 @@ impl ServerHandler for IpcProxyHandler {
                 tracing::warn!(error = %e, "failed to update session client info");
             }
 
+            // Track roots capability before consuming request
+            self.shared.roots_supported.store(
+                request.capabilities.roots.is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+
             // Store peer for logging notification forwarding. The daemon
             // pushes LoggingNotification frames after registration; the
             // heartbeat and request round-trips forward them to this peer.
@@ -315,6 +324,48 @@ impl ServerHandler for IpcProxyHandler {
 
             context.peer.set_peer_info(request);
             Ok(self.get_info())
+        }
+    }
+
+    fn on_initialized(
+        &self,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let shared = Arc::clone(&self.shared);
+        async move {
+            if !shared
+                .roots_supported
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            if let Some(peer) = shared.peer.get().cloned() {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    refresh_roots_via_daemon(&shared, &peer).await;
+                });
+            }
+        }
+    }
+
+    fn on_roots_list_changed(
+        &self,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let shared = Arc::clone(&self.shared);
+        async move {
+            if !shared
+                .roots_supported
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            if let Some(peer) = shared.peer.get().cloned() {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    refresh_roots_via_daemon(&shared, &peer).await;
+                });
+            }
         }
     }
 
@@ -643,6 +694,86 @@ impl ServerHandler for IpcProxyHandler {
                     None,
                 )),
             }
+        }
+    }
+}
+
+/// Fetch roots from the downstream peer and push them to the daemon
+/// via `IpcRequest::UpdateRoots`.
+async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleServer>) {
+    let roots_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), peer.list_roots()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!("downstream roots request timed out");
+                return;
+            }
+        };
+    match roots_result {
+        Ok(result) => {
+            let roots_json = match serde_json::to_value(&result.roots) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "failed to serialize roots for IPC");
+                    return;
+                }
+            };
+            let mut conn = shared.conn.lock().await;
+            let request = IpcRequest::UpdateRoots {
+                session_id: conn.session_id.clone(),
+                roots: roots_json,
+            };
+            let payload = match serde_json::to_vec(&request) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(error = %e, "failed to serialize UpdateRoots");
+                    return;
+                }
+            };
+            if let Err(e) = ipc::write_frame(&mut conn.writer, &payload).await {
+                tracing::debug!(error = %e, "failed to send UpdateRoots to daemon");
+                return;
+            }
+            // Read response (skipping interleaved logging notifications)
+            loop {
+                match ipc::read_frame(&mut conn.reader).await {
+                    Ok(Some(frame)) => match serde_json::from_slice::<IpcResponse>(&frame) {
+                        Ok(IpcResponse::LoggingNotification { params }) => {
+                            if let Some(peer) = shared.peer.get() {
+                                if let Ok(notif_params) = serde_json::from_value::<
+                                    LoggingMessageNotificationParam,
+                                >(params)
+                                {
+                                    let _ = peer.notify_logging_message(notif_params).await;
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(IpcResponse::Ok) => break,
+                        Ok(IpcResponse::Error { code, message }) => {
+                            tracing::debug!(
+                                code = %code,
+                                message = %message,
+                                "daemon rejected UpdateRoots"
+                            );
+                            break;
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "invalid UpdateRoots response");
+                            break;
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "failed to read UpdateRoots response");
+                        break;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to fetch roots from downstream peer");
         }
     }
 }

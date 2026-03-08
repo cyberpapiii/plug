@@ -609,6 +609,9 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         sse_channel_capacity: 32,
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
         auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
     });
     let app = build_router(state.clone());
 
