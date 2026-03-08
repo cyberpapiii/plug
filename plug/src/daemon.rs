@@ -535,12 +535,40 @@ pub async fn run_daemon(
 /// to the IPC proxy client that initiated the tool call. The proxy side listens
 /// on the `reverse_request_rx` end of the channel.
 struct DaemonBridge {
-    session_id: String,
+    session_id: Arc<str>,
     reverse_request_tx: tokio::sync::mpsc::Sender<(
         IpcClientRequest,
         tokio::sync::oneshot::Sender<IpcClientResponse>,
     )>,
     client_registry: Arc<ClientRegistry>,
+}
+
+impl DaemonBridge {
+    /// Send a reverse request over the IPC channel and await the response.
+    async fn send_and_await(
+        &self,
+        request: IpcClientRequest,
+    ) -> Result<IpcClientResponse, McpError> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.reverse_request_tx
+            .send((request, resp_tx))
+            .await
+            .map_err(|_| {
+                McpError::internal_error(
+                    format!("IPC connection lost for session {}", self.session_id),
+                    None,
+                )
+            })?;
+        resp_rx.await.map_err(|_| {
+            McpError::internal_error(
+                format!(
+                    "IPC response channel closed for session {}",
+                    self.session_id
+                ),
+                None,
+            )
+        })
+    }
 }
 
 impl DownstreamBridge for DaemonBridge {
@@ -557,32 +585,17 @@ impl DownstreamBridge for DaemonBridge {
                 ))
             });
         }
-        let tx = self.reverse_request_tx.clone();
-        let session_id = self.session_id.clone();
         Box::pin(async move {
-            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-            tx.send((
-                IpcClientRequest::CreateElicitation { params: request },
-                resp_tx,
-            ))
-            .await
-            .map_err(|_| {
-                McpError::internal_error(
-                    format!("IPC connection lost for session {session_id}"),
-                    None,
-                )
-            })?;
-            match resp_rx.await {
-                Ok(IpcClientResponse::CreateElicitation { result }) => Ok(result),
-                Ok(IpcClientResponse::Error { message }) => {
+            match self
+                .send_and_await(IpcClientRequest::CreateElicitation { params: request })
+                .await?
+            {
+                IpcClientResponse::CreateElicitation { result } => Ok(result),
+                IpcClientResponse::Error { message } => {
                     Err(McpError::internal_error(message, None))
                 }
-                Ok(other) => Err(McpError::internal_error(
+                other => Err(McpError::internal_error(
                     format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-                Err(_) => Err(McpError::internal_error(
-                    format!("IPC response channel closed for session {session_id}"),
                     None,
                 )),
             }
@@ -602,29 +615,17 @@ impl DownstreamBridge for DaemonBridge {
                 ))
             });
         }
-        let tx = self.reverse_request_tx.clone();
-        let session_id = self.session_id.clone();
         Box::pin(async move {
-            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-            tx.send((IpcClientRequest::CreateMessage { params: request }, resp_tx))
-                .await
-                .map_err(|_| {
-                    McpError::internal_error(
-                        format!("IPC connection lost for session {session_id}"),
-                        None,
-                    )
-                })?;
-            match resp_rx.await {
-                Ok(IpcClientResponse::CreateMessage { result }) => Ok(result),
-                Ok(IpcClientResponse::Error { message }) => {
+            match self
+                .send_and_await(IpcClientRequest::CreateMessage { params: request })
+                .await?
+            {
+                IpcClientResponse::CreateMessage { result } => Ok(result),
+                IpcClientResponse::Error { message } => {
                     Err(McpError::internal_error(message, None))
                 }
-                Ok(other) => Err(McpError::internal_error(
+                other => Err(McpError::internal_error(
                     format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-                Err(_) => Err(McpError::internal_error(
-                    format!("IPC response channel closed for session {session_id}"),
                     None,
                 )),
             }
@@ -1062,7 +1063,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             // to this IPC proxy client.
             let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
             let bridge = Arc::new(DaemonBridge {
-                session_id: session_id.clone(),
+                session_id: Arc::from(session_id.as_str()),
                 reverse_request_tx: reverse_tx,
                 client_registry: Arc::clone(&ctx.client_registry),
             });
@@ -1929,7 +1930,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let bridge = DaemonBridge {
-            session_id: reg_result.session_id.clone(),
+            session_id: Arc::from(reg_result.session_id.as_str()),
             reverse_request_tx: tx,
             client_registry: Arc::clone(&registry),
         };
@@ -2000,7 +2001,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let bridge = DaemonBridge {
-            session_id: reg_result.session_id.clone(),
+            session_id: Arc::from(reg_result.session_id.as_str()),
             reverse_request_tx: tx,
             client_registry: Arc::clone(&registry),
         };

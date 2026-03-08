@@ -16,7 +16,7 @@ use crate::types::ServerStatus;
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 /// Current daemon/client IPC protocol version.
-pub const IPC_PROTOCOL_VERSION: u16 = 2;
+pub const IPC_PROTOCOL_VERSION: u16 = 3;
 
 /// Requests sent from CLI → daemon over Unix socket.
 ///

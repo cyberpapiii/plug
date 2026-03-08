@@ -52,13 +52,16 @@ pub struct HttpState {
     pub pending_client_requests: DashMap<(String, i64), oneshot::Sender<ClientResult>>,
     /// Counter for generating unique reverse-request IDs.
     pub reverse_request_counter: AtomicU64,
+    /// Per-session client capabilities for reverse-request gating.
+    pub client_capabilities: DashMap<String, ClientCapabilities>,
 }
 
 /// HTTP-specific bridge for forwarding reverse requests (elicitation, sampling)
 /// to a downstream HTTP client via its SSE stream.
 struct HttpBridge {
     state: Arc<HttpState>,
-    session_id: String,
+    session_id: Arc<str>,
+    capabilities: ClientCapabilities,
 }
 
 impl DownstreamBridge for HttpBridge {
@@ -66,14 +69,22 @@ impl DownstreamBridge for HttpBridge {
         &self,
         request: CreateElicitationRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        if self.capabilities.elicitation.is_none() {
+            return Box::pin(async {
+                Err(McpError::internal_error(
+                    "client does not support elicitation".to_string(),
+                    None,
+                ))
+            });
+        }
         let state = Arc::clone(&self.state);
-        let session_id = self.session_id.clone();
+        let session_id = Arc::clone(&self.session_id);
         Box::pin(async move {
             let result = send_http_client_request(
                 &state,
                 &session_id,
                 ServerRequest::CreateElicitationRequest(CreateElicitationRequest::new(request)),
-                None, // no bridge-level timeout for elicitation (human input)
+                Some(Duration::from_secs(600)), // generous upper-bound for human interaction
             )
             .await?;
             match result {
@@ -90,8 +101,16 @@ impl DownstreamBridge for HttpBridge {
         &self,
         request: CreateMessageRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
+        if self.capabilities.sampling.is_none() {
+            return Box::pin(async {
+                Err(McpError::internal_error(
+                    "client does not support sampling".to_string(),
+                    None,
+                ))
+            });
+        }
         let state = Arc::clone(&self.state);
-        let session_id = self.session_id.clone();
+        let session_id = Arc::clone(&self.session_id);
         Box::pin(async move {
             let result = send_http_client_request(
                 &state,
@@ -403,13 +422,20 @@ async fn post_mcp(
                 }
                 ClientNotification::InitializedNotification(_) => {
                     maybe_request_http_roots(Arc::clone(&state), session_id.clone());
+                    let caps = state
+                        .client_capabilities
+                        .get(&session_id)
+                        .map(|c| c.clone())
+                        .unwrap_or_default();
+                    let session_arc = Arc::<str>::from(session_id.as_str());
                     let bridge = Arc::new(HttpBridge {
                         state: Arc::clone(&state),
-                        session_id: session_id.clone(),
+                        session_id: Arc::clone(&session_arc),
+                        capabilities: caps,
                     });
                     state.router.register_downstream_bridge(
                         NotificationTarget::Http {
-                            session_id: Arc::from(session_id.as_str()),
+                            session_id: session_arc,
                         },
                         bridge,
                     );
@@ -612,6 +638,7 @@ async fn delete_mcp(
         };
         state.router.cleanup_subscriptions_for_target(&target).await;
         state.roots_capable_sessions.remove(&session_id);
+        state.client_capabilities.remove(&session_id);
         // Drop pending reverse-request senders so receivers get RecvError
         state
             .pending_client_requests
@@ -719,6 +746,11 @@ async fn handle_request(
             if init_req.params.capabilities.roots.is_some() {
                 state.roots_capable_sessions.insert(session_id.clone(), ());
             }
+
+            // Store client capabilities for bridge capability gating
+            state
+                .client_capabilities
+                .insert(session_id.clone(), init_req.params.capabilities.clone());
 
             let result = build_initialize_result(state.router.as_ref());
 
@@ -1081,6 +1113,7 @@ mod tests {
             roots_capable_sessions: DashMap::new(),
             pending_client_requests: DashMap::new(),
             reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
         })
     }
 
@@ -1803,6 +1836,7 @@ mod tests {
             roots_capable_sessions: DashMap::new(),
             pending_client_requests: DashMap::new(),
             reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
         })
     }
 

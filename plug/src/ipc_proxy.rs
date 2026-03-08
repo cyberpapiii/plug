@@ -140,29 +140,32 @@ impl IpcProxyHandler {
                     reconnectable: true,
                 })?;
 
-            // Check if this is a DaemonToProxyMessage (has "envelope" key) or
-            // a plain IpcResponse (has "type" key). The daemon sends reverse
-            // requests wrapped in DaemonToProxyMessage during tool calls.
-            if let Ok(daemon_msg) = serde_json::from_slice::<DaemonToProxyMessage>(&frame) {
+            // Discriminate frame type by tag key: DaemonToProxyMessage uses
+            // `"envelope"`, plain IpcResponse uses `"type"`. Check for the
+            // envelope key first to avoid double-parsing on the hot path
+            // (normal frames like pings never contain `"envelope"`).
+            if frame.windows(10).any(|w| w == b"\"envelope\"") {
+                // Parse as DaemonToProxyMessage (envelope-wrapped)
+                let daemon_msg: DaemonToProxyMessage =
+                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                        message: format!("invalid envelope message: {e}"),
+                        reconnectable: false,
+                    })?;
                 match daemon_msg {
-                    DaemonToProxyMessage::Response { inner } => {
-                        // Unwrapped response — process like a normal IpcResponse
-                        match inner {
-                            IpcResponse::LoggingNotification { params } => {
-                                if let Some(peer) = peer {
-                                    if let Ok(notif_params) =
-                                        serde_json::from_value::<LoggingMessageNotificationParam>(
-                                            params,
-                                        )
-                                    {
-                                        let _ = peer.notify_logging_message(notif_params).await;
-                                    }
+                    DaemonToProxyMessage::Response { inner } => match inner {
+                        IpcResponse::LoggingNotification { params } => {
+                            if let Some(peer) = peer {
+                                if let Ok(notif_params) = serde_json::from_value::<
+                                    LoggingMessageNotificationParam,
+                                >(params)
+                                {
+                                    let _ = peer.notify_logging_message(notif_params).await;
                                 }
-                                continue;
                             }
-                            other => return Ok(other),
+                            continue;
                         }
-                    }
+                        other => return Ok(other),
+                    },
                     DaemonToProxyMessage::ReverseRequest { id, request } => {
                         // Handle reverse request from daemon (elicitation / sampling)
                         let response =
@@ -184,8 +187,7 @@ impl IpcProxyHandler {
                 }
             }
 
-            // Fall through: parse as plain IpcResponse (backward compatible
-            // with daemons that haven't been updated to use DaemonToProxyMessage).
+            // Plain IpcResponse (no envelope key)
             let response: IpcResponse =
                 serde_json::from_slice(&frame).map_err(|e| TransportFailure {
                     message: format!("invalid IPC response: {e}"),

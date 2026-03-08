@@ -621,6 +621,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         roots_capable_sessions: dashmap::DashMap::new(),
         pending_client_requests: dashmap::DashMap::new(),
         reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
     });
     let app = build_router(state.clone());
 
@@ -1200,6 +1201,7 @@ async fn test_http_elicitation_reverse_request_round_trip() {
         roots_capable_sessions: dashmap::DashMap::new(),
         pending_client_requests: dashmap::DashMap::new(),
         reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
     });
     let app = build_router(state.clone());
 
@@ -1352,6 +1354,189 @@ async fn test_http_elicitation_reverse_request_round_trip() {
     assert!(
         response_text.contains("reverse=elicitation:Accept"),
         "expected elicitation:Accept in HTTP response, got: {response_text}"
+    );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP: sampling reverse-request round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_sampling_reverse_request_round_trip() {
+    let mut config = Config::default();
+    config.servers.insert(
+        "mock".to_string(),
+        mock_server_config_with_reverse_request("echo", "sampling"),
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let state = Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        cancel: CancellationToken::new(),
+        sse_channel_capacity: 32,
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
+    });
+    let app = build_router(state.clone());
+
+    // 1. Initialize with sampling capability
+    let initialize_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {
+                "sampling": {},
+                "elicitation": {
+                    "form": {},
+                    "url": {}
+                }
+            },
+            "clientInfo": { "name": "reverse-test-http-sampling", "version": "1.0" }
+        }
+    });
+    let initialize_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&initialize_body).unwrap()))
+        .unwrap();
+    let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+    let session_id = initialize_resp
+        .headers()
+        .get(HTTP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Send initialized notification (triggers bridge registration)
+    let initialized_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let initialized_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(serde_json::to_vec(&initialized_body).unwrap()))
+        .unwrap();
+    let _ = app.clone().oneshot(initialized_req).await.unwrap();
+
+    // 3. Open SSE stream
+    let sse_req = HttpRequest::builder()
+        .method("GET")
+        .uri("/mcp")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header("accept", "text/event-stream")
+        .body(Body::empty())
+        .unwrap();
+    let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+
+    // 4. Spawn tools/call POST in background task
+    let app_clone = app.clone();
+    let session_id_clone = session_id.clone();
+    let call_handle = tokio::spawn(async move {
+        // Small delay to let SSE stream establish
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let call_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "Mock__echo",
+                "arguments": { "input": "http-sampling-test" }
+            }
+        });
+        let call_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(HTTP_SESSION_ID_HEADER, &session_id_clone)
+            .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+            .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+            .unwrap();
+        let call_resp = app_clone.oneshot(call_req).await.unwrap();
+        let call_bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&call_bytes).unwrap()
+    });
+
+    // 5. Read SSE stream for sampling request
+    let mut stream = sse_resp.into_body().into_data_stream();
+    use futures::StreamExt;
+
+    let mut sampling_request_id: Option<serde_json::Value> = None;
+    let sse_timeout = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            for line in text.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if json.get("method").and_then(|m| m.as_str())
+                            == Some("sampling/createMessage")
+                        {
+                            sampling_request_id = json.get("id").cloned();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        sse_timeout.is_ok(),
+        "timed out waiting for sampling request on SSE stream"
+    );
+    let request_id = sampling_request_id.expect("sampling request id should be captured");
+
+    // 6. POST sampling response
+    let sampling_response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "role": "assistant",
+            "content": { "type": "text", "text": "test-http-sampling-response" },
+            "model": "mock-model"
+        }
+    });
+    let resp_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(serde_json::to_vec(&sampling_response).unwrap()))
+        .unwrap();
+    let _ = app.clone().oneshot(resp_req).await.unwrap();
+
+    // 7. Await tools/call completion
+    let call_result = tokio::time::timeout(Duration::from_secs(30), call_handle)
+        .await
+        .expect("tools/call timed out")
+        .expect("tools/call task panicked");
+
+    let response_text = call_result["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        response_text.contains("reverse=sampling:model=mock-model"),
+        "expected sampling:model=mock-model in HTTP response, got: {response_text}"
     );
 
     engine.shutdown().await;

@@ -342,6 +342,7 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
         roots_capable_sessions: dashmap::DashMap::new(),
         pending_client_requests: dashmap::DashMap::new(),
         reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
     });
 
     // Spawn cleanup listener for expired HTTP sessions — handles
@@ -355,6 +356,9 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
             tool_router.cleanup_subscriptions_for_target(&target).await;
             http_state_for_expiry
                 .roots_capable_sessions
+                .remove(&session_id);
+            http_state_for_expiry
+                .client_capabilities
                 .remove(&session_id);
             http_state_for_expiry
                 .pending_client_requests
@@ -516,6 +520,7 @@ mod tests {
             roots_capable_sessions: dashmap::DashMap::new(),
             pending_client_requests: dashmap::DashMap::new(),
             reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
         });
         let router = plug_core::http::server::build_router(state);
 

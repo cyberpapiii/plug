@@ -2606,6 +2606,7 @@ fn build_invoke_tool_meta_tool() -> Tool {
 /// back to the downstream client via its `Peer<RoleServer>`.
 struct StdioBridge {
     peer: Peer<RoleServer>,
+    capabilities: ClientCapabilities,
 }
 
 impl DownstreamBridge for StdioBridge {
@@ -2613,6 +2614,14 @@ impl DownstreamBridge for StdioBridge {
         &self,
         request: CreateElicitationRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        if self.capabilities.elicitation.is_none() {
+            return Box::pin(async {
+                Err(McpError::internal_error(
+                    "client does not support elicitation".to_string(),
+                    None,
+                ))
+            });
+        }
         let peer = self.peer.clone();
         Box::pin(async move {
             peer.create_elicitation(request)
@@ -2625,6 +2634,14 @@ impl DownstreamBridge for StdioBridge {
         &self,
         request: CreateMessageRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
+        if self.capabilities.sampling.is_none() {
+            return Box::pin(async {
+                Err(McpError::internal_error(
+                    "client does not support sampling".to_string(),
+                    None,
+                ))
+            });
+        }
         let peer = self.peer.clone();
         Box::pin(async move {
             peer.create_message(request)
@@ -2647,6 +2664,8 @@ pub struct ProxyHandler {
     downstream_peer: std::sync::OnceLock<Peer<RoleServer>>,
     /// Whether the downstream client advertises roots capability.
     roots_supported: AtomicBool,
+    /// Client capabilities from initialize handshake, for bridge capability gating.
+    client_capabilities: std::sync::RwLock<ClientCapabilities>,
 }
 
 impl Drop for ProxyHandler {
@@ -2669,6 +2688,7 @@ impl ProxyHandler {
             shutdown: CancellationToken::new(),
             downstream_peer: std::sync::OnceLock::new(),
             roots_supported: AtomicBool::new(false),
+            client_capabilities: std::sync::RwLock::new(ClientCapabilities::default()),
         }
     }
 
@@ -2682,6 +2702,7 @@ impl ProxyHandler {
             shutdown: CancellationToken::new(),
             downstream_peer: std::sync::OnceLock::new(),
             roots_supported: AtomicBool::new(false),
+            client_capabilities: std::sync::RwLock::new(ClientCapabilities::default()),
         }
     }
 
@@ -2729,6 +2750,9 @@ impl ServerHandler for ProxyHandler {
 
             self.roots_supported
                 .store(request.capabilities.roots.is_some(), Ordering::SeqCst);
+            if let Ok(mut caps) = self.client_capabilities.write() {
+                *caps = request.capabilities.clone();
+            }
             let _ = self.downstream_peer.set(context.peer.clone());
 
             context.peer.set_peer_info(request);
@@ -2876,11 +2900,19 @@ impl ServerHandler for ProxyHandler {
         let client_id = Arc::clone(&self.client_id);
         let peer = self.downstream_peer.get().cloned();
         let roots_supported = self.roots_supported.load(Ordering::SeqCst);
+        let caps = self
+            .client_capabilities
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_default();
         async move {
             if let Some(peer) = &peer {
                 // Register the stdio bridge for reverse-request forwarding
                 // (elicitation, sampling) regardless of roots support.
-                let bridge = Arc::new(StdioBridge { peer: peer.clone() });
+                let bridge = Arc::new(StdioBridge {
+                    peer: peer.clone(),
+                    capabilities: caps,
+                });
                 router.register_downstream_bridge(
                     NotificationTarget::Stdio {
                         client_id: Arc::clone(&client_id),
