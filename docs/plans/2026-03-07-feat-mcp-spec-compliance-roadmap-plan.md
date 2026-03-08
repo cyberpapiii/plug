@@ -31,20 +31,27 @@ last_audit: 2026-03-07
 | Item | Status | Tracking |
 |------|--------|----------|
 | resources/subscribe over daemon IPC | Intentionally unsupported (returns honest error) | `daemon.rs:1205` |
-| Stale subscriptions after route refresh | Open bug | `todos/039` |
-| resources/list_changed forwarding | Capability advertised as `list_changed: false` (honest but limited) | -- |
-| prompts/list_changed forwarding | Same | -- |
+| MCP-Protocol-Version on upstream requests | Downstream validation done (PR #31), upstream send-side not yet | -- |
 | Runtime hot-reload beyond server add/remove | "restart required" boundary | `reload.rs:135` |
+| Daemon IPC notification parity | Only logging push frames; progress/cancelled/list_changed not pushed over IPC | -- |
+
+### Implemented by PR #31 (moved from partial/missing)
+
+| Item | PR | Notes |
+|------|----|-------|
+| Stale subscriptions after route refresh | #31 | Subscription pruning + rebind in `refresh_tools()`, todo 039 closed |
+| resources/list_changed forwarding | #31 | Coalesced refresh + fan-out (stdio/HTTP), IPC masked to `false` |
+| prompts/list_changed forwarding | #31 | Coalesced refresh + fan-out (stdio/HTTP), IPC masked to `false` |
+| MCP-Protocol-Version downstream validation | #31 | `validate_protocol_version_for_post()` in `http/server.rs` |
+| HTTP completion/complete handler | #31 | `CompleteRequest` branch in `handle_request()` |
 
 ### Not implemented in code yet
 
-- resource_link explicit handling / validation
 - sampling/createMessage
 - elicitation/create
 - roots/list
 - Legacy SSE upstream transport
 - OAuth / remote commercial MCP auth flows
-- MCP-Protocol-Version header validation
 - Broader Stream B connectivity-expansion work
 
 ---
@@ -210,14 +217,17 @@ All changes build on existing patterns in the codebase:
 
 ---
 
-#### Remaining Stream A Follow-ups (not yet implemented)
+#### Remaining Stream A Follow-ups
 
-These items from the original A3 plan were deferred:
+All Stream A follow-ups are complete except one send-side item:
 
 - [ ] **MCP-Protocol-Version on upstream requests**: Ensure header sent on all upstream HTTP requests
-- [x] **MCP-Protocol-Version validation on downstream**: Validate header on incoming POST requests
-- [x] **resources/list_changed forwarding**: Advertised + forwarded via coalesced refresh
-- [x] **prompts/list_changed forwarding**: Advertised + forwarded via coalesced refresh
+- [x] **MCP-Protocol-Version validation on downstream**: Validate header on incoming POST requests (PR #31)
+- [x] **resources/list_changed forwarding**: Advertised + forwarded via coalesced refresh (PR #31)
+- [x] **prompts/list_changed forwarding**: Advertised + forwarded via coalesced refresh (PR #31)
+- [x] **HTTP completion/complete handler**: `CompleteRequest` routing in HTTP server (PR #31)
+- [x] **Stale subscription cleanup after route refresh**: Pruning + rebind in `refresh_tools()` (PR #31)
+- [x] **IPC capability honesty for list_changed**: Masked to `false` for resources/prompts (PR #31)
 
 ---
 
@@ -485,8 +495,8 @@ These 10 features are deferred based on research findings. Each has a "revisit w
 - [x] `structuredContent` in tool results passes through unmodified
 - [x] `completion/complete` requests forwarded to correct upstream server
 - [x] Resource subscribe/unsubscribe forwarded with lifecycle cleanup
-- [ ] `MCP-Protocol-Version` header sent on upstream HTTP requests and validated on downstream
-- [ ] Capabilities advertised downstream accurately reflect plug's actual forwarding ability
+- [ ] `MCP-Protocol-Version` header sent on upstream HTTP requests ~~and validated on downstream~~ (downstream validation done, PR #31)
+- [x] Capabilities advertised downstream accurately reflect plug's actual forwarding ability (PR #31: list_changed forwarded for stdio/HTTP, masked for IPC)
 - [ ] Legacy SSE upstream servers connectable via `transport = "sse"` config (or auto-detected)
 - [ ] OAuth 2.1 + PKCE flow authenticates to remote MCP servers
 - [ ] Token refresh prevents session expiry for OAuth-protected servers
