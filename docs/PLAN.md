@@ -1,23 +1,26 @@
 # Current Plan
 
 This document tracks the current product state and the next remaining work after the merged Phase
-1-3 tranches.
+1-3 tranches and Stream A follow-ups.
 
 ## Current State
 
-`plug` has completed the major stabilization and protocol-surface work that used to sit behind the
-old `v0.1` plan:
+`plug` has completed the major stabilization, protocol-surface, and protocol-correctness work:
 
 - stabilization and truth fixes
-- notification forwarding
+- notification forwarding (logging, tools/list_changed, resources/list_changed, prompts/list_changed)
 - progress and cancellation routing
-- resources/prompts forwarding
+- resources/prompts forwarding with subscribe/unsubscribe lifecycle
+- completion forwarding across all three transports (stdio, HTTP, IPC)
+- structured output pass-through (outputSchema, structuredContent, resource_link)
 - pagination
-- capability synthesis
+- capability synthesis (honest per-transport masking)
 - meta-tool mode
 - end-to-end transport coverage
-- daemon continuity recovery
+- daemon continuity recovery (stdio clients via IPC proxy reconnect)
 - session-store abstraction seam and stateless design prep
+- MCP-Protocol-Version header validation on downstream HTTP POST requests
+- subscription pruning and rebind on route refresh (todo 039 resolved)
 
 ## What Exists Today
 
@@ -27,22 +30,28 @@ The current product shape is:
 - `plug serve` for Streamable HTTP downstream clients, with optional HTTPS via configured cert/key paths
 - shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
 - daemon-backed local sharing with reconnecting IPC proxy sessions
-- targeted notification fan-out to stdio and HTTP
+- targeted notification fan-out to stdio and HTTP (IPC limited to logging)
 - meta-tool mode as an opt-in reduced discovery surface
+- downstream HTTP bearer token auth for non-loopback binding
 
-## Remaining Work Before `v0.2.0`
+## Remaining Work
 
-The main remaining release-closeout work is documentation and release hygiene:
+### Stream B: Connectivity Expansion (next priority)
 
-- bring the tracked operating docs in sync with the merged code
+These are the open features that require new infrastructure:
+
+- **roots forwarding** — forward `roots/list` from upstream servers to downstream clients, propagate `roots/list_changed` notifications
+- **elicitation / sampling** — reverse-request routing from upstream to the specific downstream client whose tool call triggered the request
+- **legacy SSE upstream transport** — custom transport via `reqwest-eventsource` for SSE-only remote servers (Neon, Firecrawl, Figma, Linear, Atlassian)
+- **OAuth 2.1 + PKCE** — authenticate to upstream remote MCP servers with token refresh lifecycle
+
+### Smaller open items
+
+- MCP-Protocol-Version header on outgoing upstream HTTP requests (send-side, not just validate-side)
+- daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
+- dedicated tests for `structuredContent` and `resource_link` end-to-end pass-through
+
+### Documentation and release hygiene
+
 - update the risk register to current remaining risks
 - reduce the research breadcrumb list to the still-open questions
-- choose and create the `v0.2.0` tag after merge
-
-## Post-`v0.2.0` Work
-
-Likely next roadmap areas after the release boundary:
-
-- additional upstream restart / recovery proof
-- deeper stateless downstream design or implementation
-- broader ecosystem-forward work such as Tasks support once the spec direction settles

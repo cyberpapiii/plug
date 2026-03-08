@@ -3,8 +3,9 @@ use std::sync::Arc;
 use rmcp::model::{
     CancelledNotification, CancelledNotificationParam, LoggingMessageNotification,
     LoggingMessageNotificationParam, ProgressNotification, ProgressNotificationParam,
-    ResourceUpdatedNotification, ResourceUpdatedNotificationParam,
-    ServerJsonRpcMessage, ServerNotification, ToolListChangedNotification,
+    PromptListChangedNotification, ResourceListChangedNotification, ResourceUpdatedNotification,
+    ResourceUpdatedNotificationParam, ServerJsonRpcMessage, ServerNotification,
+    ToolListChangedNotification,
 };
 
 /// Internal protocol notifications used for downstream transport fan-out.
@@ -14,6 +15,8 @@ use rmcp::model::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolNotification {
     ToolListChanged,
+    ResourceListChanged,
+    PromptListChanged,
     Progress {
         target: NotificationTarget,
         params: ProgressNotificationParam,
@@ -46,6 +49,16 @@ impl ProtocolNotification {
                     ToolListChangedNotification::default(),
                 ))
             }
+            ProtocolNotification::ResourceListChanged => ServerJsonRpcMessage::notification(
+                ServerNotification::ResourceListChangedNotification(
+                    ResourceListChangedNotification::default(),
+                ),
+            ),
+            ProtocolNotification::PromptListChanged => ServerJsonRpcMessage::notification(
+                ServerNotification::PromptListChangedNotification(
+                    PromptListChangedNotification::default(),
+                ),
+            ),
             ProtocolNotification::Progress { params, .. } => ServerJsonRpcMessage::notification(
                 ServerNotification::ProgressNotification(ProgressNotification::new(params.clone())),
             ),
@@ -60,11 +73,9 @@ impl ProtocolNotification {
                 ))
             }
             ProtocolNotification::LoggingMessage { params } => {
-                ServerJsonRpcMessage::notification(
-                    ServerNotification::LoggingMessageNotification(
-                        LoggingMessageNotification::new(params.clone()),
-                    ),
-                )
+                ServerJsonRpcMessage::notification(ServerNotification::LoggingMessageNotification(
+                    LoggingMessageNotification::new(params.clone()),
+                ))
             }
         }
     }

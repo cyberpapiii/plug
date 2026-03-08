@@ -194,9 +194,7 @@ pub enum IpcResponse {
     /// Sent asynchronously by the daemon (interleaved with responses) after
     /// a proxy client registers. The payload is a serialized
     /// `LoggingMessageNotificationParam`.
-    LoggingNotification {
-        params: serde_json::Value,
-    },
+    LoggingNotification { params: serde_json::Value },
 }
 
 /// Check whether a request requires the daemon master auth token.

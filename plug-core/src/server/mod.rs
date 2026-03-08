@@ -68,6 +68,40 @@ impl ClientHandler for UpstreamClientHandler {
         }
     }
 
+    fn on_resource_list_changed(
+        &self,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                tracing::debug!(
+                    server = %server_id,
+                    "received resources/list_changed from upstream"
+                );
+                router.schedule_resource_list_changed_refresh();
+            }
+        }
+    }
+
+    fn on_prompt_list_changed(
+        &self,
+        _context: NotificationContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                tracing::debug!(
+                    server = %server_id,
+                    "received prompts/list_changed from upstream"
+                );
+                router.schedule_prompt_list_changed_refresh();
+            }
+        }
+    }
+
     fn on_progress(
         &self,
         params: ProgressNotificationParam,
@@ -226,9 +260,7 @@ impl ServerManager {
                             if let Some(router) = self.tool_router().upgrade() {
                                 let level = router.log_level();
                                 let params = SetLevelRequestParams::new(level);
-                                if let Err(e) =
-                                    upstream.client.peer().set_level(params).await
-                                {
+                                if let Err(e) = upstream.client.peer().set_level(params).await {
                                     tracing::debug!(
                                         server = %name,
                                         error = %e,
