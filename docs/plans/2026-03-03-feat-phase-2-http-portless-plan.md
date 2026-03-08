@@ -7,6 +7,10 @@ date: 2026-03-03
 
 # feat: Phase 2 — Streamable HTTP Server, HTTP Client
 
+> Historical planning note: This file is implementation history from 2026-03-03. It is not a
+> current-state source of truth. Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for the
+> current project state.
+
 ## Enhancement Summary
 
 **Deepened on:** 2026-03-03

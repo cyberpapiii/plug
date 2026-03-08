@@ -11,6 +11,7 @@ tags:
   - utf8
   - secret-redaction
 module: "plug-core (circuit.rs, health.rs, proxy/mod.rs, server/mod.rs, types.rs, config/mod.rs)"
+note: "Historical solution record from the Phase 3 implementation window. It includes rmcp 1.0.0-era details and should not be treated as current-state truth."
 symptom: |
   Multiple integration bugs surfaced during Phase 3 resilience implementation:
   1. Circuit breaker semaphore permits accumulate across half-open cycles

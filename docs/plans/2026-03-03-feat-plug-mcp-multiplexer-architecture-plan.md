@@ -7,6 +7,10 @@ date: 2026-03-03
 
 # Plug MCP Multiplexer — Architecture & Implementation Plan
 
+> Historical planning note: This file is the original architecture plan from 2026-03-03. It is
+> valuable design context, but it is not the canonical current-state source of truth. Use
+> `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current implementation status.
+
 ## Overview
 
 Plug is a single-binary Rust MCP multiplexer that sits between N AI coding clients and M upstream MCP servers. One install, one config, every client connected, every server shared. This plan incorporates findings from 6 parallel deep-research agents that resolved 29+ open questions, plus 8 parallel review agents that stress-tested every architectural decision.

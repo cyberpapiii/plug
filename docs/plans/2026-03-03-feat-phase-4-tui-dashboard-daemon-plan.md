@@ -7,6 +7,10 @@ date: 2026-03-03
 
 # feat: Phase 4 TUI Dashboard and Daemon Mode
 
+> Historical planning note: This file is design history from 2026-03-03 and includes TUI work that
+> is not part of the current product baseline. It is not a current-state source of truth. Use
+> `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for the current project state.
+
 ## Enhancement Summary
 
 **Deepened on:** 2026-03-03

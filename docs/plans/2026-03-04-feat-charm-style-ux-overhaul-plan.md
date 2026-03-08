@@ -8,6 +8,10 @@ origin: docs/brainstorms/2026-03-04-charm-style-ux-overhaul-brainstorm.md
 
 # feat: Charm-Style UX Overhaul
 
+> Historical planning note: This UX/TUI design plan is not the current product baseline and should
+> not be used as a current-state reference. Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md`
+> for current product state.
+
 ## Enhancement Summary
 
 **Deepened on:** 2026-03-04

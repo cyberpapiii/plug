@@ -14,6 +14,8 @@ severity: high
 tags:
   - rmcp
   - mcp
+
+note: "Historical integration report from the early rmcp 1.0.0 adoption phase. Useful as implementation archaeology, not as current-state truth."
   - arc-swap
   - figment
   - async-rust

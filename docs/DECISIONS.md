@@ -1,5 +1,10 @@
 # Architecture Decision Records
 
+> Historical ADR note: These decisions were recorded during pre-implementation research on
+> 2026-03-03. They are valuable historical context, but they are not the canonical current-state
+> source of truth. Use `docs/PROJECT-STATE-SNAPSHOT.md`, `docs/PLAN.md`, and current code on `main`
+> for the live implementation baseline.
+
 Decisions made during pre-implementation research (2026-03-03). Each ADR follows: Context → Decision → Consequences.
 
 ---

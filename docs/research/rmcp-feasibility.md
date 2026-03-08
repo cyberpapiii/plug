@@ -1,5 +1,9 @@
 # rmcp Feasibility Study for Plug (MCP Multiplexer/Fanout Proxy)
 
+> Historical research note: This is a point-in-time feasibility study from 2026-03-03. It reflects
+> the SDK and project state at the time of research, not the current merged state on `main`. Use
+> `docs/PROJECT-STATE-SNAPSHOT.md`, `docs/PLAN.md`, and current code on `main` for live status.
+
 **Date:** 2026-03-03
 **rmcp version evaluated:** 1.0.0 (released 2026-03-03)
 **Repository:** https://github.com/modelcontextprotocol/rust-sdk

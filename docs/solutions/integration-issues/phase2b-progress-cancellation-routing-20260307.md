@@ -12,6 +12,7 @@ tags:
   - correlation
 module: plug-core
 date: 2026-03-07
+note: "Historical solution record for the original Phase 2B landing. Current transport parity must be checked against main."
 symptom: |
   After Phase 2A, plug could receive upstream notifications and broadcast tools/list_changed,
   but request-scoped control flow was still missing. Downstream notifications/cancelled were

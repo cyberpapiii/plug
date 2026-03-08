@@ -25,14 +25,23 @@ Method:
 
 Using the actively tracked roadmap items, not the older speculative phase plans.
 
-As of PR #31 merge (`b5d90f7`, 2026-03-08):
+As of PR #31 merge (`b5d90f7`, 2026-03-08), Stream A protocol correctness is complete on `main`.
 
-- `done`: 15
-- `partial`: 4
-- `missing`: 4
+The remaining missing work on `main` is:
 
-Stream A protocol correctness is complete. The remaining `missing` items are all Stream B
-connectivity expansion (roots, elicitation, legacy SSE, OAuth) plus sampling.
+- roots forwarding
+- elicitation
+- sampling
+- legacy SSE upstream transport
+- OAuth / remote commercial MCP auth flows
+- upstream `MCP-Protocol-Version` send-side
+
+The remaining partial areas on `main` are transport-bounded or under-proven:
+
+- daemon IPC notification parity beyond logging
+- reconnect-based daemon continuity proof is narrower than full cross-transport persistence
+- dedicated end-to-end proof for `structuredContent`
+- dedicated end-to-end proof for `resource_link`
 
 ## Checklist
 
