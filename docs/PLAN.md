@@ -5,7 +5,8 @@ This document tracks the current product state and the next remaining work after
 
 ## Current State
 
-`plug` has completed the major stabilization, protocol-surface, and protocol-correctness work:
+`plug` has completed the major stabilization, protocol-surface, protocol-correctness, and roots
+forwarding work:
 
 - stabilization and truth fixes
 - notification forwarding (logging, tools/list_changed, resources/list_changed, prompts/list_changed)
@@ -21,6 +22,7 @@ This document tracks the current product state and the next remaining work after
 - session-store abstraction seam and stateless design prep
 - MCP-Protocol-Version header validation on downstream HTTP POST requests
 - subscription pruning and rebind on route refresh (todo 039 resolved)
+- roots forwarding with union cache across stdio, HTTP, and daemon IPC
 
 ## What Exists Today
 
@@ -40,7 +42,6 @@ The current product shape is:
 
 These are the open features that require new infrastructure:
 
-- **roots forwarding** — forward `roots/list` from upstream servers to downstream clients, propagate `roots/list_changed` notifications
 - **elicitation / sampling** — reverse-request routing from upstream to the specific downstream client whose tool call triggered the request
 - **legacy SSE upstream transport** — custom transport via `reqwest-eventsource` for SSE-only remote servers (Neon, Firecrawl, Figma, Linear, Atlassian)
 - **OAuth 2.1 + PKCE** — authenticate to upstream remote MCP servers with token refresh lifecycle

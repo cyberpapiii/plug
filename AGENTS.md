@@ -56,8 +56,7 @@ Plans are not current truth. Historical docs are not current truth.
 
 ## Repo-Specific Gotchas
 
-- There are many active worktrees. Do not confuse worktree state with `main`.
-- `feat/roots-forwarding` is branch-only candidate state until merged.
+- There are many stale worktrees from prior development. Do not confuse worktree state with `main`.
 - `fix/subscription-rebind-confidence` is an extraction source, not a merge target and not current truth.
 - Older `docs/plans/*` files may still say `status: active` but are historical planning context.
 - `CLAUDE.md` and this file are repo-local CE adapters, not a second workflow system.

@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `f2cf637816c508e33042a5e6fe39a76afa98f4ef`
+Baseline: `main` @ `3e16fe4` (post-merge of PR #33 truth guardrails + PR #32 roots forwarding)
 
 This is the canonical current-state doc for the project.
 
@@ -25,6 +25,7 @@ Implemented on `main`:
 - reconnecting IPC proxy sessions
 - session-store seam / stateless prep
 - downstream protocol-version validation
+- roots forwarding with union cache across stdio, HTTP, and daemon IPC
 
 Partial on `main`:
 
@@ -34,7 +35,6 @@ Partial on `main`:
 
 Missing on `main`:
 
-- roots forwarding
 - elicitation
 - sampling
 - legacy SSE upstream transport
@@ -45,8 +45,7 @@ Missing on `main`:
 
 Candidate future state only:
 
-- `feat/roots-forwarding` — active next-step branch, likely merge-ready candidate
-- `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work, not mergeable whole-cloth
+- `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, elicitation/sampling scaffolds, research docs), not mergeable whole-cloth
 
 Off-main work must not be described as current implementation.
 
@@ -73,8 +72,8 @@ Use docs by role:
 ## Current Top Priorities
 
 1. keep current-state docs aligned with `main`
-2. reconcile and classify active off-main branches/worktrees before major org changes
-3. decide whether `feat/roots-forwarding` is the next merge target
+2. clean up stale branches and worktrees from superseded development work
+3. continue Stream B work (elicitation/sampling, legacy SSE, OAuth)
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 

@@ -25,11 +25,11 @@ Method:
 
 Using the actively tracked roadmap items, not the older speculative phase plans.
 
-As of PR #31 merge (`b5d90f7`, 2026-03-08), Stream A protocol correctness is complete on `main`.
+As of PR #32 merge (`3e16fe4`, 2026-03-08), Stream A protocol correctness and roots forwarding are
+complete on `main`.
 
 The remaining missing work on `main` is:
 
-- roots forwarding
 - elicitation
 - sampling
 - legacy SSE upstream transport
@@ -81,7 +81,7 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 | OAuth / remote commercial MCP auth flows | missing | I found no implementation under `plug` or `plug-core`; current auth code is downstream bearer-token auth only in [plug-core/src/auth.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/auth.rs). |
 | `sampling/createMessage` | missing | No handler found in live code. |
 | `elicitation/create` | missing | No handler found in live code. |
-| `roots/list` | missing | No handler found in live code. |
+| `roots/list` forwarding | done | PR #32 adds `roots/list` reverse request, `roots/list_changed` notification handling, and union cache across stdio, HTTP, and daemon IPC in `plug-core/src/proxy/mod.rs`, `plug-core/src/http/server.rs`, `plug/src/daemon.rs`, and `plug/src/ipc_proxy.rs`. |
 | MCP protocol-version request validation (downstream) | done | PR #31 adds `validate_protocol_version_for_post()` in `plug-core/src/http/server.rs`. Requires `MCP-Protocol-Version: 2025-11-25` on POST (except `InitializeRequest`). Returns 400 on missing/mismatched. |
 | MCP protocol-version header on upstream requests | missing | Outgoing upstream HTTP requests do not yet include `MCP-Protocol-Version` header. |
 | Meta-tool mode / reduced discovery surface | done | Meta-tools are defined and enforced in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2101) and [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1196). |
@@ -89,10 +89,10 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 
 ## What This Means For `docs/PLAN.md`
 
-With PR #31 merged, `docs/PLAN.md` is honest. Stream A protocol correctness is complete. The remaining
-open work is all Stream B connectivity expansion (roots, elicitation/sampling, legacy SSE, OAuth)
-plus minor items (upstream protocol-version header, daemon IPC notification parity, dedicated
-pass-through tests).
+With PR #32 merged, `docs/PLAN.md` is honest. Stream A protocol correctness and roots forwarding are
+complete. The remaining open work is Stream B connectivity expansion (elicitation/sampling, legacy
+SSE, OAuth) plus minor items (upstream protocol-version header, daemon IPC notification parity,
+dedicated pass-through tests).
 
 The one nuance: “daemon continuity recovery” is broader than what the code currently proves
 (reconnect-based recovery for stdio-over-IPC clients, not full cross-transport session persistence).
@@ -103,10 +103,9 @@ All prior “minimum code gaps” from the original audit are resolved. The rema
 
 ### Stream B (new infrastructure required)
 
-1. **Roots forwarding** — `roots/list` reverse request + `roots/list_changed` notification
-2. **Elicitation + Sampling** — reverse-request routing from upstream to specific downstream client
-3. **Legacy SSE upstream transport** — custom transport for SSE-only remote servers
-4. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
+1. **Elicitation + Sampling** — reverse-request routing from upstream to specific downstream client
+2. **Legacy SSE upstream transport** — custom transport for SSE-only remote servers
+3. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
 
 ### Smaller items
 

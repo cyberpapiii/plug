@@ -38,12 +38,12 @@ Implemented today:
 - resource subscribe/unsubscribe lifecycle
 - completion forwarding across stdio, HTTP, and daemon IPC
 - meta-tool mode
+- roots forwarding with union cache across all transports
 - import/export/doctor flows
 - startup recovery and health monitoring
 
 Still incomplete:
 
-- roots forwarding
 - elicitation + sampling reverse-request routing
 - legacy SSE upstream transport
 - OAuth 2.1 + PKCE for upstream remote servers
@@ -105,8 +105,7 @@ If uncertain, prefer `exists off-main` or `missing`, never `done on main`.
 
 ## Repo-Specific CE Gotchas
 
-- there are many active worktrees; do not confuse worktree state with `main`
-- `feat/roots-forwarding` is off-main candidate state until merged
+- there are many stale worktrees from prior development; do not confuse worktree state with `main`
 - `fix/subscription-rebind-confidence` is an extraction source, not a truth source
 - older `docs/plans/*` files may still be useful, but many are historical planning context
 - roadmap and progress answers must start from the snapshot, not from historical plans
