@@ -1,5 +1,5 @@
 ---
-status: complete
+status: pending
 priority: p2
 issue_id: "045"
 tags: [code-review, security, performance, http]
@@ -66,6 +66,7 @@ _To be filled during triage_
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-03-08 | Created from CE review | 3 of 6 agents flagged this independently |
+| 2026-03-08 | Reverted to pending | Fix (600s timeout) deviated from approved plan which specifies no bridge-level elicitation timeout. Deferred to post-v1 with explicit plan revision. |
 
 ## Resources
 
