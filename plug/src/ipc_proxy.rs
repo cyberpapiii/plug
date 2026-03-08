@@ -701,7 +701,15 @@ impl ServerHandler for IpcProxyHandler {
 /// Fetch roots from the downstream peer and push them to the daemon
 /// via `IpcRequest::UpdateRoots`.
 async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleServer>) {
-    match peer.list_roots().await {
+    let roots_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), peer.list_roots()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!("downstream roots request timed out");
+                return;
+            }
+        };
+    match roots_result {
         Ok(result) => {
             let roots_json = match serde_json::to_value(&result.roots) {
                 Ok(v) => v,

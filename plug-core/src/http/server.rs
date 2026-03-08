@@ -400,9 +400,23 @@ async fn send_http_client_request(
         session_id,
         serde_json::to_value(message).map_err(|e| McpError::internal_error(e.to_string(), None))?,
     );
-    rx.await.map_err(|_| {
-        McpError::internal_error("HTTP client response channel closed".to_string(), None)
-    })
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(McpError::internal_error(
+            "HTTP client response channel closed".to_string(),
+            None,
+        )),
+        Err(_) => {
+            // Clean up the pending request on timeout
+            state
+                .pending_client_requests
+                .remove(&(session_id.to_string(), id));
+            Err(McpError::internal_error(
+                "HTTP client request timed out".to_string(),
+                None,
+            ))
+        }
+    }
 }
 
 /// Handle a client response (POST) that is the answer to a reverse request

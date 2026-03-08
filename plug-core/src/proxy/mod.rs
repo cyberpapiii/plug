@@ -350,13 +350,22 @@ impl ToolRouter {
     // ── Roots cache ──────────────────────────────────────────────────────
 
     /// Update cached roots for a downstream client. Returns true if the roots changed.
+    /// Uses `DashMap::entry()` for atomic check-and-set within a single shard lock.
     pub fn set_roots_for_target(&self, target: NotificationTarget, roots: Vec<Root>) -> bool {
-        let changed = self
-            .client_roots
-            .get(&target)
-            .is_none_or(|existing| *existing != roots);
-        self.client_roots.insert(target, roots);
-        changed
+        use dashmap::mapref::entry::Entry;
+        match self.client_roots.entry(target) {
+            Entry::Occupied(mut e) => {
+                if *e.get() == roots {
+                    return false;
+                }
+                e.insert(roots);
+                true
+            }
+            Entry::Vacant(e) => {
+                e.insert(roots);
+                true
+            }
+        }
     }
 
     /// Remove cached roots for a disconnected client. Returns true if entry existed.
@@ -365,6 +374,8 @@ impl ToolRouter {
     }
 
     /// Return the union of all connected clients' roots, deduplicated by URI.
+    /// Note: DashMap iteration is not a point-in-time snapshot; the result is
+    /// eventually consistent, which is acceptable for a roots list.
     pub fn list_roots_union(&self) -> ListRootsResult {
         let mut by_uri: HashMap<String, Root> = HashMap::new();
         for entry in self.client_roots.iter() {
