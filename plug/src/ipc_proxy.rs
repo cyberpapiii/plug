@@ -16,7 +16,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use plug_core::ipc::{self, IpcRequest, IpcResponse};
+use plug_core::ipc::{
+    self, DaemonToProxyMessage, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse,
+};
 
 const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -125,8 +127,10 @@ impl IpcProxyHandler {
             .map_err(|e| Self::transport_failure("IPC write failed", e))?;
 
         // Read frames in a loop — the daemon may interleave push notifications
-        // (logging) with the actual response. Forward notifications to the
-        // downstream peer and keep reading until we get a non-notification frame.
+        // (logging) and reverse requests (elicitation, sampling) with the actual
+        // response. Forward notifications to the downstream peer and handle
+        // reverse requests inline, then keep reading until we get the final
+        // response frame.
         loop {
             let frame = ipc::read_frame(&mut conn.reader)
                 .await
@@ -136,6 +140,52 @@ impl IpcProxyHandler {
                     reconnectable: true,
                 })?;
 
+            // Check if this is a DaemonToProxyMessage (has "envelope" key) or
+            // a plain IpcResponse (has "type" key). The daemon sends reverse
+            // requests wrapped in DaemonToProxyMessage during tool calls.
+            if let Ok(daemon_msg) = serde_json::from_slice::<DaemonToProxyMessage>(&frame) {
+                match daemon_msg {
+                    DaemonToProxyMessage::Response { inner } => {
+                        // Unwrapped response — process like a normal IpcResponse
+                        match inner {
+                            IpcResponse::LoggingNotification { params } => {
+                                if let Some(peer) = peer {
+                                    if let Ok(notif_params) =
+                                        serde_json::from_value::<LoggingMessageNotificationParam>(
+                                            params,
+                                        )
+                                    {
+                                        let _ = peer.notify_logging_message(notif_params).await;
+                                    }
+                                }
+                                continue;
+                            }
+                            other => return Ok(other),
+                        }
+                    }
+                    DaemonToProxyMessage::ReverseRequest { id, request } => {
+                        // Handle reverse request from daemon (elicitation / sampling)
+                        let response =
+                            Self::handle_daemon_reverse_request(peer, id, *request).await;
+
+                        // Send the response back to the daemon
+                        let resp_payload =
+                            serde_json::to_vec(&response).map_err(|e| TransportFailure {
+                                message: format!("failed to serialize reverse response: {e}"),
+                                reconnectable: false,
+                            })?;
+                        ipc::write_frame(&mut conn.writer, &resp_payload)
+                            .await
+                            .map_err(|e| {
+                                Self::transport_failure("IPC reverse response write failed", e)
+                            })?;
+                        continue; // keep reading for the actual tool call response
+                    }
+                }
+            }
+
+            // Fall through: parse as plain IpcResponse (backward compatible
+            // with daemons that haven't been updated to use DaemonToProxyMessage).
             let response: IpcResponse =
                 serde_json::from_slice(&frame).map_err(|e| TransportFailure {
                     message: format!("invalid IPC response: {e}"),
@@ -155,6 +205,45 @@ impl IpcProxyHandler {
                 }
                 other => return Ok(other),
             }
+        }
+    }
+
+    /// Handle a reverse request from the daemon during an active tool call.
+    ///
+    /// Calls the downstream peer's `create_elicitation()` or `create_message()`
+    /// and returns the response as an `IpcClientResponse`.
+    async fn handle_daemon_reverse_request(
+        peer: Option<&Peer<RoleServer>>,
+        id: u64,
+        request: IpcClientRequest,
+    ) -> IpcClientResponse {
+        let Some(peer) = peer else {
+            tracing::warn!(
+                reverse_request_id = id,
+                "received reverse request but no downstream peer is available"
+            );
+            return IpcClientResponse::Error {
+                message: "no downstream peer available for reverse request".to_string(),
+            };
+        };
+
+        tracing::debug!(reverse_request_id = id, "handling daemon reverse request");
+
+        match request {
+            IpcClientRequest::CreateElicitation { params } => {
+                match peer.create_elicitation(params).await {
+                    Ok(result) => IpcClientResponse::CreateElicitation { result },
+                    Err(e) => IpcClientResponse::Error {
+                        message: format!("elicitation failed: {e}"),
+                    },
+                }
+            }
+            IpcClientRequest::CreateMessage { params } => match peer.create_message(params).await {
+                Ok(result) => IpcClientResponse::CreateMessage { result },
+                Err(e) => IpcClientResponse::Error {
+                    message: format!("sampling failed: {e}"),
+                },
+            },
         }
     }
 

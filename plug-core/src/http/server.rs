@@ -1,5 +1,8 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -21,7 +24,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use super::error::HttpError;
 use super::sse::sse_stream;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
-use crate::proxy::{DownstreamCallContext, ToolRouter};
+use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
 use crate::session::SessionStore;
 
 /// rmcp header constant for session ID.
@@ -49,6 +52,63 @@ pub struct HttpState {
     pub pending_client_requests: DashMap<(String, i64), oneshot::Sender<ClientResult>>,
     /// Counter for generating unique reverse-request IDs.
     pub reverse_request_counter: AtomicU64,
+}
+
+/// HTTP-specific bridge for forwarding reverse requests (elicitation, sampling)
+/// to a downstream HTTP client via its SSE stream.
+struct HttpBridge {
+    state: Arc<HttpState>,
+    session_id: String,
+}
+
+impl DownstreamBridge for HttpBridge {
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        let state = Arc::clone(&self.state);
+        let session_id = self.session_id.clone();
+        Box::pin(async move {
+            let result = send_http_client_request(
+                &state,
+                &session_id,
+                ServerRequest::CreateElicitationRequest(CreateElicitationRequest::new(request)),
+                None, // no bridge-level timeout for elicitation (human input)
+            )
+            .await?;
+            match result {
+                ClientResult::CreateElicitationResult(r) => Ok(r),
+                other => Err(McpError::internal_error(
+                    format!("unexpected elicitation response: {other:?}"),
+                    None,
+                )),
+            }
+        })
+    }
+
+    fn create_message(
+        &self,
+        request: CreateMessageRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
+        let state = Arc::clone(&self.state);
+        let session_id = self.session_id.clone();
+        Box::pin(async move {
+            let result = send_http_client_request(
+                &state,
+                &session_id,
+                ServerRequest::CreateMessageRequest(CreateMessageRequest::new(request)),
+                Some(Duration::from_secs(60)), // sampling has bounded timeout
+            )
+            .await?;
+            match result {
+                ClientResult::CreateMessageResult(r) => Ok(*r),
+                other => Err(McpError::internal_error(
+                    format!("unexpected sampling response: {other:?}"),
+                    None,
+                )),
+            }
+        })
+    }
 }
 
 impl HttpState {
@@ -343,6 +403,16 @@ async fn post_mcp(
                 }
                 ClientNotification::InitializedNotification(_) => {
                     maybe_request_http_roots(Arc::clone(&state), session_id.clone());
+                    let bridge = Arc::new(HttpBridge {
+                        state: Arc::clone(&state),
+                        session_id: session_id.clone(),
+                    });
+                    state.router.register_downstream_bridge(
+                        NotificationTarget::Http {
+                            session_id: Arc::from(session_id.as_str()),
+                        },
+                        bridge,
+                    );
                 }
                 ClientNotification::RootsListChangedNotification(_) => {
                     maybe_request_http_roots(Arc::clone(&state), session_id.clone());
@@ -388,6 +458,7 @@ async fn send_http_client_request(
     state: &HttpState,
     session_id: &str,
     request: ServerRequest,
+    timeout: Option<Duration>,
 ) -> Result<ClientResult, McpError> {
     let id = state.reverse_request_counter.fetch_add(1, Ordering::SeqCst) as i64;
     let request_id = RequestId::from(NumberOrString::Number(id));
@@ -400,22 +471,31 @@ async fn send_http_client_request(
         session_id,
         serde_json::to_value(message).map_err(|e| McpError::internal_error(e.to_string(), None))?,
     );
-    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(_)) => Err(McpError::internal_error(
-            "HTTP client response channel closed".to_string(),
-            None,
-        )),
-        Err(_) => {
-            // Clean up the pending request on timeout
-            state
-                .pending_client_requests
-                .remove(&(session_id.to_string(), id));
-            Err(McpError::internal_error(
-                "HTTP client request timed out".to_string(),
+    match timeout {
+        Some(duration) => match tokio::time::timeout(duration, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(McpError::internal_error(
+                "HTTP client response channel closed".to_string(),
                 None,
-            ))
-        }
+            )),
+            Err(_) => {
+                // Clean up the pending request on timeout
+                state
+                    .pending_client_requests
+                    .remove(&(session_id.to_string(), id));
+                Err(McpError::internal_error(
+                    "HTTP client request timed out".to_string(),
+                    None,
+                ))
+            }
+        },
+        None => match rx.await {
+            Ok(result) => Ok(result),
+            Err(_) => Err(McpError::internal_error(
+                "HTTP client response channel closed".to_string(),
+                None,
+            )),
+        },
     }
 }
 
@@ -455,6 +535,7 @@ fn maybe_request_http_roots(state: Arc<HttpState>, session_id: String) {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
+            Some(Duration::from_secs(10)),
         )
         .await
         {
@@ -531,9 +612,11 @@ async fn delete_mcp(
         };
         state.router.cleanup_subscriptions_for_target(&target).await;
         state.roots_capable_sessions.remove(&session_id);
+        // Drop pending reverse-request senders so receivers get RecvError
         state
             .pending_client_requests
             .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
+        state.router.unregister_downstream_bridge(&target);
         if state.router.clear_roots_for_target(&target) {
             state.router.forward_roots_list_changed_to_upstreams().await;
         }

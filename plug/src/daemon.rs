@@ -3,19 +3,27 @@
 //! Provides `plug serve --daemon` functionality: starts the Engine without TUI,
 //! listens on a Unix socket for CLI queries, and logs to file.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use dashmap::DashMap;
 use fs2::FileExt as _;
+use rmcp::ErrorData as McpError;
+use rmcp::model::{
+    CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
+    CreateMessageResult, RequestId,
+};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
-use plug_core::ipc::{self, IpcRequest, IpcResponse};
+use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse};
+use plug_core::proxy::DownstreamBridge;
 
 /// Maximum concurrent IPC connections.
 const MAX_IPC_CONNECTIONS: usize = 32;
@@ -473,6 +481,7 @@ pub async fn run_daemon(
                                 started_at,
                                 client_registry: registry,
                                 session_id: None,
+                                reverse_request_rx: None,
                             };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
@@ -499,6 +508,94 @@ pub async fn run_daemon(
     Ok(())
 }
 
+// ──────────────────────── Daemon Bridge ────────────────────────────────────────
+
+/// Downstream bridge for IPC proxy clients.
+///
+/// Forwards reverse requests (elicitation, sampling) from upstream MCP servers
+/// to the IPC proxy client that initiated the tool call. The proxy side listens
+/// on the `reverse_request_rx` end of the channel.
+struct DaemonBridge {
+    session_id: String,
+    reverse_request_tx: tokio::sync::mpsc::Sender<(
+        IpcClientRequest,
+        tokio::sync::oneshot::Sender<IpcClientResponse>,
+    )>,
+}
+
+impl DownstreamBridge for DaemonBridge {
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        let tx = self.reverse_request_tx.clone();
+        let session_id = self.session_id.clone();
+        Box::pin(async move {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            tx.send((
+                IpcClientRequest::CreateElicitation { params: request },
+                resp_tx,
+            ))
+            .await
+            .map_err(|_| {
+                McpError::internal_error(
+                    format!("IPC connection lost for session {session_id}"),
+                    None,
+                )
+            })?;
+            match resp_rx.await {
+                Ok(IpcClientResponse::CreateElicitation { result }) => Ok(result),
+                Ok(IpcClientResponse::Error { message }) => {
+                    Err(McpError::internal_error(message, None))
+                }
+                Ok(other) => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+                Err(_) => Err(McpError::internal_error(
+                    format!("IPC response channel closed for session {session_id}"),
+                    None,
+                )),
+            }
+        })
+    }
+
+    fn create_message(
+        &self,
+        request: CreateMessageRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
+        let tx = self.reverse_request_tx.clone();
+        let session_id = self.session_id.clone();
+        Box::pin(async move {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            tx.send((IpcClientRequest::CreateMessage { params: request }, resp_tx))
+                .await
+                .map_err(|_| {
+                    McpError::internal_error(
+                        format!("IPC connection lost for session {session_id}"),
+                        None,
+                    )
+                })?;
+            match resp_rx.await {
+                Ok(IpcClientResponse::CreateMessage { result }) => Ok(result),
+                Ok(IpcClientResponse::Error { message }) => {
+                    Err(McpError::internal_error(message, None))
+                }
+                Ok(other) => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+                Err(_) => Err(McpError::internal_error(
+                    format!("IPC response channel closed for session {session_id}"),
+                    None,
+                )),
+            }
+        })
+    }
+}
+
+// ──────────────────────── Connection Context ──────────────────────────────────
+
 /// Per-connection context — everything needed to handle IPC requests without
 /// holding a reference to Engine.
 struct ConnectionContext {
@@ -511,6 +608,15 @@ struct ConnectionContext {
     client_registry: Arc<ClientRegistry>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
+    /// Receiver for reverse requests from the daemon bridge. Created during
+    /// Register, consumed by the IPC loop to forward reverse requests to the
+    /// proxy client. See `DaemonBridge` for the sender side.
+    reverse_request_rx: Option<
+        tokio::sync::mpsc::Receiver<(
+            IpcClientRequest,
+            tokio::sync::oneshot::Sender<IpcClientResponse>,
+        )>,
+    >,
 }
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
@@ -531,6 +637,9 @@ async fn handle_ipc_connection(
         let target = plug_core::notifications::NotificationTarget::Stdio {
             client_id: std::sync::Arc::from(session_id.as_str()),
         };
+        ctx.engine
+            .tool_router()
+            .unregister_downstream_bridge(&target);
         if ctx.engine.tool_router().clear_roots_for_target(&target) {
             ctx.engine
                 .tool_router()
@@ -645,8 +754,62 @@ async fn handle_ipc_loop(
             }
         }
 
-        // Dispatch request
-        let response = dispatch_request(&request, ctx).await;
+        // Dispatch request. During a tools/call, the upstream MCP server may
+        // issue reverse requests (elicitation, sampling) via the DaemonBridge
+        // channel. We service those concurrently with the dispatch future.
+        //
+        // We temporarily take `reverse_request_rx` out of `ctx` to avoid
+        // borrow conflicts — `dispatch_request` borrows `ctx` mutably.
+        let mut reverse_rx = ctx.reverse_request_rx.take();
+
+        let response = {
+            use std::pin::pin;
+
+            let dispatch_fut = pin!(dispatch_request(&request, ctx));
+            let mut dispatch_fut = dispatch_fut;
+            let mut done = false;
+            let mut result = None;
+
+            while !done {
+                tokio::select! {
+                    biased;
+                    resp = &mut dispatch_fut, if !done => {
+                        result = Some(resp);
+                        done = true;
+                    }
+                    // Service reverse requests from DaemonBridge while tool call is in-flight
+                    reverse = async {
+                        if let Some(ref mut rx) = reverse_rx {
+                            rx.recv().await
+                        } else {
+                            // No bridge registered — pend forever
+                            std::future::pending().await
+                        }
+                    } => {
+                        if let Some((reverse_req, resp_tx)) = reverse {
+                            handle_reverse_request(reader, writer, reverse_req, resp_tx).await?;
+                        }
+                    }
+                    // Also forward logging notifications while waiting
+                    recv = async {
+                        if let Some(ref mut rx) = log_rx {
+                            rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        send_ipc_logging_notification(writer, recv).await?;
+                    }
+                }
+            }
+            result.unwrap()
+        };
+
+        // Restore reverse_request_rx (dispatch_request may have replaced it
+        // during a Register call, in which case ctx already has the new one).
+        if ctx.reverse_request_rx.is_none() {
+            ctx.reverse_request_rx = reverse_rx;
+        }
 
         ipc::send_response(writer, &response).await?;
 
@@ -721,6 +884,59 @@ async fn send_ipc_logging_notification(
         }
         Err(RecvError::Closed) => {}
     }
+    Ok(())
+}
+
+/// Handle a reverse request from the `DaemonBridge` during an active tool call.
+///
+/// Writes an `IpcClientRequest` to the IPC socket as a `DaemonToProxyMessage::ReverseRequest`,
+/// reads the `IpcClientResponse` back from the proxy, and sends it via the oneshot channel.
+///
+/// The proxy client's read loop must be prepared to receive `DaemonToProxyMessage::ReverseRequest`
+/// frames interleaved with normal `IpcResponse` frames during a `tools/call`.
+async fn handle_reverse_request(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    request: IpcClientRequest,
+    response_tx: tokio::sync::oneshot::Sender<IpcClientResponse>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVERSE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    let id = REVERSE_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let msg = ipc::DaemonToProxyMessage::ReverseRequest {
+        id,
+        request: Box::new(request),
+    };
+
+    tracing::debug!(
+        reverse_request_id = id,
+        "sending reverse request to IPC proxy"
+    );
+    ipc::send_daemon_message(writer, &msg).await?;
+
+    // Read the proxy's response. The proxy sends an IpcClientResponse frame
+    // after handling the reverse request.
+    let response = match ipc::read_frame(reader).await? {
+        Some(frame) => match serde_json::from_slice::<IpcClientResponse>(&frame) {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(error = %e, "invalid IPC reverse-request response");
+                IpcClientResponse::Error {
+                    message: format!("invalid reverse-request response: {e}"),
+                }
+            }
+        },
+        None => {
+            // Connection closed during reverse request
+            IpcClientResponse::Error {
+                message: "IPC connection closed during reverse request".to_string(),
+            }
+        }
+    };
+
+    // Send response back to DaemonBridge
+    let _ = response_tx.send(response);
     Ok(())
 }
 
@@ -802,6 +1018,23 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
             let session_id = registration.session_id;
             ctx.session_id = Some(session_id.clone());
+
+            // Create reverse-request channel and register the daemon bridge
+            // so upstream servers can forward elicitation/sampling requests
+            // to this IPC proxy client.
+            let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
+            let bridge = Arc::new(DaemonBridge {
+                session_id: session_id.clone(),
+                reverse_request_tx: reverse_tx,
+            });
+            ctx.engine.tool_router().register_downstream_bridge(
+                plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from(session_id.as_str()),
+                },
+                bridge,
+            );
+            ctx.reverse_request_rx = Some(reverse_rx);
+
             IpcResponse::Registered {
                 protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
                 client_id: client_id.clone(),
@@ -827,6 +1060,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: std::sync::Arc::from(session_id.as_str()),
             };
+            ctx.engine
+                .tool_router()
+                .unregister_downstream_bridge(&target);
             if ctx.engine.tool_router().clear_roots_for_target(&target) {
                 ctx.engine
                     .tool_router()
@@ -835,6 +1071,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
             ctx.engine.tool_router().remove_client_log_level(session_id);
             ctx.session_id = None;
+            ctx.reverse_request_rx = None;
             IpcResponse::Ok
         }
 
@@ -1245,7 +1482,26 @@ async fn dispatch_mcp_request(
                 };
             }
 
-            match tool_router.call_tool(&name, arguments).await {
+            // Build downstream context so the ToolRouter can route reverse
+            // requests (elicitation, sampling) back to this IPC client.
+            let downstream_ctx = {
+                use plug_core::proxy::DownstreamCallContext;
+                use rmcp::model::NumberOrString;
+                // Use a synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
+                // but the context needs one for active call tracking.
+                let request_id = RequestId::from(NumberOrString::String(Arc::from(
+                    format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
+                )));
+                Some(DownstreamCallContext::stdio(
+                    Arc::from(session_id),
+                    request_id,
+                ))
+            };
+
+            match tool_router
+                .call_tool_with_context(&name, arguments, None, downstream_ctx)
+                .await
+            {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(payload) => IpcResponse::McpResponse { payload },
                     Err(e) => IpcResponse::Error {

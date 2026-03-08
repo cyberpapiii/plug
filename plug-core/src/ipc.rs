@@ -5,6 +5,10 @@
 
 use std::fmt;
 
+use rmcp::model::{
+    CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
+    CreateMessageResult,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::types::ServerStatus;
@@ -208,6 +212,51 @@ pub enum IpcResponse {
     LoggingNotification { params: serde_json::Value },
 }
 
+// ──────────────────────── Reverse-request IPC types ──────────────────────────
+//
+// During an active tool call the daemon may need to forward "reverse requests"
+// (elicitation, sampling) from the upstream MCP server back to the proxy client
+// that initiated the call. These types model the daemon-to-proxy direction.
+
+/// Daemon-to-proxy reverse request (sent during an active tool call).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IpcClientRequest {
+    CreateElicitation {
+        params: CreateElicitationRequestParams,
+    },
+    CreateMessage {
+        params: CreateMessageRequestParams,
+    },
+}
+
+/// Proxy-to-daemon response for a reverse request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IpcClientResponse {
+    CreateElicitation { result: CreateElicitationResult },
+    CreateMessage { result: CreateMessageResult },
+    Error { message: String },
+}
+
+/// Messages the daemon can send to a proxy client.
+///
+/// The IPC socket is normally request-response (client sends `IpcRequest`,
+/// daemon replies `IpcResponse`). However, during a long-running `tools/call`
+/// the daemon may need to interleave reverse requests. This tagged envelope
+/// lets the proxy's read loop distinguish the two cases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "envelope")]
+pub enum DaemonToProxyMessage {
+    /// Normal response to an `IpcRequest`.
+    Response { inner: IpcResponse },
+    /// Reverse request requiring the proxy to respond with an `IpcClientResponse`.
+    ReverseRequest {
+        id: u64,
+        request: Box<IpcClientRequest>,
+    },
+}
+
 /// Check whether a request requires the daemon master auth token.
 ///
 /// Admin operations (RestartServer, Reload, Shutdown) require it.
@@ -273,6 +322,15 @@ pub async fn send_response<W: tokio::io::AsyncWriteExt + Unpin>(
     response: &IpcResponse,
 ) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(response)?;
+    write_frame(writer, &payload).await
+}
+
+/// Send a `DaemonToProxyMessage` as a length-prefixed JSON frame.
+pub async fn send_daemon_message<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    message: &DaemonToProxyMessage,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(message)?;
     write_frame(writer, &payload).await
 }
 
@@ -411,6 +469,54 @@ mod tests {
             }),
             Some("my_token")
         );
+    }
+
+    #[test]
+    fn ipc_client_response_serialization_round_trip() {
+        let error_resp = IpcClientResponse::Error {
+            message: "test error".to_string(),
+        };
+        let json = serde_json::to_string(&error_resp).unwrap();
+        let deserialized: IpcClientResponse = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(json, json2);
+        assert!(json.contains("\"type\":\"Error\""));
+    }
+
+    #[test]
+    fn daemon_to_proxy_message_response_round_trip() {
+        let msg = DaemonToProxyMessage::Response {
+            inner: IpcResponse::Ok,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: DaemonToProxyMessage = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(json, json2);
+        assert!(json.contains("\"envelope\":\"Response\""));
+    }
+
+    #[test]
+    fn daemon_to_proxy_message_reverse_request_has_envelope_tag() {
+        // Build a CreateMessage request via JSON to avoid needing constructors
+        let create_msg_json = serde_json::json!({
+            "type": "CreateMessage",
+            "params": {
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                "maxTokens": 100,
+            }
+        });
+        let request: IpcClientRequest = serde_json::from_value(create_msg_json).unwrap();
+        let msg = DaemonToProxyMessage::ReverseRequest {
+            id: 42,
+            request: Box::new(request),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"envelope\":\"ReverseRequest\""));
+        assert!(json.contains("\"id\":42"));
+        // Verify it round-trips
+        let deserialized: DaemonToProxyMessage = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(json, json2);
     }
 
     #[test]

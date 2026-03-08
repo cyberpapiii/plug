@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -117,6 +119,8 @@ pub struct ToolRouter {
     resource_subscriptions: DashMap<String, HashSet<NotificationTarget>>,
     /// Cached downstream roots per client. Upstream servers see the union via `list_roots_union()`.
     client_roots: DashMap<NotificationTarget, Vec<Root>>,
+    /// Per-client bridge for forwarding reverse requests (elicitation, sampling).
+    downstream_bridges: DashMap<NotificationTarget, Arc<dyn DownstreamBridge>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -198,6 +202,24 @@ struct ActiveCallRecord {
     progress_token: Option<ProgressToken>,
 }
 
+/// Abstraction for forwarding reverse requests (elicitation, sampling) to a downstream client.
+///
+/// Each transport implements this trait differently:
+/// - stdio: calls `Peer<RoleServer>` methods directly
+/// - HTTP: sends JSON-RPC request via SSE, awaits POST response via oneshot channel
+/// - daemon IPC: sends `IpcClientRequest` to the proxy over Unix socket
+pub trait DownstreamBridge: Send + Sync {
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>>;
+
+    fn create_message(
+        &self,
+        request: CreateMessageRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>>;
+}
+
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
@@ -235,6 +257,7 @@ impl ToolRouter {
             engine: std::sync::RwLock::new(None),
             resource_subscriptions: DashMap::new(),
             client_roots: DashMap::new(),
+            downstream_bridges: DashMap::new(),
         }
     }
 
@@ -408,6 +431,94 @@ impl ToolRouter {
             })
             .collect();
         futures::future::join_all(futures).await;
+    }
+
+    // ── Downstream bridge management ────────────────────────────────────
+
+    /// Register a downstream bridge for reverse-request forwarding.
+    pub fn register_downstream_bridge(
+        &self,
+        target: NotificationTarget,
+        bridge: Arc<dyn DownstreamBridge>,
+    ) {
+        self.downstream_bridges.insert(target, bridge);
+    }
+
+    /// Unregister a downstream bridge on client disconnect.
+    pub fn unregister_downstream_bridge(&self, target: &NotificationTarget) {
+        self.downstream_bridges.remove(target);
+    }
+
+    /// Resolve the unique downstream target for an upstream server's reverse request.
+    ///
+    /// Looks up all active calls for the given server and extracts the unique downstream
+    /// `NotificationTarget`. Returns an error if:
+    /// - 0 active calls (no downstream client to forward to)
+    /// - 2+ distinct downstream targets (ambiguous ownership)
+    fn resolve_unique_downstream_target_for_upstream(
+        &self,
+        server_id: &str,
+    ) -> Result<NotificationTarget, McpError> {
+        let mut targets: Vec<NotificationTarget> = self
+            .active_calls
+            .iter()
+            .filter(|entry| entry.upstream_server_id == server_id)
+            .map(|entry| entry.downstream.notification_target())
+            .collect();
+        targets.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        targets.dedup();
+
+        match targets.len() {
+            0 => Err(McpError::internal_error(
+                format!("no active downstream call for upstream server {server_id}"),
+                None,
+            )),
+            1 => Ok(targets.remove(0)),
+            _ => Err(McpError::internal_error(
+                format!("ambiguous downstream ownership for upstream server {server_id}"),
+                None,
+            )),
+        }
+    }
+
+    /// Forward an upstream elicitation request to the downstream client that triggered the tool call.
+    pub async fn create_elicitation_from_upstream(
+        &self,
+        server_id: &str,
+        request: CreateElicitationRequestParams,
+    ) -> Result<CreateElicitationResult, McpError> {
+        let target = self.resolve_unique_downstream_target_for_upstream(server_id)?;
+        let bridge = self
+            .downstream_bridges
+            .get(&target)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    format!("no downstream bridge registered for target {target:?}"),
+                    None,
+                )
+            })?;
+        bridge.create_elicitation(request).await
+    }
+
+    /// Forward an upstream sampling request to the downstream client that triggered the tool call.
+    pub async fn create_message_from_upstream(
+        &self,
+        server_id: &str,
+        request: CreateMessageRequestParams,
+    ) -> Result<CreateMessageResult, McpError> {
+        let target = self.resolve_unique_downstream_target_for_upstream(server_id)?;
+        let bridge = self
+            .downstream_bridges
+            .get(&target)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    format!("no downstream bridge registered for target {target:?}"),
+                    None,
+                )
+            })?;
+        bridge.create_message(request).await
     }
 
     fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
@@ -2493,6 +2604,38 @@ fn build_invoke_tool_meta_tool() -> Tool {
     )
 }
 
+/// Stdio-specific bridge for forwarding reverse requests (elicitation, sampling)
+/// back to the downstream client via its `Peer<RoleServer>`.
+struct StdioBridge {
+    peer: Peer<RoleServer>,
+}
+
+impl DownstreamBridge for StdioBridge {
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        let peer = self.peer.clone();
+        Box::pin(async move {
+            peer.create_elicitation(request)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))
+        })
+    }
+
+    fn create_message(
+        &self,
+        request: CreateMessageRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
+        let peer = self.peer.clone();
+        Box::pin(async move {
+            peer.create_message(request)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))
+        })
+    }
+}
+
 /// MCP proxy handler that aggregates tools from multiple upstream servers
 /// and routes tool calls to the correct upstream. Used for stdio transport.
 pub struct ProxyHandler {
@@ -2511,6 +2654,10 @@ pub struct ProxyHandler {
 impl Drop for ProxyHandler {
     fn drop(&mut self) {
         self.shutdown.cancel();
+        self.router
+            .unregister_downstream_bridge(&NotificationTarget::Stdio {
+                client_id: Arc::clone(&self.client_id),
+            });
     }
 }
 
@@ -2732,6 +2879,18 @@ impl ServerHandler for ProxyHandler {
         let peer = self.downstream_peer.get().cloned();
         let roots_supported = self.roots_supported.load(Ordering::SeqCst);
         async move {
+            if let Some(peer) = &peer {
+                // Register the stdio bridge for reverse-request forwarding
+                // (elicitation, sampling) regardless of roots support.
+                let bridge = Arc::new(StdioBridge { peer: peer.clone() });
+                router.register_downstream_bridge(
+                    NotificationTarget::Stdio {
+                        client_id: Arc::clone(&client_id),
+                    },
+                    bridge,
+                );
+            }
+
             if !roots_supported {
                 return;
             }
@@ -3908,5 +4067,137 @@ mod tests {
         let result = router.list_roots_union();
         assert_eq!(result.roots.len(), 1);
         assert_eq!(result.roots[0].uri, "file:///project-2");
+    }
+
+    // ── Target resolution tests (elicitation / sampling routing) ─────
+
+    #[test]
+    fn test_target_resolution_no_active_calls() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let result = router.resolve_unique_downstream_target_for_upstream("unknown-server");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("no active downstream call"),
+            "expected 'no active downstream call' in error message, got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_target_resolution_single_active_call() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        router.register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                progress_token: None,
+            },
+        );
+
+        let result = router.resolve_unique_downstream_target_for_upstream("s1");
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(
+            result.unwrap(),
+            NotificationTarget::Stdio {
+                client_id: Arc::from("client-a"),
+            },
+        );
+    }
+
+    #[test]
+    fn test_target_resolution_dedup_same_client() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        // Two active calls from the same stdio client, different call IDs and request IDs
+        router.register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(10)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                progress_token: None,
+            },
+        );
+        router.register_active_call(
+            2,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(20)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                progress_token: None,
+            },
+        );
+
+        let result = router.resolve_unique_downstream_target_for_upstream("s1");
+        assert!(
+            result.is_ok(),
+            "expected Ok (deduplicated to 1 target), got: {result:?}",
+        );
+        assert_eq!(
+            result.unwrap(),
+            NotificationTarget::Stdio {
+                client_id: Arc::from("client-a"),
+            },
+        );
+    }
+
+    #[test]
+    fn test_target_resolution_ambiguous_different_clients() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        // One call from a stdio client
+        router.register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                progress_token: None,
+            },
+        );
+
+        // Another call from an HTTP client
+        router.register_active_call(
+            2,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::http(
+                    Arc::from("session-b"),
+                    RequestId::from(NumberOrString::Number(2)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                progress_token: None,
+            },
+        );
+
+        let result = router.resolve_unique_downstream_target_for_upstream("s1");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("ambiguous"),
+            "expected 'ambiguous' in error message, got: {}",
+            err.message,
+        );
     }
 }
