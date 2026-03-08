@@ -683,7 +683,10 @@ async fn handle_ipc_loop(
 /// Send a logging notification to the IPC client, handling broadcast errors.
 async fn send_ipc_logging_notification(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
-    recv: Result<plug_core::notifications::ProtocolNotification, tokio::sync::broadcast::error::RecvError>,
+    recv: Result<
+        plug_core::notifications::ProtocolNotification,
+        tokio::sync::broadcast::error::RecvError,
+    >,
 ) -> anyhow::Result<()> {
     use plug_core::notifications::ProtocolNotification;
     use tokio::sync::broadcast::error::RecvError;
@@ -1116,14 +1119,11 @@ async fn dispatch_mcp_request(
         }
 
         "logging/setLevel" => {
-            let level = match params
-                .and_then(|p| p.get("level"))
-                .and_then(|v| v.as_str())
-            {
+            let level = match params.and_then(|p| p.get("level")).and_then(|v| v.as_str()) {
                 Some(level_str) => {
-                    match serde_json::from_value::<rmcp::model::LoggingLevel>(
-                        serde_json::json!(level_str),
-                    ) {
+                    match serde_json::from_value::<rmcp::model::LoggingLevel>(serde_json::json!(
+                        level_str
+                    )) {
                         Ok(level) => level,
                         Err(_) => {
                             return IpcResponse::Error {

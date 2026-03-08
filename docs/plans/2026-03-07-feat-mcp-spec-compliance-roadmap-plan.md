@@ -215,9 +215,9 @@ All changes build on existing patterns in the codebase:
 These items from the original A3 plan were deferred:
 
 - [ ] **MCP-Protocol-Version on upstream requests**: Ensure header sent on all upstream HTTP requests
-- [ ] **MCP-Protocol-Version validation on downstream**: Validate header on incoming POST requests
-- [ ] **resources/list_changed forwarding**: Currently `list_changed: false` (honest but limited)
-- [ ] **prompts/list_changed forwarding**: Same
+- [x] **MCP-Protocol-Version validation on downstream**: Validate header on incoming POST requests
+- [x] **resources/list_changed forwarding**: Advertised + forwarded via coalesced refresh
+- [x] **prompts/list_changed forwarding**: Advertised + forwarded via coalesced refresh
 
 ---
 

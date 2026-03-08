@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "039"
 tags: [code-review, architecture, resources, state-consistency]
@@ -40,12 +40,13 @@ After refresh, re-subscribe upstream for any subscriptions that still have valid
 
 ## Acceptance Criteria
 
-- [ ] Server reconnect/refresh cleans stale subscription entries
-- [ ] No unbounded growth of subscription entries across reconnections
+- [x] Server reconnect/refresh cleans stale subscription entries
+- [x] No unbounded growth of subscription entries across reconnections
 
 ## Work Log
 
 - 2026-03-07: Identified during PR #30 review
+- 2026-03-08: Fixed with subscription pruning + rebind in refresh_tools()
 
 ## Resources
 

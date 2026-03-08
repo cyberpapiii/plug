@@ -28,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 const HTTP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+const HTTP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[derive(Clone)]
 struct TestClient;
@@ -659,6 +661,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         .uri("/mcp")
         .header("content-type", "application/json")
         .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
         .body(Body::from(serde_json::to_vec(&list_body).unwrap()))
         .unwrap();
     let list_resp = app.clone().oneshot(list_req).await.unwrap();
@@ -691,6 +694,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         .uri("/mcp")
         .header("content-type", "application/json")
         .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
         .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
         .unwrap();
     let call_resp = app.oneshot(call_req).await.unwrap();

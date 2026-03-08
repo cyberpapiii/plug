@@ -68,6 +68,17 @@ impl HttpState {
                                             ProtocolNotification::ToolListChanged.to_json_value(),
                                         );
                                     }
+                                    ProtocolNotification::ResourceListChanged => {
+                                        state.sessions.broadcast(
+                                            ProtocolNotification::ResourceListChanged
+                                                .to_json_value(),
+                                        );
+                                    }
+                                    ProtocolNotification::PromptListChanged => {
+                                        state.sessions.broadcast(
+                                            ProtocolNotification::PromptListChanged.to_json_value(),
+                                        );
+                                    }
                                     ProtocolNotification::Progress { target, params } => {
                                         if let NotificationTarget::Http { session_id } = target {
                                             let session_key = session_id.to_string();
@@ -297,6 +308,8 @@ async fn post_mcp(
         HttpError::BadRequest("invalid JSON-RPC message".into())
     })?;
 
+    validate_protocol_version_for_post(&headers, &message)?;
+
     // 3. Route based on message type
     match message {
         JsonRpcMessage::Request(req) => handle_request(req, &headers, &state).await,
@@ -323,6 +336,31 @@ async fn post_mcp(
         JsonRpcMessage::Error(_) => Err(HttpError::BadRequest(
             "unexpected error message from client".into(),
         )),
+    }
+}
+
+fn validate_protocol_version_for_post(
+    headers: &HeaderMap,
+    message: &ClientJsonRpcMessage,
+) -> Result<(), HttpError> {
+    let require_header = !matches!(
+        message,
+        JsonRpcMessage::Request(req)
+            if matches!(req.request, ClientRequest::InitializeRequest(_))
+    );
+
+    match headers.get(PROTOCOL_VERSION_HEADER) {
+        Some(value) => {
+            let version = value
+                .to_str()
+                .map_err(|_| HttpError::BadRequest("invalid MCP-Protocol-Version header".into()))?;
+            if version != PROTOCOL_VERSION {
+                return Err(HttpError::UnsupportedProtocolVersion(version.to_string()));
+            }
+            Ok(())
+        }
+        None if require_header => Err(HttpError::MissingProtocolVersion),
+        None => Ok(()),
     }
 }
 
@@ -641,6 +679,23 @@ async fn handle_request(
                 Ok(()) => {
                     let response_msg = ServerJsonRpcMessage::response(
                         ServerResult::EmptyResult(().into()),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::CompleteRequest(complete_req) => {
+            validate_session_header(headers, state.sessions.as_ref())?;
+            match state.router.complete_request(complete_req.params).await {
+                Ok(result) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::CompleteResult(result),
                         request_id,
                     );
                     json_response(&response_msg)
@@ -1027,6 +1082,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1044,6 +1100,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1072,6 +1129,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1145,6 +1203,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1203,6 +1262,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

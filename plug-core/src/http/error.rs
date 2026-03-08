@@ -20,6 +20,12 @@ pub enum HttpError {
     #[error("accept header must include text/event-stream")]
     InvalidAcceptHeader,
 
+    #[error("missing MCP-Protocol-Version header")]
+    MissingProtocolVersion,
+
+    #[error("unsupported MCP-Protocol-Version: {0}")]
+    UnsupportedProtocolVersion(String),
+
     #[error("unauthorized: authentication required")]
     Unauthorized,
 
@@ -63,6 +69,17 @@ impl IntoResponse for HttpError {
                 StatusCode::NOT_ACCEPTABLE,
                 "accept header must include text/event-stream",
             ),
+            HttpError::MissingProtocolVersion => (
+                StatusCode::BAD_REQUEST,
+                "missing MCP-Protocol-Version header",
+            ),
+            HttpError::UnsupportedProtocolVersion(version) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported MCP-Protocol-Version: {version}"),
+                )
+                    .into_response();
+            }
             HttpError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
             HttpError::TooManySessions => (StatusCode::TOO_MANY_REQUESTS, "too many sessions"),
             HttpError::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
@@ -89,6 +106,11 @@ mod tests {
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ),
             (HttpError::InvalidAcceptHeader, StatusCode::NOT_ACCEPTABLE),
+            (HttpError::MissingProtocolVersion, StatusCode::BAD_REQUEST),
+            (
+                HttpError::UnsupportedProtocolVersion("2025-01-01".into()),
+                StatusCode::BAD_REQUEST,
+            ),
             (
                 HttpError::BadRequest("test".into()),
                 StatusCode::BAD_REQUEST,

@@ -107,6 +107,9 @@ pub struct ToolRouter {
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
+    pending_tool_list_changed: AtomicBool,
+    pending_resource_list_changed: AtomicBool,
+    pending_prompt_list_changed: AtomicBool,
     /// Weak reference to Engine for session recovery (reconnect on error).
     /// Set after Engine construction via `set_engine()`.
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
@@ -224,6 +227,9 @@ impl ToolRouter {
             upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
+            pending_tool_list_changed: AtomicBool::new(false),
+            pending_resource_list_changed: AtomicBool::new(false),
+            pending_prompt_list_changed: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
             resource_subscriptions: DashMap::new(),
         }
@@ -280,7 +286,9 @@ impl ToolRouter {
         let original_logger = params.logger.as_deref().unwrap_or("default");
         params.logger = Some(format!("{server_id}:{original_logger}"));
 
-        let _ = self.logging_tx.send(ProtocolNotification::LoggingMessage { params });
+        let _ = self
+            .logging_tx
+            .send(ProtocolNotification::LoggingMessage { params });
     }
 
     /// Get the current effective log level.
@@ -290,8 +298,7 @@ impl ToolRouter {
 
     /// Set a client's requested log level and recalculate the effective level.
     pub fn set_client_log_level(&self, client_id: &str, level: LoggingLevel) {
-        self.client_log_levels
-            .insert(Arc::from(client_id), level);
+        self.client_log_levels.insert(Arc::from(client_id), level);
         self.recalculate_effective_level();
     }
 
@@ -337,7 +344,22 @@ impl ToolRouter {
         futures::future::join_all(futures).await;
     }
 
-    pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
+    fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
+        match notification {
+            ProtocolNotification::ToolListChanged => {
+                self.pending_tool_list_changed.store(true, Ordering::SeqCst);
+            }
+            ProtocolNotification::ResourceListChanged => {
+                self.pending_resource_list_changed
+                    .store(true, Ordering::SeqCst);
+            }
+            ProtocolNotification::PromptListChanged => {
+                self.pending_prompt_list_changed
+                    .store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+
         self.notification_refresh_pending
             .store(true, Ordering::SeqCst);
 
@@ -356,7 +378,25 @@ impl ToolRouter {
                     .notification_refresh_pending
                     .store(false, Ordering::SeqCst);
                 router.refresh_tools().await;
-                router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+
+                if router
+                    .pending_tool_list_changed
+                    .swap(false, Ordering::SeqCst)
+                {
+                    router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+                }
+                if router
+                    .pending_resource_list_changed
+                    .swap(false, Ordering::SeqCst)
+                {
+                    router.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
+                }
+                if router
+                    .pending_prompt_list_changed
+                    .swap(false, Ordering::SeqCst)
+                {
+                    router.publish_protocol_notification(ProtocolNotification::PromptListChanged);
+                }
 
                 if router
                     .notification_refresh_pending
@@ -385,6 +425,18 @@ impl ToolRouter {
         });
     }
 
+    pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
+        self.schedule_list_changed_refresh(ProtocolNotification::ToolListChanged);
+    }
+
+    pub fn schedule_resource_list_changed_refresh(self: &Arc<Self>) {
+        self.schedule_list_changed_refresh(ProtocolNotification::ResourceListChanged);
+    }
+
+    pub fn schedule_prompt_list_changed_refresh(self: &Arc<Self>) {
+        self.schedule_list_changed_refresh(ProtocolNotification::PromptListChanged);
+    }
+
     #[cfg(test)]
     pub(crate) fn active_call_count(&self) -> usize {
         self.active_calls.len()
@@ -393,6 +445,15 @@ impl ToolRouter {
     #[cfg(test)]
     pub(crate) fn replace_snapshot(&self, snapshot: RouterSnapshot) {
         self.cache.store(Arc::new(snapshot));
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn resource_subscription_count(&self, uri: &str) -> usize {
+        self.resource_subscriptions
+            .get(uri)
+            .map(|entry| entry.len())
+            .unwrap_or(0)
     }
 
     fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
@@ -1087,6 +1148,97 @@ impl ToolRouter {
 
         let tool_count = tools_all.len();
 
+        // Collect new resource URIs before moving resource_routes into the snapshot.
+        let new_resource_uris: HashSet<&String> = resource_routes.keys().collect();
+
+        // Identify stale subscriptions:
+        // 1. URIs removed from the new route cache entirely -> prune + unsubscribe old server
+        // 2. URIs still present but routed to a different server -> unsubscribe old, subscribe new
+        let mut stale_unsubscribes: Vec<(String, String)> = Vec::new();
+        let mut rebind_subscriptions: Vec<(String, String, String, Vec<NotificationTarget>)> =
+            Vec::new();
+        {
+            let old_snapshot = self.cache.load();
+            self.resource_subscriptions.retain(|uri, subscribers| {
+                match old_snapshot.resource_routes.get(uri) {
+                    Some(old_server_id) => {
+                        if let Some(new_server_id) = resource_routes.get(uri) {
+                            if old_server_id == new_server_id {
+                                true
+                            } else {
+                                rebind_subscriptions.push((
+                                    uri.clone(),
+                                    old_server_id.clone(),
+                                    new_server_id.clone(),
+                                    subscribers.iter().cloned().collect(),
+                                ));
+                                tracing::debug!(
+                                    uri = %uri,
+                                    old_server = %old_server_id,
+                                    new_server = %new_server_id,
+                                    "rebinding resource subscription after route refresh"
+                                );
+                                true
+                            }
+                        } else {
+                            stale_unsubscribes.push((uri.clone(), old_server_id.clone()));
+                            tracing::debug!(
+                                uri = %uri,
+                                "pruning stale resource subscription after route refresh"
+                            );
+                            false
+                        }
+                    }
+                    None => {
+                        if new_resource_uris.contains(uri) {
+                            true
+                        } else {
+                            tracing::debug!(
+                                uri = %uri,
+                                "pruning orphaned resource subscription with no route mapping"
+                            );
+                            false
+                        }
+                    }
+                }
+            });
+        }
+
+        let make_unsubscribe = |uri: &str| {
+            serde_json::from_value::<UnsubscribeRequestParams>(serde_json::json!({ "uri": uri }))
+                .expect("UnsubscribeRequestParams from known-good JSON")
+        };
+
+        let supports_subscribe = |upstream: &Arc<crate::server::UpstreamServer>| {
+            upstream
+                .capabilities
+                .resources
+                .as_ref()
+                .and_then(|r| r.subscribe)
+                .unwrap_or(false)
+        };
+
+        let mut rebind_failures: Vec<String> = Vec::new();
+
+        // Send upstream unsubscribes for pruned URIs (best-effort).
+        for (uri, server_id) in stale_unsubscribes {
+            if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
+                if let Err(error) = upstream
+                    .client
+                    .peer()
+                    .unsubscribe(make_unsubscribe(&uri))
+                    .await
+                {
+                    tracing::warn!(
+                        uri = %uri,
+                        server_id = %server_id,
+                        error = %error,
+                        "failed to unsubscribe stale resource during route refresh"
+                    );
+                }
+            }
+        }
+
         self.cache.store(Arc::new(RouterSnapshot {
             routes,
             tools_all,
@@ -1103,6 +1255,71 @@ impl ToolRouter {
 
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
+        }
+
+        // Rebind subscriptions whose URI still exists but ownership changed.
+        for (uri, old_server_id, new_server_id, subscribers) in rebind_subscriptions {
+            if let Some(old_upstream) = self.server_manager.get_upstream(&old_server_id) {
+                if let Err(error) = old_upstream
+                    .client
+                    .peer()
+                    .unsubscribe(make_unsubscribe(&uri))
+                    .await
+                {
+                    tracing::warn!(
+                        uri = %uri,
+                        server_id = %old_server_id,
+                        error = %error,
+                        "failed to unsubscribe old resource owner during route refresh"
+                    );
+                }
+            }
+
+            let Some(new_upstream) = self.server_manager.get_upstream(&new_server_id) else {
+                tracing::warn!(
+                    uri = %uri,
+                    server_id = %new_server_id,
+                    "new resource owner missing during route refresh; pruning local subscribers"
+                );
+                rebind_failures.push(uri);
+                continue;
+            };
+
+            if !supports_subscribe(&new_upstream) {
+                tracing::warn!(
+                    uri = %uri,
+                    server_id = %new_server_id,
+                    "new resource owner does not support subscriptions; pruning local subscribers"
+                );
+                rebind_failures.push(uri);
+                continue;
+            }
+
+            if let Err(error) = new_upstream
+                .client
+                .peer()
+                .subscribe(SubscribeRequestParams::new(&uri))
+                .await
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    server_id = %new_server_id,
+                    error = %error,
+                    "failed to resubscribe resource on new owner during route refresh"
+                );
+                rebind_failures.push(uri);
+                continue;
+            }
+
+            // Ensure the local registry still reflects the current subscribers after the rebind.
+            self.resource_subscriptions
+                .insert(uri, subscribers.into_iter().collect());
+        }
+
+        // If a rebind failed, prune the local subscription entry so the registry
+        // does not claim a live subscription that no upstream owns.
+        for uri in rebind_failures {
+            self.resource_subscriptions.remove(&uri);
         }
     }
 
@@ -1174,12 +1391,12 @@ impl ToolRouter {
             });
             capabilities.resources = Some(ResourcesCapability {
                 subscribe: if any_subscribe { Some(true) } else { None },
-                list_changed: Some(false),
+                list_changed: Some(true),
             });
         }
         if upstream_caps.iter().any(|caps| caps.prompts.is_some()) {
             capabilities.prompts = Some(PromptsCapability {
-                list_changed: Some(false),
+                list_changed: Some(true),
             });
         }
         if upstream_caps.iter().any(|caps| caps.completions.is_some()) {
@@ -2304,6 +2521,24 @@ impl ServerHandler for ProxyHandler {
                         match msg {
                             Ok(ProtocolNotification::ToolListChanged) => {
                                 if let Err(error) = peer.notify_tool_list_changed().await {
+                                    tracing::debug!(
+                                        error = %error,
+                                        "stopping stdio notification fan-out after peer send failure"
+                                    );
+                                    break;
+                                }
+                            }
+                            Ok(ProtocolNotification::ResourceListChanged) => {
+                                if let Err(error) = peer.notify_resource_list_changed().await {
+                                    tracing::debug!(
+                                        error = %error,
+                                        "stopping stdio notification fan-out after peer send failure"
+                                    );
+                                    break;
+                                }
+                            }
+                            Ok(ProtocolNotification::PromptListChanged) => {
+                                if let Err(error) = peer.notify_prompt_list_changed().await {
                                     tracing::debug!(
                                         error = %error,
                                         "stopping stdio notification fan-out after peer send failure"
