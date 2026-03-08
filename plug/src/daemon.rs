@@ -902,10 +902,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             let mut caps = ctx.engine.tool_router().synthesized_capabilities();
-            // Mask resource subscriptions for IPC clients — the daemon IPC
-            // transport has no push channel for targeted notifications.
+            // Mask capabilities that IPC clients cannot consume — the daemon IPC
+            // transport has no push channel for targeted or broadcast notifications
+            // beyond logging.
             if let Some(ref mut resources) = caps.resources {
                 resources.subscribe = None;
+                resources.list_changed = Some(false);
+            }
+            if let Some(ref mut prompts) = caps.prompts {
+                prompts.list_changed = Some(false);
             }
             match serde_json::to_value(caps) {
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },

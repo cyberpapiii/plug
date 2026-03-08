@@ -1259,6 +1259,7 @@ impl ToolRouter {
 
         // Rebind subscriptions whose URI still exists but ownership changed.
         for (uri, old_server_id, new_server_id, subscribers) in rebind_subscriptions {
+            let mut old_unsubscribe_failed = false;
             if let Some(old_upstream) = self.server_manager.get_upstream(&old_server_id) {
                 if let Err(error) = old_upstream
                     .client
@@ -1270,9 +1271,17 @@ impl ToolRouter {
                         uri = %uri,
                         server_id = %old_server_id,
                         error = %error,
-                        "failed to unsubscribe old resource owner during route refresh"
+                        "failed to unsubscribe old resource owner during route refresh; skipping rebind to avoid dual subscription"
                     );
+                    old_unsubscribe_failed = true;
                 }
+            }
+
+            if old_unsubscribe_failed {
+                // Don't subscribe the new owner while the old one may still be
+                // delivering updates — this would cause duplicate notifications.
+                rebind_failures.push(uri);
+                continue;
             }
 
             let Some(new_upstream) = self.server_manager.get_upstream(&new_server_id) else {
