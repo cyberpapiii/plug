@@ -25,7 +25,7 @@ Method:
 
 Using the actively tracked roadmap items, not the older speculative phase plans.
 
-**After PR #31 (`feat/stream-a-followups`) merge:**
+As of PR #31 merge (`b5d90f7`, 2026-03-08):
 
 - `done`: 15
 - `partial`: 4
@@ -80,7 +80,7 @@ connectivity expansion (roots, elicitation, legacy SSE, OAuth) plus sampling.
 
 ## What This Means For `docs/PLAN.md`
 
-After PR #31, `docs/PLAN.md` is honest. Stream A protocol correctness is complete. The remaining
+With PR #31 merged, `docs/PLAN.md` is honest. Stream A protocol correctness is complete. The remaining
 open work is all Stream B connectivity expansion (roots, elicitation/sampling, legacy SSE, OAuth)
 plus minor items (upstream protocol-version header, daemon IPC notification parity, dedicated
 pass-through tests).
@@ -90,7 +90,7 @@ The one nuance: “daemon continuity recovery” is broader than what the code c
 
 ## Remaining Open Work
 
-All prior “minimum code gaps” from the original audit are resolved by PR #31. The remaining work is:
+All prior “minimum code gaps” from the original audit are resolved. The remaining work is:
 
 ### Stream B (new infrastructure required)
 
