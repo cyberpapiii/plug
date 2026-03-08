@@ -34,7 +34,6 @@ The remaining missing work on `main` is:
 - sampling
 - legacy SSE upstream transport
 - OAuth / remote commercial MCP auth flows
-- upstream `MCP-Protocol-Version` send-side
 
 The remaining partial areas on `main` are transport-bounded or under-proven:
 
@@ -83,7 +82,7 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 | `elicitation/create` | missing | No handler found in live code. |
 | `roots/list` forwarding | done | PR #32 adds `roots/list` reverse request, `roots/list_changed` notification handling, and union cache across stdio, HTTP, and daemon IPC in `plug-core/src/proxy/mod.rs`, `plug-core/src/http/server.rs`, `plug/src/daemon.rs`, and `plug/src/ipc_proxy.rs`. |
 | MCP protocol-version request validation (downstream) | done | PR #31 adds `validate_protocol_version_for_post()` in `plug-core/src/http/server.rs`. Requires `MCP-Protocol-Version: 2025-11-25` on POST (except `InitializeRequest`). Returns 400 on missing/mismatched. |
-| MCP protocol-version header on upstream requests | missing | Outgoing upstream HTTP requests do not yet include `MCP-Protocol-Version` header. |
+| MCP protocol-version header on upstream requests | done | rmcp 1.1.0's `StreamableHttpClientTransport` automatically injects `mcp-protocol-version` after initialization using the negotiated version from the server's `InitializeResult`. Confirmed by repo-local confidence test `test_upstream_http_sends_protocol_version_header`. Source: rmcp `streamable_http_client.rs:385-387`. |
 | Meta-tool mode / reduced discovery surface | done | Meta-tools are defined and enforced in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2101) and [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1196). |
 | Dead TUI dependency removal | done | The root manifest [Cargo.toml](/Users/robdezendorf/Documents/GitHub/plug/Cargo.toml) no longer includes `ratatui`, `crossterm`, or `color-eyre`. |
 
@@ -109,6 +108,5 @@ All prior “minimum code gaps” from the original audit are resolved. The rema
 
 ### Smaller items
 
-5. Send `MCP-Protocol-Version` header on outgoing upstream HTTP requests
-6. Decide whether daemon IPC notification parity beyond logging is a release requirement or explicit post-release limit
-7. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
+4. Decide whether daemon IPC notification parity beyond logging is a release requirement or explicit post-release limit
+5. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through

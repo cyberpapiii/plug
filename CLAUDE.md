@@ -47,7 +47,6 @@ Still incomplete:
 - elicitation + sampling reverse-request routing
 - legacy SSE upstream transport
 - OAuth 2.1 + PKCE for upstream remote servers
-- upstream `MCP-Protocol-Version` send-side
 - daemon IPC notification parity beyond logging
 - dedicated end-to-end tests for `structuredContent` and `resource_link`
 - fully live runtime reconfiguration

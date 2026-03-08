@@ -25,6 +25,7 @@ Implemented on `main`:
 - reconnecting IPC proxy sessions
 - session-store seam / stateless prep
 - downstream protocol-version validation
+- upstream MCP-Protocol-Version send-side (provided by rmcp 1.1.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 
 Partial on `main`:
@@ -39,7 +40,6 @@ Missing on `main`:
 - sampling
 - legacy SSE upstream transport
 - OAuth upstream auth
-- upstream `MCP-Protocol-Version` send-side
 
 ## What Exists Off-Main
 

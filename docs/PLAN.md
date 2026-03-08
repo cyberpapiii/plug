@@ -21,6 +21,7 @@ forwarding work:
 - daemon continuity recovery (stdio clients via IPC proxy reconnect)
 - session-store abstraction seam and stateless design prep
 - MCP-Protocol-Version header validation on downstream HTTP POST requests
+- MCP-Protocol-Version header on upstream HTTP requests (provided by rmcp 1.1.0 after initialization)
 - subscription pruning and rebind on route refresh (todo 039 resolved)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 
@@ -48,7 +49,6 @@ These are the open features that require new infrastructure:
 
 ### Smaller open items
 
-- MCP-Protocol-Version header on outgoing upstream HTTP requests (send-side, not just validate-side)
 - daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
 - dedicated tests for `structuredContent` and `resource_link` end-to-end pass-through
 

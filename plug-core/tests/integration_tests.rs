@@ -6,6 +6,7 @@
 //! loading at the unit level without spawning child processes.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{CallToolRequestParams, ClientInfo};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -783,4 +785,190 @@ async fn test_multi_client_shared_engine_isolation() {
     );
 
     engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Confidence test: rmcp injects MCP-Protocol-Version on upstream HTTP requests
+// ---------------------------------------------------------------------------
+//
+// This test does NOT validate plug code — it confirms that rmcp's
+// StreamableHttpClientTransport automatically injects the
+// MCP-Protocol-Version header after initialization, which plug relies on
+// through its single upstream HTTP code path in server/mod.rs.
+
+#[tokio::test]
+async fn test_upstream_http_sends_protocol_version_header() {
+    /// Captured method name + optional MCP-Protocol-Version header value.
+    type CapturedHeaders = Vec<(String, Option<String>)>;
+
+    #[derive(Clone)]
+    struct MockState {
+        captured: Arc<Mutex<CapturedHeaders>>,
+    }
+
+    async fn mock_mcp_handler(
+        axum::extract::State(state): axum::extract::State<MockState>,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let protocol_version = headers
+            .get("mcp-protocol-version")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+
+        let method = json_body
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        state
+            .captured
+            .lock()
+            .await
+            .push((method.clone(), protocol_version));
+
+        let session_headers = [
+            (
+                axum::http::HeaderName::from_static("mcp-session-id"),
+                "test-session",
+            ),
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+        ];
+
+        if method == "initialize" {
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {
+                        "tools": { "listChanged": false }
+                    },
+                    "serverInfo": {
+                        "name": "mock-http-server",
+                        "version": "0.1.0"
+                    }
+                }
+            });
+            return (StatusCode::OK, session_headers, resp.to_string()).into_response();
+        }
+
+        if method == "notifications/initialized" {
+            return (StatusCode::ACCEPTED, session_headers, String::new()).into_response();
+        }
+
+        if method == "tools/list" {
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": { "tools": [] }
+            });
+            return (StatusCode::OK, session_headers, resp.to_string()).into_response();
+        }
+
+        // Default: return empty success
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": {}
+        });
+        (StatusCode::OK, session_headers, resp.to_string()).into_response()
+    }
+
+    let mock_state = MockState {
+        captured: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let app = axum::Router::new()
+        .route("/mcp", axum::routing::post(mock_mcp_handler))
+        .with_state(mock_state.clone());
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind mock server");
+    let port = listener.local_addr().unwrap().port();
+
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    // Give the mock server a moment to start.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connect through plug's upstream HTTP path (ServerManager::start_server).
+    let sm = Arc::new(ServerManager::new());
+    let config = ServerConfig {
+        command: None,
+        args: Vec::new(),
+        env: HashMap::new(),
+        enabled: true,
+        transport: TransportType::Http,
+        url: Some(format!("http://127.0.0.1:{port}/mcp")),
+        auth_token: None,
+        timeout_secs: 10,
+        call_timeout_secs: 5,
+        max_concurrent: 4,
+        health_check_interval_secs: 60,
+        circuit_breaker_enabled: false,
+        enrichment: false,
+        tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
+    };
+
+    let upstream = sm
+        .start_server("mock-http", &config)
+        .await
+        .expect("connect to mock HTTP upstream");
+
+    // start_server does: initialize → notifications/initialized → tools/list.
+    // After it returns, all three requests have been made.
+
+    let captured = mock_state.captured.lock().await;
+
+    // initialize: should NOT have MCP-Protocol-Version (version unknown yet)
+    let init = captured.iter().find(|(m, _)| m == "initialize");
+    assert!(init.is_some(), "should have captured initialize request");
+    assert_eq!(
+        init.unwrap().1,
+        None,
+        "initialize must not send MCP-Protocol-Version (version not yet negotiated)"
+    );
+
+    // notifications/initialized: SHOULD have MCP-Protocol-Version
+    let initialized = captured
+        .iter()
+        .find(|(m, _)| m == "notifications/initialized");
+    assert!(
+        initialized.is_some(),
+        "should have captured notifications/initialized"
+    );
+    assert_eq!(
+        initialized.unwrap().1,
+        Some("2025-11-25".to_string()),
+        "notifications/initialized must include MCP-Protocol-Version from server's InitializeResult"
+    );
+
+    // tools/list: SHOULD have MCP-Protocol-Version
+    let tools_list = captured.iter().find(|(m, _)| m == "tools/list");
+    assert!(
+        tools_list.is_some(),
+        "should have captured tools/list request"
+    );
+    assert_eq!(
+        tools_list.unwrap().1,
+        Some("2025-11-25".to_string()),
+        "tools/list must include MCP-Protocol-Version"
+    );
+
+    drop(upstream);
+    server_handle.abort();
 }
