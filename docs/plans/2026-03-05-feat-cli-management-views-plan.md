@@ -7,6 +7,9 @@ date: 2026-03-05
 
 # feat: CLI management views
 
+> Historical planning note: This file is implementation history, not a canonical current-state
+> reference. Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current project state.
+
 ## Goal
 
 Reshape `plug` around a cleaner operator model without losing the lower-level command API used by scripts, agents, and direct power-user workflows.

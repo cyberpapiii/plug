@@ -9,6 +9,11 @@ last_audit: 2026-03-07
 
 # MCP Spec Compliance Roadmap
 
+> Roadmap note: This file is the roadmap and planning reference for remaining work. It contains a
+> current-status section, but it is not the canonical single-source current-state document. Use
+> `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for the current implementation baseline on
+> `main`.
+
 ## Current Status (audited 2026-03-07)
 
 ### Merged on main

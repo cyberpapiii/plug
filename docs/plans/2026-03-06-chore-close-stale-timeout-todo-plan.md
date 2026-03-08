@@ -8,6 +8,9 @@ origin: docs/brainstorms/2026-03-06-timeout-semantics-brainstorm.md
 
 # Close stale timeout todo
 
+> Historical planning note: This todo-closeout plan is historical workflow context, not a current
+> project-state reference. Use `todos/` plus `docs/PROJECT-STATE-SNAPSHOT.md` for current status.
+
 ## Overview
 
 Todo `022` claims startup and tool calls share a single timeout. Current code shows this is already split and verified.

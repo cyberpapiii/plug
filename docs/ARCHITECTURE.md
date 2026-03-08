@@ -1,5 +1,8 @@
 # Architecture
 
+Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current implementation status. This
+document describes the architecture of the merged system, not branch-only or historical plan state.
+
 ## System Overview
 
 `plug` is a single Rust binary with two active downstream front doors:

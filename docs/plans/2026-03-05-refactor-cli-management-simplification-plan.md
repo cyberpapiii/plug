@@ -7,6 +7,9 @@ date: 2026-03-05
 
 # Refactor CLI management views for simplicity
 
+> Historical planning note: This refactor plan is implementation context, not a current-state
+> reference. Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current project state.
+
 ## Overview
 
 The recent CLI-first phase succeeded at the product level: `plug` now has management views for clients, servers, and tools; a daemon-first workflow; explicit linking and unlinking; server management commands; and effective tool toggling. The implementation is working, but the code structure is carrying too much incidental complexity.

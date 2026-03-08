@@ -2,6 +2,9 @@
 
 This document reflects the dependency picture of the current merged codebase.
 
+Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for overall project state. This file is
+about dependency shape, not roadmap status.
+
 ## Core Runtime
 
 - `rmcp` 1.1.x
@@ -78,11 +81,11 @@ This document reflects the dependency picture of the current merged codebase.
 - `dialoguer`, `console`, `open`
   Guided CLI flows and local config opening.
 
-## Present But Not Active Product Surface
+## Removed From The Current Product Surface
 
 - `ratatui`
 - `crossterm`
 - `color-eyre`
 
-These remain in the manifests from earlier TUI work, but there is still no active TUI product
-surface in the current merged codepath.
+These old TUI dependencies have been removed from the active manifests. The current merged codebase
+has no TUI product surface.

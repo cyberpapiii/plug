@@ -8,6 +8,9 @@ origin: docs/brainstorms/2026-03-06-semaphore-acquisition-timeout-brainstorm.md
 
 # Semaphore acquisition timeout
 
+> Historical planning note: This file is workflow history, not a canonical current-state reference.
+> Use `docs/PROJECT-STATE-SNAPSHOT.md`, `docs/PLAN.md`, and `todos/` for current status.
+
 ## Overview
 
 Prevent indefinite blocking in `ToolRouter::call_tool_inner()` by bounding semaphore acquisition time and surfacing a clear overload error.

@@ -8,6 +8,9 @@ origin: docs/brainstorms/2026-03-06-health-vs-circuit-breaker-brainstorm.md
 
 # Close stale health-circuit todo
 
+> Historical planning note: This todo-closeout plan is historical workflow context, not a current
+> project-state reference. Use `todos/` plus `docs/PROJECT-STATE-SNAPSHOT.md` for current status.
+
 ## Overview
 
 Todo `027` describes an amplification path that is no longer accurate in the current code.

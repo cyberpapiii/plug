@@ -14,6 +14,7 @@ root_cause: "ProxyHandler did not override the ServerHandler::complete() method,
 date: 2026-03-07
 pr: "#28"
 phase: "A3 — MCP Spec Compliance Roadmap"
+note: "Historical solution record for the original completion pass-through landing. Current truth must be checked against main."
 ---
 
 # Completion Pass-Through Forwarding for MCP Proxy

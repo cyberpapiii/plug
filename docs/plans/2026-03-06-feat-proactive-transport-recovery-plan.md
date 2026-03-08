@@ -8,6 +8,9 @@ origin: docs/brainstorms/2026-03-04-daemon-sharing-and-project-audit-brainstorm.
 
 # feat: Proactive Transport Recovery
 
+> Historical planning note: This file is planning history, not a canonical current-state reference.
+> Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current implementation status.
+
 ## Overview
 
 Make plug recover **before** the next tool call discovers a broken connection.

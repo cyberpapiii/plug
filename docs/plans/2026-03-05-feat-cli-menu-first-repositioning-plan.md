@@ -8,6 +8,9 @@ origin: docs/brainstorms/2026-03-04-charm-style-ux-overhaul-brainstorm.md
 
 # feat: CLI Menu-First Repositioning
 
+> Historical planning note: This file is implementation history, not a canonical current-state
+> reference. Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current project state.
+
 ## Overview
 
 `plug` has already pivoted away from the TUI-first direction. The current product value is in the core multiplexer, daemon/runtime behavior, onboarding flows, import/export, doctoring, and tool presentation. The CLI now needs to become the primary product surface instead of feeling like a temporary control panel for a deferred dashboard.
