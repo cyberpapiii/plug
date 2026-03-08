@@ -6,8 +6,8 @@
 use std::fmt;
 
 use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-    CreateMessageResult,
+    ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
+    CreateMessageRequestParams, CreateMessageResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +85,12 @@ pub enum IpcRequest {
         /// Serialized `Vec<Root>` from the downstream client.
         roots: serde_json::Value,
     },
+
+    /// Update a session's MCP client capabilities after initialize.
+    UpdateCapabilities {
+        session_id: String,
+        capabilities: Box<ClientCapabilities>,
+    },
 }
 
 /// Custom Debug that redacts auth_token fields to prevent log leakage.
@@ -146,6 +152,10 @@ impl fmt::Debug for IpcRequest {
                 .finish(),
             Self::UpdateRoots { session_id, .. } => f
                 .debug_struct("UpdateRoots")
+                .field("session_id", session_id)
+                .finish(),
+            Self::UpdateCapabilities { session_id, .. } => f
+                .debug_struct("UpdateCapabilities")
                 .field("session_id", session_id)
                 .finish(),
         }

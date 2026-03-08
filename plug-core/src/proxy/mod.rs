@@ -459,21 +459,19 @@ impl ToolRouter {
         &self,
         server_id: &str,
     ) -> Result<NotificationTarget, McpError> {
-        let mut targets: Vec<NotificationTarget> = self
+        let targets: HashSet<NotificationTarget> = self
             .active_calls
             .iter()
             .filter(|entry| entry.upstream_server_id == server_id)
             .map(|entry| entry.downstream.notification_target())
             .collect();
-        targets.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        targets.dedup();
 
         match targets.len() {
             0 => Err(McpError::internal_error(
                 format!("no active downstream call for upstream server {server_id}"),
                 None,
             )),
-            1 => Ok(targets.remove(0)),
+            1 => Ok(targets.into_iter().next().unwrap()),
             _ => Err(McpError::internal_error(
                 format!("ambiguous downstream ownership for upstream server {server_id}"),
                 None,

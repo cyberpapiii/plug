@@ -14,8 +14,8 @@ use dashmap::DashMap;
 use fs2::FileExt as _;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-    CreateMessageResult, RequestId,
+    ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
+    CreateMessageRequestParams, CreateMessageResult, RequestId,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
@@ -50,6 +50,7 @@ struct ClientSession {
     client_id: String,
     client_info: Option<String>,
     connected_at: Instant,
+    capabilities: ClientCapabilities,
 }
 
 struct RegistrationResult {
@@ -91,6 +92,7 @@ impl ClientRegistry {
                 client_id,
                 client_info,
                 connected_at: Instant::now(),
+                capabilities: ClientCapabilities::default(),
             },
         );
         self.count_tx.send_modify(|c| *c = self.sessions.len());
@@ -141,6 +143,23 @@ impl ClientRegistry {
     /// Number of currently connected clients.
     fn count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Update the MCP client capabilities for a session.
+    fn update_capabilities(&self, session_id: &str, capabilities: ClientCapabilities) -> bool {
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            entry.capabilities = capabilities;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the MCP client capabilities for a session.
+    fn capabilities(&self, session_id: &str) -> Option<ClientCapabilities> {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.capabilities.clone())
     }
 
     fn session_exists(&self, session_id: &str) -> bool {
@@ -521,6 +540,7 @@ struct DaemonBridge {
         IpcClientRequest,
         tokio::sync::oneshot::Sender<IpcClientResponse>,
     )>,
+    client_registry: Arc<ClientRegistry>,
 }
 
 impl DownstreamBridge for DaemonBridge {
@@ -528,6 +548,15 @@ impl DownstreamBridge for DaemonBridge {
         &self,
         request: CreateElicitationRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        let caps = self.client_registry.capabilities(&self.session_id);
+        if caps.as_ref().and_then(|c| c.elicitation.as_ref()).is_none() {
+            return Box::pin(async {
+                Err(McpError::internal_error(
+                    format!("client {} does not support elicitation", self.session_id),
+                    None,
+                ))
+            });
+        }
         let tx = self.reverse_request_tx.clone();
         let session_id = self.session_id.clone();
         Box::pin(async move {
@@ -564,6 +593,15 @@ impl DownstreamBridge for DaemonBridge {
         &self,
         request: CreateMessageRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
+        let caps = self.client_registry.capabilities(&self.session_id);
+        if caps.as_ref().and_then(|c| c.sampling.as_ref()).is_none() {
+            return Box::pin(async {
+                Err(McpError::internal_error(
+                    format!("client {} does not support sampling", self.session_id),
+                    None,
+                ))
+            });
+        }
         let tx = self.reverse_request_tx.clone();
         let session_id = self.session_id.clone();
         Box::pin(async move {
@@ -1026,6 +1064,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             let bridge = Arc::new(DaemonBridge {
                 session_id: session_id.clone(),
                 reverse_request_tx: reverse_tx,
+                client_registry: Arc::clone(&ctx.client_registry),
             });
             ctx.engine.tool_router().register_downstream_bridge(
                 plug_core::notifications::NotificationTarget::Stdio {
@@ -1211,6 +1250,40 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     code: "INVALID_ROOTS".to_string(),
                     message: error.to_string(),
                 },
+            }
+        }
+
+        IpcRequest::UpdateCapabilities {
+            session_id,
+            capabilities,
+        } => {
+            // Enforce session ownership
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            if ctx
+                .client_registry
+                .update_capabilities(session_id, *capabilities.clone())
+            {
+                tracing::info!(
+                    session_id = %session_id,
+                    "session capabilities updated"
+                );
+                IpcResponse::Ok
+            } else {
+                IpcResponse::Error {
+                    code: "UNKNOWN_SESSION".to_string(),
+                    message: "session not found".to_string(),
+                }
             }
         }
 
@@ -1842,5 +1915,140 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"Ping\""));
         assert!(json.contains("\"session_id\":\"session-123\""));
+    }
+
+    #[tokio::test]
+    async fn daemon_bridge_rejects_elicitation_without_capability() {
+        use plug_core::proxy::DownstreamBridge;
+        use rmcp::model::{ClientCapabilities, CreateElicitationRequestParams};
+
+        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = Arc::new(registry);
+        let reg_result = registry.register("test-client".to_string(), Some("test".to_string()));
+        // Capabilities default to None for elicitation/sampling
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let bridge = DaemonBridge {
+            session_id: reg_result.session_id.clone(),
+            reverse_request_tx: tx,
+            client_registry: Arc::clone(&registry),
+        };
+
+        // Build a minimal elicitation request via JSON deserialization
+        let request: CreateElicitationRequestParams = serde_json::from_value(serde_json::json!({
+            "message": "test",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }))
+        .unwrap();
+
+        let result = bridge.create_elicitation(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("does not support elicitation"),
+            "expected capability error, got: {}",
+            err.message
+        );
+
+        // Now update capabilities to include elicitation and verify it passes the gate
+        let caps_with_elicitation: ClientCapabilities =
+            serde_json::from_value(serde_json::json!({ "elicitation": {} })).unwrap();
+        registry.update_capabilities(&reg_result.session_id, caps_with_elicitation);
+
+        let request2: CreateElicitationRequestParams = serde_json::from_value(serde_json::json!({
+            "message": "test",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }))
+        .unwrap();
+
+        // Spawn a task to consume from the channel and drop the oneshot sender,
+        // which will cause the bridge to get a "channel closed" error — but
+        // critically, NOT a capability-gate error.
+        let drain = tokio::spawn(async move {
+            if let Some((_request, _resp_tx)) = rx.recv().await {
+                // Drop resp_tx so the bridge's oneshot recv returns Err
+            }
+        });
+
+        let result2 = bridge.create_elicitation(request2).await;
+        drain.await.unwrap();
+        // The request passed the capability gate and entered the channel.
+        // The oneshot was dropped, so we get a "channel closed" error.
+        assert!(result2.is_err());
+        let err2 = result2.unwrap_err();
+        assert!(
+            !err2.message.contains("does not support elicitation"),
+            "should have passed capability gate, got: {}",
+            err2.message
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_bridge_rejects_sampling_without_capability() {
+        use plug_core::proxy::DownstreamBridge;
+        use rmcp::model::ClientCapabilities;
+
+        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = Arc::new(registry);
+        let reg_result = registry.register("test-client".to_string(), Some("test".to_string()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let bridge = DaemonBridge {
+            session_id: reg_result.session_id.clone(),
+            reverse_request_tx: tx,
+            client_registry: Arc::clone(&registry),
+        };
+
+        // Build a minimal sampling request via JSON
+        let request: rmcp::model::CreateMessageRequestParams =
+            serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                "maxTokens": 100
+            }))
+            .unwrap();
+
+        let result = bridge.create_message(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("does not support sampling"),
+            "expected capability error, got: {}",
+            err.message
+        );
+
+        // Now update capabilities to include sampling
+        let caps_with_sampling: ClientCapabilities =
+            serde_json::from_value(serde_json::json!({ "sampling": {} })).unwrap();
+        registry.update_capabilities(&reg_result.session_id, caps_with_sampling);
+
+        let request2: rmcp::model::CreateMessageRequestParams =
+            serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                "maxTokens": 100
+            }))
+            .unwrap();
+
+        // Spawn a task to consume from the channel and drop the oneshot sender
+        let drain = tokio::spawn(async move {
+            if let Some((_request, _resp_tx)) = rx.recv().await {
+                // Drop resp_tx so the bridge's oneshot recv returns Err
+            }
+        });
+
+        let result2 = bridge.create_message(request2).await;
+        drain.await.unwrap();
+        assert!(result2.is_err());
+        let err2 = result2.unwrap_err();
+        assert!(
+            !err2.message.contains("does not support sampling"),
+            "should have passed capability gate, got: {}",
+            err2.message
+        );
     }
 }

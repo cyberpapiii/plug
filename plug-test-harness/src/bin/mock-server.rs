@@ -6,6 +6,7 @@
 //! Each tool returns a text response echoing the arguments it was called with.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -29,12 +30,18 @@ struct Args {
     /// Fail mode: "none", "timeout" (hang forever), "crash" (exit immediately)
     #[arg(long, default_value = "none")]
     fail_mode: String,
+
+    /// Reverse request mode: "none", "elicitation", "sampling"
+    /// When set, call_tool will send a reverse request to the client before returning.
+    #[arg(long, default_value = "none")]
+    reverse_request: String,
 }
 
 struct MockServer {
     tool_names: Vec<String>,
     delay: std::time::Duration,
     fail_mode: String,
+    reverse_request: String,
 }
 
 impl MockServer {
@@ -87,7 +94,7 @@ impl ServerHandler for MockServer {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
             eprintln!("mock-mcp-server: call_tool {}", request.name);
@@ -115,7 +122,46 @@ impl ServerHandler for MockServer {
                 None => "{}".to_string(),
             };
 
-            let response_text = format!("Called {} with {}", request.name, args_str);
+            let mut response_text = format!("Called {} with {}", request.name, args_str);
+
+            // Handle reverse requests
+            match self.reverse_request.as_str() {
+                "elicitation" => {
+                    eprintln!("mock-mcp-server: sending elicitation reverse request");
+                    let schema = ElicitationSchema::new(BTreeMap::new());
+                    let params = CreateElicitationRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: "mock elicitation request".to_string(),
+                        requested_schema: schema,
+                    };
+                    match context.peer.create_elicitation(params).await {
+                        Ok(result) => {
+                            response_text
+                                .push_str(&format!(" reverse=elicitation:{:?}", result.action));
+                        }
+                        Err(e) => {
+                            response_text.push_str(&format!(" reverse=elicitation:error:{e}"));
+                        }
+                    }
+                }
+                "sampling" => {
+                    eprintln!("mock-mcp-server: sending sampling reverse request");
+                    let params = CreateMessageRequestParams::new(
+                        vec![SamplingMessage::user_text("mock sampling request")],
+                        100,
+                    );
+                    match context.peer.create_message(params).await {
+                        Ok(result) => {
+                            response_text
+                                .push_str(&format!(" reverse=sampling:model={}", result.model));
+                        }
+                        Err(e) => {
+                            response_text.push_str(&format!(" reverse=sampling:error:{e}"));
+                        }
+                    }
+                }
+                _ => {}
+            }
 
             Ok(CallToolResult::success(vec![Content::text(response_text)]))
         }
@@ -154,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         tool_names,
         delay: std::time::Duration::from_millis(args.delay_ms),
         fail_mode: args.fail_mode,
+        reverse_request: args.reverse_request,
     };
 
     let transport = rmcp::transport::io::stdio();

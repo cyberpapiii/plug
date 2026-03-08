@@ -21,10 +21,17 @@ use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::session::SessionStore;
 use plug_core::types::ClientType;
+use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{CallToolRequestParams, ClientInfo};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
+    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
+    ElicitationCapability, FormElicitationCapability, Implementation, SamplingCapability,
+    SamplingMessage, UrlElicitationCapability,
+};
+use rmcp::service::RequestContext;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -971,4 +978,381 @@ async fn test_upstream_http_sends_protocol_version_header() {
 
     drop(upstream);
     server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Reverse-request test infrastructure
+// ---------------------------------------------------------------------------
+
+/// A test client that advertises elicitation + sampling capabilities
+/// and handles reverse requests from upstream servers.
+#[derive(Clone)]
+struct ReverseRequestTestClient;
+
+#[allow(clippy::manual_async_fn)]
+impl ClientHandler for ReverseRequestTestClient {
+    fn get_info(&self) -> ClientInfo {
+        let mut caps = ClientCapabilities::default();
+        caps.sampling = Some(SamplingCapability::default());
+        caps.elicitation = Some(ElicitationCapability {
+            form: Some(FormElicitationCapability::default()),
+            url: Some(UrlElicitationCapability {}),
+        });
+        ClientInfo::new(caps, Implementation::new("reverse-test-client", "1.0"))
+    }
+
+    fn create_elicitation(
+        &self,
+        _request: CreateElicitationRequestParams,
+        _context: RequestContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_ {
+        async {
+            Ok(CreateElicitationResult::new(ElicitationAction::Accept)
+                .with_content(serde_json::json!({"answer": "test-elicitation-response"})))
+        }
+    }
+
+    fn create_message(
+        &self,
+        _request: CreateMessageRequestParams,
+        _context: RequestContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
+        async {
+            Ok(CreateMessageResult::new(
+                SamplingMessage::assistant_text("test-sampling-response"),
+                "mock-model".to_string(),
+            ))
+        }
+    }
+}
+
+fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -> ServerConfig {
+    ServerConfig {
+        command: Some("cargo".to_string()),
+        args: vec![
+            "run".to_string(),
+            "--quiet".to_string(),
+            "-p".to_string(),
+            "plug-test-harness".to_string(),
+            "--bin".to_string(),
+            "mock-mcp-server".to_string(),
+            "--".to_string(),
+            "--tools".to_string(),
+            tools.to_string(),
+            "--reverse-request".to_string(),
+            reverse_request.to_string(),
+        ],
+        env: HashMap::new(),
+        enabled: true,
+        transport: TransportType::Stdio,
+        url: None,
+        auth_token: None,
+        timeout_secs: 30,
+        call_timeout_secs: 30,
+        max_concurrent: 4,
+        health_check_interval_secs: 60,
+        circuit_breaker_enabled: true,
+        enrichment: false,
+        tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stdio: elicitation reverse-request round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stdio_elicitation_reverse_request_round_trip() {
+    let mut config = Config::default();
+    config.servers.insert(
+        "mock".to_string(),
+        mock_server_config_with_reverse_request("echo", "elicitation"),
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = ReverseRequestTestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    // Verify tools are available
+    let tools = client.peer().list_all_tools().await.expect("list tools");
+    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        names.contains(&"Mock__echo".to_string()),
+        "tools: {names:?}"
+    );
+
+    // Call a tool — the mock server will send an elicitation reverse request
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("Mock__echo").with_arguments(
+                serde_json::json!({"input": "test"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call tool with elicitation reverse request");
+
+    let rendered = format!("{result:?}");
+    assert!(
+        rendered.contains("reverse=elicitation:Accept"),
+        "expected elicitation:Accept in result, got: {rendered}"
+    );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Stdio: sampling reverse-request round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stdio_sampling_reverse_request_round_trip() {
+    let mut config = Config::default();
+    config.servers.insert(
+        "mock".to_string(),
+        mock_server_config_with_reverse_request("echo", "sampling"),
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = ReverseRequestTestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let tools = client.peer().list_all_tools().await.expect("list tools");
+    assert!(
+        tools.iter().any(|t| t.name == "Mock__echo"),
+        "mock tool not found"
+    );
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("Mock__echo").with_arguments(
+                serde_json::json!({"input": "test"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call tool with sampling reverse request");
+
+    let rendered = format!("{result:?}");
+    assert!(
+        rendered.contains("reverse=sampling:model=mock-model"),
+        "expected sampling:model=mock-model in result, got: {rendered}"
+    );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP: elicitation reverse-request round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_elicitation_reverse_request_round_trip() {
+    let mut config = Config::default();
+    config.servers.insert(
+        "mock".to_string(),
+        mock_server_config_with_reverse_request("echo", "elicitation"),
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let state = Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        cancel: CancellationToken::new(),
+        sse_channel_capacity: 32,
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+    });
+    let app = build_router(state.clone());
+
+    // 1. Initialize with elicitation + sampling capabilities
+    let initialize_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {
+                "sampling": {},
+                "elicitation": {
+                    "form": {},
+                    "url": {}
+                }
+            },
+            "clientInfo": { "name": "reverse-test-http", "version": "1.0" }
+        }
+    });
+    let initialize_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&initialize_body).unwrap()))
+        .unwrap();
+    let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+    let session_id = initialize_resp
+        .headers()
+        .get(HTTP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Send initialized notification (triggers bridge registration)
+    let initialized_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let initialized_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(serde_json::to_vec(&initialized_body).unwrap()))
+        .unwrap();
+    let _ = app.clone().oneshot(initialized_req).await.unwrap();
+
+    // 3. Open SSE stream
+    let sse_req = HttpRequest::builder()
+        .method("GET")
+        .uri("/mcp")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header("accept", "text/event-stream")
+        .body(Body::empty())
+        .unwrap();
+    let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+
+    // 4. Spawn tools/call POST in background task
+    let app_clone = app.clone();
+    let session_id_clone = session_id.clone();
+    let call_handle = tokio::spawn(async move {
+        // Small delay to let SSE stream establish
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let call_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "Mock__echo",
+                "arguments": { "input": "http-elicitation-test" }
+            }
+        });
+        let call_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(HTTP_SESSION_ID_HEADER, &session_id_clone)
+            .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+            .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+            .unwrap();
+        let call_resp = app_clone.oneshot(call_req).await.unwrap();
+        let call_bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&call_bytes).unwrap()
+    });
+
+    // 5. Read SSE stream for elicitation request
+    let mut stream = sse_resp.into_body().into_data_stream();
+    use futures::StreamExt;
+
+    let mut elicitation_request_id: Option<serde_json::Value> = None;
+    let sse_timeout = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            for line in text.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if json.get("method").and_then(|m| m.as_str()) == Some("elicitation/create")
+                        {
+                            elicitation_request_id = json.get("id").cloned();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        sse_timeout.is_ok(),
+        "timed out waiting for elicitation request on SSE stream"
+    );
+    let request_id = elicitation_request_id.expect("elicitation request id should be captured");
+
+    // 6. POST elicitation response
+    let elicitation_response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "action": "accept",
+            "content": {"answer": "test-http-elicitation-response"}
+        }
+    });
+    let resp_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(
+            serde_json::to_vec(&elicitation_response).unwrap(),
+        ))
+        .unwrap();
+    let _ = app.clone().oneshot(resp_req).await.unwrap();
+
+    // 7. Await tools/call completion
+    let call_result = tokio::time::timeout(Duration::from_secs(30), call_handle)
+        .await
+        .expect("tools/call timed out")
+        .expect("tools/call task panicked");
+
+    let response_text = call_result["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        response_text.contains("reverse=elicitation:Accept"),
+        "expected elicitation:Accept in HTTP response, got: {response_text}"
+    );
+
+    engine.shutdown().await;
 }

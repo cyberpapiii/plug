@@ -742,10 +742,16 @@ must happen:
    - POST the response back
    - Verify the tool call completes
 
-7. **Integration: daemon IPC elicitation round-trip**
+7. **Integration: daemon IPC elicitation round-trip** *(deferred for v1)*
    - Similar to the existing `daemon_backed_proxy_roundtrips_reverse_requests_over_ipc` test on the
      off-main branch
    - Start daemon, connect IPC proxy, call tool, verify elicitation forwarded through IPC
+   - **v1 deferral rationale:** Requires spawning a full daemon process, Unix socket readiness
+     polling, IPC proxy connection, and session lifecycle management — no existing test harness
+     infrastructure supports this. Accepted substitute coverage: DaemonBridge capability gating
+     (2 unit tests), IPC serialization round-trips (3 unit tests), shared ToolRouter infrastructure
+     tested end-to-end via stdio and HTTP paths. The uncovered daemon-specific surface
+     (`handle_reverse_request()` framing and `tokio::select!` dispatch) is narrow and mechanical.
 
 8. **Integration: sampling round-trip (stdio)**
    - Same shape as test 5, with `sampling/createMessage`
@@ -829,6 +835,17 @@ must happen:
 | HTTP SSE connection dropped during long elicitation | Medium | Oneshot sender drop → error propagation; session expiry resolves pending senders with error before removal |
 | Tool-call timeout fires during elicitation wait | Medium | V1 decision: reverse requests consume the tool-call timeout budget (see Timeout section). Operators configure per-server `call_timeout_secs` for elicitation-heavy servers. Timeout-pause is a post-v1 option if needed. |
 | Orphaned HTTP pending requests after timeout | Medium | `ActiveCallGuard::drop()` cleans up tracking maps; session expiry cleanup resolves orphaned oneshot senders; bridge unregistered on disconnect |
+
+## Deferred Findings (v1)
+
+The following findings were identified during code review and explicitly deferred:
+
+| ID | Finding | File | Rationale |
+|----|---------|------|-----------|
+| F3 | HTTP session cleanup uses `retain()` to drop oneshot senders (receiver gets `RecvError`) rather than sending explicit error responses | `plug-core/src/http/server.rs` | Low risk; `RecvError` is functionally equivalent to an error response for the caller. Explicit error would be cleaner but is cosmetic. |
+| F4 | IPC proxy double-parses every frame: first as `DaemonToProxyMessage` envelope, then falls through to plain `IpcResponse` | `plug/src/ipc_proxy.rs` | Performance only; no correctness impact. The double-parse adds ~1 JSON parse per frame. Could be unified with a single tagged enum parse. |
+| F5 | HTTP `send_http_client_request` can send to a session whose SSE stream has disconnected; the oneshot will hang until timeout | `plug-core/src/http/server.rs` | Session expiry and bridge cleanup mitigate the worst case. A proactive liveness check before sending would be better but adds complexity. |
+| F6 | Daemon IPC mixes plain `IpcResponse` frames with `DaemonToProxyMessage` envelope frames on the same stream | `plug/src/daemon.rs`, `plug/src/ipc_proxy.rs` | Working correctly via fallthrough parsing. A unified frame format would be cleaner but requires IPC protocol version bump. |
 
 ## Sources
 

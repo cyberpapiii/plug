@@ -406,6 +406,20 @@ impl ServerHandler for IpcProxyHandler {
                 std::sync::atomic::Ordering::SeqCst,
             );
 
+            // Forward client capabilities to daemon for reverse-request gating
+            let capabilities = request.capabilities.clone();
+            if let Err(e) = self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::UpdateCapabilities {
+                        session_id: session_id.to_string(),
+                        capabilities: Box::new(capabilities.clone()),
+                    }
+                })
+                .await
+            {
+                tracing::warn!(error = %e, "failed to update session capabilities");
+            }
+
             // Store peer for logging notification forwarding. The daemon
             // pushes LoggingNotification frames after registration; the
             // heartbeat and request round-trips forward them to this peer.
