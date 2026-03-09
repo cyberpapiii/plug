@@ -11,7 +11,7 @@ use rmcp::model::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::ServerStatus;
+use crate::types::{ServerHealth, ServerStatus};
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
@@ -91,6 +91,18 @@ pub enum IpcRequest {
         session_id: String,
         capabilities: Box<ClientCapabilities>,
     },
+
+    /// Query OAuth authentication status for all configured servers.
+    AuthStatus,
+
+    /// Inject OAuth credentials into the running daemon and trigger reconnect.
+    InjectToken {
+        auth_token: String,
+        server_name: String,
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_in: Option<u64>,
+    },
 }
 
 /// Custom Debug that redacts auth_token fields to prevent log leakage.
@@ -158,6 +170,13 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("UpdateCapabilities")
                 .field("session_id", session_id)
                 .finish(),
+            Self::AuthStatus => write!(f, "AuthStatus"),
+            Self::InjectToken { server_name, .. } => f
+                .debug_struct("InjectToken")
+                .field("auth_token", &"[REDACTED]")
+                .field("server_name", server_name)
+                .field("access_token", &"[REDACTED]")
+                .finish(),
         }
     }
 }
@@ -176,6 +195,17 @@ pub struct IpcClientInfo {
     pub session_id: String,
     pub client_info: Option<String>,
     pub connected_secs: u64,
+}
+
+/// Per-server OAuth authentication info returned by `AuthStatus`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcAuthServerInfo {
+    pub name: String,
+    pub url: Option<String>,
+    pub authenticated: bool,
+    pub health: ServerHealth,
+    pub scopes: Option<Vec<String>>,
+    pub token_expires_in_secs: Option<u64>,
 }
 
 /// Responses sent from daemon → CLI over Unix socket.
@@ -234,6 +264,15 @@ pub enum IpcResponse {
     /// Push notification: an in-flight tool call was cancelled.
     /// Payload is a serialized `CancelledNotificationParam`.
     CancelledNotification { params: serde_json::Value },
+
+    /// OAuth authentication status for all configured servers.
+    AuthStatus { servers: Vec<IpcAuthServerInfo> },
+
+    /// Push notification: a server's authentication state changed.
+    AuthStateChanged {
+        server_id: String,
+        state: ServerHealth,
+    },
 }
 
 // ──────────────────────── Reverse-request IPC types ──────────────────────────
@@ -289,7 +328,10 @@ pub enum DaemonToProxyMessage {
 pub fn requires_auth(request: &IpcRequest) -> bool {
     matches!(
         request,
-        IpcRequest::RestartServer { .. } | IpcRequest::Reload { .. } | IpcRequest::Shutdown { .. }
+        IpcRequest::RestartServer { .. }
+            | IpcRequest::Reload { .. }
+            | IpcRequest::Shutdown { .. }
+            | IpcRequest::InjectToken { .. }
     )
 }
 
@@ -298,7 +340,8 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     match request {
         IpcRequest::RestartServer { auth_token, .. }
         | IpcRequest::Reload { auth_token, .. }
-        | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::Shutdown { auth_token, .. }
+        | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -400,6 +443,21 @@ mod tests {
                 method: "tools/call".to_string(),
                 params: Some(serde_json::json!({"name": "test_tool", "arguments": {}})),
             },
+            IpcRequest::AuthStatus,
+            IpcRequest::InjectToken {
+                auth_token: "token".to_string(),
+                server_name: "my-server".to_string(),
+                access_token: "at-123".to_string(),
+                refresh_token: Some("rt-456".to_string()),
+                expires_in: Some(3600),
+            },
+            IpcRequest::InjectToken {
+                auth_token: "token".to_string(),
+                server_name: "other".to_string(),
+                access_token: "at".to_string(),
+                refresh_token: None,
+                expires_in: None,
+            },
         ];
 
         for req in &requests {
@@ -444,6 +502,20 @@ mod tests {
             IpcResponse::CancelledNotification {
                 params: serde_json::json!({"requestId": 42, "reason": "user cancelled"}),
             },
+            IpcResponse::AuthStatus {
+                servers: vec![IpcAuthServerInfo {
+                    name: "my-server".to_string(),
+                    url: Some("https://example.com".to_string()),
+                    authenticated: true,
+                    health: ServerHealth::Healthy,
+                    scopes: Some(vec!["read".to_string()]),
+                    token_expires_in_secs: Some(3600),
+                }],
+            },
+            IpcResponse::AuthStateChanged {
+                server_id: "my-server".to_string(),
+                state: ServerHealth::AuthRequired,
+            },
         ];
 
         for resp in &responses {
@@ -468,6 +540,13 @@ mod tests {
         assert!(requires_auth(&IpcRequest::Shutdown {
             auth_token: "t".to_string(),
         }));
+        assert!(requires_auth(&IpcRequest::InjectToken {
+            auth_token: "t".to_string(),
+            server_name: "s".to_string(),
+            access_token: "a".to_string(),
+            refresh_token: None,
+            expires_in: None,
+        }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)
         assert!(!requires_auth(&IpcRequest::Register {
@@ -490,6 +569,7 @@ mod tests {
             method: "tools/list".to_string(),
             params: None,
         }));
+        assert!(!requires_auth(&IpcRequest::AuthStatus));
     }
 
     #[test]
@@ -501,6 +581,16 @@ mod tests {
                 auth_token: "my_token".to_string(),
             }),
             Some("my_token")
+        );
+        assert_eq!(
+            extract_auth_token(&IpcRequest::InjectToken {
+                auth_token: "inject_tok".to_string(),
+                server_name: "s".to_string(),
+                access_token: "a".to_string(),
+                refresh_token: None,
+                expires_in: None,
+            }),
+            Some("inject_tok")
         );
     }
 
@@ -572,6 +662,22 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(!debug_str.contains("super_secret"));
         assert!(debug_str.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn debug_redacts_inject_token_secrets() {
+        let req = IpcRequest::InjectToken {
+            auth_token: "daemon_secret".to_string(),
+            server_name: "my-server".to_string(),
+            access_token: "bearer_secret".to_string(),
+            refresh_token: Some("refresh_secret".to_string()),
+            expires_in: Some(3600),
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(!debug_str.contains("daemon_secret"));
+        assert!(!debug_str.contains("bearer_secret"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(debug_str.contains("my-server"));
     }
 
     #[test]

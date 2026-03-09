@@ -215,6 +215,9 @@ impl HttpState {
                                     ProtocolNotification::LoggingMessage { .. } => {
                                         // Logging is handled by the dedicated logging fan-out task below
                                     }
+                                    ProtocolNotification::AuthStateChanged { .. } => {
+                                        // AuthStateChanged is IPC-only; no MCP wire equivalent for HTTP
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

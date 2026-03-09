@@ -1024,6 +1024,16 @@ async fn send_ipc_control_notification(
                 ipc::send_response(writer, &notif).await.ok();
             }
         }
+        Ok(ProtocolNotification::AuthStateChanged {
+            server_id,
+            new_state,
+        }) => {
+            let notif = IpcResponse::AuthStateChanged {
+                server_id: server_id.to_string(),
+                state: new_state,
+            };
+            ipc::send_response(writer, &notif).await.ok();
+        }
         Ok(
             ProtocolNotification::LoggingMessage { .. }
             | ProtocolNotification::ResourceUpdated { .. },
@@ -1415,6 +1425,189 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await
+        }
+
+        IpcRequest::AuthStatus => dispatch_auth_status(ctx).await,
+
+        IpcRequest::InjectToken {
+            server_name,
+            access_token,
+            refresh_token,
+            expires_in,
+            ..
+        } => dispatch_inject_token(ctx, server_name, access_token, refresh_token, expires_in).await,
+    }
+}
+
+/// Handle `AuthStatus` — return per-server OAuth state from config + credential stores.
+async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
+    use plug_core::oauth;
+    use rmcp::transport::auth::CredentialStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let config = plug_core::config::load_config(Some(&ctx.config_path));
+    let config = match config {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return IpcResponse::Error {
+                code: "CONFIG_LOAD_FAILED".to_string(),
+                message: e.to_string(),
+            };
+        }
+    };
+
+    // Get runtime health from server manager
+    let statuses = ctx.server_manager.server_statuses();
+    let status_map: std::collections::HashMap<&str, &plug_core::types::ServerStatus> =
+        statuses.iter().map(|s| (s.server_id.as_str(), s)).collect();
+
+    let mut oauth_servers: Vec<_> = config
+        .servers
+        .iter()
+        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth"))
+        .collect();
+    oauth_servers.sort_by_key(|(name, _)| (*name).clone());
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut servers = Vec::new();
+    for (name, sc) in &oauth_servers {
+        let store = oauth::get_or_create_store(name);
+        let has_creds = store.load().await.ok().flatten().is_some();
+
+        let health = status_map
+            .get(name.as_str())
+            .map(|s| s.health)
+            .unwrap_or_else(|| {
+                if has_creds {
+                    plug_core::types::ServerHealth::Healthy
+                } else {
+                    plug_core::types::ServerHealth::AuthRequired
+                }
+            });
+
+        let token_expires_in_secs = if has_creds {
+            store.cached_expiry().map(|(received_at, expires_in)| {
+                let effective = expires_in.unwrap_or(oauth::DEFAULT_TOKEN_LIFETIME_SECS);
+                let elapsed = now.saturating_sub(received_at);
+                effective.saturating_sub(elapsed)
+            })
+        } else {
+            None
+        };
+
+        servers.push(plug_core::ipc::IpcAuthServerInfo {
+            name: (*name).clone(),
+            url: sc.url.clone(),
+            authenticated: has_creds,
+            health,
+            scopes: sc.oauth_scopes.clone(),
+            token_expires_in_secs,
+        });
+    }
+
+    IpcResponse::AuthStatus { servers }
+}
+
+/// Handle `InjectToken` — save credentials and trigger server reconnect.
+async fn dispatch_inject_token(
+    ctx: &ConnectionContext,
+    server_name: &str,
+    access_token: &str,
+    refresh_token: &Option<String>,
+    expires_in: &Option<u64>,
+) -> IpcResponse {
+    use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
+    use plug_core::oauth;
+    use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Verify server exists and is OAuth-configured
+    let config = match plug_core::config::load_config(Some(&ctx.config_path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return IpcResponse::Error {
+                code: "CONFIG_LOAD_FAILED".to_string(),
+                message: e.to_string(),
+            };
+        }
+    };
+    match config.servers.get(server_name) {
+        Some(sc) if sc.auth.as_deref() == Some("oauth") => {}
+        Some(_) => {
+            return IpcResponse::Error {
+                code: "NOT_OAUTH_SERVER".to_string(),
+                message: format!("server '{server_name}' is not configured for OAuth"),
+            };
+        }
+        None => {
+            return IpcResponse::Error {
+                code: "UNKNOWN_SERVER".to_string(),
+                message: format!("server '{server_name}' not found in config"),
+            };
+        }
+    }
+
+    // Build and save credentials
+    let store = oauth::get_or_create_store(server_name);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
+        AccessToken::new(access_token.to_string()),
+        BasicTokenType::Bearer,
+        VendorExtraTokenFields::default(),
+    );
+
+    if let Some(rt) = refresh_token {
+        token.set_refresh_token(Some(RefreshToken::new(rt.clone())));
+    }
+    if let Some(secs) = expires_in {
+        token.set_expires_in(Some(&std::time::Duration::from_secs(*secs)));
+    }
+
+    let stored = StoredCredentials {
+        client_id: "injected".to_string(),
+        token_response: Some(token),
+        granted_scopes: vec![],
+        token_received_at: Some(now),
+    };
+
+    if let Err(e) = store.save(stored).await {
+        return IpcResponse::Error {
+            code: "CREDENTIAL_SAVE_FAILED".to_string(),
+            message: e.to_string(),
+        };
+    }
+
+    // Trigger server reconnect to pick up new credentials
+    match ctx.engine.restart_server(server_name).await {
+        Ok(()) => {
+            tracing::info!(server = %server_name, "credentials injected and server restarted via IPC");
+            // Notify IPC clients of the auth state change (→ Healthy)
+            ctx.engine.tool_router().publish_protocol_notification(
+                plug_core::notifications::ProtocolNotification::AuthStateChanged {
+                    server_id: std::sync::Arc::from(server_name),
+                    new_state: plug_core::types::ServerHealth::Healthy,
+                },
+            );
+            IpcResponse::Ok
+        }
+        Err(e) => {
+            tracing::warn!(server = %server_name, error = %e, "credentials injected but server restart failed");
+            IpcResponse::Error {
+                code: "RESTART_FAILED".to_string(),
+                message: format!(
+                    "credentials saved but server restart failed: {e}. \
+                     The server may recover on next health check."
+                ),
+            }
         }
     }
 }

@@ -568,6 +568,13 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                                 old: ServerHealth::Healthy,
                                 new: ServerHealth::AuthRequired,
                             });
+                            // Notify IPC clients of the auth state change
+                            engine.tool_router().publish_protocol_notification(
+                                crate::notifications::ProtocolNotification::AuthStateChanged {
+                                    server_id: Arc::from(server_name),
+                                    new_state: ServerHealth::AuthRequired,
+                                },
+                            );
                             break; // Exit loop — AuthRequired is sticky
                         }
                         tracing::warn!(
