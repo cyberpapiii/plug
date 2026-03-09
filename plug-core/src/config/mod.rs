@@ -125,6 +125,14 @@ pub struct ServerConfig {
     pub url: Option<String>,
     /// Bearer token for HTTP upstream authentication.
     pub auth_token: Option<crate::types::SecretString>,
+    /// Authentication mode for upstream server ("oauth" for OAuth 2.1 + PKCE).
+    /// Mutually exclusive with `auth_token`.
+    pub auth: Option<String>,
+    /// OAuth client ID for pre-registered clients. If absent, dynamic client registration is used.
+    pub oauth_client_id: Option<String>,
+    /// OAuth scopes to request during authorization.
+    #[serde(default)]
+    pub oauth_scopes: Option<Vec<String>>,
     /// Startup timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -230,6 +238,24 @@ pub struct ToolGroupRule {
     pub strip: Vec<String>,
 }
 
+/// Sanitize server name for use in filesystem paths (e.g. token storage).
+/// Rejects path separators, parent directory references, hidden file prefixes,
+/// and null bytes. Caps length to 255 bytes.
+pub fn sanitize_server_name_for_path(name: &str) -> Result<&str, String> {
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(format!(
+            "server name '{name}' contains invalid path characters"
+        ));
+    }
+    if name.starts_with('.') || name.contains("..") {
+        return Err(format!("server name '{name}' contains directory traversal"));
+    }
+    if name.len() > 255 {
+        return Err(format!("server name '{name}' exceeds 255 bytes"));
+    }
+    Ok(name)
+}
+
 /// Validate a config and return a list of error messages.
 ///
 /// Returns an empty vec if the config is valid.
@@ -311,6 +337,32 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                 "server '{name}': name must not contain the prefix delimiter '{}'",
                 config.prefix_delimiter
             ));
+        }
+
+        // Server name must be filesystem-safe for token storage
+        if let Err(e) = sanitize_server_name_for_path(name) {
+            errors.push(format!("server '{name}': {e}"));
+        }
+
+        // OAuth validation
+        if server.auth.as_deref() == Some("oauth") {
+            if server.auth_token.is_some() {
+                errors.push(format!(
+                    "server '{name}': auth = \"oauth\" is mutually exclusive with auth_token"
+                ));
+            }
+            if matches!(server.transport, TransportType::Stdio) {
+                errors.push(format!(
+                    "server '{name}': auth = \"oauth\" requires http or sse transport, not stdio"
+                ));
+            }
+        }
+        if let Some(ref auth) = server.auth {
+            if auth != "oauth" {
+                errors.push(format!(
+                    "server '{name}': auth must be \"oauth\" if set (got \"{auth}\")"
+                ));
+            }
         }
 
         if server.timeout_secs == 0 {
@@ -407,6 +459,14 @@ pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figm
         if let Some(ref token) = server.auth_token {
             vars.extend(expand::extract_env_refs(token.as_str()));
         }
+        if let Some(ref client_id) = server.oauth_client_id {
+            vars.extend(expand::extract_env_refs(client_id));
+        }
+        if let Some(ref scopes) = server.oauth_scopes {
+            for scope in scopes {
+                vars.extend(expand::extract_env_refs(scope));
+            }
+        }
     }
     vars.sort();
     vars.dedup();
@@ -443,6 +503,14 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
         }
         if let Some(ref mut token) = server.auth_token {
             *token = expand_env_vars(token.as_str()).into();
+        }
+        if let Some(ref mut client_id) = server.oauth_client_id {
+            *client_id = expand_env_vars(client_id);
+        }
+        if let Some(ref mut scopes) = server.oauth_scopes {
+            for scope in scopes.iter_mut() {
+                *scope = expand_env_vars(scope);
+            }
         }
     }
 
@@ -580,6 +648,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -607,6 +678,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -638,6 +712,9 @@ mod tests {
                 transport: TransportType::Http,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -669,6 +746,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 0,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -760,6 +840,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -791,6 +874,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 0,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -804,5 +890,188 @@ mod tests {
         let errors = validate_config(&cfg);
         // Should catch port, startup_concurrency, missing command, and zero timeout
         assert!(errors.len() >= 4, "expected >= 4 errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_oauth_mutual_exclusion_with_auth_token() {
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "bad".to_string(),
+            ServerConfig {
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some("https://example.com/mcp".to_string()),
+                auth_token: Some(crate::types::SecretString::from("token".to_string())),
+                auth: Some("oauth".to_string()),
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        let errors = validate_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn validate_oauth_requires_http_or_sse_transport() {
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "bad".to_string(),
+            ServerConfig {
+                command: Some("node".to_string()),
+                args: vec![],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        let errors = validate_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("requires http or sse")));
+    }
+
+    #[test]
+    fn validate_invalid_auth_value() {
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "bad".to_string(),
+            ServerConfig {
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some("https://example.com/mcp".to_string()),
+                auth_token: None,
+                auth: Some("basic".to_string()),
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        let errors = validate_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("must be \"oauth\"")));
+    }
+
+    #[test]
+    fn validate_server_name_path_traversal() {
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "../etc/passwd".to_string(),
+            ServerConfig {
+                command: Some("node".to_string()),
+                args: vec![],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("directory traversal") || e.contains("invalid path"))
+        );
+    }
+
+    #[test]
+    fn validate_oauth_config_on_http_is_valid() {
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "notion".to_string(),
+            ServerConfig {
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some("https://mcp.notion.so/mcp".to_string()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: None,
+                oauth_scopes: Some(vec!["mcp:read".to_string(), "mcp:write".to_string()]),
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        let errors = validate_config(&cfg);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn sanitize_rejects_path_separators() {
+        assert!(sanitize_server_name_for_path("foo/bar").is_err());
+        assert!(sanitize_server_name_for_path("foo\\bar").is_err());
+        assert!(sanitize_server_name_for_path("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_directory_traversal() {
+        assert!(sanitize_server_name_for_path("..").is_err());
+        assert!(sanitize_server_name_for_path(".hidden").is_err());
+        assert!(sanitize_server_name_for_path("foo..bar").is_err());
+    }
+
+    #[test]
+    fn sanitize_accepts_valid_names() {
+        assert!(sanitize_server_name_for_path("notion").is_ok());
+        assert!(sanitize_server_name_for_path("my-server").is_ok());
+        assert!(sanitize_server_name_for_path("server_123").is_ok());
+    }
+
+    #[test]
+    fn sanitize_rejects_long_names() {
+        let long = "a".repeat(256);
+        assert!(sanitize_server_name_for_path(&long).is_err());
+        let ok = "a".repeat(255);
+        assert!(sanitize_server_name_for_path(&ok).is_ok());
     }
 }
