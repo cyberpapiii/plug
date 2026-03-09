@@ -40,14 +40,14 @@ Implemented today:
 - meta-tool mode
 - roots forwarding with union cache across all transports
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
-- OAuth 2.1 + PKCE upstream auth with credential storage, background refresh, CLI commands, and doctor checks
+- OAuth 2.1 + PKCE upstream auth with credential storage, background refresh, zero-downtime token refresh, CLI commands, and doctor checks
 - import/export/doctor flows
 - startup recovery and health monitoring
 
 Still incomplete:
 
 - fully live runtime reconfiguration
-- OAuth follow-up polish: zero-downtime reconnect, mock OAuth integration tests
+- OAuth follow-up polish: mock OAuth integration tests
 
 ## Documentation Map
 

@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `235e4cb` (post-merge truth pass for PR #41 IPC auth commands)
+Baseline: `main` @ `b1eb17b` (post-merge truth pass for PR #42 zero-downtime token refresh)
 
 This is the canonical current-state doc for the project.
 
@@ -35,11 +35,12 @@ Implemented on `main`:
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
 - `plug auth complete` for non-interactive OAuth code exchange (PR #40)
 - IPC auth commands: `AuthStatus` query, `InjectToken` credential injection with server reconnect, `AuthStateChanged` push notification (PR #41)
+- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path (PR #42)
 
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- OAuth follow-up items: zero-downtime reconnect, mock OAuth integration tests
+- OAuth follow-up items: mock OAuth integration tests
 
 ## What Exists Off-Main
 
