@@ -9,13 +9,16 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::future::join_all;
+use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CancelledNotificationParam, ClientInfo, LoggingMessageNotificationParam,
+    CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
+    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
+    ElicitationCapability, FormElicitationCapability, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
-    ResourceUpdatedNotificationParam, RootsCapabilities, ServerCapabilities, SetLevelRequestParams,
-    Tool,
+    ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
+    SetLevelRequestParams, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
@@ -44,6 +47,11 @@ impl ClientHandler for UpstreamClientHandler {
         info.capabilities.roots = Some(RootsCapabilities {
             list_changed: Some(true),
         });
+        info.capabilities.sampling = Some(SamplingCapability::default());
+        info.capabilities.elicitation = Some(ElicitationCapability {
+            form: Some(FormElicitationCapability::default()),
+            url: Some(UrlElicitationCapability::default()),
+        });
         info
     }
 
@@ -58,6 +66,48 @@ impl ClientHandler for UpstreamClientHandler {
                 Ok(router.list_roots_union())
             } else {
                 Ok(rmcp::model::ListRootsResult::default())
+            }
+        }
+    }
+
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+        _context: RequestContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                router
+                    .create_elicitation_from_upstream(server_id.as_ref(), request)
+                    .await
+            } else {
+                Err(McpError::internal_error(
+                    "router unavailable during upstream elicitation".to_string(),
+                    None,
+                ))
+            }
+        }
+    }
+
+    fn create_message(
+        &self,
+        request: CreateMessageRequestParams,
+        _context: RequestContext<rmcp::RoleClient>,
+    ) -> impl Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
+        let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
+        async move {
+            if let Some(router) = router.upgrade() {
+                router
+                    .create_message_from_upstream(server_id.as_ref(), request)
+                    .await
+            } else {
+                Err(McpError::internal_error(
+                    "router unavailable during upstream sampling".to_string(),
+                    None,
+                ))
             }
         }
     }
