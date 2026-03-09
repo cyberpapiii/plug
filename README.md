@@ -119,6 +119,8 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 - **Shared connections** — N clients share 1 upstream connection per server (not N connections)
 - **Client-aware** — automatically respects per-client tool limits (Windsurf: 100, VS Code: 128)
 - **Zero dependencies** — single static binary, no Docker, no database, no account required
+- **OAuth built in** — authenticate to remote MCP servers with `plug auth login`, background token refresh handles the rest
+- **Every transport** — upstream stdio, HTTP, and legacy SSE; downstream stdio and Streamable HTTP/HTTPS
 
 ## Commands
 
@@ -136,8 +138,10 @@ plug config check            # Validate config syntax and core rules
 plug tools disable --server slack
 plug tools enable --server slack
 plug tools --output json     # Machine-readable output for agent use
-plug connect                 # Internal stdio adapter AI clients invoke
-plug serve --daemon          # Run as headless daemon with IPC
+plug auth login --server name  # OAuth login for remote MCP servers
+plug auth status               # Show per-server auth status
+plug connect                   # Internal stdio adapter AI clients invoke
+plug serve --daemon            # Run as headless daemon with IPC
 ```
 
 ## Configuration
@@ -175,6 +179,13 @@ args = ["-y", "@modelcontextprotocol/server-postgres", "$DATABASE_URL"]
 env = { DATABASE_URL = "$DATABASE_URL" }
 max_concurrent = 1         # Limit concurrent requests
 enrichment = true          # Infer tool annotations from name patterns
+
+# Remote HTTP server with OAuth authentication
+[servers.remote-notion]
+transport = "http"
+url = "https://mcp.notion.so/mcp"
+auth = "oauth"
+oauth_scopes = ["mcp:read", "mcp:write"]
 ```
 
 Environment variable references (`$VAR_NAME`) in config values are expanded at startup.
@@ -183,16 +194,17 @@ Environment variable references (`$VAR_NAME`) in config values are expanded at s
 
 | Document | Purpose |
 |----------|---------|
+| [PROJECT-STATE-SNAPSHOT.md](docs/PROJECT-STATE-SNAPSHOT.md) | Current state of what is implemented on `main` |
+| [PLAN.md](docs/PLAN.md) | Current state and remaining work |
 | [VISION.md](docs/VISION.md) | Core principles, design philosophy, non-negotiable rules |
-| [USERS.md](docs/USERS.md) | Who uses this, user stories, personas, scenarios |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical architecture, component design, data flow |
+| [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | AI client quirks, limits, and configuration |
+| [UX-DESIGN.md](docs/UX-DESIGN.md) | Guided CLI + agent UX patterns |
+| [CRATE-STACK.md](docs/CRATE-STACK.md) | Dependency decisions with rationale |
 | [MCP-SPEC.md](docs/MCP-SPEC.md) | MCP protocol reference relevant to implementation |
-| [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | Every AI client's quirks, limits, and requirements |
-| [COMPETITIVE.md](docs/COMPETITIVE.md) | Every competitor analyzed with gap analysis |
-| [UX-DESIGN.md](docs/UX-DESIGN.md) | Guided CLI + agent UX patterns for the current product phase |
-| [CRATE-STACK.md](docs/CRATE-STACK.md) | Every dependency decision with rationale |
-| [PLAN.md](docs/PLAN.md) | Phased implementation plan |
-| [RESEARCH-BREADCRUMBS.md](docs/RESEARCH-BREADCRUMBS.md) | Open questions, edge cases, deeper research signals |
+| [USERS.md](docs/USERS.md) | User stories, personas, scenarios |
+| [COMPETITIVE.md](docs/COMPETITIVE.md) | Competitor analysis |
+| [RESEARCH-BREADCRUMBS.md](docs/RESEARCH-BREADCRUMBS.md) | Open questions and deeper research signals |
 
 ## Design Principles
 
