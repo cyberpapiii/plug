@@ -171,11 +171,25 @@ impl fmt::Debug for IpcRequest {
                 .field("session_id", session_id)
                 .finish(),
             Self::AuthStatus => write!(f, "AuthStatus"),
-            Self::InjectToken { server_name, .. } => f
+            Self::InjectToken {
+                server_name,
+                refresh_token,
+                expires_in,
+                ..
+            } => f
                 .debug_struct("InjectToken")
                 .field("auth_token", &"[REDACTED]")
                 .field("server_name", server_name)
                 .field("access_token", &"[REDACTED]")
+                .field(
+                    "refresh_token",
+                    if refresh_token.is_some() {
+                        &"[REDACTED]"
+                    } else {
+                        &"None"
+                    },
+                )
+                .field("expires_in", expires_in)
                 .finish(),
         }
     }
@@ -676,8 +690,10 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(!debug_str.contains("daemon_secret"));
         assert!(!debug_str.contains("bearer_secret"));
+        assert!(!debug_str.contains("refresh_secret"));
         assert!(debug_str.contains("[REDACTED]"));
         assert!(debug_str.contains("my-server"));
+        assert!(debug_str.contains("3600"));
     }
 
     #[test]
