@@ -544,10 +544,18 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                         next_check = Duration::from_secs(30);
                     }
                     Err(e) => {
-                        let err_str = format!("{e}");
-                        if err_str.contains("authorization required")
-                            || err_str.contains("OAuth authorization required")
-                        {
+                        // Check for auth-related failures using both the error
+                        // chain and known error message patterns. This covers
+                        // rmcp AuthError variants and anyhow-wrapped messages
+                        // from start_and_register().
+                        let err_str = format!("{e:#}").to_lowercase();
+                        let is_auth_failure = err_str.contains("authorization required")
+                            || err_str.contains("oauth authorization required")
+                            || err_str.contains("401")
+                            || err_str.contains("unauthorized")
+                            || err_str.contains("invalid_grant")
+                            || err_str.contains("invalid_token");
+                        if is_auth_failure {
                             tracing::warn!(
                                 server = %server_name,
                                 "refresh failed (authorization required), marking AuthRequired"
