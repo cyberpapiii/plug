@@ -46,12 +46,25 @@ impl LegacySseError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LegacySseTransportConfig {
     pub uri: Arc<str>,
     pub auth_token: Option<Arc<str>>,
     pub channel_buffer_capacity: usize,
     pub retry_policy: Arc<dyn SseRetryPolicy>,
+}
+
+impl std::fmt::Debug for LegacySseTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacySseTransportConfig")
+            .field("uri", &self.uri)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("channel_buffer_capacity", &self.channel_buffer_capacity)
+            .finish()
+    }
 }
 
 impl LegacySseTransportConfig {
@@ -77,14 +90,11 @@ pub struct LegacySseClientTransport(WorkerTransport<LegacySseWorker>);
 
 impl LegacySseClientTransport {
     pub fn from_config(config: LegacySseTransportConfig) -> Self {
-        Self(WorkerTransport::spawn(LegacySseWorker {
-            client: reqwest::Client::default(),
-            config,
-        }))
-    }
-
-    pub fn from_uri(uri: impl Into<Arc<str>>) -> Self {
-        Self::from_config(LegacySseTransportConfig::with_uri(uri))
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build reqwest client");
+        Self(WorkerTransport::spawn(LegacySseWorker { client, config }))
     }
 }
 
@@ -384,6 +394,7 @@ async fn post_message(
 ) -> Result<(), LegacySseError> {
     let mut request = client
         .post(endpoint.as_ref())
+        .timeout(Duration::from_secs(30))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json, text/event-stream");
     if let Some(token) = auth_token {
@@ -417,6 +428,20 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
             .join(trimmed)
             .map_err(|_| LegacySseError::InvalidEndpoint(trimmed.into()))?,
     };
+
+    // Enforce same-origin: the resolved endpoint must share the scheme, host, and port
+    // of the base URL. This prevents a malicious server from redirecting traffic
+    // to arbitrary destinations via the SSE `endpoint` event.
+    if joined.scheme() != base.scheme()
+        || joined.host_str() != base.host_str()
+        || joined.port() != base.port()
+    {
+        return Err(LegacySseError::InvalidEndpoint(format!(
+            "endpoint '{}' does not match origin of '{}'",
+            joined, base_url
+        )));
+    }
+
     Ok(Arc::from(joined.to_string()))
 }
 
@@ -430,4 +455,106 @@ pub fn should_fallback_http_error(error: &anyhow::Error) -> bool {
         || error.to_string().contains("HTTP 400")
         || error.to_string().contains("HTTP 404")
         || error.to_string().contains("HTTP 405")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_endpoint_relative_path() {
+        let endpoint =
+            resolve_endpoint("http://localhost:8080/mcp", "/messages").expect("resolve relative");
+        assert_eq!(endpoint.as_ref(), "http://localhost:8080/messages");
+    }
+
+    #[test]
+    fn resolve_endpoint_same_origin_absolute() {
+        let endpoint = resolve_endpoint(
+            "http://localhost:8080/mcp",
+            "http://localhost:8080/messages",
+        )
+        .expect("resolve same-origin absolute");
+        assert_eq!(endpoint.as_ref(), "http://localhost:8080/messages");
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_cross_origin() {
+        let result = resolve_endpoint("http://localhost:8080/mcp", "https://evil.com/steal");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("does not match origin"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_metadata_redirect() {
+        let result = resolve_endpoint(
+            "http://localhost:8080/mcp",
+            "http://169.254.169.254/latest/meta-data/",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_scheme_downgrade() {
+        let result = resolve_endpoint("https://example.com/mcp", "http://example.com/messages");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_port_change() {
+        let result = resolve_endpoint(
+            "http://localhost:8080/mcp",
+            "http://localhost:9090/messages",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_endpoint_empty_returns_error() {
+        let result = resolve_endpoint("http://localhost:8080/mcp", "  ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fallback_hint_detects_status_codes() {
+        assert!(
+            LegacySseError::UnexpectedStatus {
+                status: StatusCode::METHOD_NOT_ALLOWED,
+                body: String::new(),
+            }
+            .is_legacy_fallback_hint()
+        );
+
+        assert!(
+            LegacySseError::UnexpectedStatus {
+                status: StatusCode::NOT_FOUND,
+                body: String::new(),
+            }
+            .is_legacy_fallback_hint()
+        );
+
+        assert!(
+            !LegacySseError::UnexpectedStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: String::new(),
+            }
+            .is_legacy_fallback_hint()
+        );
+    }
+
+    #[test]
+    fn debug_redacts_auth_token() {
+        let config = LegacySseTransportConfig::with_uri("http://localhost:8080/mcp")
+            .auth_token("super-secret-token");
+        let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("super-secret"),
+            "auth token should be redacted in Debug output"
+        );
+        assert!(
+            debug_output.contains("REDACTED"),
+            "should show REDACTED placeholder"
+        );
+    }
 }
