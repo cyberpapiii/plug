@@ -168,7 +168,12 @@ impl Engine {
             if !server_config.enabled || self.server_manager.get_upstream(name).is_some() {
                 continue;
             }
-            self.server_manager.mark_start_failure(name);
+            // OAuth servers that fail at startup get AuthRequired, not Failed
+            if server_config.auth.as_deref() == Some("oauth") {
+                self.server_manager.mark_auth_required(name);
+            } else {
+                self.server_manager.mark_start_failure(name);
+            }
         }
 
         // Refresh tool cache after startup

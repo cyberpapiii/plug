@@ -503,9 +503,24 @@ impl ServerManager {
                     let mut transport_config =
                         StreamableHttpClientTransportConfig::with_uri(url);
 
-                    if let Some(ref token) = config.auth_token {
-                        transport_config =
-                            transport_config.auth_header(format!("Bearer {}", token.as_str()));
+                    // Resolve auth header: OAuth token from cache, or static bearer token
+                    let auth_header = if config.auth.as_deref() == Some("oauth") {
+                        match crate::oauth::current_access_token(name) {
+                            Some(token) => Some(format!("Bearer {}", token)),
+                            None => {
+                                tracing::info!(
+                                    server = %name,
+                                    "OAuth server has no cached token, marking AuthRequired"
+                                );
+                                return Err(anyhow::anyhow!("OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."));
+                            }
+                        }
+                    } else {
+                        config.auth_token.as_ref().map(|t| format!("Bearer {}", t.as_str()))
+                    };
+
+                    if let Some(header) = auth_header {
+                        transport_config = transport_config.auth_header(header);
                     }
 
                     tracing::info!(
@@ -594,7 +609,21 @@ impl ServerManager {
 
         let mut transport_config = LegacySseTransportConfig::with_uri(url);
 
-        if let Some(ref token) = config.auth_token {
+        // Resolve auth token: OAuth token from cache, or static bearer token
+        let auth_token_value = if config.auth.as_deref() == Some("oauth") {
+            match crate::oauth::current_access_token(name) {
+                Some(token) => Some(token),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
+                    ));
+                }
+            }
+        } else {
+            config.auth_token.as_ref().map(|t| t.as_str().to_string())
+        };
+
+        if let Some(token) = auth_token_value {
             transport_config = transport_config.auth_token(token.as_str());
         }
 
@@ -937,6 +966,18 @@ impl ServerManager {
             HealthState {
                 health: ServerHealth::Failed,
                 consecutive_failures: 6,
+            },
+        );
+    }
+
+    /// Mark a server as requiring OAuth authentication.
+    /// AuthRequired is sticky — it persists until explicit credential provision + reconnect.
+    pub fn mark_auth_required(&self, name: &str) {
+        self.health.insert(
+            name.to_string(),
+            HealthState {
+                health: ServerHealth::AuthRequired,
+                consecutive_failures: 0,
             },
         );
     }

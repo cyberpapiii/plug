@@ -68,6 +68,36 @@ mod tests {
         let secret = SecretString::from("super-secret".to_string());
         assert_eq!(format!("{secret}"), "[REDACTED]");
     }
+
+    #[test]
+    fn auth_required_is_sticky_on_success() {
+        use super::{HealthState, ServerHealth};
+        let mut state = HealthState {
+            health: ServerHealth::AuthRequired,
+            consecutive_failures: 0,
+        };
+        let changed = state.record_success();
+        assert!(!changed);
+        assert_eq!(state.health, ServerHealth::AuthRequired);
+    }
+
+    #[test]
+    fn auth_required_is_sticky_on_failure() {
+        use super::{HealthState, ServerHealth};
+        let mut state = HealthState {
+            health: ServerHealth::AuthRequired,
+            consecutive_failures: 0,
+        };
+        let changed = state.record_failure();
+        assert!(!changed);
+        assert_eq!(state.health, ServerHealth::AuthRequired);
+    }
+
+    #[test]
+    fn auth_required_is_not_routable() {
+        use super::ServerHealth;
+        assert!(!ServerHealth::AuthRequired.is_routable());
+    }
 }
 
 /// Known AI client types that connect to plug.
@@ -123,6 +153,8 @@ pub enum ServerHealth {
     Degraded,
     /// Server is not responding.
     Failed,
+    /// OAuth credentials missing or refresh failed. Server awaits re-auth.
+    AuthRequired,
 }
 
 impl ServerHealth {
@@ -161,6 +193,7 @@ impl HealthState {
             ServerHealth::Healthy => ServerHealth::Healthy,
             ServerHealth::Degraded => ServerHealth::Healthy,
             ServerHealth::Failed => ServerHealth::Degraded,
+            ServerHealth::AuthRequired => ServerHealth::AuthRequired, // sticky
         };
         old != self.health
     }
@@ -185,6 +218,7 @@ impl HealthState {
                 }
             }
             ServerHealth::Failed => ServerHealth::Failed,
+            ServerHealth::AuthRequired => ServerHealth::AuthRequired, // sticky
         };
         old != self.health
     }
