@@ -737,6 +737,253 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
 }
 
 #[tokio::test]
+async fn test_stdio_structured_content_passes_through_end_to_end() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("structured"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("Mock__structured"))
+        .await
+        .expect("call structured tool");
+    assert_eq!(
+        result.structured_content,
+        Some(serde_json::json!({
+            "tool": "structured",
+            "ok": true,
+            "count": 2
+        }))
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stdio_resource_link_passes_through_end_to_end() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("resource_link"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("Mock__resource_link"))
+        .await
+        .expect("call resource_link tool");
+    let resource = result
+        .content
+        .first()
+        .and_then(|content| content.raw.as_resource_link())
+        .expect("resource_link content");
+    assert_eq!(resource.uri, "file:///tmp/mock-resource.txt");
+    assert_eq!(resource.name, "mock-resource.txt");
+    assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_http_structured_content_passes_through_end_to_end() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("structured"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let state = Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        cancel: CancellationToken::new(),
+        sse_channel_capacity: 32,
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
+    });
+    let app = build_router(state.clone());
+
+    let initialize_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "http-structured", "version": "1.0" }
+        }
+    });
+    let initialize_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&initialize_body).unwrap()))
+        .unwrap();
+    let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+    let session_id = initialize_resp
+        .headers()
+        .get(HTTP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let call_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "Mock__structured"
+        }
+    });
+    let call_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+        .unwrap();
+    let call_resp = app.oneshot(call_req).await.unwrap();
+    let call_bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let call_json: serde_json::Value = serde_json::from_slice(&call_bytes).unwrap();
+    assert_eq!(
+        call_json["result"]["structuredContent"],
+        serde_json::json!({
+            "tool": "structured",
+            "ok": true,
+            "count": 2
+        })
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_http_resource_link_passes_through_end_to_end() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("resource_link"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let state = Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        cancel: CancellationToken::new(),
+        sse_channel_capacity: 32,
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
+    });
+    let app = build_router(state.clone());
+
+    let initialize_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "http-resource-link", "version": "1.0" }
+        }
+    });
+    let initialize_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&initialize_body).unwrap()))
+        .unwrap();
+    let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+    let session_id = initialize_resp
+        .headers()
+        .get(HTTP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let call_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "Mock__resource_link"
+        }
+    });
+    let call_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+        .unwrap();
+    let call_resp = app.oneshot(call_req).await.unwrap();
+    let call_bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let call_json: serde_json::Value = serde_json::from_slice(&call_bytes).unwrap();
+    assert_eq!(call_json["result"]["content"][0]["type"], "resource_link");
+    assert_eq!(
+        call_json["result"]["content"][0]["uri"],
+        "file:///tmp/mock-resource.txt"
+    );
+    assert_eq!(
+        call_json["result"]["content"][0]["name"],
+        "mock-resource.txt"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_multi_client_shared_engine_isolation() {
     let mut config = Config::default();
     config

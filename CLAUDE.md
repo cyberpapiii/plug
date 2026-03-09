@@ -47,7 +47,6 @@ Implemented today:
 Still incomplete:
 
 - daemon IPC notification parity beyond logging
-- dedicated end-to-end tests for `structuredContent` and `resource_link`
 - fully live runtime reconfiguration
 - OAuth follow-up polish: `plug auth complete`, localhost callback, IPC auth commands, zero-downtime reconnect
 

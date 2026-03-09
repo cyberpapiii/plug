@@ -37,8 +37,6 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 
 - daemon IPC notification parity beyond logging
 - reconnect-based daemon continuity proof is narrower than full cross-transport persistence
-- dedicated end-to-end proof for `structuredContent`
-- dedicated end-to-end proof for `resource_link`
 
 ## Checklist
 
@@ -47,8 +45,8 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 | Downstream HTTP bearer auth | done | Non-loopback token generation and enforcement exist in [plug/src/runtime.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/runtime.rs#L325), [plug-core/src/auth.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/auth.rs#L23), and [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L215). |
 | Logging notification forwarding | done | Upstream logging enters at [plug-core/src/server/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/server/mod.rs#L112), routes through the dedicated logging channel in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L266), and fans out via stdio, HTTP, and IPC in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2360), [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L131), and [plug/src/daemon.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/daemon.rs#L545). |
 | Structured output pass-through: `outputSchema` | done | `strip_optional_fields()` no longer strips schemas in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1967), with explicit test coverage at [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2656). |
-| Structured output pass-through: `structuredContent` | partial | Tool results are returned unchanged in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1619), but there is no dedicated repo-local test proving `structured_content` end to end. |
-| Structured output pass-through: `resource_link` | partial | Likely preserved by the same pass-through path in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1619), but I found no dedicated production/test exercise for `resource_link`. |
+| Structured output pass-through: `structuredContent` | done | Tool results are returned unchanged in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1619), with dedicated stdio and HTTP end-to-end tests in [plug-core/tests/integration_tests.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/tests/integration_tests.rs). |
+| Structured output pass-through: `resource_link` | done | `RawContent::ResourceLink` is preserved by the same pass-through path in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1619), with dedicated stdio and HTTP end-to-end tests in [plug-core/tests/integration_tests.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/tests/integration_tests.rs). |
 | Completion forwarding across stdio | done | The router forwards completion requests in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1333) and exposes the handler at [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2542). |
 | Completion forwarding across daemon IPC | done | IPC forwards `completion/complete` in [plug/src/ipc_proxy.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/ipc_proxy.rs#L612), and the daemon dispatches it in [plug/src/daemon.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/daemon.rs#L1081). |
 | Completion forwarding across HTTP | done | PR #31 adds `CompleteRequest` handler in `plug-core/src/http/server.rs`. Routes through `state.router.complete_request()`. |
@@ -100,4 +98,3 @@ All prior “minimum code gaps” from the original audit are resolved. The rema
 ### Smaller items
 
 1. Daemon IPC notification parity beyond logging
-2. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through

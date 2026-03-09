@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `ec06896` (post-merge truth pass after PR #36 OAuth + PR #37 followups)
+Baseline: `main` @ `e13deb3` (post-merge proof pass for structuredContent/resource_link end-to-end coverage)
 
 This is the canonical current-state doc for the project.
 
@@ -35,7 +35,6 @@ Implemented on `main`:
 Partial on `main`:
 
 - daemon IPC notification parity beyond logging
-- `structuredContent` and `resource_link` pass-through are present but under-proven by dedicated end-to-end tests
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
 - OAuth follow-up items: `plug auth complete` (non-interactive code exchange), localhost callback listener (uses manual code entry), IPC auth commands, zero-downtime reconnect, mock OAuth integration tests
 

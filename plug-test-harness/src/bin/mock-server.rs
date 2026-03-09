@@ -117,6 +117,29 @@ impl ServerHandler for MockServer {
                 tokio::time::sleep(self.delay).await;
             }
 
+            if request.name == "structured" {
+                return Ok(CallToolResult::structured(serde_json::json!({
+                    "tool": "structured",
+                    "ok": true,
+                    "count": 2
+                })));
+            }
+
+            if request.name == "resource_link" {
+                return Ok(CallToolResult::success(vec![Content::resource_link(
+                    RawResource {
+                        uri: "file:///tmp/mock-resource.txt".to_string(),
+                        name: "mock-resource.txt".to_string(),
+                        title: Some("Mock Resource".to_string()),
+                        description: Some("Structured resource link test fixture".to_string()),
+                        mime_type: Some("text/plain".to_string()),
+                        size: Some(17),
+                        icons: None,
+                        meta: None,
+                    },
+                )]));
+            }
+
             let args_str = match &request.arguments {
                 Some(args) => serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
                 None => "{}".to_string(),

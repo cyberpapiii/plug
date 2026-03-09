@@ -47,7 +47,6 @@ All major roadmap features are now implemented on `main`. The remaining work is 
 ### Open items
 
 - daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
-- dedicated tests for `structuredContent` and `resource_link` end-to-end pass-through
 
 ### OAuth follow-up polish
 
