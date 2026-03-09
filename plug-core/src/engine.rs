@@ -504,6 +504,7 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
     let store = oauth::get_or_create_store(server_name);
 
     let mut next_check = Duration::from_secs(30);
+    let mut reconnect_pending = false;
 
     loop {
         tokio::select! {
@@ -513,111 +514,121 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                 break;
             }
             _ = tokio::time::sleep(next_check) => {
-                // Read the cached credentials to check expiry
-                let (received_at, expires_in) = match store.cached_expiry() {
-                    Some(t) => t,
-                    None => {
-                        // No cached token — nothing to refresh
-                        next_check = Duration::from_secs(30);
+                // If a prior iteration already refreshed the token but
+                // reconnect failed, skip the refresh and retry reconnect.
+                if !reconnect_pending {
+                    // Read the cached credentials to check expiry
+                    let (received_at, expires_in) = match store.cached_expiry() {
+                        Some(t) => t,
+                        None => {
+                            // No cached token — nothing to refresh
+                            next_check = Duration::from_secs(30);
+                            continue;
+                        }
+                    };
+
+                    if !oauth::token_needs_refresh(received_at, expires_in) {
+                        // Not due — compute next wake time
+                        next_check = oauth::time_until_refresh_window(received_at, expires_in)
+                            .min(Duration::from_secs(30))
+                            .max(Duration::from_secs(5));
                         continue;
                     }
-                };
 
-                if !oauth::token_needs_refresh(received_at, expires_in) {
-                    // Not due — compute next wake time
-                    next_check = oauth::time_until_refresh_window(received_at, expires_in)
-                        .min(Duration::from_secs(30))
-                        .max(Duration::from_secs(5));
-                    continue;
-                }
+                    tracing::info!(server = %server_name, "token refresh due, attempting OAuth token refresh");
 
-                tracing::info!(server = %server_name, "token refresh due, attempting OAuth token refresh");
+                    // --- Step 1: Refresh the OAuth token at the token endpoint ---
+                    //
+                    // Load the server config to get the URL and client_id.
+                    let (server_url, oauth_client_id) = {
+                        let cfg = engine.config();
+                        match cfg.servers.get(server_name) {
+                            Some(sc) => (
+                                sc.url.clone(),
+                                sc.oauth_client_id.clone(),
+                            ),
+                            None => {
+                                tracing::warn!(server = %server_name, "server config not found, exiting refresh loop");
+                                break;
+                            }
+                        }
+                    };
 
-                // --- Step 1: Refresh the OAuth token at the token endpoint ---
-                //
-                // Load the server config to get the URL and client_id.
-                let (server_url, oauth_client_id) = {
-                    let cfg = engine.config();
-                    match cfg.servers.get(server_name) {
-                        Some(sc) => (
-                            sc.url.clone(),
-                            sc.oauth_client_id.clone(),
-                        ),
+                    let url = match server_url {
+                        Some(ref u) => u.as_str(),
                         None => {
-                            tracing::warn!(server = %server_name, "server config not found, exiting refresh loop");
+                            tracing::warn!(server = %server_name, "no server URL, cannot refresh token");
                             break;
                         }
-                    }
-                };
+                    };
 
-                let url = match server_url {
-                    Some(ref u) => u.as_str(),
-                    None => {
-                        tracing::warn!(server = %server_name, "no server URL, cannot refresh token");
-                        break;
-                    }
-                };
+                    let result = oauth::refresh_access_token(
+                        server_name,
+                        url,
+                        oauth_client_id.as_deref(),
+                    )
+                    .await;
 
-                let result = oauth::refresh_access_token(
-                    server_name,
-                    url,
-                    oauth_client_id.as_deref(),
-                )
-                .await;
-
-                match result {
-                    oauth::RefreshResult::Refreshed => {
-                        tracing::info!(server = %server_name, "OAuth token refreshed, reconnecting with fresh token");
+                    match result {
+                        oauth::RefreshResult::Refreshed => {
+                            tracing::info!(server = %server_name, "OAuth token refreshed, reconnecting with fresh token");
+                        }
+                        oauth::RefreshResult::InjectedToken => {
+                            // Injected tokens cannot be refreshed via OAuth.
+                            // They rely on external re-injection via InjectToken IPC.
+                            tracing::info!(
+                                server = %server_name,
+                                "injected token — cannot refresh via OAuth, skipping"
+                            );
+                            next_check = Duration::from_secs(30);
+                            continue;
+                        }
+                        oauth::RefreshResult::NoRefreshToken => {
+                            tracing::warn!(
+                                server = %server_name,
+                                "no refresh_token available, cannot refresh"
+                            );
+                            mark_auth_required(engine, server_name).await;
+                            break;
+                        }
+                        oauth::RefreshResult::NoCredentials => {
+                            tracing::warn!(
+                                server = %server_name,
+                                "no stored credentials, marking AuthRequired"
+                            );
+                            mark_auth_required(engine, server_name).await;
+                            break;
+                        }
+                        oauth::RefreshResult::AuthError(e) => {
+                            tracing::warn!(
+                                server = %server_name,
+                                error = %e,
+                                "token refresh rejected by authorization server, marking AuthRequired"
+                            );
+                            mark_auth_required(engine, server_name).await;
+                            break;
+                        }
+                        oauth::RefreshResult::TransientError(e) => {
+                            tracing::warn!(
+                                server = %server_name,
+                                error = %e,
+                                "token refresh failed (transient), retrying in 30s"
+                            );
+                            next_check = Duration::from_secs(30);
+                            continue;
+                        }
                     }
-                    oauth::RefreshResult::InjectedToken => {
-                        // Injected tokens cannot be refreshed via OAuth.
-                        // They rely on external re-injection via InjectToken IPC.
-                        tracing::info!(
-                            server = %server_name,
-                            "injected token — cannot refresh via OAuth, skipping"
-                        );
-                        next_check = Duration::from_secs(30);
-                        continue;
-                    }
-                    oauth::RefreshResult::NoRefreshToken => {
-                        tracing::warn!(
-                            server = %server_name,
-                            "no refresh_token available, cannot refresh"
-                        );
-                        mark_auth_required(engine, server_name).await;
-                        break;
-                    }
-                    oauth::RefreshResult::NoCredentials => {
-                        tracing::warn!(
-                            server = %server_name,
-                            "no stored credentials, marking AuthRequired"
-                        );
-                        mark_auth_required(engine, server_name).await;
-                        break;
-                    }
-                    oauth::RefreshResult::AuthError(e) => {
-                        tracing::warn!(
-                            server = %server_name,
-                            error = %e,
-                            "token refresh rejected by authorization server, marking AuthRequired"
-                        );
-                        mark_auth_required(engine, server_name).await;
-                        break;
-                    }
-                    oauth::RefreshResult::TransientError(e) => {
-                        tracing::warn!(
-                            server = %server_name,
-                            error = %e,
-                            "token refresh failed (transient), retrying in 30s"
-                        );
-                        next_check = Duration::from_secs(30);
-                        continue;
-                    }
+                } else {
+                    tracing::info!(
+                        server = %server_name,
+                        "retrying reconnect with already-refreshed token"
+                    );
                 }
 
                 // --- Step 2: Reconnect with the fresh token ---
                 match engine.reconnect_server(server_name).await {
                     Ok(()) => {
+                        reconnect_pending = false;
                         tracing::info!(server = %server_name, "zero-downtime token refresh + reconnect succeeded");
                         next_check = Duration::from_secs(30);
                     }
@@ -637,6 +648,7 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                             mark_auth_required(engine, server_name).await;
                             break;
                         }
+                        reconnect_pending = true;
                         tracing::warn!(
                             server = %server_name,
                             error = %e,
