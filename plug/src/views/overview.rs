@@ -252,6 +252,7 @@ pub(crate) async fn cmd_status(
                 server_id,
                 health: plug_core::types::ServerHealth::Failed,
                 tool_count: 0,
+                auth_status: "none".to_string(),
                 last_seen: None,
             })
             .collect::<Vec<_>>();

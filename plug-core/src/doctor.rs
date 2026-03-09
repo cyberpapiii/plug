@@ -60,6 +60,8 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         pid,
         clients,
         http_auth,
+        oauth_config,
+        oauth_tokens,
     ) = tokio::join!(
         check_config_exists(config_path),
         check_config_permissions(config, config_path),
@@ -71,6 +73,8 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_pid_staleness(),
         check_client_configs(),
         check_http_auth(config),
+        check_oauth_config(config),
+        check_oauth_tokens(config),
     );
 
     // Server connectivity is sequential-ish internally but we run it after the rest
@@ -88,6 +92,8 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         clients,
         connectivity,
         http_auth,
+        oauth_config,
+        oauth_tokens,
     ];
 
     DoctorReport::from_checks(checks)
@@ -874,6 +880,127 @@ async fn check_http_auth(config: &Config) -> CheckResult {
     }
 }
 
+/// Check OAuth config fields are coherent.
+async fn check_oauth_config(config: &Config) -> CheckResult {
+    let name = "oauth_config".to_string();
+
+    let mut issues = Vec::new();
+    for (server_name, sc) in &config.servers {
+        if sc.auth.as_deref() != Some("oauth") {
+            continue;
+        }
+
+        if sc.auth_token.is_some() {
+            issues.push(format!(
+                "server '{server_name}': auth = \"oauth\" and auth_token are both set (mutually exclusive)"
+            ));
+        }
+        if matches!(sc.transport, TransportType::Stdio) {
+            issues.push(format!(
+                "server '{server_name}': auth = \"oauth\" on stdio transport (requires http or sse)"
+            ));
+        }
+        if sc.oauth_scopes.is_none() || sc.oauth_scopes.as_ref().is_some_and(|s| s.is_empty()) {
+            issues.push(format!(
+                "server '{server_name}': auth = \"oauth\" but no scopes configured"
+            ));
+        }
+    }
+
+    if issues.is_empty() {
+        CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "OAuth config fields are coherent".to_string(),
+            fix_suggestion: None,
+        }
+    } else {
+        CheckResult {
+            name,
+            status: if issues
+                .iter()
+                .any(|i| i.contains("mutually exclusive") || i.contains("stdio"))
+            {
+                CheckStatus::Fail
+            } else {
+                CheckStatus::Warn
+            },
+            message: issues.join("; "),
+            fix_suggestion: Some("Check OAuth settings in your config.toml".to_string()),
+        }
+    }
+}
+
+/// Check token status for OAuth-configured servers.
+async fn check_oauth_tokens(config: &Config) -> CheckResult {
+    let name = "oauth_tokens".to_string();
+
+    let oauth_servers: Vec<_> = config
+        .servers
+        .iter()
+        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+        .collect();
+
+    if oauth_servers.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "No OAuth-configured servers".to_string(),
+            fix_suggestion: None,
+        };
+    }
+
+    let mut warnings = Vec::new();
+    for (server_name, _) in &oauth_servers {
+        let store = crate::oauth::get_or_create_store(server_name);
+        use rmcp::transport::auth::CredentialStore;
+        match store.load().await {
+            Ok(Some(_creds)) => {
+                // Check if using file fallback (no keyring)
+                // We can detect this by checking if keyring works
+                let tokens_dir = crate::oauth::tokens_dir();
+                let token_file = tokens_dir.join(format!("{server_name}.json"));
+                if token_file.exists() {
+                    // File exists — might be using file fallback
+                    // This is a warning, not an error
+                    warnings.push(format!(
+                        "server '{server_name}': token file exists at {} (keyring may be unavailable — tokens stored as plaintext)",
+                        token_file.display()
+                    ));
+                }
+            }
+            Ok(None) => {
+                warnings.push(format!(
+                    "server '{server_name}': no credentials found — run `plug auth login --server {server_name}`"
+                ));
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "server '{server_name}': credential store error: {e}"
+                ));
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "All OAuth servers have valid credentials".to_string(),
+            fix_suggestion: None,
+        }
+    } else {
+        CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: warnings.join("; "),
+            fix_suggestion: Some(
+                "Run `plug auth login --server <name>` for servers without credentials".to_string(),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1196,6 +1323,6 @@ mod tests {
     async fn run_doctor_returns_all_checks() {
         let config = test_config();
         let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 11);
+        assert_eq!(report.checks.len(), 13);
     }
 }

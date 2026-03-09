@@ -236,6 +236,13 @@ pub struct ServerStatus {
     pub server_id: String,
     pub health: ServerHealth,
     pub tool_count: usize,
+    /// Auth mechanism in use: `"bearer"`, `"oauth"`, `"auth-required"`, or `"none"`.
+    #[serde(default = "default_auth_status")]
+    pub auth_status: String,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
+}
+
+fn default_auth_status() -> String {
+    "none".to_string()
 }

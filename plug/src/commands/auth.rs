@@ -9,8 +9,8 @@ use rmcp::transport::auth::{CredentialStore, StoredCredentials};
 use plug_core::config;
 use plug_core::oauth;
 
-use crate::ui;
 use crate::OutputFormat;
+use crate::ui;
 
 /// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
@@ -176,9 +176,7 @@ async fn cmd_auth_login(
         .await
         .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
 
-    ui::print_success_line(format!(
-        "Successfully authenticated server '{server_name}'"
-    ));
+    ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
 
     Ok(())
 }
@@ -229,9 +227,7 @@ async fn cmd_auth_inject(
         .await
         .map_err(|e| anyhow::anyhow!("failed to save injected credentials: {e}"))?;
 
-    ui::print_success_line(format!(
-        "Injected credentials for server '{server_name}'"
-    ));
+    ui::print_success_line(format!("Injected credentials for server '{server_name}'"));
 
     if refresh_token.is_some() {
         ui::print_info_line("Refresh token stored -- background refresh will work");
@@ -319,9 +315,7 @@ async fn cmd_auth_status(
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let effective = expires_in.unwrap_or(
-                            oauth::DEFAULT_TOKEN_LIFETIME_SECS,
-                        );
+                        let effective = expires_in.unwrap_or(oauth::DEFAULT_TOKEN_LIFETIME_SECS);
                         let elapsed = now.saturating_sub(received_at);
                         if elapsed < effective {
                             let remaining = effective - elapsed;

@@ -933,10 +933,22 @@ impl ServerManager {
                     .get(&upstream.name)
                     .map(|h| h.health)
                     .unwrap_or(upstream.health);
+                let auth_status = if upstream.config.auth.as_deref() == Some("oauth") {
+                    if health == ServerHealth::AuthRequired {
+                        "auth-required".to_string()
+                    } else {
+                        "oauth".to_string()
+                    }
+                } else if upstream.config.auth_token.is_some() {
+                    "bearer".to_string()
+                } else {
+                    "none".to_string()
+                };
                 ServerStatus {
                     server_id: upstream.name.clone(),
                     health,
                     tool_count: upstream.tools.load().len(),
+                    auth_status,
                     last_seen: None,
                 }
             })
@@ -946,10 +958,16 @@ impl ServerManager {
             if servers.contains_key(entry.key()) {
                 continue;
             }
+            let auth_status = if entry.health == ServerHealth::AuthRequired {
+                "auth-required".to_string()
+            } else {
+                "none".to_string()
+            };
             statuses.push(ServerStatus {
                 server_id: entry.key().clone(),
                 health: entry.health,
                 tool_count: 0,
+                auth_status,
                 last_seen: None,
             });
         }
