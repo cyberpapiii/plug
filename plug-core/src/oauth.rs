@@ -372,6 +372,15 @@ impl CompositeCredentialStore {
     fn clear_cache(&self) {
         self.cache.store(Arc::new(None));
     }
+
+    /// Return the cached token timing info for refresh-check decisions.
+    ///
+    /// Returns `(token_received_at, expires_in)` or `None` if no token is cached.
+    pub fn cached_expiry(&self) -> Option<(u64, Option<u64>)> {
+        let guard = self.cache.load();
+        let cached = guard.as_ref().as_ref()?;
+        Some((cached.token_received_at, cached.expires_in))
+    }
 }
 
 #[async_trait]
