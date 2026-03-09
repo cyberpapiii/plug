@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `c85a2ac` (post-merge truth pass for PR #41 IPC auth commands)
+Baseline: `main` @ `235e4cb` (post-merge truth pass for PR #41 IPC auth commands)
 
 This is the canonical current-state doc for the project.
 
