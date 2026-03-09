@@ -134,7 +134,7 @@ pub fn current_access_token(server_name: &str) -> Option<String> {
 // CachedCredentials
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct CachedCredentials {
     access_token: String,
     /// Epoch seconds when the token was received. Used by refresh checks.
@@ -143,6 +143,16 @@ struct CachedCredentials {
     /// Token lifetime in seconds. Used by refresh checks.
     #[allow(dead_code)]
     expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for CachedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedCredentials")
+            .field("access_token", &"[REDACTED]")
+            .field("token_received_at", &self.token_received_at)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,7 +660,11 @@ pub async fn refresh_access_token(
             // rmcp's refresh_token() saves via the fresh store's backing
             // files/keyring.  Reload the global store's cache so the next
             // `current_access_token()` call returns the new token.
-            let _ = CredentialStore::load(&*store).await;
+            if let Err(e) = CredentialStore::load(&*store).await {
+                return RefreshResult::TransientError(format!(
+                    "token refreshed but cache reload failed: {e}"
+                ));
+            }
             debug!(server = %server_name, "OAuth token refreshed successfully");
             RefreshResult::Refreshed
         }
