@@ -71,6 +71,16 @@ pub fn spawn_health_checks(
                         break;
                     }
                     _ = tick.tick() => {
+                        // Skip health checks for AuthRequired servers — probing without
+                        // credentials is pointless and would fail with 401.
+                        let is_auth_required = mgr
+                            .health
+                            .get(&name)
+                            .is_some_and(|entry| entry.health == ServerHealth::AuthRequired);
+                        if is_auth_required {
+                            continue;
+                        }
+
                         let missing_upstream = mgr.get_upstream(&name).is_none();
                         let startup_failed = mgr
                             .health
