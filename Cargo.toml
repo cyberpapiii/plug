@@ -92,6 +92,8 @@ sse-stream = "0.2"
 
 # OAuth token storage
 keyring = { version = "3", features = ["apple-native", "linux-native"] }
+async-trait = "0.1"
+oauth2 = "5"
 
 # HTTP Server (Phase 2)
 axum = "0.8"

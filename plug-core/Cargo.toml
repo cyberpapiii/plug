@@ -55,6 +55,8 @@ serde_yml.workspace = true
 # OAuth token storage
 keyring.workspace = true
 fs2.workspace = true
+async-trait.workspace = true
+oauth2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
