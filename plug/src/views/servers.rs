@@ -88,6 +88,7 @@ pub(crate) async fn cmd_server_list(
                                 plug_core::types::ServerHealth::Healthy => healthy += 1,
                                 plug_core::types::ServerHealth::Degraded => degraded += 1,
                                 plug_core::types::ServerHealth::Failed => failed += 1,
+                                plug_core::types::ServerHealth::AuthRequired => failed += 1,
                             }
                         }
                         print_banner(

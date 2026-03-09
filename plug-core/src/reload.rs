@@ -146,6 +146,11 @@ fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
         || old.timeout_secs != new.timeout_secs
         || old.call_timeout_secs != new.call_timeout_secs
         || old.enabled != new.enabled
+        || old.auth_token.as_ref().map(|t| t.as_str())
+            != new.auth_token.as_ref().map(|t| t.as_str())
+        || old.auth != new.auth
+        || old.oauth_client_id != new.oauth_client_id
+        || old.oauth_scopes != new.oauth_scopes
 }
 
 /// Apply a config diff to the running engine.
@@ -249,6 +254,9 @@ mod tests {
             transport: TransportType::Stdio,
             url: None,
             auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
             timeout_secs: 30,
             call_timeout_secs: 300,
             max_concurrent: 1,

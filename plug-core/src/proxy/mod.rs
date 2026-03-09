@@ -24,7 +24,7 @@ use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
-use crate::types::{ClientType, ServerHealth};
+use crate::types::ClientType;
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
@@ -1868,7 +1868,7 @@ impl ToolRouter {
                 .server_manager
                 .health
                 .get(&server_id)
-                .map(|h| h.health != ServerHealth::Failed)
+                .map(|h| h.health.is_routable())
                 .unwrap_or(true);
             if !health_ok {
                 return Err(McpError::from(ProtocolError::ServerUnavailable {

@@ -27,6 +27,8 @@ rmcp = { version = "1.1.0", features = [
     "reqwest-tls-no-provider",
     # Elicitation reverse-request support (gates Peer<RoleServer>::create_elicitation)
     "elicitation",
+    # OAuth 2.1 + PKCE upstream authentication
+    "auth",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
@@ -87,6 +89,11 @@ hex = "0.4"
 # Legacy SSE upstream transport
 reqwest = { version = "0.13", default-features = false }
 sse-stream = "0.2"
+
+# OAuth token storage
+keyring = { version = "3", features = ["apple-native", "linux-native"] }
+async-trait = "0.1"
+oauth2 = "5"
 
 # HTTP Server (Phase 2)
 axum = "0.8"

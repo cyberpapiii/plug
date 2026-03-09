@@ -168,7 +168,12 @@ impl Engine {
             if !server_config.enabled || self.server_manager.get_upstream(name).is_some() {
                 continue;
             }
-            self.server_manager.mark_start_failure(name);
+            // OAuth servers that fail at startup get AuthRequired, not Failed
+            if server_config.auth.as_deref() == Some("oauth") {
+                self.server_manager.mark_auth_required(name);
+            } else {
+                self.server_manager.mark_start_failure(name);
+            }
         }
 
         // Refresh tool cache after startup
@@ -192,6 +197,14 @@ impl Engine {
             self.tool_router.clone(),
             Arc::clone(self),
             self.event_tx.clone(),
+            self.cancel.clone(),
+            &config,
+            &self.tracker,
+        );
+
+        // Spawn OAuth token refresh loops
+        spawn_refresh_loops(
+            Arc::clone(self),
             self.cancel.clone(),
             &config,
             &self.tracker,
@@ -449,6 +462,119 @@ impl Engine {
     }
 }
 
+/// Spawn background token refresh tasks for all OAuth-configured servers.
+///
+/// Each OAuth server gets a task that:
+/// 1. Sleeps until the refresh window opens (computed from cached token expiry)
+/// 2. Attempts token refresh via reconnect (which triggers `get_access_token()`)
+/// 3. On success: triggers zero-downtime reconnect via `Engine::reconnect_server()`
+/// 4. On terminal failure: marks the server `AuthRequired` and exits the loop
+///
+/// Tasks are spawned via `tracker.spawn()` with `CancellationToken` for clean shutdown.
+pub fn spawn_refresh_loops(
+    engine: Arc<Engine>,
+    cancel: CancellationToken,
+    config: &Config,
+    tracker: &TaskTracker,
+) {
+    for (name, sc) in &config.servers {
+        if sc.auth.as_deref() != Some("oauth") || !sc.enabled {
+            continue;
+        }
+
+        let name = name.clone();
+        let engine = engine.clone();
+        let cancel = cancel.clone();
+
+        tracker.spawn(async move {
+            run_refresh_loop(&engine, &name, cancel).await;
+        });
+    }
+}
+
+/// The per-server refresh loop.
+///
+/// Monitors the cached token expiry for a single OAuth server and triggers
+/// reconnection when the refresh window opens. Exits the loop if the server
+/// enters a terminal `AuthRequired` state (refresh token revoked, etc.).
+async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: CancellationToken) {
+    use crate::oauth;
+
+    // Get the credential store for cache access
+    let store = oauth::get_or_create_store(server_name);
+
+    let mut next_check = Duration::from_secs(30);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::debug!(server = %server_name, "refresh loop shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(next_check) => {
+                // Read the cached credentials to check expiry
+                let (received_at, expires_in) = match store.cached_expiry() {
+                    Some(t) => t,
+                    None => {
+                        // No cached token — nothing to refresh
+                        next_check = Duration::from_secs(30);
+                        continue;
+                    }
+                };
+
+                if !oauth::token_needs_refresh(received_at, expires_in) {
+                    // Not due — compute next wake time
+                    next_check = oauth::time_until_refresh_window(received_at, expires_in)
+                        .min(Duration::from_secs(30))
+                        .max(Duration::from_secs(5));
+                    continue;
+                }
+
+                tracing::info!(server = %server_name, "token refresh due, attempting refresh via reconnect");
+
+                // Attempt refresh via reconnect. The reconnect flow calls
+                // start_server() which resolves the fresh OAuth token from
+                // the credential store (via get_access_token() which
+                // auto-refreshes). The reconnect replaces the transport
+                // with a fresh one using the new token.
+                match engine.reconnect_server(server_name).await {
+                    Ok(()) => {
+                        tracing::info!(server = %server_name, "token refresh + reconnect succeeded");
+                        next_check = Duration::from_secs(30);
+                    }
+                    Err(e) => {
+                        let err_str = format!("{e}");
+                        if err_str.contains("authorization required")
+                            || err_str.contains("OAuth authorization required")
+                        {
+                            tracing::warn!(
+                                server = %server_name,
+                                "refresh failed (authorization required), marking AuthRequired"
+                            );
+                            engine.server_manager().mark_auth_required(server_name);
+                            // Refresh tools so downstream clients see the change
+                            engine.tool_router().refresh_tools().await;
+                            let _ = engine.event_sender().send(EngineEvent::ServerHealthChanged {
+                                server_id: Arc::from(server_name),
+                                old: ServerHealth::Healthy,
+                                new: ServerHealth::AuthRequired,
+                            });
+                            break; // Exit loop — AuthRequired is sticky
+                        }
+                        tracing::warn!(
+                            server = %server_name,
+                            error = %e,
+                            "token refresh check failed, retrying in 30s"
+                        );
+                        next_check = Duration::from_secs(30);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn is_retryable_reconnect_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_lowercase();
     message.contains("connection refused")
@@ -574,6 +700,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -607,6 +736,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
@@ -661,6 +793,9 @@ mod tests {
                 transport: TransportType::Stdio,
                 url: None,
                 auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
                 timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,

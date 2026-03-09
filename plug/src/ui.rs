@@ -187,6 +187,7 @@ pub(crate) fn status_marker(
         plug_core::types::ServerHealth::Healthy => style("●").green().bold(),
         plug_core::types::ServerHealth::Degraded => style("!").yellow().bold(),
         plug_core::types::ServerHealth::Failed => style("×").red().bold(),
+        plug_core::types::ServerHealth::AuthRequired => style("?").magenta().bold(),
     }
 }
 
@@ -197,6 +198,7 @@ pub(crate) fn status_label(
         plug_core::types::ServerHealth::Healthy => style("Healthy").green(),
         plug_core::types::ServerHealth::Degraded => style("Degraded").yellow(),
         plug_core::types::ServerHealth::Failed => style("Failed").red(),
+        plug_core::types::ServerHealth::AuthRequired => style("Auth Required").magenta(),
     }
 }
 

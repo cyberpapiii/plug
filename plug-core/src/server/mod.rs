@@ -503,9 +503,24 @@ impl ServerManager {
                     let mut transport_config =
                         StreamableHttpClientTransportConfig::with_uri(url);
 
-                    if let Some(ref token) = config.auth_token {
-                        transport_config =
-                            transport_config.auth_header(format!("Bearer {}", token.as_str()));
+                    // Resolve auth header: OAuth token from cache, or static bearer token
+                    let auth_header = if config.auth.as_deref() == Some("oauth") {
+                        match crate::oauth::current_access_token(name) {
+                            Some(token) => Some(format!("Bearer {}", token)),
+                            None => {
+                                tracing::info!(
+                                    server = %name,
+                                    "OAuth server has no cached token, marking AuthRequired"
+                                );
+                                return Err(anyhow::anyhow!("OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."));
+                            }
+                        }
+                    } else {
+                        config.auth_token.as_ref().map(|t| format!("Bearer {}", t.as_str()))
+                    };
+
+                    if let Some(header) = auth_header {
+                        transport_config = transport_config.auth_header(header);
                     }
 
                     tracing::info!(
@@ -594,7 +609,21 @@ impl ServerManager {
 
         let mut transport_config = LegacySseTransportConfig::with_uri(url);
 
-        if let Some(ref token) = config.auth_token {
+        // Resolve auth token: OAuth token from cache, or static bearer token
+        let auth_token_value = if config.auth.as_deref() == Some("oauth") {
+            match crate::oauth::current_access_token(name) {
+                Some(token) => Some(token),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
+                    ));
+                }
+            }
+        } else {
+            config.auth_token.as_ref().map(|t| t.as_str().to_string())
+        };
+
+        if let Some(token) = auth_token_value {
             transport_config = transport_config.auth_token(token.as_str());
         }
 
@@ -670,7 +699,7 @@ impl ServerManager {
             let health_ok = self
                 .health
                 .get(server_name)
-                .map(|h| h.health != ServerHealth::Failed)
+                .map(|h| h.health.is_routable())
                 .unwrap_or(true);
             if health_ok {
                 let tools = upstream.tools.load();
@@ -690,7 +719,7 @@ impl ServerManager {
                 let health_ok = self
                     .health
                     .get(server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true);
                 (health_ok && upstream.capabilities.resources.is_some())
                     .then(|| (server_name.clone(), Arc::clone(upstream)))
@@ -732,7 +761,7 @@ impl ServerManager {
                 let health_ok = self
                     .health
                     .get(server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true);
                 (health_ok && upstream.capabilities.resources.is_some())
                     .then(|| (server_name.clone(), Arc::clone(upstream)))
@@ -774,7 +803,7 @@ impl ServerManager {
                 let health_ok = self
                     .health
                     .get(server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true);
                 (health_ok && upstream.capabilities.prompts.is_some())
                     .then(|| (server_name.clone(), Arc::clone(upstream)))
@@ -815,7 +844,7 @@ impl ServerManager {
             .filter(|(server_name, _)| {
                 self.health
                     .get(*server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true)
             })
             .map(|(_, upstream)| upstream.capabilities.clone())
@@ -837,7 +866,7 @@ impl ServerManager {
             .filter(|(name, _)| {
                 self.health
                     .get(name.as_str())
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true)
             })
             .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
@@ -904,10 +933,22 @@ impl ServerManager {
                     .get(&upstream.name)
                     .map(|h| h.health)
                     .unwrap_or(upstream.health);
+                let auth_status = if upstream.config.auth.as_deref() == Some("oauth") {
+                    if health == ServerHealth::AuthRequired {
+                        "auth-required".to_string()
+                    } else {
+                        "oauth".to_string()
+                    }
+                } else if upstream.config.auth_token.is_some() {
+                    "bearer".to_string()
+                } else {
+                    "none".to_string()
+                };
                 ServerStatus {
                     server_id: upstream.name.clone(),
                     health,
                     tool_count: upstream.tools.load().len(),
+                    auth_status,
                     last_seen: None,
                 }
             })
@@ -917,10 +958,16 @@ impl ServerManager {
             if servers.contains_key(entry.key()) {
                 continue;
             }
+            let auth_status = if entry.health == ServerHealth::AuthRequired {
+                "auth-required".to_string()
+            } else {
+                "none".to_string()
+            };
             statuses.push(ServerStatus {
                 server_id: entry.key().clone(),
                 health: entry.health,
                 tool_count: 0,
+                auth_status,
                 last_seen: None,
             });
         }
@@ -937,6 +984,18 @@ impl ServerManager {
             HealthState {
                 health: ServerHealth::Failed,
                 consecutive_failures: 6,
+            },
+        );
+    }
+
+    /// Mark a server as requiring OAuth authentication.
+    /// AuthRequired is sticky — it persists until explicit credential provision + reconnect.
+    pub fn mark_auth_required(&self, name: &str) {
+        self.health.insert(
+            name.to_string(),
+            HealthState {
+                health: ServerHealth::AuthRequired,
+                consecutive_failures: 0,
             },
         );
     }
@@ -1118,6 +1177,9 @@ mod tests {
             transport: TransportType::Stdio,
             url: None,
             auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
             timeout_secs: 30,
             call_timeout_secs: 30,
             max_concurrent: 1,

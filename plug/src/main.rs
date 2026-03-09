@@ -184,6 +184,12 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    #[command(display_order = 19)]
+    /// Manage OAuth authentication for upstream servers
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +242,42 @@ pub(crate) enum ToolCommands {
         patterns: Vec<String>,
     },
     Disabled,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AuthCommands {
+    /// Authenticate with an OAuth-protected upstream server
+    Login {
+        /// Server name from config
+        #[arg(long)]
+        server: String,
+        /// Print auth URL instead of opening browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Inject pre-obtained OAuth tokens for a server
+    Inject {
+        /// Server name
+        #[arg(long)]
+        server: String,
+        /// Access token value
+        #[arg(long)]
+        access_token: String,
+        /// Refresh token value (enables auto-renewal)
+        #[arg(long)]
+        refresh_token: Option<String>,
+        /// Token lifetime in seconds
+        #[arg(long)]
+        expires_in: Option<u64>,
+    },
+    /// Show OAuth authentication status for all servers
+    Status,
+    /// Clear stored OAuth credentials for a server
+    Logout {
+        /// Server name
+        #[arg(long)]
+        server: String,
+    },
 }
 
 #[tokio::main]
@@ -331,6 +373,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Export { targets, all, yes }) => {
             commands::clients::cmd_link(targets, all, yes)?
+        }
+        Some(Commands::Auth { command }) => {
+            commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
     }
 
