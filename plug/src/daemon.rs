@@ -702,21 +702,34 @@ async fn handle_ipc_loop(
     // Logging subscription — activated after Register so the daemon can push
     // logging notifications to this IPC client in real time.
     let mut log_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
+    // Protocol notification subscription — activated after Register so the daemon
+    // can push list_changed, progress, and cancelled notifications to this IPC client.
+    let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
 
     loop {
         // Proxy connections (those that have Registered) are long-lived and should
         // not be subject to the idle timeout. Short-lived admin/query connections use
         // the timeout to reclaim resources.
         let frame = if let Some(ref mut rx) = log_rx {
-            // Registered with logging — multiplex request reads and notifications.
-            // Notifications are sent immediately when idle. During a request dispatch,
-            // they queue in the broadcast channel and get drained after the response.
+            // Registered with notifications — multiplex request reads and push
+            // notifications. Notifications are sent immediately when idle. During
+            // a request dispatch, they queue in the broadcast channel and get
+            // drained after the response.
             'select: loop {
                 tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => return Ok(()),
                     recv = rx.recv() => {
                         send_ipc_logging_notification(writer, recv).await?;
+                    }
+                    recv = async {
+                        if let Some(ref mut crx) = ctrl_rx {
+                            crx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                     }
                     result = ipc::read_frame(reader) => break 'select result,
                 }
@@ -800,6 +813,8 @@ async fn handle_ipc_loop(
         // We temporarily take `reverse_request_rx` out of `ctx` to avoid
         // borrow conflicts — `dispatch_request` borrows `ctx` mutably.
         let mut reverse_rx = ctx.reverse_request_rx.take();
+        // Capture session_id before dispatch borrows ctx mutably.
+        let dispatch_session_id = ctx.session_id.clone();
 
         let response = {
             use std::pin::pin;
@@ -839,6 +854,16 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_logging_notification(writer, recv).await?;
                     }
+                    // Forward control notifications (list_changed, progress, cancelled)
+                    recv = async {
+                        if let Some(ref mut crx) = ctrl_rx {
+                            crx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
+                    }
                 }
             }
             result.unwrap()
@@ -858,9 +883,10 @@ async fn handle_ipc_loop(
             break;
         }
 
-        // After registration, subscribe to logging channel for push notifications
+        // After registration, subscribe to notification channels for push delivery
         if ctx.session_id.is_some() && log_rx.is_none() {
             log_rx = Some(ctx.engine.tool_router().subscribe_logging());
+            ctrl_rx = Some(ctx.engine.tool_router().subscribe_notifications());
         }
 
         // Drain any notifications that queued during request dispatch
@@ -881,6 +907,21 @@ async fn handle_ipc_loop(
                             }),
                         };
                         ipc::send_response(writer, &synthetic).await.ok();
+                    }
+                    Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
+                }
+            }
+        }
+        if let Some(ref mut crx) = ctrl_rx {
+            use tokio::sync::broadcast::error::TryRecvError;
+            loop {
+                match crx.try_recv() {
+                    Ok(notif) => {
+                        send_ipc_control_notification(writer, Ok(notif), ctx.session_id.as_deref())
+                            .await?;
+                    }
+                    Err(TryRecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "IPC control notification lagged");
                     }
                     Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
                 }
@@ -920,6 +961,78 @@ async fn send_ipc_logging_notification(
                 }),
             };
             ipc::send_response(writer, &synthetic).await.ok();
+        }
+        Err(RecvError::Closed) => {}
+    }
+    Ok(())
+}
+
+/// Send a protocol (control) notification to the IPC client, handling broadcast errors.
+///
+/// Broadcast notifications (list_changed) are sent to all registered IPC clients.
+/// Targeted notifications (progress, cancelled) are only sent if the target matches
+/// this connection's session ID.
+async fn send_ipc_control_notification(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    recv: Result<
+        plug_core::notifications::ProtocolNotification,
+        tokio::sync::broadcast::error::RecvError,
+    >,
+    session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    use plug_core::notifications::{NotificationTarget, ProtocolNotification};
+    use tokio::sync::broadcast::error::RecvError;
+
+    match recv {
+        Ok(ProtocolNotification::ToolListChanged) => {
+            ipc::send_response(writer, &IpcResponse::ToolListChangedNotification)
+                .await
+                .ok();
+        }
+        Ok(ProtocolNotification::ResourceListChanged) => {
+            ipc::send_response(writer, &IpcResponse::ResourceListChangedNotification)
+                .await
+                .ok();
+        }
+        Ok(ProtocolNotification::PromptListChanged) => {
+            ipc::send_response(writer, &IpcResponse::PromptListChangedNotification)
+                .await
+                .ok();
+        }
+        Ok(ProtocolNotification::Progress { target, params }) => {
+            // Only forward if this notification targets our session
+            if matches!(
+                target,
+                NotificationTarget::Stdio { client_id: ref target_id }
+                    if session_id.is_some_and(|sid| target_id.as_ref() == sid)
+            ) {
+                let notif = IpcResponse::ProgressNotification {
+                    params: serde_json::to_value(params).unwrap_or_default(),
+                };
+                ipc::send_response(writer, &notif).await.ok();
+            }
+        }
+        Ok(ProtocolNotification::Cancelled { target, params }) => {
+            if matches!(
+                target,
+                NotificationTarget::Stdio { client_id: ref target_id }
+                    if session_id.is_some_and(|sid| target_id.as_ref() == sid)
+            ) {
+                let notif = IpcResponse::CancelledNotification {
+                    params: serde_json::to_value(params).unwrap_or_default(),
+                };
+                ipc::send_response(writer, &notif).await.ok();
+            }
+        }
+        Ok(
+            ProtocolNotification::LoggingMessage { .. }
+            | ProtocolNotification::ResourceUpdated { .. },
+        ) => {
+            // Logging is handled by the dedicated logging channel.
+            // ResourceUpdated is not delivered over IPC (subscribe not supported).
+        }
+        Err(RecvError::Lagged(skipped)) => {
+            tracing::warn!(skipped, "IPC control notification lagged");
         }
         Err(RecvError::Closed) => {}
     }
@@ -1197,15 +1310,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             }
             let mut caps = ctx.engine.tool_router().synthesized_capabilities();
-            // Mask capabilities that IPC clients cannot consume — the daemon IPC
-            // transport has no push channel for targeted or broadcast notifications
-            // beyond logging.
+            // IPC clients cannot subscribe to resources (no long-lived push
+            // channel for targeted ResourceUpdated delivery), so mask that.
             if let Some(ref mut resources) = caps.resources {
                 resources.subscribe = None;
-                resources.list_changed = Some(false);
-            }
-            if let Some(ref mut prompts) = caps.prompts {
-                prompts.list_changed = Some(false);
             }
             match serde_json::to_value(caps) {
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },
@@ -2050,6 +2158,212 @@ mod tests {
             !err2.message.contains("does not support sampling"),
             "should have passed capability gate, got: {}",
             err2.message
+        );
+    }
+
+    // ── IPC control notification forwarding tests ────────────────────────
+
+    /// Helper: send a control notification through the daemon helper and read
+    /// the IpcResponse that was written to the socket.
+    async fn send_and_read_control_notification(
+        notification: plug_core::notifications::ProtocolNotification,
+        session_id: Option<&str>,
+    ) -> Option<IpcResponse> {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (mut r_client, _w_client) = client.into_split();
+        let (_r_server, mut w_server) = server.into_split();
+
+        send_ipc_control_notification(&mut w_server, Ok(notification), session_id)
+            .await
+            .expect("send should not fail");
+
+        // Drop the writer so the reader gets EOF instead of blocking
+        drop(w_server);
+
+        // Try to read a frame — None means nothing was written (filtered out)
+        match ipc::read_frame(&mut r_client).await {
+            Ok(Some(frame)) => Some(serde_json::from_slice(&frame).unwrap()),
+            Ok(None) => None,
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_notification_broadcasts_tool_list_changed() {
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::ToolListChanged,
+            Some("sess-1"),
+        )
+        .await;
+
+        assert!(
+            matches!(resp, Some(IpcResponse::ToolListChangedNotification)),
+            "expected ToolListChangedNotification, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_broadcasts_resource_list_changed() {
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::ResourceListChanged,
+            Some("sess-1"),
+        )
+        .await;
+
+        assert!(
+            matches!(resp, Some(IpcResponse::ResourceListChangedNotification)),
+            "expected ResourceListChangedNotification, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_broadcasts_prompt_list_changed() {
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::PromptListChanged,
+            Some("sess-1"),
+        )
+        .await;
+
+        assert!(
+            matches!(resp, Some(IpcResponse::PromptListChangedNotification)),
+            "expected PromptListChangedNotification, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_forwards_progress_for_matching_session() {
+        use rmcp::model::{NumberOrString, ProgressNotificationParam, ProgressToken};
+
+        let progress_token = ProgressToken(NumberOrString::String(Arc::from("tok-1")));
+        let params = ProgressNotificationParam {
+            progress_token: progress_token.clone(),
+            progress: 50.0,
+            total: Some(100.0),
+            message: Some("halfway".to_string()),
+        };
+
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::Progress {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from("sess-42"),
+                },
+                params,
+            },
+            Some("sess-42"), // matches target
+        )
+        .await;
+
+        match resp {
+            Some(IpcResponse::ProgressNotification { params }) => {
+                // Verify the serialized params contain the progress data
+                assert_eq!(params["progress"], 50.0);
+                assert_eq!(params["total"], 100.0);
+                assert_eq!(params["message"], "halfway");
+            }
+            other => panic!("expected ProgressNotification, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_notification_filters_progress_for_different_session() {
+        use rmcp::model::{NumberOrString, ProgressNotificationParam, ProgressToken};
+
+        let progress_token = ProgressToken(NumberOrString::String(Arc::from("tok-1")));
+        let params = ProgressNotificationParam {
+            progress_token,
+            progress: 50.0,
+            total: Some(100.0),
+            message: None,
+        };
+
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::Progress {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from("sess-OTHER"),
+                },
+                params,
+            },
+            Some("sess-42"), // does NOT match target
+        )
+        .await;
+
+        assert!(
+            resp.is_none(),
+            "progress for a different session should be filtered out, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_forwards_cancelled_for_matching_session() {
+        use rmcp::model::{CancelledNotificationParam, NumberOrString, RequestId};
+
+        let params = CancelledNotificationParam {
+            request_id: RequestId::from(NumberOrString::Number(99)),
+            reason: Some("user cancelled".to_string()),
+        };
+
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::Cancelled {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from("sess-7"),
+                },
+                params,
+            },
+            Some("sess-7"), // matches target
+        )
+        .await;
+
+        match resp {
+            Some(IpcResponse::CancelledNotification { params }) => {
+                assert_eq!(params["reason"], "user cancelled");
+            }
+            other => panic!("expected CancelledNotification, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_notification_filters_cancelled_for_different_session() {
+        use rmcp::model::{CancelledNotificationParam, NumberOrString, RequestId};
+
+        let params = CancelledNotificationParam {
+            request_id: RequestId::from(NumberOrString::Number(99)),
+            reason: None,
+        };
+
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::Cancelled {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from("sess-OTHER"),
+                },
+                params,
+            },
+            Some("sess-7"), // does NOT match target
+        )
+        .await;
+
+        assert!(
+            resp.is_none(),
+            "cancelled for a different session should be filtered out, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_ignores_logging_on_control_channel() {
+        use rmcp::model::LoggingMessageNotificationParam;
+
+        let params = LoggingMessageNotificationParam::new(
+            rmcp::model::LoggingLevel::Info,
+            serde_json::json!("test log"),
+        );
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::LoggingMessage { params },
+            Some("sess-1"),
+        )
+        .await;
+
+        assert!(
+            resp.is_none(),
+            "logging messages should not be forwarded on the control channel, got: {resp:?}"
         );
     }
 }

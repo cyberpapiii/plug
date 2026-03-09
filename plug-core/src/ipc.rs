@@ -220,6 +220,20 @@ pub enum IpcResponse {
     /// a proxy client registers. The payload is a serialized
     /// `LoggingMessageNotificationParam`.
     LoggingNotification { params: serde_json::Value },
+
+    // ── Protocol push notifications ──────────────────────────────────────
+    /// Push notification: the tool list changed (upstream server added/removed tools).
+    ToolListChangedNotification,
+    /// Push notification: the resource list changed.
+    ResourceListChangedNotification,
+    /// Push notification: the prompt list changed.
+    PromptListChangedNotification,
+    /// Push notification: progress update for an in-flight tool call.
+    /// Payload is a serialized `ProgressNotificationParam`.
+    ProgressNotification { params: serde_json::Value },
+    /// Push notification: an in-flight tool call was cancelled.
+    /// Payload is a serialized `CancelledNotificationParam`.
+    CancelledNotification { params: serde_json::Value },
 }
 
 // ──────────────────────── Reverse-request IPC types ──────────────────────────
@@ -420,6 +434,15 @@ mod tests {
             },
             IpcResponse::McpResponse {
                 payload: serde_json::json!({"tools": []}),
+            },
+            IpcResponse::ToolListChangedNotification,
+            IpcResponse::ResourceListChangedNotification,
+            IpcResponse::PromptListChangedNotification,
+            IpcResponse::ProgressNotification {
+                params: serde_json::json!({"progressToken": "tok-1", "progress": 50, "total": 100}),
+            },
+            IpcResponse::CancelledNotification {
+                params: serde_json::json!({"requestId": 42, "reason": "user cancelled"}),
             },
         ];
 

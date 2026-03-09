@@ -164,6 +164,14 @@ impl IpcProxyHandler {
                             }
                             continue;
                         }
+                        resp @ (IpcResponse::ToolListChangedNotification
+                        | IpcResponse::ResourceListChangedNotification
+                        | IpcResponse::PromptListChangedNotification
+                        | IpcResponse::ProgressNotification { .. }
+                        | IpcResponse::CancelledNotification { .. }) => {
+                            forward_control_notification(peer, resp).await;
+                            continue;
+                        }
                         other => return Ok(other),
                     },
                     DaemonToProxyMessage::ReverseRequest { id, request } => {
@@ -204,6 +212,14 @@ impl IpcProxyHandler {
                         }
                     }
                     continue; // keep reading for the actual response
+                }
+                resp @ (IpcResponse::ToolListChangedNotification
+                | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::PromptListChangedNotification
+                | IpcResponse::ProgressNotification { .. }
+                | IpcResponse::CancelledNotification { .. }) => {
+                    forward_control_notification(peer, resp).await;
+                    continue;
                 }
                 other => return Ok(other),
             }
@@ -354,6 +370,35 @@ impl IpcProxyHandler {
             message: format!("{context}: {error}"),
             reconnectable,
         }
+    }
+}
+
+/// Forward a control notification (list_changed, progress, cancelled) to the downstream peer.
+async fn forward_control_notification(peer: Option<&Peer<RoleServer>>, response: IpcResponse) {
+    let Some(peer) = peer else {
+        return;
+    };
+    match response {
+        IpcResponse::ToolListChangedNotification => {
+            let _ = peer.notify_tool_list_changed().await;
+        }
+        IpcResponse::ResourceListChangedNotification => {
+            let _ = peer.notify_resource_list_changed().await;
+        }
+        IpcResponse::PromptListChangedNotification => {
+            let _ = peer.notify_prompt_list_changed().await;
+        }
+        IpcResponse::ProgressNotification { params } => {
+            if let Ok(notif_params) = serde_json::from_value::<ProgressNotificationParam>(params) {
+                let _ = peer.notify_progress(notif_params).await;
+            }
+        }
+        IpcResponse::CancelledNotification { params } => {
+            if let Ok(notif_params) = serde_json::from_value::<CancelledNotificationParam>(params) {
+                let _ = peer.notify_cancelled(notif_params).await;
+            }
+        }
+        _ => {} // not a control notification
     }
 }
 
