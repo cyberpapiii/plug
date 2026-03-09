@@ -29,13 +29,8 @@ As of PR #35 merge (`0389b22`, 2026-03-09), Stream A protocol correctness, roots
 elicitation + sampling reverse-request forwarding, and legacy SSE upstream transport are complete on
 `main`.
 
-The remaining missing work on `main` is:
-
-- OAuth / remote commercial MCP auth flows
-
 The remaining partial areas on `main` are transport-bounded or under-proven:
 
-- daemon IPC notification parity beyond logging
 - reconnect-based daemon continuity proof is narrower than full cross-transport persistence
 
 ## Checklist
@@ -60,11 +55,11 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 | Targeted `notifications/resources/updated` delivery | done | Upstream notification handling exists in [plug-core/src/server/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/server/mod.rs#L99), routing in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L724), and stdio/HTTP fan-out in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2334) and [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L101). |
 | Truthful resource subscribe capability synthesis | done | Capability synthesis is in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L1156), and daemon IPC masks subscriptions in [plug/src/daemon.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/daemon.rs#L901). |
 | Resource subscribe support over daemon IPC | partial | This is intentionally unsupported, not implemented. The daemon returns `UNSUPPORTED_METHOD` in [plug/src/daemon.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/daemon.rs#L1205). The behavior is honest, but it is still a capability gap. |
-| `resources/list_changed` forwarding | done | PR #31 adds `on_resource_list_changed` handler in `UpstreamClientHandler`, coalesced refresh with `pending_resource_list_changed` flag, fan-out via stdio and HTTP. IPC masked to `list_changed: false` (honest). |
-| `prompts/list_changed` forwarding | done | PR #31 adds `on_prompt_list_changed` handler in `UpstreamClientHandler`, coalesced refresh with `pending_prompt_list_changed` flag, fan-out via stdio and HTTP. IPC masked to `list_changed: false` (honest). |
-| Progress routing | partial | End-to-end routing exists for stdio and HTTP in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L504), [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L2314), and [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L71), but daemon IPC has no push frames for progress. |
-| Cancellation routing | partial | End-to-end routing exists for stdio and HTTP in [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L454), [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L532), and [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L86), but daemon IPC has no push frames for cancelled notifications. |
-| `tools/list_changed` forwarding | partial | Implemented for stdio and HTTP in [plug-core/src/server/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/server/mod.rs#L42), [plug-core/src/proxy/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs#L340), and [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L66), but not pushed over daemon IPC. |
+| `resources/list_changed` forwarding | done | PR #31 adds handler + coalesced refresh; fan-out via stdio, HTTP, and daemon IPC (PR #38). |
+| `prompts/list_changed` forwarding | done | PR #31 adds handler + coalesced refresh; fan-out via stdio, HTTP, and daemon IPC (PR #38). |
+| Progress routing | done | End-to-end routing across stdio, HTTP, and daemon IPC. PR #38 adds IPC push frames with session-targeted delivery. |
+| Cancellation routing | done | End-to-end routing across stdio, HTTP, and daemon IPC. PR #38 adds IPC push frames with session-targeted delivery. |
+| `tools/list_changed` forwarding | done | Fan-out via stdio, HTTP, and daemon IPC. PR #38 adds IPC push frames. |
 | `plug connect` stdio downstream surface | done | CLI dispatch and runtime behavior exist in [plug/src/main.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/main.rs#L146) and [plug/src/runtime.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/runtime.rs#L231). |
 | `plug serve` Streamable HTTP downstream surface | done | CLI dispatch and HTTP serving exist in [plug/src/main.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/main.rs#L149) and [plug/src/runtime.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/runtime.rs#L311). |
 | Optional HTTPS serving | done | TLS config and runtime binding exist in [plug-core/src/config/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/config/mod.rs#L73) and [plug/src/runtime.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/runtime.rs#L360). |
@@ -93,8 +88,6 @@ The one nuance: “daemon continuity recovery” is broader than what the code c
 
 ## Remaining Open Work
 
-All prior “minimum code gaps” from the original audit are resolved. The remaining work is:
-
-### Smaller items
-
-1. Daemon IPC notification parity beyond logging
+All prior “minimum code gaps” from the original audit are resolved. No smaller items remain from the
+original audit scope. Outstanding work is limited to OAuth follow-up polish and documentation hygiene
+(tracked in `docs/PLAN.md`).

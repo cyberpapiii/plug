@@ -27,6 +27,7 @@ forwarding work:
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC (PR #34)
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support (PR #35)
 - OAuth 2.1 + PKCE upstream auth with credential storage (keyring + file fallback), background token refresh, AuthRequired health state, CLI auth commands, and doctor checks (PR #36)
+- daemon IPC notification parity: progress, cancelled, and list_changed push forwarding across IPC (PR #38)
 
 ## What Exists Today
 
@@ -36,17 +37,13 @@ The current product shape is:
 - `plug serve` for Streamable HTTP downstream clients, with optional HTTPS via configured cert/key paths
 - shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
 - daemon-backed local sharing with reconnecting IPC proxy sessions
-- targeted notification fan-out to stdio and HTTP (IPC limited to logging)
+- targeted notification fan-out to stdio, HTTP, and daemon IPC (resource subscribe still unsupported over IPC)
 - meta-tool mode as an opt-in reduced discovery surface
 - downstream HTTP bearer token auth for non-loopback binding
 
 ## Remaining Work
 
 All major roadmap features are now implemented on `main`. The remaining work is smaller follow-up items:
-
-### Open items
-
-- daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
 
 ### OAuth follow-up polish
 

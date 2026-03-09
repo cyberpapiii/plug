@@ -32,8 +32,8 @@ Implemented today:
 - HTTP server for downstream clients
 - downstream HTTPS and bearer auth for non-loopback HTTP
 - logging forwarding
-- tools/resource/prompt list_changed forwarding for stdio + HTTP
-- progress and cancellation routing for stdio + HTTP
+- tools/resource/prompt list_changed forwarding for stdio, HTTP, and daemon IPC
+- progress and cancellation routing for stdio, HTTP, and daemon IPC
 - resources/prompts/templates forwarding
 - resource subscribe/unsubscribe lifecycle
 - completion forwarding across stdio, HTTP, and daemon IPC
@@ -46,7 +46,6 @@ Implemented today:
 
 Still incomplete:
 
-- daemon IPC notification parity beyond logging
 - fully live runtime reconfiguration
 - OAuth follow-up polish: `plug auth complete`, localhost callback, IPC auth commands, zero-downtime reconnect
 

@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `e13deb3` (post-merge proof pass for structuredContent/resource_link end-to-end coverage)
+Baseline: `main` @ `6f009a3` (post-merge truth pass for PR #38 daemon IPC notification parity)
 
 This is the canonical current-state doc for the project.
 
@@ -13,8 +13,8 @@ Implemented on `main`:
 - downstream HTTPS
 - downstream bearer auth for non-loopback HTTP
 - logging forwarding
-- tools/resource/prompt list-changed forwarding for stdio + HTTP
-- progress and cancelled routing for stdio + HTTP
+- tools/resource/prompt list-changed forwarding for stdio, HTTP, and daemon IPC
+- progress and cancelled routing for stdio, HTTP, and daemon IPC
 - resources/prompts/templates forwarding
 - resource subscribe/unsubscribe lifecycle
 - completion forwarding across stdio, HTTP, and daemon IPC
@@ -31,10 +31,10 @@ Implemented on `main`:
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
 - OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, and doctor checks (PR #36)
+- daemon IPC notification parity: progress, cancelled, and list_changed push forwarding (PR #38); resource subscribe remains unsupported over IPC
 
 Partial on `main`:
 
-- daemon IPC notification parity beyond logging
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
 - OAuth follow-up items: `plug auth complete` (non-interactive code exchange), localhost callback listener (uses manual code entry), IPC auth commands, zero-downtime reconnect, mock OAuth integration tests
 
@@ -70,7 +70,7 @@ Use docs by role:
 
 1. keep current-state docs aligned with `main`
 2. clean up stale branches and worktrees from superseded development work
-3. address remaining smaller items (IPC notification parity, test coverage, OAuth follow-up polish)
+3. address remaining smaller items (test coverage, OAuth follow-up polish)
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 
