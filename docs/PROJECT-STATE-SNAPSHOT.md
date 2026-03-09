@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `6f009a3` (post-merge truth pass for PR #38 daemon IPC notification parity)
+Baseline: `main` @ `3157d16` (post-merge truth pass for PR #38 daemon IPC notification parity)
 
 This is the canonical current-state doc for the project.
 
