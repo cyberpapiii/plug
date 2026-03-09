@@ -146,6 +146,7 @@ fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
         || old.timeout_secs != new.timeout_secs
         || old.call_timeout_secs != new.call_timeout_secs
         || old.enabled != new.enabled
+        || old.auth_token.as_ref().map(|t| t.as_str()) != new.auth_token.as_ref().map(|t| t.as_str())
 }
 
 /// Apply a config diff to the running engine.

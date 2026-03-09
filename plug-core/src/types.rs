@@ -125,6 +125,13 @@ pub enum ServerHealth {
     Failed,
 }
 
+impl ServerHealth {
+    /// Returns true for health states that should participate in tool/resource/prompt routing.
+    pub fn is_routable(&self) -> bool {
+        matches!(self, ServerHealth::Healthy | ServerHealth::Degraded)
+    }
+}
+
 /// Tracked health state with consecutive failure counting for state machine transitions.
 ///
 /// State machine:
