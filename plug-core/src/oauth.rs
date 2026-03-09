@@ -607,7 +607,6 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
         || has_token(&normalized, "invalid_grant")
         || has_token(&normalized, "invalid_token")
         || has_token(&normalized, "unauthorized")
-        || has_token(&normalized, "forbidden")
         || has_token(&normalized, "401")
 }
 
@@ -792,7 +791,6 @@ mod tests {
         assert!(is_auth_error("OAuth authorization required"));
         assert!(is_auth_error("OAuth token refresh failed: invalid_grant"));
         assert!(is_auth_error("server returned 401 unauthorized"));
-        assert!(is_auth_error("request failed with forbidden"));
     }
 
     #[test]
