@@ -28,6 +28,7 @@ use rmcp::transport::streamable_http_client::{
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
 use crate::proxy::ToolRouter;
+use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{HealthState, ServerHealth, ServerStatus};
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
@@ -523,41 +524,27 @@ impl ServerManager {
                         router: tool_router.clone(),
                     });
 
-                    let client: McpClient = handler.serve(transport).await.map_err(|e| {
-                        anyhow::anyhow!("failed to connect to HTTP upstream: {e}")
-                    })?;
-
-                    let tools_result = client
-                        .peer()
-                        .list_all_tools()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
-                    tools.store(Arc::new(tools_result));
-
-                    let server_info = client.peer().peer_info();
-                    if let Some(info) = server_info {
-                        tracing::info!(
-                            server = %name,
-                            server_name = %info.server_info.name,
-                            server_version = %info.server_info.version,
-                            "connected to HTTP upstream"
-                        );
+                    match handler.serve(transport).await {
+                        Ok(client) => {
+                            Self::finish_upstream_connection(name, config, client, tools, "HTTP upstream").await
+                        }
+                        Err(e) => {
+                            let error = anyhow::anyhow!("failed to connect to HTTP upstream: {e}");
+                            if crate::transport::sse_client::should_fallback_http_error(&error) {
+                                tracing::info!(
+                                    server = %name,
+                                    error = %error,
+                                    "HTTP upstream looks legacy-SSE compatible; falling back"
+                                );
+                                Self::connect_sse_upstream(name, config, tool_router).await
+                            } else {
+                                Err(error)
+                            }
+                        }
                     }
-
-                    let capabilities = client
-                        .peer()
-                        .peer_info()
-                        .map(|info| info.capabilities.clone())
-                        .unwrap_or_default();
-
-                    Ok(UpstreamServer {
-                        name: name.to_string(),
-                        config: config.clone(),
-                        client,
-                        tools,
-                        capabilities,
-                        health: ServerHealth::Healthy,
-                    })
+                }
+                TransportType::Sse => {
+                    Self::connect_sse_upstream(name, config, tool_router).await
                 }
             }
         })
@@ -578,6 +565,100 @@ impl ServerManager {
                 Err(anyhow::anyhow!(msg))
             }
         }
+    }
+
+    /// Connect to a legacy SSE upstream server.
+    async fn connect_sse_upstream(
+        name: &str,
+        config: &ServerConfig,
+        tool_router: std::sync::Weak<ToolRouter>,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        crate::tls::ensure_rustls_provider_installed();
+
+        let url = config
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("SSE transport requires a URL"))?;
+
+        // SSRF protection: same rules as HTTP upstream
+        let parsed = url
+            .parse::<http::Uri>()
+            .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+        if let Some(host) = parsed.host() {
+            if is_blocked_host(host) {
+                anyhow::bail!(
+                    "URL host '{host}' is blocked — private, loopback, or metadata endpoint"
+                );
+            }
+        }
+
+        let mut transport_config = LegacySseTransportConfig::with_uri(url);
+
+        if let Some(ref token) = config.auth_token {
+            transport_config = transport_config.auth_token(token.as_str());
+        }
+
+        tracing::info!(
+            server = %name,
+            url = %url,
+            "connecting to legacy SSE upstream"
+        );
+
+        let transport = LegacySseClientTransport::from_config(transport_config);
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from(name),
+            tools: Arc::clone(&tools),
+            router: tool_router,
+        });
+
+        let client: McpClient = handler.serve(transport).await.map_err(|e| {
+            anyhow::anyhow!("failed to connect to legacy SSE upstream: {e}")
+        })?;
+
+        Self::finish_upstream_connection(name, config, client, tools, "legacy SSE upstream").await
+    }
+
+    /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
+    async fn finish_upstream_connection(
+        name: &str,
+        config: &ServerConfig,
+        client: McpClient,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        transport_label: &str,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        let tools_result = client
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+        tools.store(Arc::new(tools_result));
+
+        let server_info = client.peer().peer_info();
+        if let Some(info) = server_info {
+            tracing::info!(
+                server = %name,
+                server_name = %info.server_info.name,
+                server_version = %info.server_info.version,
+                "connected to {transport_label}"
+            );
+        }
+
+        let capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+
+        Ok(UpstreamServer {
+            name: name.to_string(),
+            config: config.clone(),
+            client,
+            tools,
+            capabilities,
+            health: ServerHealth::Healthy,
+        })
     }
 
     /// Return all tools from all healthy servers, each paired with the server name.

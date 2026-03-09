@@ -590,8 +590,8 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
                     }
                 }
             }
-            TransportType::Http => {
-                // For HTTP servers, try a TCP connection to verify reachability
+            TransportType::Http | TransportType::Sse => {
+                // For HTTP/SSE servers, try a TCP connection to verify reachability
                 if let Some(ref url) = server.url {
                     match check_http_reachable(url).await {
                         Ok(()) => {}

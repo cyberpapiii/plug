@@ -13,8 +13,11 @@ pub(crate) fn parse_transport(
     match value.as_deref() {
         Some("stdio") | None if url.is_none() => Ok(plug_core::config::TransportType::Stdio),
         Some("http") => Ok(plug_core::config::TransportType::Http),
+        Some("sse") => Ok(plug_core::config::TransportType::Sse),
         None => Ok(plug_core::config::TransportType::Http),
-        Some(other) => anyhow::bail!("unsupported transport `{other}`; use `stdio` or `http`"),
+        Some(other) => {
+            anyhow::bail!("unsupported transport `{other}`; use `stdio`, `http`, or `sse`")
+        }
     }
 }
 
@@ -69,12 +72,13 @@ pub(crate) fn cmd_server_add(
         None if url.is_some() => plug_core::config::TransportType::Http,
         None => match Select::with_theme(&cli_prompt_theme())
             .with_prompt("Transport")
-            .items(["stdio", "http"])
+            .items(["stdio", "http", "sse"])
             .default(0)
             .interact()?
         {
             0 => plug_core::config::TransportType::Stdio,
-            _ => plug_core::config::TransportType::Http,
+            1 => plug_core::config::TransportType::Http,
+            _ => plug_core::config::TransportType::Sse,
         },
     };
 
@@ -120,7 +124,7 @@ pub(crate) fn cmd_server_add(
                 tool_groups: Vec::new(),
             }
         }
-        plug_core::config::TransportType::Http => {
+        plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
             let url = match url {
                 Some(url) => url,
                 None => Input::with_theme(&cli_prompt_theme())
@@ -268,7 +272,7 @@ pub(crate) async fn cmd_server_edit(
                     .collect()
             };
         }
-        plug_core::config::TransportType::Http => {
+        plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
             let url: String = Input::with_theme(&cli_prompt_theme())
                 .with_prompt("URL")
                 .with_initial_text(server.url.clone().unwrap_or_default())

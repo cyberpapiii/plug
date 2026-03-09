@@ -193,6 +193,7 @@ pub enum TransportType {
     #[default]
     Stdio,
     Http,
+    Sse,
 }
 
 /// A rule for classifying tools into named groups (sub-services).
@@ -346,6 +347,13 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                 if server.url.is_none() {
                     errors.push(format!(
                         "server '{name}': http transport requires 'url' to be set"
+                    ));
+                }
+            }
+            TransportType::Sse => {
+                if server.url.is_none() {
+                    errors.push(format!(
+                        "server '{name}': sse transport requires 'url' to be set"
                     ));
                 }
             }

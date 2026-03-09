@@ -84,6 +84,10 @@ fs2 = "0.4"
 subtle = "2.6"
 hex = "0.4"
 
+# Legacy SSE upstream transport
+reqwest = { version = "0.13", default-features = false }
+sse-stream = "0.2"
+
 # HTTP Server (Phase 2)
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit"] }

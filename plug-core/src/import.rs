@@ -425,7 +425,8 @@ fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig>
     let transport_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
     let transport = match transport_type {
         "stdio" => crate::config::TransportType::Stdio,
-        "sse" | "http" => crate::config::TransportType::Http,
+        "sse" => crate::config::TransportType::Sse,
+        "http" => crate::config::TransportType::Http,
         _ => return None,
     };
 
@@ -798,6 +799,10 @@ fn server_signature(config: &ServerConfig) -> String {
             let url = config.url.as_deref().unwrap_or("");
             format!("http:{url}")
         }
+        TransportType::Sse => {
+            let url = config.url.as_deref().unwrap_or("");
+            format!("sse:{url}")
+        }
     }
 }
 
@@ -909,6 +914,14 @@ pub fn servers_to_toml(servers: &[DiscoveredServer], existing_names: &[String]) 
                 if let Some(ref url) = server.config.url {
                     output.push_str(&format!(
                         "transport = \"http\"\nurl = {}\n",
+                        toml_quote(url)
+                    ));
+                }
+            }
+            TransportType::Sse => {
+                if let Some(ref url) = server.config.url {
+                    output.push_str(&format!(
+                        "transport = \"sse\"\nurl = {}\n",
                         toml_quote(url)
                     ));
                 }
