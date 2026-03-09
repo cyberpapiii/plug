@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `0389b22` (post-merge of PR #35 legacy SSE upstream transport)
+Baseline: `main` @ `8d1e119` (post-merge truth pass after PR #35 legacy SSE upstream transport)
 
 This is the canonical current-state doc for the project.
 
