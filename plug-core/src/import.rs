@@ -920,10 +920,7 @@ pub fn servers_to_toml(servers: &[DiscoveredServer], existing_names: &[String]) 
             }
             TransportType::Sse => {
                 if let Some(ref url) = server.config.url {
-                    output.push_str(&format!(
-                        "transport = \"sse\"\nurl = {}\n",
-                        toml_quote(url)
-                    ));
+                    output.push_str(&format!("transport = \"sse\"\nurl = {}\n", toml_quote(url)));
                 }
             }
         }
