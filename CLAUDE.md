@@ -26,7 +26,7 @@ This is an active codebase, not a pre-development repo.
 
 Implemented today:
 
-- upstream stdio and HTTP connections
+- upstream stdio, HTTP, and legacy SSE connections (with HTTP→SSE auto-fallback)
 - merged tool routing with client-aware filtering
 - daemon + Unix socket IPC
 - HTTP server for downstream clients
@@ -45,7 +45,6 @@ Implemented today:
 
 Still incomplete:
 
-- legacy SSE upstream transport
 - OAuth 2.1 + PKCE for upstream remote servers
 - daemon IPC notification parity beyond logging
 - dedicated end-to-end tests for `structuredContent` and `resource_link`

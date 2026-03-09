@@ -25,6 +25,7 @@ forwarding work:
 - subscription pruning and rebind on route refresh (todo 039 resolved)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC (PR #34)
+- legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support (PR #35)
 
 ## What Exists Today
 
@@ -44,13 +45,13 @@ The current product shape is:
 
 These are the open features that require new infrastructure:
 
-- **legacy SSE upstream transport** — custom transport via `reqwest-eventsource` for SSE-only remote servers (Neon, Firecrawl, Figma, Linear, Atlassian)
 - **OAuth 2.1 + PKCE** — authenticate to upstream remote MCP servers with token refresh lifecycle
 
 ### Smaller open items
 
 - daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
 - dedicated tests for `structuredContent` and `resource_link` end-to-end pass-through
+- HTTP elicitation timeout (todo 045 — deferred, needs plan revision)
 
 ### Documentation and release hygiene
 

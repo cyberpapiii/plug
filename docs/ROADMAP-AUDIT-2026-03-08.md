@@ -25,12 +25,12 @@ Method:
 
 Using the actively tracked roadmap items, not the older speculative phase plans.
 
-As of PR #34 merge (`0adf857`, 2026-03-08), Stream A protocol correctness, roots forwarding, and
-elicitation + sampling reverse-request forwarding are complete on `main`.
+As of PR #35 merge (`0389b22`, 2026-03-09), Stream A protocol correctness, roots forwarding,
+elicitation + sampling reverse-request forwarding, and legacy SSE upstream transport are complete on
+`main`.
 
 The remaining missing work on `main` is:
 
-- legacy SSE upstream transport
 - OAuth / remote commercial MCP auth flows
 
 The remaining partial areas on `main` are transport-bounded or under-proven:
@@ -74,7 +74,7 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 | Reconnecting IPC proxy sessions | done | Reconnect logic exists in [plug/src/ipc_proxy.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/ipc_proxy.rs#L80) and [plug/src/ipc_proxy.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/ipc_proxy.rs#L166), with restart recovery tests in the same file. |
 | Daemon continuity recovery | partial | The code proves reconnect-based recovery for daemon-backed stdio clients, but not broad persisted continuity across all downstream session types. See [plug/src/ipc_proxy.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/ipc_proxy.rs#L753) and [plug/src/daemon.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/daemon.rs#L528). |
 | Session-store abstraction / stateless prep | done | The abstraction seam is present in [plug-core/src/session/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/session/mod.rs#L13) and used by HTTP in [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L36). |
-| Legacy SSE upstream transport | missing | `TransportType` still only has `Stdio` and `Http` in [plug-core/src/config/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/config/mod.rs#L192). |
+| Legacy SSE upstream transport | done | PR #35 adds `TransportType::Sse`, `LegacySseClientTransport` with HTTP→SSE auto-fallback, SSRF-hardened same-origin endpoint validation, redirect-disabled reqwest client, auth token Debug redaction, and import/export/doctor support. Integration tests cover explicit SSE, fallback, and notification forwarding. |
 | OAuth / remote commercial MCP auth flows | missing | I found no implementation under `plug` or `plug-core`; current auth code is downstream bearer-token auth only in [plug-core/src/auth.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/auth.rs). |
 | `sampling/createMessage` | done | PR #34 adds `DownstreamBridge` trait with `create_message()` across stdio, HTTP, and daemon IPC. Capability-gated. End-to-end integration tests for both transports. |
 | `elicitation/create` | done | PR #34 adds `DownstreamBridge` trait with `create_elicitation()` across stdio, HTTP, and daemon IPC. Capability-gated. End-to-end integration tests for both transports. |
@@ -100,11 +100,10 @@ All prior “minimum code gaps” from the original audit are resolved. The rema
 
 ### Stream B (new infrastructure required)
 
-1. **Legacy SSE upstream transport** — custom transport for SSE-only remote servers
-2. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
+1. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
 
 ### Smaller items
 
-3. Decide whether daemon IPC notification parity beyond logging is a release requirement or explicit post-release limit
-4. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
-5. HTTP elicitation timeout (todo 045) — add bounded timeout after plan revision
+2. Decide whether daemon IPC notification parity beyond logging is a release requirement or explicit post-release limit
+3. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
+4. HTTP elicitation timeout (todo 045) — add bounded timeout after plan revision
