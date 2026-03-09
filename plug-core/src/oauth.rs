@@ -546,6 +546,130 @@ impl StateStore for CompositeStateStore {
 }
 
 // ---------------------------------------------------------------------------
+// Token refresh
+// ---------------------------------------------------------------------------
+
+/// Outcome of an OAuth token refresh attempt.
+#[derive(Debug)]
+pub enum RefreshResult {
+    /// Token was successfully refreshed and the global cache updated.
+    Refreshed,
+    /// Cannot refresh: credentials were injected (no real OAuth client).
+    InjectedToken,
+    /// Cannot refresh: stored credentials have no refresh_token.
+    NoRefreshToken,
+    /// Cannot refresh: no stored credentials at all.
+    NoCredentials,
+    /// Refresh rejected by the authorization server (token revoked, etc.).
+    AuthError(String),
+    /// Refresh failed due to a transient error (network, metadata, etc.).
+    TransientError(String),
+}
+
+/// Attempt to refresh the OAuth access token for `server_name`.
+///
+/// Builds an [`rmcp::transport::auth::AuthorizationManager`], discovers
+/// server metadata, configures the OAuth client, and calls `refresh_token()`
+/// to exchange the stored refresh token for a fresh access token.
+///
+/// On success the backing stores (keyring/file) and the global in-memory
+/// cache are updated before returning.
+///
+/// Returns [`RefreshResult::InjectedToken`] when `client_id == "injected"`.
+pub async fn refresh_access_token(
+    server_name: &str,
+    server_url: &str,
+    oauth_client_id: Option<&str>,
+) -> RefreshResult {
+    use rmcp::transport::auth::{AuthorizationManager, OAuthClientConfig};
+
+    // Ensure the TLS provider is available (reqwest needs it even for HTTP).
+    crate::tls::ensure_rustls_provider_installed();
+
+    // 1. Load stored credentials from the global store.
+    let store = get_or_create_store(server_name);
+    let creds = match CredentialStore::load(&*store).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return RefreshResult::NoCredentials,
+        Err(e) => return RefreshResult::TransientError(format!("failed to load credentials: {e}")),
+    };
+
+    // 2. Injected tokens have no real OAuth client — cannot refresh.
+    if creds.client_id == "injected" {
+        return RefreshResult::InjectedToken;
+    }
+
+    // 3. A refresh_token must be present.
+    let has_refresh = creds.token_response.as_ref().is_some_and(|tr| {
+        use oauth2::TokenResponse;
+        tr.refresh_token().is_some()
+    });
+    if !has_refresh {
+        return RefreshResult::NoRefreshToken;
+    }
+
+    // 4. Build an AuthorizationManager for the server URL.
+    let mut auth_manager = match AuthorizationManager::new(server_url).await {
+        Ok(m) => m,
+        Err(e) => {
+            return RefreshResult::TransientError(format!("failed to init auth manager: {e}"));
+        }
+    };
+
+    // Fresh store instance sharing the same backing files/keyring — we
+    // cannot reuse the global Arc because `set_credential_store` takes
+    // ownership.
+    let refresh_store = CompositeCredentialStore::new(server_name.to_string());
+    auth_manager.set_credential_store(refresh_store);
+
+    // 5. Discover OAuth server metadata.
+    let metadata = match auth_manager.discover_metadata().await {
+        Ok(m) => m,
+        Err(e) => return RefreshResult::TransientError(format!("metadata discovery failed: {e}")),
+    };
+    auth_manager.set_metadata(metadata);
+
+    // 6. Configure the OAuth client.
+    let client_id = oauth_client_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| creds.client_id.clone());
+
+    let config = OAuthClientConfig {
+        client_id,
+        client_secret: None,
+        scopes: creds.granted_scopes.clone(),
+        redirect_uri: "http://localhost:0/callback".to_string(),
+    };
+    if let Err(e) = auth_manager.configure_client(config) {
+        return RefreshResult::TransientError(format!("failed to configure client: {e}"));
+    }
+
+    // 7. Exchange refresh_token for a new access_token.
+    match auth_manager.refresh_token().await {
+        Ok(_) => {
+            // rmcp's refresh_token() saves via the fresh store's backing
+            // files/keyring.  Reload the global store's cache so the next
+            // `current_access_token()` call returns the new token.
+            let _ = CredentialStore::load(&*store).await;
+            debug!(server = %server_name, "OAuth token refreshed successfully");
+            RefreshResult::Refreshed
+        }
+        Err(e) => {
+            let err_str = format!("{e}").to_lowercase();
+            let is_auth = err_str.contains("invalid_grant")
+                || err_str.contains("invalid_token")
+                || err_str.contains("unauthorized")
+                || err_str.contains("authorization");
+            if is_auth {
+                RefreshResult::AuthError(format!("{e}"))
+            } else {
+                RefreshResult::TransientError(format!("{e}"))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -680,5 +804,104 @@ mod tests {
         // Invalid name (path separator) returns an error.
         let store = CompositeCredentialStore::new("../evil".to_string());
         assert!(store.token_file_path().is_err());
+    }
+
+    // -- refresh_access_token tests ----------------------------------------
+
+    /// Helper: build a synthetic token response for test fixtures.
+    fn make_test_token(
+        access: &str,
+        refresh: Option<&str>,
+        expires_in: Option<u64>,
+    ) -> rmcp::transport::auth::StoredCredentials {
+        use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
+        use rmcp::transport::auth::VendorExtraTokenFields;
+
+        let mut token =
+            oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
+                AccessToken::new(access.to_string()),
+                BasicTokenType::Bearer,
+                VendorExtraTokenFields::default(),
+            );
+        if let Some(rt) = refresh {
+            token.set_refresh_token(Some(RefreshToken::new(rt.to_string())));
+        }
+        if let Some(secs) = expires_in {
+            token.set_expires_in(Some(&std::time::Duration::from_secs(secs)));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        StoredCredentials {
+            client_id: "test-client".to_string(),
+            token_response: Some(token),
+            granted_scopes: vec![],
+            token_received_at: Some(now),
+        }
+    }
+
+    /// No stored credentials → NoCredentials.
+    #[tokio::test]
+    async fn test_refresh_no_credentials() {
+        let name = format!("refresh-nocreds-{}", std::process::id());
+        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
+        assert!(matches!(result, RefreshResult::NoCredentials));
+    }
+
+    /// Injected token (client_id == "injected") → InjectedToken.
+    #[tokio::test]
+    async fn test_refresh_injected_token() {
+        let name = format!("refresh-injected-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let mut creds = make_test_token("test-access", Some("test-refresh"), Some(3600));
+        creds.client_id = "injected".to_string();
+        store.save(creds).await.unwrap();
+
+        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
+        assert!(matches!(result, RefreshResult::InjectedToken));
+
+        // Clean up
+        store.clear().await.unwrap();
+    }
+
+    /// No refresh_token in stored credentials → NoRefreshToken.
+    #[tokio::test]
+    async fn test_refresh_no_refresh_token() {
+        let name = format!("refresh-norefresh-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        // Token without a refresh_token
+        let creds = make_test_token("test-access", None, Some(3600));
+        store.save(creds).await.unwrap();
+
+        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
+        assert!(matches!(result, RefreshResult::NoRefreshToken));
+
+        // Clean up
+        store.clear().await.unwrap();
+    }
+
+    /// Valid credentials but unreachable server → TransientError (metadata
+    /// discovery fails).
+    #[tokio::test]
+    async fn test_refresh_transient_error_unreachable_server() {
+        crate::tls::ensure_rustls_provider_installed();
+        let name = format!("refresh-transient-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let creds = make_test_token("test-access", Some("test-refresh"), Some(3600));
+        store.save(creds).await.unwrap();
+
+        // Point at a non-existent server — metadata discovery will fail.
+        let result = refresh_access_token(&name, "http://127.0.0.1:1", None).await;
+        assert!(
+            matches!(result, RefreshResult::TransientError(_)),
+            "expected TransientError, got {result:?}"
+        );
+
+        // Clean up
+        store.clear().await.unwrap();
     }
 }
