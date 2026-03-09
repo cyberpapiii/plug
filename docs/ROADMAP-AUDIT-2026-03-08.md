@@ -25,13 +25,11 @@ Method:
 
 Using the actively tracked roadmap items, not the older speculative phase plans.
 
-As of PR #32 merge (`3e16fe4`, 2026-03-08), Stream A protocol correctness and roots forwarding are
-complete on `main`.
+As of PR #34 merge (`0adf857`, 2026-03-08), Stream A protocol correctness, roots forwarding, and
+elicitation + sampling reverse-request forwarding are complete on `main`.
 
 The remaining missing work on `main` is:
 
-- elicitation
-- sampling
 - legacy SSE upstream transport
 - OAuth / remote commercial MCP auth flows
 
@@ -78,8 +76,8 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 | Session-store abstraction / stateless prep | done | The abstraction seam is present in [plug-core/src/session/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/session/mod.rs#L13) and used by HTTP in [plug-core/src/http/server.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/http/server.rs#L36). |
 | Legacy SSE upstream transport | missing | `TransportType` still only has `Stdio` and `Http` in [plug-core/src/config/mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/config/mod.rs#L192). |
 | OAuth / remote commercial MCP auth flows | missing | I found no implementation under `plug` or `plug-core`; current auth code is downstream bearer-token auth only in [plug-core/src/auth.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/auth.rs). |
-| `sampling/createMessage` | missing | No handler found in live code. |
-| `elicitation/create` | missing | No handler found in live code. |
+| `sampling/createMessage` | done | PR #34 adds `DownstreamBridge` trait with `create_message()` across stdio, HTTP, and daemon IPC. Capability-gated. End-to-end integration tests for both transports. |
+| `elicitation/create` | done | PR #34 adds `DownstreamBridge` trait with `create_elicitation()` across stdio, HTTP, and daemon IPC. Capability-gated. End-to-end integration tests for both transports. |
 | `roots/list` forwarding | done | PR #32 adds `roots/list` reverse request, `roots/list_changed` notification handling, and union cache across stdio, HTTP, and daemon IPC in `plug-core/src/proxy/mod.rs`, `plug-core/src/http/server.rs`, `plug/src/daemon.rs`, and `plug/src/ipc_proxy.rs`. |
 | MCP protocol-version request validation (downstream) | done | PR #31 adds `validate_protocol_version_for_post()` in `plug-core/src/http/server.rs`. Requires `MCP-Protocol-Version: 2025-11-25` on POST (except `InitializeRequest`). Returns 400 on missing/mismatched. |
 | MCP protocol-version header on upstream requests | done | rmcp 1.1.0's `StreamableHttpClientTransport` automatically injects `mcp-protocol-version` after initialization using the negotiated version from the server's `InitializeResult`. Confirmed by repo-local confidence test `test_upstream_http_sends_protocol_version_header`. Source: rmcp `streamable_http_client.rs:385-387`. |
@@ -88,10 +86,10 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 
 ## What This Means For `docs/PLAN.md`
 
-With PR #32 merged, `docs/PLAN.md` is honest. Stream A protocol correctness and roots forwarding are
-complete. The remaining open work is Stream B connectivity expansion (elicitation/sampling, legacy
-SSE, OAuth) plus minor items (upstream protocol-version header, daemon IPC notification parity,
-dedicated pass-through tests).
+With PR #34 merged, `docs/PLAN.md` is honest. Stream A protocol correctness, roots forwarding, and
+elicitation/sampling reverse-request forwarding are complete. The remaining open work is Stream B
+connectivity expansion (legacy SSE, OAuth) plus minor items (daemon IPC notification parity,
+dedicated pass-through tests, HTTP elicitation timeout todo 045).
 
 The one nuance: “daemon continuity recovery” is broader than what the code currently proves
 (reconnect-based recovery for stdio-over-IPC clients, not full cross-transport session persistence).
@@ -102,11 +100,11 @@ All prior “minimum code gaps” from the original audit are resolved. The rema
 
 ### Stream B (new infrastructure required)
 
-1. **Elicitation + Sampling** — reverse-request routing from upstream to specific downstream client
-2. **Legacy SSE upstream transport** — custom transport for SSE-only remote servers
-3. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
+1. **Legacy SSE upstream transport** — custom transport for SSE-only remote servers
+2. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
 
 ### Smaller items
 
-4. Decide whether daemon IPC notification parity beyond logging is a release requirement or explicit post-release limit
-5. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
+3. Decide whether daemon IPC notification parity beyond logging is a release requirement or explicit post-release limit
+4. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
+5. HTTP elicitation timeout (todo 045) — add bounded timeout after plan revision

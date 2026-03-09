@@ -24,6 +24,7 @@ forwarding work:
 - MCP-Protocol-Version header on upstream HTTP requests (provided by rmcp 1.1.0 after initialization)
 - subscription pruning and rebind on route refresh (todo 039 resolved)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
+- elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC (PR #34)
 
 ## What Exists Today
 
@@ -43,7 +44,6 @@ The current product shape is:
 
 These are the open features that require new infrastructure:
 
-- **elicitation / sampling** — reverse-request routing from upstream to the specific downstream client whose tool call triggered the request
 - **legacy SSE upstream transport** — custom transport via `reqwest-eventsource` for SSE-only remote servers (Neon, Firecrawl, Figma, Linear, Atlassian)
 - **OAuth 2.1 + PKCE** — authenticate to upstream remote MCP servers with token refresh lifecycle
 

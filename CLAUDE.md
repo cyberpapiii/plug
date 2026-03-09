@@ -39,16 +39,17 @@ Implemented today:
 - completion forwarding across stdio, HTTP, and daemon IPC
 - meta-tool mode
 - roots forwarding with union cache across all transports
+- elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - import/export/doctor flows
 - startup recovery and health monitoring
 
 Still incomplete:
 
-- elicitation + sampling reverse-request routing
 - legacy SSE upstream transport
 - OAuth 2.1 + PKCE for upstream remote servers
 - daemon IPC notification parity beyond logging
 - dedicated end-to-end tests for `structuredContent` and `resource_link`
+- HTTP elicitation timeout (todo 045 — deferred, needs plan revision)
 - fully live runtime reconfiguration
 
 ## Documentation Map

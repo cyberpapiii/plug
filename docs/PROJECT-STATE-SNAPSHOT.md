@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `3e16fe4` (post-merge of PR #33 truth guardrails + PR #32 roots forwarding)
+Baseline: `main` @ `0adf857` (post-merge of PR #34 elicitation + sampling reverse-request forwarding)
 
 This is the canonical current-state doc for the project.
 
@@ -27,6 +27,8 @@ Implemented on `main`:
 - downstream protocol-version validation
 - upstream MCP-Protocol-Version send-side (provided by rmcp 1.1.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
+- elicitation reverse-request forwarding across stdio, HTTP, and daemon IPC
+- sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 
 Partial on `main`:
 
@@ -36,8 +38,6 @@ Partial on `main`:
 
 Missing on `main`:
 
-- elicitation
-- sampling
 - legacy SSE upstream transport
 - OAuth upstream auth
 
@@ -45,7 +45,7 @@ Missing on `main`:
 
 Candidate future state only:
 
-- `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, elicitation/sampling scaffolds, research docs), not mergeable whole-cloth
+- `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, research docs), not mergeable whole-cloth
 
 Off-main work must not be described as current implementation.
 
@@ -73,7 +73,7 @@ Use docs by role:
 
 1. keep current-state docs aligned with `main`
 2. clean up stale branches and worktrees from superseded development work
-3. continue Stream B work (elicitation/sampling, legacy SSE, OAuth)
+3. continue Stream B work (legacy SSE, OAuth)
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 
