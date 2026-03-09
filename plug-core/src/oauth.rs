@@ -250,7 +250,11 @@ impl CompositeCredentialStore {
         };
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
-            Err(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                warn!(server = %self.server_name, error = %e, "token file: read failed");
+                return None;
+            }
         };
         match serde_json::from_str::<StoredCredentials>(&data) {
             Ok(creds) => Some(creds),

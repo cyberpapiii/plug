@@ -78,6 +78,7 @@ pub fn spawn_health_checks(
                             .get(&name)
                             .is_some_and(|entry| entry.health == ServerHealth::AuthRequired);
                         if is_auth_required {
+                            tracing::debug!(server = %name, "skipping health check for AuthRequired server");
                             continue;
                         }
 
