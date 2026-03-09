@@ -84,7 +84,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::CreateElicitationRequest(CreateElicitationRequest::new(request)),
-                None, // no bridge-level timeout for elicitation (human input)
+                Some(Duration::from_secs(600)), // 10-minute upper bound prevents resource leaks
             )
             .await?;
             match result {

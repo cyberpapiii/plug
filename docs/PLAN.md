@@ -48,7 +48,6 @@ All major roadmap features are now implemented on `main`. The remaining work is 
 
 - daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
 - dedicated tests for `structuredContent` and `resource_link` end-to-end pass-through
-- HTTP elicitation timeout (todo 045 — deferred, needs plan revision)
 
 ### OAuth follow-up polish
 

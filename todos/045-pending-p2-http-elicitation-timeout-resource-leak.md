@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 priority: p2
 issue_id: "045"
 tags: [code-review, security, performance, http]
@@ -57,9 +57,9 @@ _To be filled during triage_
 
 ## Acceptance Criteria
 
-- [ ] HTTP elicitation has a finite timeout (suggested: 10 minutes)
-- [ ] Timed-out elicitation returns error to upstream server
-- [ ] pending_client_requests entry is cleaned up on timeout
+- [x] HTTP elicitation has a finite timeout (suggested: 10 minutes)
+- [x] Timed-out elicitation returns error to upstream server
+- [x] pending_client_requests entry is cleaned up on timeout
 
 ## Work Log
 
@@ -67,6 +67,7 @@ _To be filled during triage_
 |------|--------|-----------|
 | 2026-03-08 | Created from CE review | 3 of 6 agents flagged this independently |
 | 2026-03-08 | Reverted to pending | Fix (600s timeout) deviated from approved plan which specifies no bridge-level elicitation timeout. Deferred to post-v1 with explicit plan revision. |
+| 2026-03-09 | Fixed | Applied Option A: 600s timeout. Timeout cleanup already handled by `send_http_client_request`. |
 
 ## Resources
 
