@@ -576,6 +576,41 @@ pub enum RefreshResult {
     TransientError(String),
 }
 
+fn has_token(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+
+    if needle_bytes.is_empty() || bytes.len() < needle_bytes.len() {
+        return false;
+    }
+
+    bytes
+        .windows(needle_bytes.len())
+        .enumerate()
+        .any(|(idx, window)| {
+            if window != needle_bytes {
+                return false;
+            }
+
+            let start_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+            let end_idx = idx + needle_bytes.len();
+            let end_ok = end_idx == bytes.len() || !bytes[end_idx].is_ascii_alphanumeric();
+
+            start_ok && end_ok
+        })
+}
+
+pub(crate) fn is_auth_error(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+
+    normalized.contains("authorization required")
+        || has_token(&normalized, "invalid_grant")
+        || has_token(&normalized, "invalid_token")
+        || has_token(&normalized, "unauthorized")
+        || has_token(&normalized, "forbidden")
+        || has_token(&normalized, "401")
+}
+
 /// Attempt to refresh the OAuth access token for `server_name`.
 ///
 /// Builds an [`rmcp::transport::auth::AuthorizationManager`], discovers
@@ -669,12 +704,8 @@ pub async fn refresh_access_token(
             RefreshResult::Refreshed
         }
         Err(e) => {
-            let err_str = format!("{e}").to_lowercase();
-            let is_auth = err_str.contains("invalid_grant")
-                || err_str.contains("invalid_token")
-                || err_str.contains("unauthorized")
-                || err_str.contains("authorization");
-            if is_auth {
+            let err_str = e.to_string();
+            if is_auth_error(&err_str) {
                 RefreshResult::AuthError(format!("{e}"))
             } else {
                 RefreshResult::TransientError(format!("{e}"))
@@ -754,6 +785,28 @@ mod tests {
         // Already past refresh window → zero.
         let dur = time_until_refresh_window(now - 3500, Some(3600));
         assert_eq!(dur, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_is_auth_error_matches_known_auth_failures() {
+        assert!(is_auth_error("OAuth authorization required"));
+        assert!(is_auth_error("OAuth token refresh failed: invalid_grant"));
+        assert!(is_auth_error("server returned 401 unauthorized"));
+        assert!(is_auth_error("request failed with forbidden"));
+    }
+
+    #[test]
+    fn test_is_auth_error_rejects_metadata_discovery_false_positive() {
+        assert!(!is_auth_error(
+            "metadata discovery failed: failed to fetch authorization server metadata"
+        ));
+    }
+
+    #[test]
+    fn test_is_auth_error_rejects_port_number_false_positive() {
+        assert!(!is_auth_error(
+            "connection refused while calling http://127.0.0.1:4018/callback"
+        ));
     }
 
     /// Write credentials to file, read back, and verify.
