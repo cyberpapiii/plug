@@ -26,6 +26,7 @@ forwarding work:
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC (PR #34)
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support (PR #35)
+- OAuth 2.1 + PKCE upstream auth with credential storage (keyring + file fallback), background token refresh, AuthRequired health state, CLI auth commands, and doctor checks (PR #36)
 
 ## What Exists Today
 
@@ -41,17 +42,21 @@ The current product shape is:
 
 ## Remaining Work
 
-### Stream B: Connectivity Expansion (next priority)
+All major roadmap features are now implemented on `main`. The remaining work is smaller follow-up items:
 
-These are the open features that require new infrastructure:
-
-- **OAuth 2.1 + PKCE** — authenticate to upstream remote MCP servers with token refresh lifecycle
-
-### Smaller open items
+### Open items
 
 - daemon IPC notification parity beyond logging (progress, cancelled, list_changed push frames)
 - dedicated tests for `structuredContent` and `resource_link` end-to-end pass-through
 - HTTP elicitation timeout (todo 045 — deferred, needs plan revision)
+
+### OAuth follow-up polish
+
+- `plug auth complete` command for non-interactive code exchange (agent-native)
+- localhost callback listener for `plug auth login` (currently uses manual code entry)
+- IPC auth commands (`AuthStatus`, `InjectToken`, `AuthStateChanged` push notification)
+- zero-downtime reconnect on token refresh (pre-create transport before swap)
+- mock OAuth provider integration tests
 
 ### Documentation and release hygiene
 

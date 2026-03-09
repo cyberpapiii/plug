@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `8d1e119` (post-merge truth pass after PR #35 legacy SSE upstream transport)
+Baseline: `main` @ `ec06896` (post-merge truth pass after PR #36 OAuth + PR #37 followups)
 
 This is the canonical current-state doc for the project.
 
@@ -30,16 +30,14 @@ Implemented on `main`:
 - elicitation reverse-request forwarding across stdio, HTTP, and daemon IPC
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
+- OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, and doctor checks (PR #36)
 
 Partial on `main`:
 
 - daemon IPC notification parity beyond logging
 - `structuredContent` and `resource_link` pass-through are present but under-proven by dedicated end-to-end tests
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-
-Missing on `main`:
-
-- OAuth upstream auth
+- OAuth follow-up items: `plug auth complete` (non-interactive code exchange), localhost callback listener (uses manual code entry), IPC auth commands, zero-downtime reconnect, mock OAuth integration tests
 
 ## What Exists Off-Main
 
@@ -73,7 +71,7 @@ Use docs by role:
 
 1. keep current-state docs aligned with `main`
 2. clean up stale branches and worktrees from superseded development work
-3. continue Stream B work (OAuth)
+3. address remaining smaller items (IPC notification parity, test coverage, OAuth follow-up polish)
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 

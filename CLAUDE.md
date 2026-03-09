@@ -40,16 +40,17 @@ Implemented today:
 - meta-tool mode
 - roots forwarding with union cache across all transports
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
+- OAuth 2.1 + PKCE upstream auth with credential storage, background refresh, CLI commands, and doctor checks
 - import/export/doctor flows
 - startup recovery and health monitoring
 
 Still incomplete:
 
-- OAuth 2.1 + PKCE for upstream remote servers
 - daemon IPC notification parity beyond logging
 - dedicated end-to-end tests for `structuredContent` and `resource_link`
 - HTTP elicitation timeout (todo 045 — deferred, needs plan revision)
 - fully live runtime reconfiguration
+- OAuth follow-up polish: `plug auth complete`, localhost callback, IPC auth commands, zero-downtime reconnect
 
 ## Documentation Map
 

@@ -86,9 +86,9 @@ The remaining partial areas on `main` are transport-bounded or under-proven:
 
 ## What This Means For `docs/PLAN.md`
 
-With PR #35 merged, Stream A protocol correctness, roots forwarding, elicitation/sampling reverse-request
-forwarding, and legacy SSE upstream transport are all complete. The only major remaining roadmap item
-is OAuth 2.1 + PKCE upstream authentication.
+With PRs #35 and #36 merged, all major roadmap features are complete on `main`: Stream A protocol
+correctness, roots forwarding, elicitation/sampling reverse-request forwarding, legacy SSE upstream
+transport, and OAuth 2.1 + PKCE upstream authentication.
 
 The one nuance: “daemon continuity recovery” is broader than what the code currently proves
 (reconnect-based recovery for stdio-over-IPC clients, not full cross-transport session persistence).
@@ -97,12 +97,8 @@ The one nuance: “daemon continuity recovery” is broader than what the code c
 
 All prior “minimum code gaps” from the original audit are resolved. The remaining work is:
 
-### Major
-
-1. **OAuth 2.1 + PKCE** — upstream auth with token refresh lifecycle
-
 ### Smaller items
 
-2. Daemon IPC notification parity beyond logging
+1. Daemon IPC notification parity beyond logging
 3. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
 4. HTTP elicitation timeout (todo 045) — add bounded timeout after plan revision
