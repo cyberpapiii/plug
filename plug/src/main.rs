@@ -272,6 +272,18 @@ pub(crate) enum AuthCommands {
     },
     /// Show OAuth authentication status for all servers
     Status,
+    /// Complete an OAuth flow non-interactively with a pre-obtained code
+    Complete {
+        /// Server name from config
+        #[arg(long)]
+        server: String,
+        /// Authorization code from the OAuth callback
+        #[arg(long)]
+        code: String,
+        /// CSRF state parameter from the OAuth callback
+        #[arg(long)]
+        state: String,
+    },
     /// Clear stored OAuth credentials for a server
     Logout {
         /// Server name

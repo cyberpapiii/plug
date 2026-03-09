@@ -22,6 +22,11 @@ pub(crate) async fn cmd_auth(
         crate::AuthCommands::Login { server, no_browser } => {
             cmd_auth_login(config_path, &server, no_browser).await
         }
+        crate::AuthCommands::Complete {
+            server,
+            code,
+            state,
+        } => cmd_auth_complete(config_path, &server, &code, &state).await,
         crate::AuthCommands::Inject {
             server,
             access_token,
@@ -198,6 +203,97 @@ async fn cmd_auth_login(
     ui::print_info_line("Exchanging authorization code for token...");
     auth_manager
         .exchange_code_for_token(&code, &csrf_state)
+        .await
+        .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
+
+    ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// complete (non-interactive code exchange)
+// ---------------------------------------------------------------------------
+
+/// Non-interactive OAuth code exchange for agents that obtained an authorization
+/// code through an external mechanism (e.g. a separate browser step orchestrated
+/// by an agent). Completes the token exchange without any browser or stdin
+/// interaction.
+async fn cmd_auth_complete(
+    config_path: Option<&PathBuf>,
+    server_name: &str,
+    code: &str,
+    csrf_state: &str,
+) -> anyhow::Result<()> {
+    // 1. Load and validate config ----------------------------------------
+    let cfg = config::load_config(config_path)?;
+    let server_config = cfg
+        .servers
+        .get(server_name)
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
+
+    if server_config.auth.as_deref() != Some("oauth") {
+        anyhow::bail!(
+            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
+        );
+    }
+
+    let url = server_config
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
+
+    // 2. Build an AuthorizationManager with persistent stores ------------
+    use rmcp::transport::auth::AuthorizationManager;
+
+    let mut auth_manager = AuthorizationManager::new(url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
+
+    let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
+    let state_store = oauth::CompositeStateStore::new(server_name.to_string());
+    auth_manager.set_credential_store(cred_store);
+    auth_manager.set_state_store(state_store);
+
+    // 3. Discover metadata and configure client --------------------------
+    let metadata = auth_manager
+        .discover_metadata()
+        .await
+        .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
+    auth_manager.set_metadata(metadata);
+
+    let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
+
+    // Use the placeholder redirect URI — in the complete flow the redirect
+    // has already happened externally, so this is only needed for client
+    // configuration / registration parity.
+    let redirect_uri = "http://localhost:0/callback";
+
+    if let Some(ref client_id) = server_config.oauth_client_id {
+        let oauth_config = rmcp::transport::auth::OAuthClientConfig {
+            client_id: client_id.clone(),
+            client_secret: None,
+            scopes: scopes.clone(),
+            redirect_uri: redirect_uri.to_string(),
+        };
+        auth_manager
+            .configure_client(oauth_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
+    } else {
+        let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+        let reg_config = auth_manager
+            .register_client("plug", redirect_uri, &scope_refs)
+            .await
+            .map_err(|e| anyhow::anyhow!("client registration failed: {e}"))?;
+        auth_manager
+            .configure_client(reg_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure registered client: {e}"))?;
+    }
+
+    // 4. Exchange code for token -----------------------------------------
+    ui::print_info_line("Exchanging authorization code for token...");
+    auth_manager
+        .exchange_code_for_token(code, csrf_state)
         .await
         .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
 
