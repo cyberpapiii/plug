@@ -15,6 +15,7 @@ pub mod http;
 pub mod import;
 pub mod ipc;
 pub mod notifications;
+pub mod oauth;
 pub mod proxy;
 pub mod reload;
 pub mod server;
