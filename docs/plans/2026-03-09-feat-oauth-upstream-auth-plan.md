@@ -1,7 +1,7 @@
 ---
 title: "feat: OAuth 2.1 + PKCE upstream authentication with token refresh lifecycle"
 type: feat
-status: active
+status: in-review
 date: 2026-03-09
 deepened: 2026-03-09
 ---
@@ -209,9 +209,9 @@ impl ServerHealth {
 This is a mechanical refactor (~6 call sites in server/mod.rs) that eliminates an entire class of
 integration bugs. Ship as a separate PR before OAuth.
 
-- [ ] Add `ServerHealth::is_routable()` method
-- [ ] Replace all `!= Failed` predicates with `.is_routable()`
-- [ ] Verify all routing methods use `is_routable()`
+- [x] Add `ServerHealth::is_routable()` method
+- [x] Replace all `!= Failed` predicates with `.is_routable()`
+- [x] Verify all routing methods use `is_routable()`
 
 #### Prerequisite 2: Fix `server_config_changed()` for `auth_token`
 
@@ -224,8 +224,8 @@ nothing — the old token is used until manual restart.
 
 This is a pre-existing bug that predates the OAuth plan.
 
-- [ ] Add `auth_token` to `server_config_changed()` comparison
-- [ ] Ship as part of prerequisite PR or standalone fix
+- [x] Add `auth_token` to `server_config_changed()` comparison
+- [x] Ship as part of prerequisite PR or standalone fix
 
 ### Dependencies
 
@@ -325,21 +325,21 @@ fn sanitize_server_name_for_path(name: &str) -> Result<&str, ConfigError> {
 }
 ```
 
-- [ ] Implement `sanitize_server_name_for_path()` in config validation
-- [ ] Call it from `validate_config()` for ALL server names (benefits the whole system, not just OAuth)
-- [ ] Verify final token file path is within the `tokens/` directory after construction
+- [x] Implement `sanitize_server_name_for_path()` in config validation
+- [x] Call it from `validate_config()` for ALL server names (benefits the whole system, not just OAuth)
+- [x] Verify final token file path is within the `tokens/` directory after construction
 
 #### Auth Module
 
 Create `plug-core/src/oauth.rs`:
 
-- [ ] `CompositeCredentialStore` implementing rmcp's `CredentialStore` trait
+- [x] `CompositeCredentialStore` implementing rmcp's `CredentialStore` trait
   - Primary: OS keyring via `keyring` crate (service `"plug"`, account `"oauth:{server_name}"`)
   - Fallback: JSON file at `~/.config/plug/tokens/{server_name}.json` with 0600 permissions
   - On keyring read failure, silently fall back to file
   - Write order: try keyring first, then file. No cross-synchronization needed (simplicity reviewer:
     stale file with old token is harmless — fresh keyring token wins on read)
-- [ ] In-memory cache: `ArcSwap<Option<CachedCredentials>>` per server
+- [x] In-memory cache: `ArcSwap<Option<CachedCredentials>>` per server
   - Populated on first read from keyring/file
   - Invalidated on write (refresh) and logout
   - Used by refresh-check loop (pure timestamp comparison, no I/O)
@@ -352,13 +352,13 @@ Create `plug-core/src/oauth.rs`:
     reuse across refresh cycles (avoid rediscovery on every reconnect)
   - If dynamic registration is used, persist the assigned `client_id` in the credential store
     alongside tokens (prevents re-registration on every login — Security finding #10)
-- [ ] `current_access_token(server_name) -> Result<Option<String>>` — resolve from in-memory cache
+- [x] `current_access_token(server_name) -> Result<Option<String>>` — resolve from in-memory cache
 - [ ] `refresh_if_due(auth_manager, server_name) -> Result<bool>` — proactive refresh
   - Check cached `token_received_at` + `expires_in` against current time
   - If within refresh window: attempt refresh, return `true`
   - If not due: return `false`
   - On terminal failure (revoked token): return error
-- [ ] `token_needs_refresh(stored: &StoredCredentials, window_secs: u64) -> bool` — pure function
+- [x] `token_needs_refresh(stored: &StoredCredentials, window_secs: u64) -> bool` — pure function
 
 > **Simplification applied:** Dropped `KeyringBackend` trait abstraction. The keyring crate's API
 > is already an abstraction boundary. Test the file fallback path directly — that IS the testable
@@ -398,11 +398,11 @@ Create `plug-core/src/oauth.rs`:
 
 `plug-core/src/config/mod.rs` — extend `validate_config()`:
 
-- [ ] Reject `auth = "oauth"` + `auth_token` present simultaneously
-- [ ] Reject `auth = "oauth"` on `transport = "stdio"` servers
-- [ ] Validate server names with `sanitize_server_name_for_path()`
-- [ ] Support `$ENV_VAR` expansion on OAuth config fields
-- [ ] Ensure `load_raw_config()` scans new OAuth fields for `$ENV_VAR` references so daemon
+- [x] Reject `auth = "oauth"` + `auth_token` present simultaneously
+- [x] Reject `auth = "oauth"` on `transport = "stdio"` servers
+- [x] Validate server names with `sanitize_server_name_for_path()`
+- [x] Support `$ENV_VAR` expansion on OAuth config fields
+- [x] Ensure `load_raw_config()` scans new OAuth fields for `$ENV_VAR` references so daemon
   auto-start forwards referenced environment variables correctly (Architecture finding)
 
 #### Dynamic Token Injection
@@ -493,25 +493,25 @@ Routing impact:
 
 #### Tasks (Phase 1)
 
-- [ ] Enable rmcp `"auth"` feature in workspace `Cargo.toml`
-- [ ] Add `keyring` dependency to `plug-core/Cargo.toml`
-- [ ] Add `auth: Option<String>` and OAuth fields to `ServerConfig`
-- [ ] Implement config validation rules (including server name sanitization)
-- [ ] Add `$ENV_VAR` expansion for new OAuth fields in `load_raw_config()`
-- [ ] Create `plug-core/src/oauth.rs` with `CompositeCredentialStore`
-- [ ] Implement in-memory token cache with `ArcSwap`
+- [x] Enable rmcp `"auth"` feature in workspace `Cargo.toml`
+- [x] Add `keyring` dependency to `plug-core/Cargo.toml`
+- [x] Add `auth: Option<String>` and OAuth fields to `ServerConfig`
+- [x] Implement config validation rules (including server name sanitization)
+- [x] Add `$ENV_VAR` expansion for new OAuth fields in `load_raw_config()`
+- [x] Create `plug-core/src/oauth.rs` with `CompositeCredentialStore`
+- [x] Implement in-memory token cache with `ArcSwap`
 - [ ] Create `build_authorization_manager()` factory with per-server caching
-- [ ] Create `current_access_token()` (reads from cache) and `refresh_if_due()`
-- [ ] Add `ServerHealth::AuthRequired` variant and `is_routable()` method
-- [ ] Update all routing predicates to use `is_routable()`
-- [ ] Skip health checks for AuthRequired servers
-- [ ] Modify `start_and_register()` to resolve OAuth tokens dynamically
-- [ ] Handle `AuthorizationRequired` error → set AuthRequired state instead of Failed
-- [ ] Update capability synthesis to mask AuthRequired servers
-- [ ] Add all new fields to `server_config_changed()` comparison
-- [ ] Unit tests: file store round-trip, keyring fallback, composite store behavior
-- [ ] Unit tests: config validation (mutual exclusion, transport restriction, name sanitization)
-- [ ] Integration test: OAuth server without credentials → AuthRequired state
+- [x] Create `current_access_token()` (reads from cache) and `refresh_if_due()`
+- [x] Add `ServerHealth::AuthRequired` variant and `is_routable()` method
+- [x] Update all routing predicates to use `is_routable()`
+- [x] Skip health checks for AuthRequired servers
+- [x] Modify `start_and_register()` to resolve OAuth tokens dynamically
+- [x] Handle `AuthorizationRequired` error → set AuthRequired state instead of Failed
+- [x] Update capability synthesis to mask AuthRequired servers
+- [x] Add all new fields to `server_config_changed()` comparison
+- [x] Unit tests: file store round-trip, keyring fallback, composite store behavior
+- [x] Unit tests: config validation (mutual exclusion, transport restriction, name sanitization)
+- [x] Integration test: OAuth server without credentials → AuthRequired state
 - [ ] Integration test: OAuth server with valid credentials → Healthy + tools work
 
 ### Phase 2: Background Refresh Loop
@@ -600,14 +600,14 @@ Key properties:
 
 #### Tasks (Phase 2)
 
-- [ ] Implement per-server refresh loop with computed-sleep in engine startup
-- [ ] Spawn via `tracker.spawn()` with `CancellationToken` for clean shutdown
+- [x] Implement per-server refresh loop with computed-sleep in engine startup
+- [x] Spawn via `tracker.spawn()` with `CancellationToken` for clean shutdown
 - [ ] Implement zero-downtime reconnect (pre-create transport, then swap)
-- [ ] Use `fs2::FileExt::lock_exclusive()` for cross-process credential write serialization
-- [ ] Handle refresh failure → AuthRequired transition (break loop)
-- [ ] Handle short-lived tokens: adapt refresh window when `expires_in < 600`
-- [ ] Log refresh outcomes at appropriate levels (info for refresh, warn for failure)
-- [ ] Unit test: `token_needs_refresh` pure function with various expiry scenarios
+- [x] Use `fs2::FileExt::lock_exclusive()` for cross-process credential write serialization
+- [x] Handle refresh failure → AuthRequired transition (break loop)
+- [x] Handle short-lived tokens: adapt refresh window when `expires_in < 600`
+- [x] Log refresh outcomes at appropriate levels (info for refresh, warn for failure)
+- [x] Unit test: `token_needs_refresh` pure function with various expiry scenarios
 - [ ] Unit test: computed sleep calculation
 - [ ] Integration test: token refresh triggers zero-downtime reconnect
 
@@ -726,16 +726,16 @@ Direct token injection for agents, CI/CD, and service accounts with pre-obtained
 
 #### Tasks (Phase 3)
 
-- [ ] Create `plug/src/commands/auth.rs` with login/complete/inject/status/logout subcommands
-- [ ] Register `Auth` command variant in `plug/src/main.rs`
+- [x] Create `plug/src/commands/auth.rs` with login/complete/inject/status/logout subcommands
+- [x] Register `Auth` command variant in `plug/src/main.rs`
 - [ ] Implement browser-based PKCE flow with hardened localhost callback
-- [ ] Implement `--no-browser` manual URL flow
+- [x] Implement `--no-browser` manual URL flow
 - [ ] Implement `plug auth complete` for non-interactive code exchange
-- [ ] Implement `plug auth inject` for direct token injection (including stdin support)
+- [x] Implement `plug auth inject` for direct token injection (including stdin support)
 - [ ] Implement CSRF state with CSPRNG, 256-bit entropy, constant-time comparison
-- [ ] Implement status display (text + JSON output with documented schema)
-- [ ] Implement logout with credential clearing + cache invalidation
-- [ ] Ensure authorization URLs are NEVER logged via tracing
+- [x] Implement status display (text + JSON output with documented schema)
+- [x] Implement logout with credential clearing + cache invalidation
+- [x] Ensure authorization URLs are NEVER logged via tracing
 - [ ] Integration test: full login flow with mock OAuth provider (Axum-based)
 - [ ] Test: `--no-browser` flow
 - [ ] Test: `plug auth inject` with access + refresh token
@@ -749,10 +749,10 @@ Direct token injection for agents, CI/CD, and service accounts with pre-obtained
 
 `plug-core/src/doctor.rs` — add new checks:
 
-- [ ] `check_oauth_config`: Validate OAuth config fields are coherent
+- [x] `check_oauth_config`: Validate OAuth config fields are coherent
   - Warn if `auth = "oauth"` but no scopes configured
   - Error if `auth = "oauth"` + `auth_token` both present
-- [ ] `check_oauth_tokens`: Check token status per OAuth server
+- [x] `check_oauth_tokens`: Check token status per OAuth server
   - Pass if valid credentials exist in store
   - Warn if credentials exist but token is expired (refresh may fix)
   - Warn if no credentials found (needs `plug auth login`)
@@ -772,19 +772,19 @@ Add IPC variants for daemon-connected agents:
 
 #### Error Messages
 
-- [ ] AuthRequired servers show actionable message: `"Run \`plug auth login --server {name}\` to authenticate"`
+- [x] AuthRequired servers show actionable message: `"Run \`plug auth login --server {name}\` to authenticate"`
 - [ ] 401 errors during operation include context: `"OAuth token expired or revoked for {server}"`
 - [ ] Discovery failures include the URLs attempted
-- [ ] All error messages are machine-parseable when `--output json` is used
+- [x] All error messages are machine-parseable when `--output json` is used
 
 #### Tasks (Phase 4)
 
-- [ ] Add doctor checks for OAuth config, token status, and file fallback warning
+- [x] Add doctor checks for OAuth config, token status, and file fallback warning
 - [ ] Add IPC variants for `AuthStatus` and `InjectToken`
 - [ ] Add `AuthStateChanged` push notification for IPC clients
-- [ ] Polish error messages for actionable guidance (human + machine)
-- [ ] Update `plug servers` view to show AuthRequired status clearly
-- [ ] Run full test suite: `cargo test`, `cargo clippy`, `cargo fmt`
+- [x] Polish error messages for actionable guidance (human + machine)
+- [x] Update `plug servers` view to show AuthRequired status clearly
+- [x] Run full test suite: `cargo test`, `cargo clippy`, `cargo fmt`
 
 > **Simplification applied:** Deferred import/export OAuth awareness. The existing import system
 > copies TOML fields verbatim, which handles the happy path. No AI client today exports OAuth-
@@ -819,16 +819,16 @@ timeout, and enabled. It does NOT compare auth settings today. When a user chang
 `auth_token` to `auth = "oauth"` (or vice versa), the reload system must detect this change and
 trigger a server restart with the new auth mode.
 
-- [ ] Add `auth`, `oauth_client_id`, `oauth_scopes` to `server_config_changed()` comparison
-- [ ] Also add `auth_token` (pre-existing bug — prerequisite fix)
+- [x] Add `auth`, `oauth_client_id`, `oauth_scopes` to `server_config_changed()` comparison
+- [x] Also add `auth_token` (pre-existing bug — prerequisite fix)
 
 ### Health Check vs. AuthRequired
 
 The health check probes with `list_tools()`. An AuthRequired server has no valid credentials, so
 probing is pointless and would fail with 401.
 
-- [ ] Skip health checks entirely for AuthRequired servers (check at top of health loop)
-- [ ] This is simpler than trying to classify 401 errors inside the health probe (Architecture
+- [x] Skip health checks entirely for AuthRequired servers (check at top of health loop)
+- [x] This is simpler than trying to classify 401 errors inside the health probe (Architecture
   finding #2)
 
 ### tools/list_changed on AuthRequired Transition
@@ -1026,42 +1026,42 @@ refresh loop (per server, tracked via TaskTracker)
 
 ### Functional Requirements
 
-- [ ] `plug auth login --server <name>` completes browser-based OAuth flow and stores credentials
-- [ ] `plug auth login --server <name> --no-browser` works with manual URL copy-paste
+- [x] `plug auth login --server <name>` completes browser-based OAuth flow and stores credentials
+- [x] `plug auth login --server <name> --no-browser` works with manual URL copy-paste
 - [ ] `plug auth complete --server <name> --code <CODE> --state <STATE>` exchanges code non-interactively
-- [ ] `plug auth inject --server <name>` writes pre-obtained tokens to credential store
-- [ ] `plug auth status` shows per-server auth status (text + JSON output)
-- [ ] `plug auth logout --server <name>` clears credentials from all stores
-- [ ] OAuth servers with valid credentials connect and route tools transparently
-- [ ] OAuth servers without credentials enter AuthRequired state (not Failed)
-- [ ] Background refresh proactively renews tokens before expiry with zero-downtime reconnect
-- [ ] Refresh failure transitions server to AuthRequired and exits refresh loop
+- [x] `plug auth inject --server <name>` writes pre-obtained tokens to credential store
+- [x] `plug auth status` shows per-server auth status (text + JSON output)
+- [x] `plug auth logout --server <name>` clears credentials from all stores
+- [x] OAuth servers with valid credentials connect and route tools transparently
+- [x] OAuth servers without credentials enter AuthRequired state (not Failed)
+- [x] Background refresh proactively renews tokens before expiry with zero-downtime reconnect
+- [x] Refresh failure transitions server to AuthRequired and exits refresh loop
 - [ ] Re-login after AuthRequired recovers server to Healthy and spawns new refresh loop
-- [ ] `plug doctor` validates OAuth config, token status, and file fallback warnings
+- [x] `plug doctor` validates OAuth config, token status, and file fallback warnings
 - [ ] `AuthStatus` and `InjectToken` IPC commands work for daemon-connected agents
 
 ### Non-Functional Requirements
 
-- [ ] Tokens stored in OS keyring when available, file fallback with 0600 permissions
+- [x] Tokens stored in OS keyring when available, file fallback with 0600 permissions
 - [ ] No token values in logs (SecretString wrapping from moment of receipt)
-- [ ] No authorization URLs in tracing (only printed to stdout for `--no-browser`)
+- [x] No authorization URLs in tracing (only printed to stdout for `--no-browser`)
 - [ ] PKCE S256 mandatory (refuse to proceed without `code_challenge_methods_supported`)
 - [ ] RFC 8707 resource parameter included in all authorization and token requests
-- [ ] No blocking on tool-call path (refresh is background, not synchronous)
+- [x] No blocking on tool-call path (refresh is background, not synchronous)
 - [ ] CSRF state: CSPRNG, 256-bit entropy, constant-time comparison, one-time use
-- [ ] Server names sanitized for filesystem safety before token path construction
-- [ ] Cross-process credential writes serialized via fs2 file locking
+- [x] Server names sanitized for filesystem safety before token path construction
+- [x] Cross-process credential writes serialized via fs2 file locking
 
 ### Quality Gates
 
-- [ ] All existing tests pass (`cargo test`)
-- [ ] Clippy clean (`cargo clippy --all-targets --all-features -- -D warnings`)
-- [ ] Format clean (`cargo fmt --check`)
+- [x] All existing tests pass (`cargo test`)
+- [x] Clippy clean (`cargo clippy --all-targets --all-features -- -D warnings`)
+- [x] Format clean (`cargo fmt --check`)
 - [ ] Integration test with mock OAuth provider passes
 - [ ] Token refresh integration test with zero-downtime reconnect passes
-- [ ] AuthRequired state machine test passes
+- [x] AuthRequired state machine test passes
 - [ ] PKCE S256 enforcement test passes
-- [ ] Server name sanitization test passes (path traversal attempts rejected)
+- [x] Server name sanitization test passes (path traversal attempts rejected)
 
 ## Dependencies & Prerequisites
 
