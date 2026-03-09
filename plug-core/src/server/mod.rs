@@ -670,7 +670,7 @@ impl ServerManager {
             let health_ok = self
                 .health
                 .get(server_name)
-                .map(|h| h.health != ServerHealth::Failed)
+                .map(|h| h.health.is_routable())
                 .unwrap_or(true);
             if health_ok {
                 let tools = upstream.tools.load();
@@ -690,7 +690,7 @@ impl ServerManager {
                 let health_ok = self
                     .health
                     .get(server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true);
                 (health_ok && upstream.capabilities.resources.is_some())
                     .then(|| (server_name.clone(), Arc::clone(upstream)))
@@ -732,7 +732,7 @@ impl ServerManager {
                 let health_ok = self
                     .health
                     .get(server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true);
                 (health_ok && upstream.capabilities.resources.is_some())
                     .then(|| (server_name.clone(), Arc::clone(upstream)))
@@ -774,7 +774,7 @@ impl ServerManager {
                 let health_ok = self
                     .health
                     .get(server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true);
                 (health_ok && upstream.capabilities.prompts.is_some())
                     .then(|| (server_name.clone(), Arc::clone(upstream)))
@@ -815,7 +815,7 @@ impl ServerManager {
             .filter(|(server_name, _)| {
                 self.health
                     .get(*server_name)
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true)
             })
             .map(|(_, upstream)| upstream.capabilities.clone())
@@ -837,7 +837,7 @@ impl ServerManager {
             .filter(|(name, _)| {
                 self.health
                     .get(name.as_str())
-                    .map(|h| h.health != ServerHealth::Failed)
+                    .map(|h| h.health.is_routable())
                     .unwrap_or(true)
             })
             .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
