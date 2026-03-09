@@ -52,6 +52,10 @@ subtle.workspace = true
 hex.workspace = true
 serde_yml.workspace = true
 
+# OAuth token storage
+keyring.workspace = true
+fs2.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
