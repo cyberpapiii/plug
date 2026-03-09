@@ -531,23 +531,97 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                     continue;
                 }
 
-                tracing::info!(server = %server_name, "token refresh due, attempting refresh via reconnect");
+                tracing::info!(server = %server_name, "token refresh due, attempting OAuth token refresh");
 
-                // Attempt refresh via reconnect. The reconnect flow calls
-                // start_server() which resolves the fresh OAuth token from
-                // the credential store (via get_access_token() which
-                // auto-refreshes). The reconnect replaces the transport
-                // with a fresh one using the new token.
+                // --- Step 1: Refresh the OAuth token at the token endpoint ---
+                //
+                // Load the server config to get the URL and client_id.
+                let (server_url, oauth_client_id) = {
+                    let cfg = engine.config();
+                    match cfg.servers.get(server_name) {
+                        Some(sc) => (
+                            sc.url.clone(),
+                            sc.oauth_client_id.clone(),
+                        ),
+                        None => {
+                            tracing::warn!(server = %server_name, "server config not found, exiting refresh loop");
+                            break;
+                        }
+                    }
+                };
+
+                let url = match server_url {
+                    Some(ref u) => u.as_str(),
+                    None => {
+                        tracing::warn!(server = %server_name, "no server URL, cannot refresh token");
+                        break;
+                    }
+                };
+
+                let result = oauth::refresh_access_token(
+                    server_name,
+                    url,
+                    oauth_client_id.as_deref(),
+                )
+                .await;
+
+                match result {
+                    oauth::RefreshResult::Refreshed => {
+                        tracing::info!(server = %server_name, "OAuth token refreshed, reconnecting with fresh token");
+                    }
+                    oauth::RefreshResult::InjectedToken => {
+                        // Injected tokens cannot be refreshed via OAuth.
+                        // They rely on external re-injection via InjectToken IPC.
+                        tracing::info!(
+                            server = %server_name,
+                            "injected token — cannot refresh via OAuth, skipping"
+                        );
+                        next_check = Duration::from_secs(30);
+                        continue;
+                    }
+                    oauth::RefreshResult::NoRefreshToken => {
+                        tracing::warn!(
+                            server = %server_name,
+                            "no refresh_token available, cannot refresh"
+                        );
+                        mark_auth_required(engine, server_name).await;
+                        break;
+                    }
+                    oauth::RefreshResult::NoCredentials => {
+                        tracing::warn!(
+                            server = %server_name,
+                            "no stored credentials, marking AuthRequired"
+                        );
+                        mark_auth_required(engine, server_name).await;
+                        break;
+                    }
+                    oauth::RefreshResult::AuthError(e) => {
+                        tracing::warn!(
+                            server = %server_name,
+                            error = %e,
+                            "token refresh rejected by authorization server, marking AuthRequired"
+                        );
+                        mark_auth_required(engine, server_name).await;
+                        break;
+                    }
+                    oauth::RefreshResult::TransientError(e) => {
+                        tracing::warn!(
+                            server = %server_name,
+                            error = %e,
+                            "token refresh failed (transient), retrying in 30s"
+                        );
+                        next_check = Duration::from_secs(30);
+                        continue;
+                    }
+                }
+
+                // --- Step 2: Reconnect with the fresh token ---
                 match engine.reconnect_server(server_name).await {
                     Ok(()) => {
-                        tracing::info!(server = %server_name, "token refresh + reconnect succeeded");
+                        tracing::info!(server = %server_name, "zero-downtime token refresh + reconnect succeeded");
                         next_check = Duration::from_secs(30);
                     }
                     Err(e) => {
-                        // Check for auth-related failures using both the error
-                        // chain and known error message patterns. This covers
-                        // rmcp AuthError variants and anyhow-wrapped messages
-                        // from start_and_register().
                         let err_str = format!("{e:#}").to_lowercase();
                         let is_auth_failure = err_str.contains("authorization required")
                             || err_str.contains("oauth authorization required")
@@ -558,29 +632,15 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                         if is_auth_failure {
                             tracing::warn!(
                                 server = %server_name,
-                                "refresh failed (authorization required), marking AuthRequired"
+                                "reconnect with fresh token failed (auth error), marking AuthRequired"
                             );
-                            engine.server_manager().mark_auth_required(server_name);
-                            // Refresh tools so downstream clients see the change
-                            engine.tool_router().refresh_tools().await;
-                            let _ = engine.event_sender().send(EngineEvent::ServerHealthChanged {
-                                server_id: Arc::from(server_name),
-                                old: ServerHealth::Healthy,
-                                new: ServerHealth::AuthRequired,
-                            });
-                            // Notify IPC clients of the auth state change
-                            engine.tool_router().publish_protocol_notification(
-                                crate::notifications::ProtocolNotification::AuthStateChanged {
-                                    server_id: Arc::from(server_name),
-                                    new_state: ServerHealth::AuthRequired,
-                                },
-                            );
-                            break; // Exit loop — AuthRequired is sticky
+                            mark_auth_required(engine, server_name).await;
+                            break;
                         }
                         tracing::warn!(
                             server = %server_name,
                             error = %e,
-                            "token refresh check failed, retrying in 30s"
+                            "reconnect after token refresh failed, retrying in 30s"
                         );
                         next_check = Duration::from_secs(30);
                     }
@@ -588,6 +648,28 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
             }
         }
     }
+}
+
+/// Mark a server as `AuthRequired` and broadcast the state change.
+///
+/// Used by `run_refresh_loop` when the token cannot be refreshed (revoked,
+/// missing refresh_token, etc.).
+async fn mark_auth_required(engine: &Engine, server_name: &str) {
+    engine.server_manager().mark_auth_required(server_name);
+    engine.tool_router().refresh_tools().await;
+    let _ = engine
+        .event_sender()
+        .send(EngineEvent::ServerHealthChanged {
+            server_id: Arc::from(server_name),
+            old: ServerHealth::Healthy,
+            new: ServerHealth::AuthRequired,
+        });
+    engine.tool_router().publish_protocol_notification(
+        crate::notifications::ProtocolNotification::AuthStateChanged {
+            server_id: Arc::from(server_name),
+            new_state: ServerHealth::AuthRequired,
+        },
+    );
 }
 
 fn is_retryable_reconnect_error(error: &anyhow::Error) -> bool {
