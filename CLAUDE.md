@@ -47,7 +47,7 @@ Implemented today:
 Still incomplete:
 
 - fully live runtime reconfiguration
-- OAuth follow-up polish: `plug auth complete`, localhost callback, IPC auth commands, zero-downtime reconnect
+- OAuth follow-up polish: `plug auth complete`, IPC auth commands, zero-downtime reconnect
 
 ## Documentation Map
 
