@@ -100,5 +100,4 @@ All prior “minimum code gaps” from the original audit are resolved. The rema
 ### Smaller items
 
 1. Daemon IPC notification parity beyond logging
-3. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through
-4. HTTP elicitation timeout (todo 045) — add bounded timeout after plan revision
+2. Dedicated end-to-end tests for `structuredContent` and `resource_link` pass-through

@@ -48,7 +48,6 @@ Still incomplete:
 
 - daemon IPC notification parity beyond logging
 - dedicated end-to-end tests for `structuredContent` and `resource_link`
-- HTTP elicitation timeout (todo 045 — deferred, needs plan revision)
 - fully live runtime reconfiguration
 - OAuth follow-up polish: `plug auth complete`, localhost callback, IPC auth commands, zero-downtime reconnect
 
