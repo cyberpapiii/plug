@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `452df6e` (post-merge truth pass for PR #39 localhost OAuth callback listener)
+Baseline: `main` @ `6418405` (post-merge truth pass for PR #40 plug auth complete)
 
 This is the canonical current-state doc for the project.
 
@@ -33,11 +33,12 @@ Implemented on `main`:
 - OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, and doctor checks (PR #36)
 - daemon IPC notification parity: progress, cancelled, and list_changed push forwarding (PR #38); resource subscribe remains unsupported over IPC
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
+- `plug auth complete` for non-interactive OAuth code exchange (PR #40)
 
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- OAuth follow-up items: `plug auth complete` (non-interactive code exchange), IPC auth commands, zero-downtime reconnect, mock OAuth integration tests
+- OAuth follow-up items: IPC auth commands, zero-downtime reconnect, mock OAuth integration tests
 
 ## What Exists Off-Main
 

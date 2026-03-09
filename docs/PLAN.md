@@ -47,7 +47,6 @@ All major roadmap features are now implemented on `main`. The remaining work is 
 
 ### OAuth follow-up polish
 
-- `plug auth complete` command for non-interactive code exchange (agent-native)
 - IPC auth commands (`AuthStatus`, `InjectToken`, `AuthStateChanged` push notification)
 - zero-downtime reconnect on token refresh (pre-create transport before swap)
 - mock OAuth provider integration tests
