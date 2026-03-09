@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -23,17 +27,21 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest       # ARM (Apple Silicon)
-          - os: ubuntu-latest      # x86_64 Linux
-          # Windows disabled — daemon uses Unix sockets (future: named pipes)
-          # - os: windows-latest
+  test-linux:
+    name: Test (ubuntu)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  test-macos:
+    name: Test (macos)
+    needs: check
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,6 +50,8 @@ jobs:
 
   cross-check:
     name: Cross-check (${{ matrix.target }})
+    needs: check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -63,6 +73,8 @@ jobs:
 
   binary-size:
     name: Binary size gate
+    needs: check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +92,7 @@ jobs:
 
   deny:
     name: cargo deny
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
