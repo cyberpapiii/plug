@@ -393,21 +393,50 @@ async fn await_oauth_callback(
     listener: tokio::net::TcpListener,
     timeout: Duration,
 ) -> anyhow::Result<(String, String)> {
+    // Wrap the entire accept + read + respond cycle in the timeout so a
+    // slow or malicious connection cannot hang the CLI indefinitely.
+    tokio::time::timeout(timeout, await_oauth_callback_inner(listener))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for OAuth callback ({}s)",
+                timeout.as_secs()
+            )
+        })?
+}
+
+async fn await_oauth_callback_inner(
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<(String, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut stream, _addr) = tokio::time::timeout(timeout, listener.accept())
+    let (mut stream, _addr) = listener
+        .accept()
         .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for OAuth callback (120s)"))?
         .map_err(|e| anyhow::anyhow!("failed to accept callback connection: {e}"))?;
 
-    // Read the HTTP request. The callback is a simple browser GET, so a
-    // small buffer is plenty.
+    // Read the HTTP request in a loop until we see the end-of-headers
+    // marker (\r\n\r\n). A single read() is not guaranteed to return the
+    // full request on a TCP stream.
     let mut buf = vec![0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read callback request: {e}"))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let mut total = 0;
+    loop {
+        let n = stream
+            .read(&mut buf[total..])
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read callback request: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if total >= buf.len() {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&buf[..total]);
 
     // Parse the request line: "GET /callback?code=...&state=... HTTP/1.1"
     let request_line = request.lines().next().unwrap_or("");
@@ -417,8 +446,8 @@ async fn await_oauth_callback(
         .unwrap_or("")
         .to_string();
 
-    // Extract query parameters. Simple parser — OAuth callback query strings
-    // contain only ASCII keys/values so percent-decoding is not needed here.
+    // Extract query parameters. OAuth code/state values are opaque ASCII
+    // tokens that do not require percent-decoding.
     let query = path.split('?').nth(1).unwrap_or("");
     let params: std::collections::HashMap<&str, &str> = query
         .split('&')
@@ -431,12 +460,14 @@ async fn await_oauth_callback(
             .get("error_description")
             .map(|d| format!(": {d}"))
             .unwrap_or_default();
+        let escaped_err = html_escape(err);
+        let escaped_desc = html_escape(&desc);
         let error_html = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
              Connection: close\r\n\r\n\
              <html><body><h2>Authentication failed</h2>\
-             <p>{err}{desc}</p>\
+             <p>{escaped_err}{escaped_desc}</p>\
              <p>You can close this tab.</p></body></html>"
         );
         let _ = stream.write_all(error_html.as_bytes()).await;
@@ -465,6 +496,15 @@ async fn await_oauth_callback(
     let _ = stream.shutdown().await;
 
     Ok((code, state))
+}
+
+/// Minimal HTML escaping for values interpolated into HTML responses.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 // ---------------------------------------------------------------------------
