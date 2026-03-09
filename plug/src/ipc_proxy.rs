@@ -168,7 +168,8 @@ impl IpcProxyHandler {
                         | IpcResponse::ResourceListChangedNotification
                         | IpcResponse::PromptListChangedNotification
                         | IpcResponse::ProgressNotification { .. }
-                        | IpcResponse::CancelledNotification { .. }) => {
+                        | IpcResponse::CancelledNotification { .. }
+                        | IpcResponse::AuthStateChanged { .. }) => {
                             forward_control_notification(peer, resp).await;
                             continue;
                         }
@@ -217,7 +218,8 @@ impl IpcProxyHandler {
                 | IpcResponse::ResourceListChangedNotification
                 | IpcResponse::PromptListChangedNotification
                 | IpcResponse::ProgressNotification { .. }
-                | IpcResponse::CancelledNotification { .. }) => {
+                | IpcResponse::CancelledNotification { .. }
+                | IpcResponse::AuthStateChanged { .. }) => {
                     forward_control_notification(peer, resp).await;
                     continue;
                 }
@@ -397,6 +399,15 @@ async fn forward_control_notification(peer: Option<&Peer<RoleServer>>, response:
             if let Ok(notif_params) = serde_json::from_value::<CancelledNotificationParam>(params) {
                 let _ = peer.notify_cancelled(notif_params).await;
             }
+        }
+        IpcResponse::AuthStateChanged {
+            ref server_id,
+            ref state,
+        } => {
+            // AuthStateChanged is a plug-internal notification with no MCP wire
+            // equivalent. Log it for observability but there's nothing to forward
+            // to the downstream MCP peer.
+            tracing::info!(server = %server_id, state = ?state, "auth state changed (IPC push)");
         }
         _ => {} // not a control notification
     }

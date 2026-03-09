@@ -32,6 +32,10 @@ pub enum ProtocolNotification {
     LoggingMessage {
         params: LoggingMessageNotificationParam,
     },
+    AuthStateChanged {
+        server_id: Arc<str>,
+        new_state: crate::types::ServerHealth,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -75,6 +79,18 @@ impl ProtocolNotification {
             ProtocolNotification::LoggingMessage { params } => {
                 ServerJsonRpcMessage::notification(ServerNotification::LoggingMessageNotification(
                     LoggingMessageNotification::new(params.clone()),
+                ))
+            }
+            ProtocolNotification::AuthStateChanged { .. } => {
+                // AuthStateChanged is a plug-internal notification only delivered
+                // over IPC push; it has no MCP wire equivalent. Emit a synthetic
+                // logging message for any code path that calls this generically.
+                ServerJsonRpcMessage::notification(ServerNotification::LoggingMessageNotification(
+                    LoggingMessageNotification::new(LoggingMessageNotificationParam {
+                        level: rmcp::model::LoggingLevel::Warning,
+                        logger: Some("plug".into()),
+                        data: serde_json::json!("auth state changed (internal)"),
+                    }),
                 ))
             }
         }

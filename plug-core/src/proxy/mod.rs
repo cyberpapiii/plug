@@ -2835,6 +2835,9 @@ impl ServerHandler for ProxyHandler {
                             Ok(ProtocolNotification::LoggingMessage { .. }) => {
                                 // Logging is handled by the dedicated logging fan-out task below
                             }
+                            Ok(ProtocolNotification::AuthStateChanged { .. }) => {
+                                // AuthStateChanged is IPC-only; direct stdio clients don't need it
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "stdio notification fan-out lagged");
                             }
