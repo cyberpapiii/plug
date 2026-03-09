@@ -28,6 +28,7 @@ use rmcp::transport::streamable_http_client::{
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
 use crate::proxy::ToolRouter;
+use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{HealthState, ServerHealth, ServerStatus};
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
@@ -523,41 +524,27 @@ impl ServerManager {
                         router: tool_router.clone(),
                     });
 
-                    let client: McpClient = handler.serve(transport).await.map_err(|e| {
-                        anyhow::anyhow!("failed to connect to HTTP upstream: {e}")
-                    })?;
-
-                    let tools_result = client
-                        .peer()
-                        .list_all_tools()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
-                    tools.store(Arc::new(tools_result));
-
-                    let server_info = client.peer().peer_info();
-                    if let Some(info) = server_info {
-                        tracing::info!(
-                            server = %name,
-                            server_name = %info.server_info.name,
-                            server_version = %info.server_info.version,
-                            "connected to HTTP upstream"
-                        );
+                    match handler.serve(transport).await {
+                        Ok(client) => {
+                            Self::finish_upstream_connection(name, config, client, tools, "HTTP upstream").await
+                        }
+                        Err(e) => {
+                            let error = anyhow::anyhow!("failed to connect to HTTP upstream: {e}");
+                            if crate::transport::sse_client::should_fallback_http_error(&error) {
+                                tracing::info!(
+                                    server = %name,
+                                    error = %error,
+                                    "HTTP upstream looks legacy-SSE compatible; falling back"
+                                );
+                                Self::connect_sse_upstream(name, config, tool_router).await
+                            } else {
+                                Err(error)
+                            }
+                        }
                     }
-
-                    let capabilities = client
-                        .peer()
-                        .peer_info()
-                        .map(|info| info.capabilities.clone())
-                        .unwrap_or_default();
-
-                    Ok(UpstreamServer {
-                        name: name.to_string(),
-                        config: config.clone(),
-                        client,
-                        tools,
-                        capabilities,
-                        health: ServerHealth::Healthy,
-                    })
+                }
+                TransportType::Sse => {
+                    Self::connect_sse_upstream(name, config, tool_router).await
                 }
             }
         })
@@ -578,6 +565,101 @@ impl ServerManager {
                 Err(anyhow::anyhow!(msg))
             }
         }
+    }
+
+    /// Connect to a legacy SSE upstream server.
+    async fn connect_sse_upstream(
+        name: &str,
+        config: &ServerConfig,
+        tool_router: std::sync::Weak<ToolRouter>,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        crate::tls::ensure_rustls_provider_installed();
+
+        let url = config
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("SSE transport requires a URL"))?;
+
+        // SSRF protection: same rules as HTTP upstream
+        let parsed = url
+            .parse::<http::Uri>()
+            .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+        if let Some(host) = parsed.host() {
+            if is_blocked_host(host) {
+                anyhow::bail!(
+                    "URL host '{host}' is blocked — private, loopback, or metadata endpoint"
+                );
+            }
+        }
+
+        let mut transport_config = LegacySseTransportConfig::with_uri(url);
+
+        if let Some(ref token) = config.auth_token {
+            transport_config = transport_config.auth_token(token.as_str());
+        }
+
+        tracing::info!(
+            server = %name,
+            url = %url,
+            "connecting to legacy SSE upstream"
+        );
+
+        let transport = LegacySseClientTransport::from_config(transport_config);
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from(name),
+            tools: Arc::clone(&tools),
+            router: tool_router,
+        });
+
+        let client: McpClient = handler
+            .serve(transport)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to connect to legacy SSE upstream: {e}"))?;
+
+        Self::finish_upstream_connection(name, config, client, tools, "legacy SSE upstream").await
+    }
+
+    /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
+    async fn finish_upstream_connection(
+        name: &str,
+        config: &ServerConfig,
+        client: McpClient,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        transport_label: &str,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        let tools_result = client
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+        tools.store(Arc::new(tools_result));
+
+        let server_info = client.peer().peer_info();
+        if let Some(info) = server_info {
+            tracing::info!(
+                server = %name,
+                server_name = %info.server_info.name,
+                server_version = %info.server_info.version,
+                "connected to {transport_label}"
+            );
+        }
+
+        let capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+
+        Ok(UpstreamServer {
+            name: name.to_string(),
+            config: config.clone(),
+            client,
+            tools,
+            capabilities,
+            health: ServerHealth::Healthy,
+        })
     }
 
     /// Return all tools from all healthy servers, each paired with the server name.
@@ -978,9 +1060,16 @@ fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
 
     use super::*;
     use crate::config::{ServerConfig, TransportType};
@@ -988,11 +1077,13 @@ mod tests {
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
-        AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, Content,
-        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        ListToolsResult, Meta, NumberOrString, ProgressNotificationParam, ProgressToken, Prompt,
-        PromptMessage, PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
+        AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
+        ClientRequest, Content, GetPromptResult, Implementation, InitializeResult,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, Meta,
+        NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
+        PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
+        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        ServerResult, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -1802,5 +1893,329 @@ mod tests {
             .await
             .expect("get prompt");
         assert_eq!(prompt.messages.len(), 1);
+    }
+
+    // ── Legacy SSE test mock server ──────────────────────────────────────
+
+    #[derive(Clone)]
+    struct LegacySseTestAppState {
+        tools: Arc<tokio::sync::RwLock<Vec<Tool>>>,
+        tx: tokio::sync::broadcast::Sender<sse_stream::Sse>,
+        expected_auth: Option<String>,
+        reject_post_on_stream_path: bool,
+    }
+
+    #[derive(Clone)]
+    struct LegacySseTestServer {
+        state: LegacySseTestAppState,
+    }
+
+    impl LegacySseTestServer {
+        async fn spawn(
+            initial_tools: Vec<Tool>,
+            expected_auth: Option<&str>,
+            reject_post_on_stream_path: bool,
+        ) -> (Self, String) {
+            let (tx, _) = tokio::sync::broadcast::channel(32);
+            let state = LegacySseTestAppState {
+                tools: Arc::new(tokio::sync::RwLock::new(initial_tools)),
+                tx,
+                expected_auth: expected_auth.map(str::to_string),
+                reject_post_on_stream_path,
+            };
+            let app = Router::new()
+                .route("/mcp", get(legacy_sse_stream).post(legacy_sse_stream_post))
+                .route("/messages", post(legacy_sse_messages))
+                .with_state(state.clone());
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind legacy SSE test server");
+            let addr = listener.local_addr().expect("legacy SSE local addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve legacy SSE test server");
+            });
+
+            (
+                Self { state },
+                format!("http://127.0.0.1:{}/mcp", addr.port()),
+            )
+        }
+
+        async fn set_tools_and_notify(&self, tools: Vec<Tool>) {
+            *self.state.tools.write().await = tools;
+            let notification = ServerJsonRpcMessage::notification(
+                rmcp::model::ServerNotification::ToolListChangedNotification(
+                    rmcp::model::ToolListChangedNotification::default(),
+                ),
+            );
+            self.state
+                .tx
+                .send(
+                    sse_stream::Sse::default().data(
+                        serde_json::to_string(&notification).expect("serialize notification"),
+                    ),
+                )
+                .expect("broadcast tool list changed");
+        }
+    }
+
+    fn legacy_sse_authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
+        match expected {
+            None => true,
+            Some(expected) => headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == format!("Bearer {expected}")),
+        }
+    }
+
+    async fn legacy_sse_stream(
+        State(state): State<LegacySseTestAppState>,
+        headers: HeaderMap,
+    ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+        if !legacy_sse_authorized(&headers, &state.expected_auth) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+
+        let mut rx = state.tx.subscribe();
+        let stream = async_stream::stream! {
+            yield Ok(Event::default().event("endpoint").data("/messages"));
+            loop {
+                match rx.recv().await {
+                    Ok(event) => yield Ok(event_to_axum(event)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        Ok(Sse::new(stream))
+    }
+
+    async fn legacy_sse_stream_post(
+        State(state): State<LegacySseTestAppState>,
+        headers: HeaderMap,
+    ) -> StatusCode {
+        if !legacy_sse_authorized(&headers, &state.expected_auth) {
+            return StatusCode::UNAUTHORIZED;
+        }
+        if state.reject_post_on_stream_path {
+            StatusCode::METHOD_NOT_ALLOWED
+        } else {
+            StatusCode::ACCEPTED
+        }
+    }
+
+    async fn legacy_sse_messages(
+        State(state): State<LegacySseTestAppState>,
+        headers: HeaderMap,
+        Json(message): Json<ClientJsonRpcMessage>,
+    ) -> StatusCode {
+        if !legacy_sse_authorized(&headers, &state.expected_auth) {
+            return StatusCode::UNAUTHORIZED;
+        }
+
+        match message {
+            ClientJsonRpcMessage::Request(request) => match request.request {
+                ClientRequest::InitializeRequest(_) => {
+                    let mut caps = ServerCapabilities::default();
+                    caps.tools = Some(rmcp::model::ToolsCapability {
+                        list_changed: Some(true),
+                    });
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::InitializeResult(
+                            InitializeResult::new(caps)
+                                .with_server_info(Implementation::new("legacy-sse-server", "1.0")),
+                        ),
+                        request.id,
+                    );
+                    let _ =
+                        state.tx.send(sse_stream::Sse::default().data(
+                            serde_json::to_string(&response).expect("serialize init response"),
+                        ));
+                }
+                ClientRequest::ListToolsRequest(_) => {
+                    let tools = state.tools.read().await.clone();
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(tools)),
+                        request.id,
+                    );
+                    let _ =
+                        state.tx.send(sse_stream::Sse::default().data(
+                            serde_json::to_string(&response).expect("serialize tools response"),
+                        ));
+                }
+                ClientRequest::CallToolRequest(call) => {
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::CallToolResult(CallToolResult::success(vec![Content::text(
+                            format!("legacy sse called {}", call.params.name),
+                        )])),
+                        request.id,
+                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize tool call response"),
+                    ));
+                }
+                _ => {}
+            },
+            ClientJsonRpcMessage::Notification(_) => {}
+            ClientJsonRpcMessage::Response(_) => {}
+            ClientJsonRpcMessage::Error(_) => {}
+        }
+
+        StatusCode::ACCEPTED
+    }
+
+    fn event_to_axum(event: sse_stream::Sse) -> Event {
+        let mut axum_event = Event::default();
+        if let Some(kind) = event.event {
+            axum_event = axum_event.event(kind);
+        }
+        if let Some(data) = event.data {
+            axum_event = axum_event.data(data);
+        }
+        if let Some(id) = event.id {
+            axum_event = axum_event.id(id);
+        }
+        axum_event
+    }
+
+    // ── Legacy SSE integration tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn explicit_sse_upstream_connects_and_routes_tool_calls() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (_legacy_server, url) =
+            LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token"), false).await;
+
+        let mut config = test_server_config();
+        config.transport = TransportType::Sse;
+        config.command = None;
+        config.url = Some(url);
+        config.auth_token = Some(crate::types::SecretString::from("sse-token".to_string()));
+
+        server_manager
+            .start_and_register("legacy-sse", &config)
+            .await
+            .expect("start legacy SSE upstream");
+        router.refresh_tools().await;
+
+        let tool_name = router
+            .list_tools()
+            .iter()
+            .find(|tool| tool.name.ends_with("__echo"))
+            .map(|tool| tool.name.to_string())
+            .expect("legacy SSE tool should exist");
+
+        let result = router
+            .call_tool(&tool_name, None)
+            .await
+            .expect("legacy SSE tool call");
+        assert!(format!("{result:?}").contains("legacy sse called echo"));
+    }
+
+    #[tokio::test]
+    async fn http_upstream_falls_back_to_legacy_sse() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        // reject_post_on_stream_path=true → the mock returns 405 on POST to /mcp,
+        // which signals to the HTTP transport that this is a legacy SSE server.
+        // No auth here so the POST gets 405 (not 401) to trigger fallback.
+        let (_legacy_server, url) =
+            LegacySseTestServer::spawn(vec![make_tool("echo")], None, true).await;
+
+        let mut config = test_server_config();
+        config.transport = TransportType::Http;
+        config.command = None;
+        config.url = Some(url);
+
+        server_manager
+            .start_and_register("legacy-fallback", &config)
+            .await
+            .expect("fallback HTTP -> legacy SSE upstream");
+        router.refresh_tools().await;
+
+        let tool_name = router
+            .list_tools()
+            .iter()
+            .find(|tool| tool.name.ends_with("__echo"))
+            .map(|tool| tool.name.to_string())
+            .expect("fallback SSE tool should exist");
+
+        let result = router
+            .call_tool(&tool_name, None)
+            .await
+            .expect("fallback SSE tool call");
+        assert!(format!("{result:?}").contains("legacy sse called echo"));
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_tool_list_changed_reaches_downstream_stdio_client() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (legacy_server, url) =
+            LegacySseTestServer::spawn(vec![make_tool("echo")], None, false).await;
+
+        let mut config = test_server_config();
+        config.transport = TransportType::Sse;
+        config.command = None;
+        config.url = Some(url);
+
+        server_manager
+            .start_and_register("legacy-notify", &config)
+            .await
+            .expect("start legacy SSE upstream");
+        router.refresh_tools().await;
+
+        // Wire up a downstream stdio client to receive notifications.
+        let proxy_handler = ProxyHandler::from_router(router.clone());
+        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(proxy_server_transport)
+                .await
+                .expect("start proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let signal = Arc::new(Notify::new());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let _downstream_client = ToolListChangedClient {
+            signal: Arc::clone(&signal),
+            notifications: Arc::clone(&notifications),
+        }
+        .serve(downstream_transport)
+        .await
+        .expect("connect downstream client");
+
+        // Trigger a tool list changed notification from the legacy SSE server.
+        legacy_server
+            .set_tools_and_notify(vec![make_tool("echo"), make_tool("extra")])
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("downstream stdio client should receive tools/list_changed");
+
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(router.tool_count(), 2);
     }
 }

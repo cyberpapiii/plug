@@ -39,6 +39,10 @@ toml.workspace = true
 backon.workspace = true
 rand.workspace = true
 
+# Legacy SSE upstream transport
+reqwest.workspace = true
+sse-stream.workspace = true
+
 # File watching (Phase 5)
 notify.workspace = true
 notify-debouncer-mini.workspace = true
