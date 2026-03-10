@@ -49,9 +49,5 @@ All major roadmap features are now implemented on `main`. The remaining work is 
 
 ### OAuth follow-up polish
 
-- manual refresh IPC command / decision on whether it is warranted
-
-### Documentation and release hygiene
-
 - update the risk register to current remaining risks
 - reduce the research breadcrumb list to the still-open questions

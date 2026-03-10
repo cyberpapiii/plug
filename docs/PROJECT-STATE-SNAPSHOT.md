@@ -41,7 +41,6 @@ Implemented on `main`:
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- OAuth follow-up items: manual refresh IPC command / explicit decision on whether it is warranted
 
 ## What Exists Off-Main
 
