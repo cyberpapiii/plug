@@ -2834,6 +2834,9 @@ impl ServerHandler for ProxyHandler {
                             }
                             Ok(
                                 ref notification @ (ProtocolNotification::LoggingMessage { .. }
+                                | ProtocolNotification::TokenRefreshExchanged {
+                                    ..
+                                }
                                 | ProtocolNotification::AuthStateChanged {
                                     ..
                                 }),

@@ -32,6 +32,9 @@ pub enum ProtocolNotification {
     LoggingMessage {
         params: LoggingMessageNotificationParam,
     },
+    TokenRefreshExchanged {
+        server_id: Arc<str>,
+    },
     AuthStateChanged {
         server_id: Arc<str>,
         new_state: crate::types::ServerHealth,
@@ -48,6 +51,16 @@ impl ProtocolNotification {
     pub fn as_logging_message_params(&self) -> Option<LoggingMessageNotificationParam> {
         match self {
             ProtocolNotification::LoggingMessage { params } => Some(params.clone()),
+            ProtocolNotification::TokenRefreshExchanged { server_id } => {
+                Some(LoggingMessageNotificationParam {
+                    level: rmcp::model::LoggingLevel::Info,
+                    logger: Some("plug.auth".into()),
+                    data: serde_json::json!({
+                        "event": "token_refresh_exchanged",
+                        "server_id": server_id,
+                    }),
+                })
+            }
             ProtocolNotification::AuthStateChanged {
                 server_id,
                 new_state,
@@ -99,6 +112,7 @@ impl ProtocolNotification {
                 ))
             }
             ProtocolNotification::LoggingMessage { .. }
+            | ProtocolNotification::TokenRefreshExchanged { .. }
             | ProtocolNotification::AuthStateChanged { .. } => ServerJsonRpcMessage::notification(
                 ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
                     self.as_logging_message_params()
@@ -173,6 +187,42 @@ mod tests {
                 .and_then(|v| v.get("new_state"))
                 .and_then(|v| v.as_str()),
             Some("AuthRequired")
+        );
+    }
+
+    #[test]
+    fn token_refresh_exchanged_serializes_as_structured_logging_message() {
+        let value = ProtocolNotification::TokenRefreshExchanged {
+            server_id: Arc::from("github"),
+        }
+        .to_json_value();
+
+        assert_eq!(
+            value.get("method").and_then(|v| v.as_str()),
+            Some("notifications/message")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("logger"))
+                .and_then(|v| v.as_str()),
+            Some("plug.auth")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("data"))
+                .and_then(|v| v.get("event"))
+                .and_then(|v| v.as_str()),
+            Some("token_refresh_exchanged")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("data"))
+                .and_then(|v| v.get("server_id"))
+                .and_then(|v| v.as_str()),
+            Some("github")
         );
     }
 }
