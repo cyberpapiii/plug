@@ -32,7 +32,7 @@ pub enum ProtocolNotification {
     LoggingMessage {
         params: LoggingMessageNotificationParam,
     },
-    TokenRefreshSucceeded {
+    TokenRefreshExchanged {
         server_id: Arc<str>,
     },
     AuthStateChanged {
@@ -51,12 +51,12 @@ impl ProtocolNotification {
     pub fn as_logging_message_params(&self) -> Option<LoggingMessageNotificationParam> {
         match self {
             ProtocolNotification::LoggingMessage { params } => Some(params.clone()),
-            ProtocolNotification::TokenRefreshSucceeded { server_id } => {
+            ProtocolNotification::TokenRefreshExchanged { server_id } => {
                 Some(LoggingMessageNotificationParam {
                     level: rmcp::model::LoggingLevel::Info,
                     logger: Some("plug.auth".into()),
                     data: serde_json::json!({
-                        "event": "token_refresh_succeeded",
+                        "event": "token_refresh_exchanged",
                         "server_id": server_id,
                     }),
                 })
@@ -112,7 +112,7 @@ impl ProtocolNotification {
                 ))
             }
             ProtocolNotification::LoggingMessage { .. }
-            | ProtocolNotification::TokenRefreshSucceeded { .. }
+            | ProtocolNotification::TokenRefreshExchanged { .. }
             | ProtocolNotification::AuthStateChanged { .. } => ServerJsonRpcMessage::notification(
                 ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
                     self.as_logging_message_params()
@@ -191,8 +191,8 @@ mod tests {
     }
 
     #[test]
-    fn token_refresh_succeeded_serializes_as_structured_logging_message() {
-        let value = ProtocolNotification::TokenRefreshSucceeded {
+    fn token_refresh_exchanged_serializes_as_structured_logging_message() {
+        let value = ProtocolNotification::TokenRefreshExchanged {
             server_id: Arc::from("github"),
         }
         .to_json_value();
@@ -214,7 +214,7 @@ mod tests {
                 .and_then(|v| v.get("data"))
                 .and_then(|v| v.get("event"))
                 .and_then(|v| v.as_str()),
-            Some("token_refresh_succeeded")
+            Some("token_refresh_exchanged")
         );
         assert_eq!(
             value

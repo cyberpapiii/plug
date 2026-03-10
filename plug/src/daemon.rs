@@ -1034,7 +1034,7 @@ async fn send_ipc_control_notification(
             };
             ipc::send_response(writer, &notif).await.ok();
         }
-        Ok(notification @ ProtocolNotification::TokenRefreshSucceeded { .. }) => {
+        Ok(notification @ ProtocolNotification::TokenRefreshExchanged { .. }) => {
             if let Some(params) = notification.as_logging_message_params() {
                 let notif = IpcResponse::LoggingNotification {
                     params: serde_json::to_value(params).unwrap_or_default(),
@@ -2569,9 +2569,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_notification_forwards_token_refresh_succeeded_as_logging() {
+    async fn control_notification_forwards_token_refresh_exchanged_as_logging() {
         let resp = send_and_read_control_notification(
-            plug_core::notifications::ProtocolNotification::TokenRefreshSucceeded {
+            plug_core::notifications::ProtocolNotification::TokenRefreshExchanged {
                 server_id: Arc::from("github"),
             },
             Some("sess-1"),
@@ -2581,7 +2581,7 @@ mod tests {
         match resp {
             Some(IpcResponse::LoggingNotification { params }) => {
                 assert_eq!(params["logger"], "plug.auth");
-                assert_eq!(params["data"]["event"], "token_refresh_succeeded");
+                assert_eq!(params["data"]["event"], "token_refresh_exchanged");
                 assert_eq!(params["data"]["server_id"], "github");
             }
             other => panic!("expected LoggingNotification, got: {other:?}"),

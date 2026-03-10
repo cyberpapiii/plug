@@ -214,7 +214,7 @@ impl HttpState {
                                     }
                                     ref notification @ (
                                         ProtocolNotification::LoggingMessage { .. }
-                                        | ProtocolNotification::TokenRefreshSucceeded { .. }
+                                        | ProtocolNotification::TokenRefreshExchanged { .. }
                                         | ProtocolNotification::AuthStateChanged { .. }
                                     ) => {
                                         if let Some(params) = notification.as_logging_message_params() {
@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_refresh_succeeded_reaches_http_sse_as_logging_message() {
+    async fn token_refresh_exchanged_reaches_http_sse_as_logging_message() {
         let state = test_state();
         let app = build_router(state.clone());
 
@@ -1929,7 +1929,7 @@ mod tests {
         let body = sse_resp.into_body();
 
         state.router.publish_protocol_notification(
-            crate::notifications::ProtocolNotification::TokenRefreshSucceeded {
+            crate::notifications::ProtocolNotification::TokenRefreshExchanged {
                 server_id: Arc::from("github"),
             },
         );
@@ -1938,7 +1938,7 @@ mod tests {
         assert!(
             events.iter().any(|event| {
                 event.contains("notifications/message")
-                    && event.contains("token_refresh_succeeded")
+                    && event.contains("token_refresh_exchanged")
                     && event.contains("github")
             }),
             "expected SSE stream to contain token refresh logging notification, got {events:?}"
