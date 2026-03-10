@@ -54,14 +54,15 @@ eliminate the classification problem entirely.
 
 ## Acceptance Criteria
 
-- [ ] Single classifier function used by both oauth.rs and engine.rs
-- [ ] `"authorization"` no longer matches metadata fetch failures
-- [ ] `"401"` no longer false-positives on URLs/ports
-- [ ] Unit tests for classification edge cases
+- [x] Single classifier function used by both oauth.rs and engine.rs
+- [x] `"authorization"` no longer matches metadata fetch failures
+- [x] `"401"` no longer false-positives on URLs/ports
+- [x] Unit tests for classification edge cases
 
 ## Work Log
 
 - 2026-03-09: Identified during PR #42 CE review (security-sentinel, code-simplicity-reviewer)
+- 2026-03-09: Implemented a shared classifier in `oauth.rs`, reused it from the reconnect path in `engine.rs`, and added unit coverage for metadata-discovery and `4018` false positives.
 
 ## Resources
 

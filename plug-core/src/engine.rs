@@ -633,14 +633,7 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                         next_check = Duration::from_secs(30);
                     }
                     Err(e) => {
-                        let err_str = format!("{e:#}").to_lowercase();
-                        let is_auth_failure = err_str.contains("authorization required")
-                            || err_str.contains("oauth authorization required")
-                            || err_str.contains("401")
-                            || err_str.contains("unauthorized")
-                            || err_str.contains("invalid_grant")
-                            || err_str.contains("invalid_token");
-                        if is_auth_failure {
+                        if is_auth_reconnect_error(&e) {
                             tracing::warn!(
                                 server = %server_name,
                                 "reconnect with fresh token failed (auth error), marking AuthRequired"
@@ -695,6 +688,10 @@ fn is_retryable_reconnect_error(error: &anyhow::Error) -> bool {
         || message.contains("404")
         || message.contains("failed to connect to http upstream")
         || message.contains("failed to list tools")
+}
+
+fn is_auth_reconnect_error(error: &anyhow::Error) -> bool {
+    crate::oauth::is_auth_error(&format!("{error:#}"))
 }
 
 #[cfg(test)]
@@ -1008,5 +1005,14 @@ mod tests {
 
         let err = anyhow::anyhow!("stdio transport requires a command");
         assert!(!is_retryable_reconnect_error(&err));
+    }
+
+    #[test]
+    fn auth_reconnect_error_uses_shared_classifier() {
+        let err = anyhow::anyhow!("request failed while calling http://127.0.0.1:4018/callback");
+        assert!(!is_auth_reconnect_error(&err));
+
+        let err = anyhow::anyhow!("downstream returned 401 unauthorized");
+        assert!(is_auth_reconnect_error(&err));
     }
 }
