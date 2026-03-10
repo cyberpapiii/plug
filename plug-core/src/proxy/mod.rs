@@ -2454,7 +2454,7 @@ fn paginated_result<T: Clone, R>(
     request: Option<PaginatedRequestParams>,
     build: impl FnOnce(Vec<T>, Option<String>) -> R,
 ) -> R {
-    const PAGE_SIZE: usize = 100;
+    const PAGE_SIZE: usize = 500;
 
     let start = request
         .as_ref()
@@ -3617,7 +3617,7 @@ mod tests {
     fn list_tools_page_for_client_uses_cursor_pagination() {
         let sm = Arc::new(ServerManager::new());
         let router = ToolRouter::new(sm, test_router_config());
-        let tools: Vec<Tool> = (0..150)
+        let tools: Vec<Tool> = (0..750)
             .map(|index| {
                 Tool::new(
                     Cow::Owned(format!("tool_{index}")),
@@ -3642,13 +3642,13 @@ mod tests {
 
         let first =
             router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
-        assert_eq!(first.tools.len(), 100);
-        assert_eq!(first.next_cursor.as_deref(), Some("100"));
+        assert_eq!(first.tools.len(), 500);
+        assert_eq!(first.next_cursor.as_deref(), Some("500"));
 
         let mut second_request = PaginatedRequestParams::default();
         second_request.cursor = first.next_cursor;
         let second = router.list_tools_page_for_client(ClientType::Unknown, Some(second_request));
-        assert_eq!(second.tools.len(), 50);
+        assert_eq!(second.tools.len(), 250);
         assert!(second.next_cursor.is_none());
     }
 

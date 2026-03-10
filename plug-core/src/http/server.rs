@@ -765,7 +765,12 @@ async fn handle_request(
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
 
-            json_response_with_session(&session_id, &response_msg)
+            let mut response_value = serde_json::to_value(&response_msg)
+                .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
+            response_value["result"]["protocolVersion"] =
+                serde_json::Value::String(PROTOCOL_VERSION.to_string());
+
+            json_value_response_with_session(&session_id, &response_value)
         }
 
         ClientRequest::PingRequest(_) => {
@@ -1057,12 +1062,31 @@ fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
     Ok(response)
 }
 
-/// Build a JSON response with MCP-Session-Id header (used for initialize).
-fn json_response_with_session(
+fn json_value_response(value: &serde_json::Value) -> Result<Response, HttpError> {
+    let body = serde_json::to_vec(value)
+        .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
+
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    Ok(response)
+}
+
+fn json_value_response_with_session(
     session_id: &str,
-    msg: &ServerJsonRpcMessage,
+    value: &serde_json::Value,
 ) -> Result<Response, HttpError> {
-    let mut response = json_response(msg)?;
+    let mut response = json_value_response(value)?;
     response.headers_mut().insert(
         SESSION_ID_HEADER,
         HeaderValue::from_str(session_id)
@@ -1550,6 +1574,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["result"]["protocolVersion"], "2025-11-25");
         assert_eq!(json["result"]["serverInfo"]["name"], "plug");
         assert!(json["result"]["capabilities"]["tools"].is_null());
     }
