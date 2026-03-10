@@ -45,6 +45,28 @@ pub enum NotificationTarget {
 }
 
 impl ProtocolNotification {
+    pub fn as_logging_message_params(&self) -> Option<LoggingMessageNotificationParam> {
+        match self {
+            ProtocolNotification::LoggingMessage { params } => Some(params.clone()),
+            ProtocolNotification::AuthStateChanged {
+                server_id,
+                new_state,
+            } => Some(LoggingMessageNotificationParam {
+                level: match new_state {
+                    crate::types::ServerHealth::AuthRequired => rmcp::model::LoggingLevel::Warning,
+                    _ => rmcp::model::LoggingLevel::Info,
+                },
+                logger: Some("plug.auth".into()),
+                data: serde_json::json!({
+                    "event": "auth_state_changed",
+                    "server_id": server_id,
+                    "new_state": new_state,
+                }),
+            }),
+            _ => None,
+        }
+    }
+
     /// Convert the internal notification to a server-to-client JSON-RPC message.
     pub fn to_server_jsonrpc_message(&self) -> ServerJsonRpcMessage {
         match self {
@@ -76,23 +98,13 @@ impl ProtocolNotification {
                     ResourceUpdatedNotification::new(params.clone()),
                 ))
             }
-            ProtocolNotification::LoggingMessage { params } => {
-                ServerJsonRpcMessage::notification(ServerNotification::LoggingMessageNotification(
-                    LoggingMessageNotification::new(params.clone()),
-                ))
-            }
-            ProtocolNotification::AuthStateChanged { .. } => {
-                // AuthStateChanged is a plug-internal notification only delivered
-                // over IPC push; it has no MCP wire equivalent. Emit a synthetic
-                // logging message for any code path that calls this generically.
-                ServerJsonRpcMessage::notification(ServerNotification::LoggingMessageNotification(
-                    LoggingMessageNotification::new(LoggingMessageNotificationParam {
-                        level: rmcp::model::LoggingLevel::Warning,
-                        logger: Some("plug".into()),
-                        data: serde_json::json!("auth state changed (internal)"),
-                    }),
-                ))
-            }
+            ProtocolNotification::LoggingMessage { .. }
+            | ProtocolNotification::AuthStateChanged { .. } => ServerJsonRpcMessage::notification(
+                ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
+                    self.as_logging_message_params()
+                        .expect("logging message params"),
+                )),
+            ),
         }
     }
 
@@ -112,5 +124,55 @@ impl ProtocolNotification {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_state_changed_serializes_as_structured_logging_message() {
+        let value = ProtocolNotification::AuthStateChanged {
+            server_id: Arc::from("github"),
+            new_state: crate::types::ServerHealth::AuthRequired,
+        }
+        .to_json_value();
+
+        assert_eq!(
+            value.get("method").and_then(|v| v.as_str()),
+            Some("notifications/message")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("logger"))
+                .and_then(|v| v.as_str()),
+            Some("plug.auth")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("data"))
+                .and_then(|v| v.get("event"))
+                .and_then(|v| v.as_str()),
+            Some("auth_state_changed")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("data"))
+                .and_then(|v| v.get("server_id"))
+                .and_then(|v| v.as_str()),
+            Some("github")
+        );
+        assert_eq!(
+            value
+                .get("params")
+                .and_then(|v| v.get("data"))
+                .and_then(|v| v.get("new_state"))
+                .and_then(|v| v.as_str()),
+            Some("AuthRequired")
+        );
     }
 }

@@ -212,11 +212,15 @@ impl HttpState {
                                             );
                                         }
                                     }
-                                    ProtocolNotification::LoggingMessage { .. } => {
-                                        // Logging is handled by the dedicated logging fan-out task below
-                                    }
-                                    ProtocolNotification::AuthStateChanged { .. } => {
-                                        // AuthStateChanged is IPC-only; no MCP wire equivalent for HTTP
+                                    ref notification @ (
+                                        ProtocolNotification::LoggingMessage { .. }
+                                        | ProtocolNotification::AuthStateChanged { .. }
+                                    ) => {
+                                        if let Some(params) = notification.as_logging_message_params() {
+                                            let value = ProtocolNotification::LoggingMessage { params }
+                                                .to_json_value();
+                                            state.sessions.broadcast(value);
+                                        }
                                     }
                                 }
                             }
@@ -1809,6 +1813,71 @@ mod tests {
                     && event.contains("halfway")
             }),
             "expected SSE stream to contain targeted progress notification, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_state_changed_reaches_http_sse_as_logging_message() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::AuthStateChanged {
+                server_id: Arc::from("github"),
+                new_state: crate::types::ServerHealth::AuthRequired,
+            },
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events.iter().any(|event| {
+                event.contains("notifications/message")
+                    && event.contains("auth_state_changed")
+                    && event.contains("github")
+                    && event.contains("AuthRequired")
+            }),
+            "expected SSE stream to contain auth state logging notification, got {events:?}"
         );
     }
 
