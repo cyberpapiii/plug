@@ -516,7 +516,7 @@ impl ServerManager {
                             }
                         }
                     } else {
-                        config.auth_token.as_ref().map(|t| t.as_str().to_string())
+                        config.auth_token.as_ref().map(|t| format!("Bearer {}", t.as_str()))
                     };
 
                     if let Some(header) = auth_header {
