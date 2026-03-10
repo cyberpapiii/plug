@@ -2832,11 +2832,17 @@ impl ServerHandler for ProxyHandler {
                                     break;
                                 }
                             }
-                            Ok(ProtocolNotification::LoggingMessage { .. }) => {
-                                // Logging is handled by the dedicated logging fan-out task below
-                            }
-                            Ok(ProtocolNotification::AuthStateChanged { .. }) => {
-                                // AuthStateChanged is IPC-only; direct stdio clients don't need it
+                            Ok(
+                                ref notification @ (ProtocolNotification::LoggingMessage { .. }
+                                | ProtocolNotification::AuthStateChanged {
+                                    ..
+                                }),
+                            ) => {
+                                if let Some(params) = notification.as_logging_message_params() {
+                                    if peer.notify_logging_message(params).await.is_err() {
+                                        break;
+                                    }
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "stdio notification fan-out lagged");
