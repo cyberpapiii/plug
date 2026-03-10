@@ -26,6 +26,9 @@ use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::types::ClientType;
 
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
+
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
 /// Built once at `refresh_tools()` time so that `list_tools_for_client()` is O(1).
@@ -552,6 +555,7 @@ impl ToolRouter {
                 router
                     .notification_refresh_pending
                     .store(false, Ordering::SeqCst);
+                tokio::time::sleep(LIST_CHANGED_REFRESH_DEBOUNCE).await;
                 router.refresh_tools().await;
 
                 if router
@@ -2727,6 +2731,12 @@ impl ServerHandler for ProxyHandler {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(self.router.synthesized_capabilities())
             .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+            .with_protocol_version(
+                serde_json::from_value(serde_json::Value::String(
+                    LATEST_PROTOCOL_VERSION.to_string(),
+                ))
+                .expect("latest protocol version must parse"),
+            )
     }
 
     fn initialize(
@@ -3162,8 +3172,41 @@ mod tests {
 
         assert_eq!(info.server_info.name, "plug");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.protocol_version.as_str(), LATEST_PROTOCOL_VERSION);
         assert!(info.capabilities.tools.is_none());
         assert!(info.capabilities.resources.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_tool_list_changed_refresh_debounces_bursts() {
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+        let mut rx = router.subscribe_notifications();
+
+        router.schedule_tool_list_changed_refresh();
+        router.schedule_tool_list_changed_refresh();
+        router.schedule_tool_list_changed_refresh();
+
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "notification should not publish before debounce window"
+        );
+
+        tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "notification should still be pending inside debounce window"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let notification = rx.recv().await.expect("tool list changed notification");
+        assert_eq!(notification, ProtocolNotification::ToolListChanged);
+        assert!(
+            rx.try_recv().is_err(),
+            "burst should coalesce into a single notification"
+        );
     }
 
     #[tokio::test]

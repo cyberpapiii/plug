@@ -42,6 +42,7 @@ pub struct HttpState {
     pub sessions: Arc<dyn SessionStore>,
     pub cancel: CancellationToken,
     pub sse_channel_capacity: usize,
+    pub allowed_origins: Vec<Arc<str>>,
     pub notification_task_started: AtomicBool,
     /// Bearer token for downstream client authentication.
     /// `None` means no auth required (loopback-only server).
@@ -286,7 +287,10 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
     // Bearer auth runs first; if authenticated, origin validation is skipped.
     let mcp = Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
-        .layer(middleware::from_fn(validate_origin))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            validate_origin,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             validate_bearer_auth,
@@ -351,7 +355,11 @@ async fn validate_bearer_auth(
 /// - "null" literal: rejected (DNS rebinding vector)
 /// - Anything else: rejected
 /// - Authenticated requests (via bearer token): origin check skipped
-async fn validate_origin(req: Request, next: Next) -> Result<Response, HttpError> {
+async fn validate_origin(
+    State(state): State<Arc<HttpState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, HttpError> {
     // Skip origin check for authenticated remote clients
     if req.extensions().get::<AuthStatus>() == Some(&AuthStatus::Authenticated) {
         return Ok(next.run(req).await);
@@ -359,6 +367,14 @@ async fn validate_origin(req: Request, next: Next) -> Result<Response, HttpError
 
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         let origin = origin.to_str().map_err(|_| HttpError::InvalidOrigin)?;
+
+        if state
+            .allowed_origins
+            .iter()
+            .any(|allowed| allowed.as_ref() == origin)
+        {
+            return Ok(next.run(req).await);
+        }
 
         if origin == "null" {
             return Err(HttpError::InvalidOrigin);
@@ -1140,6 +1156,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
             auth_token: None,
             roots_capable_sessions: DashMap::new(),
@@ -1312,6 +1329,63 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn origin_allowlisted_external_origin_accepted() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            sse_channel_capacity: 32,
+            allowed_origins: vec![Arc::from("https://claude.ai")],
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("origin", "https://claude.ai")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Full session lifecycle: initialize → tools/list → ping → delete
@@ -1992,6 +2066,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
             auth_token: Some(Arc::from(token)),
             roots_capable_sessions: DashMap::new(),

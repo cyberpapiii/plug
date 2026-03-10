@@ -1225,23 +1225,30 @@ mod tests {
             )
         }
 
-        async fn set_tools_and_notify(&self, tools: Vec<Tool>) {
-            self.tools_tx.send(tools).expect("update tool list");
-
+        async fn wait_for_peer(&self) -> Peer<RoleServer> {
             let mut attempts = 0usize;
             loop {
                 let peer = { self.peer.lock().unwrap().clone() };
                 if let Some(peer) = peer {
-                    peer.notify_tool_list_changed()
-                        .await
-                        .expect("notify tool list changed");
-                    return;
+                    return peer;
                 }
 
                 attempts += 1;
                 assert!(attempts < 50, "server peer should be ready before notify");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        }
+
+        async fn notify_tool_list_changed(&self) {
+            let peer = self.wait_for_peer().await;
+            peer.notify_tool_list_changed()
+                .await
+                .expect("notify tool list changed");
+        }
+
+        async fn set_tools_and_notify(&self, tools: Vec<Tool>) {
+            self.tools_tx.send(tools).expect("update tool list");
+            self.notify_tool_list_changed().await;
         }
     }
 
@@ -1639,6 +1646,96 @@ mod tests {
             .expect("tool call succeeds");
         assert!(!result.content.is_empty());
         assert_eq!(router.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_stdio_delivery(
+    ) {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
+        let upstream_peer = Arc::clone(&upstream_server.peer);
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = MutableToolServerHandler {
+                tools_rx,
+                peer: upstream_peer,
+            };
+            let server = handler
+                .serve(server_transport)
+                .await
+                .expect("start upstream test server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("upstream"),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(&router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect upstream test client");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        tools.store(Arc::new(initial_tools));
+
+        server_manager.replace_server(
+            "upstream",
+            UpstreamServer {
+                name: "upstream".to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                capabilities: ServerCapabilities::default(),
+                health: ServerHealth::Healthy,
+            },
+        );
+        router.refresh_tools().await;
+        assert_eq!(router.tool_count(), 1);
+
+        let proxy_handler = ProxyHandler::from_router(router.clone());
+        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_handler
+                .serve(proxy_server_transport)
+                .await
+                .expect("start proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let signal = Arc::new(Notify::new());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let _downstream_client = ToolListChangedClient {
+            signal: Arc::clone(&signal),
+            notifications: Arc::clone(&notifications),
+        }
+        .serve(downstream_transport)
+        .await
+        .expect("connect downstream client");
+
+        upstream_server
+            .tools_tx
+            .send(vec![make_tool("echo"), make_tool("extra")])
+            .expect("update tool list");
+        upstream_server.notify_tool_list_changed().await;
+        upstream_server.notify_tool_list_changed().await;
+        upstream_server.notify_tool_list_changed().await;
+
+        tokio::time::timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("downstream stdio client should receive tools/list_changed");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(router.tool_count(), 2);
     }
 
     #[tokio::test]

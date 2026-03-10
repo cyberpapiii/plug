@@ -21,6 +21,7 @@ use plug_core::ipc::{
 };
 
 const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 struct SharedConnection {
     conn: Mutex<crate::runtime::DaemonProxySession>,
@@ -430,6 +431,12 @@ impl ServerHandler for IpcProxyHandler {
             .unwrap_or_default();
         InitializeResult::new(capabilities)
             .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+            .with_protocol_version(
+                serde_json::from_value(serde_json::Value::String(
+                    LATEST_PROTOCOL_VERSION.to_string(),
+                ))
+                .expect("latest protocol version must parse"),
+            )
     }
 
     fn initialize(
@@ -991,7 +998,12 @@ mod tests {
 
     impl ClientHandler for TestClient {
         fn get_info(&self) -> ClientInfo {
-            ClientInfo::default()
+            ClientInfo::default().with_protocol_version(
+                serde_json::from_value(serde_json::Value::String(
+                    LATEST_PROTOCOL_VERSION.to_string(),
+                ))
+                .expect("latest protocol version must parse"),
+            )
         }
     }
 
@@ -1189,6 +1201,72 @@ mod tests {
             .await
             .expect("restarted daemon task join")
             .expect("restarted daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_advertises_latest_protocol_version() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdc-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server_config());
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-protocol-version".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let server_info = client
+            .peer()
+            .peer_info()
+            .expect("server initialize info available");
+        assert_eq!(server_info.protocol_version.as_str(), "2025-11-25");
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
 
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);

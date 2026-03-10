@@ -337,6 +337,13 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
         sessions,
         cancel: engine.cancel_token().clone(),
         sse_channel_capacity: config.http.sse_channel_capacity,
+        allowed_origins: config
+            .http
+            .allowed_origins
+            .iter()
+            .cloned()
+            .map(Arc::<str>::from)
+            .collect(),
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
         auth_token,
         roots_capable_sessions: dashmap::DashMap::new(),
@@ -449,6 +456,7 @@ mod tests {
         let http = plug_core::config::HttpConfig {
             bind_address: "127.0.0.1".to_string(),
             port: addr.port(),
+            allowed_origins: Vec::new(),
             tls_cert_path: Some(cert_path),
             tls_key_path: Some(key_path),
             session_timeout_secs: 1800,
@@ -515,6 +523,7 @@ mod tests {
             sessions,
             cancel: engine.cancel_token().clone(),
             sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
             auth_token: None,
             roots_capable_sessions: dashmap::DashMap::new(),

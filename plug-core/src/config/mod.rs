@@ -78,6 +78,9 @@ pub struct HttpConfig {
     pub bind_address: String,
     /// Port for HTTP server.
     pub port: u16,
+    /// Explicitly allowed Origin header values for HTTP MCP requests.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     /// PEM-encoded certificate chain for HTTPS serving.
     pub tls_cert_path: Option<PathBuf>,
     /// PEM-encoded private key for HTTPS serving.
@@ -95,6 +98,7 @@ impl Default for HttpConfig {
         Self {
             bind_address: "127.0.0.1".to_string(),
             port: 3282,
+            allowed_origins: Vec::new(),
             tls_cert_path: None,
             tls_key_path: None,
             session_timeout_secs: 1800,
@@ -539,6 +543,7 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.http.bind_address, "127.0.0.1");
         assert_eq!(cfg.http.port, 3282);
+        assert!(cfg.http.allowed_origins.is_empty());
         assert_eq!(cfg.http.tls_cert_path, None);
         assert_eq!(cfg.http.tls_key_path, None);
         assert_eq!(cfg.http.session_timeout_secs, 1800);
@@ -563,11 +568,13 @@ mod tests {
 
             [http]
             port = 8080
+            allowed_origins = ["https://claude.ai"]
             tls_cert_path = "/tmp/plug-cert.pem"
             tls_key_path = "/tmp/plug-key.pem"
             "#,
         );
         assert_eq!(cfg.http.port, 8080);
+        assert_eq!(cfg.http.allowed_origins, vec!["https://claude.ai"]);
         assert_eq!(
             cfg.http.tls_cert_path.as_deref(),
             Some(std::path::Path::new("/tmp/plug-cert.pem"))

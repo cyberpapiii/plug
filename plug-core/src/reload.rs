@@ -69,6 +69,11 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     );
     note_restart_required(
         &mut restart_required,
+        old.http.allowed_origins != new.http.allowed_origins,
+        "http.allowed_origins changed",
+    );
+    note_restart_required(
+        &mut restart_required,
         old.http.session_timeout_secs != new.http.session_timeout_secs,
         "http.session_timeout_secs changed",
     );
