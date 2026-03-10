@@ -47,7 +47,7 @@ Implemented today:
 Still incomplete:
 
 - fully live runtime reconfiguration
-- OAuth follow-up polish: mock OAuth integration tests
+- OAuth follow-up polish: manual refresh IPC command / explicit decision
 
 ## Documentation Map
 

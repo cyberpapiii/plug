@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `750080d` (post-merge truth pass for PR #50 refresh-exchange observability)
+Baseline: `main` @ `fcd6c3f` (post-merge truth pass after PR #50 refresh-exchange observability)
 
 This is the canonical current-state doc for the project.
 
@@ -31,6 +31,7 @@ Implemented on `main`:
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
 - OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, doctor checks, and correct HTTP auth header construction (PR #36, PR #47)
+- mock OAuth provider integration coverage for metadata discovery, auth-code exchange persistence with state cleanup, token refresh persistence, and reconnect using refreshed credentials (PR #51)
 - daemon IPC notification parity: progress, cancelled, and list_changed push forwarding (PR #38); resource subscribe remains unsupported over IPC
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
 - `plug auth complete` for non-interactive OAuth code exchange (PR #40)
@@ -40,7 +41,7 @@ Implemented on `main`:
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- OAuth follow-up items: mock OAuth integration tests, manual refresh IPC command / explicit decision on whether it is warranted
+- OAuth follow-up items: manual refresh IPC command / explicit decision on whether it is warranted
 
 ## What Exists Off-Main
 
