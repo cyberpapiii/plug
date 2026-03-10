@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
+use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
 use plug_core::client_detect::detect_client;
 use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
 use plug_core::engine::Engine;
 use plug_core::http::server::{HttpState, build_router};
 use plug_core::http::session::SessionManager;
+use plug_core::oauth;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::session::SessionStore;
@@ -32,6 +34,8 @@ use rmcp::model::{
     SamplingMessage, UrlElicitationCapability,
 };
 use rmcp::service::RequestContext;
+use rmcp::transport::auth::CredentialStore;
+use rmcp::transport::auth::{StoredCredentials, VendorExtraTokenFields};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -39,6 +43,23 @@ use tower::ServiceExt;
 const HTTP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 const HTTP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
+
+fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
+    let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
+        AccessToken::new(access.to_string()),
+        BasicTokenType::Bearer,
+        VendorExtraTokenFields::default(),
+    );
+    token.set_refresh_token(Some(RefreshToken::new(refresh.to_string())));
+    token.set_expires_in(Some(&Duration::from_secs(3600)));
+
+    StoredCredentials {
+        client_id: "test-client".to_string(),
+        token_response: Some(token),
+        granted_scopes: vec![],
+        token_received_at: Some(0),
+    }
+}
 
 #[derive(Clone)]
 struct TestClient;
@@ -1068,8 +1089,8 @@ async fn test_multi_client_shared_engine_isolation() {
 
 #[tokio::test]
 async fn test_upstream_http_sends_protocol_version_header() {
-    /// Captured method name + optional MCP-Protocol-Version header value.
-    type CapturedHeaders = Vec<(String, Option<String>)>;
+    /// Captured method name + optional MCP-Protocol-Version + Authorization header value.
+    type CapturedHeaders = Vec<(String, Option<String>, Option<String>)>;
 
     #[derive(Clone)]
     struct MockState {
@@ -1088,6 +1109,10 @@ async fn test_upstream_http_sends_protocol_version_header() {
             .get("mcp-protocol-version")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let authorization = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
         let json_body: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
@@ -1104,7 +1129,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
             .captured
             .lock()
             .await
-            .push((method.clone(), protocol_version));
+            .push((method.clone(), protocol_version, authorization));
 
         let session_headers = [
             (
@@ -1174,6 +1199,18 @@ async fn test_upstream_http_sends_protocol_version_header() {
     // Give the mock server a moment to start.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    let server_name = format!("mock-http-oauth-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store.clear().await.expect("clear OAuth store before test");
+    plug_core::tls::ensure_rustls_provider_installed();
+    store
+        .save(oauth_test_credentials(
+            "oauth-access-token",
+            "oauth-refresh-token",
+        ))
+        .await
+        .expect("seed OAuth credentials");
+
     // Connect through plug's upstream HTTP path (ServerManager::start_server).
     let sm = Arc::new(ServerManager::new());
     let config = ServerConfig {
@@ -1184,8 +1221,8 @@ async fn test_upstream_http_sends_protocol_version_header() {
         transport: TransportType::Http,
         url: Some(format!("http://127.0.0.1:{port}/mcp")),
         auth_token: None,
-        auth: None,
-        oauth_client_id: None,
+        auth: Some("oauth".to_string()),
+        oauth_client_id: Some("test-client".to_string()),
         oauth_scopes: None,
         timeout_secs: 10,
         call_timeout_secs: 5,
@@ -1198,7 +1235,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
     };
 
     let upstream = sm
-        .start_server("mock-http", &config)
+        .start_server(&server_name, &config)
         .await
         .expect("connect to mock HTTP upstream");
 
@@ -1208,18 +1245,23 @@ async fn test_upstream_http_sends_protocol_version_header() {
     let captured = mock_state.captured.lock().await;
 
     // initialize: should NOT have MCP-Protocol-Version (version unknown yet)
-    let init = captured.iter().find(|(m, _)| m == "initialize");
+    let init = captured.iter().find(|(m, _, _)| m == "initialize");
     assert!(init.is_some(), "should have captured initialize request");
     assert_eq!(
         init.unwrap().1,
         None,
         "initialize must not send MCP-Protocol-Version (version not yet negotiated)"
     );
+    assert_eq!(
+        init.unwrap().2.as_deref(),
+        Some("Bearer oauth-access-token"),
+        "initialize should send a single Bearer auth header"
+    );
 
     // notifications/initialized: SHOULD have MCP-Protocol-Version
     let initialized = captured
         .iter()
-        .find(|(m, _)| m == "notifications/initialized");
+        .find(|(m, _, _)| m == "notifications/initialized");
     assert!(
         initialized.is_some(),
         "should have captured notifications/initialized"
@@ -1231,7 +1273,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
     );
 
     // tools/list: SHOULD have MCP-Protocol-Version
-    let tools_list = captured.iter().find(|(m, _)| m == "tools/list");
+    let tools_list = captured.iter().find(|(m, _, _)| m == "tools/list");
     assert!(
         tools_list.is_some(),
         "should have captured tools/list request"
@@ -1243,6 +1285,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
     );
 
     drop(upstream);
+    store.clear().await.expect("clear OAuth store after test");
     server_handle.abort();
 }
 
