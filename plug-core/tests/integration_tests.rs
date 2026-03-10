@@ -45,12 +45,11 @@ const HTTP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
-    let mut token =
-        oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
-            AccessToken::new(access.to_string()),
-            BasicTokenType::Bearer,
-            VendorExtraTokenFields::default(),
-        );
+    let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
+        AccessToken::new(access.to_string()),
+        BasicTokenType::Bearer,
+        VendorExtraTokenFields::default(),
+    );
     token.set_refresh_token(Some(RefreshToken::new(refresh.to_string())));
     token.set_expires_in(Some(&Duration::from_secs(3600)));
 
