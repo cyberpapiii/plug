@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `f90e7a6` (post-merge truth pass for PR #45 auth-state transport parity)
+Baseline: `main` @ `e53b196` (post-merge truth pass for PR #47 HTTP OAuth auth header fix)
 
 This is the canonical current-state doc for the project.
 
@@ -30,7 +30,7 @@ Implemented on `main`:
 - elicitation reverse-request forwarding across stdio, HTTP, and daemon IPC
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
-- OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, and doctor checks (PR #36)
+- OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, doctor checks, and correct HTTP auth header construction (PR #36, PR #47)
 - daemon IPC notification parity: progress, cancelled, and list_changed push forwarding (PR #38); resource subscribe remains unsupported over IPC
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
 - `plug auth complete` for non-interactive OAuth code exchange (PR #40)
