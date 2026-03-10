@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "050"
 tags: [code-review, oauth, reliability, engine]
@@ -52,13 +52,14 @@ before falling back to the full sleep.
 
 ## Acceptance Criteria
 
-- [ ] Successful refresh + failed reconnect retries reconnect without re-refreshing the token
-- [ ] Retry uses a shorter interval than the full refresh window
-- [ ] If reconnect continues to fail, eventually transitions to AuthRequired
+- [x] Successful refresh + failed reconnect retries reconnect without re-refreshing the token
+- [x] Retry uses a shorter interval than the full refresh window
+- [ ] If reconnect continues to fail, eventually transitions to AuthRequired (auth failures do transition; non-auth transient failures loop indefinitely — pre-existing behavior, tracked separately)
 
 ## Work Log
 
 - 2026-03-09: Identified during PR #42 CE review (architecture-strategist agent)
+- 2026-03-09: Fixed via PR #44 using Option A (reconnect_pending flag). CE review passed, CI 7/7 green.
 
 ## Resources
 
