@@ -1034,6 +1034,14 @@ async fn send_ipc_control_notification(
             };
             ipc::send_response(writer, &notif).await.ok();
         }
+        Ok(notification @ ProtocolNotification::TokenRefreshSucceeded { .. }) => {
+            if let Some(params) = notification.as_logging_message_params() {
+                let notif = IpcResponse::LoggingNotification {
+                    params: serde_json::to_value(params).unwrap_or_default(),
+                };
+                ipc::send_response(writer, &notif).await.ok();
+            }
+        }
         Ok(
             ProtocolNotification::LoggingMessage { .. }
             | ProtocolNotification::ResourceUpdated { .. },
@@ -2558,5 +2566,25 @@ mod tests {
             resp.is_none(),
             "logging messages should not be forwarded on the control channel, got: {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn control_notification_forwards_token_refresh_succeeded_as_logging() {
+        let resp = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::TokenRefreshSucceeded {
+                server_id: Arc::from("github"),
+            },
+            Some("sess-1"),
+        )
+        .await;
+
+        match resp {
+            Some(IpcResponse::LoggingNotification { params }) => {
+                assert_eq!(params["logger"], "plug.auth");
+                assert_eq!(params["data"]["event"], "token_refresh_succeeded");
+                assert_eq!(params["data"]["server_id"], "github");
+            }
+            other => panic!("expected LoggingNotification, got: {other:?}"),
+        }
     }
 }

@@ -571,6 +571,7 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
 
                     match result {
                         oauth::RefreshResult::Refreshed => {
+                            publish_token_refresh_succeeded(engine, server_name);
                             tracing::info!(server = %server_name, "OAuth token refreshed, reconnecting with fresh token");
                         }
                         oauth::RefreshResult::InjectedToken => {
@@ -653,6 +654,14 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
             }
         }
     }
+}
+
+fn publish_token_refresh_succeeded(engine: &Engine, server_name: &str) {
+    engine.tool_router().publish_protocol_notification(
+        crate::notifications::ProtocolNotification::TokenRefreshSucceeded {
+            server_id: Arc::from(server_name),
+        },
+    );
 }
 
 /// Mark a server as `AuthRequired` and broadcast the state change.
@@ -781,6 +790,21 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown server"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn publish_token_refresh_succeeded_emits_protocol_notification() {
+        let engine = Engine::new(test_config());
+        let mut rx = engine.tool_router().subscribe_notifications();
+
+        publish_token_refresh_succeeded(&engine, "github");
+
+        match rx.try_recv() {
+            Ok(crate::notifications::ProtocolNotification::TokenRefreshSucceeded { server_id }) => {
+                assert_eq!(server_id.as_ref(), "github");
+            }
+            other => panic!("expected TokenRefreshSucceeded, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
