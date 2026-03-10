@@ -506,7 +506,7 @@ impl ServerManager {
                     // Resolve auth header: OAuth token from cache, or static bearer token
                     let auth_header = if config.auth.as_deref() == Some("oauth") {
                         match crate::oauth::current_access_token(name) {
-                            Some(token) => Some(format!("Bearer {}", token)),
+                            Some(token) => Some(token),
                             None => {
                                 tracing::info!(
                                     server = %name,
@@ -516,7 +516,7 @@ impl ServerManager {
                             }
                         }
                     } else {
-                        config.auth_token.as_ref().map(|t| format!("Bearer {}", t.as_str()))
+                        config.auth_token.as_ref().map(|t| t.as_str().to_string())
                     };
 
                     if let Some(header) = auth_header {
