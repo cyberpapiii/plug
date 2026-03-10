@@ -45,9 +45,9 @@ The current product shape is:
 
 ## Remaining Work
 
-All major roadmap features are now implemented on `main`. The remaining work is smaller follow-up items:
+All major roadmap features are now implemented on `main`.
+No required roadmap work remains for the current production-ready bar.
 
-### OAuth follow-up polish
+Optional future scope only:
 
-- update the risk register to current remaining risks
-- reduce the research breadcrumb list to the still-open questions
+- fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope

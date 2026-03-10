@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `9ce21f8` (tracker/truth sync after PRs #47, #48, #50, #51)
+Baseline: `main` @ `4bc22b1` (final closeout after PRs #47-#54)
 
 This is the canonical current-state doc for the project.
 
@@ -49,6 +49,12 @@ Candidate future state only:
 - `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, research docs), not mergeable whole-cloth
 
 Off-main work must not be described as current implementation.
+
+## Release Status
+
+The current roadmap is complete on `main`.
+No required roadmap items remain for the current production-ready bar.
+Any further work is optional future scope rather than a blocker.
 
 ## Documentation Taxonomy
 

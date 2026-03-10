@@ -44,7 +44,9 @@ Implemented today:
 - import/export/doctor flows
 - startup recovery and health monitoring
 
-Still incomplete:
+No current roadmap blockers remain on `main`.
+
+Out of scope for the current production-ready bar:
 
 - fully live runtime reconfiguration
 

@@ -4,32 +4,30 @@ This file now tracks the questions that are still genuinely open after the merge
 
 ## Current Open Questions
 
-### R1: What is the smallest honest post-`v0.2.0` stateless tranche?
+No open research questions block the current roadmap or the current production-ready bar.
+
+## Future Exploration Only
+
+These may matter for a future roadmap, but they are not blockers for the current product:
+
+### F1: What is the smallest honest post-`v0.2.0` stateless tranche?
 
 The `SessionStore` seam and stateless notes now exist, but the first real stateless implementation
-slice is still undefined. The next question is where to start without overcommitting:
+slice is still undefined.
 
-- stateless discovery only
-- stateless request validation path
-- full stateless downstream HTTP handling
-
-### R2: How far should meta-tool security go?
+### F2: How far should meta-tool security go?
 
 `plug` now has meta-tool mode and tool-definition drift detection, but it does not yet implement
 heavier security patterns such as quarantine or approval flows for newly changed tools.
 
-### R3: What is the right next recovery-proof slice after daemon continuity?
+### F3: What is the right next recovery-proof slice after daemon continuity?
 
-Daemon continuity is now covered end to end. The next recovery question is whether to prioritize:
+Daemon continuity is now covered end to end. Future work could deepen recovery proof beyond the
+current stdio-over-IPC path.
 
-- upstream restart recovery proof
-- mixed transport continuity
-- more aggressive failure choreography under load
+### F4: Which post-June-2026 MCP feature should `plug` tackle first?
 
-### R4: Which post-June-2026 MCP feature should `plug` tackle first?
-
-Tasks and related future-facing MCP features are still deferred. The next roadmap decision should be
-driven by actual client adoption rather than speculative implementation.
+Tasks and related future-facing MCP features remain future roadmap questions, not current blockers.
 
 ## Resolved Questions
 
