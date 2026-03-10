@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `4bc22b1` (final closeout after PRs #47-#54)
+Baseline: `main` @ `5b2f477` (final closeout and production-ready status)
 
 This is the canonical current-state doc for the project.
 

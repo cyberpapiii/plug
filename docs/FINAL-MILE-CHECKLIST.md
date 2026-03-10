@@ -1,6 +1,6 @@
 # Final Mile Checklist
 
-Baseline: `main` @ `4bc22b1`
+Baseline: `main` @ `5b2f477`
 
 This is the single finish-line tracker for the remaining work needed to call the current roadmap
 effectively complete. Keep this list small and check items off as they land on `main`.
