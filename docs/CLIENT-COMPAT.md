@@ -71,9 +71,17 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 - Can connect to remote MCP servers via HTTP
 - SSE may be deprecated in future Claude Desktop versions
 
-**fanout implications**:
-- Standard stdio connection via `fanout connect`
-- No special handling needed
+**CRITICAL: Remote connector limitations (discovered 2026-03-10)**:
+- Remote MCP connector sends `tools/list` once and ignores `nextCursor` — does NOT follow pagination
+- Does NOT open SSE stream (GET /mcp), so never receives `tools/list_changed` notifications
+- Workaround: set PAGE_SIZE large enough (500+) so all tools fit in a single page
+- After config changes (enabling/disabling upstream servers), remote clients must disconnect and reconnect to see updated tool lists
+- See: `docs/bug-reports/pagination-cursor-forwarding-and-remote-client-blanking.md`
+
+**plug implications**:
+- Standard stdio connection via `plug connect`
+- For remote HTTP: ensure all tools fit in one page (PAGE_SIZE >= total tool count)
+- Cannot rely on `tools/list_changed` notifications reaching remote Claude Desktop clients
 
 ---
 
