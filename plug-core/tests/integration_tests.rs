@@ -7,12 +7,17 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::{Form, Query, State};
 use axum::http::Request as HttpRequest;
-use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use futures::FutureExt;
+use oauth2::{AccessToken, RefreshToken, TokenResponse, basic::BasicTokenType};
 use plug_core::client_detect::detect_client;
 use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
 use plug_core::engine::Engine;
@@ -59,6 +64,338 @@ fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
         granted_scopes: vec![],
         token_received_at: Some(0),
     }
+}
+
+fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
+    let safe_server =
+        plug_core::config::sanitize_server_name_for_path(server_name).expect("valid server name");
+    let safe_state: String = state
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    oauth::tokens_dir().join(format!("{safe_server}_state_{safe_state}.json"))
+}
+
+#[derive(Clone)]
+struct MockOAuthProviderState {
+    base_url: String,
+    shared: Arc<Mutex<MockOAuthProviderShared>>,
+}
+
+struct MockOAuthProviderShared {
+    metadata_requests: usize,
+    authorize_requests: usize,
+    token_grants: Vec<String>,
+    pkce_verified: bool,
+    current_access_token: String,
+    current_refresh_token: String,
+    pending_codes: HashMap<String, PendingAuthorizationCode>,
+    mcp_auth_headers: Vec<String>,
+}
+
+struct PendingAuthorizationCode {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+}
+
+#[derive(Debug)]
+struct MockOAuthSnapshot {
+    metadata_requests: usize,
+    authorize_requests: usize,
+    token_grants: Vec<String>,
+    pkce_verified: bool,
+    mcp_auth_headers: Vec<String>,
+}
+
+struct MockOAuthProvider {
+    base_url: String,
+    shared: Arc<Mutex<MockOAuthProviderShared>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockOAuthProvider {
+    async fn start() -> Self {
+        let shared = Arc::new(Mutex::new(MockOAuthProviderShared {
+            metadata_requests: 0,
+            authorize_requests: 0,
+            token_grants: Vec::new(),
+            pkce_verified: false,
+            current_access_token: "access-token-1".to_string(),
+            current_refresh_token: "refresh-token-1".to_string(),
+            pending_codes: HashMap::new(),
+            mcp_auth_headers: Vec::new(),
+        }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind mock oauth provider");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider local addr")
+        );
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(mock_oauth_metadata_handler),
+            )
+            .route(
+                "/authorize",
+                axum::routing::get(mock_oauth_authorize_handler),
+            )
+            .route("/token", axum::routing::post(mock_oauth_token_handler))
+            .route("/mcp", axum::routing::post(mock_oauth_mcp_handler))
+            .with_state(MockOAuthProviderState {
+                base_url: base_url.clone(),
+                shared: Arc::clone(&shared),
+            });
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock oauth provider");
+        });
+
+        Self {
+            base_url,
+            shared,
+            handle,
+        }
+    }
+
+    fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.base_url)
+    }
+
+    async fn snapshot(&self) -> MockOAuthSnapshot {
+        let state = self.shared.lock().await;
+        MockOAuthSnapshot {
+            metadata_requests: state.metadata_requests,
+            authorize_requests: state.authorize_requests,
+            token_grants: state.token_grants.clone(),
+            pkce_verified: state.pkce_verified,
+            mcp_auth_headers: state.mcp_auth_headers.clone(),
+        }
+    }
+}
+
+impl Drop for MockOAuthProvider {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn mock_oauth_metadata_handler(
+    State(state): State<MockOAuthProviderState>,
+) -> impl IntoResponse {
+    let mut shared = state.shared.lock().await;
+    shared.metadata_requests += 1;
+
+    axum::Json(serde_json::json!({
+        "issuer": state.base_url,
+        "authorization_endpoint": format!("{}/authorize", state.base_url),
+        "token_endpoint": format!("{}/token", state.base_url)
+    }))
+}
+
+async fn mock_oauth_authorize_handler(
+    State(state): State<MockOAuthProviderState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let client_id = match params.get("client_id") {
+        Some(value) => value.clone(),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let redirect_uri = match params.get("redirect_uri") {
+        Some(value) => value.clone(),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let state_param = match params.get("state") {
+        Some(value) => value.clone(),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let code_challenge = match params.get("code_challenge") {
+        Some(value) => value.clone(),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    if params.get("code_challenge_method").map(String::as_str) != Some("S256")
+        || params.get("response_type").map(String::as_str) != Some("code")
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let code = format!("code-{}", state_param);
+    state.shared.lock().await.pending_codes.insert(
+        code.clone(),
+        PendingAuthorizationCode {
+            client_id,
+            redirect_uri: redirect_uri.clone(),
+            code_challenge,
+        },
+    );
+    state.shared.lock().await.authorize_requests += 1;
+
+    Redirect::to(&format!("{redirect_uri}?code={code}&state={state_param}")).into_response()
+}
+
+async fn mock_oauth_token_handler(
+    State(state): State<MockOAuthProviderState>,
+    Form(params): Form<HashMap<String, String>>,
+) -> Response {
+    let grant_type = match params.get("grant_type").map(String::as_str) {
+        Some(value) => value,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let mut shared = state.shared.lock().await;
+    shared.token_grants.push(grant_type.to_string());
+
+    match grant_type {
+        "authorization_code" => {
+            let code = match params.get("code") {
+                Some(value) => value,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let verifier = match params.get("code_verifier") {
+                Some(value) => value,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let client_id = match params.get("client_id") {
+                Some(value) => value,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let redirect_uri = match params.get("redirect_uri") {
+                Some(value) => value,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let pending = match shared.pending_codes.remove(code) {
+                Some(value) => value,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+
+            let verifier = oauth2::PkceCodeVerifier::new(verifier.clone());
+            let challenge = oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+            if client_id != &pending.client_id
+                || redirect_uri != &pending.redirect_uri
+                || challenge.as_str() != pending.code_challenge
+            {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+
+            shared.pkce_verified = true;
+            shared.current_access_token = "access-token-1".to_string();
+            shared.current_refresh_token = "refresh-token-1".to_string();
+
+            axum::Json(serde_json::json!({
+                "access_token": "access-token-1",
+                "refresh_token": "refresh-token-1",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read"
+            }))
+            .into_response()
+        }
+        "refresh_token" => {
+            if params.get("refresh_token").map(String::as_str)
+                != Some(shared.current_refresh_token.as_str())
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            shared.current_access_token = "access-token-2".to_string();
+            shared.current_refresh_token = "refresh-token-2".to_string();
+
+            axum::Json(serde_json::json!({
+                "access_token": "access-token-2",
+                "refresh_token": "refresh-token-2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read"
+            }))
+            .into_response()
+        }
+        _ => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+async fn mock_oauth_mcp_handler(
+    State(state): State<MockOAuthProviderState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+
+    let mut shared = state.shared.lock().await;
+    if let Some(ref header) = auth_header {
+        shared.mcp_auth_headers.push(header.clone());
+    }
+
+    let expected = format!("Bearer {}", shared.current_access_token);
+    if auth_header.as_deref() != Some(expected.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    drop(shared);
+
+    let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let method = json_body
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    let session_headers = [
+        (
+            axum::http::HeaderName::from_static("mcp-session-id"),
+            "test-session",
+        ),
+        (axum::http::header::CONTENT_TYPE, "application/json"),
+    ];
+
+    if method == "initialize" {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "tools": { "listChanged": false }
+                },
+                "serverInfo": {
+                    "name": "mock-http-server",
+                    "version": "0.1.0"
+                }
+            }
+        });
+        return (StatusCode::OK, session_headers, resp.to_string()).into_response();
+    }
+
+    if method == "notifications/initialized" {
+        return (StatusCode::ACCEPTED, session_headers, String::new()).into_response();
+    }
+
+    if method == "tools/list" {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": { "tools": [] }
+        });
+        return (StatusCode::OK, session_headers, resp.to_string()).into_response();
+    }
+
+    (StatusCode::BAD_REQUEST, session_headers, String::new()).into_response()
 }
 
 #[derive(Clone)]
@@ -1287,6 +1624,222 @@ async fn test_upstream_http_sends_protocol_version_header() {
     drop(upstream);
     store.clear().await.expect("clear OAuth store after test");
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_oauth_auth_code_exchange_persists_credentials() {
+    let provider = MockOAuthProvider::start().await;
+    let server_name = format!("oauth-code-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store.clear().await.expect("clear OAuth store before test");
+    plug_core::tls::ensure_rustls_provider_installed();
+    let result = AssertUnwindSafe(async {
+        use rmcp::transport::auth::{AuthorizationManager, OAuthClientConfig};
+
+        let mut auth_manager = AuthorizationManager::new(provider.mcp_url().as_str())
+            .await
+            .expect("create auth manager");
+        auth_manager.set_credential_store(plug_core::oauth::CompositeCredentialStore::new(
+            server_name.clone(),
+        ));
+        auth_manager.set_state_store(plug_core::oauth::CompositeStateStore::new(
+            server_name.clone(),
+        ));
+        let metadata = auth_manager
+            .discover_metadata()
+            .await
+            .expect("discover metadata");
+        auth_manager.set_metadata(metadata);
+        auth_manager
+            .configure_client(OAuthClientConfig {
+                client_id: "test-client".to_string(),
+                client_secret: None,
+                scopes: vec!["read".to_string()],
+                redirect_uri: "http://localhost:0/callback".to_string(),
+            })
+            .expect("configure oauth client");
+
+        let authorize_url = auth_manager
+            .get_authorization_url(&["read"])
+            .await
+            .expect("authorization url");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let response = client
+            .get(authorize_url)
+            .send()
+            .await
+            .expect("authorize request");
+        let redirect = reqwest::Url::parse(
+            response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("redirect header"),
+        )
+        .expect("parse redirect url");
+        let code = redirect
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization code");
+        let state = redirect
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("csrf state");
+        let state_path = oauth_state_file_path(&server_name, &state);
+        assert!(
+            state_path.exists(),
+            "state file should be persisted before token exchange"
+        );
+
+        auth_manager
+            .exchange_code_for_token(&code, &state)
+            .await
+            .expect("exchange code");
+
+        assert!(
+            !state_path.exists(),
+            "state file should be removed after token exchange"
+        );
+
+        let stored = store
+            .load()
+            .await
+            .expect("load credentials")
+            .expect("stored credentials");
+        let token = stored.token_response.expect("token response");
+        assert_eq!(token.access_token().secret(), "access-token-1");
+        assert_eq!(
+            token.refresh_token().expect("refresh token").secret(),
+            "refresh-token-1"
+        );
+
+        let snapshot = provider.snapshot().await;
+        assert_eq!(snapshot.metadata_requests, 1);
+        assert_eq!(snapshot.authorize_requests, 1);
+        assert_eq!(
+            snapshot.token_grants,
+            vec!["authorization_code".to_string()]
+        );
+        assert!(snapshot.pkce_verified);
+    })
+    .catch_unwind()
+    .await;
+
+    store.clear().await.expect("clear OAuth store after test");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test]
+async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token() {
+    let provider = MockOAuthProvider::start().await;
+    let server_name = format!("oauth-refresh-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store.clear().await.expect("clear OAuth store before test");
+    plug_core::tls::ensure_rustls_provider_installed();
+    store
+        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
+        .await
+        .expect("seed oauth credentials");
+    let mut engine: Option<Arc<Engine>> = None;
+    let result = AssertUnwindSafe(async {
+        let mut config = Config::default();
+        config.servers.insert(
+            server_name.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 10,
+                call_timeout_secs: 5,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+
+        let started_engine = Arc::new(Engine::new(config));
+        started_engine.start().await.expect("engine start");
+        engine = Some(Arc::clone(&started_engine));
+
+        let startup_snapshot = provider.snapshot().await;
+        assert!(
+            startup_snapshot
+                .mcp_auth_headers
+                .iter()
+                .any(|header| header == "Bearer access-token-1"),
+            "startup should use the seeded access token"
+        );
+
+        let refresh =
+            oauth::refresh_access_token(&server_name, &provider.mcp_url(), Some("test-client"))
+                .await;
+        assert!(
+            matches!(refresh, plug_core::oauth::RefreshResult::Refreshed),
+            "expected refresh success, got {refresh:?}"
+        );
+
+        started_engine
+            .reconnect_server(&server_name)
+            .await
+            .expect("reconnect with refreshed token");
+
+        let stored = store
+            .load()
+            .await
+            .expect("load refreshed credentials")
+            .expect("stored credentials");
+        let token = stored.token_response.expect("token response");
+        assert_eq!(token.access_token().secret(), "access-token-2");
+        assert_eq!(
+            token.refresh_token().expect("refresh token").secret(),
+            "refresh-token-2"
+        );
+
+        let snapshot = provider.snapshot().await;
+        assert!(
+            snapshot
+                .token_grants
+                .iter()
+                .any(|grant| grant == "refresh_token"),
+            "refresh flow should use refresh_token grant"
+        );
+        assert!(
+            snapshot
+                .mcp_auth_headers
+                .iter()
+                .any(|header| header == "Bearer access-token-2"),
+            "reconnect should use the refreshed access token"
+        );
+    })
+    .catch_unwind()
+    .await;
+
+    if let Some(engine) = engine {
+        tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+    }
+    store.clear().await.expect("clear OAuth store after test");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 // ---------------------------------------------------------------------------
