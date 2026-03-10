@@ -1,12 +1,12 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "051"
 tags: [code-review, oauth, security, correctness]
 dependencies: []
 ---
 
-# Replace string-based auth failure classification with typed path
+# Replace divergent auth failure classification with shared path
 
 ## Problem Statement
 
@@ -63,6 +63,7 @@ eliminate the classification problem entirely.
 
 - 2026-03-09: Identified during PR #42 CE review (security-sentinel, code-simplicity-reviewer)
 - 2026-03-09: Implemented a shared classifier in `oauth.rs`, reused it from the reconnect path in `engine.rs`, and added unit coverage for metadata-discovery and `4018` false positives.
+- 2026-03-10: Merged to `main` via PR #43 and verified in the post-merge truth pass.
 
 ## Resources
 
