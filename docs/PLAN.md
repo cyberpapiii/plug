@@ -9,7 +9,7 @@ This document tracks the current product state and the next remaining work after
 forwarding work:
 
 - stabilization and truth fixes
-- notification forwarding (logging, tools/list_changed, resources/list_changed, prompts/list_changed)
+- notification forwarding (logging, tools/list_changed, resources/list_changed, prompts/list_changed, `AuthStateChanged` observability via logging-channel fan-out)
 - progress and cancellation routing
 - resources/prompts forwarding with subscribe/unsubscribe lifecycle
 - completion forwarding across all three transports (stdio, HTTP, IPC)
@@ -28,7 +28,7 @@ forwarding work:
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support (PR #35)
 - OAuth 2.1 + PKCE upstream auth with credential storage (keyring + file fallback), background token refresh, AuthRequired health state, CLI auth commands, and doctor checks (PR #36)
 - daemon IPC notification parity: progress, cancelled, and list_changed push forwarding across IPC (PR #38)
-- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, cache reload error propagation, and reconnect retry without re-refreshing after transient failure (PR #42, PR #43, PR #44)
+- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, cache reload error propagation, reconnect retry without re-refreshing after transient failure, and non-IPC `AuthStateChanged` observability via logging fan-out (PR #42, PR #43, PR #44, PR #45)
 
 ## What Exists Today
 
@@ -49,6 +49,8 @@ All major roadmap features are now implemented on `main`. The remaining work is 
 ### OAuth follow-up polish
 
 - mock OAuth provider integration tests
+- successful refresh notification distinct from generic reconnect visibility
+- manual refresh IPC command / decision on whether it is warranted
 
 ### Documentation and release hygiene
 
