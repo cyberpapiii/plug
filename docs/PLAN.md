@@ -28,7 +28,7 @@ forwarding work:
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support (PR #35)
 - OAuth 2.1 + PKCE upstream auth with credential storage (keyring + file fallback), background token refresh, AuthRequired health state, CLI auth commands, doctor checks, and correct HTTP auth header construction (PR #36, PR #47)
 - daemon IPC notification parity: progress, cancelled, and list_changed push forwarding across IPC (PR #38)
-- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, cache reload error propagation, reconnect retry without re-refreshing after transient failure, and non-IPC `AuthStateChanged` observability via logging fan-out (PR #42, PR #43, PR #44, PR #45)
+- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, cache reload error propagation, reconnect retry without re-refreshing after transient failure, non-IPC `AuthStateChanged` observability via logging fan-out, and a distinct refresh-exchange observability signal (PR #42, PR #43, PR #44, PR #45, PR #50)
 
 ## What Exists Today
 
@@ -49,7 +49,6 @@ All major roadmap features are now implemented on `main`. The remaining work is 
 ### OAuth follow-up polish
 
 - mock OAuth provider integration tests
-- successful refresh notification distinct from generic reconnect visibility
 - manual refresh IPC command / decision on whether it is warranted
 
 ### Documentation and release hygiene

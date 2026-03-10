@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `e53b196` (post-merge truth pass for PR #47 HTTP OAuth auth header fix)
+Baseline: `main` @ `750080d` (post-merge truth pass for PR #50 refresh-exchange observability)
 
 This is the canonical current-state doc for the project.
 
@@ -35,12 +35,12 @@ Implemented on `main`:
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
 - `plug auth complete` for non-interactive OAuth code exchange (PR #40)
 - IPC auth commands: `AuthStatus` query, `InjectToken` credential injection with server reconnect, `AuthStateChanged` push notification (PR #41)
-- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, reconnect retry without re-refreshing after transient failure, and `AuthStateChanged` observability for non-IPC clients via logging-channel fan-out (PR #42, PR #43, PR #44, PR #45)
+- zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, reconnect retry without re-refreshing after transient failure, `AuthStateChanged` observability for non-IPC clients via logging-channel fan-out, and a distinct refresh-exchange observability signal (PR #42, PR #43, PR #44, PR #45, PR #50)
 
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- OAuth follow-up items: mock OAuth integration tests, successful refresh notification distinct from reconnect visibility, manual refresh IPC command / explicit decision on whether it is warranted
+- OAuth follow-up items: mock OAuth integration tests, manual refresh IPC command / explicit decision on whether it is warranted
 
 ## What Exists Off-Main
 
