@@ -56,6 +56,7 @@ Use a record/replay HTTP library to capture real OAuth interactions and replay t
 ## Work Log
 
 - 2026-03-09: Formalized as tracked todo (previously only in PLAN.md)
+- 2026-03-10: Blocker removed — PR #47 established HTTP OAuth integration test pattern in `integration_tests.rs`; mock OAuth provider tests are now unblocked
 
 ## Resources
 
