@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `fcd6c3f` (post-merge truth pass after PR #50 refresh-exchange observability)
+Baseline: `main` @ `9ce21f8` (tracker/truth sync after PRs #47, #48, #50, #51)
 
 This is the canonical current-state doc for the project.
 
