@@ -532,16 +532,20 @@ impl ServerHandler for IpcProxyHandler {
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
+            let params = request
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             match self
                 .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
                     IpcRequest::McpRequest {
                         session_id: session_id.to_string(),
                         method: "tools/list".to_string(),
-                        params: None,
+                        params: params.clone(),
                     }
                 })
                 .await?

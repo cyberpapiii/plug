@@ -15,7 +15,7 @@ use fs2::FileExt as _;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult, RequestId,
+    CreateMessageRequestParams, CreateMessageResult, PaginatedRequestParams, RequestId,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
@@ -1656,8 +1656,9 @@ async fn dispatch_mcp_request(
                 .map(|info| plug_core::client_detect::detect_client(&info))
                 .unwrap_or(plug_core::types::ClientType::Unknown);
 
-            let tools = tool_router.list_tools_for_client(client_type);
-            let result = rmcp::model::ListToolsResult::with_all_items((*tools).clone());
+            let request = params
+                .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
+            let result = tool_router.list_tools_page_for_client(client_type, request);
             match serde_json::to_value(result) {
                 Ok(payload) => IpcResponse::McpResponse { payload },
                 Err(e) => IpcResponse::Error {
@@ -1668,7 +1669,9 @@ async fn dispatch_mcp_request(
         }
 
         "resources/list" => {
-            let result = tool_router.list_resources_page(None);
+            let request = params
+                .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
+            let result = tool_router.list_resources_page(request);
             match serde_json::to_value(result) {
                 Ok(payload) => IpcResponse::McpResponse { payload },
                 Err(e) => IpcResponse::Error {
@@ -1679,7 +1682,9 @@ async fn dispatch_mcp_request(
         }
 
         "resources/templates/list" => {
-            let result = tool_router.list_resource_templates_page(None);
+            let request = params
+                .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
+            let result = tool_router.list_resource_templates_page(request);
             match serde_json::to_value(result) {
                 Ok(payload) => IpcResponse::McpResponse { payload },
                 Err(e) => IpcResponse::Error {
@@ -1719,7 +1724,9 @@ async fn dispatch_mcp_request(
         }
 
         "prompts/list" => {
-            let result = tool_router.list_prompts_page(None);
+            let request = params
+                .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
+            let result = tool_router.list_prompts_page(request);
             match serde_json::to_value(result) {
                 Ok(payload) => IpcResponse::McpResponse { payload },
                 Err(e) => IpcResponse::Error {
