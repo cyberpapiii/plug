@@ -1,65 +1,45 @@
 # Risk Register
 
-This register reflects the current post-Phase-3 state rather than the earlier stabilization-era
-gaps.
+This register lists only the current remaining risks on `main`.
 
 ## High
 
-### Stateless MCP evolution may outpace the current session boundary
+### Runtime reconfiguration scope is still undecided
 
 **Impact:** High  
 **Likelihood:** Medium
 
-The new `SessionStore` seam and design notes prepare for stateless downstream handling, but they do
-not implement it. If the ecosystem moves quickly toward stateless-by-default clients, `plug` will
-need a deliberate follow-on tranche.
-
-### Tasks / post-June-2026 MCP features remain unimplemented
-
-**Impact:** High  
-**Likelihood:** Medium
-
-`plug` now covers the core current protocol surface well, but future-facing spec work such as Tasks
-and adjacent workflow primitives remains deferred.
+`plug` does not yet support fully live runtime reconfiguration. The remaining risk is product-scope
+ambiguity rather than a known implementation defect: the project still needs an explicit decision on
+whether full live reconfiguration is required for the intended production-ready bar.
 
 ## Medium
 
-### Shared-runtime truth can drift again if the docs stop moving with the code
+### Manual refresh command remains an open product decision
 
 **Impact:** Medium  
 **Likelihood:** Medium
 
-The codebase already went through one major truth pass. The risk now is regression: merged behavior
-changes faster than the tracked docs are updated.
+OAuth refresh now works automatically in the background, but `main` still carries an open decision
+about whether a manual refresh IPC command is warranted. The risk is not missing core auth support;
+it is leaving operator UX and recovery policy ambiguous.
 
-### Upstream server diversity is still a practical reliability challenge
-
-**Impact:** Medium  
-**Likelihood:** Medium
-
-`plug` now has much better continuity and resilience, but upstream MCP servers remain uneven in
-quality, latency, and shutdown behavior.
-
-### Meta-tool strategy is still intentionally minimal
+### Shared-truth docs can drift from `main` if updates lag behind merges
 
 **Impact:** Medium  
 **Likelihood:** Medium
 
-The current meta-tool mode is useful and truthful, but it is not a full dynamic tool-management or
-quarantine system.
+The current truth docs are much healthier than before, but the project still depends on disciplined
+post-merge maintenance of `docs/PLAN.md`, `docs/PROJECT-STATE-SNAPSHOT.md`, `CLAUDE.md`, and the
+`todos/` inventory. Without that discipline, the repo can drift back into stale-status reporting.
 
 ## Low
 
-### TUI dependency confusion
+### Daemon continuity proof is still narrower than full cross-transport recovery
 
 **Impact:** Low  
 **Likelihood:** Medium
 
-Some TUI-era crates remain in the manifests even though there is no active TUI product surface.
+`main` proves daemon continuity for the stdio-over-IPC recovery path, but not as a broad
+cross-transport continuity guarantee. This is a remaining confidence gap, not a known regression.
 
-### Windows parity
-
-**Impact:** Low  
-**Likelihood:** Medium
-
-The current daemon/process model is still primarily exercised on Unix-like systems.
