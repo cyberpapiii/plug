@@ -68,6 +68,19 @@ pub(crate) async fn cmd_overview(
 
     let config = plug_core::config::load_config(Some(&config_path))?;
     let daemon_running = crate::daemon::connect_to_daemon().await.is_some();
+    let downstream_auth_mode = config.http.auth_mode.label();
+    let downstream_auth_summary = match config.http.auth_mode {
+        plug_core::config::DownstreamAuthMode::Auto => {
+            if plug_core::config::http_bind_is_loopback(&config.http.bind_address) {
+                "auto (loopback => no auth)"
+            } else {
+                "auto (non-loopback => bearer)"
+            }
+        }
+        plug_core::config::DownstreamAuthMode::None => "explicit none",
+        plug_core::config::DownstreamAuthMode::Bearer => "explicit bearer",
+        plug_core::config::DownstreamAuthMode::Oauth => "oauth (authorization-code + PKCE)",
+    };
 
     print_heading("Overview");
     print_label_value("Path", style(config_path.display()).dim());
@@ -89,6 +102,17 @@ pub(crate) async fn cmd_overview(
             style("stopped").yellow().bold()
         },
     );
+    print_label_value(
+        "Downstream Auth",
+        if downstream_auth_mode == "auto" {
+            style(downstream_auth_summary).bold()
+        } else {
+            style(downstream_auth_summary).yellow().bold()
+        },
+    );
+    if let Some(public_base_url) = &config.http.public_base_url {
+        print_label_value("Public URL", public_base_url);
+    }
 
     if !linked_clients.is_empty() {
         print_label_value("Linked", linked_clients.join(", "));
@@ -130,20 +154,46 @@ pub(crate) async fn cmd_status(
 
     // Load config to check HTTP auth status
     let config = plug_core::config::load_config(config_path).ok();
+    let downstream_auth_info = config.as_ref().map(|c| {
+        let mode = c.http.auth_mode.label();
+        let summary = match c.http.auth_mode {
+            plug_core::config::DownstreamAuthMode::Auto => {
+                if plug_core::config::http_bind_is_loopback(&c.http.bind_address) {
+                    "loopback => no auth".to_string()
+                } else {
+                    "non-loopback => bearer".to_string()
+                }
+            }
+            plug_core::config::DownstreamAuthMode::None => "explicit none".to_string(),
+            plug_core::config::DownstreamAuthMode::Bearer => "explicit bearer".to_string(),
+            plug_core::config::DownstreamAuthMode::Oauth => {
+                "authorization-code + PKCE".to_string()
+            }
+        };
+        (mode.to_string(), summary, c.http.public_base_url.clone())
+    });
     let http_auth_info = config.as_ref().and_then(|c| {
-        if plug_core::config::http_bind_is_loopback(&c.http.bind_address) {
-            None
-        } else {
-            let token_path = plug_core::auth::http_auth_token_path(c.http.port);
-            let token = if show_token {
-                std::fs::read_to_string(&token_path)
-                    .ok()
-                    .map(|t| t.trim().to_string())
-            } else {
-                None
-            };
-            Some((token_path.exists(), token))
+        let expects_bearer = match c.http.auth_mode {
+            plug_core::config::DownstreamAuthMode::Bearer => true,
+            plug_core::config::DownstreamAuthMode::Auto => {
+                !plug_core::config::http_bind_is_loopback(&c.http.bind_address)
+            }
+            plug_core::config::DownstreamAuthMode::None
+            | plug_core::config::DownstreamAuthMode::Oauth => false,
+        };
+        if !expects_bearer {
+            return None;
         }
+
+        let token_path = plug_core::auth::http_auth_token_path(c.http.port);
+        let token = if show_token {
+            std::fs::read_to_string(&token_path)
+                .ok()
+                .map(|t| t.trim().to_string())
+        } else {
+            None
+        };
+        Some((token_path.exists(), token))
     });
 
     if let Ok(plug_core::ipc::IpcResponse::Status {
@@ -161,6 +211,19 @@ pub(crate) async fn cmd_status(
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             print_label_value("Clients", style(clients.to_string()).bold());
+            if let Some((mode, summary, public_base_url)) = &downstream_auth_info {
+                print_label_value(
+                    "Downstream Auth",
+                    if mode == "auto" {
+                        style(format!("{mode} ({summary})")).bold()
+                    } else {
+                        style(format!("{mode} ({summary})")).yellow().bold()
+                    },
+                );
+                if let Some(public_base_url) = public_base_url {
+                    print_label_value("Public URL", public_base_url);
+                }
+            }
 
             // Show HTTP auth status
             if let Some((token_exists, token)) = &http_auth_info {
@@ -213,6 +276,13 @@ pub(crate) async fn cmd_status(
             }
         } else {
             let mut json_obj = serde_json::json!({ "uptime": uptime_secs, "clients": clients, "servers": servers });
+            if let Some((mode, summary, public_base_url)) = &downstream_auth_info {
+                json_obj["downstream_auth"] = serde_json::json!({
+                    "mode": mode,
+                    "summary": summary,
+                    "public_base_url": public_base_url,
+                });
+            }
             if let Some((token_exists, token)) = &http_auth_info {
                 json_obj["http_auth"] = serde_json::json!({
                     "enabled": *token_exists,

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -41,11 +42,13 @@ pub struct HttpState {
     pub router: Arc<ToolRouter>,
     pub sessions: Arc<dyn SessionStore>,
     pub cancel: CancellationToken,
+    pub auth_mode: crate::config::DownstreamAuthMode,
+    pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
     pub sse_channel_capacity: usize,
     pub allowed_origins: Vec<Arc<str>>,
     pub notification_task_started: AtomicBool,
     /// Bearer token for downstream client authentication.
-    /// `None` means no auth required (loopback-only server).
+    /// `None` means the current downstream auth mode does not require bearer auth.
     pub auth_token: Option<Arc<str>>,
     /// Sessions whose clients advertise `roots` capability.
     pub roots_capable_sessions: DashMap<String, ()>,
@@ -280,6 +283,12 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
     // Discovery endpoint — exempt from origin validation
     let discovery = Router::new()
         .route("/.well-known/mcp.json", get(get_server_card))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(get_oauth_authorization_server_metadata),
+        )
+        .route("/oauth/authorize", get(oauth_authorize_not_implemented))
+        .route("/oauth/token", post(oauth_token_not_implemented))
         .with_state(state.clone());
 
     // MCP protocol routes — protected by auth + origin validation middleware
@@ -323,6 +332,17 @@ fn check_bearer_token(headers: &HeaderMap, expected: &str) -> bool {
         .is_some_and(|token| crate::auth::verify_auth_token(token, expected))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct OAuthAuthorizeParams {
+    response_type: String,
+    client_id: String,
+    redirect_uri: String,
+    state: String,
+    code_challenge: String,
+    code_challenge_method: String,
+    scope: Option<String>,
+}
+
 /// Validate bearer token for non-loopback HTTP servers.
 ///
 /// When `HttpState.auth_token` is `Some`, requests must include a valid
@@ -332,6 +352,30 @@ async fn validate_bearer_auth(
     mut req: Request,
     next: Next,
 ) -> Result<Response, HttpError> {
+    if state.auth_mode == crate::config::DownstreamAuthMode::Oauth {
+        let manager = state
+            .downstream_oauth
+            .as_ref()
+            .ok_or_else(|| HttpError::Internal("missing downstream OAuth manager".to_string()))?;
+        let auth_status = if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
+            let auth = auth_header
+                .to_str()
+                .map_err(|_| HttpError::Unauthorized)?
+                .strip_prefix("Bearer ")
+                .ok_or(HttpError::Unauthorized)?;
+            if manager.validate_access_token(auth).await {
+                AuthStatus::Authenticated
+            } else {
+                return Err(HttpError::Unauthorized);
+            }
+        } else {
+            return Err(HttpError::Unauthorized);
+        };
+
+        req.extensions_mut().insert(auth_status);
+        return Ok(next.run(req).await);
+    }
+
     let auth_status = match &state.auth_token {
         None => AuthStatus::NoAuthRequired,
         Some(expected) => {
@@ -736,6 +780,151 @@ async fn get_server_card(
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+async fn get_oauth_authorization_server_metadata(
+    State(state): State<Arc<HttpState>>,
+) -> impl IntoResponse {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let base = manager.config.public_base_url.trim_end_matches('/');
+    let response = Json(json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{base}/oauth/authorize"),
+        "token_endpoint": format!("{base}/oauth/token"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+        "scopes_supported": manager.config.oauth_scopes,
+    }));
+    (StatusCode::OK, response).into_response()
+}
+
+async fn oauth_authorize_not_implemented(
+    State(state): State<Arc<HttpState>>,
+    Query(params): Query<OAuthAuthorizeParams>,
+) -> impl IntoResponse {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if params.response_type != "code" {
+        return (StatusCode::BAD_REQUEST, "unsupported response_type").into_response();
+    }
+
+    match manager
+        .build_authorize_redirect(
+            &params.client_id,
+            &params.redirect_uri,
+            &params.state,
+            &params.code_challenge,
+            &params.code_challenge_method,
+            params.scope.as_deref(),
+        )
+        .await
+    {
+        Ok(location) => {
+            let mut response = StatusCode::FOUND.into_response();
+            if let Ok(value) = HeaderValue::from_str(&location) {
+                response.headers_mut().insert(header::LOCATION, value);
+                response
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid redirect location generated",
+                )
+                    .into_response()
+            }
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            format!("authorization request rejected: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn oauth_token_not_implemented(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    Form(params): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let grant_type = match params.get("grant_type").map(String::as_str) {
+        Some(value) => value,
+        None => return (StatusCode::BAD_REQUEST, "missing grant_type").into_response(),
+    };
+
+    let (client_id, client_secret) = match manager.client_credentials_from_headers_or_form(
+        &headers,
+        params.get("client_id").map(String::as_str),
+        params.get("client_secret").map(String::as_str),
+    ) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                format!("client authentication failed: {error}"),
+            )
+                .into_response()
+        }
+    };
+
+    let result = match grant_type {
+        "authorization_code" => {
+            let code = match params.get("code") {
+                Some(value) => value,
+                None => return (StatusCode::BAD_REQUEST, "missing code").into_response(),
+            };
+            let redirect_uri = match params.get("redirect_uri") {
+                Some(value) => value,
+                None => return (StatusCode::BAD_REQUEST, "missing redirect_uri").into_response(),
+            };
+            let code_verifier = match params.get("code_verifier") {
+                Some(value) => value,
+                None => return (StatusCode::BAD_REQUEST, "missing code_verifier").into_response(),
+            };
+            manager
+                .exchange_authorization_code(
+                    &client_id,
+                    client_secret.as_deref(),
+                    code,
+                    redirect_uri,
+                    code_verifier,
+                )
+                .await
+        }
+        "refresh_token" => {
+            let refresh_token = match params.get("refresh_token") {
+                Some(value) => value,
+                None => return (StatusCode::BAD_REQUEST, "missing refresh_token").into_response(),
+            };
+            manager
+                .exchange_refresh_token(&client_id, client_secret.as_deref(), refresh_token)
+                .await
+        }
+        _ => return (StatusCode::BAD_REQUEST, "unsupported grant_type").into_response(),
+    };
+
+    match result {
+        Ok(token) => {
+            let body = json!({
+                "access_token": token.access_token,
+                "refresh_token": token.refresh_token,
+                "token_type": "Bearer",
+                "expires_in": token.expires_in,
+                "scope": token.scope,
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, format!("token exchange failed: {error}")).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1344,8 @@ mod tests {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -1351,6 +1542,8 @@ mod tests {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
             sse_channel_capacity: 32,
             allowed_origins: vec![Arc::from("https://claude.ai")],
             notification_task_started: AtomicBool::new(false),
@@ -2065,6 +2258,8 @@ mod tests {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Bearer,
+            downstream_oauth: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2166,6 +2361,230 @@ mod tests {
         // Should NOT be 403 (origin rejected) — should pass through to handler
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_metadata_endpoint_returns_server_metadata() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
+                crate::downstream_oauth::DownstreamOauthConfig {
+                    public_base_url: "https://plug.example.com".to_string(),
+                    oauth_client_id: Some("client-123".to_string()),
+                    oauth_client_secret: None,
+                    oauth_scopes: vec!["tools:read".to_string()],
+                },
+            )),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .expect("body bytes");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(
+            value["authorization_endpoint"],
+            "https://plug.example.com/oauth/authorize"
+        );
+        assert_eq!(value["token_endpoint"], "https://plug.example.com/oauth/token");
+        assert_eq!(value["scopes_supported"][0], "tools:read");
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_requires_access_token_for_mcp_requests() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
+                crate::downstream_oauth::DownstreamOauthConfig {
+                    public_base_url: "https://plug.example.com".to_string(),
+                    oauth_client_id: Some("client-123".to_string()),
+                    oauth_client_secret: None,
+                    oauth_scopes: vec!["tools:read".to_string()],
+                },
+            )),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oauth_authorization_code_flow_issues_working_access_token() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
+                crate::downstream_oauth::DownstreamOauthConfig {
+                    public_base_url: "https://plug.example.com".to_string(),
+                    oauth_client_id: Some("client-123".to_string()),
+                    oauth_client_secret: Some("secret-123".to_string().into()),
+                    oauth_scopes: vec!["tools:read".to_string()],
+                },
+            )),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let authorize_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/oauth/authorize?response_type=code&client_id=client-123&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=abc123&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools:read")
+            .body(Body::empty())
+            .unwrap();
+        let authorize_resp = app.clone().oneshot(authorize_req).await.unwrap();
+        assert_eq!(authorize_resp.status(), StatusCode::FOUND);
+        let location = authorize_resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect location");
+        let code = location
+            .split("code=")
+            .nth(1)
+            .and_then(|v| v.split('&').next())
+            .expect("authorization code");
+
+        let token_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header(
+                header::AUTHORIZATION,
+                "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz",
+            )
+            .body(Body::from(format!(
+                "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+            )))
+            .unwrap();
+        let token_resp = app.clone().oneshot(token_req).await.unwrap();
+        assert_eq!(token_resp.status(), StatusCode::OK);
+        let token_body = axum::body::to_bytes(token_resp.into_body(), 10_000)
+            .await
+            .expect("token body");
+        let token_value: serde_json::Value =
+            serde_json::from_slice(&token_body).expect("token json");
+        let access_token = token_value["access_token"]
+            .as_str()
+            .expect("access token")
+            .to_string();
+        let refresh_token = token_value["refresh_token"]
+            .as_str()
+            .expect("refresh token")
+            .to_string();
+        assert_eq!(token_value["token_type"], "Bearer");
+
+        let mcp_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {access_token}"))
+            .body(Body::from("{}"))
+            .unwrap();
+        let mcp_resp = app.clone().oneshot(mcp_req).await.unwrap();
+        assert_eq!(mcp_resp.status(), StatusCode::BAD_REQUEST);
+
+        let refresh_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header(
+                header::AUTHORIZATION,
+                "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz",
+            )
+            .body(Body::from(format!(
+                "grant_type=refresh_token&refresh_token={refresh_token}"
+            )))
+            .unwrap();
+        let refresh_resp = app.oneshot(refresh_req).await.unwrap();
+        assert_eq!(refresh_resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

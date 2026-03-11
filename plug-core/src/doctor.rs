@@ -819,64 +819,100 @@ async fn check_client_configs() -> CheckResult {
     }
 }
 
-/// Check 11: HTTP auth for non-loopback bind addresses.
+/// Check 11: Downstream HTTP auth configuration and token state.
 async fn check_http_auth(config: &Config) -> CheckResult {
     let name = "http_auth".to_string();
 
-    if crate::config::http_bind_is_loopback(&config.http.bind_address) {
-        return CheckResult {
+    match config.http.auth_mode {
+        crate::config::DownstreamAuthMode::None => CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: "HTTP server bound to loopback (auth not required)".to_string(),
+            message: if crate::config::http_bind_is_loopback(&config.http.bind_address) {
+                "HTTP auth disabled explicitly (loopback/local-only deployment)".to_string()
+            } else {
+                "HTTP auth disabled explicitly".to_string()
+            },
             fix_suggestion: None,
-        };
-    }
-
-    let token_path = crate::auth::http_auth_token_path(config.http.port);
-
-    if !token_path.exists() {
-        return CheckResult {
+        },
+        crate::config::DownstreamAuthMode::Oauth => CheckResult {
             name,
-            status: CheckStatus::Warn,
-            message: format!(
-                "HTTP server bound to {} (non-loopback) but auth token not yet generated — run `plug serve` to initialize",
-                config.http.bind_address
-            ),
-            fix_suggestion: Some(
-                "Run `plug serve` to auto-generate an auth token, or set bind_address = \"127.0.0.1\" for local-only access".to_string(),
-            ),
-        };
-    }
+            status: CheckStatus::Pass,
+            message: "HTTP auth mode is oauth (metadata, authorization, token, and bearer validation active)".to_string(),
+            fix_suggestion: None,
+        },
+        crate::config::DownstreamAuthMode::Auto | crate::config::DownstreamAuthMode::Bearer => {
+            let requires_token = matches!(config.http.auth_mode, crate::config::DownstreamAuthMode::Bearer)
+                || !crate::config::http_bind_is_loopback(&config.http.bind_address);
 
-    // Check file permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&token_path) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode != 0o600 {
+            if !requires_token {
+                return CheckResult {
+                    name,
+                    status: CheckStatus::Pass,
+                    message: "HTTP auth in auto mode resolves to no auth on loopback".to_string(),
+                    fix_suggestion: None,
+                };
+            }
+
+            let token_path = crate::auth::http_auth_token_path(config.http.port);
+
+            if !token_path.exists() {
                 return CheckResult {
                     name,
                     status: CheckStatus::Warn,
-                    message: format!(
-                        "Auth token file has permissions {:o} (should be 600): {}",
-                        mode,
-                        token_path.display()
+                    message: match config.http.auth_mode {
+                        crate::config::DownstreamAuthMode::Bearer => format!(
+                            "HTTP auth mode is bearer but auth token is not yet generated — run `plug serve` to initialize ({})",
+                            token_path.display()
+                        ),
+                        crate::config::DownstreamAuthMode::Auto => format!(
+                            "HTTP auth in auto mode resolves to bearer for bind {} but auth token is not yet generated — run `plug serve` to initialize",
+                            config.http.bind_address
+                        ),
+                        _ => unreachable!("requires_token only applies to auto/bearer"),
+                    },
+                    fix_suggestion: Some(
+                        "Run `plug serve` to auto-generate an auth token, or change http.auth_mode for your deployment".to_string(),
                     ),
-                    fix_suggestion: Some(format!("Run: chmod 600 {}", token_path.display())),
                 };
             }
-        }
-    }
 
-    CheckResult {
-        name,
-        status: CheckStatus::Pass,
-        message: format!(
-            "HTTP auth token configured for non-loopback bind ({})",
-            config.http.bind_address
-        ),
-        fix_suggestion: None,
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&token_path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode != 0o600 {
+                        return CheckResult {
+                            name,
+                            status: CheckStatus::Warn,
+                            message: format!(
+                                "Auth token file has permissions {:o} (should be 600): {}",
+                                mode,
+                                token_path.display()
+                            ),
+                            fix_suggestion: Some(format!("Run: chmod 600 {}", token_path.display())),
+                        };
+                    }
+                }
+            }
+
+            CheckResult {
+                name,
+                status: CheckStatus::Pass,
+                message: match config.http.auth_mode {
+                    crate::config::DownstreamAuthMode::Bearer => format!(
+                        "HTTP bearer auth token configured ({})",
+                        token_path.display()
+                    ),
+                    crate::config::DownstreamAuthMode::Auto => format!(
+                        "HTTP auth in auto mode resolves to bearer for bind {}",
+                        config.http.bind_address
+                    ),
+                    _ => unreachable!("requires_token only applies to auto/bearer"),
+                },
+                fix_suggestion: None,
+            }
+        }
     }
 }
 
@@ -1163,6 +1199,48 @@ mod tests {
         let result = check_env_vars(&config).await;
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
+    }
+
+    // -- check_http_auth --
+
+    #[tokio::test]
+    async fn http_auth_auto_loopback_passes_without_token() {
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Auto;
+        config.http.bind_address = "127.0.0.1".to_string();
+        config.http.port = 62001;
+
+        let result = check_http_auth(&config).await;
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("auto mode"));
+    }
+
+    #[tokio::test]
+    async fn http_auth_bearer_on_loopback_warns_when_token_missing() {
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Bearer;
+        config.http.bind_address = "127.0.0.1".to_string();
+        config.http.port = 62002;
+
+        let token_path = crate::auth::http_auth_token_path(config.http.port);
+        let _ = std::fs::remove_file(&token_path);
+
+        let result = check_http_auth(&config).await;
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("auth mode is bearer"));
+    }
+
+    #[tokio::test]
+    async fn http_auth_oauth_warns_as_unimplemented() {
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
+        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.oauth_client_id = Some("client-123".to_string());
+        config.http.port = 62003;
+
+        let result = check_http_auth(&config).await;
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("authorization"));
     }
 
     // -- check_server_binaries --

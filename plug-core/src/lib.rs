@@ -5,6 +5,7 @@ pub mod circuit;
 pub mod client_detect;
 pub mod config;
 pub mod doctor;
+pub mod downstream_oauth;
 pub mod dotenv;
 pub mod engine;
 pub mod enrichment;

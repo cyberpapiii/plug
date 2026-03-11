@@ -322,20 +322,17 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     );
     sessions.spawn_cleanup_task(engine.cancel_token().clone());
     let tool_router = engine.tool_router().clone();
-    // Generate or load auth token for non-loopback bind addresses
-    let auth_token = if !plug_core::config::http_bind_is_loopback(&config.http.bind_address) {
-        let token_path = plug_core::auth::http_auth_token_path(config.http.port);
-        let token = plug_core::auth::load_or_generate_token(&token_path)?;
-        tracing::info!("HTTP auth enabled (non-loopback bind address)");
-        Some(Arc::<str>::from(token.as_str()))
-    } else {
-        None
-    };
+    let auth_token = resolve_downstream_bearer_token(&config.http)?;
+    let downstream_oauth =
+        plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
+            .map(plug_core::downstream_oauth::DownstreamOauthManager::new);
 
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: tool_router.clone(),
         sessions,
         cancel: engine.cancel_token().clone(),
+        auth_mode: config.http.auth_mode.clone(),
+        downstream_oauth,
         sse_channel_capacity: config.http.sse_channel_capacity,
         allowed_origins: config
             .http
@@ -379,6 +376,31 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     let router = plug_core::http::server::build_router(http_state);
     serve_router(router, &config.http, engine.cancel_token().clone()).await?;
     Ok(())
+}
+
+fn resolve_downstream_bearer_token(
+    http: &plug_core::config::HttpConfig,
+) -> anyhow::Result<Option<Arc<str>>> {
+    match http.auth_mode {
+        plug_core::config::DownstreamAuthMode::Auto => {
+            if !plug_core::config::http_bind_is_loopback(&http.bind_address) {
+                let token_path = plug_core::auth::http_auth_token_path(http.port);
+                let token = plug_core::auth::load_or_generate_token(&token_path)?;
+                tracing::info!("HTTP auth enabled (auto mode on non-loopback bind address)");
+                Ok(Some(Arc::<str>::from(token.as_str())))
+            } else {
+                Ok(None)
+            }
+        }
+        plug_core::config::DownstreamAuthMode::None => Ok(None),
+        plug_core::config::DownstreamAuthMode::Bearer => {
+            let token_path = plug_core::auth::http_auth_token_path(http.port);
+            let token = plug_core::auth::load_or_generate_token(&token_path)?;
+            tracing::info!("HTTP bearer auth enabled");
+            Ok(Some(Arc::<str>::from(token.as_str())))
+        }
+        plug_core::config::DownstreamAuthMode::Oauth => Ok(None),
+    }
 }
 
 async fn serve_router(
@@ -454,6 +476,11 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let http = plug_core::config::HttpConfig {
+            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+            public_base_url: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            oauth_scopes: None,
             bind_address: "127.0.0.1".to_string(),
             port: addr.port(),
             allowed_origins: Vec::new(),
@@ -522,6 +549,8 @@ mod tests {
             router: engine.tool_router().clone(),
             sessions,
             cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -630,5 +659,34 @@ mod tests {
 
         cancel.cancel();
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn resolve_downstream_bearer_token_auto_loopback_disables_auth() {
+        let http = plug_core::config::HttpConfig::default();
+        let token = resolve_downstream_bearer_token(&http).expect("resolve token");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn resolve_downstream_bearer_token_none_disables_auth() {
+        let http = plug_core::config::HttpConfig {
+            auth_mode: plug_core::config::DownstreamAuthMode::None,
+            bind_address: "0.0.0.0".to_string(),
+            ..plug_core::config::HttpConfig::default()
+        };
+        let token = resolve_downstream_bearer_token(&http).expect("resolve token");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn resolve_downstream_bearer_token_oauth_uses_non_bearer_path() {
+        let http = plug_core::config::HttpConfig {
+            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+            public_base_url: Some("https://plug.example.com".to_string()),
+            ..plug_core::config::HttpConfig::default()
+        };
+        let token = resolve_downstream_bearer_token(&http).expect("oauth should skip bearer token");
+        assert!(token.is_none());
     }
 }

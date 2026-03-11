@@ -74,6 +74,18 @@ impl Default for Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpConfig {
+    /// Downstream authentication mode for remote HTTP clients.
+    #[serde(default)]
+    pub auth_mode: DownstreamAuthMode,
+    /// Public base URL used by remote clients to reach this server.
+    pub public_base_url: Option<String>,
+    /// OAuth client ID for downstream remote connectors.
+    pub oauth_client_id: Option<String>,
+    /// OAuth client secret for downstream remote connectors.
+    pub oauth_client_secret: Option<crate::types::SecretString>,
+    /// OAuth scopes to request for downstream remote connectors.
+    #[serde(default)]
+    pub oauth_scopes: Option<Vec<String>>,
     /// Bind address for HTTP server.
     pub bind_address: String,
     /// Port for HTTP server.
@@ -96,6 +108,11 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            auth_mode: DownstreamAuthMode::default(),
+            public_base_url: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            oauth_scopes: None,
             bind_address: "127.0.0.1".to_string(),
             port: 3282,
             allowed_origins: Vec::new(),
@@ -104,6 +121,32 @@ impl Default for HttpConfig {
             session_timeout_secs: 1800,
             max_sessions: 100,
             sse_channel_capacity: 32,
+        }
+    }
+}
+
+/// Authentication mode for downstream HTTP clients.
+///
+/// `Auto` preserves the current v0.1 behavior as a compatibility path:
+/// - loopback bind => no downstream auth
+/// - non-loopback bind => bearer auth
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownstreamAuthMode {
+    #[default]
+    Auto,
+    None,
+    Bearer,
+    Oauth,
+}
+
+impl DownstreamAuthMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Bearer => "bearer",
+            Self::Oauth => "oauth",
         }
     }
 }
@@ -268,6 +311,24 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
     if config.http.port == 0 {
         errors.push("http.port must be in range 1-65535".to_string());
+    }
+    if matches!(config.http.auth_mode, DownstreamAuthMode::Oauth)
+        && config.http.public_base_url.is_none()
+    {
+        errors.push("http.public_base_url is required when http.auth_mode = \"oauth\"".to_string());
+    }
+    if matches!(config.http.auth_mode, DownstreamAuthMode::Oauth)
+        && config.http.oauth_client_id.is_none()
+    {
+        errors.push("http.oauth_client_id is required when http.auth_mode = \"oauth\"".to_string());
+    }
+    if !http_bind_is_loopback(&config.http.bind_address)
+        && matches!(config.http.auth_mode, DownstreamAuthMode::None)
+    {
+        errors.push(
+            "http.auth_mode = \"none\" is not allowed when binding a non-loopback downstream address"
+                .to_string(),
+        );
     }
 
     if !http_bind_is_loopback(&config.http.bind_address) && config.http.tls_cert_path.is_none() {
@@ -447,6 +508,20 @@ pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figm
         .extract()?;
 
     let mut vars = Vec::new();
+    if let Some(ref public_base_url) = config.http.public_base_url {
+        vars.extend(expand::extract_env_refs(public_base_url));
+    }
+    if let Some(ref client_id) = config.http.oauth_client_id {
+        vars.extend(expand::extract_env_refs(client_id));
+    }
+    if let Some(ref secret) = config.http.oauth_client_secret {
+        vars.extend(expand::extract_env_refs(secret.as_str()));
+    }
+    if let Some(ref scopes) = config.http.oauth_scopes {
+        for scope in scopes {
+            vars.extend(expand::extract_env_refs(scope));
+        }
+    }
     for server in config.servers.values() {
         if let Some(ref cmd) = server.command {
             vars.extend(expand::extract_env_refs(cmd));
@@ -490,6 +565,21 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
         .merge(Toml::file(&path))
         .merge(Env::prefixed("PLUG_").split("__"))
         .extract()?;
+
+    if let Some(ref mut public_base_url) = config.http.public_base_url {
+        *public_base_url = expand_env_vars(public_base_url);
+    }
+    if let Some(ref mut client_id) = config.http.oauth_client_id {
+        *client_id = expand_env_vars(client_id);
+    }
+    if let Some(ref mut secret) = config.http.oauth_client_secret {
+        *secret = expand_env_vars(secret.as_str()).into();
+    }
+    if let Some(ref mut scopes) = config.http.oauth_scopes {
+        for scope in scopes.iter_mut() {
+            *scope = expand_env_vars(scope);
+        }
+    }
 
     // Expand $VAR_NAME references in server configs
     for server in config.servers.values_mut() {
@@ -541,6 +631,11 @@ mod tests {
     #[test]
     fn default_values_are_sensible() {
         let cfg = Config::default();
+        assert_eq!(cfg.http.auth_mode, DownstreamAuthMode::Auto);
+        assert_eq!(cfg.http.public_base_url, None);
+        assert_eq!(cfg.http.oauth_client_id, None);
+        assert_eq!(cfg.http.oauth_client_secret.as_ref().map(|s| s.as_str()), None);
+        assert_eq!(cfg.http.oauth_scopes, None);
         assert_eq!(cfg.http.bind_address, "127.0.0.1");
         assert_eq!(cfg.http.port, 3282);
         assert!(cfg.http.allowed_origins.is_empty());
@@ -567,11 +662,30 @@ mod tests {
             startup_concurrency = 5
 
             [http]
+            auth_mode = "auto"
+            public_base_url = "https://plug.example.com"
+            oauth_client_id = "client-123"
+            oauth_client_secret = "secret-123"
+            oauth_scopes = ["tools:read", "tools:write"]
             port = 8080
             allowed_origins = ["https://claude.ai"]
             tls_cert_path = "/tmp/plug-cert.pem"
             tls_key_path = "/tmp/plug-key.pem"
             "#,
+        );
+        assert_eq!(cfg.http.auth_mode, DownstreamAuthMode::Auto);
+        assert_eq!(
+            cfg.http.public_base_url.as_deref(),
+            Some("https://plug.example.com")
+        );
+        assert_eq!(cfg.http.oauth_client_id.as_deref(), Some("client-123"));
+        assert_eq!(
+            cfg.http.oauth_client_secret.as_ref().map(|s| s.as_str()),
+            Some("secret-123")
+        );
+        assert_eq!(
+            cfg.http.oauth_scopes,
+            Some(vec!["tools:read".to_string(), "tools:write".to_string()])
         );
         assert_eq!(cfg.http.port, 8080);
         assert_eq!(cfg.http.allowed_origins, vec!["https://claude.ai"]);
@@ -776,6 +890,83 @@ mod tests {
         cfg.http.port = 0;
         let errors = validate_config(&cfg);
         assert!(errors.iter().any(|e| e.contains("port")));
+    }
+
+    #[test]
+    fn validate_bearer_on_loopback_is_valid() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Bearer;
+        let errors = validate_config(&cfg);
+        assert!(
+            errors.is_empty(),
+            "expected bearer on loopback to be valid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth_on_loopback_is_valid_when_public_base_url_is_set() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        let errors = validate_config(&cfg);
+        assert!(
+            errors.is_empty(),
+            "expected oauth on loopback to be valid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth_requires_public_base_url() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("public_base_url") && e.contains("oauth")),
+            "expected oauth/public_base_url validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth_requires_client_id() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("oauth_client_id") && e.contains("oauth")),
+            "expected oauth/oauth_client_id validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_none_on_non_loopback_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::None;
+        cfg.http.bind_address = "0.0.0.0".to_string();
+        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
+        cfg.http.tls_key_path = Some(PathBuf::from("/tmp/key.pem"));
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("http.auth_mode = \"none\"") && e.contains("non-loopback")),
+            "expected none/non-loopback validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn load_http_auth_mode_from_toml() {
+        let cfg = config_from_toml(
+            r#"
+            [http]
+            auth_mode = "bearer"
+            "#,
+        );
+        assert_eq!(cfg.http.auth_mode, DownstreamAuthMode::Bearer);
     }
 
     #[test]
