@@ -688,6 +688,18 @@ async fn mark_auth_required(engine: &Engine, server_name: &str) {
 
 fn is_retryable_reconnect_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_lowercase();
+    let is_rate_limited = message.contains("too many requests")
+        || message.contains("429")
+        || message.contains("error_code\": \"too_many_requests\"")
+        || message.contains("blocked_seconds");
+    let is_session_conflict = message.contains("failed to open sse stream: conflict")
+        || message.contains("too many active sessions")
+        || message.contains("503 service unavailable");
+
+    if is_rate_limited || is_session_conflict {
+        return false;
+    }
+
     message.contains("connection refused")
         || message.contains("connection reset")
         || message.contains("broken pipe")
@@ -1028,6 +1040,19 @@ mod tests {
         assert!(is_retryable_reconnect_error(&err));
 
         let err = anyhow::anyhow!("stdio transport requires a command");
+        assert!(!is_retryable_reconnect_error(&err));
+
+        let err = anyhow::anyhow!(
+            "Streamable HTTP error: Error POSTing to endpoint: {{\"error_code\": \"TOO_MANY_REQUESTS\", \"details\": {{\"blocked_seconds\": 600}}}}"
+        );
+        assert!(!is_retryable_reconnect_error(&err));
+
+        let err = anyhow::anyhow!("Streamable HTTP error: Failed to open SSE stream: Conflict");
+        assert!(!is_retryable_reconnect_error(&err));
+
+        let err = anyhow::anyhow!(
+            "HTTP 503 Service Unavailable: {{\"jsonrpc\":\"2.0\",\"error\":{{\"message\":\"Too many active sessions. Try again later.\"}}}}"
+        );
         assert!(!is_retryable_reconnect_error(&err));
     }
 

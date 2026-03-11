@@ -505,12 +505,12 @@ impl ServerManager {
 
                     // Resolve auth header: OAuth token from cache, or static bearer token
                     let auth_header = if config.auth.as_deref() == Some("oauth") {
-                        match crate::oauth::current_access_token(name) {
+                        match crate::oauth::current_or_stored_access_token(name).await {
                             Some(token) => Some(token),
                             None => {
                                 tracing::info!(
                                     server = %name,
-                                    "OAuth server has no cached token, marking AuthRequired"
+                                    "OAuth server has no available token, marking AuthRequired"
                                 );
                                 return Err(anyhow::anyhow!("OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."));
                             }
@@ -611,7 +611,7 @@ impl ServerManager {
 
         // Resolve auth token: OAuth token from cache, or static bearer token
         let auth_token_value = if config.auth.as_deref() == Some("oauth") {
-            match crate::oauth::current_access_token(name) {
+            match crate::oauth::current_or_stored_access_token(name).await {
                 Some(token) => Some(token),
                 None => {
                     return Err(anyhow::anyhow!(

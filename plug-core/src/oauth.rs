@@ -130,6 +130,25 @@ pub fn current_access_token(server_name: &str) -> Option<String> {
     Some(cached.access_token.clone())
 }
 
+/// Return the current access token for a server, hydrating the in-memory cache
+/// from persisted credentials on cache miss.
+///
+/// This lets a fresh daemon/runtime recover after a successful `plug auth login`
+/// without requiring an injected-token IPC path to populate the cache first.
+pub async fn current_or_stored_access_token(server_name: &str) -> Option<String> {
+    if let Some(token) = current_access_token(server_name) {
+        return Some(token);
+    }
+
+    let store = get_or_create_store(server_name);
+    let creds = store.load().await.ok().flatten()?;
+
+    use oauth2::TokenResponse;
+    creds.token_response
+        .as_ref()
+        .map(|tr| tr.access_token().secret().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // CachedCredentials
 // ---------------------------------------------------------------------------
@@ -967,6 +986,26 @@ mod tests {
         );
 
         // Clean up
+        store.clear().await.unwrap();
+    }
+
+    /// Persisted credentials should rehydrate the cache on first access after a
+    /// cold start / `AuthRequired` state.
+    #[tokio::test]
+    async fn test_current_or_stored_access_token_hydrates_cache() {
+        let name = format!("oauth-hydrate-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let creds = make_test_token("persisted-access", Some("persisted-refresh"), Some(3600));
+        store.save(creds).await.unwrap();
+        store.clear_cache();
+
+        assert!(current_access_token(&name).is_none());
+
+        let token = current_or_stored_access_token(&name).await;
+        assert_eq!(token.as_deref(), Some("persisted-access"));
+        assert_eq!(current_access_token(&name).as_deref(), Some("persisted-access"));
+
         store.clear().await.unwrap();
     }
 }
