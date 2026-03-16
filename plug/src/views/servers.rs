@@ -80,6 +80,7 @@ pub(crate) async fn cmd_server_list(
                         let mut healthy = 0usize;
                         let mut degraded = 0usize;
                         let mut failed = 0usize;
+                        let mut auth_required = 0usize;
                         let config = plug_core::config::load_config(config_path).ok();
                         for server in &servers {
                             if server.server_id == "__plug_internal__" {
@@ -89,7 +90,7 @@ pub(crate) async fn cmd_server_list(
                                 plug_core::types::ServerHealth::Healthy => healthy += 1,
                                 plug_core::types::ServerHealth::Degraded => degraded += 1,
                                 plug_core::types::ServerHealth::Failed => failed += 1,
-                                plug_core::types::ServerHealth::AuthRequired => failed += 1,
+                                plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
                             }
                         }
                         print_banner(
@@ -110,6 +111,7 @@ pub(crate) async fn cmd_server_list(
                         print_label_value("Healthy", style(healthy).green().bold());
                         print_label_value("Degraded", style(degraded).yellow().bold());
                         print_label_value("Failed", style(failed).red().bold());
+                        print_label_value("Auth Required", style(auth_required).yellow().bold());
                         println!();
                         print_heading("Inventory");
                         for s in servers {
