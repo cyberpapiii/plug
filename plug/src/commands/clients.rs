@@ -181,10 +181,38 @@ pub(crate) fn detected_or_linked_clients() -> Vec<(&'static str, &'static str, b
 
 pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Result<()> {
     use dialoguer::{Confirm, Input, MultiSelect, Select};
+    use plug_core::export::ExportTransport;
+
+    let prompt_transport = |default_http: bool| -> anyhow::Result<ExportTransport> {
+        if yes {
+            return Ok(ExportTransport::Stdio);
+        }
+
+        let selection = Select::with_theme(&cli_prompt_theme())
+            .with_prompt("How should selected clients connect to plug?")
+            .items([
+                "stdio via `plug connect`",
+                "HTTP via `http://localhost:3282/mcp`",
+            ])
+            .default(if default_http { 1 } else { 0 })
+            .interact()?;
+        Ok(if selection == 1 {
+            ExportTransport::Http
+        } else {
+            ExportTransport::Stdio
+        })
+    };
 
     if !targets.is_empty() {
+        let transport = prompt_transport(false)?;
         for target in &targets {
-            execute_export(target, false, 3282, true, false)?;
+            execute_export(
+                target,
+                matches!(transport, ExportTransport::Http),
+                3282,
+                true,
+                false,
+            )?;
         }
         return Ok(());
     }
@@ -202,8 +230,15 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
                 "no detected clients found; pass explicit targets or run `plug link` interactively"
             );
         }
+        let transport = prompt_transport(false)?;
         for target in detected.iter().map(|(_, target, _)| *target) {
-            execute_export(target, false, 3282, true, false)?;
+            execute_export(
+                target,
+                matches!(transport, ExportTransport::Http),
+                3282,
+                true,
+                false,
+            )?;
         }
         return Ok(());
     }
@@ -274,10 +309,29 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
             .interact()?
     };
 
+    let selected_new_targets = items
+        .iter()
+        .enumerate()
+        .filter(|(idx, (_, _, _, was_linked))| selections.contains(idx) && !was_linked)
+        .map(|(_, (_, target, _, _))| *target)
+        .collect::<Vec<_>>();
+
+    let selected_transport = if selected_new_targets.is_empty() {
+        None
+    } else {
+        Some(prompt_transport(false)?)
+    };
+
     for (idx, (_, target, _display, was_linked)) in items.iter().enumerate() {
         let is_selected = selections.contains(&idx);
         if is_selected && !was_linked {
-            execute_export(target, false, 3282, true, false)?;
+            execute_export(
+                target,
+                matches!(selected_transport, Some(ExportTransport::Http)),
+                3282,
+                true,
+                false,
+            )?;
         } else if !is_selected && *was_linked {
             execute_unlink(target, false)?;
         }
@@ -306,24 +360,45 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
             .items(["JSON", "JSON (VS Code style)", "TOML", "YAML"])
             .default(0)
             .interact()?;
-        let (snippet, is_toml, is_yaml) = match format {
-            0 => (
+        let transport = prompt_transport(false)?;
+        let (snippet, is_toml, is_yaml) = match (format, transport) {
+            (0, ExportTransport::Stdio) => (
                 serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":"plug","args":["connect"]}}})).unwrap(),
                 false,
                 false,
             ),
-            1 => (
+            (0, ExportTransport::Http) => (
+                serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"url":"http://localhost:3282/mcp"}}})).unwrap(),
+                false,
+                false,
+            ),
+            (1, ExportTransport::Stdio) => (
                 serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"command":"plug","args":["connect"]}}}})).unwrap(),
                 false,
                 false,
             ),
-            2 => (
+            (1, ExportTransport::Http) => (
+                serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"url":"http://localhost:3282/mcp"}}}})).unwrap(),
+                false,
+                false,
+            ),
+            (2, ExportTransport::Stdio) => (
                 "\n[mcp_servers.plug]\ncommand = \"plug\"\nargs = [\"connect\"]\n".to_string(),
                 true,
                 false,
             ),
-            3 => (
+            (2, ExportTransport::Http) => (
+                "\n[mcp_servers.plug]\nurl = \"http://localhost:3282/mcp\"\n".to_string(),
+                true,
+                false,
+            ),
+            (3, ExportTransport::Stdio) => (
                 "\nextensions:\n  plug:\n    type: stdio\n    command: plug\n    args: [\"connect\"]\n    enabled: true\n".to_string(),
+                false,
+                true,
+            ),
+            (3, ExportTransport::Http) => (
+                "\nextensions:\n  plug:\n    type: sse\n    uri: http://localhost:3282/mcp\n    enabled: true\n".to_string(),
                 false,
                 true,
             ),
