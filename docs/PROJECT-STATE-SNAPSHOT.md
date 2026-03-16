@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `5b2f477` (final closeout and production-ready status)
+Baseline: `main` @ `b560ae3` (post-reconcile baseline including remote/OAuth follow-up fixes)
 
 This is the canonical current-state doc for the project.
 
@@ -37,6 +37,11 @@ Implemented on `main`:
 - `plug auth complete` for non-interactive OAuth code exchange (PR #40)
 - IPC auth commands: `AuthStatus` query, `InjectToken` credential injection with server reconnect, `AuthStateChanged` push notification (PR #41)
 - zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, reconnect retry without re-refreshing after transient failure, `AuthStateChanged` observability for non-IPC clients via logging-channel fan-out, and a distinct refresh-exchange observability signal (PR #42, PR #43, PR #44, PR #45, PR #50)
+- downstream OAuth remote server support
+- remote Claude HTTP connector stability fixes
+- pagination cursor forwarding and larger page size for remote clients
+- initialize response protocol-version simplification/fixups for remote compatibility
+- persisted token hydration before upstream connect
 
 Partial on `main`:
 
@@ -55,6 +60,9 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-03-16, the previously working branch/runtime line was reconciled into `main`, verified with
+the full test suite, and pushed as the new canonical baseline.
 
 ## Documentation Taxonomy
 

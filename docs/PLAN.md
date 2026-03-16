@@ -30,6 +30,9 @@ forwarding work:
 - mock OAuth provider integration coverage for metadata discovery, auth-code exchange persistence with state cleanup, token refresh persistence, and reconnect using refreshed credentials (PR #51)
 - daemon IPC notification parity: progress, cancelled, and list_changed push forwarding across IPC (PR #38)
 - zero-downtime token refresh: actual OAuth refresh_token exchange before reconnect, with injected-token skip path, shared auth-failure classification for refresh/reconnect decisions, cache reload error propagation, reconnect retry without re-refreshing after transient failure, non-IPC `AuthStateChanged` observability via logging fan-out, and a distinct refresh-exchange observability signal (PR #42, PR #43, PR #44, PR #45, PR #50)
+- downstream OAuth remote server support and related config/runtime integration
+- remote Claude connector follow-up fixes: protocol-version response adjustment, pagination cursor forwarding, larger page size, and connector stability improvements
+- persisted token hydration before upstream connect
 
 ## What Exists Today
 
@@ -42,6 +45,7 @@ The current product shape is:
 - targeted notification fan-out to stdio, HTTP, and daemon IPC (resource subscribe still unsupported over IPC)
 - meta-tool mode as an opt-in reduced discovery surface
 - downstream HTTP bearer token auth for non-loopback binding
+- downstream OAuth mode for remote/server-card based authorization flows
 
 ## Remaining Work
 
@@ -51,3 +55,9 @@ No required roadmap work remains for the current production-ready bar.
 Optional future scope only:
 
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
+
+## 2026-03-16 Reconciliation Note
+
+The previously working off-main runtime line was reconciled into `main` on 2026-03-16, verified in
+an isolated `main` worktree with a passing full test suite, and then pushed as the new canonical
+baseline.
