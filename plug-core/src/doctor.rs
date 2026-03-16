@@ -249,15 +249,29 @@ async fn check_port_available(config: &Config) -> CheckResult {
                 fix_suggestion: None,
             }
         }
-        Err(e) => CheckResult {
-            name,
-            status: CheckStatus::Fail,
-            message: format!("Port {} is not available: {e}", config.http.port),
-            fix_suggestion: Some(format!(
-                "Stop the process using port {} or change http.port in config",
-                config.http.port
-            )),
-        },
+        Err(e) => {
+            if let Some(pid) = running_daemon_pid() {
+                CheckResult {
+                    name,
+                    status: CheckStatus::Pass,
+                    message: format!(
+                        "Port {} is already bound by the running plug daemon (PID {})",
+                        config.http.port, pid
+                    ),
+                    fix_suggestion: None,
+                }
+            } else {
+                CheckResult {
+                    name,
+                    status: CheckStatus::Fail,
+                    message: format!("Port {} is not available: {e}", config.http.port),
+                    fix_suggestion: Some(format!(
+                        "Stop the process using port {} or change http.port in config",
+                        config.http.port
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -551,6 +565,13 @@ fn is_process_running(pid: u32) -> bool {
     }
 }
 
+fn running_daemon_pid() -> Option<u32> {
+    let pid_path = crate::config::config_dir().join("daemon.pid");
+    let pid_str = std::fs::read_to_string(pid_path).ok()?;
+    let pid = pid_str.trim().parse::<u32>().ok()?;
+    is_process_running(pid).then_some(pid)
+}
+
 /// Check 9: try to start and initialize each server (5s timeout).
 async fn check_server_connectivity(config: &Config) -> CheckResult {
     let name = "server_connectivity".to_string();
@@ -616,11 +637,28 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
             fix_suggestion: None,
         }
     } else {
+        let daemon_running = running_daemon_pid().is_some();
         CheckResult {
             name,
-            status: CheckStatus::Fail,
-            message: format!("Unreachable servers: {}", unreachable.join(", ")),
-            fix_suggestion: Some("Check server URLs and network connectivity".to_string()),
+            status: if daemon_running {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Fail
+            },
+            message: if daemon_running {
+                format!(
+                    "Cold connectivity issues: {} (daemon is running; compare with `plug status` for live health)",
+                    unreachable.join(", ")
+                )
+            } else {
+                format!("Unreachable servers: {}", unreachable.join(", "))
+            },
+            fix_suggestion: Some(if daemon_running {
+                "Compare with `plug status`; raw TCP reachability may differ from current daemon-routed health"
+                    .to_string()
+            } else {
+                "Check server URLs and network connectivity".to_string()
+            }),
         }
     }
 }
@@ -836,9 +874,12 @@ async fn check_http_auth(config: &Config) -> CheckResult {
         },
         crate::config::DownstreamAuthMode::Oauth => CheckResult {
             name,
-            status: CheckStatus::Pass,
-            message: "HTTP auth mode is oauth (metadata, authorization, token, and bearer validation active)".to_string(),
-            fix_suggestion: None,
+            status: CheckStatus::Warn,
+            message: "HTTP auth mode is oauth (metadata and token routes are configured, but doctor does not verify external endpoint reachability or public URL correctness)".to_string(),
+            fix_suggestion: Some(
+                "Verify the configured public URL externally, including /.well-known/mcp.json and OAuth endpoints"
+                    .to_string(),
+            ),
         },
         crate::config::DownstreamAuthMode::Auto | crate::config::DownstreamAuthMode::Bearer => {
             let requires_token = matches!(config.http.auth_mode, crate::config::DownstreamAuthMode::Bearer)
@@ -1000,7 +1041,7 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
                     // File exists — might be using file fallback
                     // This is a warning, not an error
                     warnings.push(format!(
-                        "server '{server_name}': token file exists at {} (keyring may be unavailable — tokens stored as plaintext)",
+                        "server '{server_name}': plaintext token fallback file present at {}",
                         token_file.display()
                     ));
                 }
@@ -1022,7 +1063,7 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
         CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: "All OAuth servers have valid credentials".to_string(),
+            message: "All OAuth servers have retrievable credentials".to_string(),
             fix_suggestion: None,
         }
     } else {
@@ -1231,7 +1272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_auth_oauth_warns_as_unimplemented() {
+    async fn http_auth_oauth_warns_for_unverified_external_surface() {
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1239,8 +1280,8 @@ mod tests {
         config.http.port = 62003;
 
         let result = check_http_auth(&config).await;
-        assert_eq!(result.status, CheckStatus::Pass);
-        assert!(result.message.contains("authorization"));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("does not verify external endpoint reachability"));
     }
 
     // -- check_server_binaries --

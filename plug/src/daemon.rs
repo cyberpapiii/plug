@@ -1491,7 +1491,7 @@ async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
             .map(|s| s.health)
             .unwrap_or_else(|| {
                 if has_creds {
-                    plug_core::types::ServerHealth::Healthy
+                    plug_core::types::ServerHealth::Degraded
                 } else {
                     plug_core::types::ServerHealth::AuthRequired
                 }

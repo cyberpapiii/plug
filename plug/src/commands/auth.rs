@@ -12,6 +12,24 @@ use plug_core::oauth;
 use crate::OutputFormat;
 use crate::ui;
 
+fn auth_recovery_hint(name: &str, authenticated: bool, health: plug_core::types::ServerHealth) -> String {
+    use plug_core::types::ServerHealth;
+
+    match (authenticated, health) {
+        (false, ServerHealth::AuthRequired) => format!("Run: plug auth login --server {name}"),
+        (true, ServerHealth::AuthRequired) => format!(
+            "Stored credentials are present, but re-auth is required — run: plug auth login --server {name}"
+        ),
+        (true, ServerHealth::Failed) => {
+            "Credentials are present, but the server is failing for a non-auth reason — check `plug status` and `plug doctor`".to_string()
+        }
+        (true, ServerHealth::Degraded) => {
+            "Credentials are present, but runtime health is degraded — compare `plug status` and `plug doctor`".to_string()
+        }
+        _ => String::new(),
+    }
+}
+
 /// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
     config_path: Option<&PathBuf>,
@@ -392,6 +410,18 @@ async fn cmd_auth_status(
         return Ok(());
     }
 
+    let live_auth_status = match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus)
+        .await
+    {
+        Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => Some(
+            servers
+                .into_iter()
+                .map(|s| (s.name.clone(), s))
+                .collect::<std::collections::HashMap<_, _>>(),
+        ),
+        _ => None,
+    };
+
     match output {
         OutputFormat::Text => {
             println!();
@@ -399,19 +429,39 @@ async fn cmd_auth_status(
             println!("{}", style("─".repeat(50)).dim());
 
             for (name, sc) in &oauth_servers {
+                let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
                 let store = oauth::get_or_create_store(name);
-                let has_creds = store.load().await.ok().flatten().is_some();
-
-                let status = if has_creds {
-                    style("authenticated").green()
+                let has_creds = if let Some(live) = live {
+                    live.authenticated
                 } else {
-                    style("not authenticated").red()
+                    store.load().await.ok().flatten().is_some()
                 };
 
-                let health = if has_creds {
-                    plug_core::types::ServerHealth::Healthy
-                } else {
-                    plug_core::types::ServerHealth::AuthRequired
+                let health = live
+                    .map(|s| s.health)
+                    .unwrap_or(if has_creds {
+                        plug_core::types::ServerHealth::Degraded
+                    } else {
+                        plug_core::types::ServerHealth::AuthRequired
+                    });
+
+                let status = match (has_creds, health) {
+                    (false, plug_core::types::ServerHealth::AuthRequired) => {
+                        style("not authenticated").red()
+                    }
+                    (true, plug_core::types::ServerHealth::AuthRequired) => {
+                        style("credentials present, re-auth required").yellow()
+                    }
+                    (true, plug_core::types::ServerHealth::Failed) => {
+                        style("credentials present, server failed").red()
+                    }
+                    (true, plug_core::types::ServerHealth::Degraded) => {
+                        style("authenticated, degraded").yellow()
+                    }
+                    (true, plug_core::types::ServerHealth::Healthy) => {
+                        style("authenticated").green()
+                    }
+                    (false, _) => style("not authenticated").red(),
                 };
 
                 println!(
@@ -424,13 +474,18 @@ async fn cmd_auth_status(
                 if let Some(ref url) = sc.url {
                     println!("    URL: {url}");
                 }
-                if let Some(ref scopes) = sc.oauth_scopes {
+                if let Some(scopes) = live
+                    .and_then(|s| s.scopes.clone())
+                    .or_else(|| sc.oauth_scopes.clone())
+                {
                     if !scopes.is_empty() {
                         println!("    Scopes: {}", scopes.join(", "));
                     }
                 }
 
-                if has_creds {
+                if let Some(remaining) = live.and_then(|s| s.token_expires_in_secs) {
+                    println!("    Token expires in: {remaining}s");
+                } else if has_creds {
                     if let Some((received_at, expires_in)) = store.cached_expiry() {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -445,8 +500,11 @@ async fn cmd_auth_status(
                             println!("    Token: expired (refresh pending)");
                         }
                     }
-                } else {
-                    println!("    Run: plug auth login --server {name}");
+                }
+
+                let hint = auth_recovery_hint(name, has_creds, health);
+                if !hint.is_empty() {
+                    println!("    {hint}");
                 }
                 println!();
             }
@@ -454,14 +512,29 @@ async fn cmd_auth_status(
         OutputFormat::Json => {
             let mut servers = Vec::new();
             for (name, sc) in &oauth_servers {
+                let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
                 let store = oauth::get_or_create_store(name);
-                let has_creds = store.load().await.ok().flatten().is_some();
+                let has_creds = if let Some(live) = live {
+                    live.authenticated
+                } else {
+                    store.load().await.ok().flatten().is_some()
+                };
+                let health = live
+                    .map(|s| s.health)
+                    .unwrap_or(if has_creds {
+                        plug_core::types::ServerHealth::Degraded
+                    } else {
+                        plug_core::types::ServerHealth::AuthRequired
+                    });
 
                 servers.push(serde_json::json!({
                     "name": name,
-                    "url": sc.url,
+                    "url": live.and_then(|s| s.url.clone()).or_else(|| sc.url.clone()),
                     "authenticated": has_creds,
-                    "scopes": sc.oauth_scopes,
+                    "health": format!("{health:?}"),
+                    "scopes": live.and_then(|s| s.scopes.clone()).or_else(|| sc.oauth_scopes.clone()),
+                    "token_expires_in_secs": live.and_then(|s| s.token_expires_in_secs),
+                    "recovery_hint": auth_recovery_hint(name, has_creds, health),
                 }));
             }
             println!(
