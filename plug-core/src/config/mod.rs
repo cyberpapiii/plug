@@ -904,10 +904,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_oauth_on_loopback_is_valid_when_public_base_url_is_set() {
+    fn validate_oauth_on_loopback_is_valid_when_required_fields_are_set() {
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        cfg.http.oauth_client_id = Some("client-123".to_string());
         let errors = validate_config(&cfg);
         assert!(
             errors.is_empty(),
