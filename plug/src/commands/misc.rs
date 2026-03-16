@@ -1,7 +1,7 @@
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::{cmd_link, execute_export, is_linked};
+use crate::commands::clients::{cmd_link, execute_export};
 use crate::ui::{
     cli_prompt_theme, print_banner, print_heading, print_info_line, print_success_line,
 };
@@ -275,9 +275,15 @@ pub(crate) fn cmd_repair() -> anyhow::Result<()> {
     let mut repaired_count = 0;
 
     for target in all_clients {
-        if is_linked(target, false) {
+        if let Some(transport) = crate::commands::clients::linked_client_transport(target, false) {
             print!("  {} Refreshing {}... ", style("›").cyan().bold(), target);
-            if let Err(e) = execute_export(target, false, 3282, true, false) {
+            if let Err(e) = execute_export(
+                target,
+                matches!(transport, plug_core::export::ExportTransport::Http),
+                3282,
+                true,
+                false,
+            ) {
                 println!("{}", style(format!("failed: {e}")).red());
             } else {
                 println!("{}", style("done").green());

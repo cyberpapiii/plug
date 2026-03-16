@@ -1,7 +1,7 @@
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::linked_client_targets;
+use crate::commands::clients::{linked_client_targets, linked_client_transport};
 use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_next_action, print_warning_line,
@@ -115,7 +115,19 @@ pub(crate) async fn cmd_overview(
     }
 
     if !linked_clients.is_empty() {
-        print_label_value("Linked", linked_clients.join(", "));
+        let linked_descriptions = linked_clients
+            .iter()
+            .map(|target| {
+                let transport = linked_client_transport(target, false)
+                    .map(|transport| match transport {
+                        plug_core::export::ExportTransport::Stdio => "stdio",
+                        plug_core::export::ExportTransport::Http => "http",
+                    })
+                    .unwrap_or("unknown");
+                format!("{target} ({transport})")
+            })
+            .collect::<Vec<_>>();
+        print_label_value("Linked", linked_descriptions.join(", "));
     }
 
     if matches!(

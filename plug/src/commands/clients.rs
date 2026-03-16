@@ -38,9 +38,68 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
 pub(crate) fn linked_client_targets() -> Vec<String> {
     all_client_targets()
         .iter()
-        .filter(|(_, target)| is_linked(target, false))
+        .filter(|(_, target)| linked_client_transport(target, false).is_some())
         .map(|(_, target)| (*target).to_string())
         .collect()
+}
+
+pub(crate) fn linked_client_transport(
+    target: &str,
+    project: bool,
+) -> Option<plug_core::export::ExportTransport> {
+    use plug_core::export::{ExportTarget, ExportTransport};
+
+    let target_enum: ExportTarget = target.parse().ok()?;
+    let path = plug_core::export::default_config_path(target_enum, project)?;
+    if !path.exists() {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(&path).ok()?;
+    let ext = path.extension().and_then(|e| e.to_str());
+
+    match ext {
+        Some("toml") => {
+            let value = content.parse::<toml::Value>().ok()?;
+            let table = value.get("mcp_servers")?.get("plug")?;
+            if table.get("url").is_some() {
+                Some(ExportTransport::Http)
+            } else if table.get("command").is_some() {
+                Some(ExportTransport::Stdio)
+            } else {
+                None
+            }
+        }
+        Some("yaml") | Some("yml") => {
+            let value = serde_yml::from_str::<serde_yml::Value>(&content).ok()?;
+            let plug = value.get("extensions")?.get("plug")?;
+            if plug.get("uri").is_some() {
+                Some(ExportTransport::Http)
+            } else if plug.get("command").is_some() {
+                Some(ExportTransport::Stdio)
+            } else {
+                None
+            }
+        }
+        _ => {
+            let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+            let plug = match target_enum {
+                ExportTarget::Nanobot => json.get("tools")?.get("mcpServers")?.get("plug")?,
+                ExportTarget::VSCodeCopilot => json.get("mcp")?.get("servers")?.get("plug")?,
+                _ => json
+                    .get("mcpServers")
+                    .and_then(|s| s.get("plug"))
+                    .or_else(|| json.get("context_servers").and_then(|s| s.get("plug")))?,
+            };
+            if plug.get("url").is_some() || plug.get("uri").is_some() {
+                Some(ExportTransport::Http)
+            } else if plug.get("command").is_some() {
+                Some(ExportTransport::Stdio)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 pub(crate) fn is_detected(target: &str) -> bool {
@@ -379,48 +438,7 @@ pub(crate) fn execute_unlink(target: &str, project: bool) -> anyhow::Result<()> 
 }
 
 pub(crate) fn is_linked(target: &str, project: bool) -> bool {
-    let target_enum: plug_core::export::ExportTarget = match target.parse() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let path = match plug_core::export::default_config_path(target_enum, project) {
-        Some(p) => p,
-        None => return false,
-    };
-    if !path.exists() {
-        return false;
-    }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let ext = path.extension().and_then(|e| e.to_str());
-    match ext {
-        Some("toml") => content.contains("[mcp_servers.plug]"),
-        Some("yaml") | Some("yml") => content.contains("plug:"),
-        _ => {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                match target_enum {
-                    plug_core::export::ExportTarget::Nanobot => json
-                        .get("tools")
-                        .and_then(|t| t.get("mcpServers"))
-                        .and_then(|s| s.get("plug"))
-                        .is_some(),
-                    plug_core::export::ExportTarget::VSCodeCopilot => json
-                        .get("mcp")
-                        .and_then(|m| m.get("servers"))
-                        .and_then(|s| s.get("plug"))
-                        .is_some(),
-                    _ => {
-                        json.get("mcpServers").and_then(|s| s.get("plug")).is_some()
-                            || json
-                                .get("context_servers")
-                                .and_then(|s| s.get("plug"))
-                                .is_some()
-                    }
-                }
-            } else {
-                content.contains("\"plug\":")
-            }
-        }
-    }
+    linked_client_transport(target, project).is_some()
 }
 
 fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
