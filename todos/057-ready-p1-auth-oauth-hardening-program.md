@@ -79,7 +79,7 @@ Execute the full hardening plan from [docs/plans/2026-03-16-auth-oauth-hardening
 - [x] Task 2 complete: downstream OAuth metadata advertises only supported token endpoint auth methods
 - [x] Task 3 complete: unauthorized downstream OAuth responses provide standards-appropriate discovery cues
 - [x] Task 4 complete: `doctor` distinguishes daemon-in-use from true port conflict
-- [ ] Task 5 complete: `doctor` separates cold reachability from daemon-observed health and auth state
+- [x] Task 5 complete: `doctor` separates cold reachability from daemon-observed health and auth state
 - [x] Task 6 complete: `status`, `auth status`, and server views expose explicit auth recovery categories
 - [x] Task 7 complete: token storage mode warnings are deterministic and actionable
 - [x] Task 8 complete: setup supports explicit client topology choice instead of assuming stdio bridge
@@ -159,6 +159,7 @@ Key files expected to change:
 - `0352544` `feat(ux): preserve client transport topology`
 - `12b4d86` `feat(setup): prompt for client transport choice`
 - `9033da0` `feat(ux): separate auth-required server summary`
+- `0ca32cd` `feat(doctor): add live runtime health and auth context`
 
 **Learnings:**
 - The highest-leverage fixes were standards alignment and reducing contradictory operator signals.
@@ -166,3 +167,5 @@ Key files expected to change:
   a necessary first step, not the final one.
 - We now have the first end-to-end transport/auth visibility layer, but `doctor`, setup, and
   recovery still need more explicit modeling of mixed-fleet scenarios.
+- `plug doctor` now includes daemon-observed runtime health/auth context so cold checks and live
+  state can be compared in one command, which reduces the biggest contradiction from real usage.
