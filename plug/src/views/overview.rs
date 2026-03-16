@@ -279,6 +279,18 @@ pub(crate) async fn cmd_status(
                 let config_by_server = config
                     .as_ref()
                     .map(|cfg| &cfg.servers);
+                let auth_required_servers = servers
+                    .iter()
+                    .filter(|s| s.server_id != "__plug_internal__")
+                    .filter(|s| matches!(s.health, plug_core::types::ServerHealth::AuthRequired))
+                    .map(|s| s.server_id.clone())
+                    .collect::<Vec<_>>();
+                let failed_servers = servers
+                    .iter()
+                    .filter(|s| s.server_id != "__plug_internal__")
+                    .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
+                    .map(|s| s.server_id.clone())
+                    .collect::<Vec<_>>();
                 print_heading("Servers");
                 println!(
                     "  {:<2} {:<18} {:<12} {:<8} {:<6} {:>5}",
@@ -321,6 +333,29 @@ pub(crate) async fn cmd_status(
                         auth,
                         s.tool_count
                     );
+                }
+
+                if !auth_required_servers.is_empty() || !failed_servers.is_empty() {
+                    println!();
+                    print_heading("Recovery");
+                    if !auth_required_servers.is_empty() {
+                        print_label_value(
+                            "Auth",
+                            format!(
+                                "{} need re-auth — run `plug auth status` or `plug auth login --server <name>`",
+                                auth_required_servers.join(", ")
+                            ),
+                        );
+                    }
+                    if !failed_servers.is_empty() {
+                        print_label_value(
+                            "Failed",
+                            format!(
+                                "{} failed — run `plug doctor` to inspect connectivity and runtime context",
+                                failed_servers.join(", ")
+                            ),
+                        );
+                    }
                 }
             }
         } else {
