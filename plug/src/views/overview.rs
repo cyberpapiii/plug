@@ -68,6 +68,14 @@ pub(crate) async fn cmd_overview(
 
     let config = plug_core::config::load_config(Some(&config_path))?;
     let daemon_running = crate::daemon::connect_to_daemon().await.is_some();
+    let transport_counts = config.servers.values().fold((0usize, 0usize, 0usize), |mut acc, server| {
+        match server.transport {
+            plug_core::config::TransportType::Stdio => acc.0 += 1,
+            plug_core::config::TransportType::Http => acc.1 += 1,
+            plug_core::config::TransportType::Sse => acc.2 += 1,
+        }
+        acc
+    });
     let downstream_auth_mode = config.http.auth_mode.label();
     let downstream_auth_summary = match config.http.auth_mode {
         plug_core::config::DownstreamAuthMode::Auto => {
@@ -85,6 +93,13 @@ pub(crate) async fn cmd_overview(
     print_heading("Overview");
     print_label_value("Path", style(config_path.display()).dim());
     print_label_value("Servers", style(config.servers.len()).bold());
+    print_label_value(
+        "Upstreams",
+        format!(
+            "stdio={} http={} sse={}",
+            transport_counts.0, transport_counts.1, transport_counts.2
+        ),
+    );
     print_label_value("Clients", style(linked_clients.len()).bold());
     match live_client_support {
         LiveClientSupport::Supported => {
@@ -261,27 +276,49 @@ pub(crate) async fn cmd_status(
                 print_heading("Servers");
                 println!("  No servers configured.");
             } else {
+                let config_by_server = config
+                    .as_ref()
+                    .map(|cfg| &cfg.servers);
                 print_heading("Servers");
                 println!(
-                    "  {:<2} {:<18} {:<12} {:>5}",
+                    "  {:<2} {:<18} {:<12} {:<8} {:<6} {:>5}",
                     style("").dim(),
                     style("SERVER").dim(),
                     style("STATUS").dim(),
+                    style("UPSTREAM").dim(),
+                    style("AUTH").dim(),
                     style("TOOLS").dim()
                 );
                 println!(
                     "  {}",
-                    style("------------------------------------------------").dim()
+                    style("----------------------------------------------------------------").dim()
                 );
                 for s in &servers {
                     if s.server_id == "__plug_internal__" {
                         continue;
                     }
+                    let server_cfg = config_by_server.and_then(|servers| servers.get(&s.server_id));
+                    let transport = server_cfg
+                        .map(|cfg| match cfg.transport {
+                            plug_core::config::TransportType::Stdio => "stdio",
+                            plug_core::config::TransportType::Http => "http",
+                            plug_core::config::TransportType::Sse => "sse",
+                        })
+                        .unwrap_or("unknown");
+                    let auth = server_cfg
+                        .map(|cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
+                            (Some("oauth"), _) => "oauth",
+                            (_, true) => "bearer",
+                            _ => "none",
+                        })
+                        .unwrap_or("unknown");
                     println!(
-                        "  {} {:<18} {:<12} {:>5}",
+                        "  {} {:<18} {:<12} {:<8} {:<6} {:>5}",
                         status_marker(&s.health),
                         s.server_id,
                         status_label(&s.health),
+                        transport,
+                        auth,
                         s.tool_count
                     );
                 }

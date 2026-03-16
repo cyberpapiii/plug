@@ -80,6 +80,7 @@ pub(crate) async fn cmd_server_list(
                         let mut healthy = 0usize;
                         let mut degraded = 0usize;
                         let mut failed = 0usize;
+                        let config = plug_core::config::load_config(config_path).ok();
                         for server in &servers {
                             if server.server_id == "__plug_internal__" {
                                 continue;
@@ -115,11 +116,30 @@ pub(crate) async fn cmd_server_list(
                             if s.server_id == "__plug_internal__" {
                                 continue;
                             }
+                            let server_cfg = config
+                                .as_ref()
+                                .and_then(|cfg| cfg.servers.get(&s.server_id));
+                            let transport = server_cfg
+                                .map(|cfg| match cfg.transport {
+                                    plug_core::config::TransportType::Stdio => "stdio",
+                                    plug_core::config::TransportType::Http => "http",
+                                    plug_core::config::TransportType::Sse => "sse",
+                                })
+                                .unwrap_or("unknown");
+                            let auth = server_cfg
+                                .map(|cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
+                                    (Some("oauth"), _) => "oauth",
+                                    (_, true) => "bearer",
+                                    _ => "none",
+                                })
+                                .unwrap_or("unknown");
                             println!(
-                                "  {} {:<18} {} ({} tools)",
+                                "  {} {:<18} {:<12} {:<8} {:<6} ({} tools)",
                                 status_marker(&s.health),
                                 style(&s.server_id).bold(),
                                 status_label(&s.health),
+                                transport,
+                                auth,
                                 s.tool_count
                             );
                         }
