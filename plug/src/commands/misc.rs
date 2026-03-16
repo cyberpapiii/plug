@@ -153,7 +153,25 @@ pub(crate) async fn cmd_doctor(
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
     let config = plug_core::config::load_config(config_path)?;
-    let report = plug_core::doctor::run_doctor(&config, &resolved).await;
+    let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
+    report
+        .checks
+        .extend(runtime_doctor_checks().await);
+    report.exit_code = if report
+        .checks
+        .iter()
+        .any(|c| matches!(c.status, plug_core::doctor::CheckStatus::Fail))
+    {
+        1
+    } else if report
+        .checks
+        .iter()
+        .any(|c| matches!(c.status, plug_core::doctor::CheckStatus::Warn))
+    {
+        2
+    } else {
+        0
+    };
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
         OutputFormat::Text => {
@@ -178,6 +196,108 @@ pub(crate) async fn cmd_doctor(
         }
     }
     Ok(())
+}
+
+async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
+    let mut checks = Vec::new();
+
+    if let Ok(plug_core::ipc::IpcResponse::Status {
+        servers,
+        clients,
+        uptime_secs,
+    }) = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
+    {
+        let mut healthy = 0usize;
+        let mut degraded = 0usize;
+        let mut failed = 0usize;
+        let mut auth_required = 0usize;
+
+        for server in servers.iter().filter(|s| s.server_id != "__plug_internal__") {
+            match server.health {
+                plug_core::types::ServerHealth::Healthy => healthy += 1,
+                plug_core::types::ServerHealth::Degraded => degraded += 1,
+                plug_core::types::ServerHealth::Failed => failed += 1,
+                plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
+            }
+        }
+
+        let runtime_status = if failed > 0 {
+            plug_core::doctor::CheckStatus::Fail
+        } else if degraded > 0 || auth_required > 0 {
+            plug_core::doctor::CheckStatus::Warn
+        } else {
+            plug_core::doctor::CheckStatus::Pass
+        };
+
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_health".to_string(),
+            status: runtime_status,
+            message: format!(
+                "Daemon running: uptime={}s, clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
+                uptime_secs, clients, healthy, degraded, auth_required, failed
+            ),
+            fix_suggestion: if failed > 0 || auth_required > 0 {
+                Some("Use `plug status` and `plug auth status` to inspect affected servers and next actions".to_string())
+            } else {
+                None
+            },
+        });
+    }
+
+    if let Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) =
+        crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await
+    {
+        let mut reauth = Vec::new();
+        let mut missing = Vec::new();
+        let mut degraded = Vec::new();
+
+        for server in &servers {
+            match (server.authenticated, server.health) {
+                (false, plug_core::types::ServerHealth::AuthRequired) => {
+                    missing.push(server.name.clone())
+                }
+                (true, plug_core::types::ServerHealth::AuthRequired) => {
+                    reauth.push(server.name.clone())
+                }
+                (_, plug_core::types::ServerHealth::Degraded) => {
+                    degraded.push(server.name.clone())
+                }
+                _ => {}
+            }
+        }
+
+        if !(reauth.is_empty() && missing.is_empty() && degraded.is_empty()) {
+            checks.push(plug_core::doctor::CheckResult {
+                name: "runtime_auth".to_string(),
+                status: plug_core::doctor::CheckStatus::Warn,
+                message: format!(
+                    "{}{}{}",
+                    if missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!("missing credentials: {}; ", missing.join(", "))
+                    },
+                    if reauth.is_empty() {
+                        String::new()
+                    } else {
+                        format!("re-auth required: {}; ", reauth.join(", "))
+                    },
+                    if degraded.is_empty() {
+                        String::new()
+                    } else {
+                        format!("degraded auth/runtime: {}", degraded.join(", "))
+                    }
+                )
+                .trim_end_matches("; ")
+                .to_string(),
+                fix_suggestion: Some(
+                    "Run `plug auth status` for token state and `plug auth login --server <name>` where re-auth is required".to_string(),
+                ),
+            });
+        }
+    }
+
+    checks
 }
 
 pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
