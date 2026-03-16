@@ -29,6 +29,12 @@ pub enum HttpError {
     #[error("unauthorized: authentication required")]
     Unauthorized,
 
+    #[error("unauthorized: authentication required")]
+    UnauthorizedWithMetadata {
+        metadata_url: String,
+        scope: Option<String>,
+    },
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -56,6 +62,31 @@ impl IntoResponse for HttpError {
                 response
                     .headers_mut()
                     .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                return response;
+            }
+            HttpError::UnauthorizedWithMetadata {
+                metadata_url,
+                scope,
+            } => {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32001, "message": "authentication required" },
+                    "id": null
+                });
+                let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+                let header_value = match scope {
+                    Some(scope) => format!(
+                        "Bearer resource_metadata=\"{metadata_url}\", scope=\"{scope}\""
+                    ),
+                    None => format!("Bearer resource_metadata=\"{metadata_url}\""),
+                };
+                if let Ok(value) = HeaderValue::from_str(&header_value) {
+                    response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+                } else {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                }
                 return response;
             }
             HttpError::InvalidOrigin => (StatusCode::FORBIDDEN, "forbidden"),
@@ -98,6 +129,14 @@ mod tests {
     fn error_status_codes() {
         let cases: Vec<(HttpError, StatusCode)> = vec![
             (HttpError::Unauthorized, StatusCode::UNAUTHORIZED),
+            (
+                HttpError::UnauthorizedWithMetadata {
+                    metadata_url: "https://plug.example.com/.well-known/oauth-authorization-server"
+                        .into(),
+                    scope: Some("tools:read".into()),
+                },
+                StatusCode::UNAUTHORIZED,
+            ),
             (HttpError::InvalidOrigin, StatusCode::FORBIDDEN),
             (HttpError::SessionRequired, StatusCode::BAD_REQUEST),
             (HttpError::SessionNotFound, StatusCode::NOT_FOUND),
@@ -136,5 +175,24 @@ mod tests {
         let display = format!("{error}");
         assert!(!display.contains("session_id"));
         assert!(!display.contains("uuid"));
+    }
+
+    #[test]
+    fn unauthorized_with_metadata_sets_richer_bearer_challenge() {
+        let response = HttpError::UnauthorizedWithMetadata {
+            metadata_url: "https://plug.example.com/.well-known/oauth-authorization-server".into(),
+            scope: Some("tools:read".into()),
+        }
+        .into_response();
+
+        let header = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .expect("www-authenticate header");
+
+        assert!(header.starts_with("Bearer"));
+        assert!(header.contains("resource_metadata="));
+        assert!(header.contains("scope=\"tools:read\""));
     }
 }
