@@ -566,7 +566,13 @@ fn is_process_running(pid: u32) -> bool {
 }
 
 fn running_daemon_pid() -> Option<u32> {
-    let pid_path = crate::config::config_dir().join("daemon.pid");
+    let pid_path = directories::ProjectDirs::from("", "", "plug")
+        .map(|dirs| {
+            dirs.runtime_dir()
+                .unwrap_or(dirs.data_dir())
+                .join("plug.pid")
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/plug.pid"));
     let pid_str = std::fs::read_to_string(pid_path).ok()?;
     let pid = pid_str.trim().parse::<u32>().ok()?;
     is_process_running(pid).then_some(pid)
