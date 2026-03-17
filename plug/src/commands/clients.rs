@@ -217,9 +217,7 @@ fn cline_vscode_marker_exists() -> bool {
                 home.join(
                     "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
                 ),
-                home.join(
-                    ".vscode/extensions/saoudrizwan.claude-dev",
-                ),
+                home.join(".vscode/extensions/saoudrizwan.claude-dev"),
             ]
             .into_iter()
             .any(|path| path.exists())
@@ -262,8 +260,10 @@ fn client_target_from_type(client_type: plug_core::types::ClientType) -> Option<
 pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<ClientView> {
     let mut live_counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
-    let mut live_transports: std::collections::HashMap<&'static str, std::collections::BTreeSet<&'static str>> =
-        std::collections::HashMap::new();
+    let mut live_transports: std::collections::HashMap<
+        &'static str,
+        std::collections::BTreeSet<&'static str>,
+    > = std::collections::HashMap::new();
     for session in live {
         if let Some(target) = client_target_from_type(session.client_type) {
             *live_counts.entry(target).or_insert(0) += 1;
@@ -272,10 +272,7 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<C
                 plug_core::ipc::LiveSessionTransport::Http => "http",
                 plug_core::ipc::LiveSessionTransport::Sse => "sse",
             };
-            live_transports
-                .entry(target)
-                .or_default()
-                .insert(transport);
+            live_transports.entry(target).or_default().insert(transport);
         }
     }
 
@@ -293,7 +290,12 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<C
             let live_sessions = *live_counts.get(target).unwrap_or(&0);
             let live_transports = live_transports
                 .get(target)
-                .map(|transports| transports.iter().map(|value| (*value).to_string()).collect())
+                .map(|transports| {
+                    transports
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect()
+                })
                 .unwrap_or_default();
             ClientView {
                 name: (*name).to_string(),

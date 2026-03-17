@@ -939,7 +939,10 @@ mod tests {
             },
         ]);
 
-        assert_eq!(steps, vec!["Run `plug auth login --server <name>`.".to_string()]);
+        assert_eq!(
+            steps,
+            vec!["Run `plug auth login --server <name>`.".to_string()]
+        );
     }
 
     #[test]

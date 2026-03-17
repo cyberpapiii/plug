@@ -199,11 +199,9 @@ fn build_configured_http_runtime(
     sessions.spawn_cleanup_task(engine.cancel_token().clone());
     let tool_router = engine.tool_router().clone();
     let auth_token = resolve_downstream_bearer_token(&config.http)?;
-    let operator_token = Arc::<str>::from(
-        plug_core::auth::load_or_generate_token(&plug_core::auth::http_operator_token_path(
-            config.http.port,
-        ))?,
-    );
+    let operator_token = Arc::<str>::from(plug_core::auth::load_or_generate_token(
+        &plug_core::auth::http_operator_token_path(config.http.port),
+    )?);
     let downstream_oauth =
         plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
             .map(plug_core::downstream_oauth::DownstreamOauthManager::new);
@@ -237,8 +235,12 @@ fn build_configured_http_runtime(
                 session_id: Arc::from(session_id.as_str()),
             };
             tool_router.cleanup_subscriptions_for_target(&target).await;
-            http_state_for_expiry.roots_capable_sessions.remove(&session_id);
-            http_state_for_expiry.client_capabilities.remove(&session_id);
+            http_state_for_expiry
+                .roots_capable_sessions
+                .remove(&session_id);
+            http_state_for_expiry
+                .client_capabilities
+                .remove(&session_id);
             http_state_for_expiry
                 .pending_client_requests
                 .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
@@ -266,12 +268,13 @@ fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
         bind if plug_core::config::http_bind_is_loopback(bind) => "localhost",
         bind => bind,
     };
-    format!("{scheme}://{host}:{}{}", http.port, OPERATOR_LIVE_SESSIONS_PATH)
+    format!(
+        "{scheme}://{host}:{}{}",
+        http.port, OPERATOR_LIVE_SESSIONS_PATH
+    )
 }
 
-async fn fetch_http_live_sessions(
-    config_path: Option<&PathBuf>,
-) -> LiveSessionSourceState {
+async fn fetch_http_live_sessions(config_path: Option<&PathBuf>) -> LiveSessionSourceState {
     let config = match plug_core::config::load_config(config_path) {
         Ok(config) => config,
         Err(_) => return LiveSessionSourceState::Unavailable,
@@ -364,9 +367,11 @@ pub(crate) async fn fetch_live_sessions(
 ) {
     let (daemon_source, daemon_scope, support) =
         match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListLiveSessions).await {
-            Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => {
-                (LiveSessionSourceState::Available(sessions), scope, LiveClientSupport::Supported)
-            }
+            Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => (
+                LiveSessionSourceState::Available(sessions),
+                scope,
+                LiveClientSupport::Supported,
+            ),
             Ok(plug_core::ipc::IpcResponse::Clients { clients }) => {
                 let sessions = clients
                     .into_iter()
@@ -671,7 +676,11 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         engine.tracker(),
     );
     let http_config = engine.config().http.clone();
-    let http_future = serve_router(http_runtime.router, &http_config, engine.cancel_token().clone());
+    let http_future = serve_router(
+        http_runtime.router,
+        &http_config,
+        engine.cancel_token().clone(),
+    );
     tokio::pin!(http_future);
     let daemon_future = daemon::run_daemon(
         engine.clone(),
@@ -737,8 +746,9 @@ fn resolve_downstream_bearer_token(
 
 fn preflight_http_bind(http: &plug_core::config::HttpConfig) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", http.bind_address, http.port).parse()?;
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|error| anyhow::anyhow!("failed to bind downstream HTTP address {addr}: {error}"))?;
+    let listener = std::net::TcpListener::bind(addr).map_err(|error| {
+        anyhow::anyhow!("failed to bind downstream HTTP address {addr}: {error}")
+    })?;
     drop(listener);
     Ok(())
 }
@@ -812,7 +822,10 @@ mod tests {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve test router");
         });
-        (format!("http://{}{}", addr, OPERATOR_LIVE_SESSIONS_PATH), handle)
+        (
+            format!("http://{}{}", addr, OPERATOR_LIVE_SESSIONS_PATH),
+            handle,
+        )
     }
 
     async fn spawn_https_test_server(
@@ -1084,7 +1097,10 @@ mod tests {
             LiveSessionSourceState::Available(http),
         );
 
-        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
+        assert_eq!(
+            scope,
+            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+        );
         assert_eq!(sessions.len(), 2);
     }
 
@@ -1106,7 +1122,10 @@ mod tests {
             LiveSessionSourceState::Available(Vec::new()),
         );
 
-        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
+        assert_eq!(
+            scope,
+            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+        );
         assert_eq!(sessions.len(), 1);
     }
 
@@ -1128,7 +1147,10 @@ mod tests {
             LiveSessionSourceState::Unavailable,
         );
 
-        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
+        assert_eq!(
+            scope,
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly
+        );
         assert_eq!(sessions.len(), 1);
     }
 
@@ -1174,14 +1196,18 @@ mod tests {
             LiveSessionSourceState::Unavailable,
         );
 
-        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::Unavailable);
+        assert_eq!(
+            scope,
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable
+        );
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn live_inventory_availability_marks_missing_sources() {
-        let complete =
-            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
+        let complete = live_inventory_availability(
+            plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
+        );
         assert!(!complete.partial);
         assert!(complete.unavailable_sources.is_empty());
 
@@ -1198,7 +1224,10 @@ mod tests {
         let unavailable =
             live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
         assert!(unavailable.partial);
-        assert_eq!(unavailable.unavailable_sources, vec!["daemon_proxy", "http"]);
+        assert_eq!(
+            unavailable.unavailable_sources,
+            vec!["daemon_proxy", "http"]
+        );
     }
 
     #[test]

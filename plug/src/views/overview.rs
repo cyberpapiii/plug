@@ -5,14 +5,12 @@ use crate::commands::clients::{
     configured_http_export_url, linked_client_targets, linked_client_transport,
 };
 use crate::runtime::{
-    LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions,
-    live_inventory_metadata,
+    LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions, live_inventory_metadata,
 };
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
-    print_warning_line,
-    status_label, status_marker, summarize_server_auth, summarize_server_target,
-    summarize_server_transport,
+    print_warning_line, status_label, status_marker, summarize_server_auth,
+    summarize_server_target, summarize_server_transport,
 };
 
 fn live_client_count_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
@@ -411,7 +409,10 @@ pub(crate) async fn cmd_status(
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             match live_client_support {
                 LiveClientSupport::Supported => {
-                    print_label_value("Live Sessions", style(inventory.session_count.to_string()).bold());
+                    print_label_value(
+                        "Live Sessions",
+                        style(inventory.session_count.to_string()).bold(),
+                    );
                     print_label_value(
                         "Live Transports",
                         format!(
@@ -557,8 +558,13 @@ pub(crate) async fn cmd_status(
                 }
             }
         } else {
-            let mut json_obj =
-                status_json(uptime_secs, clients, &inventory, &servers, live_client_support);
+            let mut json_obj = status_json(
+                uptime_secs,
+                clients,
+                &inventory,
+                &servers,
+                live_client_support,
+            );
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
                     linked_clients
@@ -598,7 +604,7 @@ pub(crate) async fn cmd_status(
         );
         println!();
         print_warning_line(
-            "Live runtime, auth, and session truth are unavailable right now. The server list below reflects config only."
+            "Live runtime, auth, and session truth are unavailable right now. The server list below reflects config only.",
         );
         println!();
         print_heading("Configured servers");
@@ -763,7 +769,9 @@ mod tests {
             "http-only"
         );
         assert_eq!(
-            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::TransportComplete),
+            live_inventory_scope_label(
+                plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+            ),
             "transport-complete"
         );
         assert_eq!(

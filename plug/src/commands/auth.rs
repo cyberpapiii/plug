@@ -42,10 +42,7 @@ fn auth_status_source_text(live: bool) -> &'static str {
     }
 }
 
-fn auth_status_json(
-    servers: Vec<serde_json::Value>,
-    live: bool,
-) -> serde_json::Value {
+fn auth_status_json(servers: Vec<serde_json::Value>, live: bool) -> serde_json::Value {
     serde_json::json!({
         "servers": servers,
         "status_source": if live {
@@ -514,7 +511,7 @@ async fn cmd_auth_status(
             );
             if live_auth_status.is_none() {
                 ui::print_warning_line(
-                    "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status."
+                    "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status.",
                 );
             }
             println!();

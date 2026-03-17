@@ -146,7 +146,8 @@ pub(crate) async fn cmd_client_list(
     };
 
     loop {
-        let (live, live_inventory_scope, live_client_support) = fetch_live_sessions(config_path).await;
+        let (live, live_inventory_scope, live_client_support) =
+            fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live, live_inventory_scope);
         let clients = client_views(&live);
         let live_sessions = live_session_views(&live);
@@ -255,7 +256,10 @@ pub(crate) async fn cmd_client_list(
             style("LINKED").dim(),
             style("STATE").dim()
         );
-        println!("  {}", style("----------------------------------------------------------------").dim());
+        println!(
+            "  {}",
+            style("----------------------------------------------------------------").dim()
+        );
         for client in &clients {
             let linked = if client.linked {
                 style("yes").green().bold()
@@ -293,7 +297,9 @@ mod tests {
         live_inventory_scope_label, live_inventory_scope_text, live_inventory_summary,
     };
     use crate::commands::clients::{ClientView, LiveSessionView};
-    use crate::runtime::{LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts};
+    use crate::runtime::{
+        LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts,
+    };
 
     #[test]
     fn client_list_json_includes_inventory_contract_fields() {
@@ -361,7 +367,9 @@ mod tests {
             "http-only"
         );
         assert_eq!(
-            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::TransportComplete),
+            live_inventory_scope_label(
+                plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+            ),
             "transport-complete"
         );
         assert_eq!(
