@@ -219,6 +219,8 @@ Key files expected to change:
   local-vs-remote fleets easier to reason about.
 - Added focused tests for explicit HTTP export URLs and for linked-client endpoint parsing across
   JSON, TOML, and YAML formats.
+- Added export→parse round-trip tests for JSON, TOML, and YAML client shapes so endpoint fidelity
+  is proven across the actual repair/export path rather than parser-only coverage.
 
 **Verification:**
 - `cargo test -p plug-core export_ -- --nocapture`
