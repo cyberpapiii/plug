@@ -85,6 +85,8 @@ Still remaining:
   command) so operators can immediately see what a health line actually points at.
 - 2026-03-17: daemon-unavailable fallback inventories now preserve upstream transport, auth, and
   target detail instead of collapsing back to bare server names.
+- 2026-03-17: `plug status` now surfaces linked client topology directly in the service summary so
+  operators can see which client configs are pointed at plug without switching to a second command.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
   full end-to-end command fixtures.
 

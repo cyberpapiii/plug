@@ -585,6 +585,26 @@ Key files expected to change:
 - Shared summarizers are worth it here because inconsistent labels across commands would recreate
   the same confusion under a different banner.
 
+### 2026-03-17 - Status linked-client visibility slice
+
+**By:** Codex
+
+**Actions:**
+- Added linked-client topology to `plug status` so the service summary shows which client configs
+  are linked to plug and whether they are using stdio or HTTP.
+- Mirrored the same linked-client data into JSON output so scripted inspection can reason about the
+  linked fleet without a separate `plug clients` call.
+
+**Verification:**
+- `cargo test -p plug -- --nocapture`
+- `cargo run --quiet --bin plug -- status`
+
+**Learnings:**
+- “Clients: 9” and “these seven client configs are linked to plug via stdio” answer different
+  questions and both belong in the status surface.
+- Putting the linked topology next to live client count makes the gap between configured and
+  currently connected clients much easier to reason about.
+
 ### 2026-03-17 - Non-interactive doctor and upstream target visibility
 
 **By:** Codex

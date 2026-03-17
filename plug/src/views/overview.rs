@@ -191,6 +191,18 @@ pub(crate) async fn cmd_status(
 
     // Load config to check HTTP auth status
     let config = plug_core::config::load_config(config_path).ok();
+    let linked_clients = linked_client_targets()
+        .into_iter()
+        .map(|target| {
+            let transport = linked_client_transport(&target, false)
+                .map(|transport| match transport {
+                    plug_core::export::ExportTransport::Stdio => "stdio",
+                    plug_core::export::ExportTransport::Http => "http",
+                })
+                .unwrap_or("unknown");
+            (target, transport.to_string())
+        })
+        .collect::<Vec<_>>();
     let downstream_auth_info = config.as_ref().map(|c| {
         let mode = c.http.auth_mode.label();
         let summary = match c.http.auth_mode {
@@ -253,6 +265,14 @@ pub(crate) async fn cmd_status(
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             print_label_value("Clients", style(clients.to_string()).bold());
+            if !linked_clients.is_empty() {
+                let linked_summary = linked_clients
+                    .iter()
+                    .map(|(target, transport)| format!("{target} ({transport})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                print_label_value("Linked", linked_summary);
+            }
             if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
                 print_label_value(
                     "Downstream Auth",
@@ -365,6 +385,17 @@ pub(crate) async fn cmd_status(
             }
         } else {
             let mut json_obj = serde_json::json!({ "uptime": uptime_secs, "clients": clients, "servers": servers });
+            if !linked_clients.is_empty() {
+                json_obj["linked_clients"] = serde_json::json!(
+                    linked_clients
+                        .iter()
+                        .map(|(target, transport)| serde_json::json!({
+                            "target": target,
+                            "transport": transport,
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
             if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
                 json_obj["downstream_auth"] = serde_json::json!({
                     "mode": mode,
