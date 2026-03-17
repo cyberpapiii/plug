@@ -94,6 +94,9 @@ Still remaining:
 - 2026-03-17: `plug-core` doctor tests now cover reachable and unreachable cold HTTP upstreams,
   including mixed stdio+remote fleets, so the concurrent cold-connectivity behavior is pinned by
   focused tests instead of only indirect command-level observation.
+- 2026-03-17: `plug` doctor command tests now cover the two most confusing synthesized operator
+  states directly: when both live runtime and cold connectivity are failing, and when degraded
+  servers need to be named separately from the aggregate runtime summary.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.

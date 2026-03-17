@@ -593,6 +593,38 @@ mod tests {
     }
 
     #[test]
+    fn interpretation_explains_when_cold_and_live_fail_together() {
+        let checks = vec![
+            check(
+                "server_connectivity",
+                CheckStatus::Fail,
+                "Cold connectivity issues: oura: TCP connect failed",
+            ),
+            check(
+                "runtime_health",
+                CheckStatus::Warn,
+                "Daemon running: uptime=20s, clients=2, healthy=1, degraded=0, auth_required=0, failed=1",
+            ),
+            check("runtime_failures", CheckStatus::Fail, "failing servers: oura"),
+        ];
+        let interpretation =
+            synthesize_doctor_interpretation(&checks).expect("expected interpretation");
+        assert_eq!(interpretation.status, CheckStatus::Fail);
+        assert!(
+            interpretation
+                .message
+                .contains("cold connectivity is also worse than the current live runtime")
+        );
+        assert!(
+            interpretation
+                .fix_suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fix the reported cold connectivity issue before restarting")
+        );
+    }
+
+    #[test]
     fn interpretation_explains_auth_attention_when_runtime_is_healthy() {
         let checks = vec![
             check(
@@ -661,6 +693,39 @@ mod tests {
         assert_eq!(checks[1].name, "runtime_failures");
         assert_eq!(checks[1].status, CheckStatus::Fail);
         assert_eq!(checks[1].message, "failing servers: oura");
+    }
+
+    #[test]
+    fn runtime_checks_include_named_degraded_servers() {
+        let checks = runtime_health_checks_for_tests(
+            &[
+                ServerStatus {
+                    server_id: "healthy".to_string(),
+                    health: ServerHealth::Healthy,
+                    tool_count: 1,
+                    auth_status: "none".to_string(),
+                    last_seen: None,
+                },
+                ServerStatus {
+                    server_id: "figma".to_string(),
+                    health: ServerHealth::Degraded,
+                    tool_count: 12,
+                    auth_status: "oauth".to_string(),
+                    last_seen: None,
+                },
+            ],
+            2,
+            45,
+        );
+
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "runtime_health");
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(checks[0].message.contains("degraded=1"));
+
+        assert_eq!(checks[1].name, "runtime_degraded");
+        assert_eq!(checks[1].status, CheckStatus::Warn);
+        assert_eq!(checks[1].message, "degraded servers: figma");
     }
 }
 

@@ -696,3 +696,23 @@ Key files expected to change:
   operator improvement is better attribution, not downgraded severity.
 - Focused reachability tests are a cheap way to pin the concurrent cold-connectivity path while we
   keep avoiding live daemon/keychain side effects during hardening work.
+
+### 2026-03-17 - Doctor interpretation clarity coverage slice
+
+**By:** Codex
+
+**Actions:**
+- Added focused `plug` command-layer doctor tests for the synthesized interpretation logic.
+- Covered the two operator-facing cases that were still easiest to misread:
+  - cold connectivity failure plus active runtime failures
+  - named degraded-server reporting alongside the aggregate runtime summary
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+
+**Learnings:**
+- The CLI-layer synthesis needs its own tests even when the underlying `plug-core` checks are
+  already covered, because the operator-facing semantics live in `plug`, not just the core check
+  primitives.
+- Splitting named degraded/failing servers from the aggregate summary is what makes the output
+  readable under real mixed-fleet conditions; otherwise users only see a vague warning count.
