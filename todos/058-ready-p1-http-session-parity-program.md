@@ -290,3 +290,25 @@ These write scopes should remain mostly disjoint until integration.
 **Learnings:**
 - The aggregation rules are simple enough to keep pure and test directly, which will make later
   partial/degraded-state work safer.
+
+### 2026-03-17 - Availability metadata surfaced consistently across operator views
+
+**By:** Codex
+
+**Actions:**
+- Added a small `LiveInventoryAvailability` helper in `runtime` so operator surfaces can express
+  whether the current live inventory is partial and which sources are unavailable.
+- Updated `plug clients`, `plug overview`, and `plug status` text output to show
+  `Inventory Availability` alongside `Inventory Scope`.
+- Extended the corresponding JSON output with:
+  - `inventory_partial`
+  - `inventory_unavailable_sources`
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+
+**Learnings:**
+- `inventory_scope` and `inventory_partial` answer different questions and both are useful.
+- Machine-readable missing-source metadata reduces ambiguity for future UIs and external tooling.

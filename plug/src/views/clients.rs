@@ -3,7 +3,9 @@ use dialoguer::console::style;
 
 use crate::OutputFormat;
 use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
-use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions};
+use crate::runtime::{
+    LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions, live_inventory_availability,
+};
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_warning_line,
@@ -68,6 +70,7 @@ pub(crate) async fn cmd_client_list(
 
     loop {
         let (live, live_inventory_scope, live_client_support) = fetch_live_sessions(config_path).await;
+        let inventory = live_inventory_availability(live_inventory_scope);
         let clients = client_views(&live);
         let live_sessions = live_session_views(&live);
 
@@ -79,6 +82,8 @@ pub(crate) async fn cmd_client_list(
                     "live_sessions": live_sessions,
                     "live_client_support": live_client_support,
                     "live_inventory_scope": live_inventory_scope,
+                    "inventory_partial": inventory.partial,
+                    "inventory_unavailable_sources": inventory.unavailable_sources,
                     "http_sessions_included": matches!(
                         live_inventory_scope,
                         plug_core::ipc::LiveSessionInventoryScope::TransportComplete
@@ -135,6 +140,14 @@ pub(crate) async fn cmd_client_list(
         }
         if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
             print_info_line(live_inventory_scope_text(live_inventory_scope));
+            if inventory.partial {
+                print_label_value(
+                    "Inventory Availability",
+                    format!("partial (missing: {})", inventory.unavailable_sources.join(", ")),
+                );
+            } else {
+                print_label_value("Inventory Availability", "complete");
+            }
             print_label_value(
                 "Live Transports",
                 format!("daemon_proxy={} http={}", daemon_proxy_count, http_count),

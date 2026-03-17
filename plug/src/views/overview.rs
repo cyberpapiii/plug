@@ -4,7 +4,10 @@ use crate::OutputFormat;
 use crate::commands::clients::{
     configured_http_export_url, linked_client_targets, linked_client_transport,
 };
-use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions};
+use crate::runtime::{
+    LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions,
+    live_inventory_availability,
+};
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_next_action, print_warning_line,
     status_label, status_marker, summarize_server_auth, summarize_server_target,
@@ -58,6 +61,7 @@ pub(crate) async fn cmd_overview(
     let (live_clients, live_inventory_scope, live_client_support) =
         fetch_live_sessions(Some(&config_path)).await;
     let live_client_count = live_clients.len();
+    let inventory = live_inventory_availability(live_inventory_scope);
 
     if matches!(output, OutputFormat::Json) {
         let daemon_running = crate::daemon::connect_to_daemon().await.is_some();
@@ -79,6 +83,8 @@ pub(crate) async fn cmd_overview(
                 "live_client_count": live_client_count,
                 "live_client_support": live_client_support,
                 "live_client_scope": live_inventory_scope,
+                "inventory_partial": inventory.partial,
+                "inventory_unavailable_sources": inventory.unavailable_sources,
                 "http_sessions_included": matches!(
                     live_inventory_scope,
                     plug_core::ipc::LiveSessionInventoryScope::TransportComplete
@@ -304,6 +310,7 @@ pub(crate) async fn cmd_status(
     {
         let (live_sessions, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
+        let inventory = live_inventory_availability(live_inventory_scope);
         let live_session_count = live_sessions.len();
         let (daemon_proxy_count, http_count, sse_count) = live_transport_counts(&live_sessions);
         if matches!(output, OutputFormat::Text) {
@@ -328,6 +335,17 @@ pub(crate) async fn cmd_status(
                         "Inventory Scope",
                         live_client_count_scope_text(live_inventory_scope),
                     );
+                    if inventory.partial {
+                        print_label_value(
+                            "Inventory Availability",
+                            format!(
+                                "partial (missing: {})",
+                                inventory.unavailable_sources.join(", ")
+                            ),
+                        );
+                    } else {
+                        print_label_value("Inventory Availability", "complete");
+                    }
                 }
                 LiveClientSupport::DaemonRestartRequired => {
                     print_label_value("Live Sessions", style("restart required").yellow().bold());
@@ -469,6 +487,8 @@ pub(crate) async fn cmd_status(
                 "servers": servers,
                 "live_client_support": live_client_support,
                 "live_client_scope": live_inventory_scope,
+                "inventory_partial": inventory.partial,
+                "inventory_unavailable_sources": inventory.unavailable_sources,
                 "http_sessions_included": matches!(
                     live_inventory_scope,
                     plug_core::ipc::LiveSessionInventoryScope::TransportComplete

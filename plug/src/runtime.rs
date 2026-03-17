@@ -21,6 +21,35 @@ pub(crate) enum LiveClientSupport {
     DaemonRestartRequired,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LiveInventoryAvailability {
+    pub(crate) partial: bool,
+    pub(crate) unavailable_sources: Vec<&'static str>,
+}
+
+pub(crate) fn live_inventory_availability(
+    scope: plug_core::ipc::LiveSessionInventoryScope,
+) -> LiveInventoryAvailability {
+    match scope {
+        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => LiveInventoryAvailability {
+            partial: false,
+            unavailable_sources: Vec::new(),
+        },
+        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => LiveInventoryAvailability {
+            partial: true,
+            unavailable_sources: vec!["http"],
+        },
+        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => LiveInventoryAvailability {
+            partial: true,
+            unavailable_sources: vec!["daemon_proxy"],
+        },
+        plug_core::ipc::LiveSessionInventoryScope::Unavailable => LiveInventoryAvailability {
+            partial: true,
+            unavailable_sources: vec!["daemon_proxy", "http"],
+        },
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OperatorLiveSessionsResponse {
     sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
@@ -982,6 +1011,29 @@ mod tests {
 
         assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::Unavailable);
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn live_inventory_availability_marks_missing_sources() {
+        let complete =
+            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
+        assert!(!complete.partial);
+        assert!(complete.unavailable_sources.is_empty());
+
+        let daemon_only =
+            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
+        assert!(daemon_only.partial);
+        assert_eq!(daemon_only.unavailable_sources, vec!["http"]);
+
+        let http_only =
+            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
+        assert!(http_only.partial);
+        assert_eq!(http_only.unavailable_sources, vec!["daemon_proxy"]);
+
+        let unavailable =
+            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
+        assert!(unavailable.partial);
+        assert_eq!(unavailable.unavailable_sources, vec!["daemon_proxy", "http"]);
     }
 
     #[tokio::test]
