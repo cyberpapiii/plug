@@ -135,13 +135,12 @@ pub fn current_access_token(server_name: &str) -> Option<String> {
 ///
 /// This lets a fresh daemon/runtime recover after a successful `plug auth login`
 /// without requiring an injected-token IPC path to populate the cache first.
+///
+/// When a mirrored token file contains newer credentials than the current
+/// in-memory cache, prefer the persisted credentials and refresh the cache.
 pub async fn current_or_stored_access_token(server_name: &str) -> Option<String> {
-    if let Some(token) = current_access_token(server_name) {
-        return Some(token);
-    }
-
     let store = get_or_create_store(server_name);
-    let creds = store.load().await.ok().flatten()?;
+    let creds = store.current_or_freshest_persisted_credentials().await?;
 
     use oauth2::TokenResponse;
     creds
@@ -413,6 +412,27 @@ impl CompositeCredentialStore {
         self.cache.store(Arc::new(None));
     }
 
+    fn token_identity(creds: &StoredCredentials) -> Option<String> {
+        use oauth2::TokenResponse;
+
+        creds
+            .token_response
+            .as_ref()
+            .map(|tr| tr.access_token().secret().to_string())
+    }
+
+    fn persisted_credentials_is_newer(
+        cached: &StoredCredentials,
+        persisted: &StoredCredentials,
+    ) -> bool {
+        let cached_received = cached.token_received_at.unwrap_or(0);
+        let persisted_received = persisted.token_received_at.unwrap_or(0);
+
+        persisted_received > cached_received
+            || (persisted_received == cached_received
+                && Self::token_identity(cached) != Self::token_identity(persisted))
+    }
+
     /// Return the cached token timing info for refresh-check decisions.
     ///
     /// Returns `(token_received_at, expires_in)` or `None` if no token is cached.
@@ -432,6 +452,36 @@ impl CompositeCredentialStore {
     /// Prime the in-memory cache with credentials obtained from another trusted path.
     pub fn hydrate_credentials(&self, creds: &StoredCredentials) {
         self.update_cache(creds);
+    }
+
+    /// Return the best currently-known credentials for this server.
+    ///
+    /// When cached credentials exist, prefer a newer mirrored token-file entry
+    /// over the in-memory copy. This lets a long-lived daemon recover from
+    /// fresher persisted credentials written by another process without
+    /// requiring a full restart to clear cache state.
+    async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
+        let cached = self.cached_credentials();
+        let persisted_file = self.file_load();
+
+        match (cached, persisted_file) {
+            (Some(cached), Some(persisted))
+                if Self::persisted_credentials_is_newer(&cached, &persisted) =>
+            {
+                self.update_cache(&persisted);
+                Some(persisted)
+            }
+            (Some(cached), _) => Some(cached),
+            (None, Some(persisted)) => {
+                self.update_cache(&persisted);
+                Some(persisted)
+            }
+            (None, None) => {
+                let creds = self.keyring_load()?;
+                self.update_cache(&creds);
+                Some(creds)
+            }
+        }
     }
 }
 
@@ -1046,6 +1096,36 @@ mod tests {
         store.clear().await.unwrap();
     }
 
+    /// A long-lived daemon can hold stale cached credentials while another
+    /// process persists fresher credentials to disk. Reconnect-time token lookup
+    /// should prefer the newer persisted token and refresh the shared cache.
+    #[tokio::test]
+    async fn test_current_or_stored_access_token_prefers_newer_persisted_credentials() {
+        let name = format!("oauth-refresh-cache-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let mut stale = make_test_token("stale-access", Some("stale-refresh"), Some(3600));
+        stale.token_received_at = Some(100);
+        store.save(stale).await.unwrap();
+
+        let external_store = CompositeCredentialStore::new(name.clone());
+        let mut fresh = make_test_token("fresh-access", Some("fresh-refresh"), Some(3600));
+        fresh.token_received_at = Some(200);
+        external_store.save(fresh).await.unwrap();
+
+        assert_eq!(
+            current_access_token(&name).as_deref(),
+            Some("stale-access"),
+            "expected shared cache to remain stale before lookup"
+        );
+
+        let token = current_or_stored_access_token(&name).await;
+        assert_eq!(token.as_deref(), Some("fresh-access"));
+        assert_eq!(current_access_token(&name).as_deref(), Some("fresh-access"));
+
+        store.clear().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_load_prefers_in_memory_cache_before_backing_stores() {
         let name = format!("oauth-cache-first-{}", std::process::id());
@@ -1059,7 +1139,10 @@ mod tests {
         store.file_clear();
 
         let loaded = store.load().await.unwrap();
-        assert!(loaded.is_some(), "expected cached credentials to satisfy load");
+        assert!(
+            loaded.is_some(),
+            "expected cached credentials to satisfy load"
+        );
         let loaded = loaded.unwrap();
         use oauth2::TokenResponse;
         let token = loaded
