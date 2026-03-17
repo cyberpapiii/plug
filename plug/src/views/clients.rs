@@ -83,15 +83,17 @@ pub(crate) async fn cmd_client_list(
         println!();
         print_heading("Inventory");
         println!(
-            "  {:<24} {:<10} {:<10} {:<6}",
+            "  {:<24} {:<10} {:<10} {:<28} {:<10} {:<6}",
             style("CLIENT").dim(),
             style("LINKED").dim(),
+            style("MODE").dim(),
+            style("ENDPOINT").dim(),
             style("DETECTED").dim(),
             style("LIVE").dim()
         );
         println!(
             "  {}",
-            style("----------------------------------------------------------").dim()
+            style("------------------------------------------------------------------------------------------------").dim()
         );
         for client in &clients {
             let linked = if client.linked {
@@ -99,6 +101,23 @@ pub(crate) async fn cmd_client_list(
             } else {
                 style("no").dim()
             };
+            let linked_transport = client
+                .linked_transport
+                .as_deref()
+                .map(|transport| style(transport).yellow().bold().to_string())
+                .unwrap_or_else(|| style("-").dim().to_string());
+            let endpoint = client
+                .linked_endpoint
+                .as_deref()
+                .map(|endpoint| {
+                    let mut value = endpoint.to_string();
+                    if value.len() > 28 {
+                        value.truncate(25);
+                        value.push_str("...");
+                    }
+                    style(value).dim().to_string()
+                })
+                .unwrap_or_else(|| style("-").dim().to_string());
             let detected = if client.detected {
                 style("yes").cyan()
             } else {
@@ -113,8 +132,8 @@ pub(crate) async fn cmd_client_list(
                 style("no").dim().to_string()
             };
             println!(
-                "  {:<24} {:<10} {:<10} {:<6}",
-                client.name, linked, detected, live_label
+                "  {:<24} {:<10} {:<10} {:<28} {:<10} {:<6}",
+                client.name, linked, linked_transport, endpoint, detected, live_label
             );
         }
 

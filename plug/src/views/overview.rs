@@ -1,7 +1,9 @@
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::{linked_client_targets, linked_client_transport};
+use crate::commands::clients::{
+    configured_http_export_url, linked_client_targets, linked_client_transport,
+};
 use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_next_action, print_warning_line,
@@ -68,15 +70,21 @@ pub(crate) async fn cmd_overview(
 
     let config = plug_core::config::load_config(Some(&config_path))?;
     let daemon_running = crate::daemon::connect_to_daemon().await.is_some();
-    let transport_counts = config.servers.values().fold((0usize, 0usize, 0usize), |mut acc, server| {
-        match server.transport {
-            plug_core::config::TransportType::Stdio => acc.0 += 1,
-            plug_core::config::TransportType::Http => acc.1 += 1,
-            plug_core::config::TransportType::Sse => acc.2 += 1,
-        }
-        acc
-    });
+    let transport_counts =
+        config
+            .servers
+            .values()
+            .fold((0usize, 0usize, 0usize), |mut acc, server| {
+                match server.transport {
+                    plug_core::config::TransportType::Stdio => acc.0 += 1,
+                    plug_core::config::TransportType::Http => acc.1 += 1,
+                    plug_core::config::TransportType::Sse => acc.2 += 1,
+                }
+                acc
+            });
     let downstream_auth_mode = config.http.auth_mode.label();
+    let downstream_http_endpoint = configured_http_export_url(Some(&config_path))
+        .unwrap_or_else(|| format!("http://localhost:{}/mcp", config.http.port));
     let downstream_auth_summary = match config.http.auth_mode {
         plug_core::config::DownstreamAuthMode::Auto => {
             if plug_core::config::http_bind_is_loopback(&config.http.bind_address) {
@@ -125,6 +133,7 @@ pub(crate) async fn cmd_overview(
             style(downstream_auth_summary).yellow().bold()
         },
     );
+    print_label_value("HTTP Endpoint", downstream_http_endpoint);
     if let Some(public_base_url) = &config.http.public_base_url {
         print_label_value("Public URL", public_base_url);
     }
@@ -193,11 +202,16 @@ pub(crate) async fn cmd_status(
             }
             plug_core::config::DownstreamAuthMode::None => "explicit none".to_string(),
             plug_core::config::DownstreamAuthMode::Bearer => "explicit bearer".to_string(),
-            plug_core::config::DownstreamAuthMode::Oauth => {
-                "authorization-code + PKCE".to_string()
-            }
+            plug_core::config::DownstreamAuthMode::Oauth => "authorization-code + PKCE".to_string(),
         };
-        (mode.to_string(), summary, c.http.public_base_url.clone())
+        let endpoint = configured_http_export_url(config_path)
+            .unwrap_or_else(|| format!("http://localhost:{}/mcp", c.http.port));
+        (
+            mode.to_string(),
+            summary,
+            c.http.public_base_url.clone(),
+            endpoint,
+        )
     });
     let http_auth_info = config.as_ref().and_then(|c| {
         let expects_bearer = match c.http.auth_mode {
@@ -238,7 +252,7 @@ pub(crate) async fn cmd_status(
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             print_label_value("Clients", style(clients.to_string()).bold());
-            if let Some((mode, summary, public_base_url)) = &downstream_auth_info {
+            if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
                 print_label_value(
                     "Downstream Auth",
                     if mode == "auto" {
@@ -247,6 +261,7 @@ pub(crate) async fn cmd_status(
                         style(format!("{mode} ({summary})")).yellow().bold()
                     },
                 );
+                print_label_value("HTTP Endpoint", endpoint);
                 if let Some(public_base_url) = public_base_url {
                     print_label_value("Public URL", public_base_url);
                 }
@@ -276,9 +291,7 @@ pub(crate) async fn cmd_status(
                 print_heading("Servers");
                 println!("  No servers configured.");
             } else {
-                let config_by_server = config
-                    .as_ref()
-                    .map(|cfg| &cfg.servers);
+                let config_by_server = config.as_ref().map(|cfg| &cfg.servers);
                 let auth_required_servers = servers
                     .iter()
                     .filter(|s| s.server_id != "__plug_internal__")
@@ -318,11 +331,13 @@ pub(crate) async fn cmd_status(
                         })
                         .unwrap_or("unknown");
                     let auth = server_cfg
-                        .map(|cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
-                            (Some("oauth"), _) => "oauth",
-                            (_, true) => "bearer",
-                            _ => "none",
-                        })
+                        .map(
+                            |cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
+                                (Some("oauth"), _) => "oauth",
+                                (_, true) => "bearer",
+                                _ => "none",
+                            },
+                        )
                         .unwrap_or("unknown");
                     println!(
                         "  {} {:<18} {:<12} {:<8} {:<6} {:>5}",
@@ -360,11 +375,12 @@ pub(crate) async fn cmd_status(
             }
         } else {
             let mut json_obj = serde_json::json!({ "uptime": uptime_secs, "clients": clients, "servers": servers });
-            if let Some((mode, summary, public_base_url)) = &downstream_auth_info {
+            if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
                 json_obj["downstream_auth"] = serde_json::json!({
                     "mode": mode,
                     "summary": summary,
                     "public_base_url": public_base_url,
+                    "http_endpoint": endpoint,
                 });
             }
             if let Some((token_exists, token)) = &http_auth_info {

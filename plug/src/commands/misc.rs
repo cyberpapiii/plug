@@ -154,9 +154,7 @@ pub(crate) async fn cmd_doctor(
         .unwrap_or_else(plug_core::config::default_config_path);
     let config = plug_core::config::load_config(config_path)?;
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
-    report
-        .checks
-        .extend(runtime_doctor_checks().await);
+    report.checks.extend(runtime_doctor_checks().await);
     report.exit_code = if report
         .checks
         .iter()
@@ -212,7 +210,10 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         let mut failed = 0usize;
         let mut auth_required = 0usize;
 
-        for server in servers.iter().filter(|s| s.server_id != "__plug_internal__") {
+        for server in servers
+            .iter()
+            .filter(|s| s.server_id != "__plug_internal__")
+        {
             match server.health {
                 plug_core::types::ServerHealth::Healthy => healthy += 1,
                 plug_core::types::ServerHealth::Degraded => degraded += 1,
@@ -259,9 +260,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
                 (true, plug_core::types::ServerHealth::AuthRequired) => {
                     reauth.push(server.name.clone())
                 }
-                (_, plug_core::types::ServerHealth::Degraded) => {
-                    degraded.push(server.name.clone())
-                }
+                (_, plug_core::types::ServerHealth::Degraded) => degraded.push(server.name.clone()),
                 _ => {}
             }
         }
@@ -395,12 +394,14 @@ pub(crate) fn cmd_repair() -> anyhow::Result<()> {
     let mut repaired_count = 0;
 
     for target in all_clients {
-        if let Some(transport) = crate::commands::clients::linked_client_transport(target, false) {
+        if let Some(linked) = crate::commands::clients::linked_client_config(target, false) {
             print!("  {} Refreshing {}... ", style("›").cyan().bold(), target);
+            let http_url = crate::commands::clients::configured_http_export_url(None)
+                .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
             if let Err(e) = execute_export(
                 target,
-                matches!(transport, plug_core::export::ExportTransport::Http),
-                3282,
+                matches!(linked.transport, plug_core::export::ExportTransport::Http),
+                linked.endpoint.as_deref().unwrap_or(http_url.as_str()),
                 true,
                 false,
             ) {

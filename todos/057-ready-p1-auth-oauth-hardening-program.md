@@ -169,3 +169,33 @@ Key files expected to change:
   recovery still need more explicit modeling of mixed-fleet scenarios.
 - `plug doctor` now includes daemon-observed runtime health/auth context so cold checks and live
   state can be compared in one command, which reduces the biggest contradiction from real usage.
+
+### 2026-03-16 - Topology-aware client export and inventory slice
+
+**By:** Codex
+
+**Actions:**
+- Made client export/link/custom-config HTTP snippets derive from the configured downstream endpoint
+  instead of hard-coding `http://localhost:3282/mcp`.
+- Reused the current linked client endpoint during `plug repair` so existing remote/public HTTP
+  client configs are refreshed without being flattened back to localhost.
+- Added client-config parsing helpers that recover both linked transport and linked HTTP endpoint
+  across JSON, TOML, and YAML client config shapes.
+- Surfaced linked client mode and endpoint in `plug clients`.
+- Surfaced the active downstream HTTP endpoint in overview/status so operators can see what HTTP
+  clients should actually use.
+- Added focused tests for configured endpoint derivation and linked client config parsing.
+
+**Verification:**
+- `cargo test -p plug configured_http_export_url -- --nocapture`
+- `cargo test -p plug-core export_http_uses_explicit_url_when_provided -- --nocapture`
+- `cargo build --release`
+- `cargo test` in sandbox still fails on existing listener/socket permission-restricted cases
+  (`commands::auth` callback tests, HTTPS runtime test, daemon socket IPC restart tests), but the
+  new client-topology tests pass.
+
+**Learnings:**
+- Preserving transport alone was not enough; repair also needed to preserve the actual exported HTTP
+  endpoint or it could still rewrite remote/public client configs incorrectly.
+- The client inventory needed endpoint visibility, not just a boolean linked/not-linked state, to
+  reduce confusion for mixed local and remote HTTP setups.

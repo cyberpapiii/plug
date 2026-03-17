@@ -107,7 +107,7 @@ impl ExportTarget {
 }
 
 /// Transport mode for the exported config.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportTransport {
     /// stdio via `plug connect`
     Stdio,
@@ -120,8 +120,17 @@ pub struct ExportOptions {
     pub target: ExportTarget,
     pub transport: ExportTransport,
     pub port: u16,
+    /// Explicit HTTP endpoint to export. Falls back to localhost:<port>/mcp when absent.
+    pub http_url: Option<String>,
     /// Command to use for stdio transport (e.g., "plug" or absolute path).
     pub command: String,
+}
+
+fn resolved_http_url(options: &ExportOptions) -> String {
+    options
+        .http_url
+        .clone()
+        .unwrap_or_else(|| format!("http://localhost:{}/mcp", options.port))
 }
 
 // ── Export ───────────────────────────────────────────────────────────────────
@@ -169,7 +178,7 @@ fn export_nanobot(options: &ExportOptions) -> String {
             "args": ["connect"]
         }),
         ExportTransport::Http => serde_json::json!({
-            "url": format!("http://localhost:{}/mcp", options.port)
+            "url": resolved_http_url(options)
         }),
     };
 
@@ -192,7 +201,7 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
             "args": ["connect"]
         }),
         ExportTransport::Http => serde_json::json!({
-            "url": format!("http://localhost:{}/mcp", options.port)
+            "url": resolved_http_url(options)
         }),
     };
 
@@ -229,7 +238,7 @@ fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
             );
             plug.insert(
                 serde_yml::Value::from("uri"),
-                serde_yml::Value::from(format!("http://localhost:{}/mcp", options.port)),
+                serde_yml::Value::from(resolved_http_url(options)),
             );
         }
     }
@@ -258,7 +267,7 @@ fn export_vscode(options: &ExportOptions) -> String {
             "args": ["connect"]
         }),
         ExportTransport::Http => serde_json::json!({
-            "url": format!("http://localhost:{}/mcp", options.port)
+            "url": resolved_http_url(options)
         }),
     };
 
@@ -287,9 +296,9 @@ args = ["connect"]
             format!(
                 r#"[mcp_servers.plug]
 transport = "http"
-url = "http://localhost:{}/mcp"
+url = "{}"
 "#,
-                options.port
+                resolved_http_url(options)
             )
         }
     }
@@ -430,6 +439,7 @@ mod tests {
             target: ExportTarget::ClaudeDesktop,
             transport: ExportTransport::Stdio,
             port: 3282,
+            http_url: None,
             command: "plug".to_string(),
         };
         let output = export_config(&options);
@@ -444,6 +454,7 @@ mod tests {
             target: ExportTarget::Cursor,
             transport: ExportTransport::Http,
             port: 3282,
+            http_url: None,
             command: "plug".to_string(),
         };
         let output = export_config(&options);
@@ -460,6 +471,7 @@ mod tests {
             target: ExportTarget::VSCodeCopilot,
             transport: ExportTransport::Stdio,
             port: 3282,
+            http_url: None,
             command: "plug".to_string(),
         };
         let output = export_config(&options);
@@ -473,6 +485,7 @@ mod tests {
             target: ExportTarget::CodexCli,
             transport: ExportTransport::Stdio,
             port: 3282,
+            http_url: None,
             command: "plug".to_string(),
         };
         let output = export_config(&options);
@@ -486,6 +499,7 @@ mod tests {
             target: ExportTarget::Zed,
             transport: ExportTransport::Stdio,
             port: 3282,
+            http_url: None,
             command: "plug".to_string(),
         };
         let output = export_config(&options);
@@ -501,5 +515,22 @@ mod tests {
                 "failed to parse: {name}"
             );
         }
+    }
+
+    #[test]
+    fn export_http_uses_explicit_url_when_provided() {
+        let options = ExportOptions {
+            target: ExportTarget::Cursor,
+            transport: ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        };
+        let output = export_config(&options);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            parsed["mcpServers"]["plug"]["url"],
+            "https://plug.example.com/mcp"
+        );
     }
 }

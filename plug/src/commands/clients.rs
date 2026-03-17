@@ -1,12 +1,21 @@
 use dialoguer::console::style;
+use plug_core::export::{ExportTarget, ExportTransport};
 
 use crate::ui::{cli_prompt_theme, print_banner, print_warning_line};
+
+#[derive(Debug, Clone)]
+pub(crate) struct LinkedClientConfig {
+    pub(crate) transport: ExportTransport,
+    pub(crate) endpoint: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ClientView {
     pub(crate) name: String,
     pub(crate) target: String,
     pub(crate) linked: bool,
+    pub(crate) linked_transport: Option<String>,
+    pub(crate) linked_endpoint: Option<String>,
     pub(crate) detected: bool,
     pub(crate) live: bool,
     pub(crate) live_sessions: usize,
@@ -38,7 +47,7 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
 pub(crate) fn linked_client_targets() -> Vec<String> {
     all_client_targets()
         .iter()
-        .filter(|(_, target)| linked_client_transport(target, false).is_some())
+        .filter(|(_, target)| linked_client_config(target, false).is_some())
         .map(|(_, target)| (*target).to_string())
         .collect()
 }
@@ -47,8 +56,10 @@ pub(crate) fn linked_client_transport(
     target: &str,
     project: bool,
 ) -> Option<plug_core::export::ExportTransport> {
-    use plug_core::export::{ExportTarget, ExportTransport};
+    linked_client_config(target, project).map(|config| config.transport)
+}
 
+pub(crate) fn linked_client_config(target: &str, project: bool) -> Option<LinkedClientConfig> {
     let target_enum: ExportTarget = target.parse().ok()?;
     let path = plug_core::export::default_config_path(target_enum, project)?;
     if !path.exists() {
@@ -56,16 +67,30 @@ pub(crate) fn linked_client_transport(
     }
 
     let content = std::fs::read_to_string(&path).ok()?;
+    linked_client_config_from_content(&path, target_enum, &content)
+}
+
+fn linked_client_config_from_content(
+    path: &std::path::Path,
+    target_enum: plug_core::export::ExportTarget,
+    content: &str,
+) -> Option<LinkedClientConfig> {
     let ext = path.extension().and_then(|e| e.to_str());
 
     match ext {
         Some("toml") => {
             let value = content.parse::<toml::Value>().ok()?;
             let table = value.get("mcp_servers")?.get("plug")?;
-            if table.get("url").is_some() {
-                Some(ExportTransport::Http)
+            if let Some(url) = table.get("url").and_then(|value| value.as_str()) {
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Http,
+                    endpoint: Some(url.to_string()),
+                })
             } else if table.get("command").is_some() {
-                Some(ExportTransport::Stdio)
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Stdio,
+                    endpoint: None,
+                })
             } else {
                 None
             }
@@ -73,10 +98,16 @@ pub(crate) fn linked_client_transport(
         Some("yaml") | Some("yml") => {
             let value = serde_yml::from_str::<serde_yml::Value>(&content).ok()?;
             let plug = value.get("extensions")?.get("plug")?;
-            if plug.get("uri").is_some() {
-                Some(ExportTransport::Http)
+            if let Some(uri) = plug.get("uri").and_then(|value| value.as_str()) {
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Http,
+                    endpoint: Some(uri.to_string()),
+                })
             } else if plug.get("command").is_some() {
-                Some(ExportTransport::Stdio)
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Stdio,
+                    endpoint: None,
+                })
             } else {
                 None
             }
@@ -91,10 +122,20 @@ pub(crate) fn linked_client_transport(
                     .and_then(|s| s.get("plug"))
                     .or_else(|| json.get("context_servers").and_then(|s| s.get("plug")))?,
             };
-            if plug.get("url").is_some() || plug.get("uri").is_some() {
-                Some(ExportTransport::Http)
+            if let Some(url) = plug
+                .get("url")
+                .and_then(|value| value.as_str())
+                .or_else(|| plug.get("uri").and_then(|value| value.as_str()))
+            {
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Http,
+                    endpoint: Some(url.to_string()),
+                })
             } else if plug.get("command").is_some() {
-                Some(ExportTransport::Stdio)
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Stdio,
+                    endpoint: None,
+                })
             } else {
                 None
             }
@@ -150,13 +191,21 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcClientInfo]) -> Vec<Client
     let mut views = all_client_targets()
         .iter()
         .map(|(name, target)| {
-            let linked = is_linked(target, false);
+            let linked_config = linked_client_config(target, false);
+            let linked_transport = linked_config.as_ref().map(|config| match config.transport {
+                plug_core::export::ExportTransport::Stdio => "stdio".to_string(),
+                plug_core::export::ExportTransport::Http => "http".to_string(),
+            });
+            let linked_endpoint = linked_config.and_then(|config| config.endpoint);
+            let linked = linked_transport.is_some();
             let detected = is_detected(target);
             let live_sessions = *live_counts.get(target).unwrap_or(&0);
             ClientView {
                 name: (*name).to_string(),
                 target: (*target).to_string(),
                 linked,
+                linked_transport,
+                linked_endpoint,
                 detected,
                 live: live_sessions > 0,
                 live_sessions,
@@ -179,9 +228,41 @@ pub(crate) fn detected_or_linked_clients() -> Vec<(&'static str, &'static str, b
     items
 }
 
+fn localhost_export_base(config: &plug_core::config::Config) -> String {
+    let scheme = if config.http.tls_cert_path.is_some() && config.http.tls_key_path.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+
+    let host = match config.http.bind_address.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "localhost",
+        bind if plug_core::config::http_bind_is_loopback(bind) => "localhost",
+        bind => bind,
+    };
+
+    format!("{scheme}://{host}:{}", config.http.port)
+}
+
+pub(crate) fn configured_http_export_url(
+    config_path: Option<&std::path::PathBuf>,
+) -> Option<String> {
+    let config = plug_core::config::load_config(config_path).ok()?;
+    let base = config
+        .http
+        .public_base_url
+        .clone()
+        .unwrap_or_else(|| localhost_export_base(&config));
+    let trimmed = base.trim_end_matches('/');
+    Some(format!("{trimmed}/mcp"))
+}
+
 pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Result<()> {
     use dialoguer::{Confirm, Input, MultiSelect, Select};
     use plug_core::export::ExportTransport;
+
+    let configured_http_url =
+        configured_http_export_url(None).unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
 
     let prompt_transport = |default_http: bool| -> anyhow::Result<ExportTransport> {
         if yes {
@@ -192,7 +273,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
             .with_prompt("How should selected clients connect to plug?")
             .items([
                 "stdio via `plug connect`",
-                "HTTP via `http://localhost:3282/mcp`",
+                &format!("HTTP via `{configured_http_url}`"),
             ])
             .default(if default_http { 1 } else { 0 })
             .interact()?;
@@ -209,7 +290,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
             execute_export(
                 target,
                 matches!(transport, ExportTransport::Http),
-                3282,
+                configured_http_url.as_str(),
                 true,
                 false,
             )?;
@@ -235,7 +316,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
             execute_export(
                 target,
                 matches!(transport, ExportTransport::Http),
-                3282,
+                configured_http_url.as_str(),
                 true,
                 false,
             )?;
@@ -328,7 +409,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
             execute_export(
                 target,
                 matches!(selected_transport, Some(ExportTransport::Http)),
-                3282,
+                configured_http_url.as_str(),
                 true,
                 false,
             )?;
@@ -368,7 +449,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
                 false,
             ),
             (0, ExportTransport::Http) => (
-                serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"url":"http://localhost:3282/mcp"}}})).unwrap(),
+                serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"url":configured_http_url}}})).unwrap(),
                 false,
                 false,
             ),
@@ -378,7 +459,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
                 false,
             ),
             (1, ExportTransport::Http) => (
-                serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"url":"http://localhost:3282/mcp"}}}})).unwrap(),
+                serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"url":configured_http_url}}}})).unwrap(),
                 false,
                 false,
             ),
@@ -388,7 +469,7 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
                 false,
             ),
             (2, ExportTransport::Http) => (
-                "\n[mcp_servers.plug]\nurl = \"http://localhost:3282/mcp\"\n".to_string(),
+                format!("\n[mcp_servers.plug]\nurl = \"{configured_http_url}\"\n"),
                 true,
                 false,
             ),
@@ -398,7 +479,9 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
                 true,
             ),
             (3, ExportTransport::Http) => (
-                "\nextensions:\n  plug:\n    type: sse\n    uri: http://localhost:3282/mcp\n    enabled: true\n".to_string(),
+                format!(
+                    "\nextensions:\n  plug:\n    type: sse\n    uri: {configured_http_url}\n    enabled: true\n"
+                ),
                 false,
                 true,
             ),
@@ -632,7 +715,7 @@ pub(crate) fn unlink_yaml(existing: &str) -> String {
 pub(crate) fn execute_export(
     target: &str,
     http: bool,
-    port: u16,
+    http_url: &str,
     write: bool,
     project: bool,
 ) -> anyhow::Result<()> {
@@ -649,7 +732,12 @@ pub(crate) fn execute_export(
     let options = ExportOptions {
         target: target_enum,
         transport,
-        port,
+        port: 3282,
+        http_url: if http {
+            Some(http_url.to_string())
+        } else {
+            None
+        },
         command,
     };
     let snippet = plug_core::export::export_config(&options);
@@ -682,4 +770,95 @@ pub(crate) fn execute_export(
         println!("{snippet}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("plug-{name}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    #[test]
+    fn configured_http_export_url_uses_public_base_url_when_present() {
+        let path = temp_config_path("public");
+        std::fs::write(
+            &path,
+            r#"[http]
+public_base_url = "https://plug.example.com/base"
+port = 4444
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_http_export_url(Some(&path)).as_deref(),
+            Some("https://plug.example.com/base/mcp")
+        );
+    }
+
+    #[test]
+    fn configured_http_export_url_uses_localhost_for_wildcard_bind() {
+        let path = temp_config_path("wildcard");
+        std::fs::write(
+            &path,
+            r#"[http]
+bind_address = "0.0.0.0"
+port = 4444
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_http_export_url(Some(&path)).as_deref(),
+            Some("http://localhost:4444/mcp")
+        );
+    }
+
+    #[test]
+    fn linked_client_config_reads_json_http_url() {
+        let path = std::path::Path::new("config.json");
+        let content = r#"{"mcpServers":{"plug":{"url":"https://plug.example.com/mcp"}}}"#;
+        let linked = linked_client_config_from_content(
+            path,
+            plug_core::export::ExportTarget::Cursor,
+            content,
+        )
+        .expect("linked config");
+        assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
+        assert_eq!(linked.endpoint.as_deref(), Some("https://plug.example.com/mcp"));
+    }
+
+    #[test]
+    fn linked_client_config_reads_yaml_http_uri() {
+        let path = std::path::Path::new("config.yaml");
+        let content = "extensions:\n  plug:\n    type: sse\n    uri: https://plug.example.com/mcp\n    enabled: true\n";
+        let linked =
+            linked_client_config_from_content(path, plug_core::export::ExportTarget::Goose, content)
+                .expect("linked config");
+        assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
+        assert_eq!(linked.endpoint.as_deref(), Some("https://plug.example.com/mcp"));
+    }
+
+    #[test]
+    fn linked_client_config_reads_toml_http_url() {
+        let path = std::path::Path::new("config.toml");
+        let content = "[mcp_servers.plug]\ntransport = \"http\"\nurl = \"https://plug.example.com/mcp\"\n";
+        let linked = linked_client_config_from_content(
+            path,
+            plug_core::export::ExportTarget::CodexCli,
+            content,
+        )
+        .expect("linked config");
+        assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
+        assert_eq!(linked.endpoint.as_deref(), Some("https://plug.example.com/mcp"));
+    }
 }

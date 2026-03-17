@@ -151,6 +151,14 @@ impl DownstreamAuthMode {
     }
 }
 
+pub fn downstream_mcp_url(http: &HttpConfig) -> String {
+    if let Some(public_base_url) = &http.public_base_url {
+        format!("{}/mcp", public_base_url.trim_end_matches('/'))
+    } else {
+        format!("http://localhost:{}/mcp", http.port)
+    }
+}
+
 /// Configuration for a single upstream MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -634,7 +642,10 @@ mod tests {
         assert_eq!(cfg.http.auth_mode, DownstreamAuthMode::Auto);
         assert_eq!(cfg.http.public_base_url, None);
         assert_eq!(cfg.http.oauth_client_id, None);
-        assert_eq!(cfg.http.oauth_client_secret.as_ref().map(|s| s.as_str()), None);
+        assert_eq!(
+            cfg.http.oauth_client_secret.as_ref().map(|s| s.as_str()),
+            None
+        );
         assert_eq!(cfg.http.oauth_scopes, None);
         assert_eq!(cfg.http.bind_address, "127.0.0.1");
         assert_eq!(cfg.http.port, 3282);
@@ -957,6 +968,23 @@ mod tests {
                 .any(|e| e.contains("http.auth_mode = \"none\"") && e.contains("non-loopback")),
             "expected none/non-loopback validation error, got {errors:?}"
         );
+    }
+
+    #[test]
+    fn downstream_mcp_url_prefers_public_base_url() {
+        let mut cfg = Config::default();
+        cfg.http.public_base_url = Some("https://plug.example.com/base/".to_string());
+        assert_eq!(
+            downstream_mcp_url(&cfg.http),
+            "https://plug.example.com/base/mcp"
+        );
+    }
+
+    #[test]
+    fn downstream_mcp_url_falls_back_to_localhost_port() {
+        let mut cfg = Config::default();
+        cfg.http.port = 4411;
+        assert_eq!(downstream_mcp_url(&cfg.http), "http://localhost:4411/mcp");
     }
 
     #[test]
