@@ -211,3 +211,29 @@ These write scopes should remain mostly disjoint until integration.
 - True HTTP parity still requires a second runtime truth source or an aggregation boundary that can
   combine standalone HTTP session snapshots with daemon proxy sessions without hiding degraded
   availability.
+
+### 2026-03-17 - Status surface aligned with live-session inventory model
+
+**By:** Codex
+
+**Actions:**
+- Switched `plug status` to consume the transport-aware live-session inventory path instead of
+  relying only on the older daemon `Status.clients` field.
+- Added explicit `Live Sessions`, `Live Transports`, and `Inventory Scope` text output when the
+  daemon supports the newer inventory response.
+- Preserved the daemon-restart path for older runtimes by falling back to the legacy daemon proxy
+  count with an explicit restart-required message.
+- Extended status JSON with:
+  - `live_session_count`
+  - `live_session_transports`
+  - `live_client_support`
+
+**Verification:**
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug commands::clients::tests -- --nocapture`
+
+**Learnings:**
+- The top-level runtime view should use the same live-session vocabulary as `plug clients`, even
+  before transport-complete parity exists.
+- Keeping the old daemon `clients` field in JSON remains useful for compatibility, but it should no
+  longer be the only operator-visible runtime count.

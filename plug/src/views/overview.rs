@@ -22,6 +22,24 @@ fn live_client_count_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope
     }
 }
 
+fn live_transport_counts(
+    sessions: &[plug_core::ipc::IpcLiveSessionInfo],
+) -> (usize, usize, usize) {
+    let daemon_proxy = sessions
+        .iter()
+        .filter(|session| session.transport == plug_core::ipc::LiveSessionTransport::DaemonProxy)
+        .count();
+    let http = sessions
+        .iter()
+        .filter(|session| session.transport == plug_core::ipc::LiveSessionTransport::Http)
+        .count();
+    let sse = sessions
+        .iter()
+        .filter(|session| session.transport == plug_core::ipc::LiveSessionTransport::Sse)
+        .count();
+    (daemon_proxy, http, sse)
+}
+
 pub(crate) async fn cmd_overview(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
@@ -276,6 +294,9 @@ pub(crate) async fn cmd_status(
         uptime_secs,
     }) = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
     {
+        let (live_sessions, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
+        let live_session_count = live_sessions.len();
+        let (daemon_proxy_count, http_count, sse_count) = live_transport_counts(&live_sessions);
         if matches!(output, OutputFormat::Text) {
             print_banner("◆", "Runtime", "Live service health");
             if started {
@@ -284,13 +305,30 @@ pub(crate) async fn cmd_status(
             print_heading("Service");
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
-            print_label_value("Clients", style(clients.to_string()).bold());
-            print_label_value(
-                "Client Scope",
-                live_client_count_scope_text(
-                    plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-                ),
-            );
+            match live_client_support {
+                LiveClientSupport::Supported => {
+                    print_label_value("Live Sessions", style(live_session_count.to_string()).bold());
+                    print_label_value(
+                        "Live Transports",
+                        format!(
+                            "daemon_proxy={} http={} sse={}",
+                            daemon_proxy_count, http_count, sse_count
+                        ),
+                    );
+                    print_label_value(
+                        "Inventory Scope",
+                        live_client_count_scope_text(live_inventory_scope),
+                    );
+                }
+                LiveClientSupport::DaemonRestartRequired => {
+                    print_label_value("Live Sessions", style("restart required").yellow().bold());
+                    print_label_value(
+                        "Inventory Scope",
+                        "Restart the background daemon to enable transport-aware live session inventory.",
+                    );
+                    print_label_value("Daemon Proxy Clients", style(clients.to_string()).bold());
+                }
+            }
             if !linked_clients.is_empty() {
                 let linked_summary = linked_clients
                     .iter()
@@ -413,9 +451,19 @@ pub(crate) async fn cmd_status(
             let mut json_obj = serde_json::json!({
                 "uptime": uptime_secs,
                 "clients": clients,
+                "live_session_count": live_session_count,
+                "live_session_transports": {
+                    "daemon_proxy": daemon_proxy_count,
+                    "http": http_count,
+                    "sse": sse_count,
+                },
                 "servers": servers,
-                "live_client_scope": plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-                "http_sessions_included": false
+                "live_client_support": live_client_support,
+                "live_client_scope": live_inventory_scope,
+                "http_sessions_included": matches!(
+                    live_inventory_scope,
+                    plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                )
             });
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
@@ -521,7 +569,7 @@ pub(crate) async fn cmd_status(
 
 #[cfg(test)]
 mod tests {
-    use super::live_client_count_scope_text;
+    use super::{live_client_count_scope_text, live_transport_counts};
 
     #[test]
     fn live_client_count_scope_text_mentions_daemon_and_http_gap() {
@@ -530,5 +578,40 @@ mod tests {
         );
         assert!(text.contains("daemon proxy clients"));
         assert!(text.contains("HTTP sessions"));
+    }
+
+    #[test]
+    fn live_transport_counts_split_transports() {
+        let sessions = vec![
+            plug_core::ipc::IpcLiveSessionInfo {
+                transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+                client_id: Some("c1".to_string()),
+                session_id: "s1".to_string(),
+                client_type: plug_core::types::ClientType::ClaudeDesktop,
+                client_info: Some("Claude Desktop".to_string()),
+                connected_secs: 10,
+                last_activity_secs: Some(1),
+            },
+            plug_core::ipc::IpcLiveSessionInfo {
+                transport: plug_core::ipc::LiveSessionTransport::Http,
+                client_id: None,
+                session_id: "s2".to_string(),
+                client_type: plug_core::types::ClientType::ClaudeCode,
+                client_info: Some("Claude Code".to_string()),
+                connected_secs: 20,
+                last_activity_secs: Some(2),
+            },
+            plug_core::ipc::IpcLiveSessionInfo {
+                transport: plug_core::ipc::LiveSessionTransport::Sse,
+                client_id: None,
+                session_id: "s3".to_string(),
+                client_type: plug_core::types::ClientType::Cursor,
+                client_info: Some("Cursor".to_string()),
+                connected_secs: 30,
+                last_activity_secs: Some(3),
+            },
+        ];
+
+        assert_eq!(live_transport_counts(&sessions), (1, 1, 1));
     }
 }
