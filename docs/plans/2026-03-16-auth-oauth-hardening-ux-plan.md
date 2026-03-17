@@ -115,6 +115,9 @@ Still remaining:
   daemon mode owns IPC proxy client inventory while standalone `serve` owns downstream HTTP
   sessions, so true unified live inventory requires either daemon-owned HTTP serving or a higher-
   level merged session snapshot API.
+- 2026-03-17: `plug doctor` auth runtime output now splits missing credentials, re-auth required,
+  and degraded auth/runtime into separate checks, so operators get one concrete recovery action per
+  auth state instead of one mixed warning line.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.

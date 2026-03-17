@@ -226,6 +226,27 @@ Key files expected to change:
 - Real parity requires either daemon-owned HTTP serving or a separate merged session snapshot model
   above daemon and standalone serve state.
 
+### 2026-03-17 - Doctor auth-state splitting
+
+**By:** Codex
+
+**Actions:**
+- Split runtime auth diagnostics into separate `doctor` checks for:
+  - missing credentials
+  - re-auth required
+  - degraded auth/runtime
+- Updated interpretation logic so higher-level doctor summaries still treat any of those auth
+  states as runtime auth attention, without collapsing the rendered output back into one mixed line.
+- Added focused test coverage for the split auth categories and re-ran the full `plug` test suite.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The same recovery verb does not apply to every auth warning; splitting categories makes the next
+  action deterministic and keeps `doctor` aligned with `auth status`.
+
 ### 2026-03-17 - Server auth setup scaffolding slice
 
 **By:** Codex

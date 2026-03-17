@@ -281,52 +281,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
     if let Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) =
         crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await
     {
-        let mut reauth = Vec::new();
-        let mut missing = Vec::new();
-        let mut degraded = Vec::new();
-
-        for server in &servers {
-            match (server.authenticated, server.health) {
-                (false, plug_core::types::ServerHealth::AuthRequired) => {
-                    missing.push(server.name.clone())
-                }
-                (true, plug_core::types::ServerHealth::AuthRequired) => {
-                    reauth.push(server.name.clone())
-                }
-                (_, plug_core::types::ServerHealth::Degraded) => degraded.push(server.name.clone()),
-                _ => {}
-            }
-        }
-
-        if !(reauth.is_empty() && missing.is_empty() && degraded.is_empty()) {
-            checks.push(plug_core::doctor::CheckResult {
-                name: "runtime_auth".to_string(),
-                status: plug_core::doctor::CheckStatus::Warn,
-                message: format!(
-                    "{}{}{}",
-                    if missing.is_empty() {
-                        String::new()
-                    } else {
-                        format!("missing credentials: {}; ", missing.join(", "))
-                    },
-                    if reauth.is_empty() {
-                        String::new()
-                    } else {
-                        format!("re-auth required: {}; ", reauth.join(", "))
-                    },
-                    if degraded.is_empty() {
-                        String::new()
-                    } else {
-                        format!("degraded auth/runtime: {}", degraded.join(", "))
-                    }
-                )
-                .trim_end_matches("; ")
-                .to_string(),
-                fix_suggestion: Some(
-                    "Run `plug auth status` for token state and `plug auth login --server <name>` where re-auth is required".to_string(),
-                ),
-            });
-        }
+        checks.extend(runtime_auth_checks(&servers));
     }
 
     checks
@@ -401,7 +356,13 @@ fn synthesize_doctor_interpretation(
     let connectivity = checks.iter().find(|check| check.name == "server_connectivity")?;
     let runtime_health = checks.iter().find(|check| check.name == "runtime_health");
     let runtime_failures = checks.iter().find(|check| check.name == "runtime_failures");
-    let runtime_auth = checks.iter().find(|check| check.name == "runtime_auth");
+    let runtime_auth_attention = checks.iter().any(|check| {
+        matches!(check.status, plug_core::doctor::CheckStatus::Warn)
+            && (check.name == "runtime_auth"
+                || check.name == "runtime_auth_missing"
+                || check.name == "runtime_auth_reauth"
+                || check.name == "runtime_auth_degraded")
+    });
 
     use plug_core::doctor::CheckStatus::{Fail, Pass, Warn};
 
@@ -409,7 +370,7 @@ fn synthesize_doctor_interpretation(
         &connectivity.status,
         runtime_failures.map(|check| &check.status),
         runtime_health.map(|check| &check.status),
-        runtime_auth.map(|check| &check.status),
+        runtime_auth_attention,
     ) {
         (Warn, Some(Fail), _, _) | (Fail, Some(Fail), _, _) => (
             Fail,
@@ -432,7 +393,7 @@ fn synthesize_doctor_interpretation(
                 "Use `plug status` for the failing servers, then compare with `plug doctor` to separate runtime failures from cold connectivity.".to_string(),
             ),
         ),
-        (Pass, _, Some(Warn), Some(Warn)) | (Pass, _, Some(Warn), _) => (
+        (Pass, _, Some(Warn), true) | (Pass, _, Some(Warn), false) => (
             Warn,
             "Basic connectivity checks pass, but the running daemon still has degraded or auth-required servers.".to_string(),
             Some(
@@ -446,7 +407,7 @@ fn synthesize_doctor_interpretation(
                 "Fix the reported connectivity failures before restarting the daemon or repairing client/server config.".to_string(),
             ),
         ),
-        (Pass, _, Some(Pass), Some(Warn)) => (
+        (Pass, _, Some(Pass), true) => (
             Warn,
             "The runtime is broadly healthy, but some servers still need auth attention or re-authorization.".to_string(),
             Some(
@@ -462,6 +423,67 @@ fn synthesize_doctor_interpretation(
         message,
         fix_suggestion,
     })
+}
+
+fn runtime_auth_checks(
+    servers: &[plug_core::ipc::IpcAuthServerInfo],
+) -> Vec<plug_core::doctor::CheckResult> {
+    let mut reauth = Vec::new();
+    let mut missing = Vec::new();
+    let mut degraded = Vec::new();
+
+    for server in servers {
+        match (server.authenticated, server.health) {
+            (false, plug_core::types::ServerHealth::AuthRequired) => {
+                missing.push(server.name.clone())
+            }
+            (true, plug_core::types::ServerHealth::AuthRequired) => {
+                reauth.push(server.name.clone())
+            }
+            (_, plug_core::types::ServerHealth::Degraded) => degraded.push(server.name.clone()),
+            _ => {}
+        }
+    }
+
+    let mut checks = Vec::new();
+
+    if !missing.is_empty() {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_auth_missing".to_string(),
+            status: plug_core::doctor::CheckStatus::Warn,
+            message: format!("missing credentials: {}", missing.join(", ")),
+            fix_suggestion: Some(
+                "Run `plug auth login --server <name>` for each server missing credentials."
+                    .to_string(),
+            ),
+        });
+    }
+
+    if !reauth.is_empty() {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_auth_reauth".to_string(),
+            status: plug_core::doctor::CheckStatus::Warn,
+            message: format!("re-auth required: {}", reauth.join(", ")),
+            fix_suggestion: Some(
+                "Stored credentials exist but must be refreshed — run `plug auth login --server <name>`."
+                    .to_string(),
+            ),
+        });
+    }
+
+    if !degraded.is_empty() {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_auth_degraded".to_string(),
+            status: plug_core::doctor::CheckStatus::Warn,
+            message: format!("degraded auth/runtime: {}", degraded.join(", ")),
+            fix_suggestion: Some(
+                "Run `plug auth status` and compare with `plug status` to separate auth drift from broader runtime degradation."
+                    .to_string(),
+            ),
+        });
+    }
+
+    checks
 }
 
 fn doctor_check_details(check: &plug_core::doctor::CheckResult) -> String {
@@ -544,9 +566,11 @@ pub(crate) fn cmd_setup(
 #[cfg(test)]
 mod tests {
     use super::{
-        doctor_check_details, runtime_health_checks_for_tests, synthesize_doctor_interpretation,
+        doctor_check_details, runtime_auth_checks, runtime_health_checks_for_tests,
+        synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
+    use plug_core::ipc::IpcAuthServerInfo;
     use plug_core::types::{ServerHealth, ServerStatus};
 
     fn check(name: &str, status: CheckStatus, message: &str) -> CheckResult {
@@ -653,7 +677,7 @@ mod tests {
                 "Daemon running: uptime=30s, clients=3, healthy=2, degraded=0, auth_required=0, failed=0",
             ),
             check(
-                "runtime_auth",
+                "runtime_auth_reauth",
                 CheckStatus::Warn,
                 "re-auth required: notion",
             ),
@@ -741,6 +765,51 @@ mod tests {
         assert_eq!(checks[1].name, "runtime_degraded");
         assert_eq!(checks[1].status, CheckStatus::Warn);
         assert_eq!(checks[1].message, "degraded servers: figma");
+    }
+
+    #[test]
+    fn runtime_auth_checks_split_missing_reauth_and_degraded_categories() {
+        let checks = runtime_auth_checks(&[
+            IpcAuthServerInfo {
+                name: "notion".to_string(),
+                url: Some("https://api.notion.com/mcp".to_string()),
+                authenticated: false,
+                health: ServerHealth::AuthRequired,
+                scopes: None,
+                token_expires_in_secs: None,
+            },
+            IpcAuthServerInfo {
+                name: "supabase".to_string(),
+                url: Some("https://mcp.supabase.com/mcp".to_string()),
+                authenticated: true,
+                health: ServerHealth::AuthRequired,
+                scopes: None,
+                token_expires_in_secs: Some(120),
+            },
+            IpcAuthServerInfo {
+                name: "figma".to_string(),
+                url: Some("https://api.figma.com/mcp".to_string()),
+                authenticated: true,
+                health: ServerHealth::Degraded,
+                scopes: None,
+                token_expires_in_secs: Some(300),
+            },
+        ]);
+
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].name, "runtime_auth_missing");
+        assert_eq!(checks[0].message, "missing credentials: notion");
+        assert!(checks[0]
+            .fix_suggestion
+            .as_deref()
+            .unwrap_or_default()
+            .contains("plug auth login --server <name>"));
+
+        assert_eq!(checks[1].name, "runtime_auth_reauth");
+        assert_eq!(checks[1].message, "re-auth required: supabase");
+
+        assert_eq!(checks[2].name, "runtime_auth_degraded");
+        assert_eq!(checks[2].message, "degraded auth/runtime: figma");
     }
 
     #[test]
