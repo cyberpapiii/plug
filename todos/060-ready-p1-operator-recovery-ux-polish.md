@@ -35,9 +35,9 @@ operator experience:
 - [x] Task 2: polish `plug status` runtime and recovery wording
 - [x] Task 3: polish `plug auth status` source/recovery wording
 - [x] Task 4: polish `plug doctor` grouping and next-step guidance
-- [ ] Task 5: run final consistency/copy pass across all four surfaces
-- [ ] Verification: focused tests pass
-- [ ] Verification: live smoke outputs look coherent
+- [x] Task 5: run final consistency/copy pass across all four surfaces
+- [x] Verification: focused tests pass
+- [x] Verification: live smoke outputs look coherent
 
 ## Work Log
 
@@ -91,3 +91,25 @@ operator experience:
 - A compact summary label plus one explanatory line works better than two adjacent labels
   (`Inventory Scope` + `Inventory Availability`) for the same concept.
 - `doctor` becomes much easier to act on once the command ends with deduplicated operator steps.
+
+### 2026-03-17 - Operator UX polish tranche 2
+
+**By:** Codex
+
+**Actions:**
+- Replaced the command-style `doctor` next-action renderer with plain numbered guidance steps so
+  the recovery section reads like operator instructions instead of a fake command list.
+- Ran a final consistency pass across `clients`, `status`, `auth status`, and `doctor` to confirm
+  the shared operator vocabulary holds up in live output.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- live smoke:
+  - `cargo run --quiet --bin plug -- doctor`
+  - `cargo run --quiet --bin plug -- clients`
+  - `cargo run --quiet --bin plug -- status`
+  - `cargo run --quiet --bin plug -- auth status`
+
+**Learnings:**
+- Recovery guidance should use a different renderer than command suggestions; overloading the same
+  visual treatment makes the CLI feel more mechanical and less trustworthy.

@@ -3,7 +3,7 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::clients::{cmd_link, execute_export};
 use crate::ui::{
-    cli_prompt_theme, print_banner, print_heading, print_info_line, print_next_action,
+    cli_prompt_theme, print_banner, print_heading, print_info_line, print_next_step,
     print_success_line,
 };
 
@@ -200,7 +200,7 @@ pub(crate) async fn cmd_doctor(
                 println!();
                 print_heading("Next");
                 for (index, step) in next_steps.iter().enumerate() {
-                    print_next_action(index + 1, "operator", step);
+                    print_next_step(index + 1, step);
                 }
             }
         }

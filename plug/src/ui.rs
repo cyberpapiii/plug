@@ -170,6 +170,18 @@ pub(crate) fn print_next_action(index: usize, command: &str, description: &str) 
     );
 }
 
+pub(crate) fn print_next_step(index: usize, description: &str) {
+    let index_label = format!("{index}.");
+    let prefix_text = format!("  {index_label:<2} ");
+    print_wrapped_rows(
+        &prefix_text,
+        format!("{}", style(&prefix_text).dim().bold()),
+        description,
+        terminal_width(),
+        |line| style(line),
+    );
+}
+
 pub(crate) fn print_banner(icon: &str, title: &str, subtitle: &str) {
     println!(
         "{} {}",
