@@ -775,6 +775,7 @@ pub(crate) fn execute_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plug_core::export::ExportOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -866,6 +867,72 @@ port = 4444
             path,
             plug_core::export::ExportTarget::CodexCli,
             content,
+        )
+        .expect("linked config");
+        assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
+        assert_eq!(
+            linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn export_and_parse_round_trip_cursor_http_endpoint() {
+        let output = plug_core::export::export_config(&ExportOptions {
+            target: plug_core::export::ExportTarget::Cursor,
+            transport: plug_core::export::ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        });
+        let linked = linked_client_config_from_content(
+            std::path::Path::new("config.json"),
+            plug_core::export::ExportTarget::Cursor,
+            &output,
+        )
+        .expect("linked config");
+        assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
+        assert_eq!(
+            linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn export_and_parse_round_trip_codex_http_endpoint() {
+        let output = plug_core::export::export_config(&ExportOptions {
+            target: plug_core::export::ExportTarget::CodexCli,
+            transport: plug_core::export::ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        });
+        let linked = linked_client_config_from_content(
+            std::path::Path::new("config.toml"),
+            plug_core::export::ExportTarget::CodexCli,
+            &output,
+        )
+        .expect("linked config");
+        assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
+        assert_eq!(
+            linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn export_and_parse_round_trip_goose_http_endpoint() {
+        let output = plug_core::export::export_config(&ExportOptions {
+            target: plug_core::export::ExportTarget::Goose,
+            transport: plug_core::export::ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        });
+        let linked = linked_client_config_from_content(
+            std::path::Path::new("config.yaml"),
+            plug_core::export::ExportTarget::Goose,
+            &output,
         )
         .expect("linked config");
         assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);

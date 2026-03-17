@@ -34,6 +34,20 @@ This plan is based on:
 - setup and repair flows respect different client and config types instead of flattening everything to `plug connect`
 - end-to-end tests cover mixed transport/auth scenarios that currently rely on inference
 
+## Current Status - 2026-03-17
+
+Completed so far:
+- downstream OAuth discovery, metadata, and unauthorized challenge hardening
+- daemon-aware `doctor` output with separate runtime health/auth context
+- explicit auth recovery guidance in `status` and `auth status`
+- transport-preserving repair and interactive link/setup transport choice
+- downstream HTTP endpoint awareness across export/link/repair/status/clients
+
+Still remaining:
+- broader end-to-end scenario coverage for mixed auth/topology fleets
+- deeper server add/edit auth scaffolding so common HTTP/SSE auth cases are not still hand-authored
+- final UX cleanup where command surfaces still imply a simpler topology than the runtime actually supports
+
 ## Progress Notes
 
 - 2026-03-16: Downstream OAuth discovery/privacy, metadata, and 401 challenge behavior were

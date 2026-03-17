@@ -86,9 +86,9 @@ Execute the full hardening plan from [docs/plans/2026-03-16-auth-oauth-hardening
 - [x] Task 9 complete: repair preserves client-specific transport choices
 - [x] Task 10 complete: status/menu views surface transport and auth topology clearly
 - [ ] Task 11 complete: integration tests cover mixed auth and topology scenarios end to end
-- [ ] Final verification complete: `cargo test` passes
-- [ ] Final verification complete: `cargo build --release` passes
-- [ ] Final verification complete: `plug status`, `plug auth status`, and `plug doctor` tell a coherent story on healthy, auth-required, and failed server cases
+- [x] Final verification complete: `cargo test` passes
+- [x] Final verification complete: `cargo build --release` passes
+- [x] Final verification complete: `plug status`, `plug auth status`, and `plug doctor` tell a coherent story on healthy, auth-required, and failed server cases
 
 ## Technical Details
 
@@ -160,6 +160,8 @@ Key files expected to change:
 - `12b4d86` `feat(setup): prompt for client transport choice`
 - `9033da0` `feat(ux): separate auth-required server summary`
 - `0ca32cd` `feat(doctor): add live runtime health and auth context`
+- `0aba2a7` `fix(doctor): detect running daemon pid path correctly`
+- `e9d1de4` `feat(status): add recovery guidance for server states`
 
 **Learnings:**
 - The highest-leverage fixes were standards alignment and reducing contradictory operator signals.
@@ -169,6 +171,38 @@ Key files expected to change:
   recovery still need more explicit modeling of mixed-fleet scenarios.
 - `plug doctor` now includes daemon-observed runtime health/auth context so cold checks and live
   state can be compared in one command, which reduces the biggest contradiction from real usage.
+
+### 2026-03-17 - Client endpoint topology hardening slice
+
+**By:** Codex
+
+**Actions:**
+- Promoted the downstream HTTP MCP endpoint to a derived first-class value instead of rebuilding
+  `http://localhost:3282/mcp` ad hoc in each command.
+- Wired link, repair, and custom client snippets to export the configured HTTP endpoint, including
+  `public_base_url` when present.
+- Added linked-client parsing that captures both mode and configured endpoint from JSON, TOML, and
+  YAML client configs.
+- Surfaced linked client mode and endpoint in `plug clients`.
+- Surfaced the active downstream HTTP endpoint in `plug status` and overview.
+- Added unit coverage for derived downstream endpoint resolution and linked-client config parsing.
+- Re-ran the full test suite and release build outside the sandbox so socket/listener-based auth and
+  daemon tests could verify correctly.
+
+**Verification:**
+- `cargo test`
+- `cargo build --release`
+- `cargo run --quiet --bin plug -- clients`
+- `cargo run --quiet --bin plug -- status`
+- `cargo run --quiet --bin plug -- doctor`
+
+**Learnings:**
+- Preserving transport alone was not enough; users also need the concrete downstream endpoint to
+  understand what a client is actually pointed at.
+- `public_base_url` changes the correct export target for HTTP-linked clients and has to flow
+  through setup, repair, and status together or the UX becomes misleading again.
+- The remaining hardening work is now mostly about broader scenario coverage and server-auth setup
+  ergonomics, not basic topology visibility.
 
 ### 2026-03-16 - Client topology fidelity slice
 
