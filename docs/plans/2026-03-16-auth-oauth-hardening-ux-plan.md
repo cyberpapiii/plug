@@ -91,8 +91,12 @@ Still remaining:
   the keychain-safe diagnostics behavior is pinned by tests rather than only live observation.
 - 2026-03-17: non-interactive `plug server edit` now supports transport-shape mutation with
   guardrails, so scripted maintenance can switch servers between stdio and HTTP/SSE coherently.
-- Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
-  full end-to-end command fixtures.
+- 2026-03-17: `plug-core` doctor tests now cover reachable and unreachable cold HTTP upstreams,
+  including mixed stdio+remote fleets, so the concurrent cold-connectivity behavior is pinned by
+  focused tests instead of only indirect command-level observation.
+- Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
+  cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
+  pinned directly in `plug-core`.
 
 ## Workstream A: Downstream OAuth Standards Hardening
 

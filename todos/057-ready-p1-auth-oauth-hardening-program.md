@@ -675,3 +675,46 @@ Key files expected to change:
 - Transport and auth labels alone are not enough once the system supports multiple remote and
   stdio shapes; operators need the concrete target inline to reason about what they are actually
   inspecting.
+
+### 2026-03-17 - Doctor cold connectivity coverage slice
+
+**By:** Codex
+
+**Actions:**
+- Added focused `plug-core` doctor tests for reachable remote HTTP upstreams.
+- Added focused `plug-core` doctor tests for unreachable remote HTTP upstreams.
+- Added a mixed stdio + remote fleet test to pin the current behavior that cold connectivity
+  failures stay scoped to the unreachable remote instead of collapsing healthy stdio servers into
+  the same message.
+
+**Verification:**
+- `cargo test -p plug-core doctor -- --nocapture`
+
+**Learnings:**
+- The doctor command-level UX is improving, but the underlying cold-connectivity semantics still
+  needed direct `plug-core` coverage so later output cleanup cannot accidentally weaken the actual
+  fleet checks.
+- The right severity for unreachable cold remote checks is still `Fail`, not `Warn`; the clarity
+  win comes from interpretation and recovery guidance layered on top, not from downgrading the
+  raw signal.
+
+### 2026-03-17 - Cold HTTP connectivity coverage slice
+
+**By:** Codex
+
+**Actions:**
+- Added focused `plug-core` doctor tests for cold HTTP reachability against remote upstreams.
+- Covered three concrete cases:
+  - reachable HTTP remote -> pass
+  - unreachable HTTP remote -> fail with server name and TCP error context
+  - mixed stdio + remote fleet -> fail only for the unreachable remote, without polluting the
+    message with healthy stdio peers
+
+**Verification:**
+- `cargo test -p plug-core doctor -- --nocapture`
+
+**Learnings:**
+- The right semantics for cold remote reachability are still hard failure, not warning; the useful
+  operator improvement is better attribution, not downgraded severity.
+- Focused reachability tests are a cheap way to pin the concurrent cold-connectivity path while we
+  keep avoiding live daemon/keychain side effects during hardening work.

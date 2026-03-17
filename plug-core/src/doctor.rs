@@ -1464,6 +1464,60 @@ mod tests {
         assert_eq!(result.status, CheckStatus::Pass);
     }
 
+    #[tokio::test]
+    async fn connectivity_http_server_reachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut config = test_config();
+        config.servers.insert(
+            "remote".to_string(),
+            oauth_http_server(&format!("http://127.0.0.1:{port}/mcp")),
+        );
+
+        let result = check_server_connectivity(&config).await;
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn connectivity_http_server_unreachable_fails_with_server_name() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.servers.insert(
+            "remote".to_string(),
+            oauth_http_server(&format!("http://127.0.0.1:{port}/mcp")),
+        );
+
+        let result = check_server_connectivity(&config).await;
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("remote"));
+        assert!(result.message.contains("TCP connect failed"));
+    }
+
+    #[tokio::test]
+    async fn connectivity_mixed_servers_fail_when_remote_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config
+            .servers
+            .insert("local".to_string(), stdio_server("echo"));
+        config.servers.insert(
+            "remote".to_string(),
+            oauth_http_server(&format!("http://127.0.0.1:{port}/mcp")),
+        );
+
+        let result = check_server_connectivity(&config).await;
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("remote"));
+        assert!(!result.message.contains("local"));
+    }
+
     // -- extract_env_refs --
 
     #[test]
