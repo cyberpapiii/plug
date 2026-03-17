@@ -37,6 +37,32 @@ fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) 
     }
 }
 
+fn configured_client_state_text(client: &crate::commands::clients::ClientView) -> String {
+    let mut states = Vec::new();
+    if client.detected {
+        states.push("detected".to_string());
+    }
+    if client.live {
+        states.push(format!("live ({})", client.live_sessions));
+    }
+
+    if states.is_empty() {
+        "configured only".to_string()
+    } else {
+        states.join(", ")
+    }
+}
+
+fn configured_client_link_text(client: &crate::commands::clients::ClientView) -> Option<String> {
+    let transport = client.linked_transport.as_deref()?;
+    let mut detail = format!("linked via {transport}");
+    if let Some(endpoint) = client.linked_endpoint.as_deref() {
+        detail.push_str(" -> ");
+        detail.push_str(endpoint);
+    }
+    Some(detail)
+}
+
 fn client_list_json(
     clients: &[crate::commands::clients::ClientView],
     live_sessions: &[crate::commands::clients::LiveSessionView],
@@ -218,58 +244,27 @@ pub(crate) async fn cmd_client_list(
         println!();
         print_heading("Configured Clients");
         println!(
-            "  {:<24} {:<10} {:<10} {:<28} {:<10} {:<6}",
+            "  {:<24} {:<10} {}",
             style("CLIENT").dim(),
             style("LINKED").dim(),
-            style("MODE").dim(),
-            style("ENDPOINT").dim(),
-            style("DETECTED").dim(),
-            style("LIVE").dim()
+            style("STATE").dim()
         );
-        println!(
-            "  {}",
-            style("------------------------------------------------------------------------------------------------").dim()
-        );
+        println!("  {}", style("----------------------------------------------------------------").dim());
         for client in &clients {
             let linked = if client.linked {
                 style("yes").green().bold()
             } else {
                 style("no").dim()
             };
-            let linked_transport = client
-                .linked_transport
-                .as_deref()
-                .map(|transport| style(transport).yellow().bold().to_string())
-                .unwrap_or_else(|| style("-").dim().to_string());
-            let endpoint = client
-                .linked_endpoint
-                .as_deref()
-                .map(|endpoint| {
-                    let mut value = endpoint.to_string();
-                    if value.len() > 28 {
-                        value.truncate(25);
-                        value.push_str("...");
-                    }
-                    style(value).dim().to_string()
-                })
-                .unwrap_or_else(|| style("-").dim().to_string());
-            let detected = if client.detected {
-                style("yes").cyan()
-            } else {
-                style("no").dim()
-            };
-            let live_label = if client.live {
-                style(format!("yes ({})", client.live_sessions))
-                    .green()
-                    .bold()
-                    .to_string()
-            } else {
-                style("no").dim().to_string()
-            };
             println!(
-                "  {:<24} {:<10} {:<10} {:<28} {:<10} {:<6}",
-                client.name, linked, linked_transport, endpoint, detected, live_label
+                "  {:<24} {:<10} {}",
+                client.name,
+                linked,
+                style(configured_client_state_text(client)).dim()
             );
+            if let Some(link_text) = configured_client_link_text(client) {
+                print_info_line(style(link_text).dim());
+            }
         }
 
         if !interactive {
@@ -287,7 +282,10 @@ pub(crate) async fn cmd_client_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{client_list_json, live_inventory_scope_label, live_inventory_scope_text};
+    use super::{
+        client_list_json, configured_client_link_text, configured_client_state_text,
+        live_inventory_scope_label, live_inventory_scope_text,
+    };
     use crate::commands::clients::{ClientView, LiveSessionView};
     use crate::runtime::{LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts};
 
@@ -382,5 +380,38 @@ mod tests {
         let unavailable =
             live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
         assert!(unavailable.contains("unavailable"));
+    }
+
+    #[test]
+    fn configured_client_state_text_prefers_compact_presence_summary() {
+        let client = ClientView {
+            name: "Codex CLI".to_string(),
+            target: "codex-cli".to_string(),
+            linked: true,
+            linked_transport: Some("stdio".to_string()),
+            linked_endpoint: None,
+            detected: true,
+            live: true,
+            live_sessions: 2,
+        };
+        assert_eq!(configured_client_state_text(&client), "detected, live (2)");
+    }
+
+    #[test]
+    fn configured_client_link_text_includes_endpoint_when_present() {
+        let client = ClientView {
+            name: "Claude Code".to_string(),
+            target: "claude-code".to_string(),
+            linked: true,
+            linked_transport: Some("http".to_string()),
+            linked_endpoint: Some("https://plug.example.com/mcp".to_string()),
+            detected: false,
+            live: false,
+            live_sessions: 0,
+        };
+        assert_eq!(
+            configured_client_link_text(&client).as_deref(),
+            Some("linked via http -> https://plug.example.com/mcp")
+        );
     }
 }
