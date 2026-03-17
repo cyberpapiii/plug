@@ -289,6 +289,24 @@ Key files expected to change:
 - Cached credentials are useful fallback evidence, but they should never be rendered as if they are
   live runtime truth.
 
+### 2026-03-17 - Doctor runtime client-count scope clarification
+
+**By:** Codex
+
+**Actions:**
+- Renamed the live runtime summary field in `plug doctor` from `clients=` to
+  `daemon_proxy_clients=` so the command no longer backslides into implying downstream HTTP session
+  parity.
+- Updated the focused doctor-command fixtures to assert the new wording directly.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Scope caveats need to be repeated in the lowest-level diagnostics too; otherwise one older field
+  name can undo the clarity gained in higher-level views.
+
 ### 2026-03-17 - Server auth setup scaffolding slice
 
 **By:** Codex

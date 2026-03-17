@@ -243,7 +243,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
             name: "runtime_health".to_string(),
             status: runtime_status,
             message: format!(
-                "Daemon running: uptime={}s, clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
+                "Daemon running: uptime={}s, daemon_proxy_clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
                 uptime_secs, clients, healthy, degraded, auth_required, failed
             ),
             fix_suggestion: if failed > 0 || degraded > 0 || auth_required > 0 {
@@ -323,7 +323,7 @@ fn runtime_health_checks_for_tests(
             plug_core::doctor::CheckStatus::Pass
         },
         message: format!(
-            "Daemon running: uptime={}s, clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
+            "Daemon running: uptime={}s, daemon_proxy_clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
             uptime_secs, clients, healthy, degraded, auth_required, failed
         ),
         fix_suggestion: None,
@@ -604,7 +604,7 @@ mod tests {
             check(
                 "runtime_health",
                 CheckStatus::Pass,
-                "Daemon running: uptime=10s, clients=1, healthy=2, degraded=0, auth_required=0, failed=0",
+                "Daemon running: uptime=10s, daemon_proxy_clients=1, healthy=2, degraded=0, auth_required=0, failed=0",
             ),
         ];
         let interpretation =
@@ -628,7 +628,7 @@ mod tests {
             check(
                 "runtime_health",
                 CheckStatus::Warn,
-                "Daemon running: uptime=20s, clients=2, healthy=1, degraded=0, auth_required=0, failed=2",
+                "Daemon running: uptime=20s, daemon_proxy_clients=2, healthy=1, degraded=0, auth_required=0, failed=2",
             ),
             check("runtime_failures", CheckStatus::Fail, "failing servers: oura, notion"),
         ];
@@ -653,7 +653,7 @@ mod tests {
             check(
                 "runtime_health",
                 CheckStatus::Warn,
-                "Daemon running: uptime=20s, clients=2, healthy=1, degraded=0, auth_required=0, failed=1",
+                "Daemon running: uptime=20s, daemon_proxy_clients=2, healthy=1, degraded=0, auth_required=0, failed=1",
             ),
             check("runtime_failures", CheckStatus::Fail, "failing servers: oura"),
         ];
@@ -685,7 +685,7 @@ mod tests {
             check(
                 "runtime_health",
                 CheckStatus::Pass,
-                "Daemon running: uptime=30s, clients=3, healthy=2, degraded=0, auth_required=0, failed=0",
+                "Daemon running: uptime=30s, daemon_proxy_clients=3, healthy=2, degraded=0, auth_required=0, failed=0",
             ),
             check(
                 "runtime_auth_reauth",
@@ -737,6 +737,7 @@ mod tests {
         assert_eq!(checks[0].name, "runtime_health");
         assert_eq!(checks[0].status, CheckStatus::Warn);
         assert!(checks[0].message.contains("healthy=1"));
+        assert!(checks[0].message.contains("daemon_proxy_clients=4"));
         assert!(checks[0].message.contains("auth_required=1"));
         assert!(checks[0].message.contains("failed=1"));
 
