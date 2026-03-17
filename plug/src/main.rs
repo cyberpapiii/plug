@@ -80,6 +80,12 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum ClientLinkTransport {
+    Stdio,
+    Http,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     #[command(display_order = 1)]
@@ -90,6 +96,8 @@ enum Commands {
     Setup {
         #[arg(long)]
         yes: bool,
+        #[arg(long, value_enum)]
+        transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 3)]
     /// Show runtime health and the next useful action
@@ -127,6 +135,8 @@ enum Commands {
         all: bool,
         #[arg(long)]
         yes: bool,
+        #[arg(long, value_enum)]
+        transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 11)]
     /// Remove plug from your AI client configs
@@ -183,6 +193,8 @@ enum Commands {
         all: bool,
         #[arg(long)]
         yes: bool,
+        #[arg(long, value_enum)]
+        transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 19)]
     /// Manage OAuth authentication for upstream servers
@@ -208,6 +220,8 @@ pub(crate) enum ServerCommands {
         url: Option<String>,
         #[arg(long, value_delimiter = ',')]
         args: Vec<String>,
+        #[arg(long = "env")]
+        env: Vec<String>,
         #[arg(long)]
         transport: Option<String>,
         #[arg(long)]
@@ -234,6 +248,10 @@ pub(crate) enum ServerCommands {
         url: Option<String>,
         #[arg(long, value_delimiter = ',')]
         args: Option<Vec<String>>,
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(long = "unset-env", value_delimiter = ',')]
+        unset_env: Vec<String>,
         #[arg(long)]
         transport: Option<String>,
         #[arg(long)]
@@ -376,8 +394,13 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Some(Commands::Link { targets, all, yes }) => {
-            commands::clients::cmd_link(targets, all, yes)?
+        Some(Commands::Link {
+            targets,
+            all,
+            yes,
+            transport,
+        }) => {
+            commands::clients::cmd_link(targets, all, yes, transport.map(Into::into))?
         }
         Some(Commands::Unlink { targets, all, yes }) => {
             commands::clients::cmd_unlink(targets, all, yes)?
@@ -402,13 +425,20 @@ async fn main() -> anyhow::Result<()> {
             commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?
         }
         Some(Commands::Repair) => commands::misc::cmd_repair()?,
-        Some(Commands::Setup { yes }) => commands::misc::cmd_setup(cli.config.as_ref(), yes)?,
+        Some(Commands::Setup { yes, transport }) => {
+            commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
+        }
         Some(Commands::Reload) => commands::misc::cmd_reload().await?,
         Some(Commands::Config { path, command }) => {
             commands::config::cmd_config(cli.config.as_ref(), path, command, &cli.output)?
         }
-        Some(Commands::Export { targets, all, yes }) => {
-            commands::clients::cmd_link(targets, all, yes)?
+        Some(Commands::Export {
+            targets,
+            all,
+            yes,
+            transport,
+        }) => {
+            commands::clients::cmd_link(targets, all, yes, transport.map(Into::into))?
         }
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
@@ -416,6 +446,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+impl From<ClientLinkTransport> for plug_core::export::ExportTransport {
+    fn from(value: ClientLinkTransport) -> Self {
+        match value {
+            ClientLinkTransport::Stdio => Self::Stdio,
+            ClientLinkTransport::Http => Self::Http,
+        }
+    }
 }
 
 fn init_stderr_tracing(level: &str) {

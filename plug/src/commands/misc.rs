@@ -486,7 +486,11 @@ pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_setup(config_path: Option<&std::path::PathBuf>, yes: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_setup(
+    config_path: Option<&std::path::PathBuf>,
+    yes: bool,
+    transport: Option<plug_core::export::ExportTransport>,
+) -> anyhow::Result<()> {
     use dialoguer::Confirm;
 
     print_banner(
@@ -533,7 +537,7 @@ pub(crate) fn cmd_setup(config_path: Option<&std::path::PathBuf>, yes: bool) -> 
             file.write_all(toml.as_bytes())?;
         }
     }
-    cmd_link(Vec::new(), false, yes)?;
+    cmd_link(Vec::new(), false, yes, transport)?;
     Ok(())
 }
 

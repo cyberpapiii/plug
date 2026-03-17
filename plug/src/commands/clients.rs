@@ -257,7 +257,23 @@ pub(crate) fn configured_http_export_url(
     Some(format!("{trimmed}/mcp"))
 }
 
-pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Result<()> {
+fn requested_link_transport(
+    transport: Option<ExportTransport>,
+    yes: bool,
+) -> Option<ExportTransport> {
+    transport.or(if yes {
+        Some(ExportTransport::Stdio)
+    } else {
+        None
+    })
+}
+
+pub(crate) fn cmd_link(
+    targets: Vec<String>,
+    all: bool,
+    yes: bool,
+    transport: Option<ExportTransport>,
+) -> anyhow::Result<()> {
     use dialoguer::{Confirm, Input, MultiSelect, Select};
     use plug_core::export::ExportTransport;
 
@@ -265,8 +281,8 @@ pub(crate) fn cmd_link(targets: Vec<String>, all: bool, yes: bool) -> anyhow::Re
         configured_http_export_url(None).unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
 
     let prompt_transport = |default_http: bool| -> anyhow::Result<ExportTransport> {
-        if yes {
-            return Ok(ExportTransport::Stdio);
+        if let Some(requested) = requested_link_transport(transport, yes) {
+            return Ok(requested);
         }
 
         let selection = Select::with_theme(&cli_prompt_theme())
@@ -940,5 +956,22 @@ port = 4444
             linked.endpoint.as_deref(),
             Some("https://plug.example.com/mcp")
         );
+    }
+
+    #[test]
+    fn requested_link_transport_prefers_explicit_http_even_with_yes() {
+        assert_eq!(
+            requested_link_transport(Some(ExportTransport::Http), true),
+            Some(ExportTransport::Http)
+        );
+    }
+
+    #[test]
+    fn requested_link_transport_defaults_yes_to_stdio() {
+        assert_eq!(
+            requested_link_transport(None, true),
+            Some(ExportTransport::Stdio)
+        );
+        assert_eq!(requested_link_transport(None, false), None);
     }
 }

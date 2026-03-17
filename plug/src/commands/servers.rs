@@ -26,6 +26,33 @@ fn parse_scope_list(value: &str) -> Option<Vec<String>> {
     if scopes.is_empty() { None } else { Some(scopes) }
 }
 
+fn parse_env_assignments(values: &[String]) -> anyhow::Result<HashMap<String, String>> {
+    let mut env = HashMap::new();
+    for assignment in values {
+        let Some((key, value)) = assignment.split_once('=') else {
+            anyhow::bail!("invalid env assignment `{assignment}`; expected KEY=VALUE");
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("invalid env assignment `{assignment}`; key cannot be empty");
+        }
+        env.insert(key.to_string(), value.to_string());
+    }
+    Ok(env)
+}
+
+fn parse_unset_env_names(values: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for raw in values {
+        let name = raw.trim();
+        if name.is_empty() {
+            anyhow::bail!("invalid env key `{raw}`; name cannot be empty");
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
 fn current_remote_auth_selection(server: &plug_core::config::ServerConfig) -> RemoteAuthSelection {
     if server.auth.as_deref() == Some("oauth") {
         RemoteAuthSelection::Oauth {
@@ -205,6 +232,7 @@ pub(crate) async fn cmd_server_command(
             command,
             url,
             args,
+            env,
             transport,
             auth,
             bearer_token,
@@ -217,6 +245,7 @@ pub(crate) async fn cmd_server_command(
             command,
             url,
             args,
+            env,
             transport,
             auth,
             bearer_token,
@@ -230,6 +259,8 @@ pub(crate) async fn cmd_server_command(
             command,
             url,
             args,
+            env,
+            unset_env,
             transport,
             auth,
             bearer_token,
@@ -242,6 +273,8 @@ pub(crate) async fn cmd_server_command(
                 command,
                 url,
                 args,
+                env,
+                unset_env,
                 transport,
                 auth,
                 bearer_token,
@@ -262,6 +295,7 @@ pub(crate) fn cmd_server_add(
     command: Option<String>,
     url: Option<String>,
     args: Vec<String>,
+    env: Vec<String>,
     transport: Option<String>,
     auth: Option<String>,
     bearer_token: Option<String>,
@@ -282,11 +316,13 @@ pub(crate) fn cmd_server_add(
     }
 
     let provided_transport = transport.clone();
+    let env_updates = parse_env_assignments(&env)?;
     let non_interactive =
         provided_transport.is_some()
             || command.is_some()
             || url.is_some()
             || !args.is_empty()
+            || !env.is_empty()
             || auth.is_some()
             || bearer_token.is_some()
             || oauth_client_id.is_some()
@@ -341,7 +377,7 @@ pub(crate) fn cmd_server_add(
             plug_core::config::ServerConfig {
                 command: Some(command),
                 args,
-                env: HashMap::new(),
+                env: env_updates,
                 enabled: !disabled,
                 transport,
                 url: None,
@@ -360,6 +396,9 @@ pub(crate) fn cmd_server_add(
             }
         }
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
+            if !env.is_empty() {
+                anyhow::bail!("`--env` only applies to stdio upstream servers");
+            }
             let url = match url {
                 Some(url) => url,
                 None => Input::with_theme(&cli_prompt_theme())
@@ -477,6 +516,8 @@ pub(crate) async fn cmd_server_edit(
     command: Option<String>,
     url: Option<String>,
     args: Option<Vec<String>>,
+    env: Vec<String>,
+    unset_env: Vec<String>,
     transport: Option<String>,
     auth: Option<String>,
     bearer_token: Option<String>,
@@ -504,9 +545,13 @@ pub(crate) async fn cmd_server_edit(
         }
     };
 
+    let env_updates = parse_env_assignments(&env)?;
+    let unset_env = parse_unset_env_names(&unset_env)?;
     let non_interactive = command.is_some()
         || url.is_some()
         || args.is_some()
+        || !env.is_empty()
+        || !unset_env.is_empty()
         || transport.is_some()
         || auth.is_some()
         || bearer_token.is_some()
@@ -563,6 +608,12 @@ pub(crate) async fn cmd_server_edit(
                     if let Some(args) = args {
                         server.args = args;
                     }
+                    for (key, value) in &env_updates {
+                        server.env.insert(key.clone(), value.clone());
+                    }
+                    for key in &unset_env {
+                        server.env.remove(key);
+                    }
                 } else {
                     let enabled = Confirm::with_theme(&cli_prompt_theme())
                         .with_prompt("Enabled?")
@@ -590,6 +641,9 @@ pub(crate) async fn cmd_server_edit(
                 }
             }
             plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
+                if !env.is_empty() || !unset_env.is_empty() {
+                    anyhow::bail!("env flags only apply to stdio upstream servers");
+                }
                 if non_interactive {
                     if switching_transport && server.url.is_none() && url.is_none() {
                         anyhow::bail!(
@@ -753,6 +807,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_env_assignments_rejects_invalid_values() {
+        let error = parse_env_assignments(&["NO_EQUALS".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("expected KEY=VALUE"));
+
+        let error = parse_env_assignments(&[" =value".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("key cannot be empty"));
+    }
+
+    #[test]
+    fn parse_env_assignments_collects_key_values() {
+        let env = parse_env_assignments(&[
+            "FOO=bar".to_string(),
+            "TOKEN=abc=123".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(env.get("FOO").map(|value| value.as_str()), Some("bar"));
+        assert_eq!(env.get("TOKEN").map(|value| value.as_str()), Some("abc=123"));
+    }
+
+    #[test]
     fn apply_remote_auth_selection_sets_bearer_fields() {
         let mut server = remote_server();
         apply_remote_auth_selection(
@@ -873,6 +947,8 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             Some("stdio".to_string()),
             None,
             None,
@@ -905,6 +981,8 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             Some("http".to_string()),
             None,
             None,
@@ -939,6 +1017,8 @@ mod tests {
             Some("node".to_string()),
             None,
             Some(vec!["server.js".to_string()]),
+            Vec::new(),
+            Vec::new(),
             Some("stdio".to_string()),
             None,
             None,
@@ -959,5 +1039,100 @@ mod tests {
         assert!(saved_server.auth_token.is_none());
         assert!(saved_server.oauth_client_id.is_none());
         assert!(saved_server.oauth_scopes.is_none());
+    }
+
+    #[test]
+    fn cmd_server_add_applies_stdio_env_assignments() {
+        let config_path = test_config_path("add-stdio-env");
+
+        cmd_server_add(
+            Some(&config_path),
+            Some("demo".to_string()),
+            Some("node".to_string()),
+            None,
+            vec!["server.js".to_string()],
+            vec!["FOO=bar".to_string(), "TOKEN=abc=123".to_string()],
+            Some("stdio".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
+        let saved_server = saved.servers.get("demo").unwrap();
+        assert_eq!(saved_server.env.get("FOO").map(|value| value.as_str()), Some("bar"));
+        assert_eq!(
+            saved_server.env.get("TOKEN").map(|value| value.as_str()),
+            Some("abc=123")
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_updates_stdio_env_assignments() {
+        let config_path = test_config_path("edit-stdio-env");
+        let mut config = plug_core::config::Config::default();
+        let mut server = stdio_server("node");
+        server.env.insert("OLD".to_string(), "1".to_string());
+        server.env.insert("KEEP".to_string(), "yes".to_string());
+        config.servers.insert("demo".to_string(), server);
+        save_config(&config_path, &config).unwrap();
+
+        cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            None,
+            None,
+            None,
+            vec!["NEW=value".to_string(), "KEEP=still".to_string()],
+            vec!["OLD".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+
+        let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
+        let saved_server = saved.servers.get("demo").unwrap();
+        assert_eq!(saved_server.env.get("NEW").map(|value| value.as_str()), Some("value"));
+        assert_eq!(
+            saved_server.env.get("KEEP").map(|value| value.as_str()),
+            Some("still")
+        );
+        assert!(!saved_server.env.contains_key("OLD"));
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_rejects_env_flags_for_remote_servers() {
+        let config_path = test_config_path("remote-env-flags");
+        let mut config = plug_core::config::Config::default();
+        config.servers.insert("demo".to_string(), remote_server());
+        save_config(&config_path, &config).unwrap();
+
+        let error = cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            None,
+            None,
+            None,
+            vec!["FOO=bar".to_string()],
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Text,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("env flags only apply to stdio upstream servers"));
     }
 }

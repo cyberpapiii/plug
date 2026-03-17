@@ -716,6 +716,26 @@ Key files expected to change:
 - Appending guidance at render time is a low-risk clarity win because it does not change doctor
   semantics, only whether users can see the recovery path the code already computed.
 
+### 2026-03-17 - Explicit non-interactive client transport slice
+
+**By:** Codex
+
+**Actions:**
+- Added `--transport stdio|http` to `plug link`, `plug export`, and `plug setup`.
+- Changed non-interactive linking so an explicit transport wins over the old hidden `--yes`
+  fallback to stdio.
+- Fixed the drifted server command/view call sites that the full `plug` compile exposed while
+  exercising the updated CLI surface.
+
+**Verification:**
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- `--yes` without a transport is still okay as a compatibility default, but unattended setup flows
+  need an explicit topology knob or they keep encoding the wrong deployment model.
+- Running the full package tests after CLI-shape changes is doing real work here; it caught stale
+  server command signatures that focused auth/topology tests would not have touched.
+
 ### 2026-03-17 - Doctor interpretation clarity coverage slice
 
 **By:** Codex

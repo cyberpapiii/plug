@@ -100,6 +100,9 @@ Still remaining:
 - 2026-03-17: `plug doctor` text output now prints each check's next-step guidance inline instead
   of hiding the already-computed `fix_suggestion`, which makes the command materially more
   actionable without changing the underlying checks.
+- 2026-03-17: scripted `plug link`, `plug export`, and `plug setup` now accept an explicit
+  `--transport stdio|http` choice, so unattended flows no longer silently collapse to stdio when
+  `--yes` is used.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.
