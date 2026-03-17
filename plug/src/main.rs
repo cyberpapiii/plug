@@ -235,6 +235,8 @@ pub(crate) enum ServerCommands {
         #[arg(long, value_delimiter = ',')]
         args: Option<Vec<String>>,
         #[arg(long)]
+        transport: Option<String>,
+        #[arg(long)]
         auth: Option<String>,
         #[arg(long)]
         bearer_token: Option<String>,

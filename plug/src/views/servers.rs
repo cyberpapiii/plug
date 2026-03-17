@@ -58,6 +58,7 @@ async fn prompt_server_actions(
                 None,
                 None,
                 None,
+                None,
                 output,
             )
             .await?;

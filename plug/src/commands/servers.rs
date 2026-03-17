@@ -230,6 +230,7 @@ pub(crate) async fn cmd_server_command(
             command,
             url,
             args,
+            transport,
             auth,
             bearer_token,
             oauth_client_id,
@@ -241,6 +242,7 @@ pub(crate) async fn cmd_server_command(
                 command,
                 url,
                 args,
+                transport,
                 auth,
                 bearer_token,
                 oauth_client_id,
@@ -475,6 +477,7 @@ pub(crate) async fn cmd_server_edit(
     command: Option<String>,
     url: Option<String>,
     args: Option<Vec<String>>,
+    transport: Option<String>,
     auth: Option<String>,
     bearer_token: Option<String>,
     oauth_client_id: Option<String>,
@@ -504,6 +507,7 @@ pub(crate) async fn cmd_server_edit(
     let non_interactive = command.is_some()
         || url.is_some()
         || args.is_some()
+        || transport.is_some()
         || auth.is_some()
         || bearer_token.is_some()
         || oauth_client_id.is_some()
@@ -520,7 +524,16 @@ pub(crate) async fn cmd_server_edit(
             return Ok(());
         }
 
-        match server.transport {
+        let desired_transport = match transport {
+            Some(value) => Some(parse_transport(Some(value), &url)?),
+            None => None,
+        };
+        let switching_transport = desired_transport.is_some();
+
+        match desired_transport
+            .clone()
+            .unwrap_or_else(|| server.transport.clone())
+        {
             plug_core::config::TransportType::Stdio => {
                 if auth.is_some()
                     || bearer_token.is_some()
@@ -533,6 +546,17 @@ pub(crate) async fn cmd_server_edit(
                     );
                 }
                 if non_interactive {
+                    if switching_transport && server.command.is_none() && command.is_none() {
+                        anyhow::bail!(
+                            "`--command` is required when switching a remote server to stdio"
+                        );
+                    }
+                    server.transport = plug_core::config::TransportType::Stdio;
+                    server.url = None;
+                    server.auth_token = None;
+                    server.auth = None;
+                    server.oauth_client_id = None;
+                    server.oauth_scopes = None;
                     if let Some(command) = command {
                         server.command = Some(command);
                     }
@@ -567,6 +591,14 @@ pub(crate) async fn cmd_server_edit(
             }
             plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
                 if non_interactive {
+                    if switching_transport && server.url.is_none() && url.is_none() {
+                        anyhow::bail!(
+                            "`--url` is required when switching a stdio server to HTTP or SSE"
+                        );
+                    }
+                    server.transport = desired_transport.unwrap_or_else(|| server.transport.clone());
+                    server.command = None;
+                    server.args = Vec::new();
                     if let Some(url) = url {
                         server.url = Some(url);
                     }
@@ -654,6 +686,35 @@ pub(crate) fn cmd_server_set_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config_path(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("plug-servers-{prefix}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("config.toml")
+    }
+
+    fn stdio_server(command: &str) -> plug_core::config::ServerConfig {
+        plug_core::config::ServerConfig {
+            command: Some(command.to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        }
+    }
 
     fn remote_server() -> plug_core::config::ServerConfig {
         plug_core::config::ServerConfig {
@@ -797,5 +858,106 @@ mod tests {
             noninteractive_remote_auth_selection(Some("none".to_string()), None, None, None)
                 .unwrap();
         assert_eq!(selection, Some(RemoteAuthSelection::None));
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_requires_command_when_switching_remote_to_stdio() {
+        let config_path = test_config_path("remote-to-stdio");
+        let mut config = plug_core::config::Config::default();
+        config.servers.insert("demo".to_string(), remote_server());
+        save_config(&config_path, &config).unwrap();
+
+        let error = cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            None,
+            None,
+            None,
+            Some("stdio".to_string()),
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Text,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("`--command` is required when switching a remote server to stdio")
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_requires_url_when_switching_stdio_to_remote() {
+        let config_path = test_config_path("stdio-to-remote");
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("demo".to_string(), stdio_server("echo"));
+        save_config(&config_path, &config).unwrap();
+
+        let error = cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            None,
+            None,
+            None,
+            Some("http".to_string()),
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Text,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("`--url` is required when switching a stdio server to HTTP or SSE")
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_switches_remote_to_stdio_and_clears_remote_fields() {
+        let config_path = test_config_path("switch-remote-to-stdio");
+        let mut config = plug_core::config::Config::default();
+        let mut server = remote_server();
+        server.auth = Some("oauth".to_string());
+        server.oauth_client_id = Some("client-123".to_string());
+        server.oauth_scopes = Some(vec!["read".to_string()]);
+        config.servers.insert("demo".to_string(), server);
+        save_config(&config_path, &config).unwrap();
+
+        cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            Some("node".to_string()),
+            None,
+            Some(vec!["server.js".to_string()]),
+            Some("stdio".to_string()),
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+
+        let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
+        let saved_server = saved.servers.get("demo").unwrap();
+        assert_eq!(saved_server.transport, plug_core::config::TransportType::Stdio);
+        assert_eq!(saved_server.command.as_deref(), Some("node"));
+        assert_eq!(saved_server.args, vec!["server.js".to_string()]);
+        assert!(saved_server.url.is_none());
+        assert!(saved_server.auth.is_none());
+        assert!(saved_server.auth_token.is_none());
+        assert!(saved_server.oauth_client_id.is_none());
+        assert!(saved_server.oauth_scopes.is_none());
     }
 }

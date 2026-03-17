@@ -89,6 +89,8 @@ Still remaining:
   operators can see which client configs are pointed at plug without switching to a second command.
 - 2026-03-17: `plug-core` doctor tests now cover the non-interactive OAuth token path directly, so
   the keychain-safe diagnostics behavior is pinned by tests rather than only live observation.
+- 2026-03-17: non-interactive `plug server edit` now supports transport-shape mutation with
+  guardrails, so scripted maintenance can switch servers between stdio and HTTP/SSE coherently.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
   full end-to-end command fixtures.
 

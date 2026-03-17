@@ -624,6 +624,28 @@ Key files expected to change:
 - Small focused coverage is enough here; we do not need full end-to-end auth login flows just to
   prove doctor stays non-interactive.
 
+### 2026-03-17 - Scripted transport-shape edit slice
+
+**By:** Codex
+
+**Actions:**
+- Added `--transport` support to non-interactive `plug server edit`.
+- Added guardrails so transport-shape changes require the fields that make the new shape coherent:
+  - remote -> stdio requires `--command`
+  - stdio -> http/sse requires `--url`
+- Made remote -> stdio edits clear remote-only fields (`url`, bearer token, oauth config) so the
+  saved config cannot retain stale shape-specific state.
+
+**Verification:**
+- `cargo test -p plug commands::servers::tests -- --nocapture`
+- `cargo test -p plug tests::serve_command -- --nocapture`
+
+**Learnings:**
+- Scripted maintenance was still incomplete until transport shape itself could be changed without
+  falling back to manual prompt-driven editing.
+- Shape changes need stronger validation than field edits, because invalid partial transitions are
+  much easier to create than invalid same-shape tweaks.
+
 ### 2026-03-17 - Non-interactive doctor and upstream target visibility
 
 **By:** Codex
