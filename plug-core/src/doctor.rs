@@ -1061,24 +1061,24 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     }
 
     let tokens_dir = crate::oauth::tokens_dir();
-    let mut plaintext_fallbacks = Vec::new();
+    let mut plaintext_token_files = Vec::new();
 
     for (server_name, _) in &oauth_servers {
         let token_file = tokens_dir.join(format!("{server_name}.json"));
         if token_file.exists() {
-            plaintext_fallbacks.push(format!(
-                "server '{server_name}': plaintext token fallback file present at {}",
+            plaintext_token_files.push(format!(
+                "server '{server_name}': plaintext token file present at {}",
                 token_file.display()
             ));
         }
     }
 
-    if plaintext_fallbacks.is_empty() {
+    if plaintext_token_files.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
             message:
-                "No plaintext OAuth token fallback files detected (doctor does not probe keychain-backed credentials)"
+                "No plaintext OAuth token files detected (doctor does not probe keychain-backed credentials)"
                     .to_string(),
             fix_suggestion: None,
         }
@@ -1086,9 +1086,9 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
         CheckResult {
             name,
             status: CheckStatus::Warn,
-            message: plaintext_fallbacks.join("; "),
+            message: plaintext_token_files.join("; "),
             fix_suggestion: Some(
-                "Use `plug auth status` for live credential state; plaintext fallback files should only exist when secure keychain storage is unavailable".to_string(),
+                "Use `plug auth status` for live credential state; these local token files back process restarts and should remain protected with filesystem permissions".to_string(),
             ),
         }
     }
@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_tokens_warn_when_plaintext_fallback_exists() {
+    async fn oauth_tokens_warn_when_plaintext_token_file_exists() {
         let server_name = format!("oauth-doctor-file-{}", std::process::id());
         let mut config = test_config();
         config.servers.insert(
@@ -1358,13 +1358,13 @@ mod tests {
 
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains(&server_name));
-        assert!(result.message.contains("plaintext token fallback"));
+        assert!(result.message.contains("plaintext token file"));
         assert!(
             result
                 .fix_suggestion
                 .as_deref()
                 .unwrap_or_default()
-                .contains("plug auth status")
+                .contains("filesystem permissions")
         );
     }
 
