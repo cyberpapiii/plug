@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p1
 issue_id: "060"
 tags: [ux, operator, recovery, clients, status, auth, doctor, clarity]
@@ -113,3 +113,13 @@ operator experience:
 **Learnings:**
 - Recovery guidance should use a different renderer than command suggestions; overloading the same
   visual treatment makes the CLI feel more mechanical and less trustworthy.
+
+### 2026-03-17 - Program completed
+
+**By:** Codex
+
+**Outcome:**
+- `clients`, `status`, `auth status`, and `doctor` now use one operator vocabulary and present live
+  versus linked/fallback state much more clearly.
+- The remaining work should be driven by real-world dogfooding instead of another broad polish
+  phase.
