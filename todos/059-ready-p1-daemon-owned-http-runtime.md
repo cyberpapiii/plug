@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 priority: p1
 issue_id: "059"
 tags: [daemon, http, runtime, architecture, sessions, ux]
@@ -16,8 +16,9 @@ truthful, but it is still more complex than necessary.
 
 ## Goal
 
-Promote the background service to the primary runtime authority for both downstream stdio and
-downstream HTTP, while preserving standalone `plug serve` as an explicit fallback/debug path.
+Promote the shared service to the primary runtime authority for both downstream stdio and
+downstream HTTP, including foreground `plug serve` usage, so the product stops maintaining a second
+standalone HTTP runtime path.
 
 ## Task List
 
@@ -47,7 +48,7 @@ Outcome:
 
 Acceptance:
 - `plug start` / `plug serve --daemon` clearly mean shared background service with IPC + HTTP
-- standalone `plug serve` is documented as explicit foreground/fallback behavior
+- `plug serve` clearly means the same shared service in the foreground
 
 ### Task 4: Truth-pass and verification
 
@@ -66,9 +67,34 @@ Acceptance:
 
 **Actions:**
 - Split the daemon-owned HTTP architecture step out from the completed parity program.
-- Defined the lowest-risk shape: daemon owns HTTP when background service runs, standalone
-  `plug serve` remains available explicitly.
+- Defined the initial daemon-owned HTTP architecture step and its verification boundaries.
 
 **Learnings:**
 - The parity program solved visibility.
 - This program is about simplifying runtime truth, not re-solving operator inventory.
+
+### 2026-03-17 - Daemon became the primary HTTP runtime authority
+
+**By:** Codex
+
+**Actions:**
+- Reused the shared HTTP runtime builder in daemon mode so the background service now owns
+  downstream HTTP/HTTPS alongside IPC.
+- Extended daemon `ListLiveSessions` to include HTTP session snapshots directly and report
+  `transport_complete` when it owns both transports.
+- Updated runtime inventory fetches to trust transport-complete daemon responses directly instead
+  of re-querying standalone HTTP and risking double-counting.
+- Clarified command/docs semantics so:
+  - `plug start` / `plug serve --daemon` mean the shared background service
+  - standalone `plug serve` remains an explicit foreground/fallback path
+
+**Verification:**
+- `cargo test -p plug live_sessions -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The safest architecture shift was to make daemon mode authoritative first without deleting the
+  standalone HTTP path.
+- This keeps one-runtime truth for normal background-service usage while preserving a lower-risk
+  escape hatch for explicit standalone serving.

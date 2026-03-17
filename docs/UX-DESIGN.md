@@ -173,6 +173,7 @@ These commands should fix drift and make local state understandable.
 
 ```text
 plug connect
+plug serve
 plug serve --daemon
 plug stop
 plug reload

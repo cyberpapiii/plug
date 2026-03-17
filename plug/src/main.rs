@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
 const HELP_OVERVIEW: &str = "\
 Workflow:
   Get started
-    plug start              Start the background service
+    plug start              Start the shared background service
     plug setup              Discover servers and link clients
     plug clients            View and manage AI clients
 
@@ -46,7 +46,8 @@ Workflow:
 
   Internal
     plug connect            stdio adapter invoked by AI clients
-    plug serve --daemon     Run the background service
+    plug serve              Run the shared service in the foreground
+    plug serve --daemon     Run the shared background service (IPC + HTTP)
 ";
 
 #[derive(Parser)]
@@ -89,7 +90,7 @@ pub(crate) enum ClientLinkTransport {
 #[derive(Subcommand)]
 enum Commands {
     #[command(display_order = 1)]
-    /// Start the background plug service
+    /// Start the shared background plug service (IPC + HTTP)
     Start,
     #[command(display_order = 2)]
     /// Discover servers, import config, and link your AI clients
@@ -161,7 +162,7 @@ enum Commands {
     /// Internal: start the stdio adapter AI clients invoke
     Connect,
     #[command(display_order = 14)]
-    /// Internal: run plug as an HTTP/background service
+    /// Internal: run plug as the shared foreground or background service
     Serve {
         #[arg(long)]
         daemon: bool,

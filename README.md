@@ -126,7 +126,7 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 
 ```sh
 plug                         # Show a compact overview and next actions
-plug start                   # Start the background service
+plug start                   # Start the shared background service (IPC + HTTP)
 plug setup                   # Discover servers and link clients
 plug clients                 # View and manage linked, detected, and live clients
 plug servers                 # View and manage configured servers
@@ -141,7 +141,8 @@ plug tools --output json     # Machine-readable output for agent use
 plug auth login --server name  # OAuth login for remote MCP servers
 plug auth status               # Show per-server auth status
 plug connect                   # Internal stdio adapter AI clients invoke
-plug serve --daemon            # Run as headless daemon with IPC
+plug serve                     # Run standalone HTTP/HTTPS in the foreground
+plug serve --daemon            # Run the shared background service (IPC + HTTP)
 ```
 
 ## Configuration

@@ -8,14 +8,15 @@ document describes the architecture of the merged system, not branch-only or his
 `plug` is a single Rust binary with two active downstream front doors:
 
 - `plug connect` for stdio clients
-- `plug serve` for Streamable HTTP clients, with optional HTTPS termination for remote use
+- `plug serve` for standalone foreground Streamable HTTP clients, with optional HTTPS termination
+- daemon-owned HTTP when the shared background service is running
 
 Both paths run on the same core runtime model:
 
 ```text
 Downstream clients
   stdio clients              -> plug connect -> daemon-backed or standalone proxy
-  HTTP / remote clients      -> plug serve   -> HTTP/HTTPS server + shared engine
+  HTTP / remote clients      -> plug serve or daemon-owned HTTP -> HTTP/HTTPS server + shared engine
 
 Core runtime
   Engine
@@ -65,14 +66,17 @@ Upstream servers
 
 ### Daemon
 
-The daemon is the authoritative shared local runtime for `plug connect`:
+The daemon is the authoritative shared local runtime when the background service is running:
 
 - Unix socket IPC
+- downstream HTTP/HTTPS server ownership
 - admin auth token for control commands
 - downstream client registry
+- downstream HTTP session inventory
 - reconnecting IPC proxy sessions
 
-The daemon-backed path now covers the real shared runtime, not just basic tool calls.
+The daemon-backed path now covers the real shared runtime for both downstream stdio and downstream
+HTTP, not just basic tool calls.
 
 ## Downstream Capabilities
 

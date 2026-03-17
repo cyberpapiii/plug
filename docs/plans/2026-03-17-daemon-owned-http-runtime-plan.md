@@ -87,3 +87,11 @@ Acceptance:
 - daemon mode owns both downstream transports
 - normal operator surfaces can rely on daemon session truth directly
 - standalone HTTP fallback remains available without becoming the product’s primary truth path
+
+## Phase Status
+
+- [x] daemon mode builds and owns the shared HTTP runtime
+- [x] daemon `ListLiveSessions` can report transport-complete truth directly
+- [x] runtime inventory trusts daemon-complete responses without double-counting
+- [x] command/help/docs semantics distinguish shared background service from standalone foreground `serve`
+- [x] focused and full `plug` test suite coverage passed for the new runtime model

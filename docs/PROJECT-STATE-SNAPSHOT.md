@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `65234c9` (post-reconcile baseline including auth/operator hardening and live-session parity work)
+Baseline: `main` @ `1242c6b` (post-reconcile baseline including daemon-owned background HTTP runtime)
 
 This is the canonical current-state doc for the project.
 
@@ -52,6 +52,9 @@ Implemented on `main`:
   - `transport-complete`
   - `unavailable`
 - standalone HTTP live-session operator endpoint with dedicated operator token protection
+- daemon-owned downstream HTTP/HTTPS when the shared background service is running
+- transport-complete live session inventory directly from the daemon in background-service mode
+- standalone `plug serve` retained as an explicit foreground/fallback runtime path
 - pinned machine-readable JSON contracts for operator inventory/auth/runtime surfaces
 - standalone HTTP inventory failure-path coverage for missing token, empty token, unauthorized, and malformed response cases
 
@@ -100,7 +103,7 @@ Use docs by role:
 
 1. keep current-state docs aligned with `main`
 2. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
-3. decide whether future product scope should unify downstream HTTP under daemon ownership, or retain the current aggregated model
+3. decide whether standalone `plug serve` should remain a permanent foreground/fallback mode or eventually narrow further
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 

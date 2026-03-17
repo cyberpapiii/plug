@@ -645,11 +645,11 @@ pub(crate) async fn cmd_start(
         return Ok(());
     }
 
-    print_banner("◆", "Service", "Background daemon");
+    print_banner("◆", "Service", "Shared background runtime");
     if started {
-        print_success_line("Started background service.");
+        print_success_line("Started shared background service.");
     } else {
-        print_info_line("Background service is already running.");
+        print_info_line("Shared background service is already running.");
     }
     Ok(())
 }
@@ -707,17 +707,7 @@ pub(crate) async fn cmd_daemon_stop() -> anyhow::Result<()> {
 }
 
 pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    let config = plug_core::config::load_config(config_path)?;
-    let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
-    engine.start().await?;
-    let http_runtime = build_configured_http_runtime(&config, &engine)?;
-    serve_router(
-        http_runtime.router,
-        &config.http,
-        engine.cancel_token().clone(),
-    )
-    .await?;
-    Ok(())
+    cmd_daemon(config_path).await
 }
 
 fn resolve_downstream_bearer_token(
