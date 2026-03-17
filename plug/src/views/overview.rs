@@ -21,13 +21,13 @@ fn live_client_count_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope
             "Live client counts currently reflect daemon proxy clients only; downstream HTTP sessions are not yet included."
         }
         plug_core::ipc::LiveSessionInventoryScope::HttpOnly => {
-            "Live client counts currently reflect standalone downstream HTTP sessions only; daemon proxy sessions are not included."
+            "Live client counts currently reflect downstream HTTP sessions only; daemon proxy sessions are not included."
         }
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
             "Live client counts include both daemon proxy and downstream HTTP sessions."
         }
         plug_core::ipc::LiveSessionInventoryScope::Unavailable => {
-            "Live client counts are unavailable from both daemon and standalone HTTP sources."
+            "Live client counts are unavailable from both daemon proxy and downstream HTTP sources."
         }
     }
 }

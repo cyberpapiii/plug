@@ -17,13 +17,13 @@ fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -
             "Live session inventory currently reflects daemon proxy clients only; downstream HTTP sessions are not yet surfaced here."
         }
         plug_core::ipc::LiveSessionInventoryScope::HttpOnly => {
-            "Live session inventory currently reflects standalone downstream HTTP sessions only; daemon proxy sessions are not available."
+            "Live session inventory currently reflects downstream HTTP sessions only; daemon proxy sessions are not available."
         }
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
             "Live session inventory includes both daemon proxy and downstream HTTP sessions."
         }
         plug_core::ipc::LiveSessionInventoryScope::Unavailable => {
-            "Live session inventory is unavailable from both daemon and standalone HTTP sources."
+            "Live session inventory is unavailable from both daemon proxy and downstream HTTP sources."
         }
     }
 }

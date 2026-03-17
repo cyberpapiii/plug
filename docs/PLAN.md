@@ -35,10 +35,10 @@ forwarding work:
 - persisted token hydration before upstream connect
 - downstream OAuth/operator hardening across discovery, metadata, challenge behavior, and non-interactive diagnostics
 - topology-aware setup/link/repair/status flows that preserve and surface downstream transport/auth choices
-- transport-aware live session inventory with explicit scope and availability across daemon proxy and standalone HTTP runtimes
+- transport-aware live session inventory with explicit scope and availability across daemon proxy and downstream HTTP sessions
 - daemon-owned downstream HTTP/HTTPS when the shared background service is running
 - daemon-provided transport-complete live session truth in background-service mode
-- pinned operator JSON contracts plus standalone HTTP inventory failure-path coverage
+- pinned operator JSON contracts plus downstream HTTP inventory failure-path coverage
 
 ## What Exists Today
 
@@ -49,7 +49,7 @@ The current product shape is:
 - `plug serve` for explicit standalone foreground HTTP/HTTPS serving
 - shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
 - daemon-backed local sharing with reconnecting IPC proxy sessions and daemon-owned downstream HTTP
-- transport-aware operator inventory that can rely on daemon truth directly when the background service is running, while still falling back cleanly for standalone HTTP
+- transport-aware operator inventory that can rely on daemon truth directly when the background service is running, while still falling back cleanly during non-daemon foreground HTTP serving
 - targeted notification fan-out to stdio, HTTP, and daemon IPC (resource subscribe still unsupported over IPC)
 - meta-tool mode as an opt-in reduced discovery surface
 - downstream HTTP bearer token auth for non-loopback binding
@@ -64,7 +64,7 @@ No required roadmap work remains for the current production-ready bar.
 Optional future scope only:
 
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
-- deciding whether standalone foreground `plug serve` should remain a long-term product surface or narrow further now that daemon mode owns the primary shared runtime
+- continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 
 ## 2026-03-16 Reconciliation Note
 
@@ -79,7 +79,7 @@ On 2026-03-17, `main` absorbed the follow-on operator/runtime hardening work tha
 - aligned `status`, `doctor`, `auth status`, `clients`, and `servers` around one explicit auth/runtime vocabulary
 - preserved downstream topology choices through setup/link/repair flows
 - introduced transport-aware live-session inventory with explicit availability/scope semantics
-- added regression coverage for JSON operator contracts and standalone HTTP inventory failure paths
+- added regression coverage for JSON operator contracts and downstream HTTP inventory failure paths
 
 ## 2026-03-17 Daemon-Owned HTTP Runtime
 
@@ -88,4 +88,4 @@ On 2026-03-17, `main` also moved the shared background service to the next archi
 - daemon mode now owns downstream HTTP/HTTPS as well as IPC proxy sessions
 - daemon `ListLiveSessions` can report transport-complete truth directly
 - runtime/operator surfaces trust daemon-provided complete inventory when it is available
-- standalone `plug serve` remains as an explicit foreground/fallback mode rather than the primary runtime authority
+- standalone `plug serve` remains as an explicit foreground mode rather than the primary runtime authority

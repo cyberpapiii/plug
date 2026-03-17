@@ -98,3 +98,25 @@ Acceptance:
   standalone HTTP path.
 - This keeps one-runtime truth for normal background-service usage while preserving a lower-risk
   escape hatch for explicit standalone serving.
+
+### 2026-03-17 - Live smoke pass confirmed daemon-owned runtime behavior
+
+**By:** Codex
+
+**Actions:**
+- stopped stale installed `plug connect` / daemon processes that were still auto-spawning the old
+  installed binary
+- started the current `main` debug binary and verified the daemon-owned runtime directly on the
+  machine
+- confirmed:
+  - Unix socket present at `~/Library/Application Support/plug/plug.sock`
+  - downstream HTTP listener bound on `127.0.0.1:3282`
+  - `plug --output json status` reports:
+    - `live_client_scope: transport_complete`
+    - `http_sessions_included: true`
+    - transport-aware live session fields from the daemon-owned runtime
+
+**Learnings:**
+- the earlier mismatch was stale machine state, not a remaining architecture bug in `main`
+- live validation matters here because daemon ownership can be green in tests while still being
+  obscured by older installed background processes
