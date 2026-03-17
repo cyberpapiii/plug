@@ -19,7 +19,7 @@ fn prompt_client_actions() -> anyhow::Result<bool> {
 
     match selection {
         Some(1) => {
-            cmd_link(Vec::new(), false, false, None)?;
+            cmd_link(None, Vec::new(), false, false, None)?;
             Ok(true)
         }
         Some(2) => {
