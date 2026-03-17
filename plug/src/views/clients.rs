@@ -43,7 +43,15 @@ fn configured_client_state_text(client: &crate::commands::clients::ClientView) -
         states.push("detected".to_string());
     }
     if client.live {
-        states.push(format!("live ({})", client.live_sessions));
+        let transport_summary = if client.live_transports.is_empty() {
+            "unknown".to_string()
+        } else {
+            client.live_transports.join("+")
+        };
+        states.push(format!(
+            "live via {transport_summary} ({})",
+            client.live_sessions
+        ));
     }
 
     if states.is_empty() {
@@ -300,6 +308,7 @@ mod tests {
             detected: true,
             live: true,
             live_sessions: 1,
+            live_transports: vec!["http".to_string()],
         }];
         let live_sessions = vec![LiveSessionView {
             session_id: "session-1".to_string(),
@@ -393,8 +402,12 @@ mod tests {
             detected: true,
             live: true,
             live_sessions: 2,
+            live_transports: vec!["daemon_proxy".to_string()],
         };
-        assert_eq!(configured_client_state_text(&client), "detected, live (2)");
+        assert_eq!(
+            configured_client_state_text(&client),
+            "detected, live via daemon_proxy (2)"
+        );
     }
 
     #[test]
@@ -408,6 +421,7 @@ mod tests {
             detected: false,
             live: false,
             live_sessions: 0,
+            live_transports: Vec::new(),
         };
         assert_eq!(
             configured_client_link_text(&client).as_deref(),

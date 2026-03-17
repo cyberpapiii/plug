@@ -19,6 +19,7 @@ pub(crate) struct ClientView {
     pub(crate) detected: bool,
     pub(crate) live: bool,
     pub(crate) live_sessions: usize,
+    pub(crate) live_transports: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -192,9 +193,20 @@ fn client_target_from_type(client_type: plug_core::types::ClientType) -> Option<
 pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<ClientView> {
     let mut live_counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
+    let mut live_transports: std::collections::HashMap<&'static str, std::collections::BTreeSet<&'static str>> =
+        std::collections::HashMap::new();
     for session in live {
         if let Some(target) = client_target_from_type(session.client_type) {
             *live_counts.entry(target).or_insert(0) += 1;
+            let transport = match session.transport {
+                plug_core::ipc::LiveSessionTransport::DaemonProxy => "daemon_proxy",
+                plug_core::ipc::LiveSessionTransport::Http => "http",
+                plug_core::ipc::LiveSessionTransport::Sse => "sse",
+            };
+            live_transports
+                .entry(target)
+                .or_default()
+                .insert(transport);
         }
     }
 
@@ -210,6 +222,10 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<C
             let linked = linked_transport.is_some();
             let detected = is_detected(target);
             let live_sessions = *live_counts.get(target).unwrap_or(&0);
+            let live_transports = live_transports
+                .get(target)
+                .map(|transports| transports.iter().map(|value| (*value).to_string()).collect())
+                .unwrap_or_default();
             ClientView {
                 name: (*name).to_string(),
                 target: (*target).to_string(),
@@ -219,6 +235,7 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<C
                 detected,
                 live: live_sessions > 0,
                 live_sessions,
+                live_transports,
             }
         })
         .collect::<Vec<_>>();
