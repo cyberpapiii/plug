@@ -11,6 +11,10 @@ use crate::ui::{
     summarize_server_transport,
 };
 
+fn live_client_count_scope_text() -> &'static str {
+    "Live client counts currently reflect daemon proxy clients only; downstream HTTP sessions are not yet included."
+}
+
 pub(crate) async fn cmd_overview(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
@@ -113,6 +117,7 @@ pub(crate) async fn cmd_overview(
     match live_client_support {
         LiveClientSupport::Supported => {
             print_label_value("Live", style(live_client_count).bold());
+            print_label_value("Live Scope", live_client_count_scope_text());
         }
         LiveClientSupport::DaemonRestartRequired => {
             print_label_value("Live", style("restart required").yellow().bold());
@@ -265,6 +270,7 @@ pub(crate) async fn cmd_status(
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             print_label_value("Clients", style(clients.to_string()).bold());
+            print_label_value("Client Scope", live_client_count_scope_text());
             if !linked_clients.is_empty() {
                 let linked_summary = linked_clients
                     .iter()
@@ -384,7 +390,13 @@ pub(crate) async fn cmd_status(
                 }
             }
         } else {
-            let mut json_obj = serde_json::json!({ "uptime": uptime_secs, "clients": clients, "servers": servers });
+            let mut json_obj = serde_json::json!({
+                "uptime": uptime_secs,
+                "clients": clients,
+                "servers": servers,
+                "live_client_scope": "daemon_proxy_only",
+                "http_sessions_included": false
+            });
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
                     linked_clients
@@ -482,4 +494,16 @@ pub(crate) async fn cmd_status(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_client_count_scope_text;
+
+    #[test]
+    fn live_client_count_scope_text_mentions_daemon_and_http_gap() {
+        let text = live_client_count_scope_text();
+        assert!(text.contains("daemon proxy clients"));
+        assert!(text.contains("HTTP sessions"));
+    }
 }

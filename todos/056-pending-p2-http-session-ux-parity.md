@@ -61,7 +61,17 @@ Keep current menus intact but add a dedicated diagnostics/session view that merg
 
 # Recommended Action
 
-Investigate the current session/menu plumbing first and answer one question clearly: are downstream HTTP sessions missing from the underlying inventory, or just not exposed/labeled in the UI? Then implement the smallest change that gives operators transport-aware session visibility with clear client labeling.
+Investigation is now complete: downstream HTTP sessions are missing from the current live
+daemon/session inventory, not merely hidden in the UI. The next implementation step should be an
+explicit architecture choice:
+
+1. move downstream HTTP serving under daemon ownership so IPC and HTTP sessions share one runtime
+   inventory model, or
+2. add an HTTP-session snapshot API plus a higher-level aggregator that merges standalone `serve`
+   session state with daemon IPC client state.
+
+Until then, all operator-facing commands should state the current scope explicitly instead of
+implying parity they do not yet have.
 
 # Acceptance Criteria
 
@@ -110,3 +120,18 @@ Investigate the current session/menu plumbing first and answer one question clea
   aware session snapshot model later.
 - Full parity will require shared session snapshot types plus merged daemon/HTTP inventory, not
   just another label in the existing client view.
+
+### 2026-03-17 - Runtime status scope alignment
+
+**By:** Codex
+
+**Actions:**
+- Extended the same explicit scope caveat from `plug clients` to `plug status` so the live runtime
+  client count no longer looks like full downstream transport parity.
+- Added machine-readable status metadata exposing the same truth:
+  - `live_client_scope: "daemon_proxy_only"`
+  - `http_sessions_included: false`
+
+**Learnings:**
+- Scope honesty has to be consistent across every command that prints live client counts, or users
+  will still infer parity from the least explicit surface.

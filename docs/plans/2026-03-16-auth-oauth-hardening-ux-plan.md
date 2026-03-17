@@ -51,10 +51,9 @@ Completed so far:
 - status/server inventory rows that surface each upstream target directly
 
 Still remaining:
-- deeper server add/edit auth scaffolding so common HTTP/SSE auth cases are not still hand-authored
-- richer non-interactive/server-scripted transport-shape edits beyond auth/URL/command/args
 - broader doctor-level scenario coverage that exercises live runtime state versus cold reachability
 - final UX cleanup where command surfaces still imply a simpler topology than the runtime actually supports
+- architectural follow-up for true downstream HTTP session parity in live inventory
 
 ## Progress Notes
 
@@ -112,6 +111,10 @@ Still remaining:
 - 2026-03-17: investigation confirmed that HTTP downstream sessions are missing from the current
   daemon/ListClients/client-view inventory model, so `plug clients` now says that explicitly
   instead of implying transport parity it does not yet have.
+- 2026-03-17: deeper architecture review confirmed the missing parity is structural, not cosmetic:
+  daemon mode owns IPC proxy client inventory while standalone `serve` owns downstream HTTP
+  sessions, so true unified live inventory requires either daemon-owned HTTP serving or a higher-
+  level merged session snapshot API.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.

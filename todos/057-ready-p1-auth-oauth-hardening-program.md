@@ -89,6 +89,7 @@ Execute the full hardening plan from [docs/plans/2026-03-16-auth-oauth-hardening
 - [x] Final verification complete: `cargo test` passes
 - [x] Final verification complete: `cargo build --release` passes
 - [x] Final verification complete: `plug status`, `plug auth status`, and `plug doctor` tell a coherent story on healthy, auth-required, and failed server cases
+- [ ] Follow-up tracked: true downstream HTTP live-session parity is handled as a separate architecture task, not misrepresented as complete
 
 ## Technical Details
 
@@ -203,6 +204,27 @@ Key files expected to change:
   through setup, repair, and status together or the UX becomes misleading again.
 - The remaining hardening work is now mostly about broader scenario coverage and server-auth setup
   ergonomics, not basic topology visibility.
+
+### 2026-03-17 - Live inventory scope and parity architecture truth pass
+
+**By:** Codex
+
+**Actions:**
+- Added an explicit live-client scope note to `plug status` so the runtime `Clients` count no
+  longer implies that downstream HTTP sessions are already part of the same live inventory.
+- Added matching JSON fields for machine-readable status output:
+  - `live_client_scope: "daemon_proxy_only"`
+  - `http_sessions_included: false`
+- Re-verified the architecture boundary:
+  - daemon mode owns `ClientRegistry` for IPC proxy clients
+  - standalone `serve` owns `StatefulSessionStore` for downstream HTTP sessions
+- Updated the implementation plan so HTTP session parity is tracked as an architectural follow-up,
+  not vague leftover UX polish.
+
+**Learnings:**
+- The current honesty fix is explicit scoping, not a fake merged count.
+- Real parity requires either daemon-owned HTTP serving or a separate merged session snapshot model
+  above daemon and standalone serve state.
 
 ### 2026-03-17 - Server auth setup scaffolding slice
 
