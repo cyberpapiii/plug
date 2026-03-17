@@ -1287,7 +1287,11 @@ mod tests {
 
         let result = check_http_auth(&config).await;
         assert_eq!(result.status, CheckStatus::Warn);
-        assert!(result.message.contains("does not verify external endpoint reachability"));
+        assert!(
+            result
+                .message
+                .contains("does not verify external endpoint reachability")
+        );
     }
 
     // -- check_server_binaries --

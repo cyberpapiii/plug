@@ -316,11 +316,15 @@ impl DownstreamOauthManager {
 
         match self.config.oauth_client_secret.as_ref().map(|s| s.as_str()) {
             Some(expected_secret) => match client_secret {
-                Some(provided) if subtle::ConstantTimeEq::ct_eq(
-                    provided.as_bytes(),
-                    expected_secret.as_bytes(),
-                )
-                .into() => Ok(()),
+                Some(provided)
+                    if subtle::ConstantTimeEq::ct_eq(
+                        provided.as_bytes(),
+                        expected_secret.as_bytes(),
+                    )
+                    .into() =>
+                {
+                    Ok(())
+                }
                 Some(_) => Err(DownstreamOauthError::InvalidClient),
                 None => Err(DownstreamOauthError::MissingClientCredentials),
             },
@@ -388,12 +392,14 @@ fn load_persisted_state(config: &DownstreamOauthConfig) -> Result<DownstreamOaut
     let path = state_file_path(config)?;
     let data = match std::fs::read_to_string(&path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DownstreamOauthState::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DownstreamOauthState::default());
+        }
         Err(e) => return Err(format!("failed to read downstream oauth state: {e}")),
     };
 
-    let mut state: DownstreamOauthState =
-        serde_json::from_str(&data).map_err(|e| format!("failed to parse downstream oauth state: {e}"))?;
+    let mut state: DownstreamOauthState = serde_json::from_str(&data)
+        .map_err(|e| format!("failed to parse downstream oauth state: {e}"))?;
     // Auth codes are intentionally ephemeral. Do not reload them after restart.
     state.pending_codes.clear();
     Ok(state)

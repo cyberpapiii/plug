@@ -834,24 +834,34 @@ port = 4444
         )
         .expect("linked config");
         assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
-        assert_eq!(linked.endpoint.as_deref(), Some("https://plug.example.com/mcp"));
+        assert_eq!(
+            linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
     }
 
     #[test]
     fn linked_client_config_reads_yaml_http_uri() {
         let path = std::path::Path::new("config.yaml");
         let content = "extensions:\n  plug:\n    type: sse\n    uri: https://plug.example.com/mcp\n    enabled: true\n";
-        let linked =
-            linked_client_config_from_content(path, plug_core::export::ExportTarget::Goose, content)
-                .expect("linked config");
+        let linked = linked_client_config_from_content(
+            path,
+            plug_core::export::ExportTarget::Goose,
+            content,
+        )
+        .expect("linked config");
         assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
-        assert_eq!(linked.endpoint.as_deref(), Some("https://plug.example.com/mcp"));
+        assert_eq!(
+            linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
     }
 
     #[test]
     fn linked_client_config_reads_toml_http_url() {
         let path = std::path::Path::new("config.toml");
-        let content = "[mcp_servers.plug]\ntransport = \"http\"\nurl = \"https://plug.example.com/mcp\"\n";
+        let content =
+            "[mcp_servers.plug]\ntransport = \"http\"\nurl = \"https://plug.example.com/mcp\"\n";
         let linked = linked_client_config_from_content(
             path,
             plug_core::export::ExportTarget::CodexCli,
@@ -859,6 +869,9 @@ port = 4444
         )
         .expect("linked config");
         assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
-        assert_eq!(linked.endpoint.as_deref(), Some("https://plug.example.com/mcp"));
+        assert_eq!(
+            linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
     }
 }

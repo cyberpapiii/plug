@@ -12,7 +12,11 @@ use plug_core::oauth;
 use crate::OutputFormat;
 use crate::ui;
 
-fn auth_recovery_hint(name: &str, authenticated: bool, health: plug_core::types::ServerHealth) -> String {
+fn auth_recovery_hint(
+    name: &str,
+    authenticated: bool,
+    health: plug_core::types::ServerHealth,
+) -> String {
     use plug_core::types::ServerHealth;
 
     match (authenticated, health) {
@@ -410,17 +414,16 @@ async fn cmd_auth_status(
         return Ok(());
     }
 
-    let live_auth_status = match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus)
-        .await
-    {
-        Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => Some(
-            servers
-                .into_iter()
-                .map(|s| (s.name.clone(), s))
-                .collect::<std::collections::HashMap<_, _>>(),
-        ),
-        _ => None,
-    };
+    let live_auth_status =
+        match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await {
+            Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => Some(
+                servers
+                    .into_iter()
+                    .map(|s| (s.name.clone(), s))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            ),
+            _ => None,
+        };
 
     match output {
         OutputFormat::Text => {
@@ -437,13 +440,11 @@ async fn cmd_auth_status(
                     store.load().await.ok().flatten().is_some()
                 };
 
-                let health = live
-                    .map(|s| s.health)
-                    .unwrap_or(if has_creds {
-                        plug_core::types::ServerHealth::Degraded
-                    } else {
-                        plug_core::types::ServerHealth::AuthRequired
-                    });
+                let health = live.map(|s| s.health).unwrap_or(if has_creds {
+                    plug_core::types::ServerHealth::Degraded
+                } else {
+                    plug_core::types::ServerHealth::AuthRequired
+                });
 
                 let status = match (has_creds, health) {
                     (false, plug_core::types::ServerHealth::AuthRequired) => {
@@ -519,13 +520,11 @@ async fn cmd_auth_status(
                 } else {
                     store.load().await.ok().flatten().is_some()
                 };
-                let health = live
-                    .map(|s| s.health)
-                    .unwrap_or(if has_creds {
-                        plug_core::types::ServerHealth::Degraded
-                    } else {
-                        plug_core::types::ServerHealth::AuthRequired
-                    });
+                let health = live.map(|s| s.health).unwrap_or(if has_creds {
+                    plug_core::types::ServerHealth::Degraded
+                } else {
+                    plug_core::types::ServerHealth::AuthRequired
+                });
 
                 servers.push(serde_json::json!({
                     "name": name,

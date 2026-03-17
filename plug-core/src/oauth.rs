@@ -144,7 +144,8 @@ pub async fn current_or_stored_access_token(server_name: &str) -> Option<String>
     let creds = store.load().await.ok().flatten()?;
 
     use oauth2::TokenResponse;
-    creds.token_response
+    creds
+        .token_response
         .as_ref()
         .map(|tr| tr.access_token().secret().to_string())
 }
@@ -1004,7 +1005,10 @@ mod tests {
 
         let token = current_or_stored_access_token(&name).await;
         assert_eq!(token.as_deref(), Some("persisted-access"));
-        assert_eq!(current_access_token(&name).as_deref(), Some("persisted-access"));
+        assert_eq!(
+            current_access_token(&name).as_deref(),
+            Some("persisted-access")
+        );
 
         store.clear().await.unwrap();
     }

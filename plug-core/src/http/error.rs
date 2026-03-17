@@ -75,13 +75,15 @@ impl IntoResponse for HttpError {
                 });
                 let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
                 let header_value = match scope {
-                    Some(scope) => format!(
-                        "Bearer resource_metadata=\"{metadata_url}\", scope=\"{scope}\""
-                    ),
+                    Some(scope) => {
+                        format!("Bearer resource_metadata=\"{metadata_url}\", scope=\"{scope}\"")
+                    }
                     None => format!("Bearer resource_metadata=\"{metadata_url}\""),
                 };
                 if let Ok(value) = HeaderValue::from_str(&header_value) {
-                    response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, value);
                 } else {
                     response
                         .headers_mut()

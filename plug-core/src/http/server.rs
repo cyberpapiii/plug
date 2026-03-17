@@ -915,7 +915,7 @@ async fn oauth_token_not_implemented(
                 StatusCode::UNAUTHORIZED,
                 format!("client authentication failed: {error}"),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -966,7 +966,11 @@ async fn oauth_token_not_implemented(
             });
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(error) => (StatusCode::BAD_REQUEST, format!("token exchange failed: {error}")).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            format!("token exchange failed: {error}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2462,9 +2466,15 @@ mod tests {
             value["authorization_endpoint"],
             "https://plug.example.com/oauth/authorize"
         );
-        assert_eq!(value["token_endpoint"], "https://plug.example.com/oauth/token");
+        assert_eq!(
+            value["token_endpoint"],
+            "https://plug.example.com/oauth/token"
+        );
         assert_eq!(value["scopes_supported"][0], "tools:read");
-        assert_eq!(value["token_endpoint_auth_methods_supported"], json!(["none"]));
+        assert_eq!(
+            value["token_endpoint_auth_methods_supported"],
+            json!(["none"])
+        );
     }
 
     #[tokio::test]
@@ -2684,10 +2694,7 @@ mod tests {
             .method("POST")
             .uri("/oauth/token")
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header(
-                header::AUTHORIZATION,
-                "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz",
-            )
+            .header(header::AUTHORIZATION, "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz")
             .body(Body::from(format!(
                 "grant_type=refresh_token&refresh_token={refresh_token}"
             )))

@@ -1649,8 +1649,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_stdio_delivery(
-    ) {
+    async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_stdio_delivery()
+     {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
