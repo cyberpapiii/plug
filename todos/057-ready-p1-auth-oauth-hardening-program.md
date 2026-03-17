@@ -281,6 +281,34 @@ Key files expected to change:
 - The main remaining auth/config work is now about richer configuration paths and doctor-specific
   end-to-end scenarios, not basic runtime correctness.
 
+### 2026-03-17 - Non-interactive upstream auth configuration slice
+
+**By:** Codex
+
+**Actions:**
+- Added explicit `plug server add` flags for remote auth intent:
+  - `--auth none|bearer|oauth`
+  - `--bearer-token`
+  - `--oauth-client-id`
+  - `--oauth-scopes`
+- Made the non-interactive add flow infer auth intent from bearer/oauth-specific flags while
+  rejecting contradictory combinations.
+- Kept remote auth flags scoped to HTTP/SSE upstreams so scripted stdio setup cannot silently
+  accept meaningless auth arguments.
+- Added focused unit coverage for bearer inference, oauth inference, and conflicting-flag
+  rejection.
+
+**Verification:**
+- `cargo test -p plug commands::servers::tests -- --nocapture`
+- `cargo test -p plug tests::serve_command -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The product was still better in the interactive path than in the scripted CLI path; that gap is
+  now materially smaller.
+- The remaining server-auth UX gap is mostly about non-interactive edit/update flows, not new-add
+  workflows.
+
 ### 2026-03-16 - Client topology fidelity slice
 
 **By:** Codex

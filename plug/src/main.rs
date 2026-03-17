@@ -211,6 +211,14 @@ pub(crate) enum ServerCommands {
         #[arg(long)]
         transport: Option<String>,
         #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        bearer_token: Option<String>,
+        #[arg(long)]
+        oauth_client_id: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        oauth_scopes: Option<Vec<String>>,
+        #[arg(long)]
         disabled: bool,
     },
     Remove {

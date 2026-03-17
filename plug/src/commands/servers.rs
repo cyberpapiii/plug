@@ -139,6 +139,46 @@ fn prompt_remote_auth_selection(
     }
 }
 
+fn noninteractive_remote_auth_selection(
+    auth: Option<String>,
+    bearer_token: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_scopes: Option<Vec<String>>,
+) -> anyhow::Result<Option<RemoteAuthSelection>> {
+    let inferred = match (
+        auth.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        bearer_token.as_ref(),
+        oauth_client_id.as_ref(),
+        oauth_scopes.as_ref(),
+    ) {
+        (Some("none"), None, None, None) => Some(RemoteAuthSelection::None),
+        (Some("bearer"), _, _, _) | (None, Some(_), None, None) => {
+            let token = bearer_token
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("`--bearer-token` is required when auth is bearer"))?;
+            Some(RemoteAuthSelection::Bearer { token })
+        }
+        (Some("oauth"), _, _, _) | (None, None, Some(_), _) | (None, None, None, Some(_)) => {
+            if bearer_token.is_some() {
+                anyhow::bail!("`--bearer-token` cannot be combined with oauth auth options");
+            }
+            Some(RemoteAuthSelection::Oauth {
+                client_id: oauth_client_id.filter(|value| !value.trim().is_empty()),
+                scopes: oauth_scopes.filter(|scopes| !scopes.is_empty()),
+            })
+        }
+        (Some(other), _, _, _) => {
+            anyhow::bail!("unsupported auth `{other}`; use `none`, `bearer`, or `oauth`")
+        }
+        (None, None, None, None) => None,
+        (None, Some(_), _, _) => {
+            anyhow::bail!("bearer auth options cannot be combined with oauth auth options")
+        }
+    };
+
+    Ok(inferred)
+}
+
 pub(crate) fn parse_transport(
     value: Option<String>,
     url: &Option<String>,
@@ -166,8 +206,24 @@ pub(crate) async fn cmd_server_command(
             url,
             args,
             transport,
+            auth,
+            bearer_token,
+            oauth_client_id,
+            oauth_scopes,
             disabled,
-        } => cmd_server_add(config_path, name, command, url, args, transport, disabled),
+        } => cmd_server_add(
+            config_path,
+            name,
+            command,
+            url,
+            args,
+            transport,
+            auth,
+            bearer_token,
+            oauth_client_id,
+            oauth_scopes,
+            disabled,
+        ),
         ServerCommands::Remove { name, yes } => cmd_server_remove(config_path, name, yes),
         ServerCommands::Edit { name } => cmd_server_edit(config_path, name, output).await,
         ServerCommands::Enable { name } => cmd_server_set_enabled(config_path, name, true),
@@ -182,6 +238,10 @@ pub(crate) fn cmd_server_add(
     url: Option<String>,
     args: Vec<String>,
     transport: Option<String>,
+    auth: Option<String>,
+    bearer_token: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_scopes: Option<Vec<String>>,
     disabled: bool,
 ) -> anyhow::Result<()> {
     let (path, mut config) = load_editable_config(config_path)?;
@@ -198,7 +258,14 @@ pub(crate) fn cmd_server_add(
 
     let provided_transport = transport.clone();
     let non_interactive =
-        provided_transport.is_some() || command.is_some() || url.is_some() || !args.is_empty();
+        provided_transport.is_some()
+            || command.is_some()
+            || url.is_some()
+            || !args.is_empty()
+            || auth.is_some()
+            || bearer_token.is_some()
+            || oauth_client_id.is_some()
+            || oauth_scopes.is_some();
     let transport = match transport {
         Some(value) => parse_transport(Some(value), &url)?,
         None if command.is_some() => plug_core::config::TransportType::Stdio,
@@ -217,6 +284,13 @@ pub(crate) fn cmd_server_add(
 
     let server = match transport {
         plug_core::config::TransportType::Stdio => {
+            if auth.is_some()
+                || bearer_token.is_some()
+                || oauth_client_id.is_some()
+                || oauth_scopes.is_some()
+            {
+                anyhow::bail!("remote auth flags only apply to HTTP or SSE upstream servers");
+            }
             let command = match command {
                 Some(command) => command,
                 None => Input::with_theme(&cli_prompt_theme())
@@ -297,7 +371,14 @@ pub(crate) fn cmd_server_add(
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
             };
-            if !non_interactive {
+            if let Some(selection) = noninteractive_remote_auth_selection(
+                auth,
+                bearer_token,
+                oauth_client_id,
+                oauth_scopes,
+            )? {
+                apply_remote_auth_selection(&mut server, selection);
+            } else if !non_interactive {
                 let selection = prompt_remote_auth_selection(&name, None)?;
                 apply_remote_auth_selection(&mut server, selection);
             }
@@ -580,5 +661,56 @@ mod tests {
             }
             other => panic!("expected oauth selection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn noninteractive_remote_auth_selection_infers_bearer() {
+        let selection = noninteractive_remote_auth_selection(
+            None,
+            Some("secret".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            selection,
+            Some(RemoteAuthSelection::Bearer {
+                token: "secret".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn noninteractive_remote_auth_selection_infers_oauth() {
+        let selection = noninteractive_remote_auth_selection(
+            None,
+            None,
+            Some("client-123".to_string()),
+            Some(vec!["read".to_string(), "write".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            selection,
+            Some(RemoteAuthSelection::Oauth {
+                client_id: Some("client-123".to_string()),
+                scopes: Some(vec!["read".to_string(), "write".to_string()])
+            })
+        );
+    }
+
+    #[test]
+    fn noninteractive_remote_auth_selection_rejects_conflicting_flags() {
+        let error = noninteractive_remote_auth_selection(
+            Some("oauth".to_string()),
+            Some("secret".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`--bearer-token` cannot be combined with oauth auth options")
+        );
     }
 }

@@ -31,7 +31,19 @@ async fn prompt_server_actions(
 
     match selection {
         Some(1) => {
-            cmd_server_add(config_path, None, None, None, Vec::new(), None, false)?;
+            cmd_server_add(
+                config_path,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )?;
             Ok(true)
         }
         Some(2) => {

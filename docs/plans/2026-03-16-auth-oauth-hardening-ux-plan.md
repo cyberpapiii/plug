@@ -43,11 +43,12 @@ Completed so far:
 - transport-preserving repair and interactive link/setup transport choice
 - downstream HTTP endpoint awareness across export/link/repair/status/clients
 - interactive server add/edit auth scaffolding for none, bearer, and oauth upstreams
+- non-interactive `server add` auth flags for bearer and oauth remote upstreams
 - end-to-end scenario coverage for mixed runtime fleet states and downstream OAuth protected discovery
 
 Still remaining:
 - deeper server add/edit auth scaffolding so common HTTP/SSE auth cases are not still hand-authored
-- non-interactive/server-scripted auth configuration paths for the same remote auth choices
+- richer non-interactive/server-scripted edit flows for the same remote auth choices
 - broader doctor-level scenario coverage that exercises live runtime state versus cold reachability
 - final UX cleanup where command surfaces still imply a simpler topology than the runtime actually supports
 
@@ -61,6 +62,8 @@ Still remaining:
   client inventory surfaces linked mode plus endpoint so local-vs-remote usage is visible.
 - 2026-03-17: Interactive server add/edit now scaffold remote upstream auth intent directly, but
   the equivalent non-interactive flag surface is still missing and remains follow-up work.
+- 2026-03-17: `plug server add` now supports non-interactive auth intent for bearer and oauth
+  remotes, which closes the biggest scripted-config gap; `server edit` remains interactive-only.
 - 2026-03-17: The integration matrix now covers mixed engine fleet states plus downstream OAuth
   protected discovery through the real HTTP router.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused unit tests
