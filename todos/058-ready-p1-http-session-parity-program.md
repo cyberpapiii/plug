@@ -371,3 +371,27 @@ These write scopes should remain mostly disjoint until integration.
 - Short stable labels are better primary state than long explanatory prose.
 - The long prose still matters, but it should be secondary help text rather than the main
   machine-readable status value.
+
+### 2026-03-17 - Shared runtime inventory metadata extracted
+
+**By:** Codex
+
+**Actions:**
+- Added shared runtime helpers for:
+  - transport counts
+  - availability
+  - canonical inventory metadata
+- Switched `plug clients`, `plug overview`, and `plug status` to consume the shared runtime
+  metadata instead of rebuilding similar JSON/text fragments independently.
+- Added focused runtime coverage for the new metadata helper and kept the command/view suite green.
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug commands::auth::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Once runtime inventory becomes a first-class shared object, command-surface consistency becomes a
+  maintenance property rather than a repeated implementation task.

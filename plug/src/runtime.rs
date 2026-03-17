@@ -27,6 +27,22 @@ pub(crate) struct LiveInventoryAvailability {
     pub(crate) unavailable_sources: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, Default)]
+pub(crate) struct LiveSessionTransportCounts {
+    pub(crate) daemon_proxy: usize,
+    pub(crate) http: usize,
+    pub(crate) sse: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LiveInventoryMetadata {
+    pub(crate) session_count: usize,
+    pub(crate) session_transports: LiveSessionTransportCounts,
+    pub(crate) scope: plug_core::ipc::LiveSessionInventoryScope,
+    pub(crate) availability: LiveInventoryAvailability,
+    pub(crate) http_sessions_included: bool,
+}
+
 pub(crate) fn live_inventory_availability(
     scope: plug_core::ipc::LiveSessionInventoryScope,
 ) -> LiveInventoryAvailability {
@@ -47,6 +63,37 @@ pub(crate) fn live_inventory_availability(
             partial: true,
             unavailable_sources: vec!["daemon_proxy", "http"],
         },
+    }
+}
+
+pub(crate) fn live_session_transport_counts(
+    sessions: &[plug_core::ipc::IpcLiveSessionInfo],
+) -> LiveSessionTransportCounts {
+    let mut counts = LiveSessionTransportCounts::default();
+    for session in sessions {
+        match session.transport {
+            plug_core::ipc::LiveSessionTransport::DaemonProxy => counts.daemon_proxy += 1,
+            plug_core::ipc::LiveSessionTransport::Http => counts.http += 1,
+            plug_core::ipc::LiveSessionTransport::Sse => counts.sse += 1,
+        }
+    }
+    counts
+}
+
+pub(crate) fn live_inventory_metadata(
+    sessions: &[plug_core::ipc::IpcLiveSessionInfo],
+    scope: plug_core::ipc::LiveSessionInventoryScope,
+) -> LiveInventoryMetadata {
+    LiveInventoryMetadata {
+        session_count: sessions.len(),
+        session_transports: live_session_transport_counts(sessions),
+        availability: live_inventory_availability(scope),
+        http_sessions_included: matches!(
+            scope,
+            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                | plug_core::ipc::LiveSessionInventoryScope::HttpOnly
+        ),
+        scope,
     }
 }
 
@@ -1091,6 +1138,42 @@ mod tests {
             live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
         assert!(unavailable.partial);
         assert_eq!(unavailable.unavailable_sources, vec!["daemon_proxy", "http"]);
+    }
+
+    #[test]
+    fn live_inventory_metadata_reports_counts_and_availability() {
+        let sessions = vec![
+            plug_core::ipc::IpcLiveSessionInfo {
+                transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+                client_id: Some("daemon".to_string()),
+                session_id: "daemon-1".to_string(),
+                client_type: plug_core::types::ClientType::ClaudeCode,
+                client_info: Some("Claude Code".to_string()),
+                connected_secs: 10,
+                last_activity_secs: None,
+            },
+            plug_core::ipc::IpcLiveSessionInfo {
+                transport: plug_core::ipc::LiveSessionTransport::Http,
+                client_id: None,
+                session_id: "http-1".to_string(),
+                client_type: plug_core::types::ClientType::ClaudeDesktop,
+                client_info: None,
+                connected_secs: 5,
+                last_activity_secs: Some(1),
+            },
+        ];
+
+        let metadata = live_inventory_metadata(
+            &sessions,
+            plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
+        );
+
+        assert_eq!(metadata.session_count, 2);
+        assert_eq!(metadata.session_transports.daemon_proxy, 1);
+        assert_eq!(metadata.session_transports.http, 1);
+        assert_eq!(metadata.session_transports.sse, 0);
+        assert!(!metadata.availability.partial);
+        assert!(metadata.http_sessions_included);
     }
 
     #[tokio::test]
