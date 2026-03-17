@@ -518,3 +518,55 @@ Key files expected to change:
   into one status.
 - Cold connectivity checks need their own robustness work too, or they keep undermining the clearer
   runtime/auth UX with avoidable false negatives.
+
+### 2026-03-17 - Upstream target visibility slice
+
+**By:** Codex
+
+**Actions:**
+- Added a shared server-target summarizer so operator surfaces can show what each upstream is
+  actually pointed at instead of only `stdio` / `http` / `sse`.
+- Updated `plug status` to include a `TARGET` column beside upstream transport and auth mode.
+- Updated `plug servers` to show the same target information in both live runtime inventory and
+  config-only fallback inventory.
+- Added focused unit coverage for stdio argument rendering, HTTP URL rendering, and truncation.
+
+**Verification:**
+- `cargo test -p plug -- --nocapture`
+- `./target/debug/plug servers`
+- `./target/debug/plug status`
+
+**Learnings:**
+- Transport type without target is still too abstract for real operator reasoning.
+- The right question is not just "what kind of upstream is this?" but "what exact thing is this
+  server talking to right now?".
+
+### 2026-03-17 - Non-interactive doctor and upstream target visibility
+
+**By:** Codex
+
+**Actions:**
+- Removed keychain-backed credential probing from `plug doctor` so diagnostics no longer risk
+  hanging behind macOS Keychain prompts.
+- Parallelized cold server reachability checks so slow HTTP/SSE upstreams do not turn doctor into a
+  serialized 30-60 second command on larger fleets.
+- Added a reusable server-target summarizer and surfaced each upstream target directly in
+  `plug status` and `plug servers`.
+- Verified that live health lines now show not just transport/auth mode, but also the actual URL or
+  command each server is using.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug views::servers -- --nocapture`
+- `cargo test -p plug ui::tests -- --nocapture`
+- `cargo test -p plug-core connectivity -- --nocapture`
+- `timeout 20s cargo run --quiet --bin plug -- doctor`
+- `timeout 15s target/debug/plug status`
+- `timeout 15s target/debug/plug servers`
+
+**Learnings:**
+- Diagnostic commands should stay non-interactive; touching the keychain from `doctor` makes the
+  command less trustworthy, not more complete.
+- Transport and auth labels alone are not enough once the system supports multiple remote and
+  stdio shapes; operators need the concrete target inline to reason about what they are actually
+  inspecting.

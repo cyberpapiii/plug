@@ -8,7 +8,7 @@ use crate::commands::servers::{
 use crate::runtime::ensure_daemon_with_feedback;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
-    print_label_value, status_label, status_marker,
+    print_label_value, status_label, status_marker, summarize_server_target,
 };
 
 async fn prompt_server_actions(
@@ -178,13 +178,15 @@ pub(crate) async fn cmd_server_list(
                                     },
                                 )
                                 .unwrap_or("unknown");
+                            let target = summarize_server_target(server_cfg, 28);
                             println!(
-                                "  {} {:<18} {:<12} {:<8} {:<6} ({} tools)",
+                                "  {} {:<18} {:<12} {:<8} {:<6} {:<28} ({} tools)",
                                 status_marker(&s.health),
                                 style(&s.server_id).bold(),
                                 status_label(&s.health),
                                 transport,
                                 auth,
+                                target,
                                 s.tool_count
                             );
                         }
@@ -265,19 +267,18 @@ pub(crate) async fn cmd_server_list(
                 }
                 print_heading("Inventory");
                 for name in names {
-                    let enabled = config
-                        .servers
-                        .get(name)
-                        .map(|server| server.enabled)
-                        .unwrap_or(true);
+                    let server = config.servers.get(name);
+                    let enabled = server.map(|server| server.enabled).unwrap_or(true);
+                    let target = summarize_server_target(server, 40);
                     println!(
-                        "  {} {:<18} {}",
+                        "  {} {:<18} {:<12} {}",
                         if enabled {
                             style("·").dim()
                         } else {
                             style("!").yellow().bold()
                         },
                         style(name).bold(),
+                        style(target).dim(),
                         if enabled {
                             style("configured").dim()
                         } else {

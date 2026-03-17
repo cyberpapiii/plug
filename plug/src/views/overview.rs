@@ -7,7 +7,7 @@ use crate::commands::clients::{
 use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_next_action, print_warning_line,
-    status_label, status_marker,
+    status_label, status_marker, summarize_server_target,
 };
 
 pub(crate) async fn cmd_overview(
@@ -306,17 +306,18 @@ pub(crate) async fn cmd_status(
                     .collect::<Vec<_>>();
                 print_heading("Servers");
                 println!(
-                    "  {:<2} {:<18} {:<12} {:<8} {:<6} {:>5}",
+                    "  {:<2} {:<18} {:<12} {:<8} {:<6} {:<28} {:>5}",
                     style("").dim(),
                     style("SERVER").dim(),
                     style("STATUS").dim(),
                     style("UPSTREAM").dim(),
                     style("AUTH").dim(),
+                    style("TARGET").dim(),
                     style("TOOLS").dim()
                 );
                 println!(
                     "  {}",
-                    style("----------------------------------------------------------------").dim()
+                    style("-----------------------------------------------------------------------------------------------").dim()
                 );
                 for s in &servers {
                     if s.server_id == "__plug_internal__" {
@@ -339,13 +340,15 @@ pub(crate) async fn cmd_status(
                             },
                         )
                         .unwrap_or("unknown");
+                    let target = summarize_server_target(server_cfg, 28);
                     println!(
-                        "  {} {:<18} {:<12} {:<8} {:<6} {:>5}",
+                        "  {} {:<18} {:<12} {:<8} {:<6} {:<28} {:>5}",
                         status_marker(&s.health),
                         s.server_id,
                         status_label(&s.health),
                         transport,
                         auth,
+                        target,
                         s.tool_count
                     );
                 }

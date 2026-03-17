@@ -217,3 +217,102 @@ pub(crate) fn print_warning_line(message: impl std::fmt::Display) {
 pub(crate) fn can_prompt_interactively() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
+
+pub(crate) fn summarize_server_target(
+    server: Option<&plug_core::config::ServerConfig>,
+    max_width: usize,
+) -> String {
+    let Some(server) = server else {
+        return "-".to_string();
+    };
+
+    let raw = match server.transport {
+        plug_core::config::TransportType::Stdio => match server.command.as_deref() {
+            Some(command) if !server.args.is_empty() => {
+                format!("{command} {}", server.args.join(" "))
+            }
+            Some(command) => command.to_string(),
+            None => "-".to_string(),
+        },
+        plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
+            server.url.clone().unwrap_or_else(|| "-".to_string())
+        }
+    };
+
+    truncate_tail(&raw, max_width)
+}
+
+fn truncate_tail(value: &str, max_width: usize) -> String {
+    let char_count = value.chars().count();
+    if max_width == 0 || char_count <= max_width {
+        return value.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let truncated: String = value.chars().take(max_width - 3).collect();
+    format!("{truncated}...")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_server_target;
+    use plug_core::config::{ServerConfig, TransportType};
+
+    fn server_config() -> ServerConfig {
+        ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: Default::default(),
+            tool_groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn summarize_server_target_prefers_url_for_http_servers() {
+        let mut server = server_config();
+        server.transport = TransportType::Http;
+        server.url = Some("https://example.com/mcp".to_string());
+        assert_eq!(
+            summarize_server_target(Some(&server), 80),
+            "https://example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn summarize_server_target_includes_stdio_args() {
+        let mut server = server_config();
+        server.command = Some("npx".to_string());
+        server.args = vec!["-y".to_string(), "@modelcontextprotocol/server".to_string()];
+        assert_eq!(
+            summarize_server_target(Some(&server), 80),
+            "npx -y @modelcontextprotocol/server"
+        );
+    }
+
+    #[test]
+    fn summarize_server_target_truncates_long_values() {
+        let mut server = server_config();
+        server.transport = TransportType::Http;
+        server.url = Some("https://very-long.example.com/path/to/mcp/server".to_string());
+        assert_eq!(
+            summarize_server_target(Some(&server), 20),
+            "https://very-long..."
+        );
+    }
+}
