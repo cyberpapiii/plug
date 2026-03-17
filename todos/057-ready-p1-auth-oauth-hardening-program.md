@@ -676,28 +676,6 @@ Key files expected to change:
   stdio shapes; operators need the concrete target inline to reason about what they are actually
   inspecting.
 
-### 2026-03-17 - Doctor cold connectivity coverage slice
-
-**By:** Codex
-
-**Actions:**
-- Added focused `plug-core` doctor tests for reachable remote HTTP upstreams.
-- Added focused `plug-core` doctor tests for unreachable remote HTTP upstreams.
-- Added a mixed stdio + remote fleet test to pin the current behavior that cold connectivity
-  failures stay scoped to the unreachable remote instead of collapsing healthy stdio servers into
-  the same message.
-
-**Verification:**
-- `cargo test -p plug-core doctor -- --nocapture`
-
-**Learnings:**
-- The doctor command-level UX is improving, but the underlying cold-connectivity semantics still
-  needed direct `plug-core` coverage so later output cleanup cannot accidentally weaken the actual
-  fleet checks.
-- The right severity for unreachable cold remote checks is still `Fail`, not `Warn`; the clarity
-  win comes from interpretation and recovery guidance layered on top, not from downgrading the
-  raw signal.
-
 ### 2026-03-17 - Cold HTTP connectivity coverage slice
 
 **By:** Codex
