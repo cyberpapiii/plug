@@ -3,7 +3,8 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::clients::{cmd_link, execute_export};
 use crate::ui::{
-    cli_prompt_theme, print_banner, print_heading, print_info_line, print_success_line,
+    cli_prompt_theme, print_banner, print_heading, print_info_line, print_next_action,
+    print_success_line,
 };
 
 pub(crate) fn cmd_import(
@@ -193,6 +194,14 @@ pub(crate) async fn cmd_doctor(
                     crate::ui::terminal_width(),
                     |line| style(line),
                 );
+            }
+            let next_steps = doctor_next_steps(&report.checks);
+            if !next_steps.is_empty() {
+                println!();
+                print_heading("Next");
+                for (index, step) in next_steps.iter().enumerate() {
+                    print_next_action(index + 1, "operator", step);
+                }
             }
         }
     }
@@ -500,6 +509,27 @@ fn doctor_check_details(check: &plug_core::doctor::CheckResult) -> String {
     }
 }
 
+fn doctor_next_steps(checks: &[plug_core::doctor::CheckResult]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut steps = Vec::new();
+
+    for check in checks.iter().filter(|check| {
+        matches!(
+            check.status,
+            plug_core::doctor::CheckStatus::Warn | plug_core::doctor::CheckStatus::Fail
+        )
+    }) {
+        if let Some(suggestion) = check.fix_suggestion.as_deref() {
+            let trimmed = suggestion.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                steps.push(trimmed.to_string());
+            }
+        }
+    }
+
+    steps
+}
+
 pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
     let auth = crate::daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Reload { auth_token: auth };
@@ -614,8 +644,8 @@ fn repair_targets(requested: Vec<String>, all: bool) -> anyhow::Result<Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        doctor_check_details, repair_export_endpoint, repair_targets, runtime_auth_checks,
-        runtime_health_checks_for_tests, synthesize_doctor_interpretation,
+        doctor_check_details, doctor_next_steps, repair_export_endpoint, repair_targets,
+        runtime_auth_checks, runtime_health_checks_for_tests, synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
     use plug_core::ipc::IpcAuthServerInfo;
@@ -890,6 +920,26 @@ mod tests {
         });
 
         assert_eq!(rendered, "Config file valid");
+    }
+
+    #[test]
+    fn doctor_next_steps_deduplicates_warning_guidance() {
+        let steps = doctor_next_steps(&[
+            CheckResult {
+                name: "runtime_auth_reauth".to_string(),
+                status: CheckStatus::Warn,
+                message: "re-auth required: notion".to_string(),
+                fix_suggestion: Some("Run `plug auth login --server <name>`.".to_string()),
+            },
+            CheckResult {
+                name: "runtime_auth_missing".to_string(),
+                status: CheckStatus::Warn,
+                message: "missing credentials: supabase".to_string(),
+                fix_suggestion: Some("Run `plug auth login --server <name>`.".to_string()),
+            },
+        ]);
+
+        assert_eq!(steps, vec!["Run `plug auth login --server <name>`.".to_string()]);
     }
 
     #[test]

@@ -37,6 +37,18 @@ fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) 
     }
 }
 
+fn live_inventory_summary(inventory: &crate::runtime::LiveInventoryMetadata) -> String {
+    let scope = live_inventory_scope_label(inventory.scope);
+    if inventory.availability.partial {
+        format!(
+            "{scope} (missing: {})",
+            inventory.availability.unavailable_sources.join(", ")
+        )
+    } else {
+        scope.to_string()
+    }
+}
+
 fn configured_client_state_text(client: &crate::commands::clients::ClientView) -> String {
     let mut states = Vec::new();
     if client.detected {
@@ -189,21 +201,7 @@ pub(crate) async fn cmd_client_list(
             }
         }
         if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
-            print_label_value(
-                "Inventory Scope",
-                live_inventory_scope_label(live_inventory_scope),
-            );
-            if inventory.availability.partial {
-                print_label_value(
-                    "Inventory Availability",
-                    format!(
-                        "partial (missing: {})",
-                        inventory.availability.unavailable_sources.join(", ")
-                    ),
-                );
-            } else {
-                print_label_value("Inventory Availability", "complete");
-            }
+            print_label_value("Live Inventory", live_inventory_summary(&inventory));
             print_info_line(live_inventory_scope_text(live_inventory_scope));
             print_label_value(
                 "Live Transports",
@@ -292,7 +290,7 @@ pub(crate) async fn cmd_client_list(
 mod tests {
     use super::{
         client_list_json, configured_client_link_text, configured_client_state_text,
-        live_inventory_scope_label, live_inventory_scope_text,
+        live_inventory_scope_label, live_inventory_scope_text, live_inventory_summary,
     };
     use crate::commands::clients::{ClientView, LiveSessionView};
     use crate::runtime::{LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts};
@@ -426,6 +424,25 @@ mod tests {
         assert_eq!(
             configured_client_link_text(&client).as_deref(),
             Some("linked via http -> https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn live_inventory_summary_collapses_scope_and_availability() {
+        let inventory = LiveInventoryMetadata {
+            session_count: 0,
+            session_transports: LiveSessionTransportCounts::default(),
+            scope: plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            availability: LiveInventoryAvailability {
+                partial: true,
+                unavailable_sources: vec!["http"],
+            },
+            http_sessions_included: false,
+        };
+
+        assert_eq!(
+            live_inventory_summary(&inventory),
+            "daemon-proxy-only (missing: http)"
         );
     }
 }

@@ -512,6 +512,11 @@ async fn cmd_auth_status(
                 "{}",
                 style(auth_status_source_text(live_auth_status.is_some())).dim()
             );
+            if live_auth_status.is_none() {
+                ui::print_warning_line(
+                    "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status."
+                );
+            }
             println!();
 
             for (name, sc) in &oauth_servers {

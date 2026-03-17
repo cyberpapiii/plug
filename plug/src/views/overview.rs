@@ -41,6 +41,38 @@ fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) 
     }
 }
 
+fn linked_client_transport_summary(linked_clients: &[(String, String)]) -> String {
+    let mut stdio = 0usize;
+    let mut http = 0usize;
+    let mut other = 0usize;
+
+    for (_, transport) in linked_clients {
+        match transport.as_str() {
+            "stdio" => stdio += 1,
+            "http" => http += 1,
+            _ => other += 1,
+        }
+    }
+
+    if other > 0 {
+        format!("stdio={stdio} http={http} other={other}")
+    } else {
+        format!("stdio={stdio} http={http}")
+    }
+}
+
+fn live_inventory_summary(inventory: &crate::runtime::LiveInventoryMetadata) -> String {
+    let scope = live_inventory_scope_label(inventory.scope);
+    if inventory.availability.partial {
+        format!(
+            "{scope} (missing: {})",
+            inventory.availability.unavailable_sources.join(", ")
+        )
+    } else {
+        scope.to_string()
+    }
+}
+
 fn overview_json(
     config_exists: bool,
     config_path: &std::path::Path,
@@ -57,6 +89,7 @@ fn overview_json(
         "config_path": config_path,
         "daemon_running": daemon_running,
         "server_count": server_count,
+        "linked_client_count": linked_clients.len(),
         "linked_clients": linked_clients,
         "live_client_count": inventory.session_count,
         "live_session_count": inventory.session_count,
@@ -191,22 +224,11 @@ pub(crate) async fn cmd_overview(
             transport_counts.0, transport_counts.1, transport_counts.2
         ),
     );
-    print_label_value("Clients", style(linked_clients.len()).bold());
+    print_label_value("Linked Clients", style(linked_clients.len()).bold());
     match live_client_support {
         LiveClientSupport::Supported => {
             print_label_value("Live", style(live_client_count).bold());
-            print_label_value("Inventory Scope", live_inventory_scope_label(live_inventory_scope));
-            if inventory.availability.partial {
-                print_label_value(
-                    "Inventory Availability",
-                    format!(
-                        "partial (missing: {})",
-                        inventory.availability.unavailable_sources.join(", ")
-                    ),
-                );
-            } else {
-                print_label_value("Inventory Availability", "complete");
-            }
+            print_label_value("Live Inventory", live_inventory_summary(&inventory));
             print_info_line(live_client_count_scope_text(live_inventory_scope));
             print_label_value(
                 "Live Transports",
@@ -244,6 +266,18 @@ pub(crate) async fn cmd_overview(
     }
 
     if !linked_clients.is_empty() {
+        let linked_transport_summary = linked_clients
+            .iter()
+            .map(|target| {
+                let transport = linked_client_transport(target, false)
+                    .map(|transport| match transport {
+                        plug_core::export::ExportTransport::Stdio => "stdio",
+                        plug_core::export::ExportTransport::Http => "http",
+                    })
+                    .unwrap_or("unknown");
+                (target.clone(), transport.to_string())
+            })
+            .collect::<Vec<_>>();
         let linked_descriptions = linked_clients
             .iter()
             .map(|target| {
@@ -256,7 +290,11 @@ pub(crate) async fn cmd_overview(
                 format!("{target} ({transport})")
             })
             .collect::<Vec<_>>();
-        print_label_value("Linked", linked_descriptions.join(", "));
+        print_label_value(
+            "Linked Topology",
+            linked_client_transport_summary(&linked_transport_summary),
+        );
+        print_label_value("Linked Clients", linked_descriptions.join(", "));
     }
 
     if matches!(
@@ -383,21 +421,7 @@ pub(crate) async fn cmd_status(
                             inventory.session_transports.sse
                         ),
                     );
-                    print_label_value(
-                        "Inventory Scope",
-                        live_inventory_scope_label(live_inventory_scope),
-                    );
-                    if inventory.availability.partial {
-                        print_label_value(
-                            "Inventory Availability",
-                            format!(
-                                "partial (missing: {})",
-                                inventory.availability.unavailable_sources.join(", ")
-                            ),
-                        );
-                    } else {
-                        print_label_value("Inventory Availability", "complete");
-                    }
+                    print_label_value("Live Inventory", live_inventory_summary(&inventory));
                     print_info_line(live_client_count_scope_text(live_inventory_scope));
                 }
                 LiveClientSupport::DaemonRestartRequired => {
@@ -410,12 +434,17 @@ pub(crate) async fn cmd_status(
                 }
             }
             if !linked_clients.is_empty() {
+                print_label_value("Linked Clients", style(linked_clients.len()).bold());
+                print_label_value(
+                    "Linked Topology",
+                    linked_client_transport_summary(&linked_clients),
+                );
                 let linked_summary = linked_clients
                     .iter()
                     .map(|(target, transport)| format!("{target} ({transport})"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                print_label_value("Linked", linked_summary);
+                print_label_value("Linked Detail", linked_summary);
             }
             if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
                 print_label_value(
@@ -568,6 +597,10 @@ pub(crate) async fn cmd_status(
             "Service is not currently reachable",
         );
         println!();
+        print_warning_line(
+            "Live runtime, auth, and session truth are unavailable right now. The server list below reflects config only."
+        );
+        println!();
         print_heading("Configured servers");
         println!(
             "  {:<18} {:<8} {:<6} {:<28} {}",
@@ -635,7 +668,8 @@ pub(crate) async fn cmd_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        live_client_count_scope_text, live_inventory_scope_label, overview_json, status_json,
+        live_client_count_scope_text, live_inventory_scope_label, live_inventory_summary,
+        overview_json, status_json,
     };
     use crate::runtime::{
         LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts,
@@ -794,5 +828,28 @@ mod tests {
         assert_eq!(counts.daemon_proxy, 1);
         assert_eq!(counts.http, 1);
         assert_eq!(counts.sse, 1);
+    }
+
+    #[test]
+    fn live_inventory_summary_collapses_scope_and_availability() {
+        let inventory = LiveInventoryMetadata {
+            session_count: 2,
+            session_transports: LiveSessionTransportCounts {
+                daemon_proxy: 2,
+                http: 0,
+                sse: 0,
+            },
+            scope: plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            availability: LiveInventoryAvailability {
+                partial: true,
+                unavailable_sources: vec!["http"],
+            },
+            http_sessions_included: false,
+        };
+
+        assert_eq!(
+            live_inventory_summary(&inventory),
+            "daemon-proxy-only (missing: http)"
+        );
     }
 }
