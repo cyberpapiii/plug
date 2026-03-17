@@ -980,12 +980,12 @@ Key files expected to change:
 - Investigated repeated macOS Keychain prompts in the live daemon/runtime flow instead of treating
   them as a local machine oddity.
 - Confirmed the root cause: fresh processes and cold-token paths could still re-read persisted
-  credentials even though the runtime already mirrored credentials to both keychain and the local
-  0600 token file.
+  credentials because the runtime cached only token timing and access-token strings, not the full
+  OAuth credential bundle.
 - Expanded the in-process cache to retain the full `StoredCredentials` bundle once credentials are
   hydrated successfully.
-- Changed `CredentialStore::load()` to satisfy from the in-memory cache first, then prefer the
-  mirrored local token file before probing keychain.
+- Changed `CredentialStore::load()` to satisfy from the in-memory cache first before touching
+  persisted storage.
 - Updated `refresh_access_token(...)` to hydrate the shared store cache directly from the temporary
   refresh store after a successful refresh exchange, instead of re-reading persisted storage and
   risking another keychain prompt immediately after refresh.
@@ -996,14 +996,17 @@ Key files expected to change:
 
 **Verification:**
 - `cargo test -p plug-core oauth -- --nocapture`
-- `cargo test -p plug-core doctor::tests::oauth_tokens -- --nocapture`
+- `cargo test -p plug daemon::tests::auth_status -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+- `cargo test -p plug-core -- --nocapture`
+- `cargo build --release`
 
 **Learnings:**
 - Avoiding keychain prompts in diagnostics was not enough; the runtime also needed a real
   in-memory credential cache for the full OAuth bundle, not just token expiry metadata.
 - `CompositeCredentialStore::save()` already mirrored credentials to both keychain and the local
-  token file, so preferring the file on read reduces prompt storms without introducing a new
-  plaintext-at-rest footprint.
+  token file, but the highest-value prompt reduction was to stop re-reading either store once
+  credentials had been hydrated in-process.
 - On macOS, repeated secure-store access becomes much more painful when multiple `plug` binaries
   or restarted daemons are involved, so the runtime should minimize keychain touches once
   credentials have been hydrated successfully in-process.
