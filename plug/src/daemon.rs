@@ -2067,7 +2067,85 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
+    use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncWriteExt;
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("plug-daemon-{name}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
+        let mut config = plug_core::config::Config::default();
+        for name in servers {
+            config.servers.insert(
+                (*name).to_string(),
+                plug_core::config::ServerConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    enabled: true,
+                    transport: plug_core::config::TransportType::Http,
+                    url: Some("https://example.com/mcp".to_string()),
+                    auth_token: None,
+                    auth: Some("oauth".to_string()),
+                    oauth_client_id: Some("test-client".to_string()),
+                    oauth_scopes: Some(vec!["read".to_string()]),
+                    timeout_secs: 30,
+                    call_timeout_secs: 30,
+                    max_concurrent: 4,
+                    health_check_interval_secs: 60,
+                    circuit_breaker_enabled: false,
+                    enrichment: false,
+                    tool_renames: HashMap::new(),
+                    tool_groups: Vec::new(),
+                },
+            );
+        }
+        std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    }
+
+    fn seeded_credentials() -> StoredCredentials {
+        let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
+            AccessToken::new("access-token".to_string()),
+            BasicTokenType::Bearer,
+            VendorExtraTokenFields::default(),
+        );
+        token.set_refresh_token(Some(RefreshToken::new("refresh-token".to_string())));
+        token.set_expires_in(Some(&Duration::from_secs(3600)));
+
+        StoredCredentials {
+            client_id: "test-client".to_string(),
+            token_response: Some(token),
+            granted_scopes: vec!["read".to_string()],
+            token_received_at: Some(0),
+        }
+    }
+
+    fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
+        let config = plug_core::config::load_config(Some(&config_path)).unwrap();
+        let engine = Arc::new(Engine::new(config));
+        let (client_registry, _count_rx) = ClientRegistry::new();
+        ConnectionContext {
+            cancel: CancellationToken::new(),
+            auth_token: Arc::from("test-token"),
+            server_manager: Arc::clone(engine.server_manager()),
+            engine,
+            config_path,
+            started_at: Instant::now(),
+            client_registry: Arc::new(client_registry),
+            session_id: None,
+            reverse_request_rx: None,
+        }
+    }
 
     #[test]
     fn socket_path_is_in_runtime_dir() {
@@ -2091,6 +2169,75 @@ mod tests {
         let rt = runtime_dir();
         assert!(tok.starts_with(&rt));
         assert!(tok.to_string_lossy().ends_with("plug.token"));
+    }
+
+    #[tokio::test]
+    async fn auth_status_without_credentials_reports_auth_required() {
+        let config_path = temp_config_path("auth-status-missing");
+        let server_name = format!("oauth-missing-{}", std::process::id());
+        write_oauth_config(&config_path, &[server_name.as_str()]);
+
+        let store = plug_core::oauth::get_or_create_store(&server_name);
+        store.clear().await.unwrap();
+
+        let ctx = auth_status_test_context(config_path);
+        let response = dispatch_auth_status(&ctx).await;
+        let IpcResponse::AuthStatus { servers } = response else {
+            panic!("expected auth status response");
+        };
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, server_name);
+        assert!(!servers[0].authenticated);
+        assert_eq!(servers[0].health, plug_core::types::ServerHealth::AuthRequired);
+        assert!(servers[0].token_expires_in_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_status_with_credentials_and_no_runtime_reports_degraded() {
+        let config_path = temp_config_path("auth-status-degraded");
+        let server_name = format!("oauth-degraded-{}", std::process::id());
+        write_oauth_config(&config_path, &[server_name.as_str()]);
+
+        let store = plug_core::oauth::get_or_create_store(&server_name);
+        store.clear().await.unwrap();
+        store.save(seeded_credentials()).await.unwrap();
+
+        let ctx = auth_status_test_context(config_path);
+        let response = dispatch_auth_status(&ctx).await;
+        let IpcResponse::AuthStatus { servers } = response else {
+            panic!("expected auth status response");
+        };
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, server_name);
+        assert!(servers[0].authenticated);
+        assert_eq!(servers[0].health, plug_core::types::ServerHealth::Degraded);
+        assert!(servers[0].token_expires_in_secs.is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_status_prefers_runtime_auth_required_over_cached_credentials() {
+        let config_path = temp_config_path("auth-status-runtime");
+        let server_name = format!("oauth-runtime-{}", std::process::id());
+        write_oauth_config(&config_path, &[server_name.as_str()]);
+
+        let store = plug_core::oauth::get_or_create_store(&server_name);
+        store.clear().await.unwrap();
+        store.save(seeded_credentials()).await.unwrap();
+
+        let ctx = auth_status_test_context(config_path);
+        ctx.server_manager.mark_auth_required(&server_name);
+
+        let response = dispatch_auth_status(&ctx).await;
+        let IpcResponse::AuthStatus { servers } = response else {
+            panic!("expected auth status response");
+        };
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, server_name);
+        assert!(servers[0].authenticated);
+        assert_eq!(servers[0].health, plug_core::types::ServerHealth::AuthRequired);
     }
 
     #[tokio::test]

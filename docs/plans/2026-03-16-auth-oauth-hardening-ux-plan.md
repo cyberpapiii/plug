@@ -42,6 +42,7 @@ Completed so far:
 - explicit auth recovery guidance in `status` and `auth status`
 - transport-preserving repair and interactive link/setup transport choice
 - downstream HTTP endpoint awareness across export/link/repair/status/clients
+- interactive server add/edit auth scaffolding for none, bearer, and oauth upstreams
 
 Still remaining:
 - broader end-to-end scenario coverage for mixed auth/topology fleets

@@ -204,6 +204,35 @@ Key files expected to change:
 - The remaining hardening work is now mostly about broader scenario coverage and server-auth setup
   ergonomics, not basic topology visibility.
 
+### 2026-03-17 - Server auth setup scaffolding slice
+
+**By:** Codex
+
+**Actions:**
+- Added explicit upstream auth modeling helpers for remote HTTP/SSE servers.
+- Updated interactive server add/edit flows to ask for auth mode instead of silently defaulting to
+  unauthenticated remotes.
+- Supported three explicit upstream auth paths in the CLI:
+  - none
+  - bearer token
+  - oauth (authorization-code + PKCE) with optional pre-registered client ID and scopes
+- Added post-save guidance to run `plug auth login --server <name>` when an upstream is configured
+  for OAuth.
+- Added unit coverage for scope parsing and remote auth selection application.
+
+**Verification:**
+- `cargo test -p plug parse_scope_list_ignores_empty_entries -- --nocapture`
+- `cargo test -p plug apply_remote_auth_selection_sets_oauth_fields -- --nocapture`
+- `cargo test -p plug current_remote_auth_selection_prefers_oauth_state -- --nocapture`
+- `cargo test -p plug`
+- `cargo build --release`
+
+**Learnings:**
+- Status and doctor can only be clear if configuration entry points force users to declare auth
+  intent explicitly instead of back-filling it later by editing TOML.
+- The remaining gap is now less about visibility and more about broader scenario coverage and
+  richer non-interactive config paths for the same auth choices.
+
 ### 2026-03-16 - Client topology fidelity slice
 
 **By:** Codex

@@ -1,10 +1,140 @@
 use std::collections::HashMap;
 
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::commands::config::{load_editable_config, save_config};
 use crate::ui::{cli_prompt_theme, print_info_line, print_success_line};
 use crate::{OutputFormat, ServerCommands};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteAuthSelection {
+    None,
+    Bearer { token: String },
+    Oauth {
+        client_id: Option<String>,
+        scopes: Option<Vec<String>>,
+    },
+}
+
+fn parse_scope_list(value: &str) -> Option<Vec<String>> {
+    let scopes = value
+        .split(',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if scopes.is_empty() { None } else { Some(scopes) }
+}
+
+fn current_remote_auth_selection(server: &plug_core::config::ServerConfig) -> RemoteAuthSelection {
+    if server.auth.as_deref() == Some("oauth") {
+        RemoteAuthSelection::Oauth {
+            client_id: server.oauth_client_id.clone(),
+            scopes: server.oauth_scopes.clone(),
+        }
+    } else if let Some(token) = &server.auth_token {
+        RemoteAuthSelection::Bearer {
+            token: token.as_str().to_string(),
+        }
+    } else {
+        RemoteAuthSelection::None
+    }
+}
+
+fn apply_remote_auth_selection(
+    server: &mut plug_core::config::ServerConfig,
+    selection: RemoteAuthSelection,
+) {
+    match selection {
+        RemoteAuthSelection::None => {
+            server.auth = None;
+            server.auth_token = None;
+            server.oauth_client_id = None;
+            server.oauth_scopes = None;
+        }
+        RemoteAuthSelection::Bearer { token } => {
+            server.auth = None;
+            server.auth_token = Some(token.into());
+            server.oauth_client_id = None;
+            server.oauth_scopes = None;
+        }
+        RemoteAuthSelection::Oauth { client_id, scopes } => {
+            server.auth = Some("oauth".to_string());
+            server.auth_token = None;
+            server.oauth_client_id = client_id;
+            server.oauth_scopes = scopes;
+        }
+    }
+}
+
+fn prompt_remote_auth_selection(
+    server_name: &str,
+    current: Option<&plug_core::config::ServerConfig>,
+) -> anyhow::Result<RemoteAuthSelection> {
+    let existing = current.map(current_remote_auth_selection);
+    let default = match existing.as_ref() {
+        Some(RemoteAuthSelection::Bearer { .. }) => 1,
+        Some(RemoteAuthSelection::Oauth { .. }) => 2,
+        _ => 0,
+    };
+    let choice = Select::with_theme(&cli_prompt_theme())
+        .with_prompt(format!("Auth for `{server_name}`"))
+        .items([
+            "none",
+            "bearer token",
+            "oauth (authorization-code + PKCE)",
+        ])
+        .default(default)
+        .interact()?;
+
+    match choice {
+        0 => Ok(RemoteAuthSelection::None),
+        1 => {
+            let initial = match existing {
+                Some(RemoteAuthSelection::Bearer { token }) => token,
+                _ => String::new(),
+            };
+            let token = Password::with_theme(&cli_prompt_theme())
+                .with_prompt(if initial.is_empty() {
+                    "Bearer token"
+                } else {
+                    "Bearer token (leave blank to keep current)"
+                })
+                .allow_empty_password(true)
+                .with_confirmation("Confirm bearer token", "Tokens did not match")
+                .interact()?;
+            let token = if token.is_empty() { initial } else { token };
+            Ok(RemoteAuthSelection::Bearer { token })
+        }
+        _ => {
+            let (initial_client_id, initial_scopes) = match existing {
+                Some(RemoteAuthSelection::Oauth { client_id, scopes }) => (
+                    client_id.unwrap_or_default(),
+                    scopes.unwrap_or_default().join(", "),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            let client_id: String = Input::with_theme(&cli_prompt_theme())
+                .with_prompt("Pre-registered OAuth client ID (optional)")
+                .with_initial_text(initial_client_id)
+                .allow_empty(true)
+                .interact_text()?;
+            let scopes: String = Input::with_theme(&cli_prompt_theme())
+                .with_prompt("OAuth scopes (comma-separated, optional)")
+                .with_initial_text(initial_scopes)
+                .allow_empty(true)
+                .interact_text()?;
+            Ok(RemoteAuthSelection::Oauth {
+                client_id: if client_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(client_id.trim().to_string())
+                },
+                scopes: parse_scope_list(&scopes),
+            })
+        }
+    }
+}
 
 pub(crate) fn parse_transport(
     value: Option<String>,
@@ -144,7 +274,7 @@ pub(crate) fn cmd_server_add(
                     .default(true)
                     .interact()?
             };
-            plug_core::config::ServerConfig {
+            let mut server = plug_core::config::ServerConfig {
                 command: None,
                 args: Vec::new(),
                 env: HashMap::new(),
@@ -163,13 +293,28 @@ pub(crate) fn cmd_server_add(
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+            };
+            if !non_interactive {
+                let selection = prompt_remote_auth_selection(&name, None)?;
+                apply_remote_auth_selection(&mut server, selection);
             }
+            server
         }
     };
 
     config.servers.insert(name.clone(), server);
     save_config(&path, &config)?;
     print_success_line(format!("Added server `{name}`."));
+    if config
+        .servers
+        .get(&name)
+        .and_then(|server| server.auth.as_deref())
+        == Some("oauth")
+    {
+        print_info_line(format!(
+            "Run `plug auth login --server {name}` after saving if this upstream needs authorization."
+        ));
+    }
     Ok(())
 }
 
@@ -242,53 +387,63 @@ pub(crate) async fn cmd_server_edit(
         }
     };
 
-    let server = config
-        .servers
-        .get_mut(&name)
-        .ok_or_else(|| anyhow::anyhow!("unknown server `{name}`"))?;
+    let oauth_enabled = {
+        let server = config
+            .servers
+            .get_mut(&name)
+            .ok_or_else(|| anyhow::anyhow!("unknown server `{name}`"))?;
 
-    if matches!(output, OutputFormat::Json) {
-        println!("{}", serde_json::to_string_pretty(server)?);
-        return Ok(());
-    }
-
-    let enabled = Confirm::with_theme(&cli_prompt_theme())
-        .with_prompt("Enabled?")
-        .default(server.enabled)
-        .interact()?;
-    server.enabled = enabled;
-
-    match server.transport {
-        plug_core::config::TransportType::Stdio => {
-            let command: String = Input::with_theme(&cli_prompt_theme())
-                .with_prompt("Command")
-                .with_initial_text(server.command.clone().unwrap_or_default())
-                .interact_text()?;
-            let args: String = Input::with_theme(&cli_prompt_theme())
-                .with_prompt("Args (space-separated)")
-                .with_initial_text(server.args.join(" "))
-                .allow_empty(true)
-                .interact_text()?;
-            server.command = Some(command);
-            server.args = if args.trim().is_empty() {
-                Vec::new()
-            } else {
-                args.split_whitespace()
-                    .map(|part| part.to_string())
-                    .collect()
-            };
+        if matches!(output, OutputFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(server)?);
+            return Ok(());
         }
-        plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
-            let url: String = Input::with_theme(&cli_prompt_theme())
-                .with_prompt("URL")
-                .with_initial_text(server.url.clone().unwrap_or_default())
-                .interact_text()?;
-            server.url = Some(url);
-        }
-    }
 
+        let enabled = Confirm::with_theme(&cli_prompt_theme())
+            .with_prompt("Enabled?")
+            .default(server.enabled)
+            .interact()?;
+        server.enabled = enabled;
+
+        match server.transport {
+            plug_core::config::TransportType::Stdio => {
+                let command: String = Input::with_theme(&cli_prompt_theme())
+                    .with_prompt("Command")
+                    .with_initial_text(server.command.clone().unwrap_or_default())
+                    .interact_text()?;
+                let args: String = Input::with_theme(&cli_prompt_theme())
+                    .with_prompt("Args (space-separated)")
+                    .with_initial_text(server.args.join(" "))
+                    .allow_empty(true)
+                    .interact_text()?;
+                server.command = Some(command);
+                server.args = if args.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    args.split_whitespace()
+                        .map(|part| part.to_string())
+                        .collect()
+                };
+            }
+            plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
+                let url: String = Input::with_theme(&cli_prompt_theme())
+                    .with_prompt("URL")
+                    .with_initial_text(server.url.clone().unwrap_or_default())
+                    .interact_text()?;
+                server.url = Some(url);
+                let selection = prompt_remote_auth_selection(&name, Some(server))?;
+                apply_remote_auth_selection(server, selection);
+            }
+        }
+
+        server.auth.as_deref() == Some("oauth")
+    };
     save_config(&path, &config)?;
     print_success_line(format!("Updated server `{name}`."));
+    if oauth_enabled {
+        print_info_line(format!(
+            "Run `plug auth login --server {name}` after saving if this upstream needs fresh authorization."
+        ));
+    }
     Ok(())
 }
 
@@ -333,4 +488,94 @@ pub(crate) fn cmd_server_set_enabled(
         print_success_line(format!("Disabled server `{name}`."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_server() -> plug_core::config::ServerConfig {
+        plug_core::config::ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Http,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_scope_list_ignores_empty_entries() {
+        assert_eq!(
+            parse_scope_list("read, write, , profile"),
+            Some(vec![
+                "read".to_string(),
+                "write".to_string(),
+                "profile".to_string()
+            ])
+        );
+        assert_eq!(parse_scope_list(" , "), None);
+    }
+
+    #[test]
+    fn apply_remote_auth_selection_sets_bearer_fields() {
+        let mut server = remote_server();
+        apply_remote_auth_selection(
+            &mut server,
+            RemoteAuthSelection::Bearer {
+                token: "secret".to_string(),
+            },
+        );
+        assert_eq!(server.auth, None);
+        assert_eq!(server.auth_token.as_ref().map(|s| s.as_str()), Some("secret"));
+        assert_eq!(server.oauth_client_id, None);
+        assert_eq!(server.oauth_scopes, None);
+    }
+
+    #[test]
+    fn apply_remote_auth_selection_sets_oauth_fields() {
+        let mut server = remote_server();
+        apply_remote_auth_selection(
+            &mut server,
+            RemoteAuthSelection::Oauth {
+                client_id: Some("client-123".to_string()),
+                scopes: Some(vec!["read".to_string(), "write".to_string()]),
+            },
+        );
+        assert_eq!(server.auth.as_deref(), Some("oauth"));
+        assert!(server.auth_token.is_none());
+        assert_eq!(server.oauth_client_id.as_deref(), Some("client-123"));
+        assert_eq!(
+            server.oauth_scopes,
+            Some(vec!["read".to_string(), "write".to_string()])
+        );
+    }
+
+    #[test]
+    fn current_remote_auth_selection_prefers_oauth_state() {
+        let mut server = remote_server();
+        server.auth = Some("oauth".to_string());
+        server.oauth_client_id = Some("client-123".to_string());
+        server.oauth_scopes = Some(vec!["read".to_string()]);
+        match current_remote_auth_selection(&server) {
+            RemoteAuthSelection::Oauth { client_id, scopes } => {
+                assert_eq!(client_id.as_deref(), Some("client-123"));
+                assert_eq!(scopes, Some(vec!["read".to_string()]));
+            }
+            other => panic!("expected oauth selection, got {other:?}"),
+        }
+    }
 }
