@@ -135,3 +135,19 @@ implying parity they do not yet have.
 **Learnings:**
 - Scope honesty has to be consistent across every command that prints live client counts, or users
   will still infer parity from the least explicit surface.
+
+### 2026-03-17 - Architecture follow-up plan captured
+
+**By:** Codex
+
+**Actions:**
+- Wrote a dedicated next-phase plan at
+  [docs/plans/2026-03-17-http-session-parity-architecture.md](../docs/plans/2026-03-17-http-session-parity-architecture.md)
+  so the remaining work is framed as a transport/session inventory architecture project rather than
+  vague UI polish.
+- Chose the lower-risk initial recommendation: add a merged transport-aware session snapshot layer
+  before considering daemon-owned HTTP serving.
+
+**Learnings:**
+- The remaining gap is now clear enough to scope independently from the broader auth/OAuth hardening
+  program.
