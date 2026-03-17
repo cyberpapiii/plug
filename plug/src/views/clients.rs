@@ -35,8 +35,19 @@ pub(crate) async fn cmd_client_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut started =
-        ensure_daemon_with_feedback(config_path, matches!(output, OutputFormat::Text)).await?;
+    let mut daemon_error = None;
+    let mut started = match ensure_daemon_with_feedback(
+        config_path,
+        matches!(output, OutputFormat::Text),
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            daemon_error = Some(error.to_string());
+            false
+        }
+    };
 
     loop {
         let (live, live_client_support) = fetch_live_clients().await;
@@ -48,6 +59,7 @@ pub(crate) async fn cmd_client_list(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "clients": clients,
                     "live_client_support": live_client_support,
+                    "daemon_error": daemon_error,
                 }))?
             );
             return Ok(());
@@ -65,6 +77,11 @@ pub(crate) async fn cmd_client_list(
                 "Live client inspection requires restarting the background daemon after this upgrade.",
             );
             println!();
+        } else if let Some(error) = &daemon_error {
+            print_warning_line(format!(
+                "Live client inspection unavailable: {error}. Showing linked and detected clients from config only."
+            ));
+            println!();
         }
         let linked_count = clients.iter().filter(|client| client.linked).count();
         let detected_count = clients.iter().filter(|client| client.detected).count();
@@ -72,11 +89,14 @@ pub(crate) async fn cmd_client_list(
         print_heading("Summary");
         print_label_value("Linked", style(linked_count).green().bold());
         print_label_value("Detected", style(detected_count).cyan().bold());
-        match live_client_support {
-            LiveClientSupport::Supported => {
+        match (&daemon_error, &live_client_support) {
+            (Some(_), _) => {
+                print_label_value("Live", style("unavailable").yellow().bold());
+            }
+            (None, LiveClientSupport::Supported) => {
                 print_label_value("Live", style(live_count).bold());
             }
-            LiveClientSupport::DaemonRestartRequired => {
+            (None, LiveClientSupport::DaemonRestartRequired) => {
                 print_label_value("Live", style("restart required").yellow().bold());
             }
         }

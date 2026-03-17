@@ -199,3 +199,23 @@ Key files expected to change:
   endpoint or it could still rewrite remote/public client configs incorrectly.
 - The client inventory needed endpoint visibility, not just a boolean linked/not-linked state, to
   reduce confusion for mixed local and remote HTTP setups.
+
+### 2026-03-16 - Client inventory graceful fallback
+
+**By:** Codex
+
+**Actions:**
+- Changed `plug clients` to keep rendering linked/detected client inventory even when the daemon
+  cannot be started.
+- Added explicit warning text that live client inspection is unavailable and that the view is
+  falling back to config-derived inventory only.
+- Kept the live summary truthful by surfacing `unavailable` instead of implying zero live clients.
+
+**Verification:**
+- `cargo run --quiet --bin plug -- clients`
+
+**Learnings:**
+- Visibility commands should not depend on daemon startup when most of their value comes from static
+  config state.
+- `live = 0` and `live inspection unavailable` are materially different operator states and need to
+  stay separate in the UI.
