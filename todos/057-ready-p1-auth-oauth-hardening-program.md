@@ -736,6 +736,24 @@ Key files expected to change:
 - Running the full package tests after CLI-shape changes is doing real work here; it caught stale
   server command signatures that focused auth/topology tests would not have touched.
 
+### 2026-03-17 - Config-aware exported endpoint slice
+
+**By:** Codex
+
+**Actions:**
+- Threaded `config_path` through `plug link`, `plug export`, and `plug setup` so HTTP exports now
+  derive their endpoint from the config file the user actually selected.
+- Verified that the alternate-config path fix stayed compatible with the newer explicit
+  `--transport` flow and the existing client-linking helpers.
+
+**Verification:**
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Topology-aware UX is not just about visible labels; it also means every command must resolve its
+  endpoint from the same config context the user invoked, or the CLI quietly lies about where
+  clients will connect.
+
 ### 2026-03-17 - Scripted stdio env management slice
 
 **By:** Codex

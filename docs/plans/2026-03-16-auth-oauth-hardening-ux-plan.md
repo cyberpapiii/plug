@@ -103,6 +103,9 @@ Still remaining:
 - 2026-03-17: scripted `plug link`, `plug export`, and `plug setup` now accept an explicit
   `--transport stdio|http` choice, so unattended flows no longer silently collapse to stdio when
   `--yes` is used.
+- 2026-03-17: `plug --config <path> link/setup/export --transport http` now derives the exported
+  downstream endpoint from that same config file instead of accidentally falling back to the
+  default config path.
 - 2026-03-17: scripted `plug server add` / `plug server edit` now manage stdio `--env` and
   `--unset-env` directly, closing a real config-shape gap while explicitly rejecting those flags
   for remote HTTP/SSE upstreams where they would be misleading.
