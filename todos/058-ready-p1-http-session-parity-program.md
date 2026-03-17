@@ -267,3 +267,26 @@ These write scopes should remain mostly disjoint until integration.
 - A secure standalone export path is feasible without pretending the daemon owns HTTP.
 - The current implementation can now distinguish daemon-only, HTTP-only, and fully merged session
   truth, which is enough to make later aggregation work incremental instead of architectural guesswork.
+
+### 2026-03-17 - Aggregation semantics pinned with focused tests
+
+**By:** Codex
+
+**Actions:**
+- Extracted the daemon/HTTP merge decision into a pure helper in `runtime`.
+- Added focused tests for the four currently supported scope outcomes:
+  - `transport_complete`
+  - `daemon_proxy_only`
+  - `http_only`
+  - `unavailable`
+- Added view helper coverage for the new `http_only` and `unavailable` scope text so the user-facing
+  copy cannot silently drift from the runtime semantics.
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+
+**Learnings:**
+- The aggregation rules are simple enough to keep pure and test directly, which will make later
+  partial/degraded-state work safer.

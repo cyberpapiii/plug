@@ -591,6 +591,17 @@ mod tests {
     }
 
     #[test]
+    fn live_client_count_scope_text_covers_http_only_and_unavailable() {
+        let http_only =
+            live_client_count_scope_text(plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
+        assert!(http_only.contains("HTTP sessions only"));
+
+        let unavailable =
+            live_client_count_scope_text(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
+        assert!(unavailable.contains("unavailable"));
+    }
+
+    #[test]
     fn live_transport_counts_split_transports() {
         let sessions = vec![
             plug_core::ipc::IpcLiveSessionInfo {

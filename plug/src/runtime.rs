@@ -128,6 +128,38 @@ async fn fetch_http_live_sessions(
     Some(body.sessions)
 }
 
+fn merge_live_session_sources(
+    mut daemon_sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
+    daemon_scope: plug_core::ipc::LiveSessionInventoryScope,
+    daemon_available: bool,
+    mut http_sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
+) -> (
+    Vec<plug_core::ipc::IpcLiveSessionInfo>,
+    plug_core::ipc::LiveSessionInventoryScope,
+) {
+    let scope = match (daemon_available, http_sessions.is_empty()) {
+        (true, false) => plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
+        (true, true) => daemon_scope,
+        (false, false) => plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
+        (false, true) => plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+    };
+
+    daemon_sessions.append(&mut http_sessions);
+    daemon_sessions.sort_by(|a, b| {
+        let transport_order = |transport: plug_core::ipc::LiveSessionTransport| match transport {
+            plug_core::ipc::LiveSessionTransport::DaemonProxy => 0,
+            plug_core::ipc::LiveSessionTransport::Http => 1,
+            plug_core::ipc::LiveSessionTransport::Sse => 2,
+        };
+        transport_order(a.transport)
+            .cmp(&transport_order(b.transport))
+            .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
+            .then(a.session_id.cmp(&b.session_id))
+    });
+
+    (daemon_sessions, scope)
+}
+
 pub(crate) async fn fetch_live_sessions(
     config_path: Option<&PathBuf>,
 ) -> (
@@ -135,7 +167,7 @@ pub(crate) async fn fetch_live_sessions(
     plug_core::ipc::LiveSessionInventoryScope,
     LiveClientSupport,
 ) {
-    let (mut daemon_sessions, daemon_scope, support, daemon_available) =
+    let (daemon_sessions, daemon_scope, support, daemon_available) =
         match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListLiveSessions).await {
             Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => {
                 (sessions, scope, LiveClientSupport::Supported, true)
@@ -180,27 +212,14 @@ pub(crate) async fn fetch_live_sessions(
 
     let mut http_sessions = fetch_http_live_sessions(config_path).await.unwrap_or_default();
 
-    let scope = match (daemon_available, http_sessions.is_empty()) {
-        (true, false) => plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        (true, true) => daemon_scope,
-        (false, false) => plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
-        (false, true) => plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-    };
+    let (sessions, scope) = merge_live_session_sources(
+        daemon_sessions,
+        daemon_scope,
+        daemon_available,
+        std::mem::take(&mut http_sessions),
+    );
 
-    daemon_sessions.append(&mut http_sessions);
-    daemon_sessions.sort_by(|a, b| {
-        let transport_order = |transport: plug_core::ipc::LiveSessionTransport| match transport {
-            plug_core::ipc::LiveSessionTransport::DaemonProxy => 0,
-            plug_core::ipc::LiveSessionTransport::Http => 1,
-            plug_core::ipc::LiveSessionTransport::Sse => 2,
-        };
-        transport_order(a.transport)
-            .cmp(&transport_order(b.transport))
-            .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
-            .then(a.session_id.cmp(&b.session_id))
-    });
-
-    (daemon_sessions, scope, support)
+    (sessions, scope, support)
 }
 
 pub(crate) struct DaemonProxySession {
@@ -872,6 +891,97 @@ mod tests {
         };
         let token = resolve_downstream_bearer_token(&http).expect("oauth should skip bearer token");
         assert!(token.is_none());
+    }
+
+    #[test]
+    fn merge_live_session_sources_marks_transport_complete_when_both_sources_exist() {
+        let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
+            transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+            client_id: Some("daemon".to_string()),
+            session_id: "daemon-1".to_string(),
+            client_type: plug_core::types::ClientType::ClaudeCode,
+            client_info: Some("Claude Code".to_string()),
+            connected_secs: 10,
+            last_activity_secs: None,
+        }];
+        let http = vec![plug_core::ipc::IpcLiveSessionInfo {
+            transport: plug_core::ipc::LiveSessionTransport::Http,
+            client_id: None,
+            session_id: "http-1".to_string(),
+            client_type: plug_core::types::ClientType::ClaudeDesktop,
+            client_info: None,
+            connected_secs: 5,
+            last_activity_secs: Some(1),
+        }];
+
+        let (sessions, scope) = merge_live_session_sources(
+            daemon,
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            true,
+            http,
+        );
+
+        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn merge_live_session_sources_preserves_daemon_proxy_only_scope() {
+        let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
+            transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+            client_id: Some("daemon".to_string()),
+            session_id: "daemon-1".to_string(),
+            client_type: plug_core::types::ClientType::ClaudeCode,
+            client_info: Some("Claude Code".to_string()),
+            connected_secs: 10,
+            last_activity_secs: None,
+        }];
+
+        let (sessions, scope) = merge_live_session_sources(
+            daemon,
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            true,
+            Vec::new(),
+        );
+
+        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn merge_live_session_sources_marks_http_only_without_daemon() {
+        let http = vec![plug_core::ipc::IpcLiveSessionInfo {
+            transport: plug_core::ipc::LiveSessionTransport::Http,
+            client_id: None,
+            session_id: "http-1".to_string(),
+            client_type: plug_core::types::ClientType::ClaudeDesktop,
+            client_info: None,
+            connected_secs: 5,
+            last_activity_secs: Some(1),
+        }];
+
+        let (sessions, scope) = merge_live_session_sources(
+            Vec::new(),
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+            false,
+            http,
+        );
+
+        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn merge_live_session_sources_marks_unavailable_when_no_sources_exist() {
+        let (sessions, scope) = merge_live_session_sources(
+            Vec::new(),
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+            false,
+            Vec::new(),
+        );
+
+        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::Unavailable);
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]

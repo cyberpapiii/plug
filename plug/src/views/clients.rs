@@ -255,4 +255,15 @@ mod tests {
         assert!(text.contains("daemon proxy clients"));
         assert!(text.contains("HTTP sessions"));
     }
+
+    #[test]
+    fn live_inventory_scope_text_covers_http_only_and_unavailable() {
+        let http_only =
+            live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
+        assert!(http_only.contains("HTTP sessions only"));
+
+        let unavailable =
+            live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
+        assert!(unavailable.contains("unavailable"));
+    }
 }
