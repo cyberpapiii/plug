@@ -59,8 +59,19 @@ pub(crate) async fn cmd_server_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut started =
-        ensure_daemon_with_feedback(config_path, matches!(output, OutputFormat::Text)).await?;
+    let mut daemon_error = None;
+    let mut started = match ensure_daemon_with_feedback(
+        config_path,
+        matches!(output, OutputFormat::Text),
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            daemon_error = Some(error.to_string());
+            false
+        }
+    };
 
     loop {
         if let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) =
@@ -107,6 +118,12 @@ pub(crate) async fn cmd_server_list(
                         if started {
                             println!();
                         }
+                        if let Some(error) = &daemon_error {
+                            print_info_line(format!(
+                                "Live runtime inspection is unavailable: {error}. Showing configured server inventory only."
+                            ));
+                            println!();
+                        }
                         print_heading("Summary");
                         print_label_value("Healthy", style(healthy).green().bold());
                         print_label_value("Degraded", style(degraded).yellow().bold());
@@ -114,7 +131,7 @@ pub(crate) async fn cmd_server_list(
                         print_label_value("Auth Required", style(auth_required).yellow().bold());
                         println!();
                         print_heading("Inventory");
-                        for s in servers {
+                        for s in &servers {
                             if s.server_id == "__plug_internal__" {
                                 continue;
                             }
@@ -129,11 +146,13 @@ pub(crate) async fn cmd_server_list(
                                 })
                                 .unwrap_or("unknown");
                             let auth = server_cfg
-                                .map(|cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
-                                    (Some("oauth"), _) => "oauth",
-                                    (_, true) => "bearer",
-                                    _ => "none",
-                                })
+                                .map(
+                                    |cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
+                                        (Some("oauth"), _) => "oauth",
+                                        (_, true) => "bearer",
+                                        _ => "none",
+                                    },
+                                )
                                 .unwrap_or("unknown");
                             println!(
                                 "  {} {:<18} {:<12} {:<8} {:<6} ({} tools)",
@@ -144,6 +163,62 @@ pub(crate) async fn cmd_server_list(
                                 auth,
                                 s.tool_count
                             );
+                        }
+                        let auth_required_servers = servers
+                            .iter()
+                            .filter(|s| s.server_id != "__plug_internal__")
+                            .filter(|s| {
+                                matches!(s.health, plug_core::types::ServerHealth::AuthRequired)
+                            })
+                            .map(|s| s.server_id.clone())
+                            .collect::<Vec<_>>();
+                        let failed_servers = servers
+                            .iter()
+                            .filter(|s| s.server_id != "__plug_internal__")
+                            .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
+                            .map(|s| s.server_id.clone())
+                            .collect::<Vec<_>>();
+                        let degraded_servers = servers
+                            .iter()
+                            .filter(|s| s.server_id != "__plug_internal__")
+                            .filter(|s| {
+                                matches!(s.health, plug_core::types::ServerHealth::Degraded)
+                            })
+                            .map(|s| s.server_id.clone())
+                            .collect::<Vec<_>>();
+                        if !auth_required_servers.is_empty()
+                            || !failed_servers.is_empty()
+                            || !degraded_servers.is_empty()
+                        {
+                            println!();
+                            print_heading("Recovery");
+                            if !auth_required_servers.is_empty() {
+                                print_label_value(
+                                    "Auth",
+                                    format!(
+                                        "{} need re-auth — run `plug auth status` or `plug auth login --server <name>`",
+                                        auth_required_servers.join(", ")
+                                    ),
+                                );
+                            }
+                            if !failed_servers.is_empty() {
+                                print_label_value(
+                                    "Failed",
+                                    format!(
+                                        "{} failed — run `plug doctor` to inspect connectivity and runtime context",
+                                        failed_servers.join(", ")
+                                    ),
+                                );
+                            }
+                            if !degraded_servers.is_empty() {
+                                print_label_value(
+                                    "Degraded",
+                                    format!(
+                                        "{} are degraded — compare `plug status` and `plug doctor` for runtime/auth details",
+                                        degraded_servers.join(", ")
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
@@ -158,6 +233,12 @@ pub(crate) async fn cmd_server_list(
                     "Servers",
                     &format!("{} server(s) configured (daemon not running)", names.len()),
                 );
+                if let Some(error) = &daemon_error {
+                    println!();
+                    print_info_line(format!(
+                        "Live runtime inspection is unavailable: {error}. Showing configured servers only."
+                    ));
+                }
                 print_heading("Inventory");
                 for name in names {
                     let enabled = config

@@ -219,3 +219,24 @@ Key files expected to change:
   config state.
 - `live = 0` and `live inspection unavailable` are materially different operator states and need to
   stay separate in the UI.
+
+### 2026-03-16 - Server inventory graceful fallback and recovery parity
+
+**By:** Codex
+
+**Actions:**
+- Changed `plug servers` to keep rendering configured server inventory even when the daemon cannot
+  be started.
+- Added explicit notice when live runtime inspection is unavailable so the user can distinguish
+  configured inventory from live health.
+- Added recovery guidance to `plug servers` for auth-required, failed, and degraded states so its
+  next-step language matches `plug status`.
+
+**Verification:**
+- `cargo run --quiet --bin plug -- servers`
+- `cargo run --quiet --bin plug -- clients`
+
+**Learnings:**
+- Inventory-style commands should degrade to config truth instead of failing outright.
+- Recovery guidance needs to follow the user across multiple surfaces; otherwise the same state
+  still feels ambiguous depending on which command they happen to run first.
