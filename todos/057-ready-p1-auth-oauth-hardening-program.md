@@ -170,6 +170,34 @@ Key files expected to change:
 - `plug doctor` now includes daemon-observed runtime health/auth context so cold checks and live
   state can be compared in one command, which reduces the biggest contradiction from real usage.
 
+### 2026-03-16 - Client topology fidelity slice
+
+**By:** Codex
+
+**Actions:**
+- Extended client-link parsing to preserve the actual linked HTTP endpoint, not just `stdio` vs
+  `http`.
+- Made `repair` reuse an already-linked client endpoint when one is present, instead of always
+  regenerating HTTP clients against the current default endpoint.
+- Kept export generation endpoint-aware so custom/public URLs survive regeneration across JSON,
+  TOML, YAML, and VS Code-style shapes.
+- Expanded the client inventory to show both linked mode and linked endpoint, which makes mixed
+  local-vs-remote fleets easier to reason about.
+- Added focused tests for explicit HTTP export URLs and for linked-client endpoint parsing across
+  JSON, TOML, and YAML formats.
+
+**Verification:**
+- `cargo test -p plug-core export_ -- --nocapture`
+- `cargo test -p plug clients::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Preserving transport mode alone is not enough; endpoint fidelity matters because users may link
+  some clients to a remote/public URL and others to a local daemon.
+- The right UX model is “what is this client pointed at?” rather than only “is it stdio or http?”.
+- This closes a real repair/setup footgun, but the broader mixed-scenario integration matrix still
+  needs explicit end-to-end coverage.
+
 ### 2026-03-16 - Topology-aware client export and inventory slice
 
 **By:** Codex

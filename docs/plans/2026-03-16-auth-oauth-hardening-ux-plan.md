@@ -34,6 +34,17 @@ This plan is based on:
 - setup and repair flows respect different client and config types instead of flattening everything to `plug connect`
 - end-to-end tests cover mixed transport/auth scenarios that currently rely on inference
 
+## Progress Notes
+
+- 2026-03-16: Downstream OAuth discovery/privacy, metadata, and 401 challenge behavior were
+  hardened; `doctor`/`status`/`auth status` gained clearer runtime/auth recovery modeling.
+- 2026-03-16: Setup/link/repair now preserve client transport topology and expose transport/auth
+  shape more clearly.
+- 2026-03-16: Client endpoint fidelity is now preserved during repair/export regeneration, and the
+  client inventory surfaces linked mode plus endpoint so local-vs-remote usage is visible.
+- Remaining gap: the explicit mixed-scenario integration matrix still needs broader end-to-end
+  coverage beyond focused parser/export tests.
+
 ## Workstream A: Downstream OAuth Standards Hardening
 
 ### Task 1: Add failing tests for downstream OAuth discovery privacy
