@@ -429,3 +429,31 @@ These write scopes should remain mostly disjoint until integration.
 **Learnings:**
 - Direct JSON builders are a cleaner contract-test seam than trying to scrape CLI stdout.
 - This makes future operator/UI changes safer because the payload shape is now pinned explicitly.
+
+### 2026-03-17 - Standalone HTTP inventory failure paths covered end to end
+
+**By:** Codex
+
+**Actions:**
+- Added focused runtime tests for standalone HTTP inventory failure cases:
+  - missing operator token file
+  - empty operator token file
+  - unauthorized operator endpoint response
+  - malformed JSON from the operator endpoint
+- Extracted a small internal helper so the fetch path can be tested directly with a local HTTP
+  server and temporary token files instead of depending on the user’s real config directory.
+- Hardened the runtime path by ensuring the rustls provider is installed before building the
+  `reqwest` client used for standalone HTTP inventory fetches.
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug commands::auth::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The failure-path tests were worth adding because they exposed a real runtime precondition: the
+  HTTP inventory fetch path could run before rustls provider initialization.
+- With these tests in place, `Unavailable` now means “the source actually failed or could not be
+  inspected” rather than “we never tested the unhappy path.”

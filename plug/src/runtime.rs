@@ -201,6 +201,13 @@ async fn fetch_http_live_sessions(
         Err(_) => return LiveSessionSourceState::Unavailable,
     };
     let token_path = plug_core::auth::http_operator_token_path(config.http.port);
+    fetch_http_live_sessions_from(local_http_inventory_url(&config.http), &token_path).await
+}
+
+async fn fetch_http_live_sessions_from(
+    url: String,
+    token_path: &std::path::Path,
+) -> LiveSessionSourceState {
     let token = match std::fs::read_to_string(token_path) {
         Ok(token) => token,
         Err(_) => return LiveSessionSourceState::Unavailable,
@@ -210,6 +217,7 @@ async fn fetch_http_live_sessions(
         return LiveSessionSourceState::Unavailable;
     }
 
+    plug_core::tls::ensure_rustls_provider_installed();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(2))
@@ -219,7 +227,7 @@ async fn fetch_http_live_sessions(
         Err(_) => return LiveSessionSourceState::Unavailable,
     };
     let response = client
-        .get(local_http_inventory_url(&config.http))
+        .get(url)
         .header(OPERATOR_TOKEN_HEADER, token)
         .send()
         .await;
@@ -741,6 +749,7 @@ async fn serve_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -753,6 +762,28 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsConnector;
     use tower::util::ServiceExt;
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "plug-runtime-{}-{}-{}",
+            label,
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    async fn spawn_http_test_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        (format!("http://{}{}", addr, OPERATOR_LIVE_SESSIONS_PATH), handle)
+    }
 
     async fn spawn_https_test_server(
         router: Router,
@@ -1271,5 +1302,65 @@ mod tests {
             plug_core::types::ClientType::ClaudeDesktop
         );
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_http_live_sessions_from_returns_unavailable_when_token_missing() {
+        let dir = unique_temp_dir("missing-token");
+        let token_path = dir.join("operator.token");
+
+        let state =
+            fetch_http_live_sessions_from("http://127.0.0.1:9/nowhere".to_string(), &token_path)
+                .await;
+
+        assert!(matches!(state, LiveSessionSourceState::Unavailable));
+        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn fetch_http_live_sessions_from_returns_unavailable_when_token_empty() {
+        let dir = unique_temp_dir("empty-token");
+        let token_path = dir.join("operator.token");
+        std::fs::write(&token_path, "\n").expect("write empty token");
+
+        let state =
+            fetch_http_live_sessions_from("http://127.0.0.1:9/nowhere".to_string(), &token_path)
+                .await;
+
+        assert!(matches!(state, LiveSessionSourceState::Unavailable));
+        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn fetch_http_live_sessions_from_returns_unavailable_on_unauthorized() {
+        let dir = unique_temp_dir("unauthorized");
+        let token_path = dir.join("operator.token");
+        std::fs::write(&token_path, "expected-token").expect("write token");
+        let app = Router::new().route(
+            OPERATOR_LIVE_SESSIONS_PATH,
+            get(|| async { StatusCode::UNAUTHORIZED }),
+        );
+        let (url, handle) = spawn_http_test_server(app).await;
+
+        let state = fetch_http_live_sessions_from(url, &token_path).await;
+
+        handle.abort();
+        assert!(matches!(state, LiveSessionSourceState::Unavailable));
+        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn fetch_http_live_sessions_from_returns_unavailable_on_invalid_json() {
+        let dir = unique_temp_dir("invalid-json");
+        let token_path = dir.join("operator.token");
+        std::fs::write(&token_path, "expected-token").expect("write token");
+        let app = Router::new().route(OPERATOR_LIVE_SESSIONS_PATH, get(|| async { "not-json" }));
+        let (url, handle) = spawn_http_test_server(app).await;
+
+        let state = fetch_http_live_sessions_from(url, &token_path).await;
+
+        handle.abort();
+        assert!(matches!(state, LiveSessionSourceState::Unavailable));
+        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
     }
 }
