@@ -395,3 +395,37 @@ These write scopes should remain mostly disjoint until integration.
 **Learnings:**
 - Once runtime inventory becomes a first-class shared object, command-surface consistency becomes a
   maintenance property rather than a repeated implementation task.
+
+### 2026-03-17 - Operator JSON contracts pinned with direct tests
+
+**By:** Codex
+
+**Actions:**
+- Extracted small pure JSON builders for:
+  - `plug clients`
+  - `plug overview`
+  - `plug status`
+  - `plug auth status`
+- Added direct tests that assert the machine-readable contract fields now relied on by future UI or
+  external tooling:
+  - `live_session_count`
+  - `live_session_transports`
+  - `live_client_scope`
+  - `inventory_partial`
+  - `inventory_unavailable_sources`
+  - `http_sessions_included`
+  - `daemon_proxy_client_count`
+  - `status_source`
+- Kept backward-compatible `status_scope` on auth JSON while adding the clearer `status_source`
+  contract.
+
+**Verification:**
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug commands::auth::tests -- --nocapture`
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Direct JSON builders are a cleaner contract-test seam than trying to scrape CLI stdout.
+- This makes future operator/UI changes safer because the payload shape is now pinned explicitly.

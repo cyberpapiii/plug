@@ -42,6 +42,25 @@ fn auth_status_source_text(live: bool) -> &'static str {
     }
 }
 
+fn auth_status_json(
+    servers: Vec<serde_json::Value>,
+    live: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "servers": servers,
+        "status_source": if live {
+            "live_daemon"
+        } else {
+            "stored_credentials_only"
+        },
+        "status_scope": if live {
+            "live_daemon"
+        } else {
+            "stored_credentials_only"
+        }
+    })
+}
+
 /// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
     config_path: Option<&PathBuf>,
@@ -561,19 +580,10 @@ async fn cmd_auth_status(
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "servers": servers,
-                    "status_source": if live_auth_status.is_some() {
-                        "live_daemon"
-                    } else {
-                        "stored_credentials_only"
-                    },
-                    "status_scope": if live_auth_status.is_some() {
-                        "live_daemon"
-                    } else {
-                        "stored_credentials_only"
-                    }
-                }))?
+                serde_json::to_string_pretty(&auth_status_json(
+                    servers,
+                    live_auth_status.is_some(),
+                ))?
             );
         }
     }
@@ -733,6 +743,18 @@ mod tests {
     fn auth_status_source_text_distinguishes_live_from_fallback() {
         assert!(auth_status_source_text(true).contains("live daemon"));
         assert!(auth_status_source_text(false).contains("stored credentials"));
+    }
+
+    #[test]
+    fn auth_status_json_exposes_source_and_compat_scope() {
+        let servers = vec![serde_json::json!({
+            "name": "notion",
+            "status_source": "live_daemon",
+        })];
+        let json = auth_status_json(servers, true);
+        assert_eq!(json["status_source"], "live_daemon");
+        assert_eq!(json["status_scope"], "live_daemon");
+        assert_eq!(json["servers"][0]["name"], "notion");
     }
 
     /// Simulates a browser redirect delivering code and state to the callback

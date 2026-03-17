@@ -37,6 +37,28 @@ fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) 
     }
 }
 
+fn client_list_json(
+    clients: &[crate::commands::clients::ClientView],
+    live_sessions: &[crate::commands::clients::LiveSessionView],
+    inventory: &crate::runtime::LiveInventoryMetadata,
+    live_client_support: LiveClientSupport,
+    live_inventory_scope: plug_core::ipc::LiveSessionInventoryScope,
+    daemon_error: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "clients": clients,
+        "live_sessions": live_sessions,
+        "live_session_count": inventory.session_count,
+        "live_session_transports": inventory.session_transports,
+        "live_client_support": live_client_support,
+        "live_inventory_scope": live_inventory_scope,
+        "inventory_partial": inventory.availability.partial,
+        "inventory_unavailable_sources": inventory.availability.unavailable_sources,
+        "http_sessions_included": inventory.http_sessions_included,
+        "daemon_error": daemon_error,
+    })
+}
+
 fn prompt_client_actions() -> anyhow::Result<bool> {
     let options = ["Done", "Link clients", "Unlink clients"];
     let selection = Select::with_theme(&cli_prompt_theme())
@@ -86,18 +108,14 @@ pub(crate) async fn cmd_client_list(
         if matches!(output, OutputFormat::Json) {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "clients": clients,
-                    "live_sessions": live_sessions,
-                    "live_session_count": inventory.session_count,
-                    "live_session_transports": inventory.session_transports,
-                    "live_client_support": live_client_support,
-                    "live_inventory_scope": live_inventory_scope,
-                    "inventory_partial": inventory.availability.partial,
-                    "inventory_unavailable_sources": inventory.availability.unavailable_sources,
-                    "http_sessions_included": inventory.http_sessions_included,
-                    "daemon_error": daemon_error,
-                }))?
+                serde_json::to_string_pretty(&client_list_json(
+                    &clients,
+                    &live_sessions,
+                    &inventory,
+                    live_client_support,
+                    live_inventory_scope,
+                    daemon_error.as_deref(),
+                ))?
             );
             return Ok(());
         }
@@ -269,7 +287,63 @@ pub(crate) async fn cmd_client_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{live_inventory_scope_label, live_inventory_scope_text};
+    use super::{client_list_json, live_inventory_scope_label, live_inventory_scope_text};
+    use crate::commands::clients::{ClientView, LiveSessionView};
+    use crate::runtime::{LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts};
+
+    #[test]
+    fn client_list_json_includes_inventory_contract_fields() {
+        let clients = vec![ClientView {
+            name: "Claude".to_string(),
+            target: "claude-desktop".to_string(),
+            linked: true,
+            linked_transport: Some("http".to_string()),
+            linked_endpoint: Some("https://plug.example.com/mcp".to_string()),
+            detected: true,
+            live: true,
+            live_sessions: 1,
+        }];
+        let live_sessions = vec![LiveSessionView {
+            session_id: "session-1".to_string(),
+            client_type: "claude_desktop".to_string(),
+            transport: "http".to_string(),
+            client_id: None,
+            client_info: Some("Claude Desktop".to_string()),
+            connected_secs: 12,
+            last_activity_secs: Some(3),
+        }];
+        let inventory = LiveInventoryMetadata {
+            session_count: 1,
+            session_transports: LiveSessionTransportCounts {
+                daemon_proxy: 0,
+                http: 1,
+                sse: 0,
+            },
+            scope: plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
+            availability: LiveInventoryAvailability {
+                partial: true,
+                unavailable_sources: vec!["daemon_proxy"],
+            },
+            http_sessions_included: true,
+        };
+
+        let json = client_list_json(
+            &clients,
+            &live_sessions,
+            &inventory,
+            crate::runtime::LiveClientSupport::Supported,
+            plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
+            Some("daemon unavailable"),
+        );
+
+        assert_eq!(json["live_session_count"], 1);
+        assert_eq!(json["live_session_transports"]["http"], 1);
+        assert_eq!(json["live_inventory_scope"], "http_only");
+        assert_eq!(json["inventory_partial"], true);
+        assert_eq!(json["inventory_unavailable_sources"][0], "daemon_proxy");
+        assert_eq!(json["http_sessions_included"], true);
+        assert_eq!(json["daemon_error"], "daemon unavailable");
+    }
 
     #[test]
     fn live_inventory_scope_label_uses_stable_short_states() {
