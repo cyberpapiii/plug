@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::http::error::HttpError;
 
-use super::{SessionStore, SseMessage};
+use super::{DownstreamSessionSnapshot, DownstreamTransport, SessionStore, SseMessage};
 
 /// Current in-memory stateful downstream session store.
 pub struct StatefulSessionStore {
@@ -22,12 +22,41 @@ pub struct StatefulSessionStore {
 
 struct SessionState {
     last_activity: Instant,
+    created_at: Instant,
     sse_sender: Option<mpsc::Sender<SseMessage>>,
     pending_notifications: VecDeque<SseMessage>,
     client_type: crate::types::ClientType,
 }
 
 impl StatefulSessionStore {
+    /// Return a transport-aware snapshot of tracked HTTP sessions.
+    pub fn list_sessions(&self) -> Vec<DownstreamSessionSnapshot> {
+        let timeout = self.timeout;
+
+        let mut snapshots: Vec<DownstreamSessionSnapshot> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let state = entry.value();
+                if state.last_activity.elapsed() > timeout {
+                    return None;
+                }
+
+                Some(DownstreamSessionSnapshot {
+                    session_id: entry.key().clone(),
+                    transport: DownstreamTransport::Http,
+                    client_type: state.client_type,
+                    connected_seconds: state.created_at.elapsed().as_secs(),
+                    idle_seconds: state.last_activity.elapsed().as_secs(),
+                    timeout_seconds: self.timeout.as_secs(),
+                })
+            })
+            .collect();
+
+        snapshots.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        snapshots
+    }
+
     pub fn new(timeout_secs: u64, max_sessions: usize) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
@@ -106,10 +135,12 @@ impl SessionStore for StatefulSessionStore {
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
+        let now = Instant::now();
         self.sessions.insert(
             session_id.clone(),
             SessionState {
-                last_activity: Instant::now(),
+                last_activity: now,
+                created_at: now,
                 sse_sender: None,
                 pending_notifications: VecDeque::new(),
                 client_type: crate::types::ClientType::Unknown,
@@ -255,6 +286,10 @@ impl SessionStore for StatefulSessionStore {
     fn session_count(&self) -> usize {
         self.sessions.len()
     }
+
+    fn session_snapshots(&self) -> Vec<DownstreamSessionSnapshot> {
+        self.list_sessions()
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +341,37 @@ mod tests {
         assert_eq!(store.session_count(), 1);
         store.remove(&id);
         assert_eq!(store.session_count(), 0);
+    }
+
+    #[test]
+    fn list_sessions_reports_transport_and_client_type() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+        store
+            .set_client_type(&id, crate::types::ClientType::Cursor)
+            .unwrap();
+
+        let snapshots = store.list_sessions();
+        assert_eq!(snapshots.len(), 1);
+
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.session_id, id);
+        assert_eq!(snapshot.transport, DownstreamTransport::Http);
+        assert_eq!(snapshot.client_type, crate::types::ClientType::Cursor);
+        assert_eq!(snapshot.timeout_seconds, 1800);
+        assert!(snapshot.connected_seconds <= 1);
+        assert!(snapshot.idle_seconds <= 1);
+    }
+
+    #[test]
+    fn list_sessions_filters_expired_sessions() {
+        let store = StatefulSessionStore::new(0, 100);
+        let id = store.create_session().unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        assert!(store.list_sessions().iter().all(|snapshot| snapshot.session_id != id));
+        assert_eq!(store.session_count(), 1);
     }
 
     #[tokio::test]
