@@ -307,6 +307,22 @@ Key files expected to change:
 - Scope caveats need to be repeated in the lowest-level diagnostics too; otherwise one older field
   name can undo the clarity gained in higher-level views.
 
+### 2026-03-17 - Overview JSON scope parity
+
+**By:** Codex
+
+**Actions:**
+- Added `live_client_scope` and `http_sessions_included` to overview JSON output so the overview
+  command now matches the same explicit live-client scope truth already present in `status` and
+  `clients`.
+
+**Verification:**
+- `cargo test -p plug views::overview -- --nocapture`
+
+**Learnings:**
+- Once scope truth exists on one machine-readable surface, leaving it out of a sibling command
+  recreates ambiguity for automation and scripted operators.
+
 ### 2026-03-17 - Server auth setup scaffolding slice
 
 **By:** Codex

@@ -46,6 +46,8 @@ pub(crate) async fn cmd_overview(
                 "linked_clients": linked_clients,
                 "live_client_count": live_client_count,
                 "live_client_support": live_client_support,
+                "live_client_scope": "daemon_proxy_only",
+                "http_sessions_included": false,
                 "next_actions": if !config_exists {
                     vec!["plug setup"]
                 } else if linked_clients.is_empty() {

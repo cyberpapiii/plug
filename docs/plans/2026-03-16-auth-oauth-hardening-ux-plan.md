@@ -127,6 +127,8 @@ Still remaining:
 - 2026-03-17: `plug doctor` runtime summaries now label daemon-managed client counts explicitly as
   `daemon_proxy_clients`, which keeps diagnostics aligned with the newer status/client scope
   caveats instead of reverting to an ambiguous `clients=` field.
+- 2026-03-17: overview JSON now exposes the same live-client scope metadata as `status` and
+  `clients`, so machine-readable output no longer lags behind the clarified text surfaces.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.
