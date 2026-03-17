@@ -490,3 +490,31 @@ Key files expected to change:
 - Inventory-style commands should degrade to config truth instead of failing outright.
 - Recovery guidance needs to follow the user across multiple surfaces; otherwise the same state
   still feels ambiguous depending on which command they happen to run first.
+
+### 2026-03-17 - Doctor runtime summary clarity slice
+
+**By:** Codex
+
+**Actions:**
+- Split the live runtime doctor output into a summary line plus a named `runtime_failures` line so
+  the daemon-wide view does not collapse into one blunt failure state.
+- Kept the summary at warning level when the daemon is running but some servers need attention,
+  while preserving a hard failure signal for the specific failed servers.
+- Added focused tests proving the summary/failure split and updated the interpretation tests to
+  follow the more explicit model.
+- Tightened cold HTTP reachability checks so doctor tries all resolved addresses with explicit DNS
+  timeout handling instead of trusting the first resolved socket only.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+- `cargo test -p plug-core doctor -- --nocapture`
+- `cargo build --release`
+
+**Learnings:**
+- Operators read "the daemon is up" and "these servers are failing" as two different questions, so
+  the command surface should encode them separately.
+- Reducing confusion sometimes means adding one extra explicit line, not compressing everything
+  into one status.
+- Cold connectivity checks need their own robustness work too, or they keep undermining the clearer
+  runtime/auth UX with avoidable false negatives.

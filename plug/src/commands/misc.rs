@@ -212,6 +212,8 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         let mut degraded = 0usize;
         let mut failed = 0usize;
         let mut auth_required = 0usize;
+        let mut failed_servers = Vec::new();
+        let mut degraded_servers = Vec::new();
 
         for server in servers
             .iter()
@@ -219,15 +221,19 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         {
             match server.health {
                 plug_core::types::ServerHealth::Healthy => healthy += 1,
-                plug_core::types::ServerHealth::Degraded => degraded += 1,
-                plug_core::types::ServerHealth::Failed => failed += 1,
+                plug_core::types::ServerHealth::Degraded => {
+                    degraded += 1;
+                    degraded_servers.push(server.server_id.clone());
+                }
+                plug_core::types::ServerHealth::Failed => {
+                    failed += 1;
+                    failed_servers.push(server.server_id.clone());
+                }
                 plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
             }
         }
 
-        let runtime_status = if failed > 0 {
-            plug_core::doctor::CheckStatus::Fail
-        } else if degraded > 0 || auth_required > 0 {
+        let runtime_status = if failed > 0 || degraded > 0 || auth_required > 0 {
             plug_core::doctor::CheckStatus::Warn
         } else {
             plug_core::doctor::CheckStatus::Pass
@@ -240,12 +246,36 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
                 "Daemon running: uptime={}s, clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
                 uptime_secs, clients, healthy, degraded, auth_required, failed
             ),
-            fix_suggestion: if failed > 0 || auth_required > 0 {
-                Some("Use `plug status` and `plug auth status` to inspect affected servers and next actions".to_string())
+            fix_suggestion: if failed > 0 || degraded > 0 || auth_required > 0 {
+                Some(
+                    "Use `plug status` for affected servers, then `plug auth status` for auth recovery details".to_string(),
+                )
             } else {
                 None
             },
         });
+
+        if !failed_servers.is_empty() {
+            checks.push(plug_core::doctor::CheckResult {
+                name: "runtime_failures".to_string(),
+                status: plug_core::doctor::CheckStatus::Fail,
+                message: format!("failing servers: {}", failed_servers.join(", ")),
+                fix_suggestion: Some(
+                    "Run `plug status` for the failing servers, then compare with `plug doctor` cold checks before restarting or editing config".to_string(),
+                ),
+            });
+        }
+
+        if !degraded_servers.is_empty() {
+            checks.push(plug_core::doctor::CheckResult {
+                name: "runtime_degraded".to_string(),
+                status: plug_core::doctor::CheckStatus::Warn,
+                message: format!("degraded servers: {}", degraded_servers.join(", ")),
+                fix_suggestion: Some(
+                    "Compare `plug status` and `plug doctor` to separate transient runtime degradation from cold connectivity or auth issues".to_string(),
+                ),
+            });
+        }
     }
 
     if let Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) =
@@ -302,49 +332,121 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
     checks
 }
 
+#[cfg(test)]
+fn runtime_health_checks_for_tests(
+    servers: &[plug_core::types::ServerStatus],
+    clients: usize,
+    uptime_secs: u64,
+) -> Vec<plug_core::doctor::CheckResult> {
+    let mut healthy = 0usize;
+    let mut degraded = 0usize;
+    let mut failed = 0usize;
+    let mut auth_required = 0usize;
+    let mut failed_servers = Vec::new();
+    let mut degraded_servers = Vec::new();
+
+    for server in servers.iter().filter(|s| s.server_id != "__plug_internal__") {
+        match server.health {
+            plug_core::types::ServerHealth::Healthy => healthy += 1,
+            plug_core::types::ServerHealth::Degraded => {
+                degraded += 1;
+                degraded_servers.push(server.server_id.clone());
+            }
+            plug_core::types::ServerHealth::Failed => {
+                failed += 1;
+                failed_servers.push(server.server_id.clone());
+            }
+            plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
+        }
+    }
+
+    let mut checks = vec![plug_core::doctor::CheckResult {
+        name: "runtime_health".to_string(),
+        status: if failed > 0 || degraded > 0 || auth_required > 0 {
+            plug_core::doctor::CheckStatus::Warn
+        } else {
+            plug_core::doctor::CheckStatus::Pass
+        },
+        message: format!(
+            "Daemon running: uptime={}s, clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
+            uptime_secs, clients, healthy, degraded, auth_required, failed
+        ),
+        fix_suggestion: None,
+    }];
+
+    if !failed_servers.is_empty() {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_failures".to_string(),
+            status: plug_core::doctor::CheckStatus::Fail,
+            message: format!("failing servers: {}", failed_servers.join(", ")),
+            fix_suggestion: None,
+        });
+    }
+
+    if !degraded_servers.is_empty() {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_degraded".to_string(),
+            status: plug_core::doctor::CheckStatus::Warn,
+            message: format!("degraded servers: {}", degraded_servers.join(", ")),
+            fix_suggestion: None,
+        });
+    }
+
+    checks
+}
+
 fn synthesize_doctor_interpretation(
     checks: &[plug_core::doctor::CheckResult],
 ) -> Option<plug_core::doctor::CheckResult> {
     let connectivity = checks.iter().find(|check| check.name == "server_connectivity")?;
     let runtime_health = checks.iter().find(|check| check.name == "runtime_health");
+    let runtime_failures = checks.iter().find(|check| check.name == "runtime_failures");
     let runtime_auth = checks.iter().find(|check| check.name == "runtime_auth");
 
     use plug_core::doctor::CheckStatus::{Fail, Pass, Warn};
 
     let (status, message, fix_suggestion) = match (
         &connectivity.status,
+        runtime_failures.map(|check| &check.status),
         runtime_health.map(|check| &check.status),
         runtime_auth.map(|check| &check.status),
     ) {
-        (Warn, Some(Pass), _) | (Warn, Some(Warn), _) => (
+        (Warn, Some(Fail), _, _) | (Fail, Some(Fail), _, _) => (
+            Fail,
+            "The daemon is already failing one or more servers, and cold connectivity is also worse than the current live runtime.".to_string(),
+            Some(
+                "Use `plug status` to identify the failing servers, then fix the reported cold connectivity issue before restarting the daemon.".to_string(),
+            ),
+        ),
+        (Warn, _, Some(Pass), _) | (Warn, _, Some(Warn), _) => (
             Warn,
             "Live daemon state is healthier than cold connectivity. Existing routed sessions are still running, but new connections after a restart may fail.".to_string(),
             Some(
                 "Use `plug status` for live runtime truth, then fix the cold connectivity issue before restarting the daemon.".to_string(),
             ),
         ),
-        (Pass, Some(Warn), Some(Warn)) | (Pass, Some(Warn), _) => (
-            Warn,
-            "Basic connectivity checks pass, but the running daemon still has degraded or auth-required servers.".to_string(),
-            Some(
-                "Use `plug auth status` and `plug status` to repair the affected runtime state before assuming the system is healthy.".to_string(),
-            ),
-        ),
-        (Pass, Some(Fail), _) => (
+        (Pass, Some(Fail), _, _) => (
             Fail,
             "Basic reachability looks fine, but the running daemon is currently failing one or more servers.".to_string(),
             Some(
                 "Use `plug status` for the failing servers, then compare with `plug doctor` to separate runtime failures from cold connectivity.".to_string(),
             ),
         ),
-        (Fail, Some(Pass), _) | (Fail, Some(Warn), _) => (
+        (Pass, _, Some(Warn), Some(Warn)) | (Pass, _, Some(Warn), _) => (
+            Warn,
+            "Basic connectivity checks pass, but the running daemon still has degraded or auth-required servers.".to_string(),
+            Some(
+                "Use `plug auth status` and `plug status` to repair the affected runtime state before assuming the system is healthy.".to_string(),
+            ),
+        ),
+        (Fail, _, Some(Pass), _) | (Fail, _, Some(Warn), _) => (
             Fail,
             "Cold connectivity is failing even though the daemon still has some live state. A restart would likely lose currently working routes.".to_string(),
             Some(
                 "Fix the reported connectivity failures before restarting the daemon or repairing client/server config.".to_string(),
             ),
         ),
-        (Pass, Some(Pass), Some(Warn)) => (
+        (Pass, _, Some(Pass), Some(Warn)) => (
             Warn,
             "The runtime is broadly healthy, but some servers still need auth attention or re-authorization.".to_string(),
             Some(
@@ -428,8 +530,9 @@ pub(crate) fn cmd_setup(config_path: Option<&std::path::PathBuf>, yes: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::synthesize_doctor_interpretation;
+    use super::{runtime_health_checks_for_tests, synthesize_doctor_interpretation};
     use plug_core::doctor::{CheckResult, CheckStatus};
+    use plug_core::types::{ServerHealth, ServerStatus};
 
     fn check(name: &str, status: CheckStatus, message: &str) -> CheckResult {
         CheckResult {
@@ -474,9 +577,10 @@ mod tests {
             ),
             check(
                 "runtime_health",
-                CheckStatus::Fail,
+                CheckStatus::Warn,
                 "Daemon running: uptime=20s, clients=2, healthy=1, degraded=0, auth_required=0, failed=2",
             ),
+            check("runtime_failures", CheckStatus::Fail, "failing servers: oura, notion"),
         ];
         let interpretation =
             synthesize_doctor_interpretation(&checks).expect("expected interpretation");
@@ -515,6 +619,48 @@ mod tests {
                 .message
                 .contains("need auth attention")
         );
+    }
+
+    #[test]
+    fn runtime_checks_split_summary_from_named_failures() {
+        let checks = runtime_health_checks_for_tests(
+            &[
+                ServerStatus {
+                    server_id: "healthy".to_string(),
+                    health: ServerHealth::Healthy,
+                    tool_count: 1,
+                    auth_status: "none".to_string(),
+                    last_seen: None,
+                },
+                ServerStatus {
+                    server_id: "oura".to_string(),
+                    health: ServerHealth::Failed,
+                    tool_count: 0,
+                    auth_status: "none".to_string(),
+                    last_seen: None,
+                },
+                ServerStatus {
+                    server_id: "notion".to_string(),
+                    health: ServerHealth::AuthRequired,
+                    tool_count: 0,
+                    auth_status: "oauth".to_string(),
+                    last_seen: None,
+                },
+            ],
+            4,
+            120,
+        );
+
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "runtime_health");
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(checks[0].message.contains("healthy=1"));
+        assert!(checks[0].message.contains("auth_required=1"));
+        assert!(checks[0].message.contains("failed=1"));
+
+        assert_eq!(checks[1].name, "runtime_failures");
+        assert_eq!(checks[1].status, CheckStatus::Fail);
+        assert_eq!(checks[1].message, "failing servers: oura");
     }
 }
 

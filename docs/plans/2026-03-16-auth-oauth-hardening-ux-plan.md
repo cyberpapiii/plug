@@ -72,6 +72,11 @@ Still remaining:
   protected discovery through the real HTTP router.
 - 2026-03-17: `plug doctor` now synthesizes an explicit interpretation when cold connectivity and
   live daemon state disagree, which reduces the biggest remaining diagnostics ambiguity.
+- 2026-03-17: `plug doctor` now separates the live runtime summary from named failing servers, so
+  "the daemon is up" and "these specific servers are failing" are surfaced as distinct operator
+  facts instead of one blunt red summary.
+- 2026-03-17: cold HTTP reachability checks now try all resolved addresses with bounded DNS
+  timeout handling, which reduces misleading failures on multi-address hosts.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
   full end-to-end command fixtures.
 

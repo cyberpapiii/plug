@@ -580,6 +580,8 @@ fn running_daemon_pid() -> Option<u32> {
 
 /// Check 9: try to start and initialize each server (5s timeout).
 async fn check_server_connectivity(config: &Config) -> CheckResult {
+    use futures::future::join_all;
+
     let name = "server_connectivity".to_string();
     let enabled_servers: Vec<&str> = config
         .servers
@@ -599,41 +601,50 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
 
     // We don't actually start servers in doctor mode — that would be disruptive.
     // Instead, we check that the basic requirements are met (binary exists, URL reachable).
-    let mut unreachable: Vec<String> = Vec::new();
-
-    for (server_name, server) in &config.servers {
+    let unreachable = join_all(config.servers.iter().filter_map(|(server_name, server)| {
         if !server.enabled {
-            continue;
+            return None;
         }
+
+        let server_name = server_name.clone();
         match server.transport {
             TransportType::Stdio => {
-                // For stdio, check that command exists (already covered by check_server_binaries)
-                // but also verify it's executable
-                if let Some(ref cmd) = server.command {
-                    let binary = cmd.split_whitespace().next().unwrap_or(cmd);
-                    if !binary.starts_with('$') {
-                        let found = if binary.starts_with('/') || binary.starts_with('.') {
-                            Path::new(binary).exists()
-                        } else {
-                            which(binary).is_some()
-                        };
-                        if !found {
-                            unreachable.push(format!("{server_name}: binary not found"));
+                let command = server.command.clone();
+                Some(async move {
+                    if let Some(cmd) = command {
+                        let binary = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
+                        if !binary.starts_with('$') {
+                            let found = if binary.starts_with('/') || binary.starts_with('.') {
+                                Path::new(&binary).exists()
+                            } else {
+                                which(&binary).is_some()
+                            };
+                            if !found {
+                                return Some(format!("{server_name}: binary not found"));
+                            }
                         }
                     }
-                }
+                    None
+                })
             }
             TransportType::Http | TransportType::Sse => {
-                // For HTTP/SSE servers, try a TCP connection to verify reachability
-                if let Some(ref url) = server.url {
-                    match check_http_reachable(url).await {
-                        Ok(()) => {}
-                        Err(e) => unreachable.push(format!("{server_name}: {e}")),
+                let url = server.url.clone();
+                Some(async move {
+                    if let Some(url) = url {
+                        return check_http_reachable(&url)
+                            .await
+                            .err()
+                            .map(|e| format!("{server_name}: {e}"));
                     }
-                }
+                    None
+                })
             }
         }
-    }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
 
     if unreachable.is_empty() {
         CheckResult {
@@ -671,8 +682,6 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
 
 /// Try to connect to an HTTP URL to verify basic reachability.
 async fn check_http_reachable(url: &str) -> Result<(), String> {
-    use std::net::ToSocketAddrs;
-
     let is_https = url.starts_with("https://");
     // Parse URL to extract host:port
     let url = url
@@ -687,25 +696,34 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
     };
 
     // DNS resolution + TCP connect with timeout
-    let socket_addrs: Vec<_> = addr
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed: {e}"))?
-        .collect();
+    let socket_addrs: Vec<_> = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host(&addr),
+    )
+    .await
+    .map_err(|_| "DNS resolution timed out (5s)".to_string())?
+    .map_err(|e| format!("DNS resolution failed: {e}"))?
+    .collect();
 
     if socket_addrs.is_empty() {
         return Err("DNS resolution returned no addresses".to_string());
     }
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::net::TcpStream::connect(socket_addrs[0]),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("TCP connect failed: {e}")),
-        Err(_) => Err("connection timed out (5s)".to_string()),
+    let mut last_error = None;
+    for socket_addr in socket_addrs {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(socket_addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => last_error = Some(format!("TCP connect failed: {e}")),
+            Err(_) => last_error = Some("connection timed out (5s)".to_string()),
+        }
     }
+
+    Err(last_error.unwrap_or_else(|| "connection failed".to_string()))
 }
 
 /// Check 9: detect duplicate or corrupted plug entries in AI client configs.
