@@ -148,7 +148,8 @@ pub(crate) async fn cmd_client_list(
             );
             println!(
                 "  {}",
-                style("--------------------------------------------------------------------------").dim()
+                style("--------------------------------------------------------------------------")
+                    .dim()
             );
             for session in &live_sessions {
                 let idle = session
@@ -242,7 +243,8 @@ mod tests {
 
     #[test]
     fn live_inventory_scope_text_mentions_daemon_and_http_gap() {
-        let text = live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
+        let text =
+            live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
         assert!(text.contains("daemon proxy clients"));
         assert!(text.contains("HTTP sessions"));
     }

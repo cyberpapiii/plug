@@ -9,7 +9,9 @@ use crate::{OutputFormat, ServerCommands};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteAuthSelection {
     None,
-    Bearer { token: String },
+    Bearer {
+        token: String,
+    },
     Oauth {
         client_id: Option<String>,
         scopes: Option<Vec<String>>,
@@ -23,7 +25,11 @@ fn parse_scope_list(value: &str) -> Option<Vec<String>> {
         .filter(|scope| !scope.is_empty())
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    if scopes.is_empty() { None } else { Some(scopes) }
+    if scopes.is_empty() {
+        None
+    } else {
+        Some(scopes)
+    }
 }
 
 fn parse_env_assignments(values: &[String]) -> anyhow::Result<HashMap<String, String>> {
@@ -106,11 +112,7 @@ fn prompt_remote_auth_selection(
     };
     let choice = Select::with_theme(&cli_prompt_theme())
         .with_prompt(format!("Auth for `{server_name}`"))
-        .items([
-            "none",
-            "bearer token",
-            "oauth (authorization-code + PKCE)",
-        ])
+        .items(["none", "bearer token", "oauth (authorization-code + PKCE)"])
         .default(default)
         .interact()?;
 
@@ -173,7 +175,9 @@ fn noninteractive_remote_auth_selection(
     oauth_scopes: Option<Vec<String>>,
 ) -> anyhow::Result<Option<RemoteAuthSelection>> {
     let inferred = match (
-        auth.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        auth.as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
         bearer_token.as_ref(),
         oauth_client_id.as_ref(),
         oauth_scopes.as_ref(),
@@ -182,7 +186,9 @@ fn noninteractive_remote_auth_selection(
         (Some("bearer"), _, _, _) | (None, Some(_), None, None) => {
             let token = bearer_token
                 .filter(|token| !token.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("`--bearer-token` is required when auth is bearer"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("`--bearer-token` is required when auth is bearer")
+                })?;
             Some(RemoteAuthSelection::Bearer { token })
         }
         (Some("oauth"), _, _, _) | (None, None, Some(_), _) | (None, None, None, Some(_)) => {
@@ -317,16 +323,15 @@ pub(crate) fn cmd_server_add(
 
     let provided_transport = transport.clone();
     let env_updates = parse_env_assignments(&env)?;
-    let non_interactive =
-        provided_transport.is_some()
-            || command.is_some()
-            || url.is_some()
-            || !args.is_empty()
-            || !env.is_empty()
-            || auth.is_some()
-            || bearer_token.is_some()
-            || oauth_client_id.is_some()
-            || oauth_scopes.is_some();
+    let non_interactive = provided_transport.is_some()
+        || command.is_some()
+        || url.is_some()
+        || !args.is_empty()
+        || !env.is_empty()
+        || auth.is_some()
+        || bearer_token.is_some()
+        || oauth_client_id.is_some()
+        || oauth_scopes.is_some();
     let transport = match transport {
         Some(value) => parse_transport(Some(value), &url)?,
         None if command.is_some() => plug_core::config::TransportType::Stdio,
@@ -650,7 +655,8 @@ pub(crate) async fn cmd_server_edit(
                             "`--url` is required when switching a stdio server to HTTP or SSE"
                         );
                     }
-                    server.transport = desired_transport.unwrap_or_else(|| server.transport.clone());
+                    server.transport =
+                        desired_transport.unwrap_or_else(|| server.transport.clone());
                     server.command = None;
                     server.args = Vec::new();
                     if let Some(url) = url {
@@ -742,7 +748,8 @@ mod tests {
     use super::*;
 
     fn test_config_path(prefix: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("plug-servers-{prefix}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("plug-servers-{prefix}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("config.toml")
     }
@@ -817,13 +824,13 @@ mod tests {
 
     #[test]
     fn parse_env_assignments_collects_key_values() {
-        let env = parse_env_assignments(&[
-            "FOO=bar".to_string(),
-            "TOKEN=abc=123".to_string(),
-        ])
-        .unwrap();
+        let env =
+            parse_env_assignments(&["FOO=bar".to_string(), "TOKEN=abc=123".to_string()]).unwrap();
         assert_eq!(env.get("FOO").map(|value| value.as_str()), Some("bar"));
-        assert_eq!(env.get("TOKEN").map(|value| value.as_str()), Some("abc=123"));
+        assert_eq!(
+            env.get("TOKEN").map(|value| value.as_str()),
+            Some("abc=123")
+        );
     }
 
     #[test]
@@ -836,7 +843,10 @@ mod tests {
             },
         );
         assert_eq!(server.auth, None);
-        assert_eq!(server.auth_token.as_ref().map(|s| s.as_str()), Some("secret"));
+        assert_eq!(
+            server.auth_token.as_ref().map(|s| s.as_str()),
+            Some("secret")
+        );
         assert_eq!(server.oauth_client_id, None);
         assert_eq!(server.oauth_scopes, None);
     }
@@ -877,13 +887,9 @@ mod tests {
 
     #[test]
     fn noninteractive_remote_auth_selection_infers_bearer() {
-        let selection = noninteractive_remote_auth_selection(
-            None,
-            Some("secret".to_string()),
-            None,
-            None,
-        )
-        .unwrap();
+        let selection =
+            noninteractive_remote_auth_selection(None, Some("secret".to_string()), None, None)
+                .unwrap();
         assert_eq!(
             selection,
             Some(RemoteAuthSelection::Bearer {
@@ -1031,7 +1037,10 @@ mod tests {
 
         let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
         let saved_server = saved.servers.get("demo").unwrap();
-        assert_eq!(saved_server.transport, plug_core::config::TransportType::Stdio);
+        assert_eq!(
+            saved_server.transport,
+            plug_core::config::TransportType::Stdio
+        );
         assert_eq!(saved_server.command.as_deref(), Some("node"));
         assert_eq!(saved_server.args, vec!["server.js".to_string()]);
         assert!(saved_server.url.is_none());
@@ -1063,7 +1072,10 @@ mod tests {
 
         let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
         let saved_server = saved.servers.get("demo").unwrap();
-        assert_eq!(saved_server.env.get("FOO").map(|value| value.as_str()), Some("bar"));
+        assert_eq!(
+            saved_server.env.get("FOO").map(|value| value.as_str()),
+            Some("bar")
+        );
         assert_eq!(
             saved_server.env.get("TOKEN").map(|value| value.as_str()),
             Some("abc=123")
@@ -1100,7 +1112,10 @@ mod tests {
 
         let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
         let saved_server = saved.servers.get("demo").unwrap();
-        assert_eq!(saved_server.env.get("NEW").map(|value| value.as_str()), Some("value"));
+        assert_eq!(
+            saved_server.env.get("NEW").map(|value| value.as_str()),
+            Some("value")
+        );
         assert_eq!(
             saved_server.env.get("KEEP").map(|value| value.as_str()),
             Some("still")
@@ -1133,6 +1148,10 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error.to_string().contains("env flags only apply to stdio upstream servers"));
+        assert!(
+            error
+                .to_string()
+                .contains("env flags only apply to stdio upstream servers")
+        );
     }
 }

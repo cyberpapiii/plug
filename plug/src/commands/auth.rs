@@ -438,7 +438,10 @@ async fn cmd_auth_status(
             println!();
             println!("{}", style("OAuth Server Status").bold());
             println!("{}", style("─".repeat(50)).dim());
-            println!("{}", style(auth_status_scope_text(live_auth_status.is_some())).dim());
+            println!(
+                "{}",
+                style(auth_status_scope_text(live_auth_status.is_some())).dim()
+            );
             println!();
 
             for (name, sc) in &oauth_servers {

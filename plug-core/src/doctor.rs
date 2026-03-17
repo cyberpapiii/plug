@@ -607,44 +607,46 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
         .servers
         .iter()
         .filter_map(|(server_name, server)| {
-        if !server.enabled {
-            return None;
-        }
+            if !server.enabled {
+                return None;
+            }
 
-        let server_name = server_name.clone();
-        match server.transport {
-            TransportType::Stdio => {
-                let command = server.command.clone();
-                Some(Box::pin(async move {
-                    if let Some(cmd) = command {
-                        let binary = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
-                        if !binary.starts_with('$') {
-                            let found = if binary.starts_with('/') || binary.starts_with('.') {
-                                Path::new(&binary).exists()
-                            } else {
-                                which(&binary).is_some()
-                            };
-                            if !found {
-                                return Some(format!("{server_name}: binary not found"));
+            let server_name = server_name.clone();
+            match server.transport {
+                TransportType::Stdio => {
+                    let command = server.command.clone();
+                    Some(Box::pin(async move {
+                        if let Some(cmd) = command {
+                            let binary = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
+                            if !binary.starts_with('$') {
+                                let found = if binary.starts_with('/') || binary.starts_with('.') {
+                                    Path::new(&binary).exists()
+                                } else {
+                                    which(&binary).is_some()
+                                };
+                                if !found {
+                                    return Some(format!("{server_name}: binary not found"));
+                                }
                             }
                         }
-                    }
-                    None
-                }) as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
+                        None
+                    })
+                        as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
+                }
+                TransportType::Http | TransportType::Sse => {
+                    let url = server.url.clone();
+                    Some(Box::pin(async move {
+                        if let Some(url) = url {
+                            return check_http_reachable(&url)
+                                .await
+                                .err()
+                                .map(|e| format!("{server_name}: {e}"));
+                        }
+                        None
+                    })
+                        as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
+                }
             }
-            TransportType::Http | TransportType::Sse => {
-                let url = server.url.clone();
-                Some(Box::pin(async move {
-                    if let Some(url) = url {
-                        return check_http_reachable(&url)
-                            .await
-                            .err()
-                            .map(|e| format!("{server_name}: {e}"));
-                    }
-                    None
-                }) as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
-            }
-        }
         })
         .collect();
     let unreachable = join_all(connectivity_checks)

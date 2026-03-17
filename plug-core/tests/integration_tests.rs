@@ -1975,7 +1975,9 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
             "stdio mock should contribute its echo tool"
         );
         assert_eq!(
-            status_map.get(&oauth_healthy).map(|s| s.auth_status.as_str()),
+            status_map
+                .get(&oauth_healthy)
+                .map(|s| s.auth_status.as_str()),
             Some("oauth")
         );
         assert_eq!(

@@ -129,7 +129,10 @@ pub(crate) async fn cmd_overview(
     match live_client_support {
         LiveClientSupport::Supported => {
             print_label_value("Live", style(live_client_count).bold());
-            print_label_value("Live Scope", live_client_count_scope_text(live_inventory_scope));
+            print_label_value(
+                "Live Scope",
+                live_client_count_scope_text(live_inventory_scope),
+            );
         }
         LiveClientSupport::DaemonRestartRequired => {
             print_label_value("Live", style("restart required").yellow().bold());
@@ -284,7 +287,9 @@ pub(crate) async fn cmd_status(
             print_label_value("Clients", style(clients.to_string()).bold());
             print_label_value(
                 "Client Scope",
-                live_client_count_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly),
+                live_client_count_scope_text(
+                    plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+                ),
             );
             if !linked_clients.is_empty() {
                 let linked_summary = linked_clients
@@ -520,7 +525,9 @@ mod tests {
 
     #[test]
     fn live_client_count_scope_text_mentions_daemon_and_http_gap() {
-        let text = live_client_count_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
+        let text = live_client_count_scope_text(
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+        );
         assert!(text.contains("daemon proxy clients"));
         assert!(text.contains("HTTP sessions"));
     }

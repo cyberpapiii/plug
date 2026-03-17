@@ -300,7 +300,10 @@ fn runtime_health_checks_for_tests(
     let mut failed_servers = Vec::new();
     let mut degraded_servers = Vec::new();
 
-    for server in servers.iter().filter(|s| s.server_id != "__plug_internal__") {
+    for server in servers
+        .iter()
+        .filter(|s| s.server_id != "__plug_internal__")
+    {
         match server.health {
             plug_core::types::ServerHealth::Healthy => healthy += 1,
             plug_core::types::ServerHealth::Degraded => {
@@ -353,7 +356,9 @@ fn runtime_health_checks_for_tests(
 fn synthesize_doctor_interpretation(
     checks: &[plug_core::doctor::CheckResult],
 ) -> Option<plug_core::doctor::CheckResult> {
-    let connectivity = checks.iter().find(|check| check.name == "server_connectivity")?;
+    let connectivity = checks
+        .iter()
+        .find(|check| check.name == "server_connectivity")?;
     let runtime_health = checks.iter().find(|check| check.name == "runtime_health");
     let runtime_failures = checks.iter().find(|check| check.name == "runtime_failures");
     let runtime_auth_attention = checks.iter().any(|check| {
@@ -573,10 +578,7 @@ fn repair_export_endpoint(
     })
 }
 
-fn repair_targets(
-    requested: Vec<String>,
-    all: bool,
-) -> anyhow::Result<Vec<String>> {
+fn repair_targets(requested: Vec<String>, all: bool) -> anyhow::Result<Vec<String>> {
     let known_targets = crate::commands::clients::all_client_targets()
         .iter()
         .map(|(_, target)| (*target).to_string())
@@ -601,10 +603,7 @@ fn repair_targets(
     }
 
     if !unknown.is_empty() {
-        anyhow::bail!(
-            "unknown client target(s): {}",
-            unknown.join(", ")
-        );
+        anyhow::bail!("unknown client target(s): {}", unknown.join(", "));
     }
 
     selected.sort_unstable();
@@ -616,8 +615,7 @@ fn repair_targets(
 mod tests {
     use super::{
         doctor_check_details, repair_export_endpoint, repair_targets, runtime_auth_checks,
-        runtime_health_checks_for_tests,
-        synthesize_doctor_interpretation,
+        runtime_health_checks_for_tests, synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
     use plug_core::ipc::IpcAuthServerInfo;
@@ -669,7 +667,11 @@ mod tests {
                 CheckStatus::Warn,
                 "Daemon running: uptime=20s, daemon_proxy_clients=2, healthy=1, degraded=0, auth_required=0, failed=2",
             ),
-            check("runtime_failures", CheckStatus::Fail, "failing servers: oura, notion"),
+            check(
+                "runtime_failures",
+                CheckStatus::Fail,
+                "failing servers: oura, notion",
+            ),
         ];
         let interpretation =
             synthesize_doctor_interpretation(&checks).expect("expected interpretation");
@@ -694,7 +696,11 @@ mod tests {
                 CheckStatus::Warn,
                 "Daemon running: uptime=20s, daemon_proxy_clients=2, healthy=1, degraded=0, auth_required=0, failed=1",
             ),
-            check("runtime_failures", CheckStatus::Fail, "failing servers: oura"),
+            check(
+                "runtime_failures",
+                CheckStatus::Fail,
+                "failing servers: oura",
+            ),
         ];
         let interpretation =
             synthesize_doctor_interpretation(&checks).expect("expected interpretation");
@@ -735,11 +741,7 @@ mod tests {
         let interpretation =
             synthesize_doctor_interpretation(&checks).expect("expected interpretation");
         assert_eq!(interpretation.status, CheckStatus::Warn);
-        assert!(
-            interpretation
-                .message
-                .contains("need auth attention")
-        );
+        assert!(interpretation.message.contains("need auth attention"));
     }
 
     #[test]
@@ -850,11 +852,13 @@ mod tests {
         assert_eq!(checks.len(), 3);
         assert_eq!(checks[0].name, "runtime_auth_missing");
         assert_eq!(checks[0].message, "missing credentials: notion");
-        assert!(checks[0]
-            .fix_suggestion
-            .as_deref()
-            .unwrap_or_default()
-            .contains("plug auth login --server <name>"));
+        assert!(
+            checks[0]
+                .fix_suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("plug auth login --server <name>")
+        );
 
         assert_eq!(checks[1].name, "runtime_auth_reauth");
         assert_eq!(checks[1].message, "re-auth required: supabase");
@@ -927,8 +931,7 @@ pub(crate) fn cmd_repair(
     for target in repair_targets {
         if let Some(linked) = crate::commands::clients::linked_client_config(&target, false) {
             print!("  {} Refreshing {}... ", style("›").cyan().bold(), target);
-            let export_endpoint =
-                repair_export_endpoint(linked.endpoint.as_deref(), config_path);
+            let export_endpoint = repair_export_endpoint(linked.endpoint.as_deref(), config_path);
             if let Err(e) = execute_export(
                 &target,
                 matches!(linked.transport, plug_core::export::ExportTransport::Http),

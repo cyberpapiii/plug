@@ -8,8 +8,8 @@ use crate::commands::servers::{
 use crate::runtime::ensure_daemon_with_feedback;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
-    print_label_value, status_label, status_marker, summarize_server_auth,
-    summarize_server_target, summarize_server_transport,
+    print_label_value, status_label, status_marker, summarize_server_auth, summarize_server_target,
+    summarize_server_transport,
 };
 
 async fn prompt_server_actions(

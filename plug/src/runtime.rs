@@ -47,13 +47,11 @@ pub(crate) async fn fetch_live_sessions() -> (
                 LiveClientSupport::Supported,
             )
         }
-        Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => {
-            (
-                Vec::new(),
-                plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-                LiveClientSupport::DaemonRestartRequired,
-            )
-        }
+        Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => (
+            Vec::new(),
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            LiveClientSupport::DaemonRestartRequired,
+        ),
         _ => (
             Vec::new(),
             plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,

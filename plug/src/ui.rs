@@ -253,7 +253,9 @@ pub(crate) fn summarize_server_transport(
     }
 }
 
-pub(crate) fn summarize_server_auth(server: Option<&plug_core::config::ServerConfig>) -> &'static str {
+pub(crate) fn summarize_server_auth(
+    server: Option<&plug_core::config::ServerConfig>,
+) -> &'static str {
     match server {
         Some(server) => match (server.auth.as_deref(), server.auth_token.is_some()) {
             (Some("oauth"), _) => "oauth",
