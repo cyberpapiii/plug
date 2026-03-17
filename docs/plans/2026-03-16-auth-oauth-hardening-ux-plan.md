@@ -121,6 +121,9 @@ Still remaining:
 - 2026-03-17: `plug auth status` now states whether it is using live daemon auth/runtime truth or
   stored-credential fallback, so daemon-unavailable output is no longer silently presented as if it
   were live runtime state.
+- 2026-03-17: `plug repair` now honors the active `--config` path when deriving the downstream
+  HTTP endpoint fallback, so repair no longer risks silently regenerating linked client configs
+  against the default config topology.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.

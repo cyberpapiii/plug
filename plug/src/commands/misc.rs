@@ -563,10 +563,21 @@ pub(crate) fn cmd_setup(
     Ok(())
 }
 
+fn repair_export_endpoint(
+    linked_endpoint: Option<&str>,
+    config_path: Option<&std::path::PathBuf>,
+) -> String {
+    linked_endpoint.map(str::to_owned).unwrap_or_else(|| {
+        crate::commands::clients::configured_http_export_url(config_path)
+            .unwrap_or_else(|| "http://localhost:3282/mcp".to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        doctor_check_details, runtime_auth_checks, runtime_health_checks_for_tests,
+        doctor_check_details, repair_export_endpoint, runtime_auth_checks,
+        runtime_health_checks_for_tests,
         synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
@@ -836,9 +847,15 @@ mod tests {
 
         assert_eq!(rendered, "Config file valid");
     }
+
+    #[test]
+    fn repair_export_endpoint_prefers_linked_endpoint_when_present() {
+        let endpoint = repair_export_endpoint(Some("https://plug.example.com/mcp"), None);
+        assert_eq!(endpoint, "https://plug.example.com/mcp");
+    }
 }
 
-pub(crate) fn cmd_repair() -> anyhow::Result<()> {
+pub(crate) fn cmd_repair(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     println!(
         "{} {}",
         style("◆").cyan().bold(),
@@ -871,12 +888,12 @@ pub(crate) fn cmd_repair() -> anyhow::Result<()> {
     for target in all_clients {
         if let Some(linked) = crate::commands::clients::linked_client_config(target, false) {
             print!("  {} Refreshing {}... ", style("›").cyan().bold(), target);
-            let http_url = crate::commands::clients::configured_http_export_url(None)
-                .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
+            let export_endpoint =
+                repair_export_endpoint(linked.endpoint.as_deref(), config_path);
             if let Err(e) = execute_export(
                 target,
                 matches!(linked.transport, plug_core::export::ExportTransport::Http),
-                linked.endpoint.as_deref().unwrap_or(http_url.as_str()),
+                export_endpoint.as_str(),
                 true,
                 false,
             ) {

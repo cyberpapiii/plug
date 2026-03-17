@@ -247,6 +247,27 @@ Key files expected to change:
 - The same recovery verb does not apply to every auth warning; splitting categories makes the next
   action deterministic and keeps `doctor` aligned with `auth status`.
 
+### 2026-03-17 - Repair config-path parity
+
+**By:** Codex
+
+**Actions:**
+- Wired `plug repair` through the global `--config` path instead of always falling back to the
+  default config location.
+- Centralized repair endpoint selection so it prefers the linked client's explicit endpoint and
+  otherwise derives the HTTP export endpoint from the active config path.
+- Added focused test coverage for the endpoint-selection helper.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug tests::serve_command -- --nocapture`
+
+**Learnings:**
+- Topology-preserving repair was still incomplete as long as the command could silently read the
+  wrong config baseline.
+- Config-aware endpoint derivation has to stay consistent across `link`, `export`, `setup`, and
+  `repair` or the operator model drifts again.
+
 ### 2026-03-17 - Auth status source-truth clarification
 
 **By:** Codex
