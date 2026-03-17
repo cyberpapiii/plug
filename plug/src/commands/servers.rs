@@ -225,7 +225,30 @@ pub(crate) async fn cmd_server_command(
             disabled,
         ),
         ServerCommands::Remove { name, yes } => cmd_server_remove(config_path, name, yes),
-        ServerCommands::Edit { name } => cmd_server_edit(config_path, name, output).await,
+        ServerCommands::Edit {
+            name,
+            command,
+            url,
+            args,
+            auth,
+            bearer_token,
+            oauth_client_id,
+            oauth_scopes,
+        } => {
+            cmd_server_edit(
+                config_path,
+                name,
+                command,
+                url,
+                args,
+                auth,
+                bearer_token,
+                oauth_client_id,
+                oauth_scopes,
+                output,
+            )
+            .await
+        }
         ServerCommands::Enable { name } => cmd_server_set_enabled(config_path, name, true),
         ServerCommands::Disable { name } => cmd_server_set_enabled(config_path, name, false),
     }
@@ -449,6 +472,13 @@ pub(crate) fn cmd_server_remove(
 pub(crate) async fn cmd_server_edit(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
+    command: Option<String>,
+    url: Option<String>,
+    args: Option<Vec<String>>,
+    auth: Option<String>,
+    bearer_token: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_scopes: Option<Vec<String>>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let (path, mut config) = load_editable_config(config_path)?;
@@ -471,6 +501,14 @@ pub(crate) async fn cmd_server_edit(
         }
     };
 
+    let non_interactive = command.is_some()
+        || url.is_some()
+        || args.is_some()
+        || auth.is_some()
+        || bearer_token.is_some()
+        || oauth_client_id.is_some()
+        || oauth_scopes.is_some();
+
     let oauth_enabled = {
         let server = config
             .servers
@@ -482,40 +520,79 @@ pub(crate) async fn cmd_server_edit(
             return Ok(());
         }
 
-        let enabled = Confirm::with_theme(&cli_prompt_theme())
-            .with_prompt("Enabled?")
-            .default(server.enabled)
-            .interact()?;
-        server.enabled = enabled;
-
         match server.transport {
             plug_core::config::TransportType::Stdio => {
-                let command: String = Input::with_theme(&cli_prompt_theme())
-                    .with_prompt("Command")
-                    .with_initial_text(server.command.clone().unwrap_or_default())
-                    .interact_text()?;
-                let args: String = Input::with_theme(&cli_prompt_theme())
-                    .with_prompt("Args (space-separated)")
-                    .with_initial_text(server.args.join(" "))
-                    .allow_empty(true)
-                    .interact_text()?;
-                server.command = Some(command);
-                server.args = if args.trim().is_empty() {
-                    Vec::new()
+                if auth.is_some()
+                    || bearer_token.is_some()
+                    || oauth_client_id.is_some()
+                    || oauth_scopes.is_some()
+                    || url.is_some()
+                {
+                    anyhow::bail!(
+                        "remote auth and URL flags only apply to HTTP or SSE upstream servers"
+                    );
+                }
+                if non_interactive {
+                    if let Some(command) = command {
+                        server.command = Some(command);
+                    }
+                    if let Some(args) = args {
+                        server.args = args;
+                    }
                 } else {
-                    args.split_whitespace()
-                        .map(|part| part.to_string())
-                        .collect()
-                };
+                    let enabled = Confirm::with_theme(&cli_prompt_theme())
+                        .with_prompt("Enabled?")
+                        .default(server.enabled)
+                        .interact()?;
+                    server.enabled = enabled;
+
+                    let command: String = Input::with_theme(&cli_prompt_theme())
+                        .with_prompt("Command")
+                        .with_initial_text(server.command.clone().unwrap_or_default())
+                        .interact_text()?;
+                    let args: String = Input::with_theme(&cli_prompt_theme())
+                        .with_prompt("Args (space-separated)")
+                        .with_initial_text(server.args.join(" "))
+                        .allow_empty(true)
+                        .interact_text()?;
+                    server.command = Some(command);
+                    server.args = if args.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        args.split_whitespace()
+                            .map(|part| part.to_string())
+                            .collect()
+                    };
+                }
             }
             plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
-                let url: String = Input::with_theme(&cli_prompt_theme())
-                    .with_prompt("URL")
-                    .with_initial_text(server.url.clone().unwrap_or_default())
-                    .interact_text()?;
-                server.url = Some(url);
-                let selection = prompt_remote_auth_selection(&name, Some(server))?;
-                apply_remote_auth_selection(server, selection);
+                if non_interactive {
+                    if let Some(url) = url {
+                        server.url = Some(url);
+                    }
+                    if let Some(selection) = noninteractive_remote_auth_selection(
+                        auth,
+                        bearer_token,
+                        oauth_client_id,
+                        oauth_scopes,
+                    )? {
+                        apply_remote_auth_selection(server, selection);
+                    }
+                } else {
+                    let enabled = Confirm::with_theme(&cli_prompt_theme())
+                        .with_prompt("Enabled?")
+                        .default(server.enabled)
+                        .interact()?;
+                    server.enabled = enabled;
+
+                    let url: String = Input::with_theme(&cli_prompt_theme())
+                        .with_prompt("URL")
+                        .with_initial_text(server.url.clone().unwrap_or_default())
+                        .interact_text()?;
+                    server.url = Some(url);
+                    let selection = prompt_remote_auth_selection(&name, Some(server))?;
+                    apply_remote_auth_selection(server, selection);
+                }
             }
         }
 
@@ -712,5 +789,13 @@ mod tests {
                 .to_string()
                 .contains("`--bearer-token` cannot be combined with oauth auth options")
         );
+    }
+
+    #[test]
+    fn noninteractive_remote_auth_selection_none_clears_auth() {
+        let selection =
+            noninteractive_remote_auth_selection(Some("none".to_string()), None, None, None)
+                .unwrap();
+        assert_eq!(selection, Some(RemoteAuthSelection::None));
     }
 }

@@ -228,6 +228,20 @@ pub(crate) enum ServerCommands {
     },
     Edit {
         name: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        args: Option<Vec<String>>,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        bearer_token: Option<String>,
+        #[arg(long)]
+        oauth_client_id: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        oauth_scopes: Option<Vec<String>>,
     },
     Enable {
         name: Option<String>,

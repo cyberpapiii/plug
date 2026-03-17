@@ -47,7 +47,19 @@ async fn prompt_server_actions(
             Ok(true)
         }
         Some(2) => {
-            cmd_server_edit(config_path, None, output).await?;
+            cmd_server_edit(
+                config_path,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                output,
+            )
+            .await?;
             Ok(true)
         }
         Some(3) => {

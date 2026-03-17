@@ -333,6 +333,36 @@ Key files expected to change:
   end-to-end doctor/runtime scenarios if we want the same confidence level as the auth/topology
   integration matrix.
 
+### 2026-03-17 - Scripted upstream edit parity slice
+
+**By:** Codex
+
+**Actions:**
+- Extended `plug server edit` with non-interactive field updates for:
+  - `--command`
+  - `--args`
+  - `--url`
+  - `--auth`
+  - `--bearer-token`
+  - `--oauth-client-id`
+  - `--oauth-scopes`
+- Reused the same auth-intent inference and conflicting-flag validation as `server add` so scripted
+  maintenance does not behave differently from scripted creation.
+- Kept remote auth and URL flags scoped to HTTP/SSE servers and rejected those flags on stdio
+  servers to avoid misleading partial updates.
+
+**Verification:**
+- `cargo test -p plug commands::servers::tests -- --nocapture`
+- `cargo test -p plug tests::serve_command -- --nocapture`
+- `cargo test -p plug views::servers -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The product no longer has a sharp divide between “you can script server creation” and “you must
+  click through prompts to maintain it.”
+- The remaining scripted-config gap is narrower now: transport-shape changes and deeper server
+  mutation flows still need deliberate UX design rather than more raw flags.
+
 ### 2026-03-16 - Client topology fidelity slice
 
 **By:** Codex
