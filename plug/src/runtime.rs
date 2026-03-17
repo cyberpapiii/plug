@@ -179,6 +179,82 @@ fn build_runtime_router(
     plug_core::http::server::build_router(http_state).merge(operator_router)
 }
 
+struct ConfiguredHttpRuntime {
+    router: Router,
+    sessions: Arc<dyn plug_core::session::SessionStore>,
+}
+
+fn build_configured_http_runtime(
+    config: &plug_core::config::Config,
+    engine: &Arc<plug_core::engine::Engine>,
+) -> anyhow::Result<ConfiguredHttpRuntime> {
+    let (expiry_tx, mut expiry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sessions: Arc<dyn plug_core::session::SessionStore> = Arc::new(
+        plug_core::session::StatefulSessionStore::new(
+            config.http.session_timeout_secs,
+            config.http.max_sessions,
+        )
+        .with_expiry_notifier(expiry_tx),
+    );
+    sessions.spawn_cleanup_task(engine.cancel_token().clone());
+    let tool_router = engine.tool_router().clone();
+    let auth_token = resolve_downstream_bearer_token(&config.http)?;
+    let operator_token = Arc::<str>::from(
+        plug_core::auth::load_or_generate_token(&plug_core::auth::http_operator_token_path(
+            config.http.port,
+        ))?,
+    );
+    let downstream_oauth =
+        plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
+            .map(plug_core::downstream_oauth::DownstreamOauthManager::new);
+
+    let http_state = Arc::new(plug_core::http::server::HttpState {
+        router: tool_router.clone(),
+        sessions: Arc::clone(&sessions),
+        cancel: engine.cancel_token().clone(),
+        auth_mode: config.http.auth_mode.clone(),
+        downstream_oauth,
+        sse_channel_capacity: config.http.sse_channel_capacity,
+        allowed_origins: config
+            .http
+            .allowed_origins
+            .iter()
+            .cloned()
+            .map(Arc::<str>::from)
+            .collect(),
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
+    });
+
+    let http_state_for_expiry = Arc::clone(&http_state);
+    tokio::spawn(async move {
+        while let Some(session_id) = expiry_rx.recv().await {
+            let target = plug_core::notifications::NotificationTarget::Http {
+                session_id: Arc::from(session_id.as_str()),
+            };
+            tool_router.cleanup_subscriptions_for_target(&target).await;
+            http_state_for_expiry.roots_capable_sessions.remove(&session_id);
+            http_state_for_expiry.client_capabilities.remove(&session_id);
+            http_state_for_expiry
+                .pending_client_requests
+                .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
+            if tool_router.clear_roots_for_target(&target) {
+                tool_router.forward_roots_list_changed_to_upstreams().await;
+            }
+            tool_router.remove_client_log_level(&session_id);
+        }
+    });
+
+    Ok(ConfiguredHttpRuntime {
+        router: build_runtime_router(http_state, operator_token),
+        sessions,
+    })
+}
+
 fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
     let scheme = if http.tls_cert_path.is_some() && http.tls_key_path.is_some() {
         "https"
@@ -325,6 +401,14 @@ pub(crate) async fn fetch_live_sessions(
                 LiveClientSupport::Supported,
             ),
         };
+
+    if matches!(
+        daemon_scope,
+        plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+    ) {
+        let sessions = daemon_source.into_sessions();
+        return (sessions, daemon_scope, support);
+    }
 
     let http_source = fetch_http_live_sessions(config_path).await;
 
@@ -575,8 +659,10 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
     let config = plug_core::config::load_config(Some(&config_path))?;
+    preflight_http_bind(&config.http)?;
     let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
+    let http_runtime = build_configured_http_runtime(&engine.config(), &engine)?;
     let cancel = engine.cancel_token().clone();
     plug_core::watcher::spawn_config_watcher(
         engine.clone(),
@@ -584,13 +670,20 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         cancel.clone(),
         engine.tracker(),
     );
+    let http_config = engine.config().http.clone();
+    let http_future = serve_router(http_runtime.router, &http_config, engine.cancel_token().clone());
+    tokio::pin!(http_future);
     let daemon_future = daemon::run_daemon(
         engine.clone(),
         config_path,
         engine.config().daemon_grace_period_secs,
+        Some(http_runtime.sessions),
     );
     tokio::pin!(daemon_future);
     tokio::select! {
+        result = &mut http_future => {
+            result?;
+        }
         result = &mut daemon_future => {
             result?;
         }
@@ -617,74 +710,13 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
     let config = plug_core::config::load_config(config_path)?;
     let engine = Arc::new(plug_core::engine::Engine::new(config.clone()));
     engine.start().await?;
-    let (expiry_tx, mut expiry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let sessions: Arc<dyn plug_core::session::SessionStore> = Arc::new(
-        plug_core::session::StatefulSessionStore::new(
-            config.http.session_timeout_secs,
-            config.http.max_sessions,
-        )
-        .with_expiry_notifier(expiry_tx),
-    );
-    sessions.spawn_cleanup_task(engine.cancel_token().clone());
-    let tool_router = engine.tool_router().clone();
-    let auth_token = resolve_downstream_bearer_token(&config.http)?;
-    let operator_token = Arc::<str>::from(
-        plug_core::auth::load_or_generate_token(&plug_core::auth::http_operator_token_path(
-            config.http.port,
-        ))?,
-    );
-    let downstream_oauth =
-        plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
-            .map(plug_core::downstream_oauth::DownstreamOauthManager::new);
-
-    let http_state = Arc::new(plug_core::http::server::HttpState {
-        router: tool_router.clone(),
-        sessions,
-        cancel: engine.cancel_token().clone(),
-        auth_mode: config.http.auth_mode.clone(),
-        downstream_oauth,
-        sse_channel_capacity: config.http.sse_channel_capacity,
-        allowed_origins: config
-            .http
-            .allowed_origins
-            .iter()
-            .cloned()
-            .map(Arc::<str>::from)
-            .collect(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
-
-    // Spawn cleanup listener for expired HTTP sessions — handles
-    // resource subscription cleanup, roots cache cleanup, and per-client log level removal.
-    let http_state_for_expiry = Arc::clone(&http_state);
-    tokio::spawn(async move {
-        while let Some(session_id) = expiry_rx.recv().await {
-            let target = plug_core::notifications::NotificationTarget::Http {
-                session_id: Arc::from(session_id.as_str()),
-            };
-            tool_router.cleanup_subscriptions_for_target(&target).await;
-            http_state_for_expiry
-                .roots_capable_sessions
-                .remove(&session_id);
-            http_state_for_expiry
-                .client_capabilities
-                .remove(&session_id);
-            http_state_for_expiry
-                .pending_client_requests
-                .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
-            if tool_router.clear_roots_for_target(&target) {
-                tool_router.forward_roots_list_changed_to_upstreams().await;
-            }
-            tool_router.remove_client_log_level(&session_id);
-        }
-    });
-    let router = build_runtime_router(http_state, operator_token);
-    serve_router(router, &config.http, engine.cancel_token().clone()).await?;
+    let http_runtime = build_configured_http_runtime(&config, &engine)?;
+    serve_router(
+        http_runtime.router,
+        &config.http,
+        engine.cancel_token().clone(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -711,6 +743,14 @@ fn resolve_downstream_bearer_token(
         }
         plug_core::config::DownstreamAuthMode::Oauth => Ok(None),
     }
+}
+
+fn preflight_http_bind(http: &plug_core::config::HttpConfig) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("{}:{}", http.bind_address, http.port).parse()?;
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|error| anyhow::anyhow!("failed to bind downstream HTTP address {addr}: {error}"))?;
+    drop(listener);
+    Ok(())
 }
 
 async fn serve_router(

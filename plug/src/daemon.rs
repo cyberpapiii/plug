@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use plug_core::engine::Engine;
 use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse};
 use plug_core::proxy::DownstreamBridge;
+use plug_core::session::SessionStore;
 
 /// Maximum concurrent IPC connections.
 const MAX_IPC_CONNECTIONS: usize = 32;
@@ -388,6 +389,7 @@ pub async fn run_daemon(
     engine: Arc<Engine>,
     config_path: PathBuf,
     grace_period_secs: u64,
+    http_sessions: Option<Arc<dyn SessionStore>>,
 ) -> anyhow::Result<()> {
     let rt_dir = runtime_dir();
     let log_directory = log_dir();
@@ -441,7 +443,8 @@ pub async fn run_daemon(
     let client_registry = Arc::new(client_registry);
 
     // Grace period: when the last proxy client disconnects, start a countdown.
-    // If no new client connects before it fires, shut down the daemon.
+    // If no new client reconnects and no daemon-owned HTTP sessions remain when it
+    // fires, shut down the daemon.
     // A grace_period_secs of 0 means disable auto-shutdown (explicit shutdown only).
     let grace_cancel = CancellationToken::new();
 
@@ -449,6 +452,7 @@ pub async fn run_daemon(
         let grace_token = grace_cancel.clone();
         let daemon_cancel = cancel.clone();
         let mut count_rx = count_rx;
+        let http_sessions = http_sessions.clone();
         tokio::spawn(async move {
             loop {
                 // Wait for a change in client count
@@ -465,11 +469,20 @@ pub async fn run_daemon(
 
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
-                            // Grace period expired — recheck count
-                            if *count_rx.borrow() == 0 {
+                            // Grace period expired — recheck IPC and daemon-owned HTTP sessions.
+                            let http_session_count = http_sessions
+                                .as_ref()
+                                .map(|sessions| sessions.session_count())
+                                .unwrap_or(0);
+                            if *count_rx.borrow() == 0 && http_session_count == 0 {
                                 tracing::info!("grace period expired with no clients, shutting down");
                                 daemon_cancel.cancel();
                                 return;
+                            } else if *count_rx.borrow() == 0 && http_session_count > 0 {
+                                tracing::info!(
+                                    http_session_count,
+                                    "grace period expired but HTTP sessions are still active; keeping daemon alive"
+                                );
                             }
                         }
                         result = count_rx.changed() => {
@@ -512,6 +525,7 @@ pub async fn run_daemon(
                         let engine_clone = engine.clone();
                         let registry = client_registry.clone();
                         let config_path = config_path.clone();
+                        let http_sessions = http_sessions.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit; // held for connection lifetime
@@ -526,6 +540,7 @@ pub async fn run_daemon(
                                 config_path: config_path.clone(),
                                 started_at,
                                 client_registry: registry,
+                                http_sessions,
                                 session_id: None,
                                 reverse_request_rx: None,
                             };
@@ -672,6 +687,7 @@ struct ConnectionContext {
     config_path: PathBuf,
     started_at: Instant,
     client_registry: Arc<ClientRegistry>,
+    http_sessions: Option<Arc<dyn SessionStore>>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
     /// Receiver for reverse requests from the daemon bridge. Created during
@@ -1139,6 +1155,38 @@ async fn handle_reverse_request(
 
 /// Dispatch a single IPC request to the appropriate Engine query.
 async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
+    fn downstream_http_live_sessions(
+        sessions: &dyn SessionStore,
+    ) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
+        let mut live_sessions = sessions
+            .session_snapshots()
+            .into_iter()
+            .map(|snapshot| plug_core::ipc::IpcLiveSessionInfo {
+                transport: match snapshot.transport {
+                    plug_core::session::DownstreamTransport::Http => {
+                        plug_core::ipc::LiveSessionTransport::Http
+                    }
+                    plug_core::session::DownstreamTransport::Sse => {
+                        plug_core::ipc::LiveSessionTransport::Sse
+                    }
+                },
+                client_id: None,
+                session_id: snapshot.session_id,
+                client_type: snapshot.client_type,
+                client_info: None,
+                connected_secs: snapshot.connected_seconds,
+                last_activity_secs: Some(snapshot.idle_seconds),
+            })
+            .collect::<Vec<_>>();
+        live_sessions.sort_by(|a, b| {
+            a.client_type
+                .to_string()
+                .cmp(&b.client_type.to_string())
+                .then(a.session_id.cmp(&b.session_id))
+        });
+        live_sessions
+    }
+
     match request {
         IpcRequest::Status => {
             let servers = ctx.server_manager.server_statuses();
@@ -1342,8 +1390,30 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             clients: ctx.client_registry.list(),
         },
         IpcRequest::ListLiveSessions => IpcResponse::LiveSessions {
-            sessions: ctx.client_registry.list_live_sessions(),
-            scope: plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            sessions: {
+                let mut sessions = ctx.client_registry.list_live_sessions();
+                if let Some(http_sessions) = ctx.http_sessions.as_ref() {
+                    sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
+                }
+                sessions.sort_by(|a, b| {
+                    let transport_order =
+                        |transport: plug_core::ipc::LiveSessionTransport| match transport {
+                            plug_core::ipc::LiveSessionTransport::DaemonProxy => 0,
+                            plug_core::ipc::LiveSessionTransport::Http => 1,
+                            plug_core::ipc::LiveSessionTransport::Sse => 2,
+                        };
+                    transport_order(a.transport)
+                        .cmp(&transport_order(b.transport))
+                        .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
+                        .then(a.session_id.cmp(&b.session_id))
+                });
+                sessions
+            },
+            scope: if ctx.http_sessions.is_some() {
+                plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+            } else {
+                plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly
+            },
         },
         IpcRequest::Capabilities { session_id } => {
             if ctx.session_id.as_deref() != Some(session_id.as_str()) {
@@ -2185,9 +2255,49 @@ mod tests {
             config_path,
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
+            http_sessions: None,
             session_id: None,
             reverse_request_rx: None,
         }
+    }
+
+    #[tokio::test]
+    async fn list_live_sessions_includes_http_sessions_when_daemon_owns_http() {
+        let temp = std::env::temp_dir().join(format!(
+            "plug-daemon-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let config_path = temp.join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let mut ctx = auth_status_test_context(config_path);
+        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
+        let session_id = session_store.create_session().expect("session");
+        session_store
+            .set_client_type(&session_id, plug_core::types::ClientType::ClaudeDesktop)
+            .expect("set client type");
+        ctx.http_sessions = Some(Arc::new(session_store));
+
+        let response = dispatch_request(&IpcRequest::ListLiveSessions, &mut ctx).await;
+        let IpcResponse::LiveSessions { sessions, scope } = response else {
+            panic!("expected live sessions response");
+        };
+
+        assert_eq!(
+            scope,
+            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].transport,
+            plug_core::ipc::LiveSessionTransport::Http
+        );
+        assert_eq!(
+            sessions[0].client_type,
+            plug_core::types::ClientType::ClaudeDesktop
+        );
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]

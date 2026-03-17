@@ -1038,7 +1038,8 @@ mod tests {
         let engine = Arc::new(Engine::new(config));
         engine.start().await.expect("engine start");
         let engine_for_task = Arc::clone(&engine);
-        let handle = tokio::spawn(async move { run_daemon(engine_for_task, config_path, 0).await });
+        let handle =
+            tokio::spawn(async move { run_daemon(engine_for_task, config_path, 0, None).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
         if handle.is_finished() {
             let result = handle.await.expect("daemon task join");
