@@ -541,6 +541,27 @@ Key files expected to change:
 - The right question is not just "what kind of upstream is this?" but "what exact thing is this
   server talking to right now?".
 
+### 2026-03-17 - Non-interactive doctor credential slice
+
+**By:** Codex
+
+**Actions:**
+- Changed `plug doctor` OAuth token checks to inspect plaintext fallback files only, instead of
+  probing the live credential store and triggering macOS Keychain prompts.
+- Kept the actionable path by pointing operators to `plug auth status` for live credential state.
+- Made cold server-connectivity checks build an explicit concurrent future set so the fanout stays
+  deterministic while avoiding the keychain-backed credential path entirely.
+
+**Verification:**
+- `cargo test -p plug-core doctor -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Diagnostics need to stay non-interactive or they stop being diagnostics and start acting like
+  side-effectful auth flows.
+- `plug doctor` should report storage mode and cold connectivity, while `plug auth status` remains
+  the command that touches live credential state.
+
 ### 2026-03-17 - Non-interactive doctor and upstream target visibility
 
 **By:** Codex

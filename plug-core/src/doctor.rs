@@ -581,6 +581,8 @@ fn running_daemon_pid() -> Option<u32> {
 /// Check 9: try to start and initialize each server (5s timeout).
 async fn check_server_connectivity(config: &Config) -> CheckResult {
     use futures::future::join_all;
+    use std::future::Future;
+    use std::pin::Pin;
 
     let name = "server_connectivity".to_string();
     let enabled_servers: Vec<&str> = config
@@ -601,7 +603,10 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
 
     // We don't actually start servers in doctor mode — that would be disruptive.
     // Instead, we check that the basic requirements are met (binary exists, URL reachable).
-    let unreachable = join_all(config.servers.iter().filter_map(|(server_name, server)| {
+    let connectivity_checks: Vec<Pin<Box<dyn Future<Output = Option<String>> + Send>>> = config
+        .servers
+        .iter()
+        .filter_map(|(server_name, server)| {
         if !server.enabled {
             return None;
         }
@@ -610,7 +615,7 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
         match server.transport {
             TransportType::Stdio => {
                 let command = server.command.clone();
-                Some(async move {
+                Some(Box::pin(async move {
                     if let Some(cmd) = command {
                         let binary = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
                         if !binary.starts_with('$') {
@@ -625,11 +630,11 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
                         }
                     }
                     None
-                })
+                }) as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
             }
             TransportType::Http | TransportType::Sse => {
                 let url = server.url.clone();
-                Some(async move {
+                Some(Box::pin(async move {
                     if let Some(url) = url {
                         return check_http_reachable(&url)
                             .await
@@ -637,14 +642,16 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
                             .map(|e| format!("{server_name}: {e}"));
                     }
                     None
-                })
+                }) as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
             }
         }
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+        })
+        .collect();
+    let unreachable = join_all(connectivity_checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
 
     if unreachable.is_empty() {
         CheckResult {
@@ -1051,52 +1058,35 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
         };
     }
 
-    let mut warnings = Vec::new();
+    let tokens_dir = crate::oauth::tokens_dir();
+    let mut plaintext_fallbacks = Vec::new();
+
     for (server_name, _) in &oauth_servers {
-        let store = crate::oauth::get_or_create_store(server_name);
-        use rmcp::transport::auth::CredentialStore;
-        match store.load().await {
-            Ok(Some(_creds)) => {
-                // Check if using file fallback (no keyring)
-                // We can detect this by checking if keyring works
-                let tokens_dir = crate::oauth::tokens_dir();
-                let token_file = tokens_dir.join(format!("{server_name}.json"));
-                if token_file.exists() {
-                    // File exists — might be using file fallback
-                    // This is a warning, not an error
-                    warnings.push(format!(
-                        "server '{server_name}': plaintext token fallback file present at {}",
-                        token_file.display()
-                    ));
-                }
-            }
-            Ok(None) => {
-                warnings.push(format!(
-                    "server '{server_name}': no credentials found — run `plug auth login --server {server_name}`"
-                ));
-            }
-            Err(e) => {
-                warnings.push(format!(
-                    "server '{server_name}': credential store error: {e}"
-                ));
-            }
+        let token_file = tokens_dir.join(format!("{server_name}.json"));
+        if token_file.exists() {
+            plaintext_fallbacks.push(format!(
+                "server '{server_name}': plaintext token fallback file present at {}",
+                token_file.display()
+            ));
         }
     }
 
-    if warnings.is_empty() {
+    if plaintext_fallbacks.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: "All OAuth servers have retrievable credentials".to_string(),
+            message:
+                "No plaintext OAuth token fallback files detected (doctor does not probe keychain-backed credentials)"
+                    .to_string(),
             fix_suggestion: None,
         }
     } else {
         CheckResult {
             name,
             status: CheckStatus::Warn,
-            message: warnings.join("; "),
+            message: plaintext_fallbacks.join("; "),
             fix_suggestion: Some(
-                "Run `plug auth login --server <name>` for servers without credentials".to_string(),
+                "Use `plug auth status` for live credential state; plaintext fallback files should only exist when secure keychain storage is unavailable".to_string(),
             ),
         }
     }

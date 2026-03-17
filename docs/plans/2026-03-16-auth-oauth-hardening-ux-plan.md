@@ -47,6 +47,8 @@ Completed so far:
 - non-interactive `server edit` auth and URL updates for remote upstreams
 - end-to-end scenario coverage for mixed runtime fleet states and downstream OAuth protected discovery
 - doctor interpretation that explains live-runtime versus cold-connectivity mismatches explicitly
+- doctor cold connectivity checks that avoid keychain prompts and run concurrently across the fleet
+- status/server inventory rows that surface each upstream target directly
 
 Still remaining:
 - deeper server add/edit auth scaffolding so common HTTP/SSE auth cases are not still hand-authored
@@ -77,6 +79,10 @@ Still remaining:
   facts instead of one blunt red summary.
 - 2026-03-17: cold HTTP reachability checks now try all resolved addresses with bounded DNS
   timeout handling, which reduces misleading failures on multi-address hosts.
+- 2026-03-17: `plug doctor` no longer probes keychain-backed credentials, so diagnostics stay
+  non-interactive on macOS instead of hanging behind a Keychain prompt.
+- 2026-03-17: `plug status` and `plug servers` now include each server's concrete target (URL or
+  command) so operators can immediately see what a health line actually points at.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
   full end-to-end command fixtures.
 
