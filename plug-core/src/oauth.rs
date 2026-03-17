@@ -156,6 +156,7 @@ pub async fn current_or_stored_access_token(server_name: &str) -> Option<String>
 
 #[derive(Clone)]
 struct CachedCredentials {
+    credentials: StoredCredentials,
     access_token: String,
     /// Epoch seconds when the token was received. Used by refresh checks.
     #[allow(dead_code)]
@@ -168,6 +169,7 @@ struct CachedCredentials {
 impl std::fmt::Debug for CachedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedCredentials")
+            .field("credentials", &"[REDACTED]")
             .field("access_token", &"[REDACTED]")
             .field("token_received_at", &self.token_received_at)
             .field("expires_in", &self.expires_in)
@@ -179,10 +181,13 @@ impl std::fmt::Debug for CachedCredentials {
 // CompositeCredentialStore
 // ---------------------------------------------------------------------------
 
-/// Credential store that tries the OS keyring first, falling back to a JSON
-/// file at `~/.config/plug/tokens/{server_name}.json`.
+/// Credential store that mirrors credentials to a JSON file at
+/// `~/.config/plug/tokens/{server_name}.json` and can also use the OS keyring.
 ///
-/// An in-memory [`ArcSwap`] cache avoids I/O on the hot path.
+/// Reads prefer the local 0600 token file once credentials have been mirrored
+/// there, which avoids repeated macOS keychain prompts across short-lived CLI
+/// processes while preserving the keyring-backed write path.
+#[derive(Clone)]
 pub struct CompositeCredentialStore {
     server_name: String,
     cache: Arc<ArcSwap<Option<CachedCredentials>>>,
@@ -395,6 +400,7 @@ impl CompositeCredentialStore {
                     .unwrap_or(0)
             });
             CachedCredentials {
+                credentials: creds.clone(),
                 access_token,
                 token_received_at,
                 expires_in,
@@ -415,24 +421,41 @@ impl CompositeCredentialStore {
         let cached = guard.as_ref().as_ref()?;
         Some((cached.token_received_at, cached.expires_in))
     }
+
+    /// Return the full cached credential bundle, if one has been hydrated in-process.
+    pub fn cached_credentials(&self) -> Option<StoredCredentials> {
+        let guard = self.cache.load();
+        let cached = guard.as_ref().as_ref()?;
+        Some(cached.credentials.clone())
+    }
+
+    /// Prime the in-memory cache with credentials obtained from another trusted path.
+    pub fn hydrate_credentials(&self, creds: &StoredCredentials) {
+        self.update_cache(creds);
+    }
 }
 
 #[async_trait]
 impl CredentialStore for CompositeCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        // 1. Check in-memory cache — if present, the backing stores were
-        //    already read at least once, so we can skip I/O for pure expiry
-        //    checks.  However, the full StoredCredentials must be returned
-        //    so we still hit the backing stores.
+        // 1. Check in-memory cache first. This avoids repeated keychain prompts
+        //    in long-lived daemons and refresh loops once credentials have been
+        //    hydrated successfully in-process.
+        if let Some(creds) = self.cached_credentials() {
+            return Ok(Some(creds));
+        }
 
-        // 2. Try keyring.
-        if let Some(creds) = self.keyring_load() {
+        // 2. Try the mirrored token file first. We always maintain the file as
+        //    a 0600 local copy, so preferring it avoids repeated keychain
+        //    prompts for short-lived CLI processes without changing on-disk
+        //    credential semantics.
+        if let Some(creds) = self.file_load() {
             self.update_cache(&creds);
             return Ok(Some(creds));
         }
 
-        // 3. Try file.
-        if let Some(creds) = self.file_load() {
+        // 3. Fall back to keyring when the file is absent.
+        if let Some(creds) = self.keyring_load() {
             self.update_cache(&creds);
             return Ok(Some(creds));
         }
@@ -684,7 +707,7 @@ pub async fn refresh_access_token(
     // cannot reuse the global Arc because `set_credential_store` takes
     // ownership.
     let refresh_store = CompositeCredentialStore::new(server_name.to_string());
-    auth_manager.set_credential_store(refresh_store);
+    auth_manager.set_credential_store(refresh_store.clone());
 
     // 5. Discover OAuth server metadata.
     let metadata = match auth_manager.discover_metadata().await {
@@ -711,14 +734,24 @@ pub async fn refresh_access_token(
     // 7. Exchange refresh_token for a new access_token.
     match auth_manager.refresh_token().await {
         Ok(_) => {
-            // rmcp's refresh_token() saves via the fresh store's backing
-            // files/keyring.  Reload the global store's cache so the next
-            // `current_access_token()` call returns the new token.
-            if let Err(e) = CredentialStore::load(&*store).await {
-                return RefreshResult::TransientError(format!(
-                    "token refreshed but cache reload failed: {e}"
-                ));
-            }
+            // rmcp's refresh_token() saves via the refresh store and updates its
+            // in-memory cache. Copy that fresh credential bundle into the shared
+            // store cache instead of re-reading persisted storage and re-hitting
+            // the keychain.
+            let refreshed = match CredentialStore::load(&refresh_store).await {
+                Ok(Some(creds)) => creds,
+                Ok(None) => {
+                    return RefreshResult::TransientError(
+                        "token refreshed but refreshed credentials were unavailable".to_string(),
+                    );
+                }
+                Err(e) => {
+                    return RefreshResult::TransientError(format!(
+                        "token refreshed but refreshed credentials could not be loaded: {e}"
+                    ));
+                }
+            };
+            store.hydrate_credentials(&refreshed);
             debug!(server = %server_name, "OAuth token refreshed successfully");
             RefreshResult::Refreshed
         }
@@ -1011,5 +1044,30 @@ mod tests {
         );
 
         store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_prefers_in_memory_cache_before_backing_stores() {
+        let name = format!("oauth-cache-first-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let creds = make_test_token("cached-access", Some("cached-refresh"), Some(3600));
+        store.save(creds.clone()).await.unwrap();
+
+        // Remove persisted backends; load should still succeed from cache.
+        store.keyring_clear();
+        store.file_clear();
+
+        let loaded = store.load().await.unwrap();
+        assert!(loaded.is_some(), "expected cached credentials to satisfy load");
+        let loaded = loaded.unwrap();
+        use oauth2::TokenResponse;
+        let token = loaded
+            .token_response
+            .as_ref()
+            .map(|tr| tr.access_token().secret().to_string());
+        assert_eq!(token.as_deref(), Some("cached-access"));
+
+        store.clear_cache();
     }
 }

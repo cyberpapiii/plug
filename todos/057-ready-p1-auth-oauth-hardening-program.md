@@ -258,6 +258,30 @@ Key files expected to change:
   otherwise derives the HTTP export endpoint from the active config path.
 - Added focused test coverage for the endpoint-selection helper.
 
+### 2026-03-17 - Keychain prompt storm reduction
+
+**By:** Codex
+
+**Actions:**
+- Audited the remaining credential-store read paths after the daemon-owned runtime work.
+- Confirmed the main repeated prompt source was fresh-process credential loads, not the already
+  cached long-lived daemon hot paths.
+- Changed OAuth credential reads to prefer the mirrored 0600 token file before keychain when the
+  in-memory cache is cold.
+- Updated doctor wording so it accurately describes the local token file as a normal process-restart
+  backing store rather than a rare fallback-only artifact.
+
+**Verification:**
+- `cargo test -p plug-core oauth -- --nocapture`
+- `cargo test -p plug-core doctor::tests::oauth_tokens -- --nocapture`
+
+**Learnings:**
+- `CompositeCredentialStore::save()` already mirrors credentials to both keychain and the local
+  token file, so preferring the file on read materially reduces prompt storms without changing the
+  existing at-rest data footprint.
+- The remaining macOS prompt sensitivity is mostly about binary identity (`installed` vs `debug`)
+  and process churn, not repeated same-process daemon refreshes.
+
 **Verification:**
 - `cargo test -p plug commands::misc::tests -- --nocapture`
 - `cargo test -p plug tests::serve_command -- --nocapture`
@@ -971,3 +995,35 @@ Key files expected to change:
   primitives.
 - Splitting named degraded/failing servers from the aggregate summary is what makes the output
   readable under real mixed-fleet conditions; otherwise users only see a vague warning count.
+
+### 2026-03-17 - OAuth credential cache / keychain prompt-storm mitigation
+
+**By:** Codex
+
+**Actions:**
+- Investigated repeated macOS Keychain prompts in the live daemon/runtime flow instead of treating
+  them as a local machine oddity.
+- Confirmed the root cause: `CompositeCredentialStore` cached only token timing and access-token
+  strings, while refresh and cold-token paths still re-read persisted credentials from keychain or
+  file stores whenever they needed the full OAuth bundle.
+- Changed the credential store to cache the full `StoredCredentials` payload in-process after the
+  first successful load/save.
+- Updated `CredentialStore::load()` to satisfy from that in-memory cache before probing keychain or
+  plaintext token files.
+- Updated `refresh_access_token(...)` to hydrate the shared store cache directly from the temporary
+  refresh store after a successful refresh exchange, instead of re-reading persisted storage and
+  risking another keychain prompt immediately after refresh.
+- Added focused regression coverage proving that cached credentials can satisfy `load()` even after
+  the backing stores are removed.
+
+**Verification:**
+- `cargo test -p plug-core oauth -- --nocapture`
+- `cargo test -p plug daemon::tests::auth_status -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Avoiding keychain prompts in diagnostics was not enough; the long-lived daemon also needed a
+  real in-memory credential cache for the full OAuth bundle, not just token expiry metadata.
+- On macOS, repeated secure-store access becomes much more painful when multiple `plug` binaries
+  or restarted daemons are involved, so the runtime should minimize keychain touches once
+  credentials have been hydrated successfully in-process.
