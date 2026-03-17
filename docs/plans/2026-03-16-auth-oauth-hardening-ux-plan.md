@@ -45,6 +45,7 @@ Completed so far:
 - interactive server add/edit auth scaffolding for none, bearer, and oauth upstreams
 - non-interactive `server add` auth flags for bearer and oauth remote upstreams
 - end-to-end scenario coverage for mixed runtime fleet states and downstream OAuth protected discovery
+- doctor interpretation that explains live-runtime versus cold-connectivity mismatches explicitly
 
 Still remaining:
 - deeper server add/edit auth scaffolding so common HTTP/SSE auth cases are not still hand-authored
@@ -66,8 +67,10 @@ Still remaining:
   remotes, which closes the biggest scripted-config gap; `server edit` remains interactive-only.
 - 2026-03-17: The integration matrix now covers mixed engine fleet states plus downstream OAuth
   protected discovery through the real HTTP router.
-- Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused unit tests
-  than full end-to-end fixtures.
+- 2026-03-17: `plug doctor` now synthesizes an explicit interpretation when cold connectivity and
+  live daemon state disagree, which reduces the biggest remaining diagnostics ambiguity.
+- Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
+  full end-to-end command fixtures.
 
 ## Workstream A: Downstream OAuth Standards Hardening
 

@@ -309,6 +309,30 @@ Key files expected to change:
 - The remaining server-auth UX gap is mostly about non-interactive edit/update flows, not new-add
   workflows.
 
+### 2026-03-17 - Doctor interpretation clarity slice
+
+**By:** Codex
+
+**Actions:**
+- Added a small synthesis layer on top of the existing doctor checks so `plug doctor` can explain
+  the difference between:
+  - cold connectivity problems with a still-healthy daemon
+  - runtime failures despite basic reachability
+  - auth attention needed even when the runtime is broadly healthy
+- Kept the interpretation logic pure and testable instead of baking more heuristics directly into
+  the rendering path.
+- Added focused tests for the new interpretation cases and re-ran the full `plug` suite.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The raw checks were already better than before, but users still had to mentally reconcile them.
+- The biggest remaining diagnostics gap is now fixture depth, not wording: we still need broader
+  end-to-end doctor/runtime scenarios if we want the same confidence level as the auth/topology
+  integration matrix.
+
 ### 2026-03-16 - Client topology fidelity slice
 
 **By:** Codex

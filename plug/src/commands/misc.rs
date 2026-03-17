@@ -155,6 +155,9 @@ pub(crate) async fn cmd_doctor(
     let config = plug_core::config::load_config(config_path)?;
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
     report.checks.extend(runtime_doctor_checks().await);
+    if let Some(interpreted) = synthesize_doctor_interpretation(&report.checks) {
+        report.checks.push(interpreted);
+    }
     report.exit_code = if report
         .checks
         .iter()
@@ -299,6 +302,66 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
     checks
 }
 
+fn synthesize_doctor_interpretation(
+    checks: &[plug_core::doctor::CheckResult],
+) -> Option<plug_core::doctor::CheckResult> {
+    let connectivity = checks.iter().find(|check| check.name == "server_connectivity")?;
+    let runtime_health = checks.iter().find(|check| check.name == "runtime_health");
+    let runtime_auth = checks.iter().find(|check| check.name == "runtime_auth");
+
+    use plug_core::doctor::CheckStatus::{Fail, Pass, Warn};
+
+    let (status, message, fix_suggestion) = match (
+        &connectivity.status,
+        runtime_health.map(|check| &check.status),
+        runtime_auth.map(|check| &check.status),
+    ) {
+        (Warn, Some(Pass), _) | (Warn, Some(Warn), _) => (
+            Warn,
+            "Live daemon state is healthier than cold connectivity. Existing routed sessions are still running, but new connections after a restart may fail.".to_string(),
+            Some(
+                "Use `plug status` for live runtime truth, then fix the cold connectivity issue before restarting the daemon.".to_string(),
+            ),
+        ),
+        (Pass, Some(Warn), Some(Warn)) | (Pass, Some(Warn), _) => (
+            Warn,
+            "Basic connectivity checks pass, but the running daemon still has degraded or auth-required servers.".to_string(),
+            Some(
+                "Use `plug auth status` and `plug status` to repair the affected runtime state before assuming the system is healthy.".to_string(),
+            ),
+        ),
+        (Pass, Some(Fail), _) => (
+            Fail,
+            "Basic reachability looks fine, but the running daemon is currently failing one or more servers.".to_string(),
+            Some(
+                "Use `plug status` for the failing servers, then compare with `plug doctor` to separate runtime failures from cold connectivity.".to_string(),
+            ),
+        ),
+        (Fail, Some(Pass), _) | (Fail, Some(Warn), _) => (
+            Fail,
+            "Cold connectivity is failing even though the daemon still has some live state. A restart would likely lose currently working routes.".to_string(),
+            Some(
+                "Fix the reported connectivity failures before restarting the daemon or repairing client/server config.".to_string(),
+            ),
+        ),
+        (Pass, Some(Pass), Some(Warn)) => (
+            Warn,
+            "The runtime is broadly healthy, but some servers still need auth attention or re-authorization.".to_string(),
+            Some(
+                "Use `plug auth status` to see which servers need credentials or re-auth.".to_string(),
+            ),
+        ),
+        _ => return None,
+    };
+
+    Some(plug_core::doctor::CheckResult {
+        name: "doctor_interpretation".to_string(),
+        status,
+        message,
+        fix_suggestion,
+    })
+}
+
 pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
     let auth = crate::daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Reload { auth_token: auth };
@@ -361,6 +424,98 @@ pub(crate) fn cmd_setup(config_path: Option<&std::path::PathBuf>, yes: bool) -> 
     }
     cmd_link(Vec::new(), false, yes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::synthesize_doctor_interpretation;
+    use plug_core::doctor::{CheckResult, CheckStatus};
+
+    fn check(name: &str, status: CheckStatus, message: &str) -> CheckResult {
+        CheckResult {
+            name: name.to_string(),
+            status,
+            message: message.to_string(),
+            fix_suggestion: None,
+        }
+    }
+
+    #[test]
+    fn interpretation_explains_cold_vs_live_difference() {
+        let checks = vec![
+            check(
+                "server_connectivity",
+                CheckStatus::Warn,
+                "Cold connectivity issues: workspace: TCP connect failed",
+            ),
+            check(
+                "runtime_health",
+                CheckStatus::Pass,
+                "Daemon running: uptime=10s, clients=1, healthy=2, degraded=0, auth_required=0, failed=0",
+            ),
+        ];
+        let interpretation =
+            synthesize_doctor_interpretation(&checks).expect("expected interpretation");
+        assert_eq!(interpretation.status, CheckStatus::Warn);
+        assert!(
+            interpretation
+                .message
+                .contains("Live daemon state is healthier than cold connectivity")
+        );
+    }
+
+    #[test]
+    fn interpretation_explains_runtime_failure_despite_connectivity() {
+        let checks = vec![
+            check(
+                "server_connectivity",
+                CheckStatus::Pass,
+                "All 3 servers are reachable",
+            ),
+            check(
+                "runtime_health",
+                CheckStatus::Fail,
+                "Daemon running: uptime=20s, clients=2, healthy=1, degraded=0, auth_required=0, failed=2",
+            ),
+        ];
+        let interpretation =
+            synthesize_doctor_interpretation(&checks).expect("expected interpretation");
+        assert_eq!(interpretation.status, CheckStatus::Fail);
+        assert!(
+            interpretation
+                .message
+                .contains("running daemon is currently failing")
+        );
+    }
+
+    #[test]
+    fn interpretation_explains_auth_attention_when_runtime_is_healthy() {
+        let checks = vec![
+            check(
+                "server_connectivity",
+                CheckStatus::Pass,
+                "All 2 servers are reachable",
+            ),
+            check(
+                "runtime_health",
+                CheckStatus::Pass,
+                "Daemon running: uptime=30s, clients=3, healthy=2, degraded=0, auth_required=0, failed=0",
+            ),
+            check(
+                "runtime_auth",
+                CheckStatus::Warn,
+                "re-auth required: notion",
+            ),
+        ];
+        let interpretation =
+            synthesize_doctor_interpretation(&checks).expect("expected interpretation");
+        assert_eq!(interpretation.status, CheckStatus::Warn);
+        assert!(
+            interpretation
+                .message
+                .contains("need auth attention")
+        );
+    }
 }
 
 pub(crate) fn cmd_repair() -> anyhow::Result<()> {
