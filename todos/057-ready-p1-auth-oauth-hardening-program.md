@@ -697,6 +697,25 @@ Key files expected to change:
 - Focused reachability tests are a cheap way to pin the concurrent cold-connectivity path while we
   keep avoiding live daemon/keychain side effects during hardening work.
 
+### 2026-03-17 - Doctor next-step guidance slice
+
+**By:** Codex
+
+**Actions:**
+- Wired `plug doctor` text output to include each check's existing `fix_suggestion` inline instead
+  of silently dropping it.
+- Added focused tests for the formatter so checks with guidance render a `Next:` clause and checks
+  without guidance stay unchanged.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+
+**Learnings:**
+- The command already knew the right next actions for many checks; the confusing part was purely a
+  presentation gap.
+- Appending guidance at render time is a low-risk clarity win because it does not change doctor
+  semantics, only whether users can see the recovery path the code already computed.
+
 ### 2026-03-17 - Doctor interpretation clarity coverage slice
 
 **By:** Codex

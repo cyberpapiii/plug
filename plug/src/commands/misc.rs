@@ -189,7 +189,7 @@ pub(crate) async fn cmd_doctor(
                 crate::ui::print_wrapped_rows(
                     &prefix_text,
                     prefix_display,
-                    &c.message,
+                    &doctor_check_details(c),
                     crate::ui::terminal_width(),
                     |line| style(line),
                 );
@@ -464,6 +464,15 @@ fn synthesize_doctor_interpretation(
     })
 }
 
+fn doctor_check_details(check: &plug_core::doctor::CheckResult) -> String {
+    match check.fix_suggestion.as_deref() {
+        Some(suggestion) if !suggestion.trim().is_empty() => {
+            format!("{} Next: {}", check.message, suggestion.trim())
+        }
+        _ => check.message.clone(),
+    }
+}
+
 pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
     let auth = crate::daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Reload { auth_token: auth };
@@ -530,7 +539,9 @@ pub(crate) fn cmd_setup(config_path: Option<&std::path::PathBuf>, yes: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_health_checks_for_tests, synthesize_doctor_interpretation};
+    use super::{
+        doctor_check_details, runtime_health_checks_for_tests, synthesize_doctor_interpretation,
+    };
     use plug_core::doctor::{CheckResult, CheckStatus};
     use plug_core::types::{ServerHealth, ServerStatus};
 
@@ -726,6 +737,31 @@ mod tests {
         assert_eq!(checks[1].name, "runtime_degraded");
         assert_eq!(checks[1].status, CheckStatus::Warn);
         assert_eq!(checks[1].message, "degraded servers: figma");
+    }
+
+    #[test]
+    fn doctor_check_details_appends_next_step_guidance() {
+        let rendered = doctor_check_details(&CheckResult {
+            name: "server_connectivity".to_string(),
+            status: CheckStatus::Fail,
+            message: "Cold connectivity issues: remote: TCP connect failed".to_string(),
+            fix_suggestion: Some("Run `plug status` before editing config".to_string()),
+        });
+
+        assert!(rendered.contains("Cold connectivity issues"));
+        assert!(rendered.contains("Next: Run `plug status` before editing config"));
+    }
+
+    #[test]
+    fn doctor_check_details_leaves_plain_messages_unchanged() {
+        let rendered = doctor_check_details(&CheckResult {
+            name: "config_exists".to_string(),
+            status: CheckStatus::Pass,
+            message: "Config file valid".to_string(),
+            fix_suggestion: None,
+        });
+
+        assert_eq!(rendered, "Config file valid");
     }
 }
 

@@ -97,6 +97,9 @@ Still remaining:
 - 2026-03-17: `plug` doctor command tests now cover the two most confusing synthesized operator
   states directly: when both live runtime and cold connectivity are failing, and when degraded
   servers need to be named separately from the aggregate runtime summary.
+- 2026-03-17: `plug doctor` text output now prints each check's next-step guidance inline instead
+  of hiding the already-computed `fix_suggestion`, which makes the command materially more
+  actionable without changing the underlying checks.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.
