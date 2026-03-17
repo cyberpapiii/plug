@@ -440,6 +440,13 @@ fn mock_server_config(tools: &str) -> ServerConfig {
     }
 }
 
+async fn reserve_unused_local_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind ephemeral listener");
+    listener.local_addr().expect("ephemeral local addr").port()
+}
+
 async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
     let mut events = Vec::new();
     let mut stream = body.into_data_stream();
@@ -1849,6 +1856,301 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+}
+
+#[tokio::test]
+async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
+    let provider = MockOAuthProvider::start().await;
+    let oauth_healthy = format!("oauth-healthy-{}", std::process::id());
+    let oauth_auth_required = format!("oauth-required-{}", std::process::id());
+    let healthy_store = oauth::get_or_create_store(&oauth_healthy);
+    let required_store = oauth::get_or_create_store(&oauth_auth_required);
+    healthy_store
+        .clear()
+        .await
+        .expect("clear healthy OAuth store before test");
+    required_store
+        .clear()
+        .await
+        .expect("clear required OAuth store before test");
+    healthy_store
+        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
+        .await
+        .expect("seed healthy oauth credentials");
+
+    let failed_port = reserve_unused_local_port().await;
+    let mut engine: Option<Arc<Engine>> = None;
+    let result = AssertUnwindSafe(async {
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("stdio".to_string(), mock_server_config("echo"));
+        config.servers.insert(
+            oauth_healthy.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 10,
+                call_timeout_secs: 5,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        config.servers.insert(
+            oauth_auth_required.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 10,
+                call_timeout_secs: 5,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        config.servers.insert(
+            "failed".to_string(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(format!("http://127.0.0.1:{failed_port}/mcp")),
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 1,
+                call_timeout_secs: 1,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+
+        let started_engine = Arc::new(Engine::new(config));
+        started_engine.start().await.expect("engine start");
+        engine = Some(Arc::clone(&started_engine));
+
+        let statuses = started_engine.server_statuses();
+        let status_map: HashMap<String, plug_core::types::ServerStatus> = statuses
+            .into_iter()
+            .map(|status| (status.server_id.clone(), status))
+            .collect();
+
+        assert_eq!(
+            status_map.get("stdio").map(|s| s.health),
+            Some(plug_core::types::ServerHealth::Healthy)
+        );
+        assert_eq!(
+            status_map.get("stdio").map(|s| s.tool_count),
+            Some(1),
+            "stdio mock should contribute its echo tool"
+        );
+        assert_eq!(
+            status_map.get(&oauth_healthy).map(|s| s.auth_status.as_str()),
+            Some("oauth")
+        );
+        assert_eq!(
+            status_map.get(&oauth_healthy).map(|s| s.health),
+            Some(plug_core::types::ServerHealth::Healthy)
+        );
+        assert_eq!(
+            status_map
+                .get(&oauth_auth_required)
+                .map(|s| s.auth_status.as_str()),
+            Some("auth-required")
+        );
+        assert_eq!(
+            status_map.get(&oauth_auth_required).map(|s| s.health),
+            Some(plug_core::types::ServerHealth::AuthRequired)
+        );
+        assert_eq!(
+            status_map.get("failed").map(|s| s.health),
+            Some(plug_core::types::ServerHealth::Failed)
+        );
+    })
+    .catch_unwind()
+    .await;
+
+    if let Some(engine) = engine {
+        tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+    }
+    healthy_store
+        .clear()
+        .await
+        .expect("clear healthy OAuth store after test");
+    required_store
+        .clear()
+        .await
+        .expect("clear required OAuth store after test");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test]
+async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("echo"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
+        public_base_url: "https://plug.example.com".to_string(),
+        oauth_client_id: Some("client-123".to_string()),
+        oauth_client_secret: None,
+        oauth_scopes: vec!["tools:read".to_string()],
+    };
+    let manager = plug_core::downstream_oauth::DownstreamOauthManager::new(oauth_config);
+    let app = build_router(Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        cancel: CancellationToken::new(),
+        auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+        downstream_oauth: Some(manager),
+        sse_channel_capacity: 32,
+        allowed_origins: Vec::new(),
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
+    }));
+
+    let unauth_req = HttpRequest::builder()
+        .method("GET")
+        .uri("/.well-known/mcp.json")
+        .body(Body::empty())
+        .unwrap();
+    let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::OK);
+    let unauth_body = axum::body::to_bytes(unauth_resp.into_body(), 10_000)
+        .await
+        .unwrap();
+    let unauth_card: serde_json::Value = serde_json::from_slice(&unauth_body).unwrap();
+    assert!(unauth_card.get("servers").is_none());
+    assert!(unauth_card.get("tools").is_none());
+    assert_eq!(unauth_card["auth_required"], true);
+
+    let verifier = oauth2::PkceCodeVerifier::new("v".repeat(43));
+    let challenge = oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+    let authorize_req = HttpRequest::builder()
+        .method("GET")
+        .uri(format!(
+            "/oauth/authorize?response_type=code&client_id=client-123&redirect_uri=http://localhost/callback&state=test-state&code_challenge={}&code_challenge_method=S256",
+            challenge.as_str()
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let authorize_resp = app.clone().oneshot(authorize_req).await.unwrap();
+    assert!(
+        authorize_resp.status().is_redirection(),
+        "unexpected authorize status {}",
+        authorize_resp.status()
+    );
+    let redirect = authorize_resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location");
+    let redirect = reqwest::Url::parse(redirect).expect("parse redirect URL");
+    let code = redirect
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .expect("authorization code");
+
+    let token_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "grant_type=authorization_code&code={code}&client_id=client-123&redirect_uri=http://localhost/callback&code_verifier={}",
+            verifier.secret()
+        )))
+        .unwrap();
+    let token_resp = app.clone().oneshot(token_req).await.unwrap();
+    assert_eq!(token_resp.status(), StatusCode::OK);
+    let token_body = axum::body::to_bytes(token_resp.into_body(), 10_000)
+        .await
+        .unwrap();
+    let token_json: serde_json::Value = serde_json::from_slice(&token_body).unwrap();
+    let access_token = token_json["access_token"]
+        .as_str()
+        .expect("downstream access token");
+
+    let auth_req = HttpRequest::builder()
+        .method("GET")
+        .uri("/.well-known/mcp.json")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let auth_resp = app.clone().oneshot(auth_req).await.unwrap();
+    assert_eq!(auth_resp.status(), StatusCode::OK);
+    let auth_body = axum::body::to_bytes(auth_resp.into_body(), 10_000)
+        .await
+        .unwrap();
+    let auth_card: serde_json::Value = serde_json::from_slice(&auth_body).unwrap();
+    assert!(auth_card.get("servers").is_some());
+    assert!(auth_card.get("tools").is_some());
+
+    let mcp_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": HTTP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "oauth-discovery-e2e", "version": "1.0" }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let mcp_resp = app.oneshot(mcp_req).await.unwrap();
+    assert_eq!(mcp_resp.status(), StatusCode::OK);
+
+    engine.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

@@ -85,7 +85,7 @@ Execute the full hardening plan from [docs/plans/2026-03-16-auth-oauth-hardening
 - [x] Task 8 complete: setup supports explicit client topology choice instead of assuming stdio bridge
 - [x] Task 9 complete: repair preserves client-specific transport choices
 - [x] Task 10 complete: status/menu views surface transport and auth topology clearly
-- [ ] Task 11 complete: integration tests cover mixed auth and topology scenarios end to end
+- [x] Task 11 complete: integration tests cover mixed auth and topology scenarios end to end
 - [x] Final verification complete: `cargo test` passes
 - [x] Final verification complete: `cargo build --release` passes
 - [x] Final verification complete: `plug status`, `plug auth status`, and `plug doctor` tell a coherent story on healthy, auth-required, and failed server cases
@@ -253,6 +253,33 @@ Key files expected to change:
 - Interactive auth scaffolding needs validation guardrails, not just more prompts.
 - The remaining server-auth gap is primarily about non-interactive/scripted config paths, not basic
   interactive UX anymore.
+
+### 2026-03-17 - End-to-end auth and topology scenario matrix
+
+**By:** Codex
+
+**Actions:**
+- Added an integration test that starts one engine with a mixed runtime fleet and verifies the
+  resulting server-state distinctions stay explicit across healthy stdio, healthy OAuth,
+  auth-required OAuth, and failed upstream cases.
+- Added an end-to-end downstream OAuth discovery test that exercises the real HTTP router,
+  validates the minimal protected card when unauthenticated, performs a real authorization-code +
+  PKCE exchange, and confirms authenticated discovery and MCP requests succeed afterward.
+- Re-ran the full test suite and release build after landing the new matrix coverage.
+
+**Verification:**
+- `cargo test -p plug-core test_engine_mixed_auth_fleet_reports_distinct_server_states -- --nocapture`
+- `cargo test -p plug-core test_downstream_oauth_protected_discovery_card_end_to_end -- --nocapture`
+- `cargo test -- --nocapture`
+- `cargo build --release`
+
+**Learnings:**
+- The highest-value missing coverage was not another parser test; it was proving the runtime can
+  hold multiple auth states at once without collapsing them into a simpler story.
+- Downstream OAuth discovery is now covered at both the HTTP-server test boundary and the real
+  routed integration boundary, which makes the standards-facing behavior much less inference-driven.
+- The main remaining auth/config work is now about richer configuration paths and doctor-specific
+  end-to-end scenarios, not basic runtime correctness.
 
 ### 2026-03-16 - Client topology fidelity slice
 
