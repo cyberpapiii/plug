@@ -269,6 +269,7 @@ fn requested_link_transport(
 }
 
 pub(crate) fn cmd_link(
+    config_path: Option<&std::path::PathBuf>,
     targets: Vec<String>,
     all: bool,
     yes: bool,
@@ -277,8 +278,8 @@ pub(crate) fn cmd_link(
     use dialoguer::{Confirm, Input, MultiSelect, Select};
     use plug_core::export::ExportTransport;
 
-    let configured_http_url =
-        configured_http_export_url(None).unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
+    let configured_http_url = configured_http_export_url(config_path)
+        .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
 
     let prompt_transport = |default_http: bool| -> anyhow::Result<ExportTransport> {
         if let Some(requested) = requested_link_transport(transport, yes) {

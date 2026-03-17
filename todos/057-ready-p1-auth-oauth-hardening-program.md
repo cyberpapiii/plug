@@ -736,6 +736,29 @@ Key files expected to change:
 - Running the full package tests after CLI-shape changes is doing real work here; it caught stale
   server command signatures that focused auth/topology tests would not have touched.
 
+### 2026-03-17 - Scripted stdio env management slice
+
+**By:** Codex
+
+**Actions:**
+- Added explicit stdio env management to `plug server add` and `plug server edit`:
+  - `--env KEY=VALUE`
+  - `--unset-env KEY`
+- Applied env updates only to stdio upstreams and rejected those flags for remote HTTP/SSE
+  upstreams, so the CLI does not imply unsupported remote config behavior.
+- Added focused parsing and command-path tests for env assignment validation, stdio env creation,
+  stdio env mutation, and remote rejection cases.
+
+**Verification:**
+- `cargo test -p plug commands::servers::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Stdio `env` is a real config shape, not an implementation detail, so scripted maintenance was
+  still incomplete until the CLI could manage it explicitly.
+- Guardrails matter here because “remote server env” sounds plausible to a user even though it does
+  not currently mean anything in the runtime.
+
 ### 2026-03-17 - Doctor interpretation clarity coverage slice
 
 **By:** Codex

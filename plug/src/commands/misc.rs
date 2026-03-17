@@ -537,7 +537,7 @@ pub(crate) fn cmd_setup(
             file.write_all(toml.as_bytes())?;
         }
     }
-    cmd_link(Vec::new(), false, yes, transport)?;
+    cmd_link(config_path, Vec::new(), false, yes, transport)?;
     Ok(())
 }
 

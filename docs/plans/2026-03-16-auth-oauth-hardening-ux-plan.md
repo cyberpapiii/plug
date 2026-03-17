@@ -103,6 +103,9 @@ Still remaining:
 - 2026-03-17: scripted `plug link`, `plug export`, and `plug setup` now accept an explicit
   `--transport stdio|http` choice, so unattended flows no longer silently collapse to stdio when
   `--yes` is used.
+- 2026-03-17: scripted `plug server add` / `plug server edit` now manage stdio `--env` and
+  `--unset-env` directly, closing a real config-shape gap while explicitly rejecting those flags
+  for remote HTTP/SSE upstreams where they would be misleading.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.
