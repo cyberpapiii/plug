@@ -400,7 +400,13 @@ async fn main() -> anyhow::Result<()> {
             yes,
             transport,
         }) => {
-            commands::clients::cmd_link(targets, all, yes, transport.map(Into::into))?
+            commands::clients::cmd_link(
+                cli.config.as_ref(),
+                targets,
+                all,
+                yes,
+                transport.map(Into::into),
+            )?
         }
         Some(Commands::Unlink { targets, all, yes }) => {
             commands::clients::cmd_unlink(targets, all, yes)?
@@ -438,7 +444,13 @@ async fn main() -> anyhow::Result<()> {
             yes,
             transport,
         }) => {
-            commands::clients::cmd_link(targets, all, yes, transport.map(Into::into))?
+            commands::clients::cmd_link(
+                cli.config.as_ref(),
+                targets,
+                all,
+                yes,
+                transport.map(Into::into),
+            )?
         }
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
