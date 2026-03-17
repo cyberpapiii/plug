@@ -67,6 +67,8 @@ pub enum IpcRequest {
     ListTools,
     /// List live proxy client sessions connected to the daemon.
     ListClients,
+    /// List live downstream sessions with explicit transport/scope.
+    ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
     Capabilities { session_id: String },
 
@@ -151,6 +153,7 @@ impl fmt::Debug for IpcRequest {
                 .finish(),
             Self::ListTools => write!(f, "ListTools"),
             Self::ListClients => write!(f, "ListClients"),
+            Self::ListLiveSessions => write!(f, "ListLiveSessions"),
             Self::Capabilities { session_id } => f
                 .debug_struct("Capabilities")
                 .field("session_id", session_id)
@@ -211,6 +214,32 @@ pub struct IpcClientInfo {
     pub connected_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSessionTransport {
+    DaemonProxy,
+    Http,
+    Sse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSessionInventoryScope {
+    DaemonProxyOnly,
+    TransportComplete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcLiveSessionInfo {
+    pub transport: LiveSessionTransport,
+    pub client_id: Option<String>,
+    pub session_id: String,
+    pub client_type: crate::types::ClientType,
+    pub client_info: Option<String>,
+    pub connected_secs: u64,
+    pub last_activity_secs: Option<u64>,
+}
+
 /// Per-server OAuth authentication info returned by `AuthStatus`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcAuthServerInfo {
@@ -236,6 +265,11 @@ pub enum IpcResponse {
     Tools { tools: Vec<IpcToolInfo> },
     /// List of live client sessions connected to the daemon.
     Clients { clients: Vec<IpcClientInfo> },
+    /// List of live downstream sessions with explicit transport/scope.
+    LiveSessions {
+        sessions: Vec<IpcLiveSessionInfo>,
+        scope: LiveSessionInventoryScope,
+    },
     /// Synthesized MCP capabilities for the daemon-backed shared runtime.
     Capabilities { capabilities: serde_json::Value },
     /// Success acknowledgement for mutating commands.
@@ -496,6 +530,18 @@ mod tests {
                 clients: 0,
                 uptime_secs: 42,
             },
+            IpcResponse::LiveSessions {
+                sessions: vec![IpcLiveSessionInfo {
+                    transport: LiveSessionTransport::DaemonProxy,
+                    client_id: Some("client-123".to_string()),
+                    session_id: "sess-456".to_string(),
+                    client_type: crate::types::ClientType::ClaudeCode,
+                    client_info: Some("claude-code".to_string()),
+                    connected_secs: 12,
+                    last_activity_secs: Some(1),
+                }],
+                scope: LiveSessionInventoryScope::DaemonProxyOnly,
+            },
             IpcResponse::Registered {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 client_id: "client-123".to_string(),
@@ -574,6 +620,7 @@ mod tests {
         assert!(!requires_auth(&IpcRequest::Capabilities {
             session_id: "s".to_string(),
         }));
+        assert!(!requires_auth(&IpcRequest::ListLiveSessions));
         assert!(!requires_auth(&IpcRequest::UpdateSession {
             session_id: "s".to_string(),
             client_info: "claude-code".to_string(),

@@ -1,8 +1,8 @@
 mod stateful;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use serde::{Deserialize, Serialize};
 
 use crate::http::error::HttpError;
 

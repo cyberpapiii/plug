@@ -176,3 +176,38 @@ These write scopes should remain mostly disjoint until integration.
 - The remaining problem is architectural, not cosmetic.
 - Keeping this work as a separate program reduces the risk of claiming session parity before the
   runtime model actually supports it.
+
+### 2026-03-17 - Session snapshot and transport-aware runtime inventory foundation
+
+**By:** Codex
+
+**Actions:**
+- Added a shared downstream session snapshot model in `plug-core` with explicit transport,
+  `session_id`, client identity, and timing metadata.
+- Extended the stateful HTTP session store with a read-only listing API so operator surfaces can
+  inspect downstream HTTP session state without mutating the store.
+- Introduced an additive transport-aware IPC/runtime response:
+  - `IpcRequest::ListLiveSessions`
+  - `IpcResponse::LiveSessions`
+  - `LiveSessionTransport`
+  - `LiveSessionInventoryScope`
+- Updated daemon/runtime/client/overview surfaces to use the new response shape while preserving
+  fallback compatibility with older daemons.
+- Kept scope explicit: the new live-session inventory currently reports `daemon_proxy_only`
+  truthfully instead of pretending HTTP session parity already exists.
+
+**Verification:**
+- `cargo test -p plug-core session -- --nocapture`
+- `cargo test -p plug-core response_serialization_round_trip -- --nocapture`
+- `cargo test -p plug-core requires_auth_identifies_admin_commands -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+- `cargo test -p plug-core -- --nocapture`
+
+**Learnings:**
+- The new response shape is worth keeping even before full parity because it gives every operator
+  surface one explicit place to express live-session scope.
+- True HTTP parity still requires a second runtime truth source or an aggregation boundary that can
+  combine standalone HTTP session snapshots with daemon proxy sessions without hiding degraded
+  availability.

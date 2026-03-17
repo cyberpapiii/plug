@@ -21,6 +21,17 @@ pub(crate) struct ClientView {
     pub(crate) live_sessions: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LiveSessionView {
+    pub(crate) transport: String,
+    pub(crate) client_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) client_type: String,
+    pub(crate) client_info: Option<String>,
+    pub(crate) connected_secs: u64,
+    pub(crate) last_activity_secs: Option<u64>,
+}
+
 pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
     &[
         ("Claude Desktop", "claude-desktop"),
@@ -163,9 +174,8 @@ pub(crate) fn is_detected(target: &str) -> bool {
     }
 }
 
-fn client_target_from_info(client_info: Option<&str>) -> Option<&'static str> {
-    let info = client_info?;
-    match plug_core::client_detect::detect_client(info) {
+fn client_target_from_type(client_type: plug_core::types::ClientType) -> Option<&'static str> {
+    match client_type {
         plug_core::types::ClientType::ClaudeDesktop => Some("claude-desktop"),
         plug_core::types::ClientType::ClaudeCode => Some("claude-code"),
         plug_core::types::ClientType::Cursor => Some("cursor"),
@@ -179,11 +189,11 @@ fn client_target_from_info(client_info: Option<&str>) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn client_views(live: &[plug_core::ipc::IpcClientInfo]) -> Vec<ClientView> {
+pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<ClientView> {
     let mut live_counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
     for session in live {
-        if let Some(target) = client_target_from_info(session.client_info.as_deref()) {
+        if let Some(target) = client_target_from_type(session.client_type) {
             *live_counts.entry(target).or_insert(0) += 1;
         }
     }
@@ -213,6 +223,34 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcClientInfo]) -> Vec<Client
         })
         .collect::<Vec<_>>();
     views.sort_by(|a, b| a.name.cmp(&b.name));
+    views
+}
+
+pub(crate) fn live_session_views(
+    live: &[plug_core::ipc::IpcLiveSessionInfo],
+) -> Vec<LiveSessionView> {
+    let mut views = live
+        .iter()
+        .map(|session| LiveSessionView {
+            transport: match session.transport {
+                plug_core::ipc::LiveSessionTransport::DaemonProxy => "daemon_proxy".to_string(),
+                plug_core::ipc::LiveSessionTransport::Http => "http".to_string(),
+                plug_core::ipc::LiveSessionTransport::Sse => "sse".to_string(),
+            },
+            client_id: session.client_id.clone(),
+            session_id: session.session_id.clone(),
+            client_type: session.client_type.to_string(),
+            client_info: session.client_info.clone(),
+            connected_secs: session.connected_secs,
+            last_activity_secs: session.last_activity_secs,
+        })
+        .collect::<Vec<_>>();
+    views.sort_by(|a, b| {
+        a.transport
+            .cmp(&b.transport)
+            .then(a.client_type.cmp(&b.client_type))
+            .then(a.session_id.cmp(&b.session_id))
+    });
     views
 }
 

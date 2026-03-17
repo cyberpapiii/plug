@@ -185,6 +185,33 @@ impl ClientRegistry {
         });
         clients
     }
+
+    /// Snapshot all live sessions in the newer transport-aware shape.
+    fn list_live_sessions(&self) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
+        let mut sessions = self
+            .sessions
+            .iter()
+            .map(|entry| plug_core::ipc::IpcLiveSessionInfo {
+                transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+                client_id: Some(entry.client_id.clone()),
+                session_id: entry.key().clone(),
+                client_type: entry
+                    .client_info
+                    .as_deref()
+                    .map(plug_core::client_detect::detect_client)
+                    .unwrap_or(plug_core::types::ClientType::Unknown),
+                client_info: entry.client_info.clone(),
+                connected_secs: entry.connected_at.elapsed().as_secs(),
+                last_activity_secs: None,
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|a, b| {
+            a.client_info
+                .cmp(&b.client_info)
+                .then(a.session_id.cmp(&b.session_id))
+        });
+        sessions
+    }
 }
 
 // ──────────────────────────────── Path helpers ────────────────────────────────
@@ -1314,6 +1341,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::ListClients => IpcResponse::Clients {
             clients: ctx.client_registry.list(),
         },
+        IpcRequest::ListLiveSessions => IpcResponse::LiveSessions {
+            sessions: ctx.client_registry.list_live_sessions(),
+            scope: plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+        },
         IpcRequest::Capabilities { session_id } => {
             if ctx.session_id.as_deref() != Some(session_id.as_str()) {
                 return IpcResponse::Error {
@@ -2125,11 +2156,12 @@ mod tests {
     }
 
     fn seeded_credentials() -> StoredCredentials {
-        let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
-            AccessToken::new("access-token".to_string()),
-            BasicTokenType::Bearer,
-            VendorExtraTokenFields::default(),
-        );
+        let mut token =
+            oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
+                AccessToken::new("access-token".to_string()),
+                BasicTokenType::Bearer,
+                VendorExtraTokenFields::default(),
+            );
         token.set_refresh_token(Some(RefreshToken::new("refresh-token".to_string())));
         token.set_expires_in(Some(&Duration::from_secs(3600)));
 
@@ -2199,7 +2231,10 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, server_name);
         assert!(!servers[0].authenticated);
-        assert_eq!(servers[0].health, plug_core::types::ServerHealth::AuthRequired);
+        assert_eq!(
+            servers[0].health,
+            plug_core::types::ServerHealth::AuthRequired
+        );
         assert!(servers[0].token_expires_in_secs.is_none());
 
         clear_store(&server_name).await;
@@ -2253,7 +2288,10 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, server_name);
         assert!(servers[0].authenticated);
-        assert_eq!(servers[0].health, plug_core::types::ServerHealth::AuthRequired);
+        assert_eq!(
+            servers[0].health,
+            plug_core::types::ServerHealth::AuthRequired
+        );
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);

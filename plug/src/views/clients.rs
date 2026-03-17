@@ -2,15 +2,22 @@ use dialoguer::Select;
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::{client_views, cmd_link, cmd_unlink};
-use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
+use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
+use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions};
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_warning_line,
 };
 
-fn live_inventory_scope_text() -> &'static str {
-    "Live session inventory currently reflects daemon proxy clients only; downstream HTTP sessions are not yet surfaced here."
+fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
+    match scope {
+        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => {
+            "Live session inventory currently reflects daemon proxy clients only; downstream HTTP sessions are not yet surfaced here."
+        }
+        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
+            "Live session inventory includes both daemon proxy and downstream HTTP sessions."
+        }
+    }
 }
 
 fn prompt_client_actions() -> anyhow::Result<bool> {
@@ -54,17 +61,22 @@ pub(crate) async fn cmd_client_list(
     };
 
     loop {
-        let (live, live_client_support) = fetch_live_clients().await;
+        let (live, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
         let clients = client_views(&live);
+        let live_sessions = live_session_views(&live);
 
         if matches!(output, OutputFormat::Json) {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "clients": clients,
+                    "live_sessions": live_sessions,
                     "live_client_support": live_client_support,
-                    "live_inventory_scope": "daemon_proxy_only",
-                    "http_sessions_included": false,
+                    "live_inventory_scope": live_inventory_scope,
+                    "http_sessions_included": matches!(
+                        live_inventory_scope,
+                        plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                    ),
                     "daemon_error": daemon_error,
                 }))?
             );
@@ -91,7 +103,15 @@ pub(crate) async fn cmd_client_list(
         }
         let linked_count = clients.iter().filter(|client| client.linked).count();
         let detected_count = clients.iter().filter(|client| client.detected).count();
-        let live_count = clients.iter().filter(|client| client.live).count();
+        let live_count = live_sessions.len();
+        let daemon_proxy_count = live_sessions
+            .iter()
+            .filter(|session| session.transport == "daemon_proxy")
+            .count();
+        let http_count = live_sessions
+            .iter()
+            .filter(|session| session.transport == "http")
+            .count();
         print_heading("Summary");
         print_label_value("Linked", style(linked_count).green().bold());
         print_label_value("Detected", style(detected_count).cyan().bold());
@@ -107,10 +127,47 @@ pub(crate) async fn cmd_client_list(
             }
         }
         if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
-            print_info_line(live_inventory_scope_text());
+            print_info_line(live_inventory_scope_text(live_inventory_scope));
+            print_label_value(
+                "Live Transports",
+                format!("daemon_proxy={} http={}", daemon_proxy_count, http_count),
+            );
         }
         println!();
-        print_heading("Inventory");
+        print_heading("Live Sessions");
+        if live_sessions.is_empty() {
+            print_info_line("No live downstream sessions observed.");
+        } else {
+            println!(
+                "  {:<18} {:<14} {:<12} {:<10} {:<10}",
+                style("SESSION").dim(),
+                style("CLIENT").dim(),
+                style("TRANSPORT").dim(),
+                style("CONNECTED").dim(),
+                style("IDLE").dim()
+            );
+            println!(
+                "  {}",
+                style("--------------------------------------------------------------------------").dim()
+            );
+            for session in &live_sessions {
+                let idle = session
+                    .last_activity_secs
+                    .map(|seconds| format!("{seconds}s"))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "  {:<18} {:<14} {:<12} {:<10} {:<10}",
+                    &session.session_id[..session.session_id.len().min(18)],
+                    session.client_type,
+                    session.transport,
+                    format!("{}s", session.connected_secs),
+                    idle,
+                );
+            }
+        }
+
+        println!();
+        print_heading("Configured Clients");
         println!(
             "  {:<24} {:<10} {:<10} {:<28} {:<10} {:<6}",
             style("CLIENT").dim(),
@@ -185,7 +242,7 @@ mod tests {
 
     #[test]
     fn live_inventory_scope_text_mentions_daemon_and_http_gap() {
-        let text = live_inventory_scope_text();
+        let text = live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
         assert!(text.contains("daemon proxy clients"));
         assert!(text.contains("HTTP sessions"));
     }

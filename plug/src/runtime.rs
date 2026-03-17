@@ -15,16 +15,50 @@ pub(crate) enum LiveClientSupport {
     DaemonRestartRequired,
 }
 
-pub(crate) async fn fetch_live_clients() -> (Vec<plug_core::ipc::IpcClientInfo>, LiveClientSupport)
-{
-    match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListClients).await {
+pub(crate) async fn fetch_live_sessions() -> (
+    Vec<plug_core::ipc::IpcLiveSessionInfo>,
+    plug_core::ipc::LiveSessionInventoryScope,
+    LiveClientSupport,
+) {
+    match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListLiveSessions).await {
+        Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => {
+            (sessions, scope, LiveClientSupport::Supported)
+        }
         Ok(plug_core::ipc::IpcResponse::Clients { clients }) => {
-            (clients, LiveClientSupport::Supported)
+            let sessions = clients
+                .into_iter()
+                .map(|client| plug_core::ipc::IpcLiveSessionInfo {
+                    transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+                    client_id: Some(client.client_id),
+                    session_id: client.session_id,
+                    client_type: client
+                        .client_info
+                        .as_deref()
+                        .map(plug_core::client_detect::detect_client)
+                        .unwrap_or(plug_core::types::ClientType::Unknown),
+                    client_info: client.client_info,
+                    connected_secs: client.connected_secs,
+                    last_activity_secs: None,
+                })
+                .collect();
+            (
+                sessions,
+                plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+                LiveClientSupport::Supported,
+            )
         }
         Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => {
-            (Vec::new(), LiveClientSupport::DaemonRestartRequired)
+            (
+                Vec::new(),
+                plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+                LiveClientSupport::DaemonRestartRequired,
+            )
         }
-        _ => (Vec::new(), LiveClientSupport::Supported),
+        _ => (
+            Vec::new(),
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            LiveClientSupport::Supported,
+        ),
     }
 }
 

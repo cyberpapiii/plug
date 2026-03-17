@@ -151,3 +151,29 @@ implying parity they do not yet have.
 **Learnings:**
 - The remaining gap is now clear enough to scope independently from the broader auth/OAuth hardening
   program.
+
+### 2026-03-17 - Transport-aware live-session response foundation landed
+
+**By:** Codex
+
+**Actions:**
+- Added a shared downstream session snapshot model and read-only HTTP session listing support in
+  `plug-core`.
+- Added a transport-aware IPC/runtime response used by `plug clients` and overview/status surfaces.
+- Preserved explicit scope reporting so the product now says `daemon_proxy_only` through one shared
+  response path instead of each surface inferring scope independently.
+
+**Evidence:**
+- `plug-core/src/session/mod.rs`
+- `plug-core/src/session/stateful.rs`
+- `plug-core/src/ipc.rs`
+- `plug/src/daemon.rs`
+- `plug/src/runtime.rs`
+- `plug/src/views/clients.rs`
+- `plug/src/views/overview.rs`
+
+**Learnings:**
+- The current gap is no longer “lack of transport-aware inventory types”; that foundation now
+  exists.
+- The remaining gap is the actual aggregation boundary between daemon proxy state and standalone
+  HTTP session state.

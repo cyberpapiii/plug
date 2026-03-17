@@ -99,6 +99,22 @@ Reasoning:
 - Option 2 improves operator truth without destabilizing the existing runtime model
 - if daemon-owned HTTP becomes desirable later, the snapshot model remains useful rather than wasted
 
+## Progress So Far
+
+The first implementation slice is now in place on `main` locally:
+
+- `plug-core` has a shared downstream session snapshot model and read-only list support
+- IPC/runtime now have an additive transport-aware live-session response
+- `plug clients` and overview/status surfaces now consume that response shape
+- fallback compatibility with older daemons is preserved
+
+Important constraint:
+
+- the current live-session scope is still `daemon_proxy_only`
+- downstream HTTP sessions are not yet merged into the live daemon inventory
+- this slice improves truthfulness and forward compatibility, but it does not claim transport-
+  complete parity
+
 ## Proposed Design
 
 ### 1. Introduce a shared downstream session snapshot type
@@ -170,6 +186,16 @@ Required scenarios:
 - transport is explicit for every live session
 - daemon proxy and HTTP sessions can coexist in one inventory view without ambiguity
 - tests cover mixed transport session inventories and degraded partial-availability cases
+
+## Phase Status
+
+- [x] Shared session snapshot model exists
+- [x] Stateful HTTP session store exposes read-only snapshot listing
+- [x] Additive transport-aware IPC/runtime response exists
+- [x] CLI/operator surfaces consume the new response shape
+- [ ] HTTP sessions are merged into the normal live inventory
+- [ ] Mixed daemon proxy + HTTP session inventories are visible in one operator view
+- [ ] Degraded partial-availability aggregation semantics are implemented and tested
 
 ## References
 

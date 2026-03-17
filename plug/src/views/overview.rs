@@ -4,15 +4,22 @@ use crate::OutputFormat;
 use crate::commands::clients::{
     configured_http_export_url, linked_client_targets, linked_client_transport,
 };
-use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
+use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions};
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_next_action, print_warning_line,
     status_label, status_marker, summarize_server_auth, summarize_server_target,
     summarize_server_transport,
 };
 
-fn live_client_count_scope_text() -> &'static str {
-    "Live client counts currently reflect daemon proxy clients only; downstream HTTP sessions are not yet included."
+fn live_client_count_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
+    match scope {
+        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => {
+            "Live client counts currently reflect daemon proxy clients only; downstream HTTP sessions are not yet included."
+        }
+        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
+            "Live client counts include both daemon proxy and downstream HTTP sessions."
+        }
+    }
 }
 
 pub(crate) async fn cmd_overview(
@@ -24,7 +31,7 @@ pub(crate) async fn cmd_overview(
         .unwrap_or_else(plug_core::config::default_config_path);
     let config_exists = config_path.exists();
     let linked_clients = linked_client_targets();
-    let (live_clients, live_client_support) = fetch_live_clients().await;
+    let (live_clients, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
     let live_client_count = live_clients.len();
 
     if matches!(output, OutputFormat::Json) {
@@ -46,8 +53,11 @@ pub(crate) async fn cmd_overview(
                 "linked_clients": linked_clients,
                 "live_client_count": live_client_count,
                 "live_client_support": live_client_support,
-                "live_client_scope": "daemon_proxy_only",
-                "http_sessions_included": false,
+                "live_client_scope": live_inventory_scope,
+                "http_sessions_included": matches!(
+                    live_inventory_scope,
+                    plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                ),
                 "next_actions": if !config_exists {
                     vec!["plug setup"]
                 } else if linked_clients.is_empty() {
@@ -119,7 +129,7 @@ pub(crate) async fn cmd_overview(
     match live_client_support {
         LiveClientSupport::Supported => {
             print_label_value("Live", style(live_client_count).bold());
-            print_label_value("Live Scope", live_client_count_scope_text());
+            print_label_value("Live Scope", live_client_count_scope_text(live_inventory_scope));
         }
         LiveClientSupport::DaemonRestartRequired => {
             print_label_value("Live", style("restart required").yellow().bold());
@@ -272,7 +282,10 @@ pub(crate) async fn cmd_status(
             print_label_value("Status", style("running").green().bold());
             print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
             print_label_value("Clients", style(clients.to_string()).bold());
-            print_label_value("Client Scope", live_client_count_scope_text());
+            print_label_value(
+                "Client Scope",
+                live_client_count_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly),
+            );
             if !linked_clients.is_empty() {
                 let linked_summary = linked_clients
                     .iter()
@@ -396,7 +409,7 @@ pub(crate) async fn cmd_status(
                 "uptime": uptime_secs,
                 "clients": clients,
                 "servers": servers,
-                "live_client_scope": "daemon_proxy_only",
+                "live_client_scope": plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
                 "http_sessions_included": false
             });
             if !linked_clients.is_empty() {
@@ -448,7 +461,10 @@ pub(crate) async fn cmd_status(
         );
         println!(
             "  {}",
-            style("-------------------------------------------------------------------------------").dim()
+            style(
+                "-------------------------------------------------------------------------------"
+            )
+            .dim()
         );
         let mut names: Vec<_> = config.servers.keys().collect();
         names.sort();
@@ -504,7 +520,7 @@ mod tests {
 
     #[test]
     fn live_client_count_scope_text_mentions_daemon_and_http_gap() {
-        let text = live_client_count_scope_text();
+        let text = live_client_count_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
         assert!(text.contains("daemon proxy clients"));
         assert!(text.contains("HTTP sessions"));
     }

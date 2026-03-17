@@ -370,7 +370,12 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
 
-        assert!(store.list_sessions().iter().all(|snapshot| snapshot.session_id != id));
+        assert!(
+            store
+                .list_sessions()
+                .iter()
+                .all(|snapshot| snapshot.session_id != id)
+        );
         assert_eq!(store.session_count(), 1);
     }
 
