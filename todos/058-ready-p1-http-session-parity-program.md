@@ -237,3 +237,33 @@ These write scopes should remain mostly disjoint until integration.
   before transport-complete parity exists.
 - Keeping the old daemon `clients` field in JSON remains useful for compatibility, but it should no
   longer be the only operator-visible runtime count.
+
+### 2026-03-17 - Standalone HTTP inventory export and scope expansion
+
+**By:** Codex
+
+**Actions:**
+- Added a token-protected local operator endpoint on the standalone HTTP runtime:
+  - `/_plug/live-sessions`
+- Added a dedicated operator token path separate from downstream auth material:
+  - `http_operator_token_<port>`
+- Taught `fetch_live_sessions(...)` to query both:
+  - daemon proxy live sessions via IPC
+  - standalone HTTP session snapshots via the new local operator endpoint
+- Expanded inventory scope semantics beyond the original binary model:
+  - `daemon_proxy_only`
+  - `http_only`
+  - `transport_complete`
+  - `unavailable`
+- Updated `clients` / `overview` / `status` surfaces to understand the expanded scope values.
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug commands::clients::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+
+**Learnings:**
+- A secure standalone export path is feasible without pretending the daemon owns HTTP.
+- The current implementation can now distinguish daemon-only, HTTP-only, and fully merged session
+  truth, which is enough to make later aggregation work incremental instead of architectural guesswork.

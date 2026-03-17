@@ -177,3 +177,23 @@ implying parity they do not yet have.
   exists.
 - The remaining gap is the actual aggregation boundary between daemon proxy state and standalone
   HTTP session state.
+
+### 2026-03-17 - Standalone HTTP inventory export landed
+
+**By:** Codex
+
+**Actions:**
+- Added a token-protected local operator endpoint on the standalone HTTP runtime so the CLI can
+  query downstream HTTP session snapshots directly.
+- Updated runtime aggregation to merge daemon proxy sessions with standalone HTTP session truth when
+  available.
+- Expanded scope semantics so operator surfaces can distinguish:
+  - `daemon_proxy_only`
+  - `http_only`
+  - `transport_complete`
+  - `unavailable`
+
+**Learnings:**
+- The remaining parity gap is no longer “HTTP sessions are invisible”; it is now about how far the
+  product should go in surfacing partial/degraded cross-runtime states and whether HTTP should
+  eventually move under daemon ownership.

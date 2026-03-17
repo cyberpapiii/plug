@@ -22,7 +22,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio-util.workspace = true
 axum.workspace = true
+tower.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 
 # Daemon (Phase 4)
 tracing-appender.workspace = true

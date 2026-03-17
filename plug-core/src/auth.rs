@@ -111,6 +111,11 @@ pub fn http_auth_token_path(port: u16) -> PathBuf {
     crate::config::config_dir().join(format!("http_auth_token_{port}"))
 }
 
+/// Return the path for the local operator inventory token for a given port.
+pub fn http_operator_token_path(port: u16) -> PathBuf {
+    crate::config::config_dir().join(format!("http_operator_token_{port}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

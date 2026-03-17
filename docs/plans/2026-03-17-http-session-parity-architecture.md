@@ -107,13 +107,17 @@ The first implementation slice is now in place on `main` locally:
 - IPC/runtime now have an additive transport-aware live-session response
 - `plug clients` and overview/status surfaces now consume that response shape
 - fallback compatibility with older daemons is preserved
+- standalone HTTP runtime now exposes a token-protected local operator inventory endpoint
+- runtime aggregation can distinguish daemon-only, HTTP-only, transport-complete, and unavailable
+  live-session states
 
 Important constraint:
 
 - the current live-session scope is still `daemon_proxy_only`
-- downstream HTTP sessions are not yet merged into the live daemon inventory
-- this slice improves truthfulness and forward compatibility, but it does not claim transport-
-  complete parity
+- downstream HTTP sessions are still not owned by the daemon runtime
+- the merged view is assembled in `runtime`, not by a single underlying runtime authority
+- this slice improves truthfulness and cross-runtime visibility without claiming that daemon and
+  standalone HTTP have been fully unified internally
 
 ## Proposed Design
 
@@ -193,9 +197,10 @@ Required scenarios:
 - [x] Stateful HTTP session store exposes read-only snapshot listing
 - [x] Additive transport-aware IPC/runtime response exists
 - [x] CLI/operator surfaces consume the new response shape
-- [ ] HTTP sessions are merged into the normal live inventory
-- [ ] Mixed daemon proxy + HTTP session inventories are visible in one operator view
-- [ ] Degraded partial-availability aggregation semantics are implemented and tested
+- [x] Standalone HTTP runtime exposes read-only operator session inventory
+- [x] Mixed daemon proxy + HTTP session inventories can be merged in one operator view
+- [x] Distinct daemon-only / HTTP-only / transport-complete / unavailable states exist
+- [ ] Degraded partial-availability aggregation semantics are implemented and tested more fully
 
 ## References
 

@@ -14,8 +14,14 @@ fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -
         plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => {
             "Live session inventory currently reflects daemon proxy clients only; downstream HTTP sessions are not yet surfaced here."
         }
+        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => {
+            "Live session inventory currently reflects standalone downstream HTTP sessions only; daemon proxy sessions are not available."
+        }
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
             "Live session inventory includes both daemon proxy and downstream HTTP sessions."
+        }
+        plug_core::ipc::LiveSessionInventoryScope::Unavailable => {
+            "Live session inventory is unavailable from both daemon and standalone HTTP sources."
         }
     }
 }
@@ -61,7 +67,7 @@ pub(crate) async fn cmd_client_list(
     };
 
     loop {
-        let (live, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
+        let (live, live_inventory_scope, live_client_support) = fetch_live_sessions(config_path).await;
         let clients = client_views(&live);
         let live_sessions = live_session_views(&live);
 
@@ -76,6 +82,7 @@ pub(crate) async fn cmd_client_list(
                     "http_sessions_included": matches!(
                         live_inventory_scope,
                         plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                            | plug_core::ipc::LiveSessionInventoryScope::HttpOnly
                     ),
                     "daemon_error": daemon_error,
                 }))?

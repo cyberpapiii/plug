@@ -16,8 +16,14 @@ fn live_client_count_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope
         plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => {
             "Live client counts currently reflect daemon proxy clients only; downstream HTTP sessions are not yet included."
         }
+        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => {
+            "Live client counts currently reflect standalone downstream HTTP sessions only; daemon proxy sessions are not included."
+        }
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
             "Live client counts include both daemon proxy and downstream HTTP sessions."
+        }
+        plug_core::ipc::LiveSessionInventoryScope::Unavailable => {
+            "Live client counts are unavailable from both daemon and standalone HTTP sources."
         }
     }
 }
@@ -49,7 +55,8 @@ pub(crate) async fn cmd_overview(
         .unwrap_or_else(plug_core::config::default_config_path);
     let config_exists = config_path.exists();
     let linked_clients = linked_client_targets();
-    let (live_clients, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
+    let (live_clients, live_inventory_scope, live_client_support) =
+        fetch_live_sessions(Some(&config_path)).await;
     let live_client_count = live_clients.len();
 
     if matches!(output, OutputFormat::Json) {
@@ -75,6 +82,7 @@ pub(crate) async fn cmd_overview(
                 "http_sessions_included": matches!(
                     live_inventory_scope,
                     plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                        | plug_core::ipc::LiveSessionInventoryScope::HttpOnly
                 ),
                 "next_actions": if !config_exists {
                     vec!["plug setup"]
@@ -294,7 +302,8 @@ pub(crate) async fn cmd_status(
         uptime_secs,
     }) = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
     {
-        let (live_sessions, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
+        let (live_sessions, live_inventory_scope, live_client_support) =
+            fetch_live_sessions(config_path).await;
         let live_session_count = live_sessions.len();
         let (daemon_proxy_count, http_count, sse_count) = live_transport_counts(&live_sessions);
         if matches!(output, OutputFormat::Text) {
@@ -463,6 +472,7 @@ pub(crate) async fn cmd_status(
                 "http_sessions_included": matches!(
                     live_inventory_scope,
                     plug_core::ipc::LiveSessionInventoryScope::TransportComplete
+                        | plug_core::ipc::LiveSessionInventoryScope::HttpOnly
                 )
             });
             if !linked_clients.is_empty() {

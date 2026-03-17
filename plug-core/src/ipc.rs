@@ -226,7 +226,9 @@ pub enum LiveSessionTransport {
 #[serde(rename_all = "snake_case")]
 pub enum LiveSessionInventoryScope {
     DaemonProxyOnly,
+    HttpOnly,
     TransportComplete,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
