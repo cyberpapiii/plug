@@ -573,10 +573,49 @@ fn repair_export_endpoint(
     })
 }
 
+fn repair_targets(
+    requested: Vec<String>,
+    all: bool,
+) -> anyhow::Result<Vec<String>> {
+    let known_targets = crate::commands::clients::all_client_targets()
+        .iter()
+        .map(|(_, target)| (*target).to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if all {
+        return Ok(known_targets.into_iter().collect());
+    }
+
+    if requested.is_empty() {
+        return Ok(known_targets.into_iter().collect());
+    }
+
+    let mut selected = Vec::new();
+    let mut unknown = Vec::new();
+    for target in requested {
+        if known_targets.contains(&target) {
+            selected.push(target);
+        } else {
+            unknown.push(target);
+        }
+    }
+
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "unknown client target(s): {}",
+            unknown.join(", ")
+        );
+    }
+
+    selected.sort_unstable();
+    selected.dedup();
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        doctor_check_details, repair_export_endpoint, runtime_auth_checks,
+        doctor_check_details, repair_export_endpoint, repair_targets, runtime_auth_checks,
         runtime_health_checks_for_tests,
         synthesize_doctor_interpretation,
     };
@@ -854,45 +893,44 @@ mod tests {
         let endpoint = repair_export_endpoint(Some("https://plug.example.com/mcp"), None);
         assert_eq!(endpoint, "https://plug.example.com/mcp");
     }
+
+    #[test]
+    fn repair_targets_accepts_known_requested_targets() {
+        let targets = repair_targets(vec!["cursor".to_string(), "codex-cli".to_string()], false)
+            .expect("known targets should pass");
+        assert_eq!(targets, vec!["codex-cli", "cursor"]);
+    }
+
+    #[test]
+    fn repair_targets_rejects_unknown_targets() {
+        let error = repair_targets(vec!["made-up-client".to_string()], false)
+            .expect_err("unknown target should fail");
+        assert!(error.to_string().contains("unknown client target"));
+    }
 }
 
-pub(crate) fn cmd_repair(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+pub(crate) fn cmd_repair(
+    config_path: Option<&std::path::PathBuf>,
+    targets: Vec<String>,
+    all: bool,
+) -> anyhow::Result<()> {
     println!(
         "{} {}",
         style("◆").cyan().bold(),
         style("Repairing AI client configurations...").bold()
     );
 
-    let all_clients = [
-        "claude-desktop",
-        "claude-code",
-        "cursor",
-        "vscode",
-        "windsurf",
-        "gemini-cli",
-        "codex-cli",
-        "opencode",
-        "zed",
-        "cline",
-        "cline-cli",
-        "roocode",
-        "factory",
-        "nanobot",
-        "junie",
-        "kilo",
-        "antigravity",
-        "goose",
-    ];
+    let repair_targets = repair_targets(targets, all)?;
 
     let mut repaired_count = 0;
 
-    for target in all_clients {
-        if let Some(linked) = crate::commands::clients::linked_client_config(target, false) {
+    for target in repair_targets {
+        if let Some(linked) = crate::commands::clients::linked_client_config(&target, false) {
             print!("  {} Refreshing {}... ", style("›").cyan().bold(), target);
             let export_endpoint =
                 repair_export_endpoint(linked.endpoint.as_deref(), config_path);
             if let Err(e) = execute_export(
-                target,
+                &target,
                 matches!(linked.transport, plug_core::export::ExportTransport::Http),
                 export_endpoint.as_str(),
                 true,

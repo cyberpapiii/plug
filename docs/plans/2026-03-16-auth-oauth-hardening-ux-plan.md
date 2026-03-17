@@ -129,6 +129,8 @@ Still remaining:
   caveats instead of reverting to an ambiguous `clients=` field.
 - 2026-03-17: overview JSON now exposes the same live-client scope metadata as `status` and
   `clients`, so machine-readable output no longer lags behind the clarified text surfaces.
+- 2026-03-17: `plug repair` now accepts explicit client targets, so one broken client config can
+  be refreshed without bluntly regenerating every linked client on the machine.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.

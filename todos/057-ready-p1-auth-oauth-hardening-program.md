@@ -268,6 +268,26 @@ Key files expected to change:
 - Config-aware endpoint derivation has to stay consistent across `link`, `export`, `setup`, and
   `repair` or the operator model drifts again.
 
+### 2026-03-17 - Selective repair targeting
+
+**By:** Codex
+
+**Actions:**
+- Added explicit client targets to `plug repair`, with `--all` retaining the old whole-fleet
+  behavior.
+- Reused the existing supported client target list so repair does not invent a second naming model.
+- Added focused validation tests for accepted and rejected repair targets.
+
+**Verification:**
+- `cargo test -p plug commands::misc::tests -- --nocapture`
+- `cargo test -p plug tests::serve_command -- --nocapture`
+
+**Learnings:**
+- Topology-aware repair still felt blunt until users could scope it to the one client they were
+  actually fixing.
+- Reusing the same client-target vocabulary as `plug link` keeps maintenance commands easier to
+  predict.
+
 ### 2026-03-17 - Auth status source-truth clarification
 
 **By:** Codex
@@ -322,6 +342,20 @@ Key files expected to change:
 **Learnings:**
 - Once scope truth exists on one machine-readable surface, leaving it out of a sibling command
   recreates ambiguity for automation and scripted operators.
+
+### 2026-03-17 - Session parity architecture split-out
+
+**By:** Codex
+
+**Actions:**
+- Captured the remaining HTTP-session parity work as a dedicated architecture plan:
+  [docs/plans/2026-03-17-http-session-parity-architecture.md](../docs/plans/2026-03-17-http-session-parity-architecture.md)
+- Explicitly separated that work from the current hardening tranche so the auth/OAuth UX effort can
+  close cleanly without claiming transport-complete live inventory parity.
+
+**Learnings:**
+- The hardening program now has a clean boundary: standards, recovery UX, and scope honesty are
+  largely addressed; true multi-transport session parity is the next architecture project.
 
 ### 2026-03-17 - Server auth setup scaffolding slice
 

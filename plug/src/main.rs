@@ -111,7 +111,11 @@ enum Commands {
     Doctor,
     #[command(display_order = 5)]
     /// Refresh linked AI client configuration files
-    Repair,
+    Repair {
+        targets: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
     #[command(display_order = 6)]
     /// Internal: reload service config from disk
     Reload,
@@ -430,7 +434,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Doctor) => {
             commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?
         }
-        Some(Commands::Repair) => commands::misc::cmd_repair(cli.config.as_ref())?,
+        Some(Commands::Repair { targets, all }) => {
+            commands::misc::cmd_repair(cli.config.as_ref(), targets, all)?
+        }
         Some(Commands::Setup { yes, transport }) => {
             commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
         }
