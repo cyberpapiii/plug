@@ -8,7 +8,8 @@ use crate::commands::servers::{
 use crate::runtime::ensure_daemon_with_feedback;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
-    print_label_value, status_label, status_marker, summarize_server_target,
+    print_label_value, status_label, status_marker, summarize_server_auth,
+    summarize_server_target, summarize_server_transport,
 };
 
 async fn prompt_server_actions(
@@ -162,22 +163,8 @@ pub(crate) async fn cmd_server_list(
                             let server_cfg = config
                                 .as_ref()
                                 .and_then(|cfg| cfg.servers.get(&s.server_id));
-                            let transport = server_cfg
-                                .map(|cfg| match cfg.transport {
-                                    plug_core::config::TransportType::Stdio => "stdio",
-                                    plug_core::config::TransportType::Http => "http",
-                                    plug_core::config::TransportType::Sse => "sse",
-                                })
-                                .unwrap_or("unknown");
-                            let auth = server_cfg
-                                .map(
-                                    |cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
-                                        (Some("oauth"), _) => "oauth",
-                                        (_, true) => "bearer",
-                                        _ => "none",
-                                    },
-                                )
-                                .unwrap_or("unknown");
+                            let transport = summarize_server_transport(server_cfg);
+                            let auth = summarize_server_auth(server_cfg);
                             let target = summarize_server_target(server_cfg, 28);
                             println!(
                                 "  {} {:<18} {:<12} {:<8} {:<6} {:<28} ({} tools)",
@@ -266,18 +253,32 @@ pub(crate) async fn cmd_server_list(
                     ));
                 }
                 print_heading("Inventory");
+                println!(
+                    "  {:<18} {:<8} {:<6} {:<40} {}",
+                    style("SERVER").dim(),
+                    style("UPSTREAM").dim(),
+                    style("AUTH").dim(),
+                    style("TARGET").dim(),
+                    style("STATE").dim()
+                );
+                println!(
+                    "  {}",
+                    style("---------------------------------------------------------------------------------------").dim()
+                );
                 for name in names {
                     let server = config.servers.get(name);
                     let enabled = server.map(|server| server.enabled).unwrap_or(true);
                     let target = summarize_server_target(server, 40);
                     println!(
-                        "  {} {:<18} {:<12} {}",
+                        "  {} {:<18} {:<8} {:<6} {:<40} {}",
                         if enabled {
                             style("·").dim()
                         } else {
                             style("!").yellow().bold()
                         },
                         style(name).bold(),
+                        summarize_server_transport(server),
+                        summarize_server_auth(server),
                         style(target).dim(),
                         if enabled {
                             style("configured").dim()

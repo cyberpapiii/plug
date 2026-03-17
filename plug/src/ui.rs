@@ -242,6 +242,28 @@ pub(crate) fn summarize_server_target(
     truncate_tail(&raw, max_width)
 }
 
+pub(crate) fn summarize_server_transport(
+    server: Option<&plug_core::config::ServerConfig>,
+) -> &'static str {
+    match server.map(|server| &server.transport) {
+        Some(plug_core::config::TransportType::Stdio) => "stdio",
+        Some(plug_core::config::TransportType::Http) => "http",
+        Some(plug_core::config::TransportType::Sse) => "sse",
+        None => "unknown",
+    }
+}
+
+pub(crate) fn summarize_server_auth(server: Option<&plug_core::config::ServerConfig>) -> &'static str {
+    match server {
+        Some(server) => match (server.auth.as_deref(), server.auth_token.is_some()) {
+            (Some("oauth"), _) => "oauth",
+            (_, true) => "bearer",
+            _ => "none",
+        },
+        None => "unknown",
+    }
+}
+
 fn truncate_tail(value: &str, max_width: usize) -> String {
     let char_count = value.chars().count();
     if max_width == 0 || char_count <= max_width {
@@ -257,7 +279,7 @@ fn truncate_tail(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize_server_target;
+    use super::{summarize_server_auth, summarize_server_target, summarize_server_transport};
     use plug_core::config::{ServerConfig, TransportType};
 
     fn server_config() -> ServerConfig {
@@ -314,5 +336,14 @@ mod tests {
             summarize_server_target(Some(&server), 20),
             "https://very-long..."
         );
+    }
+
+    #[test]
+    fn summarize_server_transport_and_auth_follow_server_shape() {
+        let mut server = server_config();
+        server.transport = TransportType::Sse;
+        server.auth = Some("oauth".to_string());
+        assert_eq!(summarize_server_transport(Some(&server)), "sse");
+        assert_eq!(summarize_server_auth(Some(&server)), "oauth");
     }
 }

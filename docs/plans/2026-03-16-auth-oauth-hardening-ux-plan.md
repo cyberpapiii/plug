@@ -83,6 +83,8 @@ Still remaining:
   non-interactive on macOS instead of hanging behind a Keychain prompt.
 - 2026-03-17: `plug status` and `plug servers` now include each server's concrete target (URL or
   command) so operators can immediately see what a health line actually points at.
+- 2026-03-17: daemon-unavailable fallback inventories now preserve upstream transport, auth, and
+  target detail instead of collapsing back to bare server names.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
   full end-to-end command fixtures.
 

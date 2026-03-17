@@ -7,7 +7,8 @@ use crate::commands::clients::{
 use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_next_action, print_warning_line,
-    status_label, status_marker, summarize_server_target,
+    status_label, status_marker, summarize_server_auth, summarize_server_target,
+    summarize_server_transport,
 };
 
 pub(crate) async fn cmd_overview(
@@ -324,22 +325,8 @@ pub(crate) async fn cmd_status(
                         continue;
                     }
                     let server_cfg = config_by_server.and_then(|servers| servers.get(&s.server_id));
-                    let transport = server_cfg
-                        .map(|cfg| match cfg.transport {
-                            plug_core::config::TransportType::Stdio => "stdio",
-                            plug_core::config::TransportType::Http => "http",
-                            plug_core::config::TransportType::Sse => "sse",
-                        })
-                        .unwrap_or("unknown");
-                    let auth = server_cfg
-                        .map(
-                            |cfg| match (cfg.auth.as_deref(), cfg.auth_token.is_some()) {
-                                (Some("oauth"), _) => "oauth",
-                                (_, true) => "bearer",
-                                _ => "none",
-                            },
-                        )
-                        .unwrap_or("unknown");
+                    let transport = summarize_server_transport(server_cfg);
+                    let auth = summarize_server_auth(server_cfg);
                     let target = summarize_server_target(server_cfg, 28);
                     println!(
                         "  {} {:<18} {:<12} {:<8} {:<6} {:<28} {:>5}",
@@ -406,14 +393,38 @@ pub(crate) async fn cmd_status(
         );
         println!();
         print_heading("Configured servers");
+        println!(
+            "  {:<18} {:<8} {:<6} {:<28} {}",
+            style("SERVER").dim(),
+            style("UPSTREAM").dim(),
+            style("AUTH").dim(),
+            style("TARGET").dim(),
+            style("STATE").dim()
+        );
+        println!(
+            "  {}",
+            style("-------------------------------------------------------------------------------").dim()
+        );
         let mut names: Vec<_> = config.servers.keys().collect();
         names.sort();
         for n in names {
+            let server = config.servers.get(n);
             println!(
-                "  {} {:<18} {}",
-                style("·").dim(),
+                "  {} {:<18} {:<8} {:<6} {:<28} {}",
+                if server.map(|server| server.enabled).unwrap_or(true) {
+                    style("·").dim()
+                } else {
+                    style("!").yellow().bold()
+                },
                 n,
-                style("not running").dim()
+                summarize_server_transport(server),
+                summarize_server_auth(server),
+                summarize_server_target(server, 28),
+                if server.map(|server| server.enabled).unwrap_or(true) {
+                    style("configured").dim()
+                } else {
+                    style("disabled").yellow()
+                }
             );
         }
     } else {

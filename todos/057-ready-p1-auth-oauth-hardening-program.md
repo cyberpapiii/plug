@@ -562,6 +562,29 @@ Key files expected to change:
 - `plug doctor` should report storage mode and cold connectivity, while `plug auth status` remains
   the command that touches live credential state.
 
+### 2026-03-17 - Fallback topology parity slice
+
+**By:** Codex
+
+**Actions:**
+- Added shared transport/auth summarizers so live and fallback inventories use the same labels.
+- Updated daemon-unavailable `plug servers` fallback output to retain upstream transport, auth, and
+  target detail instead of dropping back to bare names.
+- Updated daemon-unavailable `plug status` fallback output the same way so runtime loss does not
+  also hide the config topology you need to diagnose.
+- Added focused unit coverage for the shared transport/auth summarizers.
+
+**Verification:**
+- `cargo test -p plug -- --nocapture`
+- `./target/debug/plug status`
+- `./target/debug/plug servers`
+
+**Learnings:**
+- The daemon being down is exactly when config topology matters most, so fallback output has to
+  preserve structure rather than simplify it away.
+- Shared summarizers are worth it here because inconsistent labels across commands would recreate
+  the same confusion under a different banner.
+
 ### 2026-03-17 - Non-interactive doctor and upstream target visibility
 
 **By:** Codex
