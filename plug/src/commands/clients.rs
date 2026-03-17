@@ -323,6 +323,33 @@ fn requested_link_transport(
     })
 }
 
+fn prompt_link_transport(
+    configured_http_url: &str,
+    requested_transport: Option<ExportTransport>,
+    prompt_label: &str,
+    default_http: bool,
+) -> anyhow::Result<ExportTransport> {
+    use dialoguer::Select;
+
+    if let Some(requested) = requested_transport {
+        return Ok(requested);
+    }
+
+    let selection = Select::with_theme(&cli_prompt_theme())
+        .with_prompt(prompt_label)
+        .items([
+            "stdio via `plug connect`",
+            &format!("HTTP via `{configured_http_url}`"),
+        ])
+        .default(if default_http { 1 } else { 0 })
+        .interact()?;
+    Ok(if selection == 1 {
+        ExportTransport::Http
+    } else {
+        ExportTransport::Stdio
+    })
+}
+
 pub(crate) fn cmd_link(
     config_path: Option<&std::path::PathBuf>,
     targets: Vec<String>,
@@ -335,29 +362,15 @@ pub(crate) fn cmd_link(
 
     let configured_http_url = configured_http_export_url(config_path)
         .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
-
-    let prompt_transport = |default_http: bool| -> anyhow::Result<ExportTransport> {
-        if let Some(requested) = requested_link_transport(transport, yes) {
-            return Ok(requested);
-        }
-
-        let selection = Select::with_theme(&cli_prompt_theme())
-            .with_prompt("How should selected clients connect to plug?")
-            .items([
-                "stdio via `plug connect`",
-                &format!("HTTP via `{configured_http_url}`"),
-            ])
-            .default(if default_http { 1 } else { 0 })
-            .interact()?;
-        Ok(if selection == 1 {
-            ExportTransport::Http
-        } else {
-            ExportTransport::Stdio
-        })
-    };
+    let requested_transport = requested_link_transport(transport, yes);
 
     if !targets.is_empty() {
-        let transport = prompt_transport(false)?;
+        let transport = prompt_link_transport(
+            configured_http_url.as_str(),
+            requested_transport,
+            "How should selected clients connect to plug?",
+            false,
+        )?;
         for target in &targets {
             execute_export(
                 target,
@@ -383,7 +396,12 @@ pub(crate) fn cmd_link(
                 "no detected clients found; pass explicit targets or run `plug link` interactively"
             );
         }
-        let transport = prompt_transport(false)?;
+        let transport = prompt_link_transport(
+            configured_http_url.as_str(),
+            requested_transport,
+            "How should selected clients connect to plug?",
+            false,
+        )?;
         for target in detected.iter().map(|(_, target, _)| *target) {
             execute_export(
                 target,
@@ -466,21 +484,29 @@ pub(crate) fn cmd_link(
         .iter()
         .enumerate()
         .filter(|(idx, (_, _, _, was_linked))| selections.contains(idx) && !was_linked)
-        .map(|(_, (_, target, _, _))| *target)
+        .map(|(_, (_, target, display, _))| (*target, *display))
         .collect::<Vec<_>>();
 
     let selected_transport = if selected_new_targets.is_empty() {
         None
+    } else if let Some(requested) = requested_transport {
+        Some(requested)
     } else {
-        Some(prompt_transport(false)?)
+        None
     };
 
     for (idx, (_, target, _display, was_linked)) in items.iter().enumerate() {
         let is_selected = selections.contains(&idx);
         if is_selected && !was_linked {
+            let transport = selected_transport.unwrap_or(prompt_link_transport(
+                configured_http_url.as_str(),
+                None,
+                &format!("How should {} connect to plug?", _display),
+                false,
+            )?);
             execute_export(
                 target,
-                matches!(selected_transport, Some(ExportTransport::Http)),
+                matches!(transport, ExportTransport::Http),
                 configured_http_url.as_str(),
                 true,
                 false,
@@ -513,7 +539,12 @@ pub(crate) fn cmd_link(
             .items(["JSON", "JSON (VS Code style)", "TOML", "YAML"])
             .default(0)
             .interact()?;
-        let transport = prompt_transport(false)?;
+        let transport = prompt_link_transport(
+            configured_http_url.as_str(),
+            requested_transport,
+            "How should this client connect to plug?",
+            false,
+        )?;
         let (snippet, is_toml, is_yaml) = match (format, transport) {
             (0, ExportTransport::Stdio) => (
                 serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":"plug","args":["connect"]}}})).unwrap(),
@@ -1028,6 +1059,11 @@ port = 4444
             requested_link_transport(None, true),
             Some(ExportTransport::Stdio)
         );
+        assert_eq!(requested_link_transport(None, false), None);
+    }
+
+    #[test]
+    fn requested_link_transport_defaults_explicit_targets_to_prompt() {
         assert_eq!(requested_link_transport(None, false), None);
     }
 }
