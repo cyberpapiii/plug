@@ -61,6 +61,31 @@ fn auth_status_json(
     })
 }
 
+async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
+    if !crate::daemon::socket_path().exists() {
+        return Ok(false);
+    }
+
+    let auth_token = match crate::daemon::read_auth_token() {
+        Ok(token) => token,
+        Err(_) => return Ok(false),
+    };
+
+    let request = plug_core::ipc::IpcRequest::RestartServer {
+        server_id: server_name.to_string(),
+        auth_token,
+    };
+
+    match crate::daemon::ipc_request(&request).await {
+        Ok(plug_core::ipc::IpcResponse::Ok) => Ok(true),
+        Ok(plug_core::ipc::IpcResponse::Error { code, message }) => {
+            anyhow::bail!("{code}: {message}");
+        }
+        Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
+        Err(err) => Err(err),
+    }
+}
+
 /// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
     config_path: Option<&PathBuf>,
@@ -256,6 +281,19 @@ async fn cmd_auth_login(
         .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
 
     ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
+    match refresh_live_daemon_server(server_name).await {
+        Ok(true) => {
+            ui::print_info_line(format!(
+                "Refreshed live daemon state for server '{server_name}'"
+            ));
+        }
+        Ok(false) => {}
+        Err(err) => {
+            ui::print_warning_line(format!(
+                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: run `plug stop && plug start`."
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -347,6 +385,19 @@ async fn cmd_auth_complete(
         .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
 
     ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
+    match refresh_live_daemon_server(server_name).await {
+        Ok(true) => {
+            ui::print_info_line(format!(
+                "Refreshed live daemon state for server '{server_name}'"
+            ));
+        }
+        Ok(false) => {}
+        Err(err) => {
+            ui::print_warning_line(format!(
+                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: run `plug stop && plug start`."
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -730,6 +781,19 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to clear credentials: {e}"))?;
 
     ui::print_success_line(format!("Logged out from server '{server_name}'"));
+    match refresh_live_daemon_server(server_name).await {
+        Ok(true) => {
+            ui::print_info_line(format!(
+                "Refreshed live daemon state for server '{server_name}'"
+            ));
+        }
+        Ok(false) => {}
+        Err(err) => {
+            ui::print_warning_line(format!(
+                "Stored credentials were cleared, but the running service did not reload them automatically: {err}. Next: run `plug stop && plug start`."
+            ));
+        }
+    }
 
     Ok(())
 }
