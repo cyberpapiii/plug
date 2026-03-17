@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `b560ae3` (post-reconcile baseline including remote/OAuth follow-up fixes)
+Baseline: `main` @ `65234c9` (post-reconcile baseline including auth/operator hardening and live-session parity work)
 
 This is the canonical current-state doc for the project.
 
@@ -42,6 +42,18 @@ Implemented on `main`:
 - pagination cursor forwarding and larger page size for remote clients
 - initialize response protocol-version simplification/fixups for remote compatibility
 - persisted token hydration before upstream connect
+- downstream OAuth discovery/privacy hardening, more accurate metadata, and richer challenge behavior
+- clearer operator auth/runtime UX across `plug status`, `plug doctor`, `plug auth status`, `plug clients`, and `plug servers`
+- topology-aware setup/link/repair flows that preserve configured stdio vs HTTP downstream choices
+- transport-aware live session inventory across daemon proxy and standalone HTTP runtimes
+- explicit live inventory scope/availability semantics:
+  - `daemon-proxy-only`
+  - `http-only`
+  - `transport-complete`
+  - `unavailable`
+- standalone HTTP live-session operator endpoint with dedicated operator token protection
+- pinned machine-readable JSON contracts for operator inventory/auth/runtime surfaces
+- standalone HTTP inventory failure-path coverage for missing token, empty token, unauthorized, and malformed response cases
 
 Partial on `main`:
 
@@ -87,8 +99,8 @@ Use docs by role:
 ## Current Top Priorities
 
 1. keep current-state docs aligned with `main`
-2. clean up stale branches and worktrees from superseded development work
-3. address remaining smaller items (test coverage, OAuth follow-up polish)
+2. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
+3. decide whether future product scope should unify downstream HTTP under daemon ownership, or retain the current aggregated model
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 

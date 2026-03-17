@@ -33,6 +33,10 @@ forwarding work:
 - downstream OAuth remote server support and related config/runtime integration
 - remote Claude connector follow-up fixes: protocol-version response adjustment, pagination cursor forwarding, larger page size, and connector stability improvements
 - persisted token hydration before upstream connect
+- downstream OAuth/operator hardening across discovery, metadata, challenge behavior, and non-interactive diagnostics
+- topology-aware setup/link/repair/status flows that preserve and surface downstream transport/auth choices
+- transport-aware live session inventory with explicit scope and availability across daemon proxy and standalone HTTP runtimes
+- pinned operator JSON contracts plus standalone HTTP inventory failure-path coverage
 
 ## What Exists Today
 
@@ -42,10 +46,12 @@ The current product shape is:
 - `plug serve` for Streamable HTTP downstream clients, with optional HTTPS via configured cert/key paths
 - shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
 - daemon-backed local sharing with reconnecting IPC proxy sessions
+- transport-aware operator inventory that can merge daemon proxy and standalone HTTP live sessions
 - targeted notification fan-out to stdio, HTTP, and daemon IPC (resource subscribe still unsupported over IPC)
 - meta-tool mode as an opt-in reduced discovery surface
 - downstream HTTP bearer token auth for non-loopback binding
 - downstream OAuth mode for remote/server-card based authorization flows
+- explicit runtime/auth/operator state vocabulary across `status`, `doctor`, `auth status`, `clients`, and `servers`
 
 ## Remaining Work
 
@@ -55,9 +61,19 @@ No required roadmap work remains for the current production-ready bar.
 Optional future scope only:
 
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
+- deeper runtime unification if the product bar expands from aggregated live inventory toward one daemon-owned source of truth for downstream HTTP and IPC sessions
 
 ## 2026-03-16 Reconciliation Note
 
 The previously working off-main runtime line was reconciled into `main` on 2026-03-16, verified in
 an isolated `main` worktree with a passing full test suite, and then pushed as the new canonical
 baseline.
+
+## 2026-03-17 Operator Truth Expansion
+
+On 2026-03-17, `main` absorbed the follow-on operator/runtime hardening work that:
+
+- aligned `status`, `doctor`, `auth status`, `clients`, and `servers` around one explicit auth/runtime vocabulary
+- preserved downstream topology choices through setup/link/repair flows
+- introduced transport-aware live-session inventory with explicit availability/scope semantics
+- added regression coverage for JSON operator contracts and standalone HTTP inventory failure paths

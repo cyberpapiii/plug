@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 priority: p1
 issue_id: "058"
 tags: [http, sessions, parity, topology, daemon, serve, ux, architecture]
@@ -457,3 +457,26 @@ These write scopes should remain mostly disjoint until integration.
   HTTP inventory fetch path could run before rustls provider initialization.
 - With these tests in place, `Unavailable` now means “the source actually failed or could not be
   inspected” rather than “we never tested the unhappy path.”
+
+### 2026-03-17 - Program closed with truth-pass updates
+
+**By:** Codex
+
+**Actions:**
+- Updated the current-truth docs so the project snapshot and plan now describe the transport-aware
+  live inventory work as done on `main`.
+- Closed the original parity incident in
+  [todos/056-pending-p2-http-session-ux-parity.md](./056-pending-p2-http-session-ux-parity.md)
+  now that normal CLI/operator surfaces expose merged live inventory with explicit scope semantics.
+- Reframed any further work as optional future runtime-unification scope rather than an open parity
+  bug.
+
+**Verification:**
+- doc truth-pass against `docs/PROJECT-STATE-SNAPSHOT.md`
+- doc truth-pass against `docs/PLAN.md`
+- acceptance criteria review against `todos/056-pending-p2-http-session-ux-parity.md`
+
+**Learnings:**
+- This program is complete once the product truth, operator surfaces, and tracking docs all agree
+  that merged HTTP/daemon live inventory is present on `main`.
+- Remaining session/runtime design questions belong to future scope, not this parity program.

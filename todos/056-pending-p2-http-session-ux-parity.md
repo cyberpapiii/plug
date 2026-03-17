@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 priority: p2
 issue_id: "056"
 tags: [http, ux, sessions, parity, observability]
@@ -8,7 +8,7 @@ dependencies: []
 
 # Problem Statement
 
-The current plug terminal/menu UX does not appear to surface active downstream HTTP sessions with parity to local stdio clients. During remote Claude Desktop/Mobile troubleshooting, active HTTP connector usage was not clearly visible or distinguishable in the menu/session system, which made diagnosis materially more confusing.
+The current plug terminal/menu UX did not originally surface active downstream HTTP sessions with parity to local stdio clients. During remote Claude Desktop/Mobile troubleshooting, active HTTP connector usage was not clearly visible or distinguishable in the menu/session system, which made diagnosis materially more confusing.
 
 # Findings
 
@@ -59,27 +59,28 @@ Keep current menus intact but add a dedicated diagnostics/session view that merg
 - Larger scope than a direct parity fix
 - More product/UI work
 
-# Recommended Action
+# Resolution
 
-Investigation is now complete: downstream HTTP sessions are missing from the current live
-daemon/session inventory, not merely hidden in the UI. The next implementation step should be an
-explicit architecture choice:
+Investigation confirmed that downstream HTTP sessions were missing from the original live
+daemon/session inventory, not merely hidden in the UI. That work is now implemented on `main`
+through an explicit aggregation model:
 
-1. move downstream HTTP serving under daemon ownership so IPC and HTTP sessions share one runtime
-   inventory model, or
+1. keep downstream HTTP serving and daemon IPC ownership separate for now
 2. add an HTTP-session snapshot API plus a higher-level aggregator that merges standalone `serve`
-   session state with daemon IPC client state.
+   session state with daemon IPC client state
+3. expose explicit inventory scope/availability semantics instead of implying a single unified
+   runtime authority
 
-Until then, all operator-facing commands should state the current scope explicitly instead of
-implying parity they do not yet have.
+Future architecture work is still possible if the product wants one daemon-owned runtime authority,
+but the operator UX parity gap described by this issue is now closed on `main`.
 
 # Acceptance Criteria
 
 - [x] Investigation confirms whether downstream HTTP sessions are currently tracked by the menu/session subsystem
-- [ ] The UX can show active HTTP sessions alongside stdio sessions, or a dedicated diagnostics view exists with equivalent visibility
-- [ ] Session transport is explicitly labeled
-- [ ] Claude Desktop/Mobile HTTP sessions can be distinguished from local stdio clients during troubleshooting
-- [ ] A regression or smoke-test procedure exists for verifying remote-session visibility
+- [x] The UX can show active HTTP sessions alongside stdio sessions, or a dedicated diagnostics view exists with equivalent visibility
+- [x] Session transport is explicitly labeled
+- [x] Claude Desktop/Mobile HTTP sessions can be distinguished from local stdio clients during troubleshooting
+- [x] A regression or smoke-test procedure exists for verifying remote-session visibility
 
 # Work Log
 
@@ -197,3 +198,38 @@ implying parity they do not yet have.
 - The remaining parity gap is no longer “HTTP sessions are invisible”; it is now about how far the
   product should go in surfacing partial/degraded cross-runtime states and whether HTTP should
   eventually move under daemon ownership.
+
+### 2026-03-17 - Operator parity closed on `main`
+
+**By:** Codex
+
+**Actions:**
+- Added merged live-session inventory semantics across normal operator surfaces:
+  - `plug clients`
+  - `plug status`
+  - overview/runtime views
+- Exposed explicit availability/scope metadata and transport labels in both text and JSON output.
+- Added contract tests for operator JSON fields and standalone HTTP inventory failure-path tests.
+- Updated the architecture plan to treat any remaining work as future runtime-unification scope
+  rather than an open operator-visibility bug.
+
+**Evidence:**
+- `plug/src/runtime.rs`
+- `plug/src/views/clients.rs`
+- `plug/src/views/overview.rs`
+- `plug/src/commands/auth.rs`
+- `plug/src/commands/misc.rs`
+- `docs/plans/2026-03-17-http-session-parity-architecture.md`
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug commands::auth::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- The original parity incident is resolved once normal CLI/operator surfaces can display merged
+  transport-aware live inventory with explicit scope semantics.
+- The remaining design question is not visibility parity; it is whether the product eventually wants
+  a single daemon-owned runtime truth source.
