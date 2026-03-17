@@ -87,6 +87,8 @@ Still remaining:
   target detail instead of collapsing back to bare server names.
 - 2026-03-17: `plug status` now surfaces linked client topology directly in the service summary so
   operators can see which client configs are pointed at plug without switching to a second command.
+- 2026-03-17: `plug-core` doctor tests now cover the non-interactive OAuth token path directly, so
+  the keychain-safe diagnostics behavior is pinned by tests rather than only live observation.
 - Remaining gap: deeper `doctor` command/runtime scenarios still rely more on focused tests than
   full end-to-end command fixtures.
 

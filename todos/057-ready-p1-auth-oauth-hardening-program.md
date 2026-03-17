@@ -605,6 +605,25 @@ Key files expected to change:
 - Putting the linked topology next to live client count makes the gap between configured and
   currently connected clients much easier to reason about.
 
+### 2026-03-17 - Doctor OAuth token coverage slice
+
+**By:** Codex
+
+**Actions:**
+- Added focused `plug-core` doctor tests for the new `oauth_tokens` behavior.
+- Covered both expected paths:
+  - no plaintext fallback file -> pass without probing keychain
+  - plaintext fallback file present -> warn with actionable guidance
+
+**Verification:**
+- `cargo test -p plug-core doctor -- --nocapture`
+
+**Learnings:**
+- The keychain-safe doctor behavior needed direct tests, not just code review, because it sits on a
+  line between diagnostics and live auth state.
+- Small focused coverage is enough here; we do not need full end-to-end auth login flows just to
+  prove doctor stays non-interactive.
+
 ### 2026-03-17 - Non-interactive doctor and upstream target visibility
 
 **By:** Codex

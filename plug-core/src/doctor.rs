@@ -1126,6 +1126,16 @@ mod tests {
         }
     }
 
+    fn oauth_http_server(url: &str) -> ServerConfig {
+        ServerConfig {
+            transport: TransportType::Http,
+            url: Some(url.to_string()),
+            auth: Some("oauth".to_string()),
+            oauth_scopes: Some(vec!["read".to_string()]),
+            ..stdio_server("echo")
+        }
+    }
+
     // -- check_config_exists --
 
     #[tokio::test]
@@ -1299,6 +1309,60 @@ mod tests {
             result
                 .message
                 .contains("does not verify external endpoint reachability")
+        );
+    }
+
+    // -- check_oauth_tokens --
+
+    #[tokio::test]
+    async fn oauth_tokens_pass_without_plaintext_fallback_files() {
+        let server_name = format!("oauth-doctor-no-file-{}", std::process::id());
+        let mut config = test_config();
+        config.servers.insert(
+            server_name.clone(),
+            oauth_http_server("https://example.com/mcp"),
+        );
+
+        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let _ = std::fs::remove_file(&token_file);
+
+        let result = check_oauth_tokens(&config).await;
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(
+            result
+                .message
+                .contains("does not probe keychain-backed credentials")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_tokens_warn_when_plaintext_fallback_exists() {
+        let server_name = format!("oauth-doctor-file-{}", std::process::id());
+        let mut config = test_config();
+        config.servers.insert(
+            server_name.clone(),
+            oauth_http_server("https://example.com/mcp"),
+        );
+
+        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        if let Some(parent) = token_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&token_file, "{}").unwrap();
+
+        let result = check_oauth_tokens(&config).await;
+
+        let _ = std::fs::remove_file(&token_file);
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains(&server_name));
+        assert!(result.message.contains("plaintext token fallback"));
+        assert!(
+            result
+                .fix_suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("plug auth status")
         );
     }
 
