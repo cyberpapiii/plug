@@ -312,3 +312,29 @@ These write scopes should remain mostly disjoint until integration.
 **Learnings:**
 - `inventory_scope` and `inventory_partial` answer different questions and both are useful.
 - Machine-readable missing-source metadata reduces ambiguity for future UIs and external tooling.
+
+### 2026-03-17 - Aggregation now distinguishes idle sources from missing sources
+
+**By:** Codex
+
+**Actions:**
+- Reworked the runtime aggregation path so daemon and standalone HTTP inventory are tracked as
+  explicit source states instead of collapsing failures into empty session vectors.
+- Changed merged scope semantics so `transport_complete` now means both sources answered, even if
+  one side currently has zero sessions.
+- Added focused tests for the previously ambiguous cases:
+  - daemon available + HTTP available + zero HTTP sessions
+  - daemon unavailable + HTTP available + zero HTTP sessions
+  - daemon available + HTTP unavailable
+  - both sources unavailable
+
+**Verification:**
+- `cargo test -p plug runtime::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+
+**Learnings:**
+- Session presence and source availability are separate concerns and have to stay modeled
+  separately.
+- Empty HTTP inventory is not the same as unreachable HTTP inventory, and the product truth gets
+  materially better once that distinction exists in the aggregation layer.

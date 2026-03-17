@@ -200,7 +200,7 @@ Required scenarios:
 - [x] Standalone HTTP runtime exposes read-only operator session inventory
 - [x] Mixed daemon proxy + HTTP session inventories can be merged in one operator view
 - [x] Distinct daemon-only / HTTP-only / transport-complete / unavailable states exist
-- [ ] Degraded partial-availability aggregation semantics are implemented and tested more fully
+- [x] Degraded partial-availability aggregation semantics are implemented and tested more fully
 
 ## References
 

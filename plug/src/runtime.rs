@@ -50,6 +50,24 @@ pub(crate) fn live_inventory_availability(
     }
 }
 
+enum LiveSessionSourceState {
+    Available(Vec<plug_core::ipc::IpcLiveSessionInfo>),
+    Unavailable,
+}
+
+impl LiveSessionSourceState {
+    fn available(&self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+
+    fn into_sessions(self) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
+        match self {
+            Self::Available(sessions) => sessions,
+            Self::Unavailable => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OperatorLiveSessionsResponse {
     sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
@@ -130,47 +148,64 @@ fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
 
 async fn fetch_http_live_sessions(
     config_path: Option<&PathBuf>,
-) -> Option<Vec<plug_core::ipc::IpcLiveSessionInfo>> {
-    let config = plug_core::config::load_config(config_path).ok()?;
+) -> LiveSessionSourceState {
+    let config = match plug_core::config::load_config(config_path) {
+        Ok(config) => config,
+        Err(_) => return LiveSessionSourceState::Unavailable,
+    };
     let token_path = plug_core::auth::http_operator_token_path(config.http.port);
-    let token = std::fs::read_to_string(token_path).ok()?;
+    let token = match std::fs::read_to_string(token_path) {
+        Ok(token) => token,
+        Err(_) => return LiveSessionSourceState::Unavailable,
+    };
     let token = token.trim().to_string();
     if token.is_empty() {
-        return None;
+        return LiveSessionSourceState::Unavailable;
     }
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?;
+        .build();
+    let client = match client {
+        Ok(client) => client,
+        Err(_) => return LiveSessionSourceState::Unavailable,
+    };
     let response = client
         .get(local_http_inventory_url(&config.http))
         .header(OPERATOR_TOKEN_HEADER, token)
         .send()
-        .await
-        .ok()?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => return LiveSessionSourceState::Unavailable,
+    };
     if !response.status().is_success() {
-        return None;
+        return LiveSessionSourceState::Unavailable;
     }
-    let body = response.json::<OperatorLiveSessionsResponse>().await.ok()?;
-    Some(body.sessions)
+    match response.json::<OperatorLiveSessionsResponse>().await {
+        Ok(body) => LiveSessionSourceState::Available(body.sessions),
+        Err(_) => LiveSessionSourceState::Unavailable,
+    }
 }
 
 fn merge_live_session_sources(
-    mut daemon_sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
     daemon_scope: plug_core::ipc::LiveSessionInventoryScope,
-    daemon_available: bool,
-    mut http_sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
+    daemon_source: LiveSessionSourceState,
+    http_source: LiveSessionSourceState,
 ) -> (
     Vec<plug_core::ipc::IpcLiveSessionInfo>,
     plug_core::ipc::LiveSessionInventoryScope,
 ) {
-    let scope = match (daemon_available, http_sessions.is_empty()) {
-        (true, false) => plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        (true, true) => daemon_scope,
-        (false, false) => plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
-        (false, true) => plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+    let daemon_available = daemon_source.available();
+    let http_available = http_source.available();
+    let mut daemon_sessions = daemon_source.into_sessions();
+    let mut http_sessions = http_source.into_sessions();
+    let scope = match (daemon_available, http_available) {
+        (true, true) => plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
+        (true, false) => daemon_scope,
+        (false, true) => plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
+        (false, false) => plug_core::ipc::LiveSessionInventoryScope::Unavailable,
     };
 
     daemon_sessions.append(&mut http_sessions);
@@ -196,10 +231,10 @@ pub(crate) async fn fetch_live_sessions(
     plug_core::ipc::LiveSessionInventoryScope,
     LiveClientSupport,
 ) {
-    let (daemon_sessions, daemon_scope, support, daemon_available) =
+    let (daemon_source, daemon_scope, support) =
         match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListLiveSessions).await {
             Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => {
-                (sessions, scope, LiveClientSupport::Supported, true)
+                (LiveSessionSourceState::Available(sessions), scope, LiveClientSupport::Supported)
             }
             Ok(plug_core::ipc::IpcResponse::Clients { clients }) => {
                 let sessions = clients
@@ -219,34 +254,26 @@ pub(crate) async fn fetch_live_sessions(
                     })
                     .collect();
                 (
-                    sessions,
+                    LiveSessionSourceState::Available(sessions),
                     plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
                     LiveClientSupport::Supported,
-                    true,
                 )
             }
             Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => (
-                Vec::new(),
+                LiveSessionSourceState::Unavailable,
                 plug_core::ipc::LiveSessionInventoryScope::Unavailable,
                 LiveClientSupport::DaemonRestartRequired,
-                false,
             ),
             _ => (
-                Vec::new(),
+                LiveSessionSourceState::Unavailable,
                 plug_core::ipc::LiveSessionInventoryScope::Unavailable,
                 LiveClientSupport::Supported,
-                false,
             ),
         };
 
-    let mut http_sessions = fetch_http_live_sessions(config_path).await.unwrap_or_default();
+    let http_source = fetch_http_live_sessions(config_path).await;
 
-    let (sessions, scope) = merge_live_session_sources(
-        daemon_sessions,
-        daemon_scope,
-        daemon_available,
-        std::mem::take(&mut http_sessions),
-    );
+    let (sessions, scope) = merge_live_session_sources(daemon_scope, daemon_source, http_source);
 
     (sessions, scope, support)
 }
@@ -944,10 +971,9 @@ mod tests {
         }];
 
         let (sessions, scope) = merge_live_session_sources(
-            daemon,
             plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-            true,
-            http,
+            LiveSessionSourceState::Available(daemon),
+            LiveSessionSourceState::Available(http),
         );
 
         assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
@@ -955,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_live_session_sources_preserves_daemon_proxy_only_scope() {
+    fn merge_live_session_sources_marks_transport_complete_when_http_source_is_idle() {
         let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
             transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
             client_id: Some("daemon".to_string()),
@@ -967,10 +993,31 @@ mod tests {
         }];
 
         let (sessions, scope) = merge_live_session_sources(
-            daemon,
             plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-            true,
-            Vec::new(),
+            LiveSessionSourceState::Available(daemon),
+            LiveSessionSourceState::Available(Vec::new()),
+        );
+
+        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::TransportComplete);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn merge_live_session_sources_preserves_daemon_proxy_only_scope_when_http_unavailable() {
+        let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
+            transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
+            client_id: Some("daemon".to_string()),
+            session_id: "daemon-1".to_string(),
+            client_type: plug_core::types::ClientType::ClaudeCode,
+            client_info: Some("Claude Code".to_string()),
+            connected_secs: 10,
+            last_activity_secs: None,
+        }];
+
+        let (sessions, scope) = merge_live_session_sources(
+            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            LiveSessionSourceState::Available(daemon),
+            LiveSessionSourceState::Unavailable,
         );
 
         assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
@@ -990,10 +1037,9 @@ mod tests {
         }];
 
         let (sessions, scope) = merge_live_session_sources(
-            Vec::new(),
             plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            false,
-            http,
+            LiveSessionSourceState::Unavailable,
+            LiveSessionSourceState::Available(http),
         );
 
         assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
@@ -1001,12 +1047,23 @@ mod tests {
     }
 
     #[test]
+    fn merge_live_session_sources_marks_http_only_when_http_source_is_idle() {
+        let (sessions, scope) = merge_live_session_sources(
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+            LiveSessionSourceState::Unavailable,
+            LiveSessionSourceState::Available(Vec::new()),
+        );
+
+        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
     fn merge_live_session_sources_marks_unavailable_when_no_sources_exist() {
         let (sessions, scope) = merge_live_session_sources(
-            Vec::new(),
             plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            false,
-            Vec::new(),
+            LiveSessionSourceState::Unavailable,
+            LiveSessionSourceState::Unavailable,
         );
 
         assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::Unavailable);
