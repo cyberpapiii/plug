@@ -338,3 +338,36 @@ These write scopes should remain mostly disjoint until integration.
   separately.
 - Empty HTTP inventory is not the same as unreachable HTTP inventory, and the product truth gets
   materially better once that distinction exists in the aggregation layer.
+
+### 2026-03-17 - Runtime inventory vocabulary aligned across commands
+
+**By:** Codex
+
+**Actions:**
+- Normalized the operator vocabulary across `plug clients`, `plug overview`, and `plug status` so
+  each surface now presents:
+  - `Inventory Scope`
+  - `Inventory Availability`
+  - `Live Transports`
+- Added stable short scope labels for text and JSON consumers:
+  - `daemon-proxy-only`
+  - `http-only`
+  - `transport-complete`
+  - `unavailable`
+- Added richer JSON parity details where they were missing:
+  - `live_session_count`
+  - `live_session_transports`
+  - `daemon_proxy_client_count`
+- Added `status_source` to `plug auth status` JSON while keeping the older `status_scope` field for
+  compatibility.
+
+**Verification:**
+- `cargo test -p plug commands::auth::tests -- --nocapture`
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug views::overview -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Short stable labels are better primary state than long explanatory prose.
+- The long prose still matters, but it should be secondary help text rather than the main
+  machine-readable status value.

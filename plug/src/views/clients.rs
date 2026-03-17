@@ -28,6 +28,15 @@ fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -
     }
 }
 
+fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
+    match scope {
+        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => "daemon-proxy-only",
+        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => "http-only",
+        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => "transport-complete",
+        plug_core::ipc::LiveSessionInventoryScope::Unavailable => "unavailable",
+    }
+}
+
 fn prompt_client_actions() -> anyhow::Result<bool> {
     let options = ["Done", "Link clients", "Unlink clients"];
     let selection = Select::with_theme(&cli_prompt_theme())
@@ -73,6 +82,19 @@ pub(crate) async fn cmd_client_list(
         let inventory = live_inventory_availability(live_inventory_scope);
         let clients = client_views(&live);
         let live_sessions = live_session_views(&live);
+        let live_count = live_sessions.len();
+        let daemon_proxy_count = live_sessions
+            .iter()
+            .filter(|session| session.transport == "daemon_proxy")
+            .count();
+        let http_count = live_sessions
+            .iter()
+            .filter(|session| session.transport == "http")
+            .count();
+        let sse_count = live_sessions
+            .iter()
+            .filter(|session| session.transport == "sse")
+            .count();
 
         if matches!(output, OutputFormat::Json) {
             println!(
@@ -80,6 +102,12 @@ pub(crate) async fn cmd_client_list(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "clients": clients,
                     "live_sessions": live_sessions,
+                    "live_session_count": live_count,
+                    "live_session_transports": {
+                        "daemon_proxy": daemon_proxy_count,
+                        "http": http_count,
+                        "sse": sse_count,
+                    },
                     "live_client_support": live_client_support,
                     "live_inventory_scope": live_inventory_scope,
                     "inventory_partial": inventory.partial,
@@ -115,15 +143,6 @@ pub(crate) async fn cmd_client_list(
         }
         let linked_count = clients.iter().filter(|client| client.linked).count();
         let detected_count = clients.iter().filter(|client| client.detected).count();
-        let live_count = live_sessions.len();
-        let daemon_proxy_count = live_sessions
-            .iter()
-            .filter(|session| session.transport == "daemon_proxy")
-            .count();
-        let http_count = live_sessions
-            .iter()
-            .filter(|session| session.transport == "http")
-            .count();
         print_heading("Summary");
         print_label_value("Linked", style(linked_count).green().bold());
         print_label_value("Detected", style(detected_count).cyan().bold());
@@ -139,7 +158,10 @@ pub(crate) async fn cmd_client_list(
             }
         }
         if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
-            print_info_line(live_inventory_scope_text(live_inventory_scope));
+            print_label_value(
+                "Inventory Scope",
+                live_inventory_scope_label(live_inventory_scope),
+            );
             if inventory.partial {
                 print_label_value(
                     "Inventory Availability",
@@ -148,9 +170,13 @@ pub(crate) async fn cmd_client_list(
             } else {
                 print_label_value("Inventory Availability", "complete");
             }
+            print_info_line(live_inventory_scope_text(live_inventory_scope));
             print_label_value(
                 "Live Transports",
-                format!("daemon_proxy={} http={}", daemon_proxy_count, http_count),
+                format!(
+                    "daemon_proxy={} http={} sse={}",
+                    daemon_proxy_count, http_count, sse_count
+                ),
             );
         }
         println!();
@@ -259,7 +285,27 @@ pub(crate) async fn cmd_client_list(
 
 #[cfg(test)]
 mod tests {
-    use super::live_inventory_scope_text;
+    use super::{live_inventory_scope_label, live_inventory_scope_text};
+
+    #[test]
+    fn live_inventory_scope_label_uses_stable_short_states() {
+        assert_eq!(
+            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly),
+            "daemon-proxy-only"
+        );
+        assert_eq!(
+            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::HttpOnly),
+            "http-only"
+        );
+        assert_eq!(
+            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::TransportComplete),
+            "transport-complete"
+        );
+        assert_eq!(
+            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::Unavailable),
+            "unavailable"
+        );
+    }
 
     #[test]
     fn live_inventory_scope_text_mentions_daemon_and_http_gap() {

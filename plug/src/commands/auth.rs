@@ -34,7 +34,7 @@ fn auth_recovery_hint(
     }
 }
 
-fn auth_status_scope_text(live: bool) -> &'static str {
+fn auth_status_source_text(live: bool) -> &'static str {
     if live {
         "Status reflects live daemon auth/runtime state."
     } else {
@@ -440,7 +440,7 @@ async fn cmd_auth_status(
             println!("{}", style("─".repeat(50)).dim());
             println!(
                 "{}",
-                style(auth_status_scope_text(live_auth_status.is_some())).dim()
+                style(auth_status_source_text(live_auth_status.is_some())).dim()
             );
             println!();
 
@@ -547,6 +547,11 @@ async fn cmd_auth_status(
                     "scopes": live.and_then(|s| s.scopes.clone()).or_else(|| sc.oauth_scopes.clone()),
                     "token_expires_in_secs": live.and_then(|s| s.token_expires_in_secs),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
+                    "status_source": if live.is_some() {
+                        "live_daemon"
+                    } else {
+                        "stored_credentials_only"
+                    },
                     "status_scope": if live.is_some() {
                         "live_daemon"
                     } else {
@@ -558,6 +563,11 @@ async fn cmd_auth_status(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "servers": servers,
+                    "status_source": if live_auth_status.is_some() {
+                        "live_daemon"
+                    } else {
+                        "stored_credentials_only"
+                    },
                     "status_scope": if live_auth_status.is_some() {
                         "live_daemon"
                     } else {
@@ -720,9 +730,9 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[test]
-    fn auth_status_scope_text_distinguishes_live_from_fallback() {
-        assert!(auth_status_scope_text(true).contains("live daemon"));
-        assert!(auth_status_scope_text(false).contains("stored credentials"));
+    fn auth_status_source_text_distinguishes_live_from_fallback() {
+        assert!(auth_status_source_text(true).contains("live daemon"));
+        assert!(auth_status_source_text(false).contains("stored credentials"));
     }
 
     /// Simulates a browser redirect delivering code and state to the callback
