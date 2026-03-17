@@ -104,6 +104,9 @@ fn prompt_remote_auth_selection(
                 .with_confirmation("Confirm bearer token", "Tokens did not match")
                 .interact()?;
             let token = if token.is_empty() { initial } else { token };
+            if token.trim().is_empty() {
+                anyhow::bail!("bearer token cannot be empty")
+            }
             Ok(RemoteAuthSelection::Bearer { token })
         }
         _ => {

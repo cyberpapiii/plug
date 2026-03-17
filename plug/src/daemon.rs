@@ -2083,6 +2083,17 @@ mod tests {
         dir.join("config.toml")
     }
 
+    async fn clear_store(server_name: &str) {
+        let store = plug_core::oauth::get_or_create_store(server_name);
+        store.clear().await.unwrap();
+    }
+
+    fn cleanup_temp_config(config_path: &std::path::Path) {
+        if let Some(dir) = config_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
         let mut config = plug_core::config::Config::default();
         for name in servers {
@@ -2177,8 +2188,7 @@ mod tests {
         let server_name = format!("oauth-missing-{}", std::process::id());
         write_oauth_config(&config_path, &[server_name.as_str()]);
 
-        let store = plug_core::oauth::get_or_create_store(&server_name);
-        store.clear().await.unwrap();
+        clear_store(&server_name).await;
 
         let ctx = auth_status_test_context(config_path);
         let response = dispatch_auth_status(&ctx).await;
@@ -2191,6 +2201,9 @@ mod tests {
         assert!(!servers[0].authenticated);
         assert_eq!(servers[0].health, plug_core::types::ServerHealth::AuthRequired);
         assert!(servers[0].token_expires_in_secs.is_none());
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -2200,7 +2213,7 @@ mod tests {
         write_oauth_config(&config_path, &[server_name.as_str()]);
 
         let store = plug_core::oauth::get_or_create_store(&server_name);
-        store.clear().await.unwrap();
+        clear_store(&server_name).await;
         store.save(seeded_credentials()).await.unwrap();
 
         let ctx = auth_status_test_context(config_path);
@@ -2214,6 +2227,9 @@ mod tests {
         assert!(servers[0].authenticated);
         assert_eq!(servers[0].health, plug_core::types::ServerHealth::Degraded);
         assert!(servers[0].token_expires_in_secs.is_some());
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -2223,7 +2239,7 @@ mod tests {
         write_oauth_config(&config_path, &[server_name.as_str()]);
 
         let store = plug_core::oauth::get_or_create_store(&server_name);
-        store.clear().await.unwrap();
+        clear_store(&server_name).await;
         store.save(seeded_credentials()).await.unwrap();
 
         let ctx = auth_status_test_context(config_path);
@@ -2238,6 +2254,9 @@ mod tests {
         assert_eq!(servers[0].name, server_name);
         assert!(servers[0].authenticated);
         assert_eq!(servers[0].health, plug_core::types::ServerHealth::AuthRequired);
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]

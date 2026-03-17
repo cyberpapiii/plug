@@ -233,6 +233,27 @@ Key files expected to change:
 - The remaining gap is now less about visibility and more about broader scenario coverage and
   richer non-interactive config paths for the same auth choices.
 
+### 2026-03-17 - Server auth guardrails and auth-status test cleanup
+
+**By:** Codex
+
+**Actions:**
+- Rejected empty bearer-token submissions in interactive remote server auth setup so the CLI does
+  not save a misleading `auth_token = ""` state.
+- Added cleanup for the new daemon auth-status tests so temp config directories and seeded
+  credential-store entries do not accumulate after test runs.
+- Re-ran the focused server-auth and auth-status coverage after tightening those guardrails.
+
+**Verification:**
+- `cargo test -p plug commands::servers::tests -- --nocapture`
+- `cargo test -p plug daemon::tests::auth_status -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Interactive auth scaffolding needs validation guardrails, not just more prompts.
+- The remaining server-auth gap is primarily about non-interactive/scripted config paths, not basic
+  interactive UX anymore.
+
 ### 2026-03-16 - Client topology fidelity slice
 
 **By:** Codex
@@ -292,6 +313,33 @@ Key files expected to change:
   endpoint or it could still rewrite remote/public client configs incorrectly.
 - The client inventory needed endpoint visibility, not just a boolean linked/not-linked state, to
   reduce confusion for mixed local and remote HTTP setups.
+
+### 2026-03-16 - Daemon auth-state scenario coverage
+
+**By:** Codex
+
+**Actions:**
+- Added daemon-level tests for the `AuthStatus` IPC surface so the auth categories shown by
+  `plug auth status` and the live runtime doctor checks are pinned to explicit scenarios.
+- Covered the three fallback rules that matter most to operator clarity:
+  - no credentials -> `AuthRequired`
+  - credentials present but no runtime status -> `Degraded`
+  - runtime `AuthRequired` beats cached credentials
+- Fixed two compile blockers in `plug/src/commands/servers.rs` that surfaced when compiling the
+  expanded test matrix.
+- Re-ran the full workspace test suite and release build after the new coverage landed.
+
+**Verification:**
+- `cargo test -p plug daemon::tests::auth_status -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+- `cargo test -- --nocapture`
+- `cargo build --release`
+
+**Learnings:**
+- The daemon auth-status seam is where auth truth has to be pinned, because both operator-facing
+  auth messaging and the richer doctor runtime context depend on it.
+- Runtime state must outrank the mere existence of cached credentials, or the UX slides back into
+  the same ambiguous “credentials exist, so maybe things are fine” model we were trying to remove.
 
 ### 2026-03-16 - Client inventory graceful fallback
 

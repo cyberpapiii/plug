@@ -47,6 +47,7 @@ Completed so far:
 Still remaining:
 - broader end-to-end scenario coverage for mixed auth/topology fleets
 - deeper server add/edit auth scaffolding so common HTTP/SSE auth cases are not still hand-authored
+- non-interactive/server-scripted auth configuration paths for the same remote auth choices
 - final UX cleanup where command surfaces still imply a simpler topology than the runtime actually supports
 
 ## Progress Notes
@@ -57,6 +58,8 @@ Still remaining:
   shape more clearly.
 - 2026-03-16: Client endpoint fidelity is now preserved during repair/export regeneration, and the
   client inventory surfaces linked mode plus endpoint so local-vs-remote usage is visible.
+- 2026-03-17: Interactive server add/edit now scaffold remote upstream auth intent directly, but
+  the equivalent non-interactive flag surface is still missing and remains follow-up work.
 - Remaining gap: the explicit mixed-scenario integration matrix still needs broader end-to-end
   coverage beyond focused parser/export tests.
 
