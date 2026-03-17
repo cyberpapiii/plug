@@ -109,6 +109,9 @@ Still remaining:
 - 2026-03-17: scripted `plug server add` / `plug server edit` now manage stdio `--env` and
   `--unset-env` directly, closing a real config-shape gap while explicitly rejecting those flags
   for remote HTTP/SSE upstreams where they would be misleading.
+- 2026-03-17: investigation confirmed that HTTP downstream sessions are missing from the current
+  daemon/ListClients/client-view inventory model, so `plug clients` now says that explicitly
+  instead of implying transport parity it does not yet have.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.

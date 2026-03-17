@@ -754,6 +754,28 @@ Key files expected to change:
   endpoint from the same config context the user invoked, or the CLI quietly lies about where
   clients will connect.
 
+### 2026-03-17 - Honest live-session inventory slice
+
+**By:** Codex
+
+**Actions:**
+- Investigated the old HTTP-session parity complaint and confirmed it is a model gap:
+  - HTTP downstream sessions live in `SessionStore`
+  - daemon `ListClients` only returns IPC proxy clients
+  - `plug clients` therefore cannot currently show HTTP sessions with parity
+- Updated `plug clients` text and JSON output to say that explicitly instead of implying full live
+  transport parity.
+
+**Verification:**
+- `cargo test -p plug views::clients -- --nocapture`
+- `cargo test -p plug commands::clients::tests -- --nocapture`
+
+**Learnings:**
+- The shortest honest UX fix is sometimes to surface a real product boundary instead of hiding it
+  behind a misleading aggregate count.
+- Full HTTP session parity will require a unified session snapshot model, not just more labeling in
+  the existing client view.
+
 ### 2026-03-17 - Scripted stdio env management slice
 
 **By:** Codex

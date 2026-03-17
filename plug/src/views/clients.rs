@@ -5,9 +5,13 @@ use crate::OutputFormat;
 use crate::commands::clients::{client_views, cmd_link, cmd_unlink};
 use crate::runtime::{LiveClientSupport, ensure_daemon_with_feedback, fetch_live_clients};
 use crate::ui::{
-    can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_label_value,
-    print_warning_line,
+    can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
+    print_label_value, print_warning_line,
 };
+
+fn live_inventory_scope_text() -> &'static str {
+    "Live session inventory currently reflects daemon proxy clients only; downstream HTTP sessions are not yet surfaced here."
+}
 
 fn prompt_client_actions() -> anyhow::Result<bool> {
     let options = ["Done", "Link clients", "Unlink clients"];
@@ -59,6 +63,8 @@ pub(crate) async fn cmd_client_list(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "clients": clients,
                     "live_client_support": live_client_support,
+                    "live_inventory_scope": "daemon_proxy_only",
+                    "http_sessions_included": false,
                     "daemon_error": daemon_error,
                 }))?
             );
@@ -99,6 +105,9 @@ pub(crate) async fn cmd_client_list(
             (None, LiveClientSupport::DaemonRestartRequired) => {
                 print_label_value("Live", style("restart required").yellow().bold());
             }
+        }
+        if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
+            print_info_line(live_inventory_scope_text());
         }
         println!();
         print_heading("Inventory");
@@ -168,4 +177,16 @@ pub(crate) async fn cmd_client_list(
         started = false;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_inventory_scope_text;
+
+    #[test]
+    fn live_inventory_scope_text_mentions_daemon_and_http_gap() {
+        let text = live_inventory_scope_text();
+        assert!(text.contains("daemon proxy clients"));
+        assert!(text.contains("HTTP sessions"));
+    }
 }

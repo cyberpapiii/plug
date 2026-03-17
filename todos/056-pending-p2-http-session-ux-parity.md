@@ -65,7 +65,7 @@ Investigate the current session/menu plumbing first and answer one question clea
 
 # Acceptance Criteria
 
-- [ ] Investigation confirms whether downstream HTTP sessions are currently tracked by the menu/session subsystem
+- [x] Investigation confirms whether downstream HTTP sessions are currently tracked by the menu/session subsystem
 - [ ] The UX can show active HTTP sessions alongside stdio sessions, or a dedicated diagnostics view exists with equivalent visibility
 - [ ] Session transport is explicitly labeled
 - [ ] Claude Desktop/Mobile HTTP sessions can be distinguished from local stdio clients during troubleshooting
@@ -84,3 +84,29 @@ Investigate the current session/menu plumbing first and answer one question clea
 **Learnings:**
 - Remote HTTP support is materially harder to operate if logs are the only trustworthy source of session truth
 - Session visibility parity is part of feature completeness, not optional polish
+
+### 2026-03-17 - Inventory-path investigation and explicit UX caveat
+
+**By:** Codex
+
+**Actions:**
+- Traced the live-client path end to end:
+  - `plug-core` HTTP sessions are tracked only inside `SessionStore` / `StatefulSessionStore`
+  - daemon `ListClients` returns only IPC proxy clients from `ClientRegistry`
+  - `plug clients` builds its live inventory from that daemon IPC list only
+- Confirmed the parity problem is therefore an underlying inventory/model gap, not just hidden UI
+  data.
+- Added an explicit note to `plug clients` so the command now states that its live inventory is
+  daemon-proxy-only and does not yet include downstream HTTP sessions.
+
+**Evidence:**
+- `plug-core/src/http/server.rs` creates HTTP sessions and records only `client_type`
+- `plug-core/src/session/mod.rs` has no list/snapshot API
+- `plug/src/daemon.rs` `ListClients` returns `ctx.client_registry.list()` only
+- `plug/src/runtime.rs` `fetch_live_clients()` consumes only that daemon IPC response
+
+**Learnings:**
+- The shortest honest fix is to surface the limitation explicitly now, then add a unified transport-
+  aware session snapshot model later.
+- Full parity will require shared session snapshot types plus merged daemon/HTTP inventory, not
+  just another label in the existing client view.
