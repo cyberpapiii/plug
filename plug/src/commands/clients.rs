@@ -158,21 +158,90 @@ fn linked_client_config_from_content(
 pub(crate) fn is_detected(target: &str) -> bool {
     if let Ok(t) = target.parse::<plug_core::export::ExportTarget>() {
         if let Some(path) = plug_core::export::default_config_path(t, false) {
-            if path.exists() {
-                true
-            } else if let Some(parent) = path.parent() {
+            let config_exists = path.exists();
+            let parent_exists = path.parent().is_some_and(|parent| {
                 parent.exists()
                     && !parent.to_string_lossy().ends_with(".config")
                     && parent != dirs::home_dir().unwrap_or_default()
-            } else {
-                false
-            }
+            });
+            is_detected_from_signals(t, config_exists, parent_exists)
         } else {
             false
         }
     } else {
         false
     }
+}
+
+fn is_detected_from_signals(
+    target: plug_core::export::ExportTarget,
+    config_exists: bool,
+    parent_exists: bool,
+) -> bool {
+    is_detected_from_signals_with_markers(
+        target,
+        config_exists,
+        parent_exists,
+        vscode_app_installed(),
+        cline_vscode_marker_exists(),
+        cline_cli_marker_exists(),
+    )
+}
+
+fn is_detected_from_signals_with_markers(
+    target: plug_core::export::ExportTarget,
+    config_exists: bool,
+    parent_exists: bool,
+    vscode_installed: bool,
+    cline_vscode_marker: bool,
+    cline_cli_marker: bool,
+) -> bool {
+    match target {
+        plug_core::export::ExportTarget::VSCodeCopilot => vscode_installed,
+        plug_core::export::ExportTarget::Cline => vscode_installed && cline_vscode_marker,
+        plug_core::export::ExportTarget::ClineCli => cline_cli_marker,
+        _ => config_exists || parent_exists,
+    }
+}
+
+fn vscode_app_installed() -> bool {
+    known_app_paths(&["Visual Studio Code.app"])
+        .into_iter()
+        .any(|path| path.exists())
+}
+
+fn cline_vscode_marker_exists() -> bool {
+    dirs::home_dir()
+        .map(|home| {
+            [
+                home.join(
+                    "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
+                ),
+                home.join(
+                    ".vscode/extensions/saoudrizwan.claude-dev",
+                ),
+            ]
+            .into_iter()
+            .any(|path| path.exists())
+        })
+        .unwrap_or(false)
+}
+
+fn cline_cli_marker_exists() -> bool {
+    dirs::home_dir()
+        .map(|home| home.join(".cline").exists())
+        .unwrap_or(false)
+}
+
+fn known_app_paths(app_names: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for app in app_names {
+        paths.push(std::path::PathBuf::from("/Applications").join(app));
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join("Applications").join(app));
+        }
+    }
+    paths
 }
 
 fn client_target_from_type(client_type: plug_core::types::ClientType) -> Option<&'static str> {
@@ -1065,5 +1134,49 @@ port = 4444
     #[test]
     fn requested_link_transport_defaults_explicit_targets_to_prompt() {
         assert_eq!(requested_link_transport(None, false), None);
+    }
+
+    #[test]
+    fn detection_requires_real_vscode_install_markers() {
+        assert!(!is_detected_from_signals_with_markers(
+            plug_core::export::ExportTarget::VSCodeCopilot,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn detection_requires_real_cline_markers() {
+        assert!(!is_detected_from_signals_with_markers(
+            plug_core::export::ExportTarget::Cline,
+            true,
+            true,
+            false,
+            true,
+            false,
+        ));
+        assert!(!is_detected_from_signals_with_markers(
+            plug_core::export::ExportTarget::ClineCli,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn detection_keeps_parent_fallback_for_other_clients() {
+        assert!(is_detected_from_signals_with_markers(
+            plug_core::export::ExportTarget::Cursor,
+            false,
+            true,
+            false,
+            false,
+            false,
+        ));
     }
 }
