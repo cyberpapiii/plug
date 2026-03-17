@@ -247,6 +247,27 @@ Key files expected to change:
 - The same recovery verb does not apply to every auth warning; splitting categories makes the next
   action deterministic and keeps `doctor` aligned with `auth status`.
 
+### 2026-03-17 - Auth status source-truth clarification
+
+**By:** Codex
+
+**Actions:**
+- Added an explicit source line to `plug auth status` text output so it now distinguishes:
+  - live daemon auth/runtime state
+  - stored-credential fallback when the daemon is unavailable
+- Added matching JSON metadata:
+  - top-level `status_scope`
+  - per-server `status_scope`
+- Added focused test coverage for the new scope text and re-ran the full `plug` suite.
+
+**Verification:**
+- `cargo test -p plug commands::auth::tests -- --nocapture`
+- `cargo test -p plug -- --nocapture`
+
+**Learnings:**
+- Cached credentials are useful fallback evidence, but they should never be rendered as if they are
+  live runtime truth.
+
 ### 2026-03-17 - Server auth setup scaffolding slice
 
 **By:** Codex

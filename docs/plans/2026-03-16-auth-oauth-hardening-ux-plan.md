@@ -118,6 +118,9 @@ Still remaining:
 - 2026-03-17: `plug doctor` auth runtime output now splits missing credentials, re-auth required,
   and degraded auth/runtime into separate checks, so operators get one concrete recovery action per
   auth state instead of one mixed warning line.
+- 2026-03-17: `plug auth status` now states whether it is using live daemon auth/runtime truth or
+  stored-credential fallback, so daemon-unavailable output is no longer silently presented as if it
+  were live runtime state.
 - Remaining gap: `plug doctor` still needs fuller command-level fixtures for live-runtime versus
   cold-connectivity interpretation, but the core cold HTTP/SSE connectivity semantics are now
   pinned directly in `plug-core`.
