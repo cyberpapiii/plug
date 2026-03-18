@@ -2922,6 +2922,14 @@ impl ServerHandler for ProxyHandler {
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "stdio notification fan-out lagged");
+                                let _ = peer
+                                    .notify_logging_message(
+                                        ProtocolNotification::control_lagged_logging_params(
+                                            skipped as u64,
+                                            "stdio",
+                                        ),
+                                    )
+                                    .await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }

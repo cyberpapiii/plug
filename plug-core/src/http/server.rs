@@ -231,6 +231,14 @@ impl HttpState {
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
+                                let value = ProtocolNotification::LoggingMessage {
+                                    params: ProtocolNotification::control_lagged_logging_params(
+                                        skipped as u64,
+                                        "http",
+                                    ),
+                                }
+                                .to_json_value();
+                                state.sessions.broadcast(value);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }

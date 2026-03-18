@@ -965,6 +965,16 @@ async fn handle_ipc_loop(
                     }
                     Err(TryRecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "IPC control notification lagged");
+                        let notif = IpcResponse::LoggingNotification {
+                            params: serde_json::to_value(
+                                plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
+                                    skipped as u64,
+                                    "ipc",
+                                ),
+                            )
+                            .unwrap_or_default(),
+                        };
+                        ipc::send_response(writer, &notif).await.ok();
                     }
                     Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
                 }
@@ -1094,6 +1104,16 @@ async fn send_ipc_control_notification(
         }
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC control notification lagged");
+            let notif = IpcResponse::LoggingNotification {
+                params: serde_json::to_value(
+                    plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
+                        skipped as u64,
+                        "ipc",
+                    ),
+                )
+                .unwrap_or_default(),
+            };
+            ipc::send_response(writer, &notif).await.ok();
         }
         Err(RecvError::Closed) => {}
     }

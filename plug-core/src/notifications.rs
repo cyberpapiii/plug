@@ -48,6 +48,21 @@ pub enum NotificationTarget {
 }
 
 impl ProtocolNotification {
+    pub fn control_lagged_logging_params(
+        skipped: u64,
+        transport: &'static str,
+    ) -> LoggingMessageNotificationParam {
+        LoggingMessageNotificationParam {
+            level: rmcp::model::LoggingLevel::Warning,
+            logger: Some("plug.control".into()),
+            data: serde_json::json!({
+                "event": "control_notification_lagged",
+                "transport": transport,
+                "skipped": skipped,
+            }),
+        }
+    }
+
     pub fn as_logging_message_params(&self) -> Option<LoggingMessageNotificationParam> {
         match self {
             ProtocolNotification::LoggingMessage { params } => Some(params.clone()),
@@ -224,5 +239,15 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("github")
         );
+    }
+
+    #[test]
+    fn control_lagged_logging_params_are_structured() {
+        let params = ProtocolNotification::control_lagged_logging_params(7, "stdio");
+        assert_eq!(params.logger.as_deref(), Some("plug.control"));
+        assert_eq!(params.level, rmcp::model::LoggingLevel::Warning);
+        assert_eq!(params.data["event"], "control_notification_lagged");
+        assert_eq!(params.data["transport"], "stdio");
+        assert_eq!(params.data["skipped"], 7);
     }
 }
