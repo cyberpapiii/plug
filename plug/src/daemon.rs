@@ -1571,8 +1571,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 /// Handle `AuthStatus` — return per-server OAuth state from config + credential stores.
 async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
     use plug_core::oauth;
-    use rmcp::transport::auth::CredentialStore;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     let config = plug_core::config::load_config(Some(&ctx.config_path));
     let config = match config {
@@ -1597,16 +1595,11 @@ async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
         .collect();
     oauth_servers.sort_by_key(|(name, _)| (*name).clone());
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     let mut servers = Vec::new();
     for (name, sc) in &oauth_servers {
         let store = oauth::get_or_create_store(name);
-        let has_creds = store.load().await.ok().flatten().is_some();
-        let warnings = store.backing_store_warnings();
+        let snapshot = store.credential_snapshot();
+        let has_creds = snapshot.credentials.is_some();
 
         let health = status_map
             .get(name.as_str())
@@ -1619,24 +1612,14 @@ async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
                 }
             });
 
-        let token_expires_in_secs = if has_creds {
-            store.cached_expiry().map(|(received_at, expires_in)| {
-                let effective = expires_in.unwrap_or(oauth::DEFAULT_TOKEN_LIFETIME_SECS);
-                let elapsed = now.saturating_sub(received_at);
-                effective.saturating_sub(elapsed)
-            })
-        } else {
-            None
-        };
-
         servers.push(plug_core::ipc::IpcAuthServerInfo {
             name: (*name).clone(),
             url: sc.url.clone(),
             authenticated: has_creds,
             health,
             scopes: sc.oauth_scopes.clone(),
-            token_expires_in_secs,
-            warnings,
+            token_expires_in_secs: snapshot.token_expires_in_secs,
+            warnings: snapshot.warnings,
         });
     }
 

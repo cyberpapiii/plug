@@ -172,6 +172,14 @@ enum CredentialSource {
     Keyring,
 }
 
+#[derive(Clone, Debug)]
+pub struct CredentialSnapshot {
+    pub credentials: Option<StoredCredentials>,
+    pub source: Option<&'static str>,
+    pub token_expires_in_secs: Option<u64>,
+    pub warnings: Vec<String>,
+}
+
 impl std::fmt::Debug for CachedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedCredentials")
@@ -478,12 +486,13 @@ impl CompositeCredentialStore {
 
     /// Return human-readable warnings about backing-store drift between the
     /// mirrored token file and the keyring entry for this server.
-    pub fn backing_store_warnings(&self) -> Vec<String> {
-        let file = self.file_load();
-        let keyring = self.keyring_load();
+    fn compute_backing_store_warnings(
+        file: Option<&StoredCredentials>,
+        keyring: Option<&StoredCredentials>,
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
 
-        match (file.as_ref(), keyring.as_ref()) {
+        match (file, keyring) {
             (Some(_), None) => warnings.push(
                 "token file mirror exists but keyring entry is missing".to_string(),
             ),
@@ -509,13 +518,13 @@ impl CompositeCredentialStore {
         warnings
     }
 
-    /// Return the best currently-known credentials for this server.
-    ///
-    /// When cached credentials exist, prefer a newer mirrored token-file entry
-    /// over the in-memory copy. This lets a long-lived daemon recover from
-    /// fresher persisted credentials written by another process without
-    /// requiring a full restart to clear cache state.
-    async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
+    pub fn backing_store_warnings(&self) -> Vec<String> {
+        let file = self.file_load();
+        let keyring = self.keyring_load();
+        Self::compute_backing_store_warnings(file.as_ref(), keyring.as_ref())
+    }
+
+    fn credential_snapshot_inner(&self) -> CredentialSnapshot {
         let cached = self.cached_credentials();
         let persisted_file = self.file_load();
         let persisted_keyring = self.keyring_load();
@@ -530,43 +539,73 @@ impl CompositeCredentialStore {
             ),
         );
 
+        let warnings =
+            Self::compute_backing_store_warnings(persisted_file.as_ref(), persisted_keyring.as_ref());
+
         match freshest {
-            Some((creds, CredentialSource::Cache)) => Some(creds.clone()),
-            Some((creds, _)) => {
+            Some((creds, CredentialSource::Cache)) => CredentialSnapshot {
+                credentials: Some(creds.clone()),
+                source: Some("cache"),
+                token_expires_in_secs: self.cached_expiry().map(|(_, expires_in)| {
+                    let effective = expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let received_at = creds.token_received_at.unwrap_or(now);
+                    effective.saturating_sub(now.saturating_sub(received_at))
+                }),
+                warnings,
+            },
+            Some((creds, source)) => {
                 self.update_cache(creds);
-                Some(creds.clone())
+                CredentialSnapshot {
+                    credentials: Some(creds.clone()),
+                    source: Some(match source {
+                        CredentialSource::Cache => "cache",
+                        CredentialSource::File => "file",
+                        CredentialSource::Keyring => "keyring",
+                    }),
+                    token_expires_in_secs: self.cached_expiry().map(|(_, expires_in)| {
+                        let effective = expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let received_at = creds.token_received_at.unwrap_or(now);
+                        effective.saturating_sub(now.saturating_sub(received_at))
+                    }),
+                    warnings,
+                }
             }
-            None => None,
+            None => CredentialSnapshot {
+                credentials: None,
+                source: None,
+                token_expires_in_secs: None,
+                warnings,
+            },
         }
+    }
+
+    pub fn credential_snapshot(&self) -> CredentialSnapshot {
+        self.credential_snapshot_inner()
+    }
+
+    /// Return the best currently-known credentials for this server.
+    ///
+    /// When cached credentials exist, prefer a newer mirrored token-file entry
+    /// over the in-memory copy. This lets a long-lived daemon recover from
+    /// fresher persisted credentials written by another process without
+    /// requiring a full restart to clear cache state.
+    async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
+        self.credential_snapshot_inner().credentials
     }
 }
 
 #[async_trait]
 impl CredentialStore for CompositeCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        // 1. Check in-memory cache first. This avoids repeated keychain prompts
-        //    in long-lived daemons and refresh loops once credentials have been
-        //    hydrated successfully in-process.
-        if let Some(creds) = self.cached_credentials() {
-            return Ok(Some(creds));
-        }
-
-        // 2. Try the mirrored token file first. We always maintain the file as
-        //    a 0600 local copy, so preferring it avoids repeated keychain
-        //    prompts for short-lived CLI processes without changing on-disk
-        //    credential semantics.
-        if let Some(creds) = self.file_load() {
-            self.update_cache(&creds);
-            return Ok(Some(creds));
-        }
-
-        // 3. Fall back to keyring when the file is absent.
-        if let Some(creds) = self.keyring_load() {
-            self.update_cache(&creds);
-            return Ok(Some(creds));
-        }
-
-        Ok(None)
+        Ok(self.credential_snapshot_inner().credentials)
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
