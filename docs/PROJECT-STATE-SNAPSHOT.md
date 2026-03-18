@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `cbbcee2` (post-reconcile baseline including daemon-owned background HTTP runtime semantics)
+Baseline: `main` @ `bf876f4` (post performance/efficiency hardening and operator-truth follow-up)
 
 This is the canonical current-state doc for the project.
 
@@ -57,10 +57,18 @@ Implemented on `main`:
 - standalone `plug serve` retained as an explicit foreground runtime path for deliberate non-daemon serving
 - pinned machine-readable JSON contracts for operator inventory/auth/runtime surfaces
 - standalone HTTP inventory failure-path coverage for missing token, empty token, unauthorized, and malformed response cases
+- unified OAuth credential snapshot reads across runtime and operator auth surfaces
+- fail-fast HTTP reverse requests for dead SSE targets plus explicit live-delivery feedback after enqueue
+- bounded concurrent reload startup with single-flight engine reloads and safe shared upstream registration
+- coalesced health-triggered tool refreshes and deduplicated proactive recovery task spawning
+- pre-serialized HTTP/SSE notification fanout payloads
+- centralized config env traversal reused by doctor env checks, with broader coverage across config fields
+- stricter runtime-truth handling across `status`, `tools`, `servers`, `clients`, and `doctor` when the daemon is reachable but IPC/runtime inspection fails
 
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
+- some low-priority internal simplification remains possible in reload/session/SSE helper structure, but no roadmap-critical correctness work remains open
 
 ## What Exists Off-Main
 
@@ -78,6 +86,15 @@ Any further work is optional future scope rather than a blocker.
 
 On 2026-03-16, the previously working branch/runtime line was reconciled into `main`, verified with
 the full test suite, and pushed as the new canonical baseline.
+
+On 2026-03-18, `main` also absorbed the follow-on performance, efficiency, and operator-truth
+hardening work that:
+
+- unified credential snapshot reads and removed redundant auth-store probes from operator flows
+- made reverse HTTP client requests fail immediately when live SSE delivery cannot be completed
+- serialized reload execution and removed batched upstream registration races
+- reduced SSE broadcast cost by reusing pre-serialized payloads
+- clarified the difference between daemon reachability and successful runtime inspection across operator surfaces
 
 ## Documentation Taxonomy
 
@@ -103,7 +120,7 @@ Use docs by role:
 
 1. keep current-state docs aligned with `main`
 2. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
-3. continue optional operator/runtime polish around live recovery and mixed-topology clarity
+3. consider low-priority simplification/perf cleanup in reload/session/SSE helper structure if the maintenance bar expands
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 

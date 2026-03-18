@@ -39,6 +39,9 @@ forwarding work:
 - daemon-owned downstream HTTP/HTTPS when the shared background service is running
 - daemon-provided transport-complete live session truth in background-service mode
 - pinned operator JSON contracts plus downstream HTTP inventory failure-path coverage
+- performance and efficiency follow-through across auth-store reads, reload batching, SSE fanout, and config env traversal
+- runtime-truth follow-up hardening across `status`, `tools`, `servers`, `clients`, and `doctor`
+- explicit live reverse-request delivery failure handling for downstream HTTP sessions
 
 ## What Exists Today
 
@@ -55,6 +58,9 @@ The current product shape is:
 - downstream HTTP bearer token auth for non-loopback binding
 - downstream OAuth mode for remote/server-card based authorization flows
 - explicit runtime/auth/operator state vocabulary across `status`, `doctor`, `auth status`, `clients`, and `servers`
+- single-flight reload application with bounded concurrent startup and safe shared registration
+- pre-serialized broadcast SSE payloads for the hot HTTP notification path
+- centralized env-reference traversal reused by config loading and doctor checks
 
 ## Remaining Work
 
@@ -65,6 +71,7 @@ Optional future scope only:
 
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
+- further low-priority simplification of internal reload/session/SSE helper structure
 
 ## 2026-03-16 Reconciliation Note
 
@@ -89,3 +96,15 @@ On 2026-03-17, `main` also moved the shared background service to the next archi
 - daemon `ListLiveSessions` can report transport-complete truth directly
 - runtime/operator surfaces trust daemon-provided complete inventory when it is available
 - standalone `plug serve` remains as an explicit foreground mode rather than the primary runtime authority
+
+## 2026-03-18 Performance And Runtime Truth Hardening
+
+On 2026-03-18, `main` absorbed a focused hardening pass that:
+
+- unified OAuth credential snapshot reads and reduced duplicated auth-store IO
+- added fail-fast handling for dead HTTP reverse-request targets, then tightened send-time live-delivery failure handling
+- batched reload startup with configured concurrency while serializing reload execution and protecting shared upstream registration
+- coalesced health-triggered refresh work and deduplicated proactive recovery scheduling
+- pre-serialized SSE notification payloads for HTTP fanout
+- centralized config env traversal and reused it in doctor env inspection
+- clarified operator runtime truth when the daemon is reachable but IPC/runtime inspection is unavailable
