@@ -31,6 +31,13 @@ struct SessionState {
     client_type: crate::types::ClientType,
 }
 
+enum BroadcastFollowup {
+    Expire,
+    Delivered,
+    QueueIfStillInactive,
+    ClearAndRequeue,
+}
+
 impl StatefulSessionStore {
     /// Return a transport-aware snapshot of tracked HTTP sessions.
     pub fn list_sessions(&self) -> Vec<DownstreamSessionSnapshot> {
@@ -290,55 +297,53 @@ impl SessionStore for StatefulSessionStore {
     }
 
     fn broadcast(&self, message: SseMessage) {
-        let mut expired_sessions = Vec::new();
-        let mut queue_for_inactive_sessions = Vec::new();
-        let mut clear_and_requeue = Vec::new();
-        let mut delivered_sessions = Vec::new();
+        let mut followups: Vec<(String, BroadcastFollowup)> = Vec::new();
 
         for entry in self.sessions.iter() {
             let session_id: String = entry.key().clone();
             if entry.last_activity.elapsed() > self.timeout {
-                expired_sessions.push(session_id);
+                followups.push((session_id, BroadcastFollowup::Expire));
                 continue;
             }
 
             if let Some(sender) = entry.sse_sender.as_ref() {
                 match sender.try_send(message.clone()) {
-                    Ok(()) => delivered_sessions.push(session_id),
+                    Ok(()) => followups.push((session_id, BroadcastFollowup::Delivered)),
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
                     | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        clear_and_requeue.push(session_id);
+                        followups.push((session_id, BroadcastFollowup::ClearAndRequeue));
                     }
                 }
             } else {
-                queue_for_inactive_sessions.push(session_id);
+                followups.push((session_id, BroadcastFollowup::QueueIfStillInactive));
             }
         }
 
-        for session_id in expired_sessions {
-            if self.sessions.remove(&session_id).is_some() {
-                self.notify_expired(&session_id);
-            }
-        }
-
-        for session_id in delivered_sessions {
-            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
-                entry.last_activity = Instant::now();
-            }
-        }
-
-        for session_id in queue_for_inactive_sessions {
-            if let Some(mut entry) = self.sessions.get_mut(&session_id)
-                && entry.sse_sender.is_none()
-            {
-                Self::enqueue_pending(&mut entry, message.clone());
-            }
-        }
-
-        for session_id in clear_and_requeue {
-            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
-                entry.sse_sender = None;
-                Self::enqueue_pending(&mut entry, message.clone());
+        for (session_id, followup) in followups {
+            match followup {
+                BroadcastFollowup::Expire => {
+                    if self.sessions.remove(&session_id).is_some() {
+                        self.notify_expired(&session_id);
+                    }
+                }
+                BroadcastFollowup::Delivered => {
+                    if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                        entry.last_activity = Instant::now();
+                    }
+                }
+                BroadcastFollowup::QueueIfStillInactive => {
+                    if let Some(mut entry) = self.sessions.get_mut(&session_id)
+                        && entry.sse_sender.is_none()
+                    {
+                        Self::enqueue_pending(&mut entry, message.clone());
+                    }
+                }
+                BroadcastFollowup::ClearAndRequeue => {
+                    if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                        entry.sse_sender = None;
+                        Self::enqueue_pending(&mut entry, message.clone());
+                    }
+                }
             }
         }
     }

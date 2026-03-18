@@ -5,7 +5,7 @@ use crate::commands::clients::{
     configured_http_export_url, linked_client_targets, linked_client_transport,
 };
 use crate::runtime::{
-    LiveClientSupport, daemon_running, fetch_live_sessions, live_inventory_metadata,
+    LiveClientSupport, daemon_query, daemon_running, fetch_live_sessions, live_inventory_metadata,
 };
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
@@ -396,13 +396,20 @@ pub(crate) async fn cmd_status(
         Some((token_path.exists(), token))
     });
 
-    if daemon_running
-        && let Ok(plug_core::ipc::IpcResponse::Status {
-        servers,
-        clients,
-        uptime_secs,
-    }) = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
-    {
+    let (status_availability, live_status) = daemon_query(
+        &plug_core::ipc::IpcRequest::Status,
+        |response| match response {
+            plug_core::ipc::IpcResponse::Status {
+                servers,
+                clients,
+                uptime_secs,
+            } => Some((servers, clients, uptime_secs)),
+            _ => None,
+        },
+    )
+    .await;
+
+    if let Some((servers, clients, uptime_secs)) = live_status {
         let (live_sessions, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live_sessions, live_inventory_scope);
@@ -613,7 +620,7 @@ pub(crate) async fn cmd_status(
             "Service is not currently reachable",
         );
         println!();
-        if daemon_running {
+        if status_availability.daemon_reachable() {
             print_warning_line(
                 "The daemon socket is reachable, but runtime inspection failed. Live runtime, auth, and session truth are unavailable right now.",
             );
@@ -683,9 +690,9 @@ pub(crate) async fn cmd_status(
                 "uptime": 0,
                 "clients": 0,
                 "runtime_available": false,
-                "status_source": if daemon_running { "ipc_unavailable" } else { "config_only" },
+                "status_source": if status_availability.daemon_reachable() { "ipc_unavailable" } else { "config_only" },
                 "servers": servers,
-                "daemon_running": daemon_running
+                "daemon_running": status_availability.daemon_reachable()
             }))?
         );
     }

@@ -5,7 +5,7 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::config::load_editable_config;
 use crate::commands::tools::prompt_tool_actions;
-use crate::runtime::daemon_running;
+use crate::runtime::daemon_query;
 use crate::ui::{
     can_prompt_interactively, print_banner, print_heading, print_label_value, terminal_width,
 };
@@ -59,39 +59,43 @@ pub(crate) async fn cmd_tool_list(
     };
 
     loop {
-        let daemon_reachable = daemon_running().await;
-        let config = load_editable_config(config_path).ok().map(|(_, config)| config);
-        let configured_server_count = config.as_ref().map(|config| config.servers.len()).unwrap_or(0);
-        let runtime_status = if daemon_reachable {
-            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
-                Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) => Some(
+        let (status_availability, runtime_status) = daemon_query(
+            &plug_core::ipc::IpcRequest::Status,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(
                     servers
                         .into_iter()
                         .filter(|server| server.server_id != "__plug_internal__")
                         .collect::<Vec<_>>(),
                 ),
                 _ => None,
-            }
-        } else {
-            None
-        };
-        let runtime_available = runtime_status.is_some();
+            },
+        )
+        .await;
+        let config = load_editable_config(config_path).ok().map(|(_, config)| config);
+        let configured_server_count = config.as_ref().map(|config| config.servers.len()).unwrap_or(0);
+        let runtime_available = status_availability.runtime_available();
         let runtime_servers = runtime_status.unwrap_or_default();
-        let (all_tools, list_tools_available): (Vec<plug_core::ipc::IpcToolInfo>, bool) = if runtime_available {
-            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await {
-                Ok(plug_core::ipc::IpcResponse::Tools { tools }) => (
+        let (tools_availability, tools_result) = daemon_query(
+            &plug_core::ipc::IpcRequest::ListTools,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Tools { tools } => Some(
                     tools
                         .into_iter()
                         .filter(|tool| tool.server_id != "__plug_internal__")
-                        .collect(),
-                    true,
+                        .collect::<Vec<_>>(),
                 ),
-                _ => (Vec::new(), false),
-            }
+                _ => None,
+            },
+        )
+        .await;
+        let all_tools = tools_result.unwrap_or_default();
+        let inventory_availability = if runtime_available {
+            tools_availability
         } else {
-            (Vec::new(), false)
+            status_availability
         };
-        let inventory_available = runtime_available && list_tools_available;
+        let inventory_available = inventory_availability.runtime_available();
 
         let mut tools_by_prefix: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
         for t in &all_tools {
@@ -134,13 +138,7 @@ pub(crate) async fn cmd_tool_list(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                         "runtime_available": inventory_available,
-                        "status_source": if inventory_available {
-                            "live_daemon"
-                        } else if daemon_reachable {
-                            "ipc_unavailable"
-                        } else {
-                            "runtime_unavailable"
-                        },
+                        "status_source": inventory_availability.status_source(),
                         "tool_count": all_tools.len(),
                         "server_count": unique_servers.len(),
                         "groups": json_groups,
@@ -152,7 +150,7 @@ pub(crate) async fn cmd_tool_list(
                 if tools_by_prefix.is_empty() {
                     match classify_empty_tool_inventory(
                         inventory_available,
-                        daemon_reachable,
+                        inventory_availability.daemon_reachable(),
                         configured_server_count,
                         &runtime_servers,
                     ) {

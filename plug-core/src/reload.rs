@@ -6,12 +6,12 @@
 //! - File watcher (`watcher.rs`, 500ms debounce via `notify`)
 
 use std::collections::HashSet;
-use std::future::Future;
 
 use futures::stream::{self, StreamExt};
 
 use crate::config::{Config, ServerConfig};
 use crate::engine::EngineEvent;
+use crate::server::ServerManager;
 
 /// Diff result between old and new configs.
 #[derive(Debug, Clone)]
@@ -43,21 +43,32 @@ struct ReloadStartAction {
     kind: ReloadStartKind,
 }
 
-async fn run_reload_start_actions<F, Fut>(
+async fn run_reload_start_actions(
     actions: Vec<ReloadStartAction>,
     concurrency_limit: usize,
-    run: F,
-) -> Vec<(ReloadStartAction, Result<(), String>)>
-where
-    F: Fn(ReloadStartAction) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(), String>> + Send,
-{
+    server_manager: std::sync::Arc<ServerManager>,
+) -> Vec<(ReloadStartAction, Result<(), String>)> {
     stream::iter(actions)
         .map(move |action| {
-            let run = run.clone();
+            let server_manager = server_manager.clone();
             async move {
                 let action_for_result = action.clone();
-                let result = run(action).await;
+                let result = async move {
+                    match action.kind {
+                        ReloadStartKind::Restart => {
+                            tracing::info!(server = %action.name, "starting replacement for changed server");
+                        }
+                        ReloadStartKind::Start => {
+                            tracing::info!(server = %action.name, "starting new server");
+                        }
+                    }
+
+                    server_manager
+                        .start_and_register(&action.name, &action.config)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                .await;
                 (action_for_result, result)
             }
         })
@@ -256,27 +267,7 @@ pub async fn apply_reload(
     let start_results = run_reload_start_actions(
         start_actions,
         new_config.startup_concurrency,
-        {
-            let server_manager = server_manager.clone();
-            move |action| {
-                let server_manager = server_manager.clone();
-                async move {
-                    match action.kind {
-                        ReloadStartKind::Restart => {
-                            tracing::info!(server = %action.name, "starting replacement for changed server");
-                        }
-                        ReloadStartKind::Start => {
-                            tracing::info!(server = %action.name, "starting new server");
-                        }
-                    }
-
-                    server_manager
-                        .start_and_register(&action.name, &action.config)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            }
-        },
+        server_manager.clone(),
     )
     .await;
 
@@ -346,6 +337,7 @@ pub struct ReloadReport {
 mod tests {
     use super::*;
     use crate::config::{Config, ServerConfig, TransportType};
+    use futures::stream::{self, StreamExt};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -552,22 +544,25 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
 
-        let results = run_reload_start_actions(actions, 2, {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            move |_action| {
+        let results: Vec<_> = stream::iter(actions)
+            .map({
                 let active = Arc::clone(&active);
                 let peak = Arc::clone(&peak);
-                async move {
-                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(current, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(())
+                move |action| {
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        (action, Ok::<(), String>(()))
+                    }
                 }
-            }
-        })
-        .await;
+            })
+            .buffer_unordered(2)
+            .collect()
+            .await;
 
         assert_eq!(results.len(), 3);
         assert_eq!(peak.load(Ordering::SeqCst), 2);

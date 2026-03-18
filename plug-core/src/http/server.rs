@@ -266,10 +266,8 @@ impl HttpState {
                     _ = log_state.cancel.cancelled() => break,
                     recv = log_rx.recv() => {
                         match recv {
-                            Ok(ref notif @ ProtocolNotification::LoggingMessage { .. }) => {
-                                if let Some(message) =
-                                    SseMessage::from_json_value(notif.to_json_value()).ok()
-                                {
+                            Ok(notif @ ProtocolNotification::LoggingMessage { .. }) => {
+                                if let Some(message) = notification_to_sse_message(notif) {
                                     log_state.sessions.broadcast(message);
                                 }
                             }
@@ -286,9 +284,7 @@ impl HttpState {
                                         )),
                                     },
                                 };
-                                if let Some(message) =
-                                    SseMessage::from_json_value(synthetic.to_json_value()).ok()
-                                {
+                                if let Some(message) = notification_to_sse_message(synthetic) {
                                     log_state.sessions.broadcast(message);
                                 }
                             }

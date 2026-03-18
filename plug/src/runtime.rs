@@ -14,6 +14,31 @@ use tokio_util::sync::CancellationToken;
 const OPERATOR_LIVE_SESSIONS_PATH: &str = "/_plug/live-sessions";
 const OPERATOR_TOKEN_HEADER: &str = "x-plug-operator-token";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonQueryAvailability {
+    Unreachable,
+    IpcUnavailable,
+    Available,
+}
+
+impl DaemonQueryAvailability {
+    pub(crate) fn runtime_available(self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    pub(crate) fn daemon_reachable(self) -> bool {
+        !matches!(self, Self::Unreachable)
+    }
+
+    pub(crate) fn status_source(self) -> &'static str {
+        match self {
+            Self::Available => "live_daemon",
+            Self::IpcUnavailable => "ipc_unavailable",
+            Self::Unreachable => "runtime_unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LiveClientSupport {
@@ -650,6 +675,23 @@ pub(crate) async fn ensure_daemon_with_feedback(
 
 pub(crate) async fn daemon_running() -> bool {
     daemon::connect_to_daemon().await.is_some()
+}
+
+pub(crate) async fn daemon_query<T>(
+    request: &plug_core::ipc::IpcRequest,
+    decode: impl FnOnce(plug_core::ipc::IpcResponse) -> Option<T>,
+) -> (DaemonQueryAvailability, Option<T>) {
+    if !daemon_running().await {
+        return (DaemonQueryAvailability::Unreachable, None);
+    }
+
+    match daemon::ipc_request(request).await {
+        Ok(response) => match decode(response) {
+            Some(value) => (DaemonQueryAvailability::Available, Some(value)),
+            None => (DaemonQueryAvailability::IpcUnavailable, None),
+        },
+        Err(_) => (DaemonQueryAvailability::IpcUnavailable, None),
+    }
 }
 
 pub(crate) async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {

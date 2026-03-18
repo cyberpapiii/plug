@@ -5,7 +5,7 @@ use crate::OutputFormat;
 use crate::commands::servers::{
     cmd_server_add, cmd_server_edit, cmd_server_remove, cmd_server_set_enabled,
 };
-use crate::runtime::daemon_running;
+use crate::runtime::daemon_query;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, status_label, status_marker, summarize_server_auth, summarize_server_target,
@@ -91,15 +91,14 @@ pub(crate) async fn cmd_server_list(
     let mut started = false;
 
     loop {
-        let daemon_reachable = daemon_running().await;
-        let live_status = if daemon_reachable {
-            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
-                Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) => Some(servers),
+        let (availability, live_status) = daemon_query(
+            &plug_core::ipc::IpcRequest::Status,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(servers),
                 _ => None,
-            }
-        } else {
-            None
-        };
+            },
+        )
+        .await;
         if let Some(servers) = live_status {
             match output {
                 OutputFormat::Json => {
@@ -247,7 +246,7 @@ pub(crate) async fn cmd_server_list(
                     &format!(
                         "{} server(s) configured ({})",
                         names.len(),
-                        if daemon_reachable {
+                        if availability.daemon_reachable() {
                             "runtime inspection failed"
                         } else {
                             "daemon not running"
@@ -294,8 +293,12 @@ pub(crate) async fn cmd_server_list(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "runtime_available": false,
-                            "status_source": if daemon_reachable { "ipc_unavailable" } else { "config_only" },
-                            "daemon_running": daemon_reachable,
+                            "status_source": if availability.daemon_reachable() {
+                                "ipc_unavailable"
+                            } else {
+                                "config_only"
+                            },
+                            "daemon_running": availability.daemon_reachable(),
                             "servers": config.servers,
                         }))?
                     );
