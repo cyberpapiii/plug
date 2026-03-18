@@ -983,18 +983,28 @@ port = 4444
     #[test]
     fn configured_http_export_url_uses_localhost_for_wildcard_bind() {
         let path = temp_config_path("wildcard");
+        let cert_path = path.parent().unwrap().join("cert.pem");
+        let key_path = path.parent().unwrap().join("key.pem");
+        std::fs::write(&cert_path, "test-cert").unwrap();
+        std::fs::write(&key_path, "test-key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         std::fs::write(
             &path,
-            r#"[http]
-bind_address = "0.0.0.0"
-port = 4444
-"#,
+            format!(
+                "[http]\nbind_address = \"0.0.0.0\"\nauth_mode = \"bearer\"\nport = 4444\ntls_cert_path = \"{}\"\ntls_key_path = \"{}\"\n",
+                cert_path.display(),
+                key_path.display()
+            ),
         )
         .unwrap();
 
         assert_eq!(
             configured_http_export_url(Some(&path)).as_deref(),
-            Some("http://localhost:4444/mcp")
+            Some("https://localhost:4444/mcp")
         );
     }
 

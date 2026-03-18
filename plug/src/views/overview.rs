@@ -5,7 +5,7 @@ use crate::commands::clients::{
     configured_http_export_url, linked_client_targets, linked_client_transport,
 };
 use crate::runtime::{
-    LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions, live_inventory_metadata,
+    LiveClientSupport, daemon_running, fetch_live_sessions, live_inventory_metadata,
 };
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
@@ -326,8 +326,8 @@ pub(crate) async fn cmd_status(
     output: &OutputFormat,
     show_token: bool,
 ) -> anyhow::Result<()> {
-    let started =
-        ensure_daemon_with_feedback(config_path, matches!(output, OutputFormat::Text)).await?;
+    let started = false;
+    let daemon_running = daemon_running().await;
 
     // Load config to check HTTP auth status
     let config = plug_core::config::load_config(config_path).ok();
@@ -390,7 +390,8 @@ pub(crate) async fn cmd_status(
         Some((token_path.exists(), token))
     });
 
-    if let Ok(plug_core::ipc::IpcResponse::Status {
+    if daemon_running
+        && let Ok(plug_core::ipc::IpcResponse::Status {
         servers,
         clients,
         uptime_secs,

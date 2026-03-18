@@ -4,7 +4,7 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
 use crate::runtime::{
-    LiveClientSupport, ensure_daemon_with_feedback, fetch_live_sessions, live_inventory_metadata,
+    LiveClientSupport, daemon_running, fetch_live_sessions, live_inventory_metadata,
 };
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
@@ -132,18 +132,11 @@ pub(crate) async fn cmd_client_list(
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
     let mut daemon_error = None;
-    let mut started = match ensure_daemon_with_feedback(
-        config_path,
-        matches!(output, OutputFormat::Text),
-    )
-    .await
-    {
-        Ok(started) => started,
-        Err(error) => {
-            daemon_error = Some(error.to_string());
-            false
-        }
-    };
+    let mut started = false;
+    let daemon_available = daemon_running().await;
+    if !daemon_available {
+        daemon_error = Some("daemon not running".to_string());
+    }
 
     loop {
         let (live, live_inventory_scope, live_client_support) =

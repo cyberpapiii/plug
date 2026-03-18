@@ -30,6 +30,10 @@ pub(crate) fn save_config(
     path: &std::path::Path,
     config: &plug_core::config::Config,
 ) -> anyhow::Result<()> {
+    let errors = plug_core::config::validate_config(config);
+    if !errors.is_empty() {
+        anyhow::bail!(errors.join("; "));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

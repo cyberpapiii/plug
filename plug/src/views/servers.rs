@@ -5,7 +5,7 @@ use crate::OutputFormat;
 use crate::commands::servers::{
     cmd_server_add, cmd_server_edit, cmd_server_remove, cmd_server_set_enabled,
 };
-use crate::runtime::ensure_daemon_with_feedback;
+use crate::runtime::daemon_running;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, status_label, status_marker, summarize_server_auth, summarize_server_target,
@@ -88,27 +88,25 @@ pub(crate) async fn cmd_server_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut daemon_error = None;
-    let mut started = match ensure_daemon_with_feedback(
-        config_path,
-        matches!(output, OutputFormat::Text),
-    )
-    .await
-    {
-        Ok(started) => started,
-        Err(error) => {
-            daemon_error = Some(error.to_string());
-            false
-        }
-    };
+    let daemon_error: Option<String> = None;
+    let mut started = false;
+    let daemon_available = daemon_running().await;
 
     loop {
-        if let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) =
+        if daemon_available
+            && let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) =
             crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
         {
             match output {
                 OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&servers)?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "runtime_available": true,
+                            "status_source": "live_daemon",
+                            "servers": servers,
+                        }))?
+                    );
                     return Ok(());
                 }
                 OutputFormat::Text => {
@@ -292,7 +290,14 @@ pub(crate) async fn cmd_server_list(
                     );
                 }
             } else {
-                println!("{}", serde_json::to_string_pretty(&config.servers)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "runtime_available": false,
+                        "status_source": "config_only",
+                        "servers": config.servers,
+                    }))?
+                );
                 return Ok(());
             }
         }

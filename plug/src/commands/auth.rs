@@ -15,19 +15,21 @@ use crate::ui;
 fn auth_recovery_hint(
     name: &str,
     authenticated: bool,
-    health: plug_core::types::ServerHealth,
+    health: Option<plug_core::types::ServerHealth>,
 ) -> String {
     use plug_core::types::ServerHealth;
 
     match (authenticated, health) {
-        (false, ServerHealth::AuthRequired) => format!("Run: plug auth login --server {name}"),
-        (true, ServerHealth::AuthRequired) => format!(
+        (false, Some(ServerHealth::AuthRequired)) | (false, None) => {
+            format!("Run: plug auth login --server {name}")
+        }
+        (true, Some(ServerHealth::AuthRequired)) => format!(
             "Stored credentials are present, but re-auth is required — run: plug auth login --server {name}"
         ),
-        (true, ServerHealth::Failed) => {
+        (true, Some(ServerHealth::Failed)) => {
             "Credentials are present, but the server is failing for a non-auth reason — check `plug status` and `plug doctor`".to_string()
         }
-        (true, ServerHealth::Degraded) => {
+        (true, Some(ServerHealth::Degraded)) => {
             "Credentials are present, but runtime health is degraded — compare `plug status` and `plug doctor`".to_string()
         }
         _ => String::new(),
@@ -44,6 +46,7 @@ fn auth_status_source_text(live: bool) -> &'static str {
 
 fn auth_status_json(servers: Vec<serde_json::Value>, live: bool) -> serde_json::Value {
     serde_json::json!({
+        "runtime_available": live,
         "servers": servers,
         "status_source": if live {
             "live_daemon"
@@ -525,34 +528,28 @@ async fn cmd_auth_status(
                     store.load().await.ok().flatten().is_some()
                 };
 
-                let health = live.map(|s| s.health).unwrap_or(if has_creds {
-                    plug_core::types::ServerHealth::Degraded
-                } else {
-                    plug_core::types::ServerHealth::AuthRequired
-                });
+                let health = live.map(|s| s.health);
 
                 let status = match (has_creds, health) {
-                    (false, plug_core::types::ServerHealth::AuthRequired) => {
-                        style("not authenticated").red()
-                    }
-                    (true, plug_core::types::ServerHealth::AuthRequired) => {
+                    (false, _) => style("not authenticated").red(),
+                    (true, Some(plug_core::types::ServerHealth::AuthRequired)) => {
                         style("credentials present, re-auth required").yellow()
                     }
-                    (true, plug_core::types::ServerHealth::Failed) => {
+                    (true, Some(plug_core::types::ServerHealth::Failed)) => {
                         style("credentials present, server failed").red()
                     }
-                    (true, plug_core::types::ServerHealth::Degraded) => {
+                    (true, Some(plug_core::types::ServerHealth::Degraded)) => {
                         style("authenticated, degraded").yellow()
                     }
-                    (true, plug_core::types::ServerHealth::Healthy) => {
+                    (true, Some(plug_core::types::ServerHealth::Healthy)) => {
                         style("authenticated").green()
                     }
-                    (false, _) => style("not authenticated").red(),
+                    (true, None) => style("credentials present, runtime unavailable").yellow(),
                 };
 
                 println!(
                     "  {} {} ({})",
-                    ui::status_marker(&health),
+                    ui::status_marker(&health.unwrap_or(plug_core::types::ServerHealth::Degraded)),
                     style(name).bold(),
                     status,
                 );
@@ -605,17 +602,13 @@ async fn cmd_auth_status(
                 } else {
                     store.load().await.ok().flatten().is_some()
                 };
-                let health = live.map(|s| s.health).unwrap_or(if has_creds {
-                    plug_core::types::ServerHealth::Degraded
-                } else {
-                    plug_core::types::ServerHealth::AuthRequired
-                });
+                let health = live.map(|s| s.health);
 
                 servers.push(serde_json::json!({
                     "name": name,
                     "url": live.and_then(|s| s.url.clone()).or_else(|| sc.url.clone()),
                     "authenticated": has_creds,
-                    "health": format!("{health:?}"),
+                    "health": health.map(|value| format!("{value:?}")),
                     "scopes": live.and_then(|s| s.scopes.clone()).or_else(|| sc.oauth_scopes.clone()),
                     "token_expires_in_secs": live.and_then(|s| s.token_expires_in_secs),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
@@ -818,6 +811,7 @@ mod tests {
             "status_source": "live_daemon",
         })];
         let json = auth_status_json(servers, true);
+        assert_eq!(json["runtime_available"], true);
         assert_eq!(json["status_source"], "live_daemon");
         assert_eq!(json["status_scope"], "live_daemon");
         assert_eq!(json["servers"][0]["name"], "notion");

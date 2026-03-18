@@ -5,7 +5,7 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::config::load_editable_config;
 use crate::commands::tools::prompt_tool_actions;
-use crate::runtime::ensure_daemon_with_feedback;
+use crate::runtime::daemon_running;
 use crate::ui::{
     can_prompt_interactively, print_banner, print_heading, print_label_value, terminal_width,
 };
@@ -21,14 +21,14 @@ pub(crate) async fn cmd_tool_list(
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
     let mut started = match started {
         Some(started) => started,
-        None => {
-            ensure_daemon_with_feedback(config_path, matches!(output, OutputFormat::Text)).await?
-        }
+        None => false,
     };
+    let daemon_available = daemon_running().await;
 
     loop {
         let mut all_tools: Vec<plug_core::ipc::IpcToolInfo> = Vec::new();
-        if let Ok(plug_core::ipc::IpcResponse::Tools { tools }) =
+        if daemon_available
+            && let Ok(plug_core::ipc::IpcResponse::Tools { tools }) =
             crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await
         {
             for t in tools {
@@ -76,15 +76,33 @@ pub(crate) async fn cmd_tool_list(
                         (prefix.clone(), entries)
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&json_groups)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "runtime_available": daemon_available,
+                        "status_source": if daemon_available { "live_daemon" } else { "runtime_unavailable" },
+                        "tool_count": all_tools.len(),
+                        "server_count": unique_servers.len(),
+                        "groups": json_groups,
+                    }))?
+                );
                 return Ok(());
             }
             OutputFormat::Text => {
                 if tools_by_prefix.is_empty() {
-                    println!(
-                        "No tools found. Run {} to add servers.",
-                        style("plug setup").cyan()
-                    );
+                    if daemon_available {
+                        println!(
+                            "No live tools found. Check {} and {} for runtime or auth failures.",
+                            style("plug status").cyan(),
+                            style("plug auth status").cyan()
+                        );
+                    } else {
+                        println!(
+                            "Runtime is unavailable. Start the shared service with {} or inspect config with {}.",
+                            style("plug start").cyan(),
+                            style("plug servers").cyan()
+                        );
+                    }
                     return Ok(());
                 }
                 let term_width = terminal_width();

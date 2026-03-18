@@ -488,6 +488,57 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     errors
 }
 
+fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String> {
+    let mut env_map: HashMap<String, String> = std::env::vars().collect();
+    env_map.extend(crate::dotenv::read_dotenv_vars_for_config(Some(config_path)));
+    env_map
+}
+
+fn expand_config_env_refs(config: &mut Config, env_map: &HashMap<String, String>) {
+    use expand::expand_env_vars_with_source;
+
+    if let Some(ref mut public_base_url) = config.http.public_base_url {
+        *public_base_url = expand_env_vars_with_source(public_base_url, env_map);
+    }
+    if let Some(ref mut client_id) = config.http.oauth_client_id {
+        *client_id = expand_env_vars_with_source(client_id, env_map);
+    }
+    if let Some(ref mut secret) = config.http.oauth_client_secret {
+        *secret = expand_env_vars_with_source(secret.as_str(), env_map).into();
+    }
+    if let Some(ref mut scopes) = config.http.oauth_scopes {
+        for scope in scopes.iter_mut() {
+            *scope = expand_env_vars_with_source(scope, env_map);
+        }
+    }
+
+    for server in config.servers.values_mut() {
+        if let Some(ref mut cmd) = server.command {
+            *cmd = expand_env_vars_with_source(cmd, env_map);
+        }
+        for arg in &mut server.args {
+            *arg = expand_env_vars_with_source(arg, env_map);
+        }
+        for val in server.env.values_mut() {
+            *val = expand_env_vars_with_source(val, env_map);
+        }
+        if let Some(ref mut url) = server.url {
+            *url = expand_env_vars_with_source(url, env_map);
+        }
+        if let Some(ref mut token) = server.auth_token {
+            *token = expand_env_vars_with_source(token.as_str(), env_map).into();
+        }
+        if let Some(ref mut client_id) = server.oauth_client_id {
+            *client_id = expand_env_vars_with_source(client_id, env_map);
+        }
+        if let Some(ref mut scopes) = server.oauth_scopes {
+            for scope in scopes.iter_mut() {
+                *scope = expand_env_vars_with_source(scope, env_map);
+            }
+        }
+    }
+}
+
 /// Returns the plug config directory (e.g. `~/.config/plug/`).
 pub fn config_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "plug")
@@ -573,50 +624,15 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
         .merge(Toml::file(&path))
         .merge(Env::prefixed("PLUG_").split("__"))
         .extract()?;
+    let env_map = resolved_env_source(&path);
+    expand_config_env_refs(&mut config, &env_map);
 
-    if let Some(ref mut public_base_url) = config.http.public_base_url {
-        *public_base_url = expand_env_vars(public_base_url);
+    let errors = validate_config(&config);
+    if errors.is_empty() {
+        Ok(config)
+    } else {
+        Err(figment::Error::from(errors.join("; ")))
     }
-    if let Some(ref mut client_id) = config.http.oauth_client_id {
-        *client_id = expand_env_vars(client_id);
-    }
-    if let Some(ref mut secret) = config.http.oauth_client_secret {
-        *secret = expand_env_vars(secret.as_str()).into();
-    }
-    if let Some(ref mut scopes) = config.http.oauth_scopes {
-        for scope in scopes.iter_mut() {
-            *scope = expand_env_vars(scope);
-        }
-    }
-
-    // Expand $VAR_NAME references in server configs
-    for server in config.servers.values_mut() {
-        if let Some(ref mut cmd) = server.command {
-            *cmd = expand_env_vars(cmd);
-        }
-        for arg in &mut server.args {
-            *arg = expand_env_vars(arg);
-        }
-        for val in server.env.values_mut() {
-            *val = expand_env_vars(val);
-        }
-        if let Some(ref mut url) = server.url {
-            *url = expand_env_vars(url);
-        }
-        if let Some(ref mut token) = server.auth_token {
-            *token = expand_env_vars(token.as_str()).into();
-        }
-        if let Some(ref mut client_id) = server.oauth_client_id {
-            *client_id = expand_env_vars(client_id);
-        }
-        if let Some(ref mut scopes) = server.oauth_scopes {
-            for scope in scopes.iter_mut() {
-                *scope = expand_env_vars(scope);
-            }
-        }
-    }
-
-    Ok(config)
 }
 
 #[cfg(test)]
@@ -624,6 +640,7 @@ mod tests {
     use super::*;
     use figment::Figment;
     use figment::providers::{Format, Serialized, Toml};
+    use std::path::PathBuf;
 
     /// Helper to load a Config from a TOML string merged over defaults.
     fn config_from_toml(toml: &str) -> Config {
@@ -632,6 +649,17 @@ mod tests {
             .merge(Toml::string(toml))
             .extract()
             .expect("failed to parse TOML config")
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "plug-config-{}-{}-{}",
+            label,
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     // ---- default values ----
@@ -712,6 +740,53 @@ mod tests {
         assert_eq!(cfg.startup_concurrency, 5);
         // Non-overridden fields keep defaults
         assert_eq!(cfg.http.bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn load_config_uses_dotenv_adjacent_to_active_config_path() {
+        let dir = unique_temp_dir("dotenv-adjacent");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            dir.join(".env"),
+            "TEST_REMOTE_URL=https://env.example.com/mcp\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config_path,
+            r#"
+            [servers.demo]
+            transport = "http"
+            url = "$TEST_REMOTE_URL"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&config_path)).expect("load config with sibling dotenv");
+        assert_eq!(
+            cfg.servers.get("demo").and_then(|server| server.url.as_deref()),
+            Some("https://env.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn load_config_enforces_semantic_validation() {
+        let dir = unique_temp_dir("validation");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [http]
+            bind_address = "0.0.0.0"
+            auth_mode = "none"
+            "#,
+        )
+        .unwrap();
+
+        let err = load_config(Some(&config_path)).expect_err("semantic validation should fail");
+        assert!(
+            err.to_string().contains("auth_mode = \"none\""),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

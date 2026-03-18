@@ -13,6 +13,7 @@ use super::{DownstreamSessionSnapshot, DownstreamTransport, SessionStore, SseMes
 /// Current in-memory stateful downstream session store.
 pub struct StatefulSessionStore {
     sessions: Arc<DashMap<String, SessionState>>,
+    admission_lock: std::sync::Mutex<()>,
     max_sessions: usize,
     timeout: Duration,
     /// Optional channel to notify when sessions are implicitly removed (expiry).
@@ -60,6 +61,7 @@ impl StatefulSessionStore {
     pub fn new(timeout_secs: u64, max_sessions: usize) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
+            admission_lock: std::sync::Mutex::new(()),
             max_sessions,
             timeout: Duration::from_secs(timeout_secs),
             expiry_tx: None,
@@ -80,18 +82,43 @@ impl StatefulSessionStore {
         }
     }
 
+    fn prune_expired_sessions(&self) {
+        let expired_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.last_activity.elapsed() > self.timeout)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for session_id in expired_ids {
+            if self.sessions.remove(&session_id).is_some() {
+                self.notify_expired(&session_id);
+            }
+        }
+    }
+
+    fn enqueue_pending(entry: &mut SessionState, message: SseMessage) {
+        const PENDING_LIMIT: usize = 32;
+        if entry.pending_notifications.len() >= PENDING_LIMIT {
+            entry.pending_notifications.pop_front();
+        }
+        entry.pending_notifications.push_back(message);
+    }
+
     fn try_send_to_session(&self, session_id: &str, message: &SseMessage) {
         let mut remove_session = false;
         let mut clear_sender = false;
+        let mut queue_message = false;
+        let mut delivered = false;
 
         if let Some(entry) = self.sessions.get(session_id) {
             if entry.last_activity.elapsed() > self.timeout {
                 remove_session = true;
             } else if let Some(sender) = entry.sse_sender.as_ref() {
                 match sender.try_send(message.clone()) {
-                    Ok(()) => {}
+                    Ok(()) => delivered = true,
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         clear_sender = true;
+                        queue_message = true;
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         tracing::warn!(
@@ -99,6 +126,7 @@ impl StatefulSessionStore {
                             "dropping slow SSE client from targeted notification delivery"
                         );
                         clear_sender = true;
+                        queue_message = true;
                     }
                 }
             }
@@ -115,14 +143,15 @@ impl StatefulSessionStore {
         if clear_sender {
             if let Some(mut entry) = self.sessions.get_mut(session_id) {
                 entry.sse_sender = None;
+                if queue_message {
+                    Self::enqueue_pending(&mut entry, message.clone());
+                }
             }
         } else if let Some(mut entry) = self.sessions.get_mut(session_id) {
-            if entry.sse_sender.is_none() {
-                const PENDING_LIMIT: usize = 32;
-                if entry.pending_notifications.len() >= PENDING_LIMIT {
-                    entry.pending_notifications.pop_front();
-                }
-                entry.pending_notifications.push_back(message.clone());
+            if delivered {
+                entry.last_activity = Instant::now();
+            } else if entry.sse_sender.is_none() {
+                Self::enqueue_pending(&mut entry, message.clone());
             }
         }
     }
@@ -130,6 +159,8 @@ impl StatefulSessionStore {
 
 impl SessionStore for StatefulSessionStore {
     fn create_session(&self) -> Result<String, HttpError> {
+        let _guard = self.admission_lock.lock().expect("session admission mutex poisoned");
+        self.prune_expired_sessions();
         if self.sessions.len() >= self.max_sessions {
             return Err(HttpError::TooManySessions);
         }
@@ -178,12 +209,15 @@ impl SessionStore for StatefulSessionStore {
             .get_mut(session_id)
             .ok_or(HttpError::SessionNotFound)?;
         entry.sse_sender = Some(sender);
+        entry.last_activity = Instant::now();
         while let Some(message) = entry.pending_notifications.pop_front() {
             if let Some(active_sender) = entry.sse_sender.as_ref() {
                 match active_sender.try_send(message) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-                    | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Ok(()) => entry.last_activity = Instant::now(),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(message))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
+                        Self::enqueue_pending(&mut entry, message);
+                        entry.sse_sender = None;
                         break;
                     }
                 }
@@ -333,6 +367,14 @@ mod tests {
         assert!(store.create_session().is_err());
     }
 
+    #[tokio::test]
+    async fn create_session_prunes_expired_sessions_before_enforcing_cap() {
+        let store = StatefulSessionStore::new(0, 1);
+        store.create_session().unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(store.create_session().is_ok());
+    }
+
     #[test]
     fn session_count() {
         let store = StatefulSessionStore::new(1800, 100);
@@ -423,5 +465,27 @@ mod tests {
             .expect("fast receiver should not be blocked")
             .expect("fast receiver message present");
         assert_eq!(received["type"], "broadcast");
+    }
+
+    #[tokio::test]
+    async fn targeted_message_is_requeued_when_sender_is_full() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        let (tx, _rx) = mpsc::channel(1);
+        store.set_sse_sender(&id, tx.clone()).unwrap();
+        tx.try_send(serde_json::json!({"type": "already-buffered"}))
+            .unwrap();
+
+        store.send_to_session(&id, serde_json::json!({"type": "requeued"}));
+
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        store.set_sse_sender(&id, new_tx).unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
+            .await
+            .expect("requeued message should be delivered")
+            .expect("requeued message present");
+        assert_eq!(received["type"], "requeued");
     }
 }

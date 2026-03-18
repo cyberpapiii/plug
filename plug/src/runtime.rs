@@ -248,6 +248,7 @@ fn build_configured_http_runtime(
                 tool_router.forward_roots_list_changed_to_upstreams().await;
             }
             tool_router.remove_client_log_level(&session_id);
+            tool_router.unregister_downstream_bridge(&target);
         }
     });
 
@@ -585,6 +586,11 @@ pub(crate) fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> any
     if let Some(path) = config_path {
         cmd.arg("--config").arg(path);
     }
+    for (key, value) in
+        plug_core::dotenv::read_dotenv_vars_for_config(config_path.map(|path| path.as_path()))
+    {
+        cmd.env(key, value);
+    }
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -620,6 +626,10 @@ pub(crate) async fn ensure_daemon_with_feedback(
         return Ok(true);
     }
     Ok(false)
+}
+
+pub(crate) async fn daemon_running() -> bool {
+    daemon::connect_to_daemon().await.is_some()
 }
 
 pub(crate) async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {

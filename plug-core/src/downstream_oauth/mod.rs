@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -191,13 +192,15 @@ impl DownstreamOauthManager {
         let mut guard = self.state.lock().await;
         let pending = guard
             .pending_codes
-            .remove(code)
+            .get(code)
+            .cloned()
             .ok_or(DownstreamOauthError::InvalidGrant)?;
 
         if pending.client_id != client_id || pending.redirect_uri != redirect_uri {
             return Err(DownstreamOauthError::InvalidGrant);
         }
         if pending.expires_at < epoch_secs() {
+            guard.pending_codes.remove(code);
             return Err(DownstreamOauthError::TokenExpired);
         }
 
@@ -206,6 +209,7 @@ impl DownstreamOauthManager {
         if computed.as_str() != pending.code_challenge {
             return Err(DownstreamOauthError::PkceVerificationFailed);
         }
+        guard.pending_codes.remove(code);
 
         let access_token = uuid::Uuid::new_v4().to_string();
         let refresh_token = uuid::Uuid::new_v4().to_string();
@@ -381,11 +385,15 @@ fn scope_string(scopes: &[String]) -> Option<String> {
 
 fn state_file_path(config: &DownstreamOauthConfig) -> Result<PathBuf, String> {
     let client = config.oauth_client_id.as_deref().unwrap_or("default");
+    let instance = format!("{}|{client}", config.public_base_url);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    instance.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
     let safe = crate::config::sanitize_server_name_for_path(client)
         .map_err(|e| format!("invalid downstream oauth client id for file path: {e}"))?;
     Ok(crate::config::config_dir()
         .join("downstream_oauth")
-        .join(format!("{safe}.json")))
+        .join(format!("{safe}-{hash}.json")))
 }
 
 fn load_persisted_state(config: &DownstreamOauthConfig) -> Result<DownstreamOauthState, String> {
@@ -558,5 +566,65 @@ mod tests {
         assert!(!reloaded.access_tokens.contains_key("expired-access"));
 
         cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn invalid_pkce_does_not_consume_authorization_code() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        let redirect = manager
+            .build_authorize_redirect(
+                &client_id,
+                "https://client.example.com/callback",
+                "abc123",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await
+            .expect("authorize redirect");
+        let code = redirect
+            .split("code=")
+            .nth(1)
+            .and_then(|v| v.split('&').next())
+            .expect("auth code");
+
+        let first = manager
+            .exchange_authorization_code(
+                &client_id,
+                Some("secret-123"),
+                code,
+                "https://client.example.com/callback",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await;
+        assert!(matches!(first, Err(DownstreamOauthError::PkceVerificationFailed)));
+
+        let second = manager
+            .exchange_authorization_code(
+                &client_id,
+                Some("secret-123"),
+                code,
+                "https://client.example.com/callback",
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            )
+            .await;
+        assert!(second.is_ok(), "authorization code should remain retryable");
+
+        cleanup_state(&client_id);
+    }
+
+    #[test]
+    fn persistence_is_scoped_by_public_base_url() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        let config_a = test_config(&client_id);
+        let mut config_b = test_config(&client_id);
+        config_b.public_base_url = "https://other.example.com".to_string();
+
+        let path_a = state_file_path(&config_a).expect("state path a");
+        let path_b = state_file_path(&config_b).expect("state path b");
+        assert_ne!(path_a, path_b);
     }
 }

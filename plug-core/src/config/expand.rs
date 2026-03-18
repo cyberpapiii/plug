@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::env;
 
-/// Expand `$VAR_NAME` references in a string value.
-///
-/// Only expands variables matching the allowlist pattern `$[A-Z_][A-Z0-9_]*`
-/// to prevent shell injection via `$(...)` or `${...}` patterns.
-///
-/// Unknown variables are left as-is (not expanded).
-pub fn expand_env_vars(input: &str) -> String {
+fn expand_env_vars_from_map(input: &str, env_map: Option<&HashMap<String, String>>) -> String {
+    let lookup = |var_name: &str| -> Option<String> {
+        env_map
+            .and_then(|vars| vars.get(var_name).cloned())
+            .or_else(|| env::var(var_name).ok())
+    };
+
     let mut result = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -27,10 +28,9 @@ pub fn expand_env_vars(input: &str) -> String {
                 }
                 let var_name = &input[start..end];
                 if !var_name.is_empty() {
-                    match env::var(var_name) {
-                        Ok(val) => result.push_str(&val),
-                        Err(_) => {
-                            // Leave unexpanded
+                    match lookup(var_name) {
+                        Some(val) => result.push_str(&val),
+                        None => {
                             result.push('$');
                             result.push_str(var_name);
                         }
@@ -46,6 +46,22 @@ pub fn expand_env_vars(input: &str) -> String {
     }
 
     result
+}
+
+/// Expand `$VAR_NAME` references in a string value.
+///
+/// Only expands variables matching the allowlist pattern `$[A-Z_][A-Z0-9_]*`
+/// to prevent shell injection via `$(...)` or `${...}` patterns.
+///
+/// Unknown variables are left as-is (not expanded).
+pub fn expand_env_vars(input: &str) -> String {
+    expand_env_vars_from_map(input, None)
+}
+
+/// Expand variables using a resolved config environment first, then fall back
+/// to the process environment.
+pub fn expand_env_vars_with_source(input: &str, env_map: &HashMap<String, String>) -> String {
+    expand_env_vars_from_map(input, Some(env_map))
 }
 
 /// Extract `$VAR_NAME` references from a string without expanding them.
