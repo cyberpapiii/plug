@@ -1606,6 +1606,7 @@ async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
     for (name, sc) in &oauth_servers {
         let store = oauth::get_or_create_store(name);
         let has_creds = store.load().await.ok().flatten().is_some();
+        let warnings = store.backing_store_warnings();
 
         let health = status_map
             .get(name.as_str())
@@ -1635,6 +1636,7 @@ async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
             health,
             scopes: sc.oauth_scopes.clone(),
             token_expires_in_secs,
+            warnings,
         });
     }
 
@@ -2366,6 +2368,7 @@ mod tests {
             plug_core::types::ServerHealth::AuthRequired
         );
         assert!(servers[0].token_expires_in_secs.is_none());
+        assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);
@@ -2392,6 +2395,7 @@ mod tests {
         assert!(servers[0].authenticated);
         assert_eq!(servers[0].health, plug_core::types::ServerHealth::Degraded);
         assert!(servers[0].token_expires_in_secs.is_some());
+        assert_eq!(servers[0].warnings, store.backing_store_warnings());
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);
@@ -2422,6 +2426,7 @@ mod tests {
             servers[0].health,
             plug_core::types::ServerHealth::AuthRequired
         );
+        assert_eq!(servers[0].warnings, store.backing_store_warnings());
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);

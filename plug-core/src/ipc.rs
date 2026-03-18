@@ -251,6 +251,7 @@ pub struct IpcAuthServerInfo {
     pub health: ServerHealth,
     pub scopes: Option<Vec<String>>,
     pub token_expires_in_secs: Option<u64>,
+    pub warnings: Vec<String>,
 }
 
 /// Responses sent from daemon → CLI over Unix socket.
@@ -572,6 +573,7 @@ mod tests {
                     health: ServerHealth::Healthy,
                     scopes: Some(vec!["read".to_string()]),
                     token_expires_in_secs: Some(3600),
+                    warnings: vec![],
                 }],
             },
             IpcResponse::AuthStateChanged {

@@ -476,6 +476,39 @@ impl CompositeCredentialStore {
         self.update_cache(creds);
     }
 
+    /// Return human-readable warnings about backing-store drift between the
+    /// mirrored token file and the keyring entry for this server.
+    pub fn backing_store_warnings(&self) -> Vec<String> {
+        let file = self.file_load();
+        let keyring = self.keyring_load();
+        let mut warnings = Vec::new();
+
+        match (file.as_ref(), keyring.as_ref()) {
+            (Some(_), None) => warnings.push(
+                "token file mirror exists but keyring entry is missing".to_string(),
+            ),
+            (None, Some(_)) => warnings.push(
+                "keyring entry exists but token file mirror is missing".to_string(),
+            ),
+            (Some(file), Some(keyring)) => {
+                let file_received = file.token_received_at.unwrap_or(0);
+                let keyring_received = keyring.token_received_at.unwrap_or(0);
+                let file_token = Self::token_identity(file);
+                let keyring_token = Self::token_identity(keyring);
+
+                if file_received != keyring_received || file_token != keyring_token {
+                    warnings.push(
+                        "keyring entry and token file mirror disagree; using freshest persisted credentials"
+                            .to_string(),
+                    );
+                }
+            }
+            (None, None) => {}
+        }
+
+        warnings
+    }
+
     /// Return the best currently-known credentials for this server.
     ///
     /// When cached credentials exist, prefer a newer mirrored token-file entry
@@ -1218,5 +1251,24 @@ mod tests {
             Some("keyring-access")
         );
         assert_eq!(chosen.1, CredentialSource::Keyring);
+    }
+
+    #[tokio::test]
+    async fn backing_store_warnings_report_missing_keyring_entry_when_file_exists() {
+        let name = format!("oauth-warn-file-only-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let creds = make_test_token("file-only-access", Some("file-only-refresh"), Some(3600));
+        store.file_save(&creds).unwrap();
+        store.keyring_clear();
+
+        let warnings = store.backing_store_warnings();
+        assert_eq!(
+            warnings,
+            vec!["token file mirror exists but keyring entry is missing".to_string()]
+        );
+
+        store.clear().await.unwrap();
     }
 }

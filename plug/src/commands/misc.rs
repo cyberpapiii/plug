@@ -860,6 +860,7 @@ mod tests {
                 health: ServerHealth::AuthRequired,
                 scopes: None,
                 token_expires_in_secs: None,
+                warnings: vec![],
             },
             IpcAuthServerInfo {
                 name: "supabase".to_string(),
@@ -868,6 +869,7 @@ mod tests {
                 health: ServerHealth::AuthRequired,
                 scopes: None,
                 token_expires_in_secs: Some(120),
+                warnings: vec![],
             },
             IpcAuthServerInfo {
                 name: "figma".to_string(),
@@ -876,6 +878,7 @@ mod tests {
                 health: ServerHealth::Degraded,
                 scopes: None,
                 token_expires_in_secs: Some(300),
+                warnings: vec![],
             },
         ]);
 

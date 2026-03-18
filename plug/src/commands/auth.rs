@@ -625,6 +625,13 @@ async fn cmd_auth_status(
                     }
                 }
 
+                let warnings = live
+                    .map(|s| s.warnings.clone())
+                    .unwrap_or_else(|| store.backing_store_warnings());
+                for warning in warnings {
+                    ui::print_warning_line(format!("{name}: {warning}"));
+                }
+
                 let hint = auth_recovery_hint(name, has_creds, health);
                 if !hint.is_empty() {
                     println!("    {hint}");
@@ -651,6 +658,7 @@ async fn cmd_auth_status(
                     "health": health.map(|value| format!("{value:?}")),
                     "scopes": live.and_then(|s| s.scopes.clone()).or_else(|| sc.oauth_scopes.clone()),
                     "token_expires_in_secs": live.and_then(|s| s.token_expires_in_secs),
+                    "warnings": live.map(|s| s.warnings.clone()).unwrap_or_else(|| store.backing_store_warnings()),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
                     "status_source": if live.is_some() {
                         "live_daemon"
@@ -882,12 +890,17 @@ mod tests {
         let servers = vec![serde_json::json!({
             "name": "notion",
             "status_source": "live_daemon",
+            "warnings": ["token file mirror exists but keyring entry is missing"],
         })];
         let json = auth_status_json(servers, true);
         assert_eq!(json["runtime_available"], true);
         assert_eq!(json["status_source"], "live_daemon");
         assert_eq!(json["status_scope"], "live_daemon");
         assert_eq!(json["servers"][0]["name"], "notion");
+        assert_eq!(
+            json["servers"][0]["warnings"][0],
+            "token file mirror exists but keyring entry is missing"
+        );
     }
 
     /// Simulates a browser redirect delivering code and state to the callback
