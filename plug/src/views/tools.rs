@@ -52,9 +52,9 @@ pub(crate) async fn cmd_tool_list(
         Some(started) => started,
         None => false,
     };
-    let daemon_available = daemon_running().await;
 
     loop {
+        let daemon_available = daemon_running().await;
         let config = load_editable_config(config_path).ok().map(|(_, config)| config);
         let configured_server_count = config.as_ref().map(|config| config.servers.len()).unwrap_or(0);
         let runtime_servers = if daemon_available {

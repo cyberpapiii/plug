@@ -494,49 +494,99 @@ fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String>
     env_map
 }
 
-fn expand_config_env_refs(config: &mut Config, env_map: &HashMap<String, String>) {
-    use expand::expand_env_vars_with_source;
-
+fn transform_env_expandable_strings(
+    config: &mut Config,
+    mut transform: impl FnMut(String) -> String,
+) {
     if let Some(ref mut public_base_url) = config.http.public_base_url {
-        *public_base_url = expand_env_vars_with_source(public_base_url, env_map);
+        *public_base_url = transform(public_base_url.clone());
     }
     if let Some(ref mut client_id) = config.http.oauth_client_id {
-        *client_id = expand_env_vars_with_source(client_id, env_map);
+        *client_id = transform(client_id.clone());
     }
     if let Some(ref mut secret) = config.http.oauth_client_secret {
-        *secret = expand_env_vars_with_source(secret.as_str(), env_map).into();
+        *secret = transform(secret.as_str().to_string()).into();
     }
     if let Some(ref mut scopes) = config.http.oauth_scopes {
         for scope in scopes.iter_mut() {
-            *scope = expand_env_vars_with_source(scope, env_map);
+            *scope = transform(scope.clone());
         }
     }
 
     for server in config.servers.values_mut() {
         if let Some(ref mut cmd) = server.command {
-            *cmd = expand_env_vars_with_source(cmd, env_map);
+            *cmd = transform(cmd.clone());
         }
         for arg in &mut server.args {
-            *arg = expand_env_vars_with_source(arg, env_map);
+            *arg = transform(arg.clone());
         }
         for val in server.env.values_mut() {
-            *val = expand_env_vars_with_source(val, env_map);
+            *val = transform(val.clone());
         }
         if let Some(ref mut url) = server.url {
-            *url = expand_env_vars_with_source(url, env_map);
+            *url = transform(url.clone());
         }
         if let Some(ref mut token) = server.auth_token {
-            *token = expand_env_vars_with_source(token.as_str(), env_map).into();
+            *token = transform(token.as_str().to_string()).into();
         }
         if let Some(ref mut client_id) = server.oauth_client_id {
-            *client_id = expand_env_vars_with_source(client_id, env_map);
+            *client_id = transform(client_id.clone());
         }
         if let Some(ref mut scopes) = server.oauth_scopes {
             for scope in scopes.iter_mut() {
-                *scope = expand_env_vars_with_source(scope, env_map);
+                *scope = transform(scope.clone());
             }
         }
     }
+}
+
+fn visit_env_expandable_strings(config: &Config, mut visit: impl FnMut(&str)) {
+    if let Some(ref public_base_url) = config.http.public_base_url {
+        visit(public_base_url);
+    }
+    if let Some(ref client_id) = config.http.oauth_client_id {
+        visit(client_id);
+    }
+    if let Some(ref secret) = config.http.oauth_client_secret {
+        visit(secret.as_str());
+    }
+    if let Some(ref scopes) = config.http.oauth_scopes {
+        for scope in scopes {
+            visit(scope);
+        }
+    }
+
+    for server in config.servers.values() {
+        if let Some(ref cmd) = server.command {
+            visit(cmd);
+        }
+        for arg in &server.args {
+            visit(arg);
+        }
+        for val in server.env.values() {
+            visit(val);
+        }
+        if let Some(ref url) = server.url {
+            visit(url);
+        }
+        if let Some(ref token) = server.auth_token {
+            visit(token.as_str());
+        }
+        if let Some(ref client_id) = server.oauth_client_id {
+            visit(client_id);
+        }
+        if let Some(ref scopes) = server.oauth_scopes {
+            for scope in scopes {
+                visit(scope);
+            }
+        }
+    }
+}
+
+fn expand_config_env_refs(config: &mut Config, env_map: &HashMap<String, String>) {
+    use expand::expand_env_vars_with_source;
+
+    transform_env_expandable_strings(config, |value| expand_env_vars_with_source(&value, env_map));
 }
 
 /// Returns the plug config directory (e.g. `~/.config/plug/`).
@@ -567,45 +617,7 @@ pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figm
         .extract()?;
 
     let mut vars = Vec::new();
-    if let Some(ref public_base_url) = config.http.public_base_url {
-        vars.extend(expand::extract_env_refs(public_base_url));
-    }
-    if let Some(ref client_id) = config.http.oauth_client_id {
-        vars.extend(expand::extract_env_refs(client_id));
-    }
-    if let Some(ref secret) = config.http.oauth_client_secret {
-        vars.extend(expand::extract_env_refs(secret.as_str()));
-    }
-    if let Some(ref scopes) = config.http.oauth_scopes {
-        for scope in scopes {
-            vars.extend(expand::extract_env_refs(scope));
-        }
-    }
-    for server in config.servers.values() {
-        if let Some(ref cmd) = server.command {
-            vars.extend(expand::extract_env_refs(cmd));
-        }
-        for arg in &server.args {
-            vars.extend(expand::extract_env_refs(arg));
-        }
-        for val in server.env.values() {
-            vars.extend(expand::extract_env_refs(val));
-        }
-        if let Some(ref url) = server.url {
-            vars.extend(expand::extract_env_refs(url));
-        }
-        if let Some(ref token) = server.auth_token {
-            vars.extend(expand::extract_env_refs(token.as_str()));
-        }
-        if let Some(ref client_id) = server.oauth_client_id {
-            vars.extend(expand::extract_env_refs(client_id));
-        }
-        if let Some(ref scopes) = server.oauth_scopes {
-            for scope in scopes {
-                vars.extend(expand::extract_env_refs(scope));
-            }
-        }
-    }
+    visit_env_expandable_strings(&config, |value| vars.extend(expand::extract_env_refs(value)));
     vars.sort();
     vars.dedup();
     Ok(vars)

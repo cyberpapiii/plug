@@ -88,11 +88,10 @@ pub(crate) async fn cmd_server_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let daemon_error: Option<String> = None;
     let mut started = false;
-    let daemon_available = daemon_running().await;
 
     loop {
+        let daemon_available = daemon_running().await;
         if daemon_available
             && let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) =
             crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
@@ -143,12 +142,6 @@ pub(crate) async fn cmd_server_list(
                             ),
                         );
                         if started {
-                            println!();
-                        }
-                        if let Some(error) = &daemon_error {
-                            print_info_line(format!(
-                                "Live runtime inspection is unavailable: {error}. Showing configured server inventory only."
-                            ));
                             println!();
                         }
                         print_heading("Summary");
@@ -248,12 +241,6 @@ pub(crate) async fn cmd_server_list(
                     "Servers",
                     &format!("{} server(s) configured (daemon not running)", names.len()),
                 );
-                if let Some(error) = &daemon_error {
-                    println!();
-                    print_info_line(format!(
-                        "Live runtime inspection is unavailable: {error}. Showing configured servers only."
-                    ));
-                }
                 print_heading("Inventory");
                 println!(
                     "  {:<18} {:<8} {:<6} {:<40} {}",

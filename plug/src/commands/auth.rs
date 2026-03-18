@@ -893,6 +893,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auth_status_json_empty_case_keeps_stable_envelope() {
+        let json = auth_status_json(Vec::new(), false);
+        assert_eq!(json["runtime_available"], false);
+        assert_eq!(json["status_source"], "stored_credentials_only");
+        assert_eq!(json["status_scope"], "stored_credentials_only");
+        assert!(json["servers"].as_array().is_some());
+        assert_eq!(json["servers"].as_array().unwrap().len(), 0);
+    }
+
     /// Simulates a browser redirect delivering code and state to the callback
     /// listener. Proves the happy path extracts both parameters correctly.
     #[tokio::test]
