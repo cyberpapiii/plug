@@ -107,6 +107,9 @@ fn status_json(
     inventory: &crate::runtime::LiveInventoryMetadata,
     servers: &[plug_core::types::ServerStatus],
     live_client_support: LiveClientSupport,
+    runtime_available: bool,
+    status_source: &str,
+    daemon_running: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "uptime": uptime_secs,
@@ -115,6 +118,9 @@ fn status_json(
         "live_session_count": inventory.session_count,
         "live_session_transports": inventory.session_transports,
         "servers": servers,
+        "runtime_available": runtime_available,
+        "status_source": status_source,
+        "daemon_running": daemon_running,
         "live_client_support": live_client_support,
         "live_client_scope": inventory.scope,
         "inventory_partial": inventory.availability.partial,
@@ -565,6 +571,9 @@ pub(crate) async fn cmd_status(
                 &inventory,
                 &servers,
                 live_client_support,
+                true,
+                "live_daemon",
+                daemon_running,
             );
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
@@ -604,9 +613,15 @@ pub(crate) async fn cmd_status(
             "Service is not currently reachable",
         );
         println!();
-        print_warning_line(
-            "Live runtime, auth, and session truth are unavailable right now. The server list below reflects config only.",
-        );
+        if daemon_running {
+            print_warning_line(
+                "The daemon socket is reachable, but runtime inspection failed. Live runtime, auth, and session truth are unavailable right now.",
+            );
+        } else {
+            print_warning_line(
+                "Live runtime, auth, and session truth are unavailable right now. The server list below reflects config only.",
+            );
+        }
         println!();
         print_heading("Configured servers");
         println!(
@@ -649,14 +664,17 @@ pub(crate) async fn cmd_status(
     } else {
         let servers = config
             .servers
-            .keys()
-            .cloned()
-            .map(|server_id| plug_core::types::ServerStatus {
-                server_id,
-                health: plug_core::types::ServerHealth::Failed,
-                tool_count: 0,
-                auth_status: "none".to_string(),
-                last_seen: None,
+            .iter()
+            .map(|(server_id, server)| {
+                serde_json::json!({
+                    "server_id": server_id,
+                    "health": serde_json::Value::Null,
+                    "tool_count": 0,
+                    "auth_status": serde_json::Value::Null,
+                    "configured": true,
+                    "enabled": server.enabled,
+                    "status_source": "config_only",
+                })
             })
             .collect::<Vec<_>>();
         println!(
@@ -664,8 +682,10 @@ pub(crate) async fn cmd_status(
             serde_json::to_string_pretty(&serde_json::json!({
                 "uptime": 0,
                 "clients": 0,
+                "runtime_available": false,
+                "status_source": if daemon_running { "ipc_unavailable" } else { "config_only" },
                 "servers": servers,
-                "daemon_running": false
+                "daemon_running": daemon_running
             }))?
         );
     }
@@ -748,6 +768,9 @@ mod tests {
             &inventory,
             &servers,
             crate::runtime::LiveClientSupport::Supported,
+            true,
+            "live_daemon",
+            true,
         );
 
         assert_eq!(json["clients"], 3);
@@ -757,6 +780,8 @@ mod tests {
         assert_eq!(json["live_client_scope"], "http_only");
         assert_eq!(json["inventory_partial"], true);
         assert_eq!(json["inventory_unavailable_sources"][0], "daemon_proxy");
+        assert_eq!(json["runtime_available"], true);
+        assert_eq!(json["status_source"], "live_daemon");
     }
 
     #[test]

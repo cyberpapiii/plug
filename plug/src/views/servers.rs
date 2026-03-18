@@ -91,11 +91,16 @@ pub(crate) async fn cmd_server_list(
     let mut started = false;
 
     loop {
-        let daemon_available = daemon_running().await;
-        if daemon_available
-            && let Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) =
-            crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
-        {
+        let daemon_reachable = daemon_running().await;
+        let live_status = if daemon_reachable {
+            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
+                Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) => Some(servers),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(servers) = live_status {
             match output {
                 OutputFormat::Json => {
                     println!(
@@ -239,7 +244,15 @@ pub(crate) async fn cmd_server_list(
                 print_banner(
                     "◆",
                     "Servers",
-                    &format!("{} server(s) configured (daemon not running)", names.len()),
+                    &format!(
+                        "{} server(s) configured ({})",
+                        names.len(),
+                        if daemon_reachable {
+                            "runtime inspection failed"
+                        } else {
+                            "daemon not running"
+                        }
+                    ),
                 );
                 print_heading("Inventory");
                 println!(
@@ -278,13 +291,14 @@ pub(crate) async fn cmd_server_list(
                 }
             } else {
                 println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "runtime_available": false,
-                        "status_source": "config_only",
-                        "servers": config.servers,
-                    }))?
-                );
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "runtime_available": false,
+                            "status_source": if daemon_reachable { "ipc_unavailable" } else { "config_only" },
+                            "daemon_running": daemon_reachable,
+                            "servers": config.servers,
+                        }))?
+                    );
                 return Ok(());
             }
         }

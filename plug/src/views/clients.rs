@@ -131,14 +131,14 @@ pub(crate) async fn cmd_client_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut daemon_error = None;
     let mut started = false;
-    let daemon_available = daemon_running().await;
-    if !daemon_available {
-        daemon_error = Some("daemon not running".to_string());
-    }
 
     loop {
+        let daemon_error = if daemon_running().await {
+            None
+        } else {
+            Some("daemon not running".to_string())
+        };
         let (live, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live, live_inventory_scope);

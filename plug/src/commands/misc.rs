@@ -210,12 +210,40 @@ pub(crate) async fn cmd_doctor(
 
 async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
     let mut checks = Vec::new();
+    let daemon_reachable = crate::runtime::daemon_running().await;
+    let status_response = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await;
+    let auth_response = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await;
+
+    if daemon_reachable
+        && !matches!(status_response, Ok(plug_core::ipc::IpcResponse::Status { .. }))
+    {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "runtime_availability".to_string(),
+            status: plug_core::doctor::CheckStatus::Warn,
+            message: "Daemon socket is reachable, but runtime status inspection failed".to_string(),
+            fix_suggestion: Some(
+                "Run `plug status` and inspect daemon logs to diagnose IPC/runtime availability problems.".to_string(),
+            ),
+        });
+    }
+    if daemon_reachable
+        && !matches!(auth_response, Ok(plug_core::ipc::IpcResponse::AuthStatus { .. }))
+    {
+        checks.push(plug_core::doctor::CheckResult {
+            name: "auth_availability".to_string(),
+            status: plug_core::doctor::CheckStatus::Warn,
+            message: "Daemon socket is reachable, but auth status inspection failed".to_string(),
+            fix_suggestion: Some(
+                "Run `plug auth status` and inspect daemon logs to diagnose auth/runtime availability problems.".to_string(),
+            ),
+        });
+    }
 
     if let Ok(plug_core::ipc::IpcResponse::Status {
         servers,
         clients,
         uptime_secs,
-    }) = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await
+    }) = status_response
     {
         let mut healthy = 0usize;
         let mut degraded = 0usize;
@@ -287,9 +315,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         }
     }
 
-    if let Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) =
-        crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await
-    {
+    if let Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) = auth_response {
         checks.extend(runtime_auth_checks(&servers));
     }
 

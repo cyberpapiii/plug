@@ -16,20 +16,25 @@ type ToolInventoryGroup = Vec<(String, String, Option<String>, Option<String>)>;
 enum ToolInventoryEmptyState {
     NoConfiguredServers,
     RuntimeUnavailable,
+    RuntimeInspectionFailed,
     AllServersUnavailable,
     EmptyMergedSet,
 }
 
 fn classify_empty_tool_inventory(
-    daemon_available: bool,
+    runtime_available: bool,
+    daemon_reachable: bool,
     configured_server_count: usize,
     runtime_servers: &[plug_core::types::ServerStatus],
 ) -> ToolInventoryEmptyState {
     if configured_server_count == 0 {
         return ToolInventoryEmptyState::NoConfiguredServers;
     }
-    if !daemon_available {
+    if !daemon_reachable {
         return ToolInventoryEmptyState::RuntimeUnavailable;
+    }
+    if !runtime_available {
+        return ToolInventoryEmptyState::RuntimeInspectionFailed;
     }
     if !runtime_servers.is_empty()
         && runtime_servers
@@ -54,32 +59,39 @@ pub(crate) async fn cmd_tool_list(
     };
 
     loop {
-        let daemon_available = daemon_running().await;
+        let daemon_reachable = daemon_running().await;
         let config = load_editable_config(config_path).ok().map(|(_, config)| config);
         let configured_server_count = config.as_ref().map(|config| config.servers.len()).unwrap_or(0);
-        let runtime_servers = if daemon_available {
+        let runtime_status = if daemon_reachable {
             match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await {
-                Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) => servers
-                    .into_iter()
-                    .filter(|server| server.server_id != "__plug_internal__")
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
+                Ok(plug_core::ipc::IpcResponse::Status { servers, .. }) => Some(
+                    servers
+                        .into_iter()
+                        .filter(|server| server.server_id != "__plug_internal__")
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
             }
         } else {
-            Vec::new()
+            None
         };
-        let mut all_tools: Vec<plug_core::ipc::IpcToolInfo> = Vec::new();
-        if daemon_available
-            && let Ok(plug_core::ipc::IpcResponse::Tools { tools }) =
-            crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await
-        {
-            for t in tools {
-                if t.server_id == "__plug_internal__" {
-                    continue;
-                }
-                all_tools.push(t);
+        let runtime_available = runtime_status.is_some();
+        let runtime_servers = runtime_status.unwrap_or_default();
+        let (all_tools, list_tools_available): (Vec<plug_core::ipc::IpcToolInfo>, bool) = if runtime_available {
+            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await {
+                Ok(plug_core::ipc::IpcResponse::Tools { tools }) => (
+                    tools
+                        .into_iter()
+                        .filter(|tool| tool.server_id != "__plug_internal__")
+                        .collect(),
+                    true,
+                ),
+                _ => (Vec::new(), false),
             }
-        }
+        } else {
+            (Vec::new(), false)
+        };
+        let inventory_available = runtime_available && list_tools_available;
 
         let mut tools_by_prefix: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
         for t in &all_tools {
@@ -119,10 +131,16 @@ pub(crate) async fn cmd_tool_list(
                     })
                     .collect();
                 println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "runtime_available": daemon_available,
-                        "status_source": if daemon_available { "live_daemon" } else { "runtime_unavailable" },
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                        "runtime_available": inventory_available,
+                        "status_source": if inventory_available {
+                            "live_daemon"
+                        } else if daemon_reachable {
+                            "ipc_unavailable"
+                        } else {
+                            "runtime_unavailable"
+                        },
                         "tool_count": all_tools.len(),
                         "server_count": unique_servers.len(),
                         "groups": json_groups,
@@ -133,7 +151,8 @@ pub(crate) async fn cmd_tool_list(
             OutputFormat::Text => {
                 if tools_by_prefix.is_empty() {
                     match classify_empty_tool_inventory(
-                        daemon_available,
+                        inventory_available,
+                        daemon_reachable,
                         configured_server_count,
                         &runtime_servers,
                     ) {
@@ -149,6 +168,13 @@ pub(crate) async fn cmd_tool_list(
                                 "Runtime is unavailable. Start the shared service with {} or inspect config with {}.",
                                 style("plug start").cyan(),
                                 style("plug servers").cyan()
+                            );
+                        }
+                        ToolInventoryEmptyState::RuntimeInspectionFailed => {
+                            println!(
+                                "Runtime inspection failed even though the daemon is reachable. Use {} or {} to diagnose the IPC/runtime failure.",
+                                style("plug doctor").cyan(),
+                                style("plug status").cyan()
                             );
                         }
                         ToolInventoryEmptyState::AllServersUnavailable => {
@@ -257,15 +283,16 @@ mod tests {
     #[test]
     fn classify_empty_tool_inventory_distinguishes_major_empty_states() {
         assert_eq!(
-            classify_empty_tool_inventory(false, 0, &[]),
+            classify_empty_tool_inventory(false, false, 0, &[]),
             ToolInventoryEmptyState::NoConfiguredServers
         );
         assert_eq!(
-            classify_empty_tool_inventory(false, 2, &[]),
+            classify_empty_tool_inventory(false, false, 2, &[]),
             ToolInventoryEmptyState::RuntimeUnavailable
         );
         assert_eq!(
             classify_empty_tool_inventory(
+                true,
                 true,
                 2,
                 &[
@@ -278,10 +305,15 @@ mod tests {
         assert_eq!(
             classify_empty_tool_inventory(
                 true,
+                true,
                 1,
                 &[server_status("a", plug_core::types::ServerHealth::Healthy)],
             ),
             ToolInventoryEmptyState::EmptyMergedSet
+        );
+        assert_eq!(
+            classify_empty_tool_inventory(false, true, 1, &[]),
+            ToolInventoryEmptyState::RuntimeInspectionFailed
         );
     }
 }

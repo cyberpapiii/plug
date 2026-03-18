@@ -494,10 +494,24 @@ fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String>
     env_map
 }
 
+fn transform_path_buf(path: &mut PathBuf, mut transform: impl FnMut(String) -> String) {
+    *path = PathBuf::from(transform(path.to_string_lossy().into_owned()));
+}
+
 fn transform_env_expandable_strings(
     config: &mut Config,
     mut transform: impl FnMut(String) -> String,
 ) {
+    config.log_level = transform(config.log_level.clone());
+    config.prefix_delimiter = transform(config.prefix_delimiter.clone());
+    for tool in &mut config.priority_tools {
+        *tool = transform(tool.clone());
+    }
+    for tool in &mut config.disabled_tools {
+        *tool = transform(tool.clone());
+    }
+
+    config.http.bind_address = transform(config.http.bind_address.clone());
     if let Some(ref mut public_base_url) = config.http.public_base_url {
         *public_base_url = transform(public_base_url.clone());
     }
@@ -511,6 +525,15 @@ fn transform_env_expandable_strings(
         for scope in scopes.iter_mut() {
             *scope = transform(scope.clone());
         }
+    }
+    for origin in &mut config.http.allowed_origins {
+        *origin = transform(origin.clone());
+    }
+    if let Some(ref mut cert_path) = config.http.tls_cert_path {
+        transform_path_buf(cert_path, &mut transform);
+    }
+    if let Some(ref mut key_path) = config.http.tls_key_path {
+        transform_path_buf(key_path, &mut transform);
     }
 
     for server in config.servers.values_mut() {
@@ -529,6 +552,9 @@ fn transform_env_expandable_strings(
         if let Some(ref mut token) = server.auth_token {
             *token = transform(token.as_str().to_string()).into();
         }
+        if let Some(ref mut auth) = server.auth {
+            *auth = transform(auth.clone());
+        }
         if let Some(ref mut client_id) = server.oauth_client_id {
             *client_id = transform(client_id.clone());
         }
@@ -537,50 +563,110 @@ fn transform_env_expandable_strings(
                 *scope = transform(scope.clone());
             }
         }
-    }
-}
-
-fn visit_env_expandable_strings(config: &Config, mut visit: impl FnMut(&str)) {
-    if let Some(ref public_base_url) = config.http.public_base_url {
-        visit(public_base_url);
-    }
-    if let Some(ref client_id) = config.http.oauth_client_id {
-        visit(client_id);
-    }
-    if let Some(ref secret) = config.http.oauth_client_secret {
-        visit(secret.as_str());
-    }
-    if let Some(ref scopes) = config.http.oauth_scopes {
-        for scope in scopes {
-            visit(scope);
+        if !server.tool_renames.is_empty() {
+            let remapped = server
+                .tool_renames
+                .drain()
+                .map(|(key, value)| (transform(key), transform(value)))
+                .collect();
+            server.tool_renames = remapped;
         }
-    }
-
-    for server in config.servers.values() {
-        if let Some(ref cmd) = server.command {
-            visit(cmd);
-        }
-        for arg in &server.args {
-            visit(arg);
-        }
-        for val in server.env.values() {
-            visit(val);
-        }
-        if let Some(ref url) = server.url {
-            visit(url);
-        }
-        if let Some(ref token) = server.auth_token {
-            visit(token.as_str());
-        }
-        if let Some(ref client_id) = server.oauth_client_id {
-            visit(client_id);
-        }
-        if let Some(ref scopes) = server.oauth_scopes {
-            for scope in scopes {
-                visit(scope);
+        for group in &mut server.tool_groups {
+            group.prefix = transform(group.prefix.clone());
+            for item in &mut group.contains {
+                *item = transform(item.clone());
+            }
+            for item in &mut group.strip {
+                *item = transform(item.clone());
             }
         }
     }
+}
+
+pub(crate) fn visit_env_expandable_fields(
+    config: &Config,
+    mut visit: impl FnMut(Option<&str>, &str, &str),
+) {
+    visit(None, "log_level", &config.log_level);
+    visit(None, "prefix_delimiter", &config.prefix_delimiter);
+    for tool in &config.priority_tools {
+        visit(None, "priority_tools", tool);
+    }
+    for tool in &config.disabled_tools {
+        visit(None, "disabled_tools", tool);
+    }
+
+    visit(None, "http.bind_address", &config.http.bind_address);
+    for origin in &config.http.allowed_origins {
+        visit(None, "http.allowed_origins", origin);
+    }
+    if let Some(ref cert_path) = config.http.tls_cert_path {
+        visit(None, "http.tls_cert_path", cert_path.to_string_lossy().as_ref());
+    }
+    if let Some(ref key_path) = config.http.tls_key_path {
+        visit(None, "http.tls_key_path", key_path.to_string_lossy().as_ref());
+    }
+    if let Some(ref public_base_url) = config.http.public_base_url {
+        visit(None, "http.public_base_url", public_base_url);
+    }
+    if let Some(ref client_id) = config.http.oauth_client_id {
+        visit(None, "http.oauth_client_id", client_id);
+    }
+    if let Some(ref secret) = config.http.oauth_client_secret {
+        visit(None, "http.oauth_client_secret", secret.as_str());
+    }
+    if let Some(ref scopes) = config.http.oauth_scopes {
+        for scope in scopes {
+            visit(None, "http.oauth_scopes", scope);
+        }
+    }
+
+    for (server_name, server) in &config.servers {
+        if let Some(ref cmd) = server.command {
+            visit(Some(server_name), "command", cmd);
+        }
+        for arg in &server.args {
+            visit(Some(server_name), "args", arg);
+        }
+        for (key, val) in &server.env {
+            let field = format!("env.{key}");
+            visit(Some(server_name), &field, val);
+        }
+        if let Some(ref url) = server.url {
+            visit(Some(server_name), "url", url);
+        }
+        if let Some(ref token) = server.auth_token {
+            visit(Some(server_name), "auth_token", token.as_str());
+        }
+        if let Some(ref auth) = server.auth {
+            visit(Some(server_name), "auth", auth);
+        }
+        if let Some(ref client_id) = server.oauth_client_id {
+            visit(Some(server_name), "oauth_client_id", client_id);
+        }
+        if let Some(ref scopes) = server.oauth_scopes {
+            for scope in scopes {
+                visit(Some(server_name), "oauth_scopes", scope);
+            }
+        }
+        for (key, value) in &server.tool_renames {
+            visit(Some(server_name), "tool_renames.key", key);
+            visit(Some(server_name), "tool_renames.value", value);
+        }
+        for group in &server.tool_groups {
+            visit(Some(server_name), "tool_groups.prefix", &group.prefix);
+            for item in &group.contains {
+                visit(Some(server_name), "tool_groups.contains", item);
+            }
+            for item in &group.strip {
+                visit(Some(server_name), "tool_groups.strip", item);
+            }
+        }
+    }
+}
+
+pub(crate) fn visit_env_expandable_strings(config: &Config, mut visit: impl FnMut(&str)) {
+    visit_env_expandable_fields(config, |_, _, value| visit(value));
 }
 
 fn expand_config_env_refs(config: &mut Config, env_map: &HashMap<String, String>) {

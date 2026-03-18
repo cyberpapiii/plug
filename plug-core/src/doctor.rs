@@ -282,49 +282,23 @@ async fn check_env_vars(config: &Config) -> CheckResult {
     let mut core_missing: Vec<String> = Vec::new();
     let mut third_party_missing: Vec<String> = Vec::new();
 
-    for (server_name, server) in &config.servers {
-        let mut server_missing: Vec<String> = Vec::new();
-
-        // Check env values for $VAR references
-        for (key, val) in &server.env {
-            for var in extract_env_refs(val) {
-                if std::env::var(&var).is_err() {
-                    server_missing.push(format!("{server_name}.env.{key} references ${var}"));
-                }
+    crate::config::visit_env_expandable_fields(config, |server_name, field, value| {
+        for var in extract_env_refs(value) {
+            if std::env::var(&var).is_ok() {
+                continue;
+            }
+            let message = if let Some(server_name) = server_name {
+                format!("{server_name}.{field} references ${var}")
+            } else {
+                format!("config.{field} references ${var}")
+            };
+            if server_name.is_some_and(|server_name| !server_name.starts_with("plug")) {
+                third_party_missing.push(message);
+            } else {
+                core_missing.push(message);
             }
         }
-        // Check command
-        if let Some(ref cmd) = server.command {
-            for var in extract_env_refs(cmd) {
-                if std::env::var(&var).is_err() {
-                    server_missing.push(format!("{server_name}.command references ${var}"));
-                }
-            }
-        }
-        // Check args
-        for arg in &server.args {
-            for var in extract_env_refs(arg) {
-                if std::env::var(&var).is_err() {
-                    server_missing.push(format!("{server_name}.args references ${var}"));
-                }
-            }
-        }
-        // Check url
-        if let Some(ref url) = server.url {
-            for var in extract_env_refs(url) {
-                if std::env::var(&var).is_err() {
-                    server_missing.push(format!("{server_name}.url references ${var}"));
-                }
-            }
-        }
-
-        // Core plug servers fail; third-party servers only warn
-        if server_name.starts_with("plug") {
-            core_missing.extend(server_missing);
-        } else {
-            third_party_missing.extend(server_missing);
-        }
-    }
+    });
 
     if core_missing.is_empty() && third_party_missing.is_empty() {
         CheckResult {
