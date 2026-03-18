@@ -121,6 +121,7 @@ pub struct Engine {
     restart_timestamps: dashmap::DashMap<String, Instant>,
     health_task_generations: dashmap::DashMap<String, u64>,
     refresh_task_generations: dashmap::DashMap<String, u64>,
+    recovery_task_flags: dashmap::DashMap<String, Arc<AtomicBool>>,
 }
 
 impl Engine {
@@ -147,6 +148,7 @@ impl Engine {
             restart_timestamps: dashmap::DashMap::new(),
             health_task_generations: dashmap::DashMap::new(),
             refresh_task_generations: dashmap::DashMap::new(),
+            recovery_task_flags: dashmap::DashMap::new(),
         }
     }
 
@@ -320,6 +322,22 @@ impl Engine {
 
     pub(crate) fn clear_refresh_task_generation(&self, server_name: &str) {
         self.refresh_task_generations.remove(server_name);
+    }
+
+    pub(crate) fn try_claim_recovery_task(&self, server_name: &str) -> Option<Arc<AtomicBool>> {
+        let flag = self
+            .recovery_task_flags
+            .entry(server_name.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        if flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(flag)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn spawn_background_tasks_for_server(
@@ -1068,6 +1086,25 @@ mod tests {
         assert_eq!(broken.tool_count, 0);
 
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn recovery_task_claim_is_deduplicated_until_released() {
+        let engine = Engine::new(Config::default());
+
+        let first = engine
+            .try_claim_recovery_task("github")
+            .expect("first claim should succeed");
+        assert!(
+            engine.try_claim_recovery_task("github").is_none(),
+            "second claim should be suppressed while recovery is active"
+        );
+
+        first.store(false, Ordering::SeqCst);
+        assert!(
+            engine.try_claim_recovery_task("github").is_some(),
+            "claim should succeed again after the active recovery releases"
+        );
     }
 
     /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain

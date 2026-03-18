@@ -118,19 +118,14 @@ pub fn spawn_health_check(
                         .is_some_and(|entry| entry.health == ServerHealth::Failed);
 
                     if missing_upstream && startup_failed {
-                        let engine = engine.clone();
-                        let name = name.clone();
-                        let cancel = cancel.clone();
-                        tracker_clone.spawn(async move {
-                            spawn_proactive_recovery(&engine, &name, cancel).await;
-                        });
+                        spawn_proactive_recovery_once(&engine, &name, cancel.clone(), &tracker_clone);
                         continue;
                     }
 
                     let result = health_check_server(&server_manager, &name).await;
                     if let Some((old, new)) = result {
                         tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
-                        router.refresh_tools().await;
+                        router.schedule_tool_list_changed_refresh();
                         let _ = event_tx.send(EngineEvent::ServerHealthChanged {
                             server_id: Arc::from(name.as_str()),
                             old,
@@ -138,17 +133,37 @@ pub fn spawn_health_check(
                         });
 
                         if new == ServerHealth::Failed {
-                            let engine = engine.clone();
-                            let name = name.clone();
-                            let cancel = cancel.clone();
-                            tracker_clone.spawn(async move {
-                                spawn_proactive_recovery(&engine, &name, cancel).await;
-                            });
+                            spawn_proactive_recovery_once(&engine, &name, cancel.clone(), &tracker_clone);
                         }
                     }
                 }
             }
         }
+    });
+}
+
+fn spawn_proactive_recovery_once(
+    engine: &Arc<Engine>,
+    server_name: &str,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+) {
+    let Some(flag) = engine.try_claim_recovery_task(server_name) else {
+        tracing::debug!(server = %server_name, "proactive recovery task already active");
+        return;
+    };
+
+    let engine = Arc::clone(engine);
+    let server_name = server_name.to_string();
+    tracker.spawn(async move {
+        struct RecoveryGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for RecoveryGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = RecoveryGuard(flag);
+        spawn_proactive_recovery(&engine, &server_name, cancel).await;
     });
 }
 

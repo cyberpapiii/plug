@@ -6,9 +6,14 @@
 //! - File watcher (`watcher.rs`, 500ms debounce via `notify`)
 
 use std::collections::HashSet;
+use std::future::Future;
+
+use futures::stream::{self, StreamExt};
 
 use crate::config::{Config, ServerConfig};
 use crate::engine::EngineEvent;
+
+const RELOAD_START_CONCURRENCY: usize = 4;
 
 /// Diff result between old and new configs.
 #[derive(Debug, Clone)]
@@ -25,6 +30,42 @@ pub struct ConfigDiff {
     pub settings_changed: bool,
     /// Settings that require a restart to apply.
     pub restart_required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadStartKind {
+    Start,
+    Restart,
+}
+
+#[derive(Debug, Clone)]
+struct ReloadStartAction {
+    name: String,
+    config: ServerConfig,
+    kind: ReloadStartKind,
+}
+
+async fn run_reload_start_actions<F, Fut>(
+    actions: Vec<ReloadStartAction>,
+    concurrency_limit: usize,
+    run: F,
+) -> Vec<(ReloadStartAction, Result<(), String>)>
+where
+    F: Fn(ReloadStartAction) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send,
+{
+    stream::iter(actions)
+        .map(move |action| {
+            let run = run.clone();
+            async move {
+                let action_for_result = action.clone();
+                let result = run(action).await;
+                (action_for_result, result)
+            }
+        })
+        .buffer_unordered(concurrency_limit.max(1))
+        .collect()
+        .await
 }
 
 /// Compare two configs and return the diff.
@@ -196,38 +237,74 @@ pub async fn apply_reload(
         engine.clear_refresh_task_generation(name);
     }
 
-    // 2. Restart changed servers
-    for (name, new_cfg) in &diff.changed {
+    // 2. Stop changed servers before their replacement startup batch begins.
+    for (name, _new_cfg) in &diff.changed {
         tracing::info!(server = %name, "restarting changed server");
         server_manager.stop_server(name).await;
-        if let Err(e) = server_manager.start_and_register(name, new_cfg).await {
-            if new_cfg.auth.as_deref() == Some("oauth") {
-                server_manager.mark_auth_required(name);
-            } else {
-                server_manager.mark_start_failure(name);
-            }
-            let msg = format!("failed to restart server {name}: {e}");
-            tracing::error!("{msg}");
-            report.errors.push(msg);
-        } else if new_cfg.enabled {
-            spawn_after_swap.push((name.clone(), new_cfg.clone()));
-        }
     }
 
-    // 3. Start added servers
-    for (name, cfg) in &diff.added {
-        tracing::info!(server = %name, "starting new server");
-        if let Err(e) = server_manager.start_and_register(name, cfg).await {
-            if cfg.auth.as_deref() == Some("oauth") {
-                server_manager.mark_auth_required(name);
-            } else {
-                server_manager.mark_start_failure(name);
+    let mut start_actions = Vec::new();
+    start_actions.extend(diff.changed.iter().map(|(name, cfg)| ReloadStartAction {
+        name: name.clone(),
+        config: cfg.clone(),
+        kind: ReloadStartKind::Restart,
+    }));
+    start_actions.extend(diff.added.iter().map(|(name, cfg)| ReloadStartAction {
+        name: name.clone(),
+        config: cfg.clone(),
+        kind: ReloadStartKind::Start,
+    }));
+
+    let start_results = run_reload_start_actions(
+        start_actions,
+        RELOAD_START_CONCURRENCY,
+        {
+            let server_manager = server_manager.clone();
+            move |action| {
+                let server_manager = server_manager.clone();
+                async move {
+                    match action.kind {
+                        ReloadStartKind::Restart => {
+                            tracing::info!(server = %action.name, "starting replacement for changed server");
+                        }
+                        ReloadStartKind::Start => {
+                            tracing::info!(server = %action.name, "starting new server");
+                        }
+                    }
+
+                    server_manager
+                        .start_and_register(&action.name, &action.config)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             }
-            let msg = format!("failed to start server {name}: {e}");
-            tracing::error!("{msg}");
-            report.errors.push(msg);
-        } else if cfg.enabled {
-            spawn_after_swap.push((name.clone(), cfg.clone()));
+        },
+    )
+    .await;
+
+    // 3. Record startup outcomes after the batch completes so config swap and
+    // downstream refresh happen once for the whole reload.
+    for (action, result) in start_results {
+        match result {
+            Ok(()) => {
+                if action.config.enabled {
+                    spawn_after_swap.push((action.name.clone(), action.config.clone()));
+                }
+            }
+            Err(error) => {
+                if action.config.auth.as_deref() == Some("oauth") {
+                    server_manager.mark_auth_required(&action.name);
+                } else {
+                    server_manager.mark_start_failure(&action.name);
+                }
+                let verb = match action.kind {
+                    ReloadStartKind::Restart => "restart",
+                    ReloadStartKind::Start => "start",
+                };
+                let msg = format!("failed to {verb} server {}: {error}", action.name);
+                tracing::error!("{msg}");
+                report.errors.push(msg);
+            }
         }
     }
 
@@ -272,6 +349,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, ServerConfig, TransportType};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn make_server(command: &str) -> ServerConfig {
         ServerConfig {
@@ -449,5 +529,50 @@ mod tests {
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].0, "github");
+    }
+
+    #[tokio::test]
+    async fn run_reload_start_actions_is_bounded_and_concurrent() {
+        let actions = vec![
+            ReloadStartAction {
+                name: "one".into(),
+                config: make_server("one"),
+                kind: ReloadStartKind::Start,
+            },
+            ReloadStartAction {
+                name: "two".into(),
+                config: make_server("two"),
+                kind: ReloadStartKind::Start,
+            },
+            ReloadStartAction {
+                name: "three".into(),
+                config: make_server("three"),
+                kind: ReloadStartKind::Restart,
+            },
+        ];
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let results = run_reload_start_actions(actions, 2, {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move |_action| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert!(results.into_iter().all(|(_, result)| result.is_ok()));
     }
 }
