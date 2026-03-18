@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -122,6 +123,7 @@ pub struct Engine {
     health_task_generations: dashmap::DashMap<String, u64>,
     refresh_task_generations: dashmap::DashMap<String, u64>,
     recovery_task_flags: dashmap::DashMap<String, Arc<AtomicBool>>,
+    reload_lock: Mutex<()>,
 }
 
 impl Engine {
@@ -149,6 +151,7 @@ impl Engine {
             health_task_generations: dashmap::DashMap::new(),
             refresh_task_generations: dashmap::DashMap::new(),
             recovery_task_flags: dashmap::DashMap::new(),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -550,6 +553,7 @@ impl Engine {
         self: &Arc<Self>,
         new_config: Config,
     ) -> Result<crate::reload::ReloadReport, anyhow::Error> {
+        let _guard = self.reload_lock.lock().await;
         crate::reload::apply_reload(self, new_config).await
     }
 }

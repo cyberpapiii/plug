@@ -8,7 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::http::error::HttpError;
 
-use super::{DownstreamSessionSnapshot, DownstreamTransport, SessionStore, SseMessage};
+use super::{
+    DownstreamSessionSnapshot, DownstreamTransport, SessionSendOutcome, SessionStore, SseMessage,
+};
 
 /// Current in-memory stateful downstream session store.
 pub struct StatefulSessionStore {
@@ -104,7 +106,32 @@ impl StatefulSessionStore {
         entry.pending_notifications.push_back(message);
     }
 
-    fn try_send_to_session(&self, session_id: &str, message: &SseMessage) {
+    fn with_live_session_mut<T>(
+        &self,
+        session_id: &str,
+        mut f: impl FnMut(&mut SessionState) -> T,
+    ) -> Result<T, HttpError> {
+        let mut entry = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
+
+        if entry.last_activity.elapsed() > self.timeout {
+            drop(entry);
+            self.sessions.remove(session_id);
+            self.notify_expired(session_id);
+            return Err(HttpError::SessionNotFound);
+        }
+
+        Ok(f(&mut entry))
+    }
+
+    fn try_send_to_session(
+        &self,
+        session_id: &str,
+        message: &SseMessage,
+        queue_if_unavailable: bool,
+    ) -> SessionSendOutcome {
         let mut remove_session = false;
         let mut clear_sender = false;
         let mut queue_message = false;
@@ -118,7 +145,7 @@ impl StatefulSessionStore {
                     Ok(()) => delivered = true,
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         clear_sender = true;
-                        queue_message = true;
+                        queue_message = queue_if_unavailable;
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         tracing::warn!(
@@ -126,18 +153,18 @@ impl StatefulSessionStore {
                             "dropping slow SSE client from targeted notification delivery"
                         );
                         clear_sender = true;
-                        queue_message = true;
+                        queue_message = queue_if_unavailable;
                     }
                 }
             }
         } else {
-            return;
+            return SessionSendOutcome::SessionNotFound;
         }
 
         if remove_session {
             self.sessions.remove(session_id);
             self.notify_expired(session_id);
-            return;
+            return SessionSendOutcome::SessionNotFound;
         }
 
         if clear_sender {
@@ -153,6 +180,14 @@ impl StatefulSessionStore {
             } else if entry.sse_sender.is_none() {
                 Self::enqueue_pending(&mut entry, message.clone());
             }
+        }
+
+        if delivered {
+            SessionSendOutcome::Delivered
+        } else if queue_message {
+            SessionSendOutcome::Queued
+        } else {
+            SessionSendOutcome::SessionNotFound
         }
     }
 }
@@ -183,53 +218,19 @@ impl SessionStore for StatefulSessionStore {
     }
 
     fn validate(&self, session_id: &str) -> Result<(), HttpError> {
-        let mut entry = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
-
-        if entry.last_activity.elapsed() > self.timeout {
-            drop(entry);
-            self.sessions.remove(session_id);
-            self.notify_expired(session_id);
-            return Err(HttpError::SessionNotFound);
-        }
-
-        entry.last_activity = Instant::now();
-        Ok(())
+        self.with_live_session_mut(session_id, |entry| {
+            entry.last_activity = Instant::now();
+        })
     }
 
     fn touch(&self, session_id: &str) -> Result<(), HttpError> {
-        let mut entry = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
-
-        if entry.last_activity.elapsed() > self.timeout {
-            drop(entry);
-            self.sessions.remove(session_id);
-            self.notify_expired(session_id);
-            return Err(HttpError::SessionNotFound);
-        }
-
-        entry.last_activity = Instant::now();
-        Ok(())
+        self.with_live_session_mut(session_id, |entry| {
+            entry.last_activity = Instant::now();
+        })
     }
 
     fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
-
-        if entry.last_activity.elapsed() > self.timeout {
-            drop(entry);
-            self.sessions.remove(session_id);
-            self.notify_expired(session_id);
-            return Err(HttpError::SessionNotFound);
-        }
-
-        Ok(entry.sse_sender.is_some())
+        self.with_live_session_mut(session_id, |entry| entry.sse_sender.is_some())
     }
 
     fn set_sse_sender(
@@ -343,7 +344,11 @@ impl SessionStore for StatefulSessionStore {
     }
 
     fn send_to_session(&self, session_id: &str, message: SseMessage) {
-        self.try_send_to_session(session_id, &message);
+        let _ = self.try_send_to_session(session_id, &message, true);
+    }
+
+    fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome {
+        self.try_send_to_session(session_id, &message, false)
     }
 
     fn spawn_cleanup_task(&self, cancel: CancellationToken) {

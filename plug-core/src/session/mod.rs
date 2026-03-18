@@ -37,6 +37,13 @@ impl SseMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSendOutcome {
+    Delivered,
+    Queued,
+    SessionNotFound,
+}
+
 /// Transport type for a downstream client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownstreamTransport {
@@ -90,6 +97,7 @@ pub trait SessionStore: Send + Sync {
     fn remove(&self, session_id: &str) -> bool;
     fn broadcast(&self, message: SseMessage);
     fn send_to_session(&self, session_id: &str, message: SseMessage);
+    fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome;
     fn spawn_cleanup_task(&self, cancel: CancellationToken);
     fn session_count(&self) -> usize;
 

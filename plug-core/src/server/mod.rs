@@ -256,6 +256,7 @@ pub struct UpstreamServer {
 /// are infrequent and use compare-and-swap.
 pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
+    server_map_write_lock: std::sync::Mutex<()>,
     pub(crate) health: DashMap<String, HealthState>,
     pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
     pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
@@ -269,6 +270,7 @@ impl ServerManager {
     pub fn new() -> Self {
         Self {
             servers: ArcSwap::from_pointee(HashMap::new()),
+            server_map_write_lock: std::sync::Mutex::new(()),
             health: DashMap::new(),
             circuit_breakers: DashMap::new(),
             semaphores: DashMap::new(),
@@ -289,6 +291,30 @@ impl ServerManager {
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
             .unwrap_or_default()
+    }
+
+    fn insert_upstream(&self, name: String, upstream: Arc<UpstreamServer>) -> Option<Arc<UpstreamServer>> {
+        let _guard = self
+            .server_map_write_lock
+            .lock()
+            .expect("server map write mutex poisoned");
+        let mut new_map = HashMap::clone(&self.servers.load());
+        let previous = new_map.insert(name, upstream);
+        self.servers.store(Arc::new(new_map));
+        previous
+    }
+
+    fn remove_upstream(&self, name: &str) -> Option<Arc<UpstreamServer>> {
+        let _guard = self
+            .server_map_write_lock
+            .lock()
+            .expect("server map write mutex poisoned");
+        let mut new_map = HashMap::clone(&self.servers.load());
+        let removed = new_map.remove(name);
+        if removed.is_some() {
+            self.servers.store(Arc::new(new_map));
+        }
+        removed
     }
 
     /// Start all enabled servers from config, batched by `config.startup_concurrency`.
@@ -354,9 +380,7 @@ impl ServerManager {
                         // Clone current map, insert new server, swap
                         let max_concurrent = upstream.config.max_concurrent;
                         let cb_enabled = upstream.config.circuit_breaker_enabled;
-                        let mut new_map = HashMap::clone(&self.servers.load());
-                        new_map.insert(name.clone(), Arc::new(upstream));
-                        self.servers.store(Arc::new(new_map));
+                        self.insert_upstream(name.clone(), Arc::new(upstream));
 
                         // Initialize resilience state for this server
                         self.health.insert(name.clone(), HealthState::new());
@@ -1005,9 +1029,7 @@ impl ServerManager {
         let upstream = self.start_server(name, config).await?;
         let max_concurrent = upstream.config.max_concurrent;
         let cb_enabled = upstream.config.circuit_breaker_enabled;
-        let mut new_map = HashMap::clone(&self.servers.load());
-        new_map.insert(name.to_string(), Arc::new(upstream));
-        self.servers.store(Arc::new(new_map));
+        self.insert_upstream(name.to_string(), Arc::new(upstream));
 
         self.health.insert(name.to_string(), HealthState::new());
         self.semaphores.insert(
@@ -1025,9 +1047,7 @@ impl ServerManager {
 
     /// Stop and remove a single upstream server.
     pub async fn stop_server(&self, name: &str) {
-        let mut new_map = HashMap::clone(&self.servers.load());
-        if let Some(upstream_arc) = new_map.remove(name) {
-            self.servers.store(Arc::new(new_map));
+        if let Some(upstream_arc) = self.remove_upstream(name) {
             self.health.remove(name);
             self.circuit_breakers.remove(name);
             self.semaphores.remove(name);
@@ -1038,9 +1058,7 @@ impl ServerManager {
     /// Replace an upstream server (used after reconnection).
     /// Updates the servers map and resets circuit breaker and health state.
     pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
-        let mut new_map = HashMap::clone(&self.servers.load());
-        let old_upstream = new_map.insert(name.to_string(), Arc::new(upstream));
-        self.servers.store(Arc::new(new_map));
+        let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
 
         // Reset circuit breaker on successful reconnection
         if let Some(cb) = self.circuit_breakers.get(name) {
@@ -1405,6 +1423,45 @@ mod tests {
         }
     }
 
+    async fn make_connected_test_upstream(name: &str) -> UpstreamServer {
+        let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
+        let upstream_peer = Arc::clone(&upstream_server.peer);
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = MutableToolServerHandler {
+                tools_rx,
+                peer: upstream_peer,
+            };
+            let server = handler
+                .serve(server_transport)
+                .await
+                .expect("start upstream test server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from(name.to_string()),
+            tools: Arc::clone(&tools),
+            router: std::sync::Weak::new(),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect upstream test client");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        tools.store(Arc::new(initial_tools));
+
+        UpstreamServer {
+            name: name.to_string(),
+            config: test_server_config(),
+            client,
+            tools,
+            capabilities: ServerCapabilities::default(),
+            health: ServerHealth::Healthy,
+        }
+    }
+
     struct ProgressClient {
         progress_signal: Arc<Notify>,
         progress: Arc<Mutex<Vec<ProgressNotificationParam>>>,
@@ -1559,6 +1616,31 @@ mod tests {
         let health = mgr.health.get("test").unwrap();
         assert_eq!(health.health, ServerHealth::Healthy);
         assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_insert_upstream_preserves_all_servers() {
+        let mgr = Arc::new(ServerManager::new());
+        let upstream_a = make_connected_test_upstream("alpha").await;
+        let upstream_b = make_connected_test_upstream("beta").await;
+
+        let mgr_a = Arc::clone(&mgr);
+        let mgr_b = Arc::clone(&mgr);
+
+        let task_a = tokio::spawn(async move {
+            mgr_a.insert_upstream("alpha".to_string(), Arc::new(upstream_a));
+        });
+        let task_b = tokio::spawn(async move {
+            mgr_b.insert_upstream("beta".to_string(), Arc::new(upstream_b));
+        });
+
+        task_a.await.expect("alpha insert task");
+        task_b.await.expect("beta insert task");
+
+        let servers = mgr.servers.load();
+        assert!(servers.contains_key("alpha"));
+        assert!(servers.contains_key("beta"));
+        assert_eq!(servers.len(), 2);
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
-use crate::session::{SessionStore, SseMessage};
+use crate::session::{SessionSendOutcome, SessionStore, SseMessage};
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -646,7 +646,18 @@ async fn send_http_client_request(
     state
         .pending_client_requests
         .insert((session_id.to_string(), id), tx);
-    state.sessions.send_to_session(session_id, message);
+    match state.sessions.send_to_live_session(session_id, message) {
+        SessionSendOutcome::Delivered => {}
+        SessionSendOutcome::Queued | SessionSendOutcome::SessionNotFound => {
+            state
+                .pending_client_requests
+                .remove(&(session_id.to_string(), id));
+            return Err(McpError::internal_error(
+                "HTTP client SSE stream could not accept reverse request delivery".to_string(),
+                None,
+            ));
+        }
+    }
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, rx).await {
             Ok(Ok(result)) => Ok(result),

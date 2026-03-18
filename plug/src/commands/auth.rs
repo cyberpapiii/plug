@@ -482,6 +482,14 @@ async fn cmd_auth_inject(
         .await
         .map_err(|e| anyhow::anyhow!("failed to save injected credentials: {e}"))?;
 
+    match refresh_live_daemon_server(server_name).await {
+        Ok(true) => ui::print_info_line("Refreshed live daemon server state"),
+        Ok(false) => {}
+        Err(err) => ui::print_warning_line(format!(
+            "Stored credentials but failed to refresh the live daemon state: {err}"
+        )),
+    }
+
     ui::print_success_line(format!("Injected credentials for server '{server_name}'"));
 
     if refresh_token.is_some() {
@@ -564,11 +572,19 @@ async fn cmd_auth_status(
 
             for (name, sc) in &oauth_servers {
                 let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
-                let store = oauth::get_or_create_store(name);
-                let snapshot = store.credential_snapshot();
+                let snapshot = if live.is_none() {
+                    Some(oauth::get_or_create_store(name).credential_snapshot())
+                } else {
+                    None
+                };
                 let has_creds = live
                     .map(|live| live.authenticated)
-                    .unwrap_or(snapshot.credentials.is_some());
+                    .unwrap_or_else(|| {
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.credentials.as_ref())
+                            .is_some()
+                    });
 
                 let health = live.map(|s| s.health);
 
@@ -610,7 +626,10 @@ async fn cmd_auth_status(
 
                 if let Some(remaining) = live.and_then(|s| s.token_expires_in_secs) {
                     println!("    Token expires in: {remaining}s");
-                } else if let Some(remaining) = snapshot.token_expires_in_secs {
+                } else if let Some(remaining) = snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.token_expires_in_secs)
+                {
                     println!("    Token expires in: {remaining}s");
                 } else if has_creds {
                     println!("    Token: expired (refresh pending)");
@@ -618,7 +637,12 @@ async fn cmd_auth_status(
 
                 let warnings = live
                     .map(|s| s.warnings.clone())
-                    .unwrap_or(snapshot.warnings);
+                    .unwrap_or_else(|| {
+                        snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.warnings.clone())
+                            .unwrap_or_default()
+                    });
                 for warning in warnings {
                     ui::print_warning_line(format!("{name}: {warning}"));
                 }
@@ -634,11 +658,19 @@ async fn cmd_auth_status(
             let mut servers = Vec::new();
             for (name, sc) in &oauth_servers {
                 let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
-                let store = oauth::get_or_create_store(name);
-                let snapshot = store.credential_snapshot();
+                let snapshot = if live.is_none() {
+                    Some(oauth::get_or_create_store(name).credential_snapshot())
+                } else {
+                    None
+                };
                 let has_creds = live
                     .map(|live| live.authenticated)
-                    .unwrap_or(snapshot.credentials.is_some());
+                    .unwrap_or_else(|| {
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.credentials.as_ref())
+                            .is_some()
+                    });
                 let health = live.map(|s| s.health);
 
                 servers.push(serde_json::json!({
@@ -647,8 +679,12 @@ async fn cmd_auth_status(
                     "authenticated": has_creds,
                     "health": health.map(|value| format!("{value:?}")),
                     "scopes": live.and_then(|s| s.scopes.clone()).or_else(|| sc.oauth_scopes.clone()),
-                    "token_expires_in_secs": live.and_then(|s| s.token_expires_in_secs).or(snapshot.token_expires_in_secs),
-                    "warnings": live.map(|s| s.warnings.clone()).unwrap_or(snapshot.warnings),
+                    "token_expires_in_secs": live
+                        .and_then(|s| s.token_expires_in_secs)
+                        .or_else(|| snapshot.as_ref().and_then(|snapshot| snapshot.token_expires_in_secs)),
+                    "warnings": live
+                        .map(|s| s.warnings.clone())
+                        .unwrap_or_else(|| snapshot.as_ref().map(|snapshot| snapshot.warnings.clone()).unwrap_or_default()),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
                     "status_source": if live.is_some() {
                         "live_daemon"

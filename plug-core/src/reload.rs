@@ -13,8 +13,6 @@ use futures::stream::{self, StreamExt};
 use crate::config::{Config, ServerConfig};
 use crate::engine::EngineEvent;
 
-const RELOAD_START_CONCURRENCY: usize = 4;
-
 /// Diff result between old and new configs.
 #[derive(Debug, Clone)]
 pub struct ConfigDiff {
@@ -257,7 +255,7 @@ pub async fn apply_reload(
 
     let start_results = run_reload_start_actions(
         start_actions,
-        RELOAD_START_CONCURRENCY,
+        new_config.startup_concurrency,
         {
             let server_manager = server_manager.clone();
             move |action| {
