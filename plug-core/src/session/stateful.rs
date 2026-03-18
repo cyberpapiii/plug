@@ -216,6 +216,22 @@ impl SessionStore for StatefulSessionStore {
         Ok(())
     }
 
+    fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
+
+        if entry.last_activity.elapsed() > self.timeout {
+            drop(entry);
+            self.sessions.remove(session_id);
+            self.notify_expired(session_id);
+            return Err(HttpError::SessionNotFound);
+        }
+
+        Ok(entry.sse_sender.is_some())
+    }
+
     fn set_sse_sender(
         &self,
         session_id: &str,
@@ -367,6 +383,16 @@ mod tests {
         let store = StatefulSessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         assert!(store.touch(&id).is_ok());
+    }
+
+    #[test]
+    fn live_sse_sender_reports_presence() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+        assert!(!store.has_live_sse_sender(&id).unwrap());
+        let (tx, _rx) = mpsc::channel(1);
+        store.set_sse_sender(&id, tx).unwrap();
+        assert!(store.has_live_sse_sender(&id).unwrap());
     }
 
     #[test]

@@ -581,17 +581,43 @@ async fn send_http_client_request(
     request: ServerRequest,
     timeout: Option<Duration>,
 ) -> Result<ClientResult, McpError> {
+    let has_live_sse_sender = state.sessions.has_live_sse_sender(session_id).map_err(|_| {
+        McpError::internal_error(
+            "HTTP client has no live SSE stream for reverse requests".to_string(),
+            None,
+        )
+    })?;
+    if !has_live_sse_sender {
+        return Err(McpError::internal_error(
+            "HTTP client has no live SSE stream for reverse requests".to_string(),
+            None,
+        ));
+    }
+
     let id = state.reverse_request_counter.fetch_add(1, Ordering::SeqCst) as i64;
     let request_id = RequestId::from(NumberOrString::Number(id));
+    let message = ServerJsonRpcMessage::request(request, request_id);
+    let message = serde_json::to_value(message)
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+    let has_live_sse_sender = state.sessions.has_live_sse_sender(session_id).map_err(|_| {
+        McpError::internal_error(
+            "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
+            None,
+        )
+    })?;
+    if !has_live_sse_sender {
+        return Err(McpError::internal_error(
+            "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
+            None,
+        ));
+    }
+
     let (tx, rx) = oneshot::channel();
     state
         .pending_client_requests
         .insert((session_id.to_string(), id), tx);
-    let message = ServerJsonRpcMessage::request(request, request_id);
-    state.sessions.send_to_session(
-        session_id,
-        serde_json::to_value(message).map_err(|e| McpError::internal_error(e.to_string(), None))?,
-    );
+    state.sessions.send_to_session(session_id, message);
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, rx).await {
             Ok(Ok(result)) => Ok(result),
@@ -1975,6 +2001,76 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reverse_request_fails_fast_without_live_sse_sender() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+
+        let result = send_http_client_request(
+            &state,
+            &session_id,
+            ServerRequest::ListRootsRequest(ListRootsRequest {
+                method: Default::default(),
+                extensions: Default::default(),
+            }),
+            Some(Duration::from_millis(50)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(state.pending_client_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reverse_request_succeeds_with_live_sse_sender() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        state.sessions.set_sse_sender(&session_id, tx).unwrap();
+
+        let state_for_response = Arc::clone(&state);
+        let session_id_for_response = session_id.clone();
+        tokio::spawn(async move {
+            let message = rx.recv().await.expect("reverse request message");
+            let message: ServerJsonRpcMessage =
+                serde_json::from_value(message).expect("deserialize reverse request");
+            let request_id = match message {
+                ServerJsonRpcMessage::Request(request) => request.id,
+                other => panic!("unexpected reverse request payload: {other:?}"),
+            };
+
+            handle_client_response(
+                JsonRpcResponse {
+                    jsonrpc: Default::default(),
+                    id: request_id,
+                    result: ClientResult::ListRootsResult(ListRootsResult::default()),
+                },
+                &session_id_for_response,
+                &state_for_response,
+            )
+            .await
+            .expect("post reverse request response");
+        });
+
+        let result = send_http_client_request(
+            &state,
+            &session_id,
+            ServerRequest::ListRootsRequest(ListRootsRequest {
+                method: Default::default(),
+                extensions: Default::default(),
+            }),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect("reverse request should succeed");
+
+        match result {
+            ClientResult::ListRootsResult(_) => {}
+            other => panic!("unexpected reverse request result: {other:?}"),
+        }
+        assert!(state.pending_client_requests.is_empty());
     }
 
     #[tokio::test]

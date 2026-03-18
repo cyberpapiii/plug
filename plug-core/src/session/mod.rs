@@ -49,6 +49,7 @@ pub trait SessionStore: Send + Sync {
     fn create_session(&self) -> Result<String, HttpError>;
     fn validate(&self, session_id: &str) -> Result<(), HttpError>;
     fn touch(&self, session_id: &str) -> Result<(), HttpError>;
+    fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError>;
     fn set_sse_sender(
         &self,
         session_id: &str,
