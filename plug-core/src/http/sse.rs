@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,6 +17,31 @@ pub fn sse_stream(
     rx: mpsc::Receiver<serde_json::Value>,
     cancel: CancellationToken,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), || {})
+}
+
+pub fn sse_stream_with_heartbeat<F>(
+    rx: mpsc::Receiver<serde_json::Value>,
+    cancel: CancellationToken,
+    mut on_keepalive: F,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+where
+    F: FnMut() + Send + 'static,
+{
+    sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), move || {
+        on_keepalive();
+    })
+}
+
+fn sse_stream_with_heartbeat_interval<F>(
+    rx: mpsc::Receiver<serde_json::Value>,
+    cancel: CancellationToken,
+    keepalive_interval: Duration,
+    mut on_keepalive: F,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+where
+    F: FnMut() + Send + 'static,
+{
     let stream = async_stream::stream! {
         // SSE priming event (SHOULD per spec 2025-11-25):
         // Empty data with event ID so clients know the stream is alive.
@@ -26,6 +51,9 @@ pub fn sse_stream(
         use futures::StreamExt;
 
         let mut event_id: u64 = 1;
+        let mut keepalive = tokio::time::interval(keepalive_interval);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        keepalive.tick().await;
         loop {
             tokio::select! {
                 biased;
@@ -52,13 +80,15 @@ pub fn sse_stream(
                         }
                     }
                 }
+                _ = keepalive.tick() => {
+                    on_keepalive();
+                    yield Ok(Event::default().comment(""));
+                }
             }
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new().interval(Duration::from_secs(15)).text(""), // SSE comment, not event — won't confuse MCP clients
-    )
+    Sse::new(stream)
 }
 
 #[cfg(test)]
@@ -159,6 +189,30 @@ mod tests {
             events.len() <= 2,
             "stream should close after cancel, got {} events",
             events.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_emits_comment_and_runs_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_tx, rx) = mpsc::channel::<serde_json::Value>(8);
+        let cancel = CancellationToken::new();
+        let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&heartbeats);
+
+        let sse = sse_stream_with_heartbeat_interval(rx, cancel.clone(), Duration::from_millis(10), move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let response = sse.into_response();
+        let body = response.into_body();
+
+        let events = collect_sse_events(body, 2).await;
+        cancel.cancel();
+
+        assert!(heartbeats.load(Ordering::SeqCst) >= 1);
+        assert!(
+            events.iter().any(|event| event.starts_with(":")),
+            "expected at least one keepalive comment event, got: {events:?}"
         );
     }
 }

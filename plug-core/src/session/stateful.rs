@@ -199,6 +199,23 @@ impl SessionStore for StatefulSessionStore {
         Ok(())
     }
 
+    fn touch(&self, session_id: &str) -> Result<(), HttpError> {
+        let mut entry = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
+
+        if entry.last_activity.elapsed() > self.timeout {
+            drop(entry);
+            self.sessions.remove(session_id);
+            self.notify_expired(session_id);
+            return Err(HttpError::SessionNotFound);
+        }
+
+        entry.last_activity = Instant::now();
+        Ok(())
+    }
+
     fn set_sse_sender(
         &self,
         session_id: &str,
@@ -343,6 +360,13 @@ mod tests {
         let store = StatefulSessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         assert!(store.validate(&id).is_ok());
+    }
+
+    #[test]
+    fn touch_existing_session() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+        assert!(store.touch(&id).is_ok());
     }
 
     #[test]

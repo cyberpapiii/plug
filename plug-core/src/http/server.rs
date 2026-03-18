@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
-use super::sse::sse_stream;
+use super::sse::sse_stream_with_heartbeat;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
 use crate::session::SessionStore;
@@ -703,7 +703,11 @@ async fn get_mcp(
     state.sessions.set_sse_sender(&session_id, tx)?;
 
     // 4. Build SSE response with appropriate headers
-    let sse = sse_stream(rx, state.cancel.clone());
+    let session_store = Arc::clone(&state.sessions);
+    let keepalive_session_id = session_id.clone();
+    let sse = sse_stream_with_heartbeat(rx, state.cancel.clone(), move || {
+        let _ = session_store.touch(&keepalive_session_id);
+    });
     let mut response = sse.into_response();
     response
         .headers_mut()
