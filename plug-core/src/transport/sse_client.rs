@@ -51,6 +51,7 @@ pub struct LegacySseTransportConfig {
     pub uri: Arc<str>,
     pub auth_token: Option<Arc<str>>,
     pub channel_buffer_capacity: usize,
+    pub endpoint_wait_timeout: Duration,
     pub retry_policy: Arc<dyn SseRetryPolicy>,
 }
 
@@ -63,6 +64,7 @@ impl std::fmt::Debug for LegacySseTransportConfig {
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("channel_buffer_capacity", &self.channel_buffer_capacity)
+            .field("endpoint_wait_timeout", &self.endpoint_wait_timeout)
             .finish()
     }
 }
@@ -73,6 +75,7 @@ impl LegacySseTransportConfig {
             uri: uri.into(),
             auth_token: None,
             channel_buffer_capacity: 16,
+            endpoint_wait_timeout: Duration::from_secs(5),
             retry_policy: Arc::new(ExponentialBackoff {
                 max_times: None,
                 base_duration: Duration::from_millis(1_000),
@@ -82,6 +85,11 @@ impl LegacySseTransportConfig {
 
     pub fn auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
         self.auth_token = Some(token.into());
+        self
+    }
+
+    pub fn endpoint_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.endpoint_wait_timeout = timeout;
         self
     }
 }
@@ -161,12 +169,11 @@ impl Worker for LegacySseWorker {
         ));
 
         let mut endpoint_rx = endpoint_rx;
-        let endpoint =
-            wait_for_endpoint(&mut endpoint_rx)
-                .await
-                .map_err(WorkerQuitReason::fatal_context(
-                    "wait for legacy SSE endpoint",
-                ))?;
+        let endpoint = wait_for_endpoint(&mut endpoint_rx, self.config.endpoint_wait_timeout)
+            .await
+            .map_err(WorkerQuitReason::fatal_context(
+                "wait for legacy SSE endpoint",
+            ))?;
 
         let initialize = context.recv_from_handler().await?;
         post_message(
@@ -328,12 +335,13 @@ async fn run_sse_loop(
 
 async fn wait_for_endpoint(
     endpoint_rx: &mut tokio::sync::watch::Receiver<Option<Arc<str>>>,
+    timeout: Duration,
 ) -> Result<Arc<str>, LegacySseError> {
     if let Some(endpoint) = endpoint_rx.borrow().clone() {
         return Ok(endpoint);
     }
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(timeout, async {
         loop {
             endpoint_rx
                 .changed()
@@ -450,11 +458,14 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
 pub fn should_fallback_http_error(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .filter_map(|cause| cause.downcast_ref::<LegacySseError>())
-        .any(LegacySseError::is_legacy_fallback_hint)
-        || error.to_string().contains("HTTP 400")
-        || error.to_string().contains("HTTP 404")
-        || error.to_string().contains("HTTP 405")
+        .any(|cause| {
+            cause
+                .downcast_ref::<LegacySseError>()
+                .is_some_and(LegacySseError::is_legacy_fallback_hint)
+                || cause
+                    .to_string()
+                    .contains("unexpected server response: HTTP 405 Method Not Allowed")
+        })
 }
 
 #[cfg(test)]
@@ -466,6 +477,19 @@ mod tests {
         let endpoint =
             resolve_endpoint("http://localhost:8080/mcp", "/messages").expect("resolve relative");
         assert_eq!(endpoint.as_ref(), "http://localhost:8080/messages");
+    }
+
+    #[tokio::test]
+    async fn wait_for_endpoint_uses_provided_timeout() {
+        let (_tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
+        let result = wait_for_endpoint(&mut rx, Duration::from_millis(10)).await;
+        assert!(matches!(result, Err(LegacySseError::MissingEndpoint)));
+    }
+
+    #[test]
+    fn generic_http_status_strings_do_not_trigger_fallback() {
+        let error = anyhow::anyhow!("failed to connect to HTTP upstream: HTTP 404 Not Found");
+        assert!(!should_fallback_http_error(&error));
     }
 
     #[test]

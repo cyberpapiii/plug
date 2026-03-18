@@ -546,7 +546,8 @@ impl ServerManager {
                             Self::finish_upstream_connection(name, config, client, tools, "HTTP upstream").await
                         }
                         Err(e) => {
-                            let error = anyhow::anyhow!("failed to connect to HTTP upstream: {e}");
+                            let error = anyhow::Error::new(e)
+                                .context("failed to connect to HTTP upstream");
                             if crate::transport::sse_client::should_fallback_http_error(&error) {
                                 tracing::info!(
                                     server = %name,
@@ -609,7 +610,9 @@ impl ServerManager {
             }
         }
 
-        let mut transport_config = LegacySseTransportConfig::with_uri(url);
+        let mut transport_config =
+            LegacySseTransportConfig::with_uri(url)
+                .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs));
 
         // Resolve auth token: OAuth token from cache, or static bearer token
         let auth_token_value = if config.auth.as_deref() == Some("oauth") {
