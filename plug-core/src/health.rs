@@ -214,12 +214,13 @@ async fn health_check_server(
         None => return None,
     };
 
-    // Use list_tools as a lightweight health probe (universal across MCP servers).
+    // Use the first list_tools page as a lightweight liveness probe rather than
+    // enumerating the full merged surface on every health cycle.
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         upstream
             .client
             .peer()
-            .list_all_tools()
+            .list_tools(None)
             .await
             .map_err(|e| anyhow::anyhow!("health probe failed: {e}"))
     })

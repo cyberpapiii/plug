@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -188,6 +189,9 @@ impl Worker for LegacySseWorker {
         ))?;
         let _ = initialize.responder.send(Ok(()));
 
+        // Legacy SSE servers can send notifications before the initialize
+        // response arrives; buffer them so startup stays lossless.
+        let mut buffered_preinitialize_messages = VecDeque::new();
         let initialize_response = loop {
             let Some(message) = sse_rx.recv().await else {
                 return Err(WorkerQuitReason::fatal(
@@ -195,11 +199,15 @@ impl Worker for LegacySseWorker {
                     "legacy SSE stream closed before initialize response",
                 ));
             };
-            if matches!(message, ServerJsonRpcMessage::Response(_)) {
+            if is_response_message(&message) {
                 break message;
             }
+            buffered_preinitialize_messages.push_back(message);
         };
         context.send_to_handler(initialize_response).await?;
+        while let Some(message) = buffered_preinitialize_messages.pop_front() {
+            context.send_to_handler(message).await?;
+        }
 
         loop {
             tokio::select! {
@@ -235,6 +243,13 @@ impl Worker for LegacySseWorker {
             }
         }
     }
+}
+
+fn is_response_message(message: &ServerJsonRpcMessage) -> bool {
+    matches!(
+        message,
+        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+    )
 }
 
 async fn run_sse_loop(
@@ -471,6 +486,25 @@ pub fn should_fallback_http_error(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::sync::Mutex;
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use futures::Stream;
+    use rmcp::ServiceExt as _;
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{
+        ClientRequest, Implementation, InitializeResult, ListToolsResult, LoggingLevel,
+        LoggingMessageNotification, LoggingMessageNotificationParam, ServerCapabilities,
+        ServerNotification, ServerResult, Tool, ToolsCapability,
+    };
+    use rmcp::service::NotificationContext;
+    use serde_json::json;
+    use tokio::sync::Notify;
 
     #[test]
     fn resolve_endpoint_relative_path() {
@@ -580,5 +614,160 @@ mod tests {
             debug_output.contains("REDACTED"),
             "should show REDACTED placeholder"
         );
+    }
+
+    #[derive(Clone)]
+    struct EarlyNotificationState {
+        tx: tokio::sync::broadcast::Sender<sse_stream::Sse>,
+    }
+
+    #[derive(Clone)]
+    struct LoggingCaptureClient {
+        signal: Arc<Notify>,
+        payloads: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl ClientHandler for LoggingCaptureClient {
+        fn get_info(&self) -> rmcp::model::ClientInfo {
+            rmcp::model::ClientInfo::default()
+        }
+
+        async fn on_logging_message(
+            &self,
+            params: LoggingMessageNotificationParam,
+            _context: NotificationContext<rmcp::RoleClient>,
+        ) {
+            self.payloads.lock().unwrap().push(params.data);
+            self.signal.notify_one();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preinitialize_notifications_are_replayed_after_initialize_response() {
+        crate::tls::ensure_rustls_provider_installed();
+        let (server_url, _server_handle) = spawn_legacy_sse_server_with_early_logging().await;
+        let signal = Arc::new(Notify::new());
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(LoggingCaptureClient {
+            signal: Arc::clone(&signal),
+            payloads: Arc::clone(&payloads),
+        });
+
+        let transport = LegacySseClientTransport::from_config(
+            LegacySseTransportConfig::with_uri(server_url).endpoint_wait_timeout(Duration::from_secs(1)),
+        );
+
+        let _client = handler.serve(transport).await.expect("connect legacy SSE client");
+
+        tokio::time::timeout(Duration::from_secs(2), signal.notified())
+            .await
+            .expect("receive early logging notification");
+        assert_eq!(
+            payloads.lock().unwrap().as_slice(),
+            &[json!({"phase": "before_initialize_response"})]
+        );
+    }
+
+    async fn spawn_legacy_sse_server_with_early_logging() -> (String, tokio::task::JoinHandle<()>) {
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let state = EarlyNotificationState { tx };
+        let app = Router::new()
+            .route("/mcp", get(early_logging_stream))
+            .route("/messages", post(early_logging_messages))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind legacy SSE early logging server");
+        let addr = listener.local_addr().expect("legacy SSE early logging addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve legacy SSE early logging server");
+        });
+
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    async fn early_logging_stream(
+        State(state): State<EarlyNotificationState>,
+    ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+        let mut rx = state.tx.subscribe();
+        let stream = async_stream::stream! {
+            yield Ok(Event::default().event("endpoint").data("/messages"));
+            loop {
+                match rx.recv().await {
+                    Ok(event) => yield Ok(event_to_axum(event)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        Ok(Sse::new(stream))
+    }
+
+    async fn early_logging_messages(
+        State(state): State<EarlyNotificationState>,
+        Json(message): Json<ClientJsonRpcMessage>,
+    ) -> StatusCode {
+        if let ClientJsonRpcMessage::Request(request) = message {
+            match request.request {
+                ClientRequest::InitializeRequest(_) => {
+                    let mut capabilities = ServerCapabilities::default();
+                    capabilities.tools = Some(ToolsCapability {
+                        list_changed: Some(false),
+                    });
+                    let logging = ServerJsonRpcMessage::notification(
+                        ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
+                            LoggingMessageNotificationParam::new(
+                                LoggingLevel::Info,
+                                json!({"phase": "before_initialize_response"}),
+                            ),
+                        )),
+                    );
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::InitializeResult(
+                            InitializeResult::new(capabilities)
+                            .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
+                        ),
+                        request.id,
+                    );
+                    let _ = state.tx.send(
+                        sse_stream::Sse::default()
+                            .data(serde_json::to_string(&logging).expect("serialize logging notification")),
+                    );
+                    let _ = state.tx.send(
+                        sse_stream::Sse::default()
+                            .data(serde_json::to_string(&response).expect("serialize initialize response")),
+                    );
+                }
+                ClientRequest::ListToolsRequest(_) => {
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(Vec::<Tool>::new())),
+                        request.id,
+                    );
+                    let _ = state.tx.send(
+                        sse_stream::Sse::default()
+                            .data(serde_json::to_string(&response).expect("serialize list tools response")),
+                    );
+                }
+                _ => {}
+            }
+        }
+        StatusCode::ACCEPTED
+    }
+
+    fn event_to_axum(event: sse_stream::Sse) -> Event {
+        let mut axum_event = Event::default();
+        if let Some(kind) = event.event {
+            axum_event = axum_event.event(kind);
+        }
+        if let Some(data) = event.data {
+            axum_event = axum_event.data(data);
+        }
+        if let Some(id) = event.id {
+            axum_event = axum_event.id(id);
+        }
+        axum_event
     }
 }
