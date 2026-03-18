@@ -74,14 +74,15 @@ impl ClientHandler for UpstreamClientHandler {
     fn create_elicitation(
         &self,
         request: CreateElicitationRequestParams,
-        _context: RequestContext<rmcp::RoleClient>,
+        context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_ {
         let router = self.router.clone();
         let server_id = Arc::clone(&self.server_id);
+        let request_id = context.id.clone();
         async move {
             if let Some(router) = router.upgrade() {
                 router
-                    .create_elicitation_from_upstream(server_id.as_ref(), request)
+                    .create_elicitation_from_upstream(server_id.as_ref(), request_id, request)
                     .await
             } else {
                 Err(McpError::internal_error(
@@ -95,14 +96,15 @@ impl ClientHandler for UpstreamClientHandler {
     fn create_message(
         &self,
         request: CreateMessageRequestParams,
-        _context: RequestContext<rmcp::RoleClient>,
+        context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
         let router = self.router.clone();
         let server_id = Arc::clone(&self.server_id);
+        let request_id = context.id.clone();
         async move {
             if let Some(router) = router.upgrade() {
                 router
-                    .create_message_from_upstream(server_id.as_ref(), request)
+                    .create_message_from_upstream(server_id.as_ref(), request_id, request)
                     .await
             } else {
                 Err(McpError::internal_error(

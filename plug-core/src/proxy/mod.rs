@@ -202,7 +202,9 @@ struct ActiveCallRecord {
     downstream: DownstreamCallContext,
     upstream_server_id: String,
     upstream_request_id: Option<RequestId>,
-    progress_token: Option<ProgressToken>,
+    downstream_progress_token: Option<ProgressToken>,
+    upstream_progress_token: Option<ProgressToken>,
+    pending_cancel_reason: Option<Option<String>>,
 }
 
 /// Abstraction for forwarding reverse requests (elicitation, sampling) to a downstream client.
@@ -452,12 +454,33 @@ impl ToolRouter {
         self.downstream_bridges.remove(target);
     }
 
-    /// Resolve the unique downstream target for an upstream server's reverse request.
-    ///
-    /// Looks up all active calls for the given server and extracts the unique downstream
-    /// `NotificationTarget`. Returns an error if:
-    /// - 0 active calls (no downstream client to forward to)
-    /// - 2+ distinct downstream targets (ambiguous ownership)
+    fn active_call_for_upstream_request(
+        &self,
+        server_id: &str,
+        request_id: &RequestId,
+    ) -> Result<ActiveCallRecord, McpError> {
+        let key = UpstreamRequestKey {
+            server_id: server_id.to_string(),
+            request_id: request_id.clone(),
+        };
+        let Some(call_id) = self.upstream_request_lookup.get(&key).map(|entry| *entry) else {
+            return Err(McpError::internal_error(
+                format!("no active downstream call for upstream request {server_id}:{request_id:?}"),
+                None,
+            ));
+        };
+
+        self.active_calls
+            .get(&call_id)
+            .map(|entry| entry.clone())
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    format!("active call record missing for upstream request {server_id}:{request_id:?}"),
+                    None,
+                )
+            })
+    }
+
     fn resolve_unique_downstream_target_for_upstream(
         &self,
         server_id: &str,
@@ -486,9 +509,13 @@ impl ToolRouter {
     pub async fn create_elicitation_from_upstream(
         &self,
         server_id: &str,
+        upstream_request_id: RequestId,
         request: CreateElicitationRequestParams,
     ) -> Result<CreateElicitationResult, McpError> {
-        let target = self.resolve_unique_downstream_target_for_upstream(server_id)?;
+        let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
+            Ok(record) => record.downstream.notification_target(),
+            Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
+        };
         let bridge = self
             .downstream_bridges
             .get(&target)
@@ -506,9 +533,13 @@ impl ToolRouter {
     pub async fn create_message_from_upstream(
         &self,
         server_id: &str,
+        upstream_request_id: RequestId,
         request: CreateMessageRequestParams,
     ) -> Result<CreateMessageResult, McpError> {
-        let target = self.resolve_unique_downstream_target_for_upstream(server_id)?;
+        let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
+            Ok(record) => record.downstream.notification_target(),
+            Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
+        };
         let bridge = self
             .downstream_bridges
             .get(&target)
@@ -647,7 +678,7 @@ impl ToolRouter {
                 call_id,
             );
         }
-        if let Some(progress_token) = record.progress_token.clone() {
+        if let Some(progress_token) = record.upstream_progress_token.clone() {
             self.upstream_progress_lookup.insert(
                 UpstreamProgressKey {
                     server_id: record.upstream_server_id.clone(),
@@ -660,16 +691,32 @@ impl ToolRouter {
     }
 
     fn attach_upstream_request_id(&self, call_id: u64, server_id: &str, request_id: RequestId) {
+        let mut pending_cancel = None;
         if let Some(mut entry) = self.active_calls.get_mut(&call_id) {
             entry.upstream_request_id = Some(request_id.clone());
+            pending_cancel = entry.pending_cancel_reason.take();
         }
         self.upstream_request_lookup.insert(
             UpstreamRequestKey {
                 server_id: server_id.to_string(),
-                request_id,
+                request_id: request_id.clone(),
             },
             call_id,
         );
+        if let Some(reason) = pending_cancel
+            && let Some(upstream) = self.server_manager.get_upstream(server_id)
+        {
+            let peer = upstream.client.peer().clone();
+            let request_id = request_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = peer
+                    .notify_cancelled(CancelledNotificationParam { request_id, reason })
+                    .await
+                {
+                    tracing::warn!(error = %error, "failed to forward pending downstream cancellation upstream");
+                }
+            });
+        }
     }
 
     fn remove_active_call(&self, call_id: u64) {
@@ -682,7 +729,7 @@ impl ToolRouter {
                     request_id,
                 });
             }
-            if let Some(progress_token) = record.progress_token {
+            if let Some(progress_token) = record.upstream_progress_token {
                 self.upstream_progress_lookup.remove(&UpstreamProgressKey {
                     server_id: record.upstream_server_id,
                     progress_token,
@@ -709,7 +756,7 @@ impl ToolRouter {
             return;
         };
 
-        let Some(record) = self.active_calls.get(&call_id).map(|entry| entry.clone()) else {
+        let Some(mut record) = self.active_calls.get_mut(&call_id) else {
             return;
         };
 
@@ -727,6 +774,7 @@ impl ToolRouter {
                 server = %record.upstream_server_id,
                 "upstream request id not attached yet for downstream cancellation"
             );
+            record.pending_cancel_reason = Some(reason);
             return;
         };
 
@@ -763,9 +811,14 @@ impl ToolRouter {
             return;
         };
 
+        let mut downstream_params = params;
+        if let Some(token) = record.downstream_progress_token.clone() {
+            downstream_params.progress_token = token;
+        }
+
         self.publish_protocol_notification(ProtocolNotification::Progress {
             target: record.downstream.notification_target(),
-            params,
+            params: downstream_params,
         });
     }
 
@@ -1930,25 +1983,33 @@ impl ToolRouter {
             let peer = upstream.client.peer().clone();
             drop(upstream); // Release Arc early
 
+            let call_id = next_call_id();
+
             // Build the upstream call with the original (unprefixed) tool name
             let mut upstream_params = CallToolRequestParams::new(original_name.clone());
             if let Some(ref args) = arguments {
                 upstream_params = upstream_params.with_arguments(args.clone());
             }
-            if let Some(token) = progress_token.clone() {
+            let downstream_progress_token = progress_token.clone();
+            let upstream_progress_token = downstream_progress_token
+                .as_ref()
+                .map(|_| {
+                    ProgressToken(NumberOrString::String(Arc::from(format!(
+                        "plug-progress-{call_id}"
+                    ))))
+                });
+            if let Some(token) = upstream_progress_token.clone() {
                 upstream_params.set_progress_token(token);
             }
-            let downstream_progress_token = upstream_params.progress_token();
 
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
             let options = PeerRequestOptions {
                 timeout: Some(timeout_duration),
-                meta: downstream_progress_token
+                meta: upstream_progress_token
                     .clone()
                     .map(Meta::with_progress_token),
             };
 
-            let call_id = next_call_id();
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,
                 call_id: u64,
@@ -1976,7 +2037,9 @@ impl ToolRouter {
                         downstream: call_context,
                         upstream_server_id: server_id.clone(),
                         upstream_request_id: None,
-                        progress_token: downstream_progress_token.clone(),
+                        downstream_progress_token,
+                        upstream_progress_token,
+                        pending_cancel_reason: None,
                     },
                 );
                 active_call_guard = Some(ActiveCallGuard {
@@ -3711,7 +3774,9 @@ mod tests {
                 ),
                 upstream_server_id: "upstream".to_string(),
                 upstream_request_id: None,
-                progress_token: Some(progress_token.clone()),
+                downstream_progress_token: Some(progress_token.clone()),
+                upstream_progress_token: Some(progress_token.clone()),
+                pending_cancel_reason: None,
             },
         );
 
@@ -4154,14 +4219,17 @@ mod tests {
         assert_eq!(result.roots[0].uri, "file:///project-2");
     }
 
-    // ── Target resolution tests (elicitation / sampling routing) ─────
+    // ── Upstream request ownership tests ───────────────────────────────
 
     #[test]
-    fn test_target_resolution_no_active_calls() {
+    fn test_upstream_request_lookup_requires_active_call() {
         let sm = Arc::new(ServerManager::new());
         let router = ToolRouter::new(sm, test_router_config());
 
-        let result = router.resolve_unique_downstream_target_for_upstream("unknown-server");
+        let result = router.active_call_for_upstream_request(
+            "unknown-server",
+            &RequestId::from(NumberOrString::Number(1)),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -4172,7 +4240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_target_resolution_single_active_call() {
+    fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
         let sm = Arc::new(ServerManager::new());
         let router = ToolRouter::new(sm, test_router_config());
 
@@ -4184,85 +4252,12 @@ mod tests {
                     RequestId::from(NumberOrString::Number(1)),
                 ),
                 upstream_server_id: "s1".to_string(),
-                upstream_request_id: None,
-                progress_token: None,
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: None,
             },
         );
-
-        let result = router.resolve_unique_downstream_target_for_upstream("s1");
-        assert!(result.is_ok(), "expected Ok, got: {result:?}");
-        assert_eq!(
-            result.unwrap(),
-            NotificationTarget::Stdio {
-                client_id: Arc::from("client-a"),
-            },
-        );
-    }
-
-    #[test]
-    fn test_target_resolution_dedup_same_client() {
-        let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(sm, test_router_config());
-
-        // Two active calls from the same stdio client, different call IDs and request IDs
-        router.register_active_call(
-            1,
-            ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
-                    Arc::from("client-a"),
-                    RequestId::from(NumberOrString::Number(10)),
-                ),
-                upstream_server_id: "s1".to_string(),
-                upstream_request_id: None,
-                progress_token: None,
-            },
-        );
-        router.register_active_call(
-            2,
-            ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
-                    Arc::from("client-a"),
-                    RequestId::from(NumberOrString::Number(20)),
-                ),
-                upstream_server_id: "s1".to_string(),
-                upstream_request_id: None,
-                progress_token: None,
-            },
-        );
-
-        let result = router.resolve_unique_downstream_target_for_upstream("s1");
-        assert!(
-            result.is_ok(),
-            "expected Ok (deduplicated to 1 target), got: {result:?}",
-        );
-        assert_eq!(
-            result.unwrap(),
-            NotificationTarget::Stdio {
-                client_id: Arc::from("client-a"),
-            },
-        );
-    }
-
-    #[test]
-    fn test_target_resolution_ambiguous_different_clients() {
-        let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(sm, test_router_config());
-
-        // One call from a stdio client
-        router.register_active_call(
-            1,
-            ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
-                    Arc::from("client-a"),
-                    RequestId::from(NumberOrString::Number(1)),
-                ),
-                upstream_server_id: "s1".to_string(),
-                upstream_request_id: None,
-                progress_token: None,
-            },
-        );
-
-        // Another call from an HTTP client
         router.register_active_call(
             2,
             ActiveCallRecord {
@@ -4271,18 +4266,168 @@ mod tests {
                     RequestId::from(NumberOrString::Number(2)),
                 ),
                 upstream_server_id: "s1".to_string(),
-                upstream_request_id: None,
-                progress_token: None,
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(202))),
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: None,
             },
         );
 
-        let result = router.resolve_unique_downstream_target_for_upstream("s1");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let result = router.active_call_for_upstream_request(
+            "s1",
+            &RequestId::from(NumberOrString::Number(202)),
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(
+            result.unwrap().downstream.notification_target(),
+            NotificationTarget::Http {
+                session_id: Arc::from("session-b"),
+            },
+        );
+    }
+
+    #[test]
+    fn test_route_upstream_progress_restores_downstream_token() {
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+        let mut rx = router.subscribe_notifications();
+
+        router.register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
+                downstream_progress_token: Some(ProgressToken(NumberOrString::String(
+                    Arc::from("downstream-token"),
+                ))),
+                upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "upstream-token",
+                )))),
+                pending_cancel_reason: None,
+            },
+        );
+
+        router.route_upstream_progress(
+            "s1",
+            ProgressNotificationParam {
+                progress_token: ProgressToken(NumberOrString::String(Arc::from("upstream-token"))),
+                progress: 0.5,
+                total: Some(1.0),
+                message: None,
+            },
+        );
+
+        let notification = rx.try_recv().expect("progress notification");
+        match notification {
+            ProtocolNotification::Progress { target, params } => {
+                assert_eq!(
+                    target,
+                    NotificationTarget::Stdio {
+                        client_id: Arc::from("client-a"),
+                    }
+                );
+                assert_eq!(
+                    params.progress_token,
+                    ProgressToken(NumberOrString::String(Arc::from("downstream-token")))
+                );
+            }
+            other => panic!("expected progress notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        router.register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: Some(Some("cancelled".to_string())),
+            },
+        );
+
+        router.attach_upstream_request_id(1, "s1", RequestId::from(NumberOrString::Number(42)));
+        let record = router.active_calls.get(&1).expect("active call").clone();
+        assert_eq!(
+            record.upstream_request_id,
+            Some(RequestId::from(NumberOrString::Number(42)))
+        );
+        assert!(record.pending_cancel_reason.is_none());
+    }
+
+    #[test]
+    fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        router.register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
+                downstream_progress_token: Some(ProgressToken(NumberOrString::String(
+                    Arc::from("downstream-token"),
+                ))),
+                upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "upstream-token",
+                )))),
+                pending_cancel_reason: None,
+            },
+        );
+
+        assert_eq!(
+            router
+                .upstream_progress_lookup
+                .get(&UpstreamProgressKey {
+                    server_id: "s1".to_string(),
+                    progress_token: ProgressToken(NumberOrString::String(Arc::from(
+                        "upstream-token",
+                    ))),
+                })
+                .map(|entry| *entry),
+            Some(1)
+        );
         assert!(
-            err.message.contains("ambiguous"),
-            "expected 'ambiguous' in error message, got: {}",
-            err.message,
+            router
+                .upstream_progress_lookup
+                .get(&UpstreamProgressKey {
+                    server_id: "s1".to_string(),
+                    progress_token: ProgressToken(NumberOrString::String(Arc::from(
+                        "downstream-token",
+                    ))),
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_downstream_context_notification_target() {
+        assert_eq!(
+            DownstreamCallContext::stdio(
+                Arc::from("client-a"),
+                RequestId::from(NumberOrString::Number(1))
+            )
+            .notification_target(),
+            NotificationTarget::Stdio {
+                client_id: Arc::from("client-a"),
+            },
         );
     }
 }
