@@ -165,6 +165,13 @@ struct CachedCredentials {
     expires_in: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CredentialSource {
+    Cache,
+    File,
+    Keyring,
+}
+
 impl std::fmt::Debug for CachedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedCredentials")
@@ -421,16 +428,31 @@ impl CompositeCredentialStore {
             .map(|tr| tr.access_token().secret().to_string())
     }
 
-    fn persisted_credentials_is_newer(
-        cached: &StoredCredentials,
-        persisted: &StoredCredentials,
-    ) -> bool {
-        let cached_received = cached.token_received_at.unwrap_or(0);
-        let persisted_received = persisted.token_received_at.unwrap_or(0);
+    fn choose_fresher_credentials<'a>(
+        lhs: Option<(&'a StoredCredentials, CredentialSource)>,
+        rhs: Option<(&'a StoredCredentials, CredentialSource)>,
+    ) -> Option<(&'a StoredCredentials, CredentialSource)> {
+        match (lhs, rhs) {
+            (Some(left), Some(right)) => {
+                let left_received = left.0.token_received_at.unwrap_or(0);
+                let right_received = right.0.token_received_at.unwrap_or(0);
 
-        persisted_received > cached_received
-            || (persisted_received == cached_received
-                && Self::token_identity(cached) != Self::token_identity(persisted))
+                if right_received > left_received {
+                    Some(right)
+                } else if right_received < left_received {
+                    Some(left)
+                } else if Self::token_identity(left.0) != Self::token_identity(right.0)
+                    && right.1 >= left.1
+                {
+                    Some(right)
+                } else {
+                    Some(left)
+                }
+            }
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        }
     }
 
     /// Return the cached token timing info for refresh-check decisions.
@@ -463,24 +485,25 @@ impl CompositeCredentialStore {
     async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
         let cached = self.cached_credentials();
         let persisted_file = self.file_load();
+        let persisted_keyring = self.keyring_load();
 
-        match (cached, persisted_file) {
-            (Some(cached), Some(persisted))
-                if Self::persisted_credentials_is_newer(&cached, &persisted) =>
-            {
-                self.update_cache(&persisted);
-                Some(persisted)
+        let freshest = Self::choose_fresher_credentials(
+            cached.as_ref().map(|creds| (creds, CredentialSource::Cache)),
+            Self::choose_fresher_credentials(
+                persisted_file.as_ref().map(|creds| (creds, CredentialSource::File)),
+                persisted_keyring
+                    .as_ref()
+                    .map(|creds| (creds, CredentialSource::Keyring)),
+            ),
+        );
+
+        match freshest {
+            Some((creds, CredentialSource::Cache)) => Some(creds.clone()),
+            Some((creds, _)) => {
+                self.update_cache(creds);
+                Some(creds.clone())
             }
-            (Some(cached), _) => Some(cached),
-            (None, Some(persisted)) => {
-                self.update_cache(&persisted);
-                Some(persisted)
-            }
-            (None, None) => {
-                let creds = self.keyring_load()?;
-                self.update_cache(&creds);
-                Some(creds)
-            }
+            None => None,
         }
     }
 }
@@ -526,6 +549,12 @@ impl CredentialStore for CompositeCredentialStore {
         // If both backends failed, propagate the file error.
         if !keyring_ok {
             file_result?;
+        } else if let Err(error) = file_result {
+            warn!(
+                server = %self.server_name,
+                error = %error,
+                "token file mirror save failed after keyring save; continuing with keyring-backed credentials"
+            );
         }
 
         Ok(())
@@ -1152,5 +1181,42 @@ mod tests {
         assert_eq!(token.as_deref(), Some("cached-access"));
 
         store.clear_cache();
+    }
+
+    #[test]
+    fn choose_fresher_credentials_prefers_newer_timestamp() {
+        let mut older = make_test_token("older-access", Some("older-refresh"), Some(3600));
+        older.token_received_at = Some(100);
+        let mut newer = make_test_token("newer-access", Some("newer-refresh"), Some(3600));
+        newer.token_received_at = Some(200);
+
+        let chosen = CompositeCredentialStore::choose_fresher_credentials(
+            Some((&older, CredentialSource::File)),
+            Some((&newer, CredentialSource::Keyring)),
+        )
+        .expect("choose fresher credentials");
+
+        assert_eq!(chosen.0.token_received_at, Some(200));
+        assert_eq!(chosen.1, CredentialSource::Keyring);
+    }
+
+    #[test]
+    fn choose_fresher_credentials_prefers_keyring_on_tied_timestamp_and_different_tokens() {
+        let mut file = make_test_token("file-access", Some("file-refresh"), Some(3600));
+        file.token_received_at = Some(100);
+        let mut keyring = make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
+        keyring.token_received_at = Some(100);
+
+        let chosen = CompositeCredentialStore::choose_fresher_credentials(
+            Some((&file, CredentialSource::File)),
+            Some((&keyring, CredentialSource::Keyring)),
+        )
+        .expect("choose fresher credentials");
+
+        assert_eq!(
+            CompositeCredentialStore::token_identity(chosen.0).as_deref(),
+            Some("keyring-access")
+        );
+        assert_eq!(chosen.1, CredentialSource::Keyring);
     }
 }
