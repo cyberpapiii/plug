@@ -42,92 +42,114 @@ pub fn spawn_health_checks(
         if !sc.enabled {
             continue;
         }
+        spawn_health_check(
+            server_manager.clone(),
+            router.clone(),
+            engine.clone(),
+            event_tx.clone(),
+            cancel.clone(),
+            name.clone(),
+            sc.health_check_interval_secs,
+            tracker,
+        );
+    }
+}
 
-        let name = name.clone();
-        let interval = Duration::from_secs(sc.health_check_interval_secs);
-        let mgr = server_manager.clone();
-        let router = router.clone();
-        let engine = engine.clone();
-        let cancel = cancel.clone();
-        let event_tx = event_tx.clone();
-        let tracker_clone = tracker.clone();
+pub fn spawn_health_check(
+    server_manager: Arc<ServerManager>,
+    router: Arc<ToolRouter>,
+    engine: Arc<Engine>,
+    event_tx: broadcast::Sender<EngineEvent>,
+    cancel: CancellationToken,
+    name: String,
+    health_check_interval_secs: u64,
+    tracker: &TaskTracker,
+) {
+    let generation = engine.next_health_task_generation(&name);
+    let interval = Duration::from_secs(health_check_interval_secs);
+    let tracker_clone = tracker.clone();
 
-        tracker.spawn(async move {
-            // Stagger start with random 0-10s jitter to avoid thundering herd
-            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..10_000));
-            tokio::time::sleep(jitter).await;
+    tracker.spawn(async move {
+        let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..10_000));
+        tokio::time::sleep(jitter).await;
 
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tick.tick().await;
 
-            // Skip the first immediate tick (server just started)
-            tick.tick().await;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        tracing::debug!(server = %name, "health check task shutting down");
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::debug!(server = %name, "health check task shutting down");
+                    break;
+                }
+                _ = tick.tick() => {
+                    if engine.current_health_task_generation(&name) != Some(generation) {
+                        tracing::debug!(server = %name, "health check generation superseded");
                         break;
                     }
-                    _ = tick.tick() => {
-                        // Skip health checks for AuthRequired servers — probing without
-                        // credentials is pointless and would fail with 401.
-                        let is_auth_required = mgr
-                            .health
-                            .get(&name)
-                            .is_some_and(|entry| entry.health == ServerHealth::AuthRequired);
-                        if is_auth_required {
-                            tracing::debug!(server = %name, "skipping health check for AuthRequired server");
-                            continue;
-                        }
 
-                        let missing_upstream = mgr.get_upstream(&name).is_none();
-                        let startup_failed = mgr
-                            .health
-                            .get(&name)
-                            .is_some_and(|entry| entry.health == ServerHealth::Failed);
+                    let current_config = {
+                        let cfg = engine.config();
+                        cfg.servers.get(&name).cloned()
+                    };
+                    let Some(current_config) = current_config else {
+                        engine.clear_health_task_generation(&name);
+                        break;
+                    };
+                    if !current_config.enabled || current_config.health_check_interval_secs != health_check_interval_secs {
+                        break;
+                    }
 
-                        if missing_upstream && startup_failed {
+                    let is_auth_required = server_manager
+                        .health
+                        .get(&name)
+                        .is_some_and(|entry| entry.health == ServerHealth::AuthRequired);
+                    if is_auth_required {
+                        tracing::debug!(server = %name, "skipping health check for AuthRequired server");
+                        continue;
+                    }
+
+                    let missing_upstream = server_manager.get_upstream(&name).is_none();
+                    let startup_failed = server_manager
+                        .health
+                        .get(&name)
+                        .is_some_and(|entry| entry.health == ServerHealth::Failed);
+
+                    if missing_upstream && startup_failed {
+                        let engine = engine.clone();
+                        let name = name.clone();
+                        let cancel = cancel.clone();
+                        tracker_clone.spawn(async move {
+                            spawn_proactive_recovery(&engine, &name, cancel).await;
+                        });
+                        continue;
+                    }
+
+                    let result = health_check_server(&server_manager, &name).await;
+                    if let Some((old, new)) = result {
+                        tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
+                        router.refresh_tools().await;
+                        let _ = event_tx.send(EngineEvent::ServerHealthChanged {
+                            server_id: Arc::from(name.as_str()),
+                            old,
+                            new,
+                        });
+
+                        if new == ServerHealth::Failed {
                             let engine = engine.clone();
                             let name = name.clone();
                             let cancel = cancel.clone();
                             tracker_clone.spawn(async move {
                                 spawn_proactive_recovery(&engine, &name, cancel).await;
                             });
-                            continue;
-                        }
-
-                        let result = health_check_server(&mgr, &name).await;
-                        if let Some((old, new)) = result {
-                            tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
-                            router.refresh_tools().await;
-
-                            // Emit event on state transition (transition-based, not time-suppressed)
-                            let _ = event_tx.send(EngineEvent::ServerHealthChanged {
-                                server_id: Arc::from(name.as_str()),
-                                old,
-                                new,
-                            });
-
-                            // Proactive recovery: when a server reaches Failed,
-                            // spawn a tracked recovery task with exponential backoff.
-                            // The AtomicBool reconnect flag in ServerManager deduplicates
-                            // concurrent attempts, so stacking tasks is safe.
-                            if new == ServerHealth::Failed {
-                                let engine = engine.clone();
-                                let name = name.clone();
-                                let cancel = cancel.clone();
-                                tracker_clone.spawn(async move {
-                                    spawn_proactive_recovery(&engine, &name, cancel).await;
-                                });
-                            }
                         }
                     }
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 /// Attempt proactive recovery of a failed server with exponential backoff.

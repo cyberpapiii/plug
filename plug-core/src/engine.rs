@@ -119,6 +119,8 @@ pub struct Engine {
     started_at: Instant,
     /// Per-server last restart timestamp for rate limiting.
     restart_timestamps: dashmap::DashMap<String, Instant>,
+    health_task_generations: dashmap::DashMap<String, u64>,
+    refresh_task_generations: dashmap::DashMap<String, u64>,
 }
 
 impl Engine {
@@ -143,6 +145,8 @@ impl Engine {
             event_tx,
             started_at: Instant::now(),
             restart_timestamps: dashmap::DashMap::new(),
+            health_task_generations: dashmap::DashMap::new(),
+            refresh_task_generations: dashmap::DashMap::new(),
         }
     }
 
@@ -273,6 +277,75 @@ impl Engine {
     /// Get a reference to the task tracker (for spawning background tasks).
     pub fn tracker(&self) -> &TaskTracker {
         &self.tracker
+    }
+
+    pub(crate) fn next_health_task_generation(&self, server_name: &str) -> u64 {
+        let next = self
+            .health_task_generations
+            .get(server_name)
+            .map(|entry| *entry + 1)
+            .unwrap_or(1);
+        self.health_task_generations
+            .insert(server_name.to_string(), next);
+        next
+    }
+
+    pub(crate) fn current_health_task_generation(&self, server_name: &str) -> Option<u64> {
+        self.health_task_generations
+            .get(server_name)
+            .map(|entry| *entry)
+    }
+
+    pub(crate) fn clear_health_task_generation(&self, server_name: &str) {
+        self.health_task_generations.remove(server_name);
+    }
+
+    pub(crate) fn next_refresh_task_generation(&self, server_name: &str) -> u64 {
+        let next = self
+            .refresh_task_generations
+            .get(server_name)
+            .map(|entry| *entry + 1)
+            .unwrap_or(1);
+        self.refresh_task_generations
+            .insert(server_name.to_string(), next);
+        next
+    }
+
+    pub(crate) fn current_refresh_task_generation(&self, server_name: &str) -> Option<u64> {
+        self.refresh_task_generations
+            .get(server_name)
+            .map(|entry| *entry)
+    }
+
+    pub(crate) fn clear_refresh_task_generation(&self, server_name: &str) {
+        self.refresh_task_generations.remove(server_name);
+    }
+
+    pub(crate) fn spawn_background_tasks_for_server(
+        self: &Arc<Self>,
+        server_name: &str,
+        server_config: &crate::config::ServerConfig,
+    ) {
+        crate::health::spawn_health_check(
+            self.server_manager.clone(),
+            self.tool_router.clone(),
+            Arc::clone(self),
+            self.event_tx.clone(),
+            self.cancel.clone(),
+            server_name.to_string(),
+            server_config.health_check_interval_secs,
+            &self.tracker,
+        );
+        if server_config.enabled && server_config.auth.as_deref() == Some("oauth") {
+            spawn_refresh_loop_for_server(
+                Arc::clone(self),
+                self.cancel.clone(),
+                server_name.to_string(),
+                &self.tracker,
+            );
+        } else {
+            self.clear_refresh_task_generation(server_name);
+        }
     }
 
     /// Atomically swap in a new config.
@@ -431,7 +504,7 @@ impl Engine {
     /// Enable or disable a server. Clones the current config, toggles the
     /// `enabled` field, and applies via `reload_config` for a clean diff.
     pub async fn set_server_enabled(
-        &self,
+        self: &Arc<Self>,
         server_id: &str,
         enabled: bool,
     ) -> Result<(), anyhow::Error> {
@@ -455,7 +528,7 @@ impl Engine {
     /// Diffs the old and new configs, starts/stops/restarts servers as needed,
     /// refreshes the tool cache, and emits `ConfigReloaded`.
     pub async fn reload_config(
-        &self,
+        self: &Arc<Self>,
         new_config: Config,
     ) -> Result<crate::reload::ReloadReport, anyhow::Error> {
         crate::reload::apply_reload(self, new_config).await
@@ -481,15 +554,20 @@ pub fn spawn_refresh_loops(
         if sc.auth.as_deref() != Some("oauth") || !sc.enabled {
             continue;
         }
-
-        let name = name.clone();
-        let engine = engine.clone();
-        let cancel = cancel.clone();
-
-        tracker.spawn(async move {
-            run_refresh_loop(&engine, &name, cancel).await;
-        });
+        spawn_refresh_loop_for_server(engine.clone(), cancel.clone(), name.clone(), tracker);
     }
+}
+
+pub fn spawn_refresh_loop_for_server(
+    engine: Arc<Engine>,
+    cancel: CancellationToken,
+    server_name: String,
+    tracker: &TaskTracker,
+) {
+    let generation = engine.next_refresh_task_generation(&server_name);
+    tracker.spawn(async move {
+        run_refresh_loop(&engine, &server_name, cancel, generation).await;
+    });
 }
 
 /// The per-server refresh loop.
@@ -497,7 +575,12 @@ pub fn spawn_refresh_loops(
 /// Monitors the cached token expiry for a single OAuth server and triggers
 /// reconnection when the refresh window opens. Exits the loop if the server
 /// enters a terminal `AuthRequired` state (refresh token revoked, etc.).
-async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: CancellationToken) {
+async fn run_refresh_loop(
+    engine: &Engine,
+    server_name: &str,
+    cancel: CancellationToken,
+    generation: u64,
+) {
     use crate::oauth;
 
     // Get the credential store for cache access
@@ -514,6 +597,23 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                 break;
             }
             _ = tokio::time::sleep(next_check) => {
+                if engine.current_refresh_task_generation(server_name) != Some(generation) {
+                    tracing::debug!(server = %server_name, "refresh loop generation superseded");
+                    break;
+                }
+
+                let current_config = {
+                    let cfg = engine.config();
+                    cfg.servers.get(server_name).cloned()
+                };
+                let Some(current_config) = current_config else {
+                    engine.clear_refresh_task_generation(server_name);
+                    break;
+                };
+                if !current_config.enabled || current_config.auth.as_deref() != Some("oauth") {
+                    break;
+                }
+
                 // If a prior iteration already refreshed the token but
                 // reconnect failed, skip the refresh and retry reconnect.
                 if !reconnect_pending {
@@ -549,6 +649,7 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                             ),
                             None => {
                                 tracing::warn!(server = %server_name, "server config not found, exiting refresh loop");
+                                engine.clear_refresh_task_generation(server_name);
                                 break;
                             }
                         }
@@ -558,6 +659,7 @@ async fn run_refresh_loop(engine: &Engine, server_name: &str, cancel: Cancellati
                         Some(ref u) => u.as_str(),
                         None => {
                             tracing::warn!(server = %server_name, "no server URL, cannot refresh token");
+                            engine.clear_refresh_task_generation(server_name);
                             break;
                         }
                     };
@@ -821,7 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_set_server_enabled_unknown() {
-        let engine = Engine::new(test_config());
+        let engine = Arc::new(Engine::new(test_config()));
         let result = engine.set_server_enabled("nonexistent", true).await;
         assert!(result.is_err());
     }
@@ -856,7 +958,7 @@ mod tests {
             },
         );
 
-        let engine = Engine::new(config);
+        let engine = Arc::new(Engine::new(config));
         // Already enabled — should be a no-op
         let result = engine.set_server_enabled("test", true).await;
         assert!(result.is_ok());
@@ -892,7 +994,7 @@ mod tests {
             },
         );
 
-        let engine = Engine::new(config);
+        let engine = Arc::new(Engine::new(config));
         let mut rx = engine.subscribe();
 
         // Disable the server — triggers reload which emits ConfigReloaded
@@ -912,6 +1014,59 @@ mod tests {
             }
         }
         assert!(found_reloaded, "expected ConfigReloaded event");
+    }
+
+    #[tokio::test]
+    async fn reload_preserves_failed_server_visibility_for_added_server() {
+        use crate::config::ServerConfig;
+        use std::collections::HashMap;
+
+        let engine = Arc::new(Engine::new(Config::default()));
+        engine.start().await.expect("engine start");
+
+        let mut new_config = Config::default();
+        new_config.servers.insert(
+            "broken".to_string(),
+            ServerConfig {
+                command: Some("definitely-not-a-real-command".to_string()),
+                args: vec![],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+
+        let report = engine
+            .reload_config(new_config)
+            .await
+            .expect("reload report");
+        assert!(
+            !report.errors.is_empty(),
+            "expected reload failure for invalid command"
+        );
+
+        let statuses = engine.server_statuses();
+        let broken = statuses
+            .iter()
+            .find(|status| status.server_id == "broken")
+            .expect("failed server should remain visible");
+        assert_eq!(broken.health, ServerHealth::Failed);
+        assert_eq!(broken.tool_count, 0);
+
+        engine.shutdown().await;
     }
 
     /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain

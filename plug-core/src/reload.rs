@@ -156,6 +156,7 @@ fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
         || old.auth != new.auth
         || old.oauth_client_id != new.oauth_client_id
         || old.oauth_scopes != new.oauth_scopes
+        || old.health_check_interval_secs != new.health_check_interval_secs
 }
 
 /// Apply a config diff to the running engine.
@@ -168,7 +169,7 @@ fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
 /// 5. Swap config via ArcSwap
 /// 6. Emit ConfigReloaded event
 pub async fn apply_reload(
-    engine: &crate::engine::Engine,
+    engine: &std::sync::Arc<crate::engine::Engine>,
     new_config: Config,
 ) -> Result<ReloadReport, anyhow::Error> {
     let old_config = engine.config();
@@ -185,11 +186,14 @@ pub async fn apply_reload(
     };
 
     let server_manager = engine.server_manager();
+    let mut spawn_after_swap: Vec<(String, ServerConfig)> = Vec::new();
 
     // 1. Stop removed servers
     for name in &diff.removed {
         tracing::info!(server = %name, "stopping removed server");
         server_manager.stop_server(name).await;
+        engine.clear_health_task_generation(name);
+        engine.clear_refresh_task_generation(name);
     }
 
     // 2. Restart changed servers
@@ -197,9 +201,16 @@ pub async fn apply_reload(
         tracing::info!(server = %name, "restarting changed server");
         server_manager.stop_server(name).await;
         if let Err(e) = server_manager.start_and_register(name, new_cfg).await {
+            if new_cfg.auth.as_deref() == Some("oauth") {
+                server_manager.mark_auth_required(name);
+            } else {
+                server_manager.mark_start_failure(name);
+            }
             let msg = format!("failed to restart server {name}: {e}");
             tracing::error!("{msg}");
             report.errors.push(msg);
+        } else if new_cfg.enabled {
+            spawn_after_swap.push((name.clone(), new_cfg.clone()));
         }
     }
 
@@ -207,17 +218,29 @@ pub async fn apply_reload(
     for (name, cfg) in &diff.added {
         tracing::info!(server = %name, "starting new server");
         if let Err(e) = server_manager.start_and_register(name, cfg).await {
+            if cfg.auth.as_deref() == Some("oauth") {
+                server_manager.mark_auth_required(name);
+            } else {
+                server_manager.mark_start_failure(name);
+            }
             let msg = format!("failed to start server {name}: {e}");
             tracing::error!("{msg}");
             report.errors.push(msg);
+        } else if cfg.enabled {
+            spawn_after_swap.push((name.clone(), cfg.clone()));
         }
     }
 
-    // 4. Refresh tool cache
-    engine.tool_router().refresh_tools().await;
-
-    // 5. Swap config atomically
+    // 4. Swap config atomically before spawning background tasks so new tasks
+    // observe the updated server set immediately.
     engine.store_config(new_config);
+
+    for (name, cfg) in &spawn_after_swap {
+        engine.spawn_background_tasks_for_server(name, cfg);
+    }
+
+    // 5. Refresh tool cache
+    engine.tool_router().refresh_tools().await;
 
     // 6. Emit event
     let _ = engine.event_sender().send(EngineEvent::ConfigReloaded);
@@ -411,5 +434,20 @@ mod tests {
 
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.changed.len(), 1);
+    }
+
+    #[test]
+    fn diff_health_interval_change_triggers_restart() {
+        let mut old = Config::default();
+        old.servers.insert("github".into(), make_server("npx"));
+
+        let mut new = Config::default();
+        let mut server = make_server("npx");
+        server.health_check_interval_secs = 5;
+        new.servers.insert("github".into(), server);
+
+        let diff = diff_configs(&old, &new);
+        assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.changed[0].0, "github");
     }
 }
