@@ -217,11 +217,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Ordered shutdown: cancel tasks → wait for drain → shutdown servers.
+    /// Bounded shutdown: cancel tasks, give background work a short drain window,
+    /// then explicitly retire upstreams without spending the full caller timeout.
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         self.tracker.close();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.tracker.wait()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.tracker.wait()).await;
         self.server_manager.shutdown_all().await;
     }
 
@@ -394,7 +395,7 @@ impl Engine {
             .await
         {
             Ok(upstream) => {
-                self.server_manager.replace_server(server_id, upstream);
+                self.server_manager.replace_server(server_id, upstream).await;
                 self.tool_router.refresh_tools().await;
 
                 let _ = self.event_tx.send(EngineEvent::ServerStarted {
@@ -490,7 +491,7 @@ impl Engine {
             }
         };
 
-        self.server_manager.replace_server(server_id, upstream);
+        self.server_manager.replace_server(server_id, upstream).await;
         self.tool_router.refresh_tools().await;
 
         let _ = self.event_tx.send(EngineEvent::ServerStarted {

@@ -32,6 +32,11 @@ use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportC
 use crate::types::{HealthState, ServerHealth, ServerStatus};
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
+const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
@@ -901,25 +906,11 @@ impl ServerManager {
         }
 
         tracing::info!(count = map.len(), "shutting down upstream servers");
-
-        for (name, upstream_arc) in map {
-            match Arc::try_unwrap(upstream_arc) {
-                Ok(upstream) => {
-                    tracing::info!(server = %name, "shutting down server");
-                    // Drop the UpstreamServer — rmcp client's Drop impl handles
-                    // sending the shutdown notification and cleaning up the process.
-                    drop(upstream);
-                    tracing::info!(server = %name, "server shut down");
-                }
-                Err(arc) => {
-                    tracing::warn!(
-                        server = %name,
-                        "could not take ownership; relying on Drop"
-                    );
-                    drop(arc);
-                }
-            }
-        }
+        join_all(
+            map.into_iter()
+                .map(|(name, upstream_arc)| retire_upstream_owned(name, upstream_arc, "shutdown_all")),
+        )
+        .await;
 
         self.health.clear();
         self.circuit_breakers.clear();
@@ -1040,25 +1031,15 @@ impl ServerManager {
             self.health.remove(name);
             self.circuit_breakers.remove(name);
             self.semaphores.remove(name);
-
-            match Arc::try_unwrap(upstream_arc) {
-                Ok(upstream) => {
-                    tracing::info!(server = %name, "stopped server");
-                    drop(upstream);
-                }
-                Err(arc) => {
-                    tracing::warn!(server = %name, "could not take ownership; relying on Drop");
-                    drop(arc);
-                }
-            }
+            retire_upstream_owned(name.to_string(), upstream_arc, "stop").await;
         }
     }
 
     /// Replace an upstream server (used after reconnection).
     /// Updates the servers map and resets circuit breaker and health state.
-    pub fn replace_server(&self, name: &str, upstream: UpstreamServer) {
+    pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
         let mut new_map = HashMap::clone(&self.servers.load());
-        new_map.insert(name.to_string(), Arc::new(upstream));
+        let old_upstream = new_map.insert(name.to_string(), Arc::new(upstream));
         self.servers.store(Arc::new(new_map));
 
         // Reset circuit breaker on successful reconnection
@@ -1072,6 +1053,18 @@ impl ServerManager {
         }
 
         tracing::info!(server = %name, "server replaced after reconnection");
+
+        if let Some(old_upstream) = old_upstream {
+            if Arc::strong_count(&old_upstream) > 1 {
+                let name = name.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(UPSTREAM_REPLACEMENT_GRACE_PERIOD).await;
+                    retire_upstream_owned(name, old_upstream, "replace_after_grace").await;
+                });
+            } else {
+                retire_upstream_owned(name.to_string(), old_upstream, "replace").await;
+            }
+        }
     }
 
     /// Get the reconnecting flag for a server (creates one if missing).
@@ -1081,6 +1074,48 @@ impl ServerManager {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
             .clone()
+    }
+}
+
+async fn retire_upstream_owned(name: String, upstream_arc: Arc<UpstreamServer>, reason: &str) {
+    upstream_arc.client.cancellation_token().cancel();
+
+    match Arc::try_unwrap(upstream_arc) {
+        Ok(mut upstream) => {
+            match upstream
+                .client
+                .close_with_timeout(UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT)
+                .await
+            {
+                Ok(Some(_)) => {
+                    tracing::info!(server = %name, reason, "retired upstream cleanly");
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        server = %name,
+                        reason,
+                        timeout_secs = UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT.as_secs(),
+                        "upstream shutdown timed out after cancellation"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        server = %name,
+                        reason,
+                        error = %error,
+                        "upstream shutdown join failed after cancellation"
+                    );
+                }
+            }
+        }
+        Err(arc) => {
+            tracing::warn!(
+                server = %name,
+                reason,
+                "could not take ownership of upstream; sent cancellation and dropped Arc"
+            );
+            drop(arc);
+        }
     }
 }
 
@@ -1526,6 +1561,107 @@ mod tests {
         assert_eq!(health.consecutive_failures, 0);
     }
 
+    #[tokio::test]
+    async fn replace_server_cancels_replaced_upstream_when_old_arc_is_still_held() {
+        let mgr = ServerManager::new();
+
+        let (upstream_server_a, tools_rx_a) = MutableToolServer::new(vec![make_tool("echo")]);
+        let upstream_peer_a = Arc::clone(&upstream_server_a.peer);
+        let (server_transport_a, client_transport_a) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = MutableToolServerHandler {
+                tools_rx: tools_rx_a,
+                peer: upstream_peer_a,
+            };
+            let server = handler
+                .serve(server_transport_a)
+                .await
+                .expect("start upstream test server a");
+            let _ = server.waiting().await;
+        });
+
+        let tools_a = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler_a = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("replace-test"),
+            tools: Arc::clone(&tools_a),
+            router: std::sync::Weak::new(),
+        });
+        let client_a: McpClient = upstream_handler_a
+            .serve(client_transport_a)
+            .await
+            .expect("connect upstream test client a");
+        let initial_tools_a = client_a.peer().list_all_tools().await.expect("initial tools a");
+        tools_a.store(Arc::new(initial_tools_a));
+
+        mgr.replace_server(
+            "replace-test",
+            UpstreamServer {
+                name: "replace-test".to_string(),
+                config: test_server_config(),
+                client: client_a,
+                tools: tools_a,
+                capabilities: ServerCapabilities::default(),
+                health: ServerHealth::Healthy,
+            },
+        )
+        .await;
+
+        let old_upstream = mgr.get_upstream("replace-test").expect("old upstream");
+        assert!(!old_upstream.client.is_closed(), "old upstream should start open");
+
+        let (upstream_server_b, tools_rx_b) = MutableToolServer::new(vec![make_tool("echo")]);
+        let upstream_peer_b = Arc::clone(&upstream_server_b.peer);
+        let (server_transport_b, client_transport_b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let handler = MutableToolServerHandler {
+                tools_rx: tools_rx_b,
+                peer: upstream_peer_b,
+            };
+            let server = handler
+                .serve(server_transport_b)
+                .await
+                .expect("start upstream test server b");
+            let _ = server.waiting().await;
+        });
+
+        let tools_b = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler_b = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("replace-test"),
+            tools: Arc::clone(&tools_b),
+            router: std::sync::Weak::new(),
+        });
+        let client_b: McpClient = upstream_handler_b
+            .serve(client_transport_b)
+            .await
+            .expect("connect upstream test client b");
+        let initial_tools_b = client_b.peer().list_all_tools().await.expect("initial tools b");
+        tools_b.store(Arc::new(initial_tools_b));
+
+        mgr.replace_server(
+            "replace-test",
+            UpstreamServer {
+                name: "replace-test".to_string(),
+                config: test_server_config(),
+                client: client_b,
+                tools: tools_b,
+                capabilities: ServerCapabilities::default(),
+                health: ServerHealth::Healthy,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if old_upstream.client.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replaced upstream should be cancelled even with lingering Arc");
+    }
+
     #[test]
     fn get_reconnecting_flag_returns_same_instance() {
         let mgr = ServerManager::new();
@@ -1594,7 +1730,8 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        server_manager.replace_server(
+        server_manager
+        .replace_server(
             "upstream",
             UpstreamServer {
                 name: "upstream".to_string(),
@@ -1604,7 +1741,8 @@ mod tests {
                 capabilities: ServerCapabilities::default(),
                 health: ServerHealth::Healthy,
             },
-        );
+        )
+        .await;
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
@@ -1692,7 +1830,8 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        server_manager.replace_server(
+        server_manager
+        .replace_server(
             "upstream",
             UpstreamServer {
                 name: "upstream".to_string(),
@@ -1702,7 +1841,8 @@ mod tests {
                 capabilities: ServerCapabilities::default(),
                 health: ServerHealth::Healthy,
             },
-        );
+        )
+        .await;
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
@@ -1784,7 +1924,8 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        server_manager.replace_server(
+        server_manager
+        .replace_server(
             "upstream",
             UpstreamServer {
                 name: "upstream".to_string(),
@@ -1794,7 +1935,8 @@ mod tests {
                 capabilities: ServerCapabilities::default(),
                 health: ServerHealth::Healthy,
             },
-        );
+        )
+        .await;
         router.refresh_tools().await;
 
         let proxy_handler = ProxyHandler::from_router(router.clone());
@@ -1888,7 +2030,8 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        server_manager.replace_server(
+        server_manager
+        .replace_server(
             "upstream",
             UpstreamServer {
                 name: "upstream".to_string(),
@@ -1898,7 +2041,8 @@ mod tests {
                 capabilities: ServerCapabilities::default(),
                 health: ServerHealth::Healthy,
             },
-        );
+        )
+        .await;
         router.refresh_tools().await;
 
         let proxy_handler = ProxyHandler::from_router(router.clone());
@@ -2023,7 +2167,8 @@ mod tests {
             .unwrap_or_default();
         tools.store(Arc::new(initial_tools));
 
-        server_manager.replace_server(
+        server_manager
+        .replace_server(
             "catalog",
             UpstreamServer {
                 name: "catalog".to_string(),
@@ -2033,7 +2178,8 @@ mod tests {
                 capabilities,
                 health: ServerHealth::Healthy,
             },
-        );
+        )
+        .await;
 
         router.refresh_tools().await;
 
