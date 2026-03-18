@@ -26,7 +26,7 @@ use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
-use crate::session::SessionStore;
+use crate::session::{SessionStore, SseMessage};
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -156,64 +156,69 @@ impl HttpState {
                             Ok(notification) => {
                                 match notification {
                                     ProtocolNotification::ToolListChanged => {
-                                        state.sessions.broadcast(
-                                            ProtocolNotification::ToolListChanged.to_json_value(),
-                                        );
+                                        if let Some(message) = notification_to_sse_message(
+                                            ProtocolNotification::ToolListChanged,
+                                        ) {
+                                            state.sessions.broadcast(message);
+                                        }
                                     }
                                     ProtocolNotification::ResourceListChanged => {
-                                        state.sessions.broadcast(
-                                            ProtocolNotification::ResourceListChanged
-                                                .to_json_value(),
-                                        );
+                                        if let Some(message) = notification_to_sse_message(
+                                            ProtocolNotification::ResourceListChanged,
+                                        ) {
+                                            state.sessions.broadcast(message);
+                                        }
                                     }
                                     ProtocolNotification::PromptListChanged => {
-                                        state.sessions.broadcast(
-                                            ProtocolNotification::PromptListChanged.to_json_value(),
-                                        );
+                                        if let Some(message) = notification_to_sse_message(
+                                            ProtocolNotification::PromptListChanged,
+                                        ) {
+                                            state.sessions.broadcast(message);
+                                        }
                                     }
                                     ProtocolNotification::Progress { target, params } => {
                                         if let NotificationTarget::Http { session_id } = target {
                                             let session_key = session_id.to_string();
-                                            state.sessions.send_to_session(
-                                                &session_key,
+                                            if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::Progress {
                                                     target: NotificationTarget::Http {
                                                         session_id,
                                                     },
                                                     params,
-                                                }
-                                                .to_json_value(),
-                                            );
+                                                },
+                                            ) {
+                                                state.sessions.send_to_session(&session_key, message);
+                                            }
                                         }
                                     }
                                     ProtocolNotification::Cancelled { target, params } => {
                                         if let NotificationTarget::Http { session_id } = target {
                                             let session_key = session_id.to_string();
-                                            state.sessions.send_to_session(
-                                                &session_key,
+                                            if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::Cancelled {
                                                     target: NotificationTarget::Http {
                                                         session_id,
                                                     },
                                                     params,
-                                                }
-                                                .to_json_value(),
-                                            );
+                                                },
+                                            ) {
+                                                state.sessions.send_to_session(&session_key, message);
+                                            }
                                         }
                                     }
                                     ProtocolNotification::ResourceUpdated { target, params } => {
                                         if let NotificationTarget::Http { session_id } = target {
                                             let session_key = session_id.to_string();
-                                            state.sessions.send_to_session(
-                                                &session_key,
+                                            if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::ResourceUpdated {
                                                     target: NotificationTarget::Http {
                                                         session_id,
                                                     },
                                                     params,
-                                                }
-                                                .to_json_value(),
-                                            );
+                                                },
+                                            ) {
+                                                state.sessions.send_to_session(&session_key, message);
+                                            }
                                         }
                                     }
                                     ref notification @ (
@@ -222,23 +227,27 @@ impl HttpState {
                                         | ProtocolNotification::AuthStateChanged { .. }
                                     ) => {
                                         if let Some(params) = notification.as_logging_message_params() {
-                                            let value = ProtocolNotification::LoggingMessage { params }
-                                                .to_json_value();
-                                            state.sessions.broadcast(value);
+                                            if let Some(message) = notification_to_sse_message(
+                                                ProtocolNotification::LoggingMessage { params },
+                                            ) {
+                                                state.sessions.broadcast(message);
+                                            }
                                         }
                                     }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
-                                let value = ProtocolNotification::LoggingMessage {
-                                    params: ProtocolNotification::control_lagged_logging_params(
-                                        skipped as u64,
-                                        "http",
-                                    ),
+                                if let Some(message) = notification_to_sse_message(
+                                    ProtocolNotification::LoggingMessage {
+                                        params: ProtocolNotification::control_lagged_logging_params(
+                                            skipped as u64,
+                                            "http",
+                                        ),
+                                    },
+                                ) {
+                                    state.sessions.broadcast(message);
                                 }
-                                .to_json_value();
-                                state.sessions.broadcast(value);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
@@ -258,7 +267,11 @@ impl HttpState {
                     recv = log_rx.recv() => {
                         match recv {
                             Ok(ref notif @ ProtocolNotification::LoggingMessage { .. }) => {
-                                log_state.sessions.broadcast(notif.to_json_value());
+                                if let Some(message) =
+                                    SseMessage::from_json_value(notif.to_json_value()).ok()
+                                {
+                                    log_state.sessions.broadcast(message);
+                                }
                             }
                             Ok(_) => {} // non-logging notifications on wrong channel
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -273,7 +286,11 @@ impl HttpState {
                                         )),
                                     },
                                 };
-                                log_state.sessions.broadcast(synthetic.to_json_value());
+                                if let Some(message) =
+                                    SseMessage::from_json_value(synthetic.to_json_value()).ok()
+                                {
+                                    log_state.sessions.broadcast(message);
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
@@ -282,6 +299,14 @@ impl HttpState {
             }
         });
     }
+}
+
+fn notification_to_sse_message(notification: ProtocolNotification) -> Option<SseMessage> {
+    SseMessage::from_json_value(notification.to_json_value())
+        .map_err(|error| {
+            tracing::error!(%error, "failed to serialize SSE notification payload");
+        })
+        .ok()
 }
 
 /// Build the axum Router with all middleware and handlers.
@@ -598,7 +623,11 @@ async fn send_http_client_request(
     let request_id = RequestId::from(NumberOrString::Number(id));
     let message = ServerJsonRpcMessage::request(request, request_id);
     let message = serde_json::to_value(message)
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        .map_err(|e| McpError::internal_error(e.to_string(), None))
+        .and_then(|value| {
+            SseMessage::from_json_value(value)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))
+        })?;
 
     let has_live_sse_sender = state.sessions.has_live_sse_sender(session_id).map_err(|_| {
         McpError::internal_error(
@@ -2035,7 +2064,7 @@ mod tests {
         tokio::spawn(async move {
             let message = rx.recv().await.expect("reverse request message");
             let message: ServerJsonRpcMessage =
-                serde_json::from_value(message).expect("deserialize reverse request");
+                serde_json::from_str(message.as_str()).expect("deserialize reverse request");
             let request_id = match message {
                 ServerJsonRpcMessage::Request(request) => request.id,
                 other => panic!("unexpected reverse request payload: {other:?}"),

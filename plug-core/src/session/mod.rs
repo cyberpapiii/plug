@@ -1,5 +1,7 @@
 mod stateful;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +11,31 @@ use crate::http::error::HttpError;
 pub use stateful::StatefulSessionStore;
 
 /// Server-to-client notification payload queued or delivered via SSE.
-pub type SseMessage = serde_json::Value;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseMessage {
+    serialized: Arc<str>,
+}
+
+impl SseMessage {
+    pub fn from_json_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::to_string(&value).map(|serialized| Self {
+            serialized: Arc::from(serialized),
+        })
+    }
+
+    pub fn from_serialized(serialized: Arc<str>) -> Self {
+        Self { serialized }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.serialized
+    }
+
+    #[cfg(test)]
+    pub fn to_json_value(&self) -> serde_json::Value {
+        serde_json::from_str(self.as_str()).expect("valid serialized SSE payload")
+    }
+}
 
 /// Transport type for a downstream client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

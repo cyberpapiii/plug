@@ -289,13 +289,56 @@ impl SessionStore for StatefulSessionStore {
     }
 
     fn broadcast(&self, message: SseMessage) {
-        let session_ids: Vec<String> = self
-            .sessions
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        for session_id in session_ids {
-            self.try_send_to_session(&session_id, &message);
+        let mut expired_sessions = Vec::new();
+        let mut queue_for_inactive_sessions = Vec::new();
+        let mut clear_and_requeue = Vec::new();
+        let mut delivered_sessions = Vec::new();
+
+        for entry in self.sessions.iter() {
+            let session_id: String = entry.key().clone();
+            if entry.last_activity.elapsed() > self.timeout {
+                expired_sessions.push(session_id);
+                continue;
+            }
+
+            if let Some(sender) = entry.sse_sender.as_ref() {
+                match sender.try_send(message.clone()) {
+                    Ok(()) => delivered_sessions.push(session_id),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        clear_and_requeue.push(session_id);
+                    }
+                }
+            } else {
+                queue_for_inactive_sessions.push(session_id);
+            }
+        }
+
+        for session_id in expired_sessions {
+            if self.sessions.remove(&session_id).is_some() {
+                self.notify_expired(&session_id);
+            }
+        }
+
+        for session_id in delivered_sessions {
+            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                entry.last_activity = Instant::now();
+            }
+        }
+
+        for session_id in queue_for_inactive_sessions {
+            if let Some(mut entry) = self.sessions.get_mut(&session_id)
+                && entry.sse_sender.is_none()
+            {
+                Self::enqueue_pending(&mut entry, message.clone());
+            }
+        }
+
+        for session_id in clear_and_requeue {
+            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                entry.sse_sender = None;
+                Self::enqueue_pending(&mut entry, message.clone());
+            }
         }
     }
 
@@ -487,7 +530,9 @@ mod tests {
         store.set_sse_sender(&id, tx).unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
-        store.broadcast(serde_json::json!({"type": "test"}));
+        store.broadcast(crate::session::SseMessage::from_json_value(
+            serde_json::json!({"type": "test"}),
+        ).unwrap());
 
         assert!(store.validate(&id).is_err());
         assert!(rx.try_recv().is_err());
@@ -505,16 +550,20 @@ mod tests {
         store.set_sse_sender(&fast_id, fast_tx).unwrap();
 
         slow_tx
-            .try_send(serde_json::json!({"type": "already-buffered"}))
+            .try_send(crate::session::SseMessage::from_json_value(
+                serde_json::json!({"type": "already-buffered"}),
+            ).unwrap())
             .unwrap();
 
-        store.broadcast(serde_json::json!({"type": "broadcast"}));
+        store.broadcast(crate::session::SseMessage::from_json_value(
+            serde_json::json!({"type": "broadcast"}),
+        ).unwrap());
 
         let received = tokio::time::timeout(Duration::from_secs(1), fast_rx.recv())
             .await
             .expect("fast receiver should not be blocked")
             .expect("fast receiver message present");
-        assert_eq!(received["type"], "broadcast");
+        assert_eq!(received.to_json_value()["type"], "broadcast");
     }
 
     #[tokio::test]
@@ -524,10 +573,18 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx.clone()).unwrap();
-        tx.try_send(serde_json::json!({"type": "already-buffered"}))
+        tx.try_send(crate::session::SseMessage::from_json_value(
+            serde_json::json!({"type": "already-buffered"}),
+        ).unwrap())
             .unwrap();
 
-        store.send_to_session(&id, serde_json::json!({"type": "requeued"}));
+        store.send_to_session(
+            &id,
+            crate::session::SseMessage::from_json_value(
+                serde_json::json!({"type": "requeued"}),
+            )
+            .unwrap(),
+        );
 
         let (new_tx, mut new_rx) = mpsc::channel(1);
         store.set_sse_sender(&id, new_tx).unwrap();
@@ -536,6 +593,6 @@ mod tests {
             .await
             .expect("requeued message should be delivered")
             .expect("requeued message present");
-        assert_eq!(received["type"], "requeued");
+        assert_eq!(received.to_json_value()["type"], "requeued");
     }
 }

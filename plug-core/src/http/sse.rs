@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::session::SseMessage;
+
 /// Create an SSE stream from an mpsc receiver with disconnect detection.
 ///
 /// - Sends a priming event as the first event (SHOULD per MCP spec 2025-11-25)
@@ -14,14 +16,14 @@ use tokio_util::sync::CancellationToken;
 /// - Uses `biased` select to prioritize shutdown over messages
 /// - KeepAlive sends SSE comments (not events) to avoid confusing MCP clients
 pub fn sse_stream(
-    rx: mpsc::Receiver<serde_json::Value>,
+    rx: mpsc::Receiver<SseMessage>,
     cancel: CancellationToken,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), || {})
 }
 
 pub fn sse_stream_with_heartbeat<F>(
-    rx: mpsc::Receiver<serde_json::Value>,
+    rx: mpsc::Receiver<SseMessage>,
     cancel: CancellationToken,
     mut on_keepalive: F,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
@@ -34,7 +36,7 @@ where
 }
 
 fn sse_stream_with_heartbeat_interval<F>(
-    rx: mpsc::Receiver<serde_json::Value>,
+    rx: mpsc::Receiver<SseMessage>,
     cancel: CancellationToken,
     keepalive_interval: Duration,
     mut on_keepalive: F,
@@ -64,15 +66,8 @@ where
                 msg = rx.next() => {
                     match msg {
                         Some(msg) => {
-                            match serde_json::to_string(&msg) {
-                                Ok(data) => {
-                                    yield Ok(Event::default().id(event_id.to_string()).data(data));
-                                    event_id += 1;
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "failed to serialize SSE message");
-                                }
-                            }
+                            yield Ok(Event::default().id(event_id.to_string()).data(msg.as_str()));
+                            event_id += 1;
                         }
                         None => {
                             tracing::debug!("SSE sender dropped, closing stream");
@@ -155,8 +150,12 @@ mod tests {
         let body = response.into_body();
 
         // Send two messages
-        tx.send(serde_json::json!({"msg": "hello"})).await.unwrap();
-        tx.send(serde_json::json!({"msg": "world"})).await.unwrap();
+        tx.send(SseMessage::from_json_value(serde_json::json!({"msg": "hello"})).unwrap())
+            .await
+            .unwrap();
+        tx.send(SseMessage::from_json_value(serde_json::json!({"msg": "world"})).unwrap())
+            .await
+            .unwrap();
         drop(tx);
 
         let events = collect_sse_events(body, 4).await;
@@ -172,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_closes_stream() {
-        let (_tx, rx) = mpsc::channel::<serde_json::Value>(8);
+        let (_tx, rx) = mpsc::channel::<SseMessage>(8);
         let cancel = CancellationToken::new();
 
         let sse = sse_stream(rx, cancel.clone());
@@ -195,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_emits_comment_and_runs_callback() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let (_tx, rx) = mpsc::channel::<serde_json::Value>(8);
+        let (_tx, rx) = mpsc::channel::<SseMessage>(8);
         let cancel = CancellationToken::new();
         let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = std::sync::Arc::clone(&heartbeats);
