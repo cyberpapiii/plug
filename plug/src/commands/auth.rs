@@ -106,7 +106,16 @@ pub(crate) async fn cmd_auth(
             access_token,
             refresh_token,
             expires_in,
-        } => cmd_auth_inject(&server, &access_token, refresh_token.as_deref(), expires_in).await,
+        } => {
+            cmd_auth_inject(
+                config_path,
+                &server,
+                &access_token,
+                refresh_token.as_deref(),
+                expires_in,
+            )
+            .await
+        }
         crate::AuthCommands::Status => cmd_auth_status(config_path, output).await,
         crate::AuthCommands::Logout { server } => cmd_auth_logout(&server).await,
     }
@@ -406,7 +415,24 @@ async fn cmd_auth_complete(
 // inject
 // ---------------------------------------------------------------------------
 
+fn injected_client_identity(
+    server_config: Option<&plug_core::config::ServerConfig>,
+    has_refresh_token: bool,
+) -> (String, bool) {
+    let Some(server_config) = server_config else {
+        return ("injected".to_string(), false);
+    };
+    if !has_refresh_token || server_config.auth.as_deref() != Some("oauth") {
+        return ("injected".to_string(), false);
+    }
+    if let Some(client_id) = server_config.oauth_client_id.as_deref() {
+        return (client_id.to_string(), true);
+    }
+    ("injected".to_string(), false)
+}
+
 async fn cmd_auth_inject(
+    config_path: Option<&PathBuf>,
     server_name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
@@ -415,6 +441,11 @@ async fn cmd_auth_inject(
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::VendorExtraTokenFields;
 
+    let cfg = config::load_config(config_path)?;
+    let server_config = cfg
+        .servers
+        .get(server_name)
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
     let store = oauth::get_or_create_store(server_name);
 
     let now = SystemTime::now()
@@ -436,8 +467,11 @@ async fn cmd_auth_inject(
         token.set_expires_in(Some(&std::time::Duration::from_secs(secs)));
     }
 
+    let (client_id, refreshable) =
+        injected_client_identity(Some(server_config), refresh_token.is_some());
+
     let stored = StoredCredentials {
-        client_id: "injected".to_string(),
+        client_id,
         token_response: Some(token),
         granted_scopes: vec![],
         token_received_at: Some(now),
@@ -451,7 +485,13 @@ async fn cmd_auth_inject(
     ui::print_success_line(format!("Injected credentials for server '{server_name}'"));
 
     if refresh_token.is_some() {
-        ui::print_info_line("Refresh token stored -- background refresh will work");
+        if refreshable {
+            ui::print_info_line("Refresh token stored -- background refresh is enabled");
+        } else {
+            ui::print_warning_line(
+                "Refresh token stored, but automatic refresh is unavailable without a configured OAuth client ID.",
+            );
+        }
     } else {
         ui::print_info_line("No refresh token -- token will not auto-renew");
     }
@@ -797,6 +837,39 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn injected_client_identity_requires_configured_oauth_client_for_refresh() {
+        let server = plug_core::config::ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Http,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: Some("oauth".to_string()),
+            oauth_client_id: Some("client-123".to_string()),
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+        };
+
+        let (client_id, refreshable) = injected_client_identity(Some(&server), true);
+        assert_eq!(client_id, "client-123");
+        assert!(refreshable);
+
+        let (fallback_client_id, fallback_refreshable) =
+            injected_client_identity(Some(&server), false);
+        assert_eq!(fallback_client_id, "injected");
+        assert!(!fallback_refreshable);
+    }
 
     #[test]
     fn auth_status_source_text_distinguishes_live_from_fallback() {
