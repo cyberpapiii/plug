@@ -32,6 +32,9 @@ struct SharedConnection {
     peer: std::sync::OnceLock<Peer<RoleServer>>,
     /// Whether the downstream client advertises roots capability.
     roots_supported: std::sync::atomic::AtomicBool,
+    /// Notifications received during daemon session establishment before the
+    /// downstream peer exists. Flushed after initialize.
+    pending_daemon_notifications: std::sync::Mutex<Vec<IpcResponse>>,
 }
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
@@ -60,12 +63,15 @@ struct TransportFailure {
 impl IpcProxyHandler {
     /// Create a new proxy handler from an established IPC connection.
     pub fn new(session: crate::runtime::DaemonProxySession, config_path: Option<PathBuf>) -> Self {
+        let pending_daemon_notifications =
+            std::sync::Mutex::new(session.pending_notifications.clone());
         let shared = Arc::new(SharedConnection {
             capabilities: std::sync::RwLock::new(session.capabilities.clone()),
             conn: Mutex::new(session),
             config_path,
             peer: std::sync::OnceLock::new(),
             roots_supported: std::sync::atomic::AtomicBool::new(false),
+            pending_daemon_notifications,
         });
         let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
         Self { shared, heartbeat }
@@ -414,6 +420,31 @@ async fn forward_control_notification(peer: Option<&Peer<RoleServer>>, response:
     }
 }
 
+async fn flush_pending_daemon_notifications(shared: &SharedConnection) {
+    let pending = {
+        let mut guard = shared
+            .pending_daemon_notifications
+            .lock()
+            .expect("pending daemon notifications mutex poisoned");
+        std::mem::take(&mut *guard)
+    };
+
+    let peer = shared.peer.get();
+    for response in pending {
+        match response {
+            IpcResponse::LoggingNotification { params } => {
+                if let Some(peer) = peer
+                    && let Ok(notif_params) =
+                        serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                {
+                    let _ = peer.notify_logging_message(notif_params).await;
+                }
+            }
+            other => forward_control_notification(peer, other).await,
+        }
+    }
+}
+
 impl Drop for IpcProxyHandler {
     fn drop(&mut self) {
         self.heartbeat.abort();
@@ -489,6 +520,7 @@ impl ServerHandler for IpcProxyHandler {
             // pushes LoggingNotification frames after registration; the
             // heartbeat and request round-trips forward them to this peer.
             let _ = self.shared.peer.set(context.peer.clone());
+            flush_pending_daemon_notifications(&self.shared).await;
 
             context.peer.set_peer_info(request);
             Ok(self.get_info())
@@ -906,19 +938,25 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
                 tracing::debug!(error = %e, "failed to send UpdateRoots to daemon");
                 return;
             }
-            // Read response (skipping interleaved logging notifications)
+            // Read response while forwarding any interleaved daemon push traffic.
             loop {
                 match ipc::read_frame(&mut conn.reader).await {
                     Ok(Some(frame)) => match serde_json::from_slice::<IpcResponse>(&frame) {
                         Ok(IpcResponse::LoggingNotification { params }) => {
-                            if let Some(peer) = shared.peer.get() {
-                                if let Ok(notif_params) = serde_json::from_value::<
-                                    LoggingMessageNotificationParam,
-                                >(params)
-                                {
-                                    let _ = peer.notify_logging_message(notif_params).await;
-                                }
+                            if let Ok(notif_params) =
+                                serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                            {
+                                let _ = peer.notify_logging_message(notif_params).await;
                             }
+                            continue;
+                        }
+                        Ok(resp @ (IpcResponse::ToolListChangedNotification
+                        | IpcResponse::ResourceListChangedNotification
+                        | IpcResponse::PromptListChangedNotification
+                        | IpcResponse::ProgressNotification { .. }
+                        | IpcResponse::CancelledNotification { .. }
+                        | IpcResponse::AuthStateChanged { .. })) => {
+                            forward_control_notification(Some(peer), resp).await;
                             continue;
                         }
                         Ok(IpcResponse::Ok) => break,

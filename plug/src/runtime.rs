@@ -430,6 +430,67 @@ pub(crate) struct DaemonProxySession {
     pub(crate) client_info: Option<String>,
     pub(crate) session_id: String,
     pub(crate) capabilities: rmcp::model::ServerCapabilities,
+    pub(crate) pending_notifications: Vec<plug_core::ipc::IpcResponse>,
+}
+
+enum PendingIpcResponse {
+    Registered(String),
+    Capabilities(rmcp::model::ServerCapabilities),
+}
+
+async fn read_pending_or_matching_response(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    expected_client_id: &str,
+    pending_notifications: &mut Vec<plug_core::ipc::IpcResponse>,
+    matcher: impl Fn(&plug_core::ipc::IpcResponse) -> Option<PendingIpcResponse>,
+) -> anyhow::Result<PendingIpcResponse> {
+    loop {
+        let frame = plug_core::ipc::read_frame(reader)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed connection while waiting for response"))?;
+        let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)
+            .map_err(|e| anyhow::anyhow!("invalid daemon response: {e}"))?;
+
+        if let Some(matched) = matcher(&response) {
+            return Ok(matched);
+        }
+
+        match response {
+            plug_core::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!("{code}: {message}");
+            }
+            plug_core::ipc::IpcResponse::Registered {
+                protocol_version,
+                client_id,
+                session_id,
+            } => {
+                if protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{}",
+                        plug_core::ipc::IPC_PROTOCOL_VERSION
+                    );
+                }
+                if client_id != expected_client_id {
+                    anyhow::bail!(
+                        "daemon/client registration mismatch: expected client_id {expected_client_id}, got {client_id}"
+                    );
+                }
+                return Ok(PendingIpcResponse::Registered(session_id));
+            }
+            resp @ (plug_core::ipc::IpcResponse::LoggingNotification { .. }
+            | plug_core::ipc::IpcResponse::ToolListChangedNotification
+            | plug_core::ipc::IpcResponse::ResourceListChangedNotification
+            | plug_core::ipc::IpcResponse::PromptListChangedNotification
+            | plug_core::ipc::IpcResponse::ProgressNotification { .. }
+            | plug_core::ipc::IpcResponse::CancelledNotification { .. }
+            | plug_core::ipc::IpcResponse::AuthStateChanged { .. }) => {
+                pending_notifications.push(resp);
+            }
+            other => {
+                anyhow::bail!("unexpected daemon response while waiting for IPC setup: {other:?}");
+            }
+        }
+    }
 }
 
 pub(crate) async fn establish_daemon_proxy_session(
@@ -446,6 +507,7 @@ pub(crate) async fn establish_daemon_proxy_session(
     };
 
     let (mut reader, mut writer) = stream.into_split();
+    let mut pending_notifications = Vec::new();
     let register_req = plug_core::ipc::IpcRequest::Register {
         protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
         client_id: client_id.clone(),
@@ -453,21 +515,45 @@ pub(crate) async fn establish_daemon_proxy_session(
     };
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
-
-    let frame = plug_core::ipc::read_frame(&mut reader)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed during registration"))?;
-
-    let session_id = parse_registered_session(&frame, &client_id)?;
+    let session_id = match read_pending_or_matching_response(
+        &mut reader,
+        &client_id,
+        &mut pending_notifications,
+        |response| match response {
+            plug_core::ipc::IpcResponse::Registered { session_id, .. } => {
+                Some(PendingIpcResponse::Registered(session_id.clone()))
+            }
+            _ => None,
+        },
+    )
+    .await?
+    {
+        PendingIpcResponse::Registered(session_id) => session_id,
+        PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
+    };
     let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
         session_id: session_id.clone(),
     };
     let capabilities_payload = serde_json::to_vec(&capabilities_req)?;
     plug_core::ipc::write_frame(&mut writer, &capabilities_payload).await?;
-    let capabilities_frame = plug_core::ipc::read_frame(&mut reader)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed while fetching capabilities"))?;
-    let capabilities = parse_capabilities_response(&capabilities_frame)?;
+    let capabilities = match read_pending_or_matching_response(
+        &mut reader,
+        &client_id,
+        &mut pending_notifications,
+        |response| match response {
+            plug_core::ipc::IpcResponse::Capabilities { capabilities } => serde_json::from_value(
+                capabilities.clone(),
+            )
+            .ok()
+            .map(PendingIpcResponse::Capabilities),
+            _ => None,
+        },
+    )
+    .await?
+    {
+        PendingIpcResponse::Capabilities(capabilities) => capabilities,
+        PendingIpcResponse::Registered(_) => unreachable!("capabilities response expected"),
+    };
     Ok(DaemonProxySession {
         reader,
         writer,
@@ -475,74 +561,8 @@ pub(crate) async fn establish_daemon_proxy_session(
         client_info,
         session_id,
         capabilities,
+        pending_notifications,
     })
-}
-
-fn parse_registered_session(frame: &[u8], expected_client_id: &str) -> anyhow::Result<String> {
-    let value: serde_json::Value = serde_json::from_slice(frame)
-        .map_err(|e| anyhow::anyhow!("invalid daemon registration response: {e}"))?;
-
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("Error") => {
-            let response: plug_core::ipc::IpcResponse = serde_json::from_value(value)?;
-            if let plug_core::ipc::IpcResponse::Error { code, message } = response {
-                anyhow::bail!("{code}: {message}");
-            }
-            unreachable!("validated Error response")
-        }
-        Some("Registered") => {
-            let protocol_version = value
-                .get("protocol_version")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "daemon/client protocol mismatch: restart plug connect after upgrading"
-                    )
-                })?;
-            if protocol_version != u64::from(plug_core::ipc::IPC_PROTOCOL_VERSION) {
-                anyhow::bail!(
-                    "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{}",
-                    plug_core::ipc::IPC_PROTOCOL_VERSION
-                );
-            }
-
-            let response_client_id = value
-                .get("client_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "daemon/client protocol mismatch: restart plug connect after upgrading"
-                    )
-                })?;
-            if response_client_id != expected_client_id {
-                anyhow::bail!(
-                    "daemon/client registration mismatch: expected client_id {expected_client_id}, got {response_client_id}"
-                );
-            }
-
-            value
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("registration failed: missing session_id"))
-        }
-        Some(other) => anyhow::bail!("registration failed: unexpected response type {other}"),
-        None => anyhow::bail!("registration failed: malformed response"),
-    }
-}
-
-fn parse_capabilities_response(frame: &[u8]) -> anyhow::Result<rmcp::model::ServerCapabilities> {
-    let response: plug_core::ipc::IpcResponse = serde_json::from_slice(frame)
-        .map_err(|e| anyhow::anyhow!("invalid daemon capabilities response: {e}"))?;
-
-    match response {
-        plug_core::ipc::IpcResponse::Capabilities { capabilities } => {
-            serde_json::from_value(capabilities)
-                .map_err(|e| anyhow::anyhow!("invalid daemon capabilities payload: {e}"))
-        }
-        plug_core::ipc::IpcResponse::Error { code, message } => anyhow::bail!("{code}: {message}"),
-        other => anyhow::bail!("unexpected daemon capabilities response: {other:?}"),
-    }
 }
 
 pub(crate) async fn connect_via_daemon(
