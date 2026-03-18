@@ -157,7 +157,9 @@ impl Worker for LegacySseWorker {
         self,
         mut context: WorkerContext<Self>,
     ) -> Result<(), WorkerQuitReason<Self::Error>> {
-        let (sse_tx, mut sse_rx) =
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(self.config.channel_buffer_capacity);
+        let (notification_tx, mut notification_rx) =
             tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(self.config.channel_buffer_capacity);
         let (endpoint_tx, endpoint_rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
         let transport_ct = context.cancellation_token.clone();
@@ -165,7 +167,8 @@ impl Worker for LegacySseWorker {
             self.client.clone(),
             self.config.clone(),
             endpoint_tx,
-            sse_tx.clone(),
+            response_tx,
+            notification_tx,
             transport_ct.child_token(),
         ));
 
@@ -193,20 +196,30 @@ impl Worker for LegacySseWorker {
         // response arrives; buffer them so startup stays lossless.
         let mut buffered_preinitialize_messages = VecDeque::new();
         let initialize_response = loop {
-            let Some(message) = sse_rx.recv().await else {
-                return Err(WorkerQuitReason::fatal(
-                    LegacySseError::TransportChannelClosed,
-                    "legacy SSE stream closed before initialize response",
-                ));
-            };
-            if is_response_message(&message) {
-                break message;
+            tokio::select! {
+                response = response_rx.recv() => {
+                    let Some(message) = response else {
+                        return Err(WorkerQuitReason::fatal(
+                            LegacySseError::TransportChannelClosed,
+                            "legacy SSE response channel closed before initialize response",
+                        ));
+                    };
+                    break message;
+                }
+                notification = notification_rx.recv() => {
+                    let Some(message) = notification else {
+                        return Err(WorkerQuitReason::fatal(
+                            LegacySseError::TransportChannelClosed,
+                            "legacy SSE notification channel closed before initialize response",
+                        ));
+                    };
+                    buffered_preinitialize_messages.push_back(message);
+                }
             }
-            buffered_preinitialize_messages.push_back(message);
         };
         context.send_to_handler(initialize_response).await?;
         while let Some(message) = buffered_preinitialize_messages.pop_front() {
-            context.send_to_handler(message).await?;
+            deliver_notification_best_effort(&context, message)?;
         }
 
         loop {
@@ -227,14 +240,23 @@ impl Worker for LegacySseWorker {
                     ).await;
                     let _ = send.responder.send(response.map(|_| ()));
                 }
-                server_message = sse_rx.recv() => {
-                    let Some(server_message) = server_message else {
+                response = response_rx.recv() => {
+                    let Some(server_message) = response else {
                         return Err(WorkerQuitReason::fatal(
                             LegacySseError::TransportChannelClosed,
-                            "legacy SSE message channel closed",
+                            "legacy SSE response channel closed",
                         ));
                     };
                     context.send_to_handler(server_message).await?;
+                }
+                notification = notification_rx.recv() => {
+                    let Some(server_message) = notification else {
+                        return Err(WorkerQuitReason::fatal(
+                            LegacySseError::TransportChannelClosed,
+                            "legacy SSE notification channel closed",
+                        ));
+                    };
+                    deliver_notification_best_effort(&context, server_message)?;
                 }
                 result = &mut stream_task => {
                     let result = result.map_err(WorkerQuitReason::Join)?;
@@ -252,11 +274,28 @@ fn is_response_message(message: &ServerJsonRpcMessage) -> bool {
     )
 }
 
+fn deliver_notification_best_effort(
+    context: &WorkerContext<LegacySseWorker>,
+    message: ServerJsonRpcMessage,
+) -> Result<(), WorkerQuitReason<LegacySseError>> {
+    match context.to_handler_tx.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("dropping legacy SSE notification due to downstream handler backpressure");
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(WorkerQuitReason::HandlerTerminated)
+        }
+    }
+}
+
 async fn run_sse_loop(
     client: reqwest::Client,
     config: LegacySseTransportConfig,
     endpoint_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
-    sse_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
+    response_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
+    notification_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
     ct: tokio_util::sync::CancellationToken,
 ) -> Result<(), WorkerQuitReason<LegacySseError>> {
     let mut last_event_id: Option<String> = None;
@@ -319,7 +358,14 @@ async fn run_sse_loop(
                                     continue;
                                 }
                             };
-                            sse_tx.send(message).await.map_err(|_| WorkerQuitReason::HandlerTerminated)?;
+                            if is_response_message(&message) {
+                                response_tx
+                                    .send(message)
+                                    .await
+                                    .map_err(|_| WorkerQuitReason::HandlerTerminated)?;
+                            } else if notification_tx.try_send(message).is_err() {
+                                tracing::warn!("dropping legacy SSE notification due to worker backpressure");
+                            }
                         }
                         Some(Err(error)) => {
                             let Some(delay) = config.retry_policy.retry(retry_count) else {
@@ -498,9 +544,10 @@ mod tests {
     use rmcp::ServiceExt as _;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
-        ClientRequest, Implementation, InitializeResult, ListToolsResult, LoggingLevel,
-        LoggingMessageNotification, LoggingMessageNotificationParam, ServerCapabilities,
-        ServerNotification, ServerResult, Tool, ToolsCapability,
+        CallToolRequestParams, ClientRequest, Content, Implementation, InitializeResult,
+        ListToolsResult, LoggingLevel, LoggingMessageNotification,
+        LoggingMessageNotificationParam, ServerCapabilities, ServerNotification, ServerResult,
+        Tool, ToolsCapability,
     };
     use rmcp::service::NotificationContext;
     use serde_json::json;
@@ -625,6 +672,7 @@ mod tests {
     struct LoggingCaptureClient {
         signal: Arc<Notify>,
         payloads: Arc<Mutex<Vec<serde_json::Value>>>,
+        notification_delay: Duration,
     }
 
     impl ClientHandler for LoggingCaptureClient {
@@ -637,6 +685,9 @@ mod tests {
             params: LoggingMessageNotificationParam,
             _context: NotificationContext<rmcp::RoleClient>,
         ) {
+            if !self.notification_delay.is_zero() {
+                tokio::time::sleep(self.notification_delay).await;
+            }
             self.payloads.lock().unwrap().push(params.data);
             self.signal.notify_one();
         }
@@ -651,6 +702,7 @@ mod tests {
         let handler = Arc::new(LoggingCaptureClient {
             signal: Arc::clone(&signal),
             payloads: Arc::clone(&payloads),
+            notification_delay: Duration::ZERO,
         });
 
         let transport = LegacySseClientTransport::from_config(
@@ -665,6 +717,34 @@ mod tests {
         assert_eq!(
             payloads.lock().unwrap().as_slice(),
             &[json!({"phase": "before_initialize_response"})]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn responses_are_not_blocked_by_notification_backlog() {
+        crate::tls::ensure_rustls_provider_installed();
+        let (server_url, _server_handle) = spawn_legacy_sse_server_with_noisy_call().await;
+        let handler = Arc::new(LoggingCaptureClient {
+            signal: Arc::new(Notify::new()),
+            payloads: Arc::new(Mutex::new(Vec::new())),
+            notification_delay: Duration::from_millis(50),
+        });
+        let transport = LegacySseClientTransport::from_config(
+            LegacySseTransportConfig::with_uri(server_url).endpoint_wait_timeout(Duration::from_secs(1)),
+        );
+        let client = handler.serve(transport).await.expect("connect noisy legacy SSE client");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.peer().call_tool(CallToolRequestParams::new("echo")),
+        )
+        .await
+        .expect("tool response should not stall behind notifications")
+        .expect("call tool over noisy legacy SSE");
+
+        assert!(
+            format!("{result:?}").contains("noisy call completed"),
+            "unexpected tool response: {result:?}"
         );
     }
 
@@ -684,6 +764,27 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve legacy SSE early logging server");
+        });
+
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    async fn spawn_legacy_sse_server_with_noisy_call() -> (String, tokio::task::JoinHandle<()>) {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        let state = EarlyNotificationState { tx };
+        let app = Router::new()
+            .route("/mcp", get(early_logging_stream))
+            .route("/messages", post(noisy_call_messages))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind noisy legacy SSE server");
+        let addr = listener.local_addr().expect("noisy legacy SSE addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve noisy legacy SSE server");
         });
 
         (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
@@ -749,6 +850,75 @@ mod tests {
                     let _ = state.tx.send(
                         sse_stream::Sse::default()
                             .data(serde_json::to_string(&response).expect("serialize list tools response")),
+                    );
+                }
+                _ => {}
+            }
+        }
+        StatusCode::ACCEPTED
+    }
+
+    async fn noisy_call_messages(
+        State(state): State<EarlyNotificationState>,
+        Json(message): Json<ClientJsonRpcMessage>,
+    ) -> StatusCode {
+        if let ClientJsonRpcMessage::Request(request) = message {
+            match request.request {
+                ClientRequest::InitializeRequest(_) => {
+                    let mut capabilities = ServerCapabilities::default();
+                    capabilities.tools = Some(ToolsCapability {
+                        list_changed: Some(false),
+                    });
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::InitializeResult(
+                            InitializeResult::new(capabilities)
+                                .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
+                        ),
+                        request.id,
+                    );
+                    let _ = state.tx.send(
+                        sse_stream::Sse::default()
+                            .data(serde_json::to_string(&response).expect("serialize initialize response")),
+                    );
+                }
+                ClientRequest::ListToolsRequest(_) => {
+                    let mut tool = Tool::default();
+                    tool.name = "echo".into();
+                    tool.description = Some("Echo".into());
+                    tool.input_schema = Arc::new(serde_json::Map::new());
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![tool])),
+                        request.id,
+                    );
+                    let _ = state.tx.send(
+                        sse_stream::Sse::default()
+                            .data(serde_json::to_string(&response).expect("serialize list tools response")),
+                    );
+                }
+                ClientRequest::CallToolRequest(_) => {
+                    for idx in 0..32 {
+                        let logging = ServerJsonRpcMessage::notification(
+                            ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
+                                LoggingMessageNotificationParam::new(
+                                    LoggingLevel::Info,
+                                    json!({"burst": idx}),
+                                ),
+                            )),
+                        );
+                        let _ = state.tx.send(
+                            sse_stream::Sse::default()
+                                .data(serde_json::to_string(&logging).expect("serialize noisy logging notification")),
+                        );
+                    }
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::CallToolResult(rmcp::model::CallToolResult::success(vec![
+                            Content::text("noisy call completed"),
+                        ])),
+                        request.id,
+                    );
+                    let _ = state.tx.send(
+                        sse_stream::Sse::default()
+                            .data(serde_json::to_string(&response).expect("serialize tool response")),
                     );
                 }
                 _ => {}
