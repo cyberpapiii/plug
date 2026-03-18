@@ -108,7 +108,7 @@ async fn check_config_exists(config_path: &Path) -> CheckResult {
             name,
             status: CheckStatus::Warn,
             message: format!("Config file not found: {}", config_path.display()),
-            fix_suggestion: Some("Run `plug init` to create a default config".to_string()),
+            fix_suggestion: Some("Run `plug setup` to create and link a config".to_string()),
         };
     }
 
@@ -1145,6 +1145,10 @@ mod tests {
         let result = check_config_exists(Path::new("/nonexistent/path/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains("not found"));
+        assert_eq!(
+            result.fix_suggestion.as_deref(),
+            Some("Run `plug setup` to create and link a config")
+        );
     }
 
     #[tokio::test]
