@@ -518,6 +518,11 @@ impl CompositeCredentialStore {
         warnings
     }
 
+    fn persisted_credentials_match(lhs: &StoredCredentials, rhs: &StoredCredentials) -> bool {
+        lhs.token_received_at == rhs.token_received_at
+            && Self::token_identity(lhs) == Self::token_identity(rhs)
+    }
+
     pub fn backing_store_warnings(&self) -> Vec<String> {
         let file = self.file_load();
         let keyring = self.keyring_load();
@@ -558,6 +563,20 @@ impl CompositeCredentialStore {
                 warnings,
             },
             Some((creds, source)) => {
+                if matches!(source, CredentialSource::Keyring)
+                    && persisted_file
+                        .as_ref()
+                        .map(|file| !Self::persisted_credentials_match(file, creds))
+                        .unwrap_or(true)
+                {
+                    if let Err(error) = self.file_save(creds) {
+                        warn!(
+                            server = %self.server_name,
+                            error = %error,
+                            "token file mirror repair failed after keyring-backed load"
+                        );
+                    }
+                }
                 self.update_cache(creds);
                 CredentialSnapshot {
                     credentials: Some(creds.clone()),
@@ -1307,6 +1326,38 @@ mod tests {
             warnings,
             vec!["token file mirror exists but keyring entry is missing".to_string()]
         );
+
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_repairs_missing_file_mirror_from_keyring() {
+        let name = format!("oauth-repair-file-mirror-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let creds = make_test_token("keyring-only-access", Some("keyring-only-refresh"), Some(3600));
+        store.save(creds.clone()).await.unwrap();
+
+        // Simulate the operator state we hit locally: keyring entry exists, but
+        // the non-interactive token-file mirror is gone before a cold read.
+        store.file_clear();
+        store.clear_cache();
+
+        assert!(store.file_load().is_none(), "expected file mirror to be missing before load");
+
+        let loaded = store.load().await.unwrap();
+        assert!(loaded.is_some(), "expected keyring-backed load to succeed");
+
+        let mirrored = store
+            .file_load()
+            .expect("expected load to repair the missing token-file mirror");
+        use oauth2::TokenResponse;
+        let token = mirrored
+            .token_response
+            .as_ref()
+            .map(|tr| tr.access_token().secret().to_string());
+        assert_eq!(token.as_deref(), Some("keyring-only-access"));
 
         store.clear().await.unwrap();
     }
