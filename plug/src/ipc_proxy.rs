@@ -460,8 +460,19 @@ impl ServerHandler for IpcProxyHandler {
             .read()
             .map(|caps| caps.clone())
             .unwrap_or_default();
-        InitializeResult::new(capabilities)
-            .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+        InitializeResult::new(capabilities).with_server_info(
+            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+                .with_title("Plug")
+                .with_description("MCP multiplexer")
+                .with_website_url("https://github.com/plug-mcp/plug")
+                .with_icons(vec![
+                    Icon::new(
+                        "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+                    )
+                    .with_mime_type("image/svg+xml")
+                    .with_sizes(vec!["any".to_string()]),
+                ]),
+        )
             .with_protocol_version(
                 serde_json::from_value(serde_json::Value::String(
                     LATEST_PROTOCOL_VERSION.to_string(),
@@ -514,6 +525,32 @@ impl ServerHandler for IpcProxyHandler {
                 .await
             {
                 tracing::warn!(error = %e, "failed to update session capabilities");
+            }
+
+            // Refresh daemon-derived server capabilities at handshake time so
+            // downstream initialize sees the current routed surface, including
+            // late-bound capabilities like tasks once tools are available.
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::Capabilities {
+                        session_id: session_id.to_string(),
+                    }
+                })
+                .await
+            {
+                Ok(IpcResponse::Capabilities { capabilities }) => {
+                    if let Ok(parsed) = serde_json::from_value::<ServerCapabilities>(capabilities) {
+                        if let Ok(mut caps) = self.shared.capabilities.write() {
+                            *caps = parsed;
+                        }
+                    }
+                }
+                Ok(other) => {
+                    tracing::warn!(response = ?other, "unexpected IPC capabilities response");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to refresh daemon capabilities");
+                }
             }
 
             // Store peer for logging notification forwarding. The daemon
@@ -605,6 +642,43 @@ impl ServerHandler for IpcProxyHandler {
         }
     }
 
+    fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tools/call".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(
+                            format!("unexpected task enqueue response: {e}"),
+                            None,
+                        )
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
     fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -637,6 +711,144 @@ impl ServerHandler for IpcProxyHandler {
                             format!("unexpected tool call response: {e}"),
                             None,
                         )
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn list_tasks(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
+        async move {
+            let params = request
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tasks/list".to_string(),
+                        params: params.clone(),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("failed to parse tasks/list: {e}"), None)
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tasks/get".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("failed to parse tasks/get: {e}"), None)
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tasks/result".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("failed to parse tasks/result: {e}"), None)
+                    })
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "tasks/cancel".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("failed to parse tasks/cancel: {e}"), None)
                     })
                 }
                 IpcResponse::Error { code, message } => {
@@ -950,12 +1162,14 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
                             }
                             continue;
                         }
-                        Ok(resp @ (IpcResponse::ToolListChangedNotification
-                        | IpcResponse::ResourceListChangedNotification
-                        | IpcResponse::PromptListChangedNotification
-                        | IpcResponse::ProgressNotification { .. }
-                        | IpcResponse::CancelledNotification { .. }
-                        | IpcResponse::AuthStateChanged { .. })) => {
+                        Ok(
+                            resp @ (IpcResponse::ToolListChangedNotification
+                            | IpcResponse::ResourceListChangedNotification
+                            | IpcResponse::PromptListChangedNotification
+                            | IpcResponse::ProgressNotification { .. }
+                            | IpcResponse::CancelledNotification { .. }
+                            | IpcResponse::AuthStateChanged { .. }),
+                        ) => {
                             forward_control_notification(Some(peer), resp).await;
                             continue;
                         }
@@ -1000,6 +1214,10 @@ mod tests {
     use plug_core::engine::Engine;
     use rmcp::ServiceExt as _;
     use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{
+        CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskInfoParams,
+        GetTaskInfoRequest, GetTaskResultParams, GetTaskResultRequest, ServerResult, TaskStatus,
+    };
     use tokio::task::JoinHandle;
 
     fn daemon_test_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1240,6 +1458,303 @@ mod tests {
             .await
             .expect("restarted daemon task join")
             .expect("restarted daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_supports_task_wrapped_tool_calls() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdt-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server_config());
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-tasks".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+        let server_info = client
+            .peer()
+            .peer_info()
+            .expect("server initialize info available");
+        assert!(
+            server_info.capabilities.tasks.is_some(),
+            "IPC proxy should advertise tasks capability when routed tools exist"
+        );
+
+        let task_request = CallToolRequestParams::new("Mock__echo")
+            .with_arguments(
+                serde_json::json!({"input": "task-mode"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .with_task(serde_json::Map::new());
+
+        let create_response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .peer()
+                .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                    task_request,
+                ))),
+        )
+        .await
+        .expect("task create timeout")
+        .expect("task create response");
+
+        let task_id = match create_response {
+            ServerResult::CreateTaskResult(result) => {
+                assert_eq!(result.task.status, TaskStatus::Working);
+                result.task.task_id
+            }
+            other => panic!("unexpected create task response: {other:?}"),
+        };
+
+        let final_status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = client
+                    .peer()
+                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                        GetTaskInfoParams {
+                            meta: None,
+                            task_id: task_id.clone(),
+                        },
+                    )))
+                    .await
+                    .expect("task info response");
+                match response {
+                    ServerResult::GetTaskResult(result) => {
+                        if result.task.status == TaskStatus::Completed {
+                            break result.task;
+                        }
+                    }
+                    other => panic!("unexpected task info response: {other:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("task completion timeout");
+        assert_eq!(final_status.status, TaskStatus::Completed);
+
+        let payload_response = client
+            .peer()
+            .send_request(ClientRequest::GetTaskResultRequest(
+                GetTaskResultRequest::new(GetTaskResultParams {
+                    meta: None,
+                    task_id: task_id.clone(),
+                }),
+            ))
+            .await
+            .expect("task result response");
+        match payload_response {
+            ServerResult::GetTaskPayloadResult(payload) => {
+                assert!(payload.0.to_string().contains("task-mode"));
+            }
+            ServerResult::CallToolResult(result) => {
+                assert!(format!("{result:?}").contains("task-mode"));
+            }
+            other => panic!("unexpected task payload response: {other:?}"),
+        }
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_tasks_survive_session_replacement_for_same_client() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdu-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server_config());
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let client_id = "client-task-continuity".to_string();
+        let session_a = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            client_id.clone(),
+            None,
+        )
+        .await
+        .expect("establish first daemon proxy session");
+        let proxy_a = IpcProxyHandler::new(session_a, Some(config_path.clone()));
+
+        let (server_transport_a, client_transport_a) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_a
+                .serve(server_transport_a)
+                .await
+                .expect("start first IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client_a = TestClient
+            .serve(client_transport_a)
+            .await
+            .expect("connect first downstream client");
+
+        let task_request = CallToolRequestParams::new("Mock__echo")
+            .with_arguments(
+                serde_json::json!({"input": "continuity"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .with_task(serde_json::Map::new());
+
+        let create_response = client_a
+            .peer()
+            .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                task_request,
+            )))
+            .await
+            .expect("task create response");
+        let task_id = match create_response {
+            ServerResult::CreateTaskResult(result) => result.task.task_id,
+            other => panic!("unexpected create task response: {other:?}"),
+        };
+
+        let session_b = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            client_id,
+            None,
+        )
+        .await
+        .expect("establish replacement daemon proxy session");
+        let proxy_b = IpcProxyHandler::new(session_b, Some(config_path.clone()));
+
+        let (server_transport_b, client_transport_b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_b
+                .serve(server_transport_b)
+                .await
+                .expect("start replacement IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client_b = TestClient
+            .serve(client_transport_b)
+            .await
+            .expect("connect replacement downstream client");
+
+        let final_status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = client_b
+                    .peer()
+                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                        GetTaskInfoParams {
+                            meta: None,
+                            task_id: task_id.clone(),
+                        },
+                    )))
+                    .await
+                    .expect("replacement task info response");
+                match response {
+                    ServerResult::GetTaskResult(result) => {
+                        if result.task.status == TaskStatus::Completed {
+                            break result.task;
+                        }
+                    }
+                    other => panic!("unexpected replacement task info response: {other:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("task completion timeout after session replacement");
+        assert_eq!(final_status.task_id, task_id);
+        assert_eq!(final_status.status, TaskStatus::Completed);
+
+        let payload_response = client_b
+            .peer()
+            .send_request(ClientRequest::GetTaskResultRequest(
+                GetTaskResultRequest::new(GetTaskResultParams {
+                    meta: None,
+                    task_id: task_id.clone(),
+                }),
+            ))
+            .await
+            .expect("replacement task result response");
+        match payload_response {
+            ServerResult::GetTaskPayloadResult(payload) => {
+                assert!(payload.0.to_string().contains("continuity"));
+            }
+            ServerResult::CallToolResult(result) => {
+                assert!(format!("{result:?}").contains("continuity"));
+            }
+            other => panic!("unexpected replacement task payload response: {other:?}"),
+        }
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
 
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);

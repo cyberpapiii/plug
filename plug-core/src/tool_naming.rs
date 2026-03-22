@@ -71,6 +71,12 @@ pub fn sanitize_tool_name(name: &str) -> String {
 /// Capitalize the first letter of a server name for use as a wire name prefix.
 /// "slack" -> "Slack", "imessage" -> "IMessage", "context7" -> "Context7"
 pub fn format_server_prefix(server_name: &str) -> String {
+    match server_name.to_ascii_lowercase().as_str() {
+        "github" => return "GitHub".to_string(),
+        "imessage" => return "IMessage".to_string(),
+        _ => {}
+    }
+
     let mut chars = server_name.chars();
     match chars.next() {
         None => String::new(),
@@ -485,12 +491,13 @@ mod tests {
     #[test]
     fn capitalize_server_name() {
         assert_eq!(format_server_prefix("slack"), "Slack");
-        assert_eq!(format_server_prefix("imessage"), "Imessage");
+        assert_eq!(format_server_prefix("imessage"), "IMessage");
         assert_eq!(format_server_prefix("context7"), "Context7");
         assert_eq!(format_server_prefix("supabase"), "Supabase");
         assert_eq!(format_server_prefix("supermemory"), "Supermemory");
         assert_eq!(format_server_prefix("exa"), "Exa");
         assert_eq!(format_server_prefix("Gmail"), "Gmail"); // already capitalized
+        assert_eq!(format_server_prefix("github"), "GitHub");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Tool Naming & Display System — Implementation Plan
 
+> Historical implementation artifact. Current naming truth lives in `README.md`, `docs/MCP-SPEC.md`, and the code on `main`. Keep this file for archaeology, not as the current source of truth.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Improve tool wire names for LLM accuracy and human readability — sanitize casing, add semantic sub-service prefixes for workspace tools, generate `title` fields, and add case-insensitive routing fallback.

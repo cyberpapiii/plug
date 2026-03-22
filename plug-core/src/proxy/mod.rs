@@ -14,6 +14,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
 use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, RoleServer};
+use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -24,10 +25,28 @@ use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
+use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
 use crate::types::ClientType;
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
+const PLUG_TITLE: &str = "Plug";
+const PLUG_DESCRIPTION: &str = "MCP multiplexer";
+const PLUG_WEBSITE_URL: &str = "https://github.com/plug-mcp/plug";
+const PLUG_ICON_URL: &str =
+    "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg";
+
+fn plug_implementation() -> Implementation {
+    Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+        .with_title(PLUG_TITLE)
+        .with_description(PLUG_DESCRIPTION)
+        .with_website_url(PLUG_WEBSITE_URL)
+        .with_icons(vec![
+            Icon::new(PLUG_ICON_URL)
+                .with_mime_type("image/svg+xml")
+                .with_sizes(vec!["any".to_string()]),
+        ])
+}
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
@@ -124,6 +143,8 @@ pub struct ToolRouter {
     client_roots: DashMap<NotificationTarget, Vec<Root>>,
     /// Per-client bridge for forwarding reverse requests (elicitation, sampling).
     downstream_bridges: DashMap<NotificationTarget, Arc<dyn DownstreamBridge>>,
+    /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
+    task_store: Mutex<TaskStore>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -263,6 +284,7 @@ impl ToolRouter {
             resource_subscriptions: DashMap::new(),
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
+            task_store: Mutex::new(TaskStore::new()),
         }
     }
 
@@ -465,7 +487,9 @@ impl ToolRouter {
         };
         let Some(call_id) = self.upstream_request_lookup.get(&key).map(|entry| *entry) else {
             return Err(McpError::internal_error(
-                format!("no active downstream call for upstream request {server_id}:{request_id:?}"),
+                format!(
+                    "no active downstream call for upstream request {server_id}:{request_id:?}"
+                ),
                 None,
             ));
         };
@@ -475,7 +499,9 @@ impl ToolRouter {
             .map(|entry| entry.clone())
             .ok_or_else(|| {
                 McpError::internal_error(
-                    format!("active call record missing for upstream request {server_id}:{request_id:?}"),
+                    format!(
+                        "active call record missing for upstream request {server_id}:{request_id:?}"
+                    ),
                     None,
                 )
             })
@@ -1096,7 +1122,6 @@ impl ToolRouter {
             prefix: String,
             stripped_name: String,
             full_name: String,
-            has_strip_keywords: bool,
         }
 
         let mut classified: Vec<Classified> = Vec::new();
@@ -1128,43 +1153,41 @@ impl ToolRouter {
                     }
                 });
 
-            let (prefix, full_name, stripped_name, has_strip_keywords) =
-                if let Some(ref rules) = tool_group_rules {
-                    match crate::tool_naming::classify_with_rules(&sanitized, rules) {
-                        Some(result) => {
-                            let stripped = crate::tool_naming::strip_keywords(
-                                &result.name,
-                                &result.strip_keywords,
-                            );
-                            let has_strip = !result.strip_keywords.is_empty();
-                            (result.prefix, result.name, stripped, has_strip)
-                        }
-                        None => {
-                            let prefix = crate::tool_naming::format_server_prefix(&server_name);
-                            (prefix, sanitized.clone(), sanitized.clone(), false)
-                        }
+            let (prefix, full_name, stripped_name) = if let Some(ref rules) = tool_group_rules {
+                match crate::tool_naming::classify_with_rules(&sanitized, rules) {
+                    Some(result) => {
+                        let stripped = crate::tool_naming::strip_keywords(
+                            &result.name,
+                            &result.strip_keywords,
+                        );
+                        (result.prefix, result.name, stripped)
                     }
-                } else {
-                    let prefix = crate::tool_naming::format_server_prefix(&server_name);
-                    let mut name = sanitized.clone();
+                    None => {
+                        let prefix = crate::tool_naming::format_server_prefix(&server_name);
+                        (prefix, sanitized.clone(), sanitized.clone())
+                    }
+                }
+            } else {
+                let prefix = crate::tool_naming::format_server_prefix(&server_name);
+                let mut name = sanitized.clone();
 
-                    // Dedup: strip server_name prefix/suffix if redundant
-                    if name.starts_with(&server_name) && name.len() > server_name.len() {
-                        let rest = &name[server_name.len()..];
-                        if rest.starts_with('_') || rest.starts_with('-') {
-                            name = rest[1..].to_string();
-                        }
+                // Dedup: strip server_name prefix/suffix if redundant
+                if name.starts_with(&server_name) && name.len() > server_name.len() {
+                    let rest = &name[server_name.len()..];
+                    if rest.starts_with('_') || rest.starts_with('-') {
+                        name = rest[1..].to_string();
                     }
-                    if name.ends_with(&server_name) && name.len() > server_name.len() {
-                        let prefix_len = name.len() - server_name.len();
-                        let rest = &name[..prefix_len];
-                        if rest.ends_with('_') || rest.ends_with('-') {
-                            name = rest[..rest.len() - 1].to_string();
-                        }
+                }
+                if name.ends_with(&server_name) && name.len() > server_name.len() {
+                    let prefix_len = name.len() - server_name.len();
+                    let rest = &name[..prefix_len];
+                    if rest.ends_with('_') || rest.ends_with('-') {
+                        name = rest[..rest.len() - 1].to_string();
                     }
+                }
 
-                    (prefix, name.clone(), name, false)
-                };
+                (prefix, name.clone(), name)
+            };
 
             classified.push(Classified {
                 server_name,
@@ -1172,7 +1195,6 @@ impl ToolRouter {
                 prefix,
                 stripped_name,
                 full_name,
-                has_strip_keywords,
             });
         }
 
@@ -1231,16 +1253,14 @@ impl ToolRouter {
                 crate::enrichment::enrich_tool(&mut prefixed_tool);
             }
 
-            // Title always uses stripped name (display-only, no collision risk)
-            let title_name = if c.has_strip_keywords {
-                crate::tool_naming::generate_title(&c.prefix, &c.stripped_name)
-            } else {
-                crate::tool_naming::generate_title(&c.prefix, &final_name)
-            };
+            crate::enrichment::normalize_annotations(&mut prefixed_tool, &final_name);
 
-            // Set wire name and title
+            // Display titles follow the same disambiguation path as wire names.
+            let title_name = crate::tool_naming::generate_title(&c.prefix, &final_name);
+
+            // Set wire name and canonical display metadata
             prefixed_tool.name = Cow::Owned(prefixed_name);
-            prefixed_tool.title = Some(title_name);
+            apply_canonical_tool_title(&mut prefixed_tool, title_name);
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
@@ -1611,6 +1631,19 @@ impl ToolRouter {
         self.cache.load().tools_all.len()
     }
 
+    pub fn get_tool_definition(&self, name: &str) -> Option<Tool> {
+        self.cache
+            .load()
+            .tools_all
+            .iter()
+            .find(|tool| tool.name.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    pub fn supports_tasks(&self) -> bool {
+        !self.config.meta_tool_mode && !self.cache.load().tools_all.is_empty()
+    }
+
     pub fn synthesized_capabilities(&self) -> ServerCapabilities {
         let upstream_caps = self.server_manager.healthy_capabilities();
         let mut capabilities = ServerCapabilities::default();
@@ -1645,6 +1678,9 @@ impl ToolRouter {
         }
         if upstream_caps.iter().any(|caps| caps.logging.is_some()) {
             capabilities.logging = Some(serde_json::Map::new());
+        }
+        if self.supports_tasks() {
+            capabilities.tasks = Some(TasksCapability::server_default());
         }
 
         capabilities
@@ -1855,6 +1891,259 @@ impl ToolRouter {
             .await
     }
 
+    pub fn task_owner_for_ipc_client(client_id: &str) -> TaskOwner {
+        TaskOwner::new(Arc::<str>::from(format!("ipc:{client_id}")))
+    }
+
+    pub async fn enqueue_tool_task(
+        self: &Arc<Self>,
+        tool_name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        progress_token: Option<ProgressToken>,
+        owner: TaskOwner,
+    ) -> Result<CreateTaskResult, McpError> {
+        let cache = self.cache.load();
+        let (server_id, original_name) = cache
+            .routes
+            .get(tool_name)
+            .cloned()
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ToolNotFound {
+                    tool_name: tool_name.to_string(),
+                })
+            })?;
+        drop(cache);
+
+        if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
+            if upstream
+                .capabilities
+                .tasks
+                .as_ref()
+                .is_some_and(|tasks| tasks.supports_tools_call())
+            {
+                let mut upstream_params = CallToolRequestParams::new(original_name.clone());
+                if let Some(args) = arguments.clone() {
+                    upstream_params = upstream_params.with_arguments(args);
+                }
+                upstream_params.task = Some(serde_json::Map::new());
+                if let Some(token) = progress_token.clone() {
+                    upstream_params.set_progress_token(token);
+                }
+                let response = upstream
+                    .client
+                    .peer()
+                    .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                        upstream_params,
+                    )))
+                    .await
+                    .map_err(|error| match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+
+                if let ServerResult::CreateTaskResult(result) = response {
+                    let task = self.task_store.lock().await.create_passthrough(
+                        owner,
+                        tool_name,
+                        &result.task,
+                        TaskUpstreamRef::Task {
+                            server_id,
+                            task_id: result.task.task_id.clone(),
+                        },
+                    );
+                    return Ok(CreateTaskResult::new(task));
+                }
+
+                return Err(McpError::internal_error(
+                    format!(
+                        "upstream task-capable server returned unexpected response for task-wrapped tool call: {response:?}"
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        let task = {
+            let mut store = self.task_store.lock().await;
+            store.create(owner, tool_name)
+        };
+
+        let task_id = task.task_id.clone();
+        let router = Arc::clone(self);
+        let tool_name = tool_name.to_string();
+        let handle = tokio::spawn(async move {
+            router
+                .execute_tool_task(task_id, tool_name, arguments, progress_token, false)
+                .await;
+        });
+
+        self.task_store
+            .lock()
+            .await
+            .attach_abort_handle(&task.task_id, handle);
+
+        Ok(CreateTaskResult::new(task))
+    }
+
+    pub async fn list_tasks_for_owner(
+        &self,
+        owner: &TaskOwner,
+        request: Option<PaginatedRequestParams>,
+    ) -> Result<ListTasksResult, McpError> {
+        Ok(self.task_store.lock().await.list_for_owner(owner, request))
+    }
+
+    pub async fn get_task_info_for_owner(
+        &self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<GetTaskResult, McpError> {
+        let upstream = {
+            self.task_store
+                .lock()
+                .await
+                .upstream_for_owner(owner, task_id)?
+        };
+        if let Some(TaskUpstreamRef::Task { server_id, task_id: upstream_task_id }) = upstream {
+            if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                let response = server
+                    .client
+                    .peer()
+                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                        GetTaskInfoParams {
+                            meta: None,
+                            task_id: upstream_task_id,
+                        },
+                    )))
+                    .await
+                    .map_err(|error| match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                if let ServerResult::GetTaskResult(result) = response {
+                    let synced = self
+                        .task_store
+                        .lock()
+                        .await
+                        .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
+                    return Ok(GetTaskResult {
+                        meta: None,
+                        task: synced,
+                    });
+                }
+                return Err(McpError::internal_error(
+                    "unexpected upstream tasks/get response".to_string(),
+                    None,
+                ));
+            }
+        }
+        self.task_store.lock().await.get_info_for_owner(owner, task_id)
+    }
+
+    pub async fn get_task_result_for_owner(
+        &self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<GetTaskPayloadResult, McpError> {
+        let upstream = {
+            self.task_store
+                .lock()
+                .await
+                .upstream_for_owner(owner, task_id)?
+        };
+        if let Some(TaskUpstreamRef::Task { server_id, task_id: upstream_task_id }) = upstream {
+            if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                let response = server
+                    .client
+                    .peer()
+                    .send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest::new(
+                        GetTaskResultParams {
+                            meta: None,
+                            task_id: upstream_task_id,
+                        },
+                    )))
+                    .await
+                    .map_err(|error| match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                return match response {
+                    ServerResult::GetTaskPayloadResult(result) => Ok(result),
+                    ServerResult::CallToolResult(result) => serde_json::to_value(result)
+                        .map(GetTaskPayloadResult::new)
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("failed to serialize upstream task payload: {e}"),
+                                None,
+                            )
+                        }),
+                    _ => Err(McpError::internal_error(
+                        "unexpected upstream tasks/result response".to_string(),
+                        None,
+                    )),
+                };
+            }
+        }
+        self.task_store.lock().await.get_result_for_owner(owner, task_id)
+    }
+
+    pub async fn cancel_task_for_owner(
+        &self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<CancelTaskResult, McpError> {
+        let (task, upstream, handle) = self
+            .task_store
+            .lock()
+            .await
+            .mark_cancelled(owner, task_id)?;
+        if let Some(upstream) = upstream {
+            match upstream {
+                TaskUpstreamRef::Task { server_id, task_id: upstream_task_id } => {
+                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                        let response = server
+                            .client
+                            .peer()
+                            .send_request(ClientRequest::CancelTaskRequest(
+                                CancelTaskRequest::new(CancelTaskParams {
+                                    meta: None,
+                                    task_id: upstream_task_id,
+                                }),
+                            ))
+                            .await;
+                        if let Ok(ServerResult::CancelTaskResult(result)) = response {
+                            let synced = self
+                                .task_store
+                                .lock()
+                                .await
+                                .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
+                            return Ok(CancelTaskResult {
+                                meta: None,
+                                task: synced,
+                            });
+                        }
+                    }
+                }
+                TaskUpstreamRef::Request { server_id, request_id } => {
+                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                        let _ = server
+                            .client
+                            .peer()
+                            .notify_cancelled(CancelledNotificationParam {
+                                request_id,
+                                reason: Some("task cancelled".to_string()),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+        Ok(CancelTaskResult { meta: None, task })
+    }
+
     pub async fn call_tool_with_context(
         &self,
         tool_name: &str,
@@ -1864,6 +2153,157 @@ impl ToolRouter {
     ) -> Result<CallToolResult, McpError> {
         self.call_tool_inner(tool_name, arguments, progress_token, downstream, false)
             .await
+    }
+
+    async fn execute_tool_task(
+        self: Arc<Self>,
+        task_id: String,
+        tool_name: String,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        progress_token: Option<ProgressToken>,
+        is_retry: bool,
+    ) {
+        let cache = self.cache.load();
+        let (server_id, original_name) = match cache.routes.get(tool_name.as_str()).or_else(|| {
+            cache
+                .routes
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(tool_name.as_str()))
+                .map(|(_, v)| v)
+        }) {
+            Some(route) => route.clone(),
+            None => {
+                drop(cache);
+                self.task_store
+                    .lock()
+                    .await
+                    .fail(&task_id, format!("tool not found: {tool_name}"));
+                return;
+            }
+        };
+        drop(cache);
+
+        let mut current_arguments = arguments;
+        let mut allow_retry = !is_retry;
+
+        loop {
+            let call_id = next_call_id();
+            let semaphore_timeout = Duration::from_secs(1);
+            let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
+                match tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned()).await {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(_)) => {
+                        self.task_store
+                            .lock()
+                            .await
+                            .fail(&task_id, format!("server unavailable: {server_id}"));
+                        return;
+                    }
+                    Err(_) => {
+                        self.task_store
+                            .lock()
+                            .await
+                            .fail(&task_id, format!("server busy: {server_id}"));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let Some(upstream) = self.server_manager.get_upstream(&server_id) else {
+                self.task_store
+                    .lock()
+                    .await
+                    .fail(&task_id, format!("server unavailable: {server_id}"));
+                return;
+            };
+
+            let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
+            let transport_type = upstream.config.transport.clone();
+            let peer = upstream.client.peer().clone();
+            drop(upstream);
+
+            let upstream_progress_token = progress_token.as_ref().map(|_| {
+                ProgressToken(NumberOrString::String(Arc::from(format!(
+                    "plug-task-progress-{call_id}"
+                ))))
+            });
+            let retry_arguments = current_arguments.clone();
+            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
+            if let Some(args) = current_arguments.take() {
+                upstream_params = upstream_params.with_arguments(args);
+            }
+            if let Some(token) = upstream_progress_token.clone() {
+                upstream_params.set_progress_token(token);
+            }
+            let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
+            let options = PeerRequestOptions {
+                timeout: Some(timeout_duration),
+                meta: upstream_progress_token
+                    .clone()
+                    .map(Meta::with_progress_token),
+            };
+
+            let request_handle = match peer.send_cancellable_request(request, options).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    drop(permit);
+                    self.task_store
+                        .lock()
+                        .await
+                        .fail(&task_id, error.to_string());
+                    return;
+                }
+            };
+
+            self.task_store.lock().await.set_upstream_request(
+                &task_id,
+                TaskUpstreamRef::Request {
+                    server_id: server_id.clone(),
+                    request_id: request_handle.id.clone(),
+                },
+            );
+
+            let result = request_handle.await_response().await;
+            drop(permit);
+
+            match result {
+                Ok(ServerResult::CallToolResult(response)) => {
+                    match serde_json::to_value(&response) {
+                        Ok(payload) => self.task_store.lock().await.complete(&task_id, payload),
+                        Err(error) => self.task_store.lock().await.fail(
+                            &task_id,
+                            format!("failed to serialize task result: {error}"),
+                        ),
+                    }
+                    return;
+                }
+                Err(e) if is_session_error(&e) && allow_retry => {
+                    if self.reconnect_server_now(&server_id).await.is_ok() {
+                        current_arguments = retry_arguments;
+                        allow_retry = false;
+                        continue;
+                    }
+                    self.task_store.lock().await.fail(&task_id, e.to_string());
+                    return;
+                }
+                Err(e) => {
+                    if matches!(transport_type, crate::config::TransportType::Stdio) {
+                        self.reconnect_server_in_background(server_id.clone());
+                    }
+                    self.task_store.lock().await.fail(&task_id, e.to_string());
+                    return;
+                }
+                Ok(other) => {
+                    self.task_store.lock().await.fail(
+                        &task_id,
+                        format!("unexpected upstream task response: {other:?}"),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     /// Inner tool call implementation with retry support.
@@ -1991,13 +2431,11 @@ impl ToolRouter {
                 upstream_params = upstream_params.with_arguments(args.clone());
             }
             let downstream_progress_token = progress_token.clone();
-            let upstream_progress_token = downstream_progress_token
-                .as_ref()
-                .map(|_| {
-                    ProgressToken(NumberOrString::String(Arc::from(format!(
-                        "plug-progress-{call_id}"
-                    ))))
-                });
+            let upstream_progress_token = downstream_progress_token.as_ref().map(|_| {
+                ProgressToken(NumberOrString::String(Arc::from(format!(
+                    "plug-progress-{call_id}"
+                ))))
+            });
             if let Some(token) = upstream_progress_token.clone() {
                 upstream_params.set_progress_token(token);
             }
@@ -2444,6 +2882,12 @@ fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
     }
 }
 
+fn apply_canonical_tool_title(tool: &mut Tool, title: String) {
+    tool.title = Some(title.clone());
+    let annotations = tool.annotations.get_or_insert_with(Default::default);
+    annotations.title = Some(title);
+}
+
 fn sanitize_description(desc: &str) -> String {
     desc.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
@@ -2793,13 +3237,34 @@ impl ProxyHandler {
 impl ServerHandler for ProxyHandler {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(self.router.synthesized_capabilities())
-            .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+            .with_server_info(plug_implementation())
             .with_protocol_version(
                 serde_json::from_value(serde_json::Value::String(
                     LATEST_PROTOCOL_VERSION.to_string(),
                 ))
                 .expect("latest protocol version must parse"),
             )
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.router.get_tool_definition(name)
+    }
+
+    fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        let router = Arc::clone(&self.router);
+        let progress_token = request.progress_token();
+        let tool_name = request.name.to_string();
+        let arguments = request.arguments;
+        async move {
+            router
+                .enqueue_tool_task(&tool_name, arguments, progress_token, owner)
+                .await
+        }
     }
 
     fn initialize(
@@ -3083,6 +3548,16 @@ impl ServerHandler for ProxyHandler {
         }
     }
 
+    fn list_tasks(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move { router.list_tasks_for_owner(&owner, request).await }
+    }
+
     fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -3102,6 +3577,44 @@ impl ServerHandler for ProxyHandler {
                 )
                 .await
         }
+    }
+
+    fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move {
+            router
+                .get_task_info_for_owner(&owner, &request.task_id)
+                .await
+        }
+    }
+
+    fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move {
+            router
+                .get_task_result_for_owner(&owner, &request.task_id)
+                .await
+        }
+    }
+
+    fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move { router.cancel_task_for_owner(&owner, &request.task_id).await }
     }
 
     fn on_cancelled(
@@ -3242,6 +3755,19 @@ mod tests {
         let info = handler.get_info();
 
         assert_eq!(info.server_info.name, "plug");
+        assert_eq!(info.server_info.title.as_deref(), Some("Plug"));
+        assert_eq!(
+            info.server_info.description.as_deref(),
+            Some("MCP multiplexer")
+        );
+        assert_eq!(
+            info.server_info.website_url.as_deref(),
+            Some("https://github.com/plug-mcp/plug")
+        );
+        assert_eq!(
+            info.server_info.icons.as_ref().map(|icons| icons.len()),
+            Some(1)
+        );
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.protocol_version.as_str(), LATEST_PROTOCOL_VERSION);
         assert!(info.capabilities.tools.is_none());
@@ -3401,6 +3927,47 @@ mod tests {
         strip_optional_fields(&mut tool, Some(4));
 
         assert_eq!(tool.description.as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn apply_canonical_tool_title_sets_top_level_and_annotation_titles() {
+        let mut tool = Tool::new(
+            Cow::Borrowed("Slack__channels_list"),
+            Cow::Borrowed("Get list of channels"),
+            Arc::new(serde_json::Map::new()),
+        );
+        let mut annotations = ToolAnnotations::default();
+        annotations.title = Some("List Channels".to_string());
+        tool.annotations = Some(annotations);
+
+        apply_canonical_tool_title(&mut tool, "Slack: List Channels".to_string());
+
+        assert_eq!(tool.title.as_deref(), Some("Slack: List Channels"));
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|ann| ann.title.as_deref()),
+            Some("Slack: List Channels")
+        );
+    }
+
+    #[test]
+    fn apply_canonical_tool_title_creates_annotation_title_when_missing() {
+        let mut tool = Tool::new(
+            Cow::Borrowed("Todoist__add_filters"),
+            Cow::Borrowed("Add one or more new personal filters."),
+            Arc::new(serde_json::Map::new()),
+        );
+
+        apply_canonical_tool_title(&mut tool, "Todoist: Add Filters".to_string());
+
+        assert_eq!(tool.title.as_deref(), Some("Todoist: Add Filters"));
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|ann| ann.title.as_deref()),
+            Some("Todoist: Add Filters")
+        );
     }
 
     #[test]
@@ -3580,6 +4147,43 @@ mod tests {
         let full_tools = router.list_all_tools();
         assert_eq!(full_tools.len(), 1);
         assert_eq!(full_tools[0].1.name.as_ref(), "git__commit");
+    }
+
+    #[test]
+    fn synthesized_capabilities_include_tasks_when_tools_exist() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "Mock__echo".to_string(),
+            ("mock".to_string(), "echo".to_string()),
+        );
+        let tools = vec![Tool::new(
+            Cow::Borrowed("Mock__echo"),
+            Cow::Borrowed("Echo a value"),
+            Arc::new(serde_json::Map::new()),
+        )];
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(tools),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let caps = router.synthesized_capabilities();
+        assert!(caps.tasks.is_some());
+        let tasks = caps.tasks.unwrap();
+        assert!(tasks.supports_list());
+        assert!(tasks.supports_cancel());
+        assert!(tasks.supports_tools_call());
     }
 
     #[test]
@@ -4281,10 +4885,8 @@ mod tests {
             },
         );
 
-        let result = router.active_call_for_upstream_request(
-            "s1",
-            &RequestId::from(NumberOrString::Number(202)),
-        );
+        let result = router
+            .active_call_for_upstream_request("s1", &RequestId::from(NumberOrString::Number(202)));
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         assert_eq!(
             result.unwrap().downstream.notification_target(),
@@ -4309,9 +4911,9 @@ mod tests {
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
-                downstream_progress_token: Some(ProgressToken(NumberOrString::String(
-                    Arc::from("downstream-token"),
-                ))),
+                downstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "downstream-token",
+                )))),
                 upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
                     "upstream-token",
                 )))),
@@ -4390,9 +4992,9 @@ mod tests {
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
-                downstream_progress_token: Some(ProgressToken(NumberOrString::String(
-                    Arc::from("downstream-token"),
-                ))),
+                downstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "downstream-token",
+                )))),
                 upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
                     "upstream-token",
                 )))),

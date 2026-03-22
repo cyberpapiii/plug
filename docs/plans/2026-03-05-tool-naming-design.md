@@ -1,5 +1,7 @@
 # Tool Naming & Display System Design
 
+> Historical design artifact. Current naming truth lives in `README.md`, `docs/MCP-SPEC.md`, and the code on `main`. This document captures the design process and may not reflect the current shipped naming model in every detail.
+
 **Date**: 2026-03-05
 **Status**: Approved
 

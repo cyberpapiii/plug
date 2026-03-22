@@ -41,8 +41,9 @@ pub struct Config {
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
-    /// Seconds to keep daemon alive after last client disconnects (default: 60).
-    /// Set to 0 to disable auto-shutdown (daemon stays alive indefinitely).
+    /// Seconds to keep daemon alive after last client disconnects.
+    /// Default is 0, which disables auto-shutdown and keeps the daemon alive
+    /// until explicit shutdown.
     #[serde(default = "default_grace_period")]
     pub daemon_grace_period_secs: u64,
     /// Upstream server definitions.
@@ -64,7 +65,7 @@ impl Default for Config {
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
             http: HttpConfig::default(),
-            daemon_grace_period_secs: 60,
+            daemon_grace_period_secs: 0,
             servers: HashMap::new(),
         }
     }
@@ -241,7 +242,7 @@ fn default_tool_search_threshold() -> usize {
 }
 
 fn default_grace_period() -> u64 {
-    60
+    0
 }
 
 /// Check whether a bind address refers to loopback (localhost-only).

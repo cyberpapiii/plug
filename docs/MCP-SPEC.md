@@ -267,7 +267,12 @@ Normal request/response/notification flow.
 - Allowed chars: `A-Za-z0-9_-.`
 - NO dots for Claude API interop (use `_` instead)
 
-**fanout prefixing**: `create_issue` → `github__create_issue` (double underscore delimiter)
+**plug prefixing**: `create_issue` → `GitHub__create_issue` (double underscore delimiter)
+
+**Display metadata**:
+- `name` is the stable invocation identifier
+- top-level `title` is the preferred UI display label
+- `annotations.title` is a backward-compatibility display fallback some clients still consume
 
 ---
 

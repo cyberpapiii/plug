@@ -1794,7 +1794,17 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
-        let startup_snapshot = provider.snapshot().await;
+        let startup_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = provider.snapshot().await;
+                if !snapshot.mcp_auth_headers.is_empty() {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("startup should reach the OAuth MCP endpoint");
         assert!(
             startup_snapshot
                 .mcp_auth_headers
@@ -1959,7 +1969,31 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
-        let statuses = started_engine.server_statuses();
+        let statuses = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let statuses = started_engine.server_statuses();
+                let status_map: HashMap<String, plug_core::types::ServerStatus> = statuses
+                    .iter()
+                    .cloned()
+                    .map(|status| (status.server_id.clone(), status))
+                    .collect();
+                let healthy_ready = status_map
+                    .get(&oauth_healthy)
+                    .is_some_and(|s| s.auth_status == "oauth" && s.health == plug_core::types::ServerHealth::Healthy);
+                let required_ready = status_map
+                    .get(&oauth_auth_required)
+                    .is_some_and(|s| s.auth_status == "auth-required" && s.health == plug_core::types::ServerHealth::AuthRequired);
+                let stdio_ready = status_map
+                    .get("stdio")
+                    .is_some_and(|s| s.health == plug_core::types::ServerHealth::Healthy && s.tool_count == 1);
+                if healthy_ready && required_ready && stdio_ready {
+                    break statuses;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("engine status snapshot should converge");
         let status_map: HashMap<String, plug_core::types::ServerStatus> = statuses
             .into_iter()
             .map(|status| (status.server_id.clone(), status))
