@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `bf876f4` (post performance/efficiency hardening and operator-truth follow-up)
+Baseline: `main` @ `ab743da` (post tasks support, metadata enrichment, and review hardening)
 
 This is the canonical current-state doc for the project.
 
@@ -20,6 +20,8 @@ Implemented on `main`:
 - completion forwarding across stdio, HTTP, and daemon IPC
 - structured output pass-through, with strongest proof for `outputSchema`
 - capability synthesis with per-transport masking
+- tool behavior/metadata enrichment for `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, and `execution.taskSupport`
+- canonical server/tool display metadata including server `title`, `icons`, and normalized tool titles
 - meta-tool mode
 - daemon-backed local sharing
 - reconnecting IPC proxy sessions
@@ -51,6 +53,13 @@ Implemented on `main`:
   - `http-only`
   - `transport-complete`
   - `unavailable`
+- core MCP Tasks support for tool-backed tasks across stdio, HTTP, and daemon IPC:
+  - task-wrapped `tools/call`
+  - `tasks/list`
+  - `tasks/get`
+  - `tasks/result`
+  - `tasks/cancel`
+- upstream task pass-through when an upstream advertises task-capable `tools/call`, with local wrapper-mode fallback otherwise
 - downstream HTTP live-session operator endpoint with dedicated operator token protection
 - daemon-owned downstream HTTP/HTTPS when the shared background service is running
 - transport-complete live session inventory directly from the daemon in background-service mode
@@ -68,6 +77,7 @@ Implemented on `main`:
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
+- task retention/indexing hardening and passthrough terminal-result durability remain as tracked non-blocking follow-up work
 - some low-priority internal simplification remains possible in reload/session/SSE helper structure, but no roadmap-critical correctness work remains open
 
 ## What Exists Off-Main
@@ -83,6 +93,13 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-03-22, `main` absorbed the core MCP Tasks tranche and related follow-through work that:
+
+- added task lifecycle support across stdio, HTTP, and daemon IPC
+- prefers upstream task pass-through when supported, with proven wrapper-mode fallback
+- enriched tool semantics and branding metadata for downstream clients
+- closed the blocking review findings around monotonic task state, reconnect-stable IPC task ownership, and fail-closed pass-through dispatch
 
 On 2026-03-16, the previously working branch/runtime line was reconciled into `main`, verified with
 the full test suite, and pushed as the new canonical baseline.
@@ -119,10 +136,11 @@ Use docs by role:
 ## Current Top Priorities
 
 1. keep current-state docs aligned with `main`
-2. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
-3. consider low-priority simplification/perf cleanup in reload/session/SSE helper structure if the maintenance bar expands
-4. keep all off-main work clearly marked as candidate future state only
-5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
+2. address the remaining P2 task follow-ups in `todos/066` and `todos/067` when the maintenance bar allows
+3. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
+4. consider low-priority simplification/perf cleanup in reload/session/SSE helper structure if the maintenance bar expands
+5. keep all off-main work clearly marked as candidate future state only
+6. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 
 ## Audit Artifacts
 

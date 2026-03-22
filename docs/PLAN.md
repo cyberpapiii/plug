@@ -13,9 +13,12 @@ forwarding work:
 - progress and cancellation routing
 - resources/prompts forwarding with subscribe/unsubscribe lifecycle
 - completion forwarding across all three transports (stdio, HTTP, IPC)
+- full task lifecycle support for tool-backed tasks across stdio, HTTP, and daemon IPC
+- upstream task pass-through when supported, with local wrapper-mode execution otherwise
 - structured output pass-through (outputSchema, structuredContent, resource_link)
 - pagination
 - capability synthesis (honest per-transport masking)
+- tool semantics enrichment (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `taskSupport`) and canonicalized branding/display metadata
 - meta-tool mode
 - end-to-end transport coverage
 - daemon continuity recovery (stdio clients via IPC proxy reconnect)
@@ -42,6 +45,7 @@ forwarding work:
 - performance and efficiency follow-through across auth-store reads, reload batching, SSE fanout, and config env traversal
 - runtime-truth follow-up hardening across `status`, `tools`, `servers`, `clients`, and `doctor`
 - explicit live reverse-request delivery failure handling for downstream HTTP sessions
+- review-hardened task correctness around monotonic state transitions, reconnect-stable IPC ownership, and fail-closed pass-through dispatch
 
 ## What Exists Today
 
@@ -61,6 +65,7 @@ The current product shape is:
 - single-flight reload application with bounded concurrent startup and safe shared registration
 - pre-serialized broadcast SSE payloads for the hot HTTP notification path
 - centralized env-reference traversal reused by config loading and doctor checks
+- core MCP Tasks support as part of the routed downstream surface
 
 ## Remaining Work
 
@@ -69,9 +74,21 @@ No required roadmap work remains for the current production-ready bar.
 
 Optional future scope only:
 
+- task-store retention/indexing hardening (`todos/066`)
+- terminal passthrough result durability (`todos/067`)
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
+
+## 2026-03-22 Tasks Tranche
+
+On 2026-03-22, `main` absorbed the core Tasks tranche and immediate review fixes:
+
+- task-wrapped `tools/call` plus `tasks/list`, `tasks/get`, `tasks/result`, and `tasks/cancel`
+- daemon IPC, HTTP, and stdio parity for task flows
+- upstream task pass-through proof via dedicated task-native integration coverage
+- metadata enrichment and branding follow-through that landed alongside the tranche
+- fixes for the blocking review findings raised during `ce:review`
 
 ## 2026-03-16 Reconciliation Note
 
