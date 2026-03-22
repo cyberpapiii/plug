@@ -1608,6 +1608,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_backed_proxy_tasks_survive_session_replacement_for_same_client() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdu-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server_config());
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let client_id = "client-task-continuity".to_string();
+        let session_a = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            client_id.clone(),
+            None,
+        )
+        .await
+        .expect("establish first daemon proxy session");
+        let proxy_a = IpcProxyHandler::new(session_a, Some(config_path.clone()));
+
+        let (server_transport_a, client_transport_a) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_a
+                .serve(server_transport_a)
+                .await
+                .expect("start first IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client_a = TestClient
+            .serve(client_transport_a)
+            .await
+            .expect("connect first downstream client");
+
+        let task_request = CallToolRequestParams::new("Mock__echo")
+            .with_arguments(
+                serde_json::json!({"input": "continuity"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .with_task(serde_json::Map::new());
+
+        let create_response = client_a
+            .peer()
+            .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                task_request,
+            )))
+            .await
+            .expect("task create response");
+        let task_id = match create_response {
+            ServerResult::CreateTaskResult(result) => result.task.task_id,
+            other => panic!("unexpected create task response: {other:?}"),
+        };
+
+        let session_b = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            client_id,
+            None,
+        )
+        .await
+        .expect("establish replacement daemon proxy session");
+        let proxy_b = IpcProxyHandler::new(session_b, Some(config_path.clone()));
+
+        let (server_transport_b, client_transport_b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_b
+                .serve(server_transport_b)
+                .await
+                .expect("start replacement IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client_b = TestClient
+            .serve(client_transport_b)
+            .await
+            .expect("connect replacement downstream client");
+
+        let final_status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = client_b
+                    .peer()
+                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                        GetTaskInfoParams {
+                            meta: None,
+                            task_id: task_id.clone(),
+                        },
+                    )))
+                    .await
+                    .expect("replacement task info response");
+                match response {
+                    ServerResult::GetTaskResult(result) => {
+                        if result.task.status == TaskStatus::Completed {
+                            break result.task;
+                        }
+                    }
+                    other => panic!("unexpected replacement task info response: {other:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("task completion timeout after session replacement");
+        assert_eq!(final_status.task_id, task_id);
+        assert_eq!(final_status.status, TaskStatus::Completed);
+
+        let payload_response = client_b
+            .peer()
+            .send_request(ClientRequest::GetTaskResultRequest(
+                GetTaskResultRequest::new(GetTaskResultParams {
+                    meta: None,
+                    task_id: task_id.clone(),
+                }),
+            ))
+            .await
+            .expect("replacement task result response");
+        match payload_response {
+            ServerResult::GetTaskPayloadResult(payload) => {
+                assert!(payload.0.to_string().contains("continuity"));
+            }
+            ServerResult::CallToolResult(result) => {
+                assert!(format!("{result:?}").contains("continuity"));
+            }
+            other => panic!("unexpected replacement task payload response: {other:?}"),
+        }
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
     async fn daemon_backed_proxy_advertises_latest_protocol_version() {
         let _guard = daemon_test_lock().lock().await;
 

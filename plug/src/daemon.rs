@@ -158,6 +158,11 @@ impl ClientRegistry {
             .and_then(|s| s.client_info.clone())
     }
 
+    /// Get the stable client_id for a session.
+    fn client_id(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id).map(|s| s.client_id.clone())
+    }
+
     /// Number of currently connected clients.
     fn count(&self) -> usize {
         self.sessions.len()
@@ -2019,7 +2024,13 @@ async fn dispatch_mcp_request(
             };
 
             if call_params.task.is_some() {
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+                let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                    return IpcResponse::Error {
+                        code: "UNKNOWN_SESSION".to_string(),
+                        message: "session not found".to_string(),
+                    };
+                };
+                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
                 let progress_token = call_params.progress_token();
                 let tool_name = call_params.name.to_string();
                 let arguments = call_params.arguments;
@@ -2074,7 +2085,13 @@ async fn dispatch_mcp_request(
         "tasks/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                return IpcResponse::Error {
+                    code: "UNKNOWN_SESSION".to_string(),
+                    message: "session not found".to_string(),
+                };
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
             match tool_router.list_tasks_for_owner(&owner, request).await {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(payload) => IpcResponse::McpResponse { payload },
@@ -2107,7 +2124,13 @@ async fn dispatch_mcp_request(
                     };
                 }
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                return IpcResponse::Error {
+                    code: "UNKNOWN_SESSION".to_string(),
+                    message: "session not found".to_string(),
+                };
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
             match tool_router.get_task_info_for_owner(&owner, task_id).await {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(payload) => IpcResponse::McpResponse { payload },
@@ -2140,7 +2163,13 @@ async fn dispatch_mcp_request(
                     };
                 }
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                return IpcResponse::Error {
+                    code: "UNKNOWN_SESSION".to_string(),
+                    message: "session not found".to_string(),
+                };
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
             match tool_router.get_task_result_for_owner(&owner, task_id).await {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(payload) => IpcResponse::McpResponse { payload },
@@ -2173,7 +2202,13 @@ async fn dispatch_mcp_request(
                     };
                 }
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                return IpcResponse::Error {
+                    code: "UNKNOWN_SESSION".to_string(),
+                    message: "session not found".to_string(),
+                };
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
             match tool_router.cancel_task_for_owner(&owner, task_id).await {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(payload) => IpcResponse::McpResponse { payload },

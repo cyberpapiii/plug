@@ -141,6 +141,10 @@ impl TaskStore {
 
     pub fn complete(&mut self, task_id: &str, result: Value) {
         if let Some(record) = self.tasks.get_mut(task_id) {
+            if is_terminal(&record.task.status) {
+                record.last_touched = Instant::now();
+                return;
+            }
             record.task.status = TaskStatus::Completed;
             record.task.status_message = Some("Completed".to_string());
             record.task.last_updated_at = rmcp::task_manager::current_timestamp();
@@ -153,6 +157,10 @@ impl TaskStore {
 
     pub fn fail(&mut self, task_id: &str, message: String) {
         if let Some(record) = self.tasks.get_mut(task_id) {
+            if is_terminal(&record.task.status) {
+                record.last_touched = Instant::now();
+                return;
+            }
             record.task.status = TaskStatus::Failed;
             record.task.status_message = Some(message);
             record.task.last_updated_at = rmcp::task_manager::current_timestamp();
@@ -173,6 +181,11 @@ impl TaskStore {
             .get_mut(task_id)
             .ok_or_else(|| task_not_found(task_id))?;
         ensure_owner(owner, record)?;
+
+        if is_terminal(&record.task.status) {
+            record.last_touched = Instant::now();
+            return Ok((record.task.clone(), None, None));
+        }
 
         record.task.status = TaskStatus::Cancelled;
         record.task.status_message = Some("Cancelled".to_string());
@@ -231,6 +244,11 @@ impl TaskStore {
             .get_mut(task_id)
             .ok_or_else(|| task_not_found(task_id))?;
         ensure_owner(owner, record)?;
+
+        if is_terminal(&record.task.status) && record.task.status != upstream_task.status {
+            record.last_touched = Instant::now();
+            return Ok(record.task.clone());
+        }
 
         record.task.status = upstream_task.status.clone();
         record.task.status_message = upstream_task.status_message.clone();
@@ -314,6 +332,13 @@ impl TaskStore {
     }
 }
 
+fn is_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+    )
+}
+
 fn ensure_owner(owner: &TaskOwner, record: &TaskRecord) -> Result<(), McpError> {
     if &record.owner == owner {
         Ok(())
@@ -387,5 +412,30 @@ mod tests {
         let list_b = store.list_for_owner(&owner_b, None);
         assert_eq!(list_a.tasks.len(), 2);
         assert_eq!(list_b.tasks.len(), 1);
+    }
+
+    #[test]
+    fn terminal_task_states_are_monotonic() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("stdio:a"));
+        let task = store.create(owner.clone(), "Mock__echo");
+
+        store.complete(&task.task_id, serde_json::json!({"ok": true}));
+        let completed = store
+            .get_info_for_owner(&owner, &task.task_id)
+            .expect("task info after completion");
+        assert_eq!(completed.task.status, TaskStatus::Completed);
+
+        let cancelled = store
+            .mark_cancelled(&owner, &task.task_id)
+            .expect("cancel completed task");
+        assert_eq!(cancelled.0.status, TaskStatus::Completed);
+
+        store.fail(&task.task_id, "late failure".to_string());
+        let after_fail = store
+            .get_info_for_owner(&owner, &task.task_id)
+            .expect("task info after late failure");
+        assert_eq!(after_fail.task.status, TaskStatus::Completed);
+        assert!(store.get_result_for_owner(&owner, &task.task_id).is_ok());
     }
 }

@@ -1891,8 +1891,8 @@ impl ToolRouter {
             .await
     }
 
-    pub fn task_owner_for_ipc_session(session_id: &str) -> TaskOwner {
-        TaskOwner::new(Arc::<str>::from(format!("ipc:{session_id}")))
+    pub fn task_owner_for_ipc_client(client_id: &str) -> TaskOwner {
+        TaskOwner::new(Arc::<str>::from(format!("ipc:{client_id}")))
     }
 
     pub async fn enqueue_tool_task(
@@ -1953,6 +1953,13 @@ impl ToolRouter {
                     );
                     return Ok(CreateTaskResult::new(task));
                 }
+
+                return Err(McpError::internal_error(
+                    format!(
+                        "upstream task-capable server returned unexpected response for task-wrapped tool call: {response:?}"
+                    ),
+                    None,
+                ));
             }
         }
 
