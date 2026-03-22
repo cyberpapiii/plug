@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "066"
 tags: [code-review, tasks, performance, memory, daemon]
@@ -98,3 +98,16 @@ To be filled during triage.
 - Task correctness shipped first, but retention and indexing policy are now the next pressure point
 - Disconnect cleanup and bounded retention should be treated as part of task lifecycle, not optional polish
 
+### 2026-03-22 - Fix implemented
+
+**By:** Codex / ce:work
+
+**Actions:**
+- Added bounded completed-task retention per owner in [tasks.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/tasks.rs)
+- Added stale in-flight task expiry and explicit owner cleanup hooks
+- Cleaned up daemon-owned tasks on real client disconnect while preserving same-client session replacement continuity in [daemon.rs](/Users/robdezendorf/Documents/GitHub/plug/plug/src/daemon.rs)
+- Added regression coverage for owner cleanup in [tasks.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/tasks.rs)
+
+**Learnings:**
+- Bounded retention plus disconnect cleanup was enough to remove the main lifecycle risk without reworking task indexing yet
+- The daemon accept-path concern was reviewed and left unchanged for now; the concrete follow-up here was task-state pressure, not socket admission redesign

@@ -728,6 +728,7 @@ async fn handle_ipc_connection(
 
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
+        let removed_client_id = ctx.client_registry.client_id(session_id);
         ctx.client_registry.deregister(session_id);
         let target = plug_core::notifications::NotificationTarget::Stdio {
             client_id: std::sync::Arc::from(session_id.as_str()),
@@ -742,6 +743,12 @@ async fn handle_ipc_connection(
                 .await;
         }
         ctx.engine.tool_router().remove_client_log_level(session_id);
+        if let Some(client_id) = removed_client_id {
+            if !ctx.client_registry.client_sessions.contains_key(&client_id) {
+                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                ctx.engine.tool_router().cleanup_tasks_for_owner(&owner).await;
+            }
+        }
     }
 
     result
@@ -1352,6 +1359,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session is no longer active for this client".to_string(),
                 };
             }
+            let removed_client_id = ctx.client_registry.client_id(session_id);
             ctx.client_registry.deregister(session_id);
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: std::sync::Arc::from(session_id.as_str()),
@@ -1362,10 +1370,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if ctx.engine.tool_router().clear_roots_for_target(&target) {
                 ctx.engine
                     .tool_router()
-                    .forward_roots_list_changed_to_upstreams()
-                    .await;
+                .forward_roots_list_changed_to_upstreams()
+                .await;
             }
             ctx.engine.tool_router().remove_client_log_level(session_id);
+            if let Some(client_id) = removed_client_id {
+                if !ctx.client_registry.client_sessions.contains_key(&client_id) {
+                    let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                    ctx.engine.tool_router().cleanup_tasks_for_owner(&owner).await;
+                }
+            }
             ctx.session_id = None;
             ctx.reverse_request_rx = None;
             IpcResponse::Ok

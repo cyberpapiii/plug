@@ -12,6 +12,8 @@ use tokio::task::JoinHandle;
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
+const DEFAULT_MAX_COMPLETED_TASKS_PER_OWNER: usize = 100;
+const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaskOwner {
@@ -91,6 +93,7 @@ impl TaskStore {
             },
         );
 
+        self.enforce_owner_completed_retention();
         task
     }
 
@@ -136,6 +139,7 @@ impl TaskStore {
             },
         );
 
+        self.enforce_owner_completed_retention();
         task
     }
 
@@ -153,6 +157,7 @@ impl TaskStore {
             record.upstream = None;
             record.last_touched = Instant::now();
         }
+        self.enforce_owner_completed_retention();
     }
 
     pub fn fail(&mut self, task_id: &str, message: String) {
@@ -168,6 +173,7 @@ impl TaskStore {
             record.upstream = None;
             record.last_touched = Instant::now();
         }
+        self.enforce_owner_completed_retention();
     }
 
     pub fn mark_cancelled(
@@ -176,26 +182,61 @@ impl TaskStore {
         task_id: &str,
     ) -> Result<(Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>), McpError> {
         self.prune_expired();
+        let (task, upstream, handle) = {
+            let record = self
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| task_not_found(task_id))?;
+            ensure_owner(owner, record)?;
+
+            if is_terminal(&record.task.status) {
+                record.last_touched = Instant::now();
+                return Ok((record.task.clone(), None, None));
+            }
+
+            record.task.status = TaskStatus::Cancelled;
+            record.task.status_message = Some("Cancelled".to_string());
+            record.task.last_updated_at = rmcp::task_manager::current_timestamp();
+            record.result = None;
+            record.last_touched = Instant::now();
+
+            (
+                record.task.clone(),
+                record.upstream.take(),
+                record.abort_handle.take(),
+            )
+        };
+        self.enforce_owner_completed_retention();
+        Ok((task, upstream, handle))
+    }
+
+    pub fn cache_result_for_owner(
+        &mut self,
+        owner: &TaskOwner,
+        task_id: &str,
+        result: Value,
+    ) -> Result<(), McpError> {
+        self.prune_expired();
         let record = self
             .tasks
             .get_mut(task_id)
             .ok_or_else(|| task_not_found(task_id))?;
         ensure_owner(owner, record)?;
 
-        if is_terminal(&record.task.status) {
-            record.last_touched = Instant::now();
-            return Ok((record.task.clone(), None, None));
-        }
-
-        record.task.status = TaskStatus::Cancelled;
-        record.task.status_message = Some("Cancelled".to_string());
+        record.result = Some(result);
+        record.task.status = TaskStatus::Completed;
+        record.task.status_message = Some("Completed".to_string());
         record.task.last_updated_at = rmcp::task_manager::current_timestamp();
-        record.result = None;
+        record.upstream = None;
+        record.abort_handle = None;
         record.last_touched = Instant::now();
 
-        let upstream = record.upstream.take();
-        let handle = record.abort_handle.take();
-        Ok((record.task.clone(), upstream, handle))
+        self.enforce_owner_completed_retention();
+        Ok(())
+    }
+
+    pub fn cleanup_owner(&mut self, owner: &TaskOwner) {
+        self.tasks.retain(|_, record| &record.owner != owner);
     }
 
     pub fn list_for_owner(
@@ -323,12 +364,38 @@ impl TaskStore {
     fn prune_expired(&mut self) {
         let now = Instant::now();
         self.tasks.retain(|_, record| match record.task.status {
-            TaskStatus::Working | TaskStatus::InputRequired => true,
+            TaskStatus::Working | TaskStatus::InputRequired => {
+                now.duration_since(record.last_touched)
+                    < Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
+            }
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
                 let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
                 now.duration_since(record.last_touched) < Duration::from_millis(ttl_ms)
             }
         });
+    }
+
+    fn enforce_owner_completed_retention(&mut self) {
+        let mut completed_by_owner: HashMap<TaskOwner, Vec<(String, Instant)>> = HashMap::new();
+        for (task_id, record) in &self.tasks {
+            if is_terminal(&record.task.status) {
+                completed_by_owner
+                    .entry(record.owner.clone())
+                    .or_default()
+                    .push((task_id.clone(), record.last_touched));
+            }
+        }
+
+        for completed in completed_by_owner.values_mut() {
+            if completed.len() <= DEFAULT_MAX_COMPLETED_TASKS_PER_OWNER {
+                continue;
+            }
+            completed.sort_by_key(|(_, touched)| *touched);
+            let drop_count = completed.len() - DEFAULT_MAX_COMPLETED_TASKS_PER_OWNER;
+            for (task_id, _) in completed.iter().take(drop_count) {
+                self.tasks.remove(task_id);
+            }
+        }
     }
 }
 
@@ -437,5 +504,50 @@ mod tests {
             .expect("task info after late failure");
         assert_eq!(after_fail.task.status, TaskStatus::Completed);
         assert!(store.get_result_for_owner(&owner, &task.task_id).is_ok());
+    }
+
+    #[test]
+    fn cleanup_owner_removes_all_owned_tasks() {
+        let mut store = TaskStore::new();
+        let owner_a = TaskOwner::new(Arc::<str>::from("ipc:a"));
+        let owner_b = TaskOwner::new(Arc::<str>::from("ipc:b"));
+
+        let task_a = store.create(owner_a.clone(), "Mock__echo");
+        let task_b = store.create(owner_b.clone(), "Mock__echo");
+
+        store.cleanup_owner(&owner_a);
+
+        assert!(store.get_info_for_owner(&owner_a, &task_a.task_id).is_err());
+        assert!(store.get_info_for_owner(&owner_b, &task_b.task_id).is_ok());
+    }
+
+    #[test]
+    fn cached_result_is_returned_locally() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
+        let task = store.create_passthrough(
+            owner.clone(),
+            "Mock__echo",
+            &Task::new(
+                "upstream-task-1".to_string(),
+                TaskStatus::Working,
+                rmcp::task_manager::current_timestamp(),
+                rmcp::task_manager::current_timestamp(),
+            ),
+            TaskUpstreamRef::Task {
+                server_id: "mock".to_string(),
+                task_id: "upstream-task-1".to_string(),
+            },
+        );
+
+        store
+            .cache_result_for_owner(&owner, &task.task_id, serde_json::json!({"ok": true}))
+            .expect("cache result");
+
+        let payload = store
+            .get_result_for_owner(&owner, &task.task_id)
+            .expect("local cached result");
+        assert_eq!(payload.0, serde_json::json!({"ok": true}));
+        assert!(store.upstream_for_owner(&owner, &task.task_id).unwrap().is_none());
     }
 }

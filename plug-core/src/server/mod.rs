@@ -1438,6 +1438,7 @@ mod tests {
     struct TaskNativeUpstreamHandler {
         next_id: AtomicUsize,
         tasks: Mutex<HashMap<String, (Task, serde_json::Value)>>,
+        task_result_requests: Arc<AtomicUsize>,
     }
 
     impl ServerHandler for TaskNativeUpstreamHandler {
@@ -1541,6 +1542,14 @@ mod tests {
             request: rmcp::model::GetTaskResultParams,
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
+            let call_count = self.task_result_requests.fetch_add(1, Ordering::SeqCst);
+            if call_count > 0 {
+                return std::future::ready(Err(McpError::internal_error(
+                    "upstream task result should have been cached locally after first fetch"
+                        .to_string(),
+                    None,
+                )));
+            }
             let result = self
                 .tasks
                 .lock()
@@ -1612,10 +1621,16 @@ mod tests {
     async fn make_connected_task_native_upstream(
         name: &str,
         router: &Arc<crate::proxy::ToolRouter>,
-    ) -> UpstreamServer {
+    ) -> (UpstreamServer, Arc<AtomicUsize>) {
+        let result_request_count = Arc::new(AtomicUsize::new(0));
         let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let result_request_count_for_server = Arc::clone(&result_request_count);
         tokio::spawn(async move {
-            let server = TaskNativeUpstreamHandler::default()
+            let server = TaskNativeUpstreamHandler {
+                next_id: AtomicUsize::new(0),
+                tasks: Mutex::new(HashMap::new()),
+                task_result_requests: result_request_count_for_server,
+            }
                 .serve(server_transport)
                 .await
                 .expect("start task-native upstream test server");
@@ -1641,14 +1656,17 @@ mod tests {
         });
         capabilities.tasks = Some(TasksCapability::server_default());
 
-        UpstreamServer {
-            name: name.to_string(),
-            config: test_server_config(),
-            client,
-            tools,
-            capabilities,
-            health: ServerHealth::Healthy,
-        }
+        (
+            UpstreamServer {
+                name: name.to_string(),
+                config: test_server_config(),
+                client,
+                tools,
+                capabilities,
+                health: ServerHealth::Healthy,
+            },
+            result_request_count,
+        )
     }
 
     struct ProgressClient {
@@ -2163,7 +2181,7 @@ mod tests {
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
-        let upstream = tokio::time::timeout(
+        let (upstream, task_result_request_count) = tokio::time::timeout(
             Duration::from_secs(5),
             make_connected_task_native_upstream("upstream", &router),
         )
@@ -2220,6 +2238,21 @@ mod tests {
         .expect("fetch passthrough task result timed out")
         .expect("fetch passthrough task result");
         assert!(payload.0.to_string().contains("task-native pass-through"));
+        assert_eq!(task_result_request_count.load(Ordering::SeqCst), 1);
+
+        let cached_payload = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.get_task_result_for_owner(&owner, &create.task.task_id),
+        )
+        .await
+        .expect("fetch cached passthrough task result timed out")
+        .expect("fetch cached passthrough task result");
+        assert!(cached_payload.0.to_string().contains("task-native pass-through"));
+        assert_eq!(
+            task_result_request_count.load(Ordering::SeqCst),
+            1,
+            "second result read should come from local cache"
+        );
 
         let second = tokio::time::timeout(
             Duration::from_secs(5),

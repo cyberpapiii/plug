@@ -74,8 +74,6 @@ No required roadmap work remains for the current production-ready bar.
 
 Optional future scope only:
 
-- task-store retention/indexing hardening (`todos/066`)
-- terminal passthrough result durability (`todos/067`)
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure

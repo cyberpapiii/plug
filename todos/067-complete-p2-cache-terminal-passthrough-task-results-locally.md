@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "067"
 tags: [code-review, tasks, passthrough, resilience, correctness]
@@ -94,3 +94,15 @@ To be filled during triage.
 - Passthrough mode currently provides status continuity better than result continuity
 - Terminal payload durability needs to be made explicit if reconnect/runtime guarantees are important
 
+### 2026-03-22 - Fix implemented
+
+**By:** Codex / ce:work
+
+**Actions:**
+- Cached successful passthrough task payloads locally in [mod.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/proxy/mod.rs) and [tasks.rs](/Users/robdezendorf/Documents/GitHub/plug/plug-core/src/tasks.rs)
+- Cleared upstream task references once a terminal payload is cached so subsequent reads use the local store
+- Strengthened the task-native upstream integration test to prove the second result read is served locally
+
+**Learnings:**
+- Result durability needed only a small extension to the task store once the ownership model was already correct
+- The best proof here was not another synthetic unit test but making the upstream fail on a second result read and verifying `plug` still succeeds

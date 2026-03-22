@@ -2068,15 +2068,26 @@ impl ToolRouter {
                         other => McpError::internal_error(other.to_string(), None),
                     })?;
                 return match response {
-                    ServerResult::GetTaskPayloadResult(result) => Ok(result),
-                    ServerResult::CallToolResult(result) => serde_json::to_value(result)
-                        .map(GetTaskPayloadResult::new)
-                        .map_err(|e| {
+                    ServerResult::GetTaskPayloadResult(result) => {
+                        self.task_store
+                            .lock()
+                            .await
+                            .cache_result_for_owner(owner, task_id, result.0.clone())?;
+                        Ok(result)
+                    }
+                    ServerResult::CallToolResult(result) => {
+                        let payload = serde_json::to_value(result).map_err(|e| {
                             McpError::internal_error(
                                 format!("failed to serialize upstream task payload: {e}"),
                                 None,
                             )
-                        }),
+                        })?;
+                        self.task_store
+                            .lock()
+                            .await
+                            .cache_result_for_owner(owner, task_id, payload.clone())?;
+                        Ok(GetTaskPayloadResult::new(payload))
+                    }
                     _ => Err(McpError::internal_error(
                         "unexpected upstream tasks/result response".to_string(),
                         None,
@@ -2085,6 +2096,10 @@ impl ToolRouter {
             }
         }
         self.task_store.lock().await.get_result_for_owner(owner, task_id)
+    }
+
+    pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
+        self.task_store.lock().await.cleanup_owner(owner);
     }
 
     pub async fn cancel_task_for_owner(

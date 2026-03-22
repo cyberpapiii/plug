@@ -77,7 +77,6 @@ Implemented on `main`:
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- task retention/indexing hardening and passthrough terminal-result durability remain as tracked non-blocking follow-up work
 - some low-priority internal simplification remains possible in reload/session/SSE helper structure, but no roadmap-critical correctness work remains open
 
 ## What Exists Off-Main
@@ -136,11 +135,10 @@ Use docs by role:
 ## Current Top Priorities
 
 1. keep current-state docs aligned with `main`
-2. address the remaining P2 task follow-ups in `todos/066` and `todos/067` when the maintenance bar allows
-3. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
-4. consider low-priority simplification/perf cleanup in reload/session/SSE helper structure if the maintenance bar expands
-5. keep all off-main work clearly marked as candidate future state only
-6. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
+2. continue optional operator/runtime polish around mixed-topology visibility and recovery clarity
+3. consider low-priority simplification/perf cleanup in reload/session/SSE helper structure if the maintenance bar expands
+4. keep all off-main work clearly marked as candidate future state only
+5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 
 ## Audit Artifacts
 
