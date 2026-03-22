@@ -101,6 +101,38 @@ impl TaskStore {
         }
     }
 
+    pub fn create_passthrough(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+    ) -> Task {
+        self.prune_expired();
+        let task_id = format!("task_{}", self.next_task_id);
+        self.next_task_id += 1;
+
+        let mut task = upstream_task.clone();
+        task.task_id = task_id.clone();
+        if task.status_message.is_none() {
+            task.status_message = Some(format!("Running {name}"));
+        }
+
+        self.tasks.insert(
+            task_id,
+            TaskRecord {
+                task: task.clone(),
+                owner,
+                result: None,
+                abort_handle: None,
+                upstream: Some(upstream),
+                last_touched: Instant::now(),
+            },
+        );
+
+        task
+    }
+
     pub fn complete(&mut self, task_id: &str, result: Value) {
         if let Some(record) = self.tasks.get_mut(task_id) {
             record.task.status = TaskStatus::Completed;
@@ -179,6 +211,41 @@ impl TaskStore {
             meta: None,
             task: record.task.clone(),
         })
+    }
+
+    pub fn sync_from_upstream_for_owner(
+        &mut self,
+        owner: &TaskOwner,
+        task_id: &str,
+        upstream_task: &Task,
+    ) -> Result<Task, McpError> {
+        self.prune_expired();
+        let record = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| task_not_found(task_id))?;
+        ensure_owner(owner, record)?;
+
+        record.task.status = upstream_task.status.clone();
+        record.task.status_message = upstream_task.status_message.clone();
+        record.task.created_at = upstream_task.created_at.clone();
+        record.task.last_updated_at = upstream_task.last_updated_at.clone();
+        record.task.ttl = upstream_task.ttl;
+        record.task.poll_interval = upstream_task.poll_interval;
+        record.last_touched = Instant::now();
+
+        Ok(record.task.clone())
+    }
+
+    pub fn upstream_for_owner(
+        &mut self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<Option<TaskUpstreamRef>, McpError> {
+        self.prune_expired();
+        let record = self.tasks.get(task_id).ok_or_else(|| task_not_found(task_id))?;
+        ensure_owner(owner, record)?;
+        Ok(record.upstream.clone())
     }
 
     pub fn get_result_for_owner(

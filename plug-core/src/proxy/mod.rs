@@ -1902,6 +1902,62 @@ impl ToolRouter {
         progress_token: Option<ProgressToken>,
         owner: TaskOwner,
     ) -> Result<CreateTaskResult, McpError> {
+        let cache = self.cache.load();
+        let (server_id, original_name) = cache
+            .routes
+            .get(tool_name)
+            .cloned()
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::ToolNotFound {
+                    tool_name: tool_name.to_string(),
+                })
+            })?;
+        drop(cache);
+
+        if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
+            if upstream
+                .capabilities
+                .tasks
+                .as_ref()
+                .is_some_and(|tasks| tasks.supports_tools_call())
+            {
+                let mut upstream_params = CallToolRequestParams::new(original_name.clone());
+                if let Some(args) = arguments.clone() {
+                    upstream_params = upstream_params.with_arguments(args);
+                }
+                upstream_params.task = Some(serde_json::Map::new());
+                if let Some(token) = progress_token.clone() {
+                    upstream_params.set_progress_token(token);
+                }
+                let response = upstream
+                    .client
+                    .peer()
+                    .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                        upstream_params,
+                    )))
+                    .await
+                    .map_err(|error| match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+
+                if let ServerResult::CreateTaskResult(result) = response {
+                    let task = self.task_store.lock().await.create_passthrough(
+                        owner,
+                        tool_name,
+                        &result.task,
+                        TaskUpstreamRef {
+                            server_id,
+                            request_id: RequestId::from(NumberOrString::String(Arc::from(
+                                result.task.task_id.clone(),
+                            ))),
+                        },
+                    );
+                    return Ok(CreateTaskResult::new(task));
+                }
+            }
+        }
+
         let task = {
             let mut store = self.task_store.lock().await;
             store.create(owner, tool_name)
@@ -1937,10 +1993,40 @@ impl ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskResult, McpError> {
-        self.task_store
-            .lock()
-            .await
-            .get_info_for_owner(owner, task_id)
+        if let Some(upstream) = self.task_store.lock().await.upstream_for_owner(owner, task_id)? {
+            if let Some(server) = self.server_manager.get_upstream(&upstream.server_id) {
+                let response = server
+                    .client
+                    .peer()
+                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                        GetTaskInfoParams {
+                            meta: None,
+                            task_id: upstream.request_id.to_string(),
+                        },
+                    )))
+                    .await
+                    .map_err(|error| match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                if let ServerResult::GetTaskResult(result) = response {
+                    let synced = self
+                        .task_store
+                        .lock()
+                        .await
+                        .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
+                    return Ok(GetTaskResult {
+                        meta: None,
+                        task: synced,
+                    });
+                }
+                return Err(McpError::internal_error(
+                    "unexpected upstream tasks/get response".to_string(),
+                    None,
+                ));
+            }
+        }
+        self.task_store.lock().await.get_info_for_owner(owner, task_id)
     }
 
     pub async fn get_task_result_for_owner(
@@ -1948,10 +2034,40 @@ impl ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        self.task_store
-            .lock()
-            .await
-            .get_result_for_owner(owner, task_id)
+        if let Some(upstream) = self.task_store.lock().await.upstream_for_owner(owner, task_id)? {
+            if let Some(server) = self.server_manager.get_upstream(&upstream.server_id) {
+                let response = server
+                    .client
+                    .peer()
+                    .send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest::new(
+                        GetTaskResultParams {
+                            meta: None,
+                            task_id: upstream.request_id.to_string(),
+                        },
+                    )))
+                    .await
+                    .map_err(|error| match error {
+                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                return match response {
+                    ServerResult::GetTaskPayloadResult(result) => Ok(result),
+                    ServerResult::CallToolResult(result) => serde_json::to_value(result)
+                        .map(GetTaskPayloadResult::new)
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("failed to serialize upstream task payload: {e}"),
+                                None,
+                            )
+                        }),
+                    _ => Err(McpError::internal_error(
+                        "unexpected upstream tasks/result response".to_string(),
+                        None,
+                    )),
+                };
+            }
+        }
+        self.task_store.lock().await.get_result_for_owner(owner, task_id)
     }
 
     pub async fn cancel_task_for_owner(
@@ -1966,14 +2082,27 @@ impl ToolRouter {
             .mark_cancelled(owner, task_id)?;
         if let Some(upstream) = upstream {
             if let Some(server) = self.server_manager.get_upstream(&upstream.server_id) {
-                let _ = server
+                let response = server
                     .client
                     .peer()
-                    .notify_cancelled(CancelledNotificationParam {
-                        request_id: upstream.request_id,
-                        reason: Some("task cancelled".to_string()),
-                    })
+                    .send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+                        CancelTaskParams {
+                            meta: None,
+                            task_id: upstream.request_id.to_string(),
+                        },
+                    )))
                     .await;
+                if let Ok(ServerResult::CancelTaskResult(result)) = response {
+                    let synced = self
+                        .task_store
+                        .lock()
+                        .await
+                        .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
+                    return Ok(CancelTaskResult {
+                        meta: None,
+                        task: synced,
+                    });
+                }
             }
         }
         if let Some(handle) = handle {
