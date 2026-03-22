@@ -527,6 +527,32 @@ impl ServerHandler for IpcProxyHandler {
                 tracing::warn!(error = %e, "failed to update session capabilities");
             }
 
+            // Refresh daemon-derived server capabilities at handshake time so
+            // downstream initialize sees the current routed surface, including
+            // late-bound capabilities like tasks once tools are available.
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::Capabilities {
+                        session_id: session_id.to_string(),
+                    }
+                })
+                .await
+            {
+                Ok(IpcResponse::Capabilities { capabilities }) => {
+                    if let Ok(parsed) = serde_json::from_value::<ServerCapabilities>(capabilities) {
+                        if let Ok(mut caps) = self.shared.capabilities.write() {
+                            *caps = parsed;
+                        }
+                    }
+                }
+                Ok(other) => {
+                    tracing::warn!(response = ?other, "unexpected IPC capabilities response");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to refresh daemon capabilities");
+                }
+            }
+
             // Store peer for logging notification forwarding. The daemon
             // pushes LoggingNotification frames after registration; the
             // heartbeat and request round-trips forward them to this peer.
@@ -1486,6 +1512,14 @@ mod tests {
             .serve(client_transport)
             .await
             .expect("connect downstream client");
+        let server_info = client
+            .peer()
+            .peer_info()
+            .expect("server initialize info available");
+        assert!(
+            server_info.capabilities.tasks.is_some(),
+            "IPC proxy should advertise tasks capability when routed tools exist"
+        );
 
         let task_request = CallToolRequestParams::new("Mock__echo")
             .with_arguments(

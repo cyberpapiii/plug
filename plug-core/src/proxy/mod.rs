@@ -1946,11 +1946,9 @@ impl ToolRouter {
                         owner,
                         tool_name,
                         &result.task,
-                        TaskUpstreamRef {
+                        TaskUpstreamRef::Task {
                             server_id,
-                            request_id: RequestId::from(NumberOrString::String(Arc::from(
-                                result.task.task_id.clone(),
-                            ))),
+                            task_id: result.task.task_id.clone(),
                         },
                     );
                     return Ok(CreateTaskResult::new(task));
@@ -1993,15 +1991,21 @@ impl ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskResult, McpError> {
-        if let Some(upstream) = self.task_store.lock().await.upstream_for_owner(owner, task_id)? {
-            if let Some(server) = self.server_manager.get_upstream(&upstream.server_id) {
+        let upstream = {
+            self.task_store
+                .lock()
+                .await
+                .upstream_for_owner(owner, task_id)?
+        };
+        if let Some(TaskUpstreamRef::Task { server_id, task_id: upstream_task_id }) = upstream {
+            if let Some(server) = self.server_manager.get_upstream(&server_id) {
                 let response = server
                     .client
                     .peer()
                     .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
                         GetTaskInfoParams {
                             meta: None,
-                            task_id: upstream.request_id.to_string(),
+                            task_id: upstream_task_id,
                         },
                     )))
                     .await
@@ -2034,15 +2038,21 @@ impl ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        if let Some(upstream) = self.task_store.lock().await.upstream_for_owner(owner, task_id)? {
-            if let Some(server) = self.server_manager.get_upstream(&upstream.server_id) {
+        let upstream = {
+            self.task_store
+                .lock()
+                .await
+                .upstream_for_owner(owner, task_id)?
+        };
+        if let Some(TaskUpstreamRef::Task { server_id, task_id: upstream_task_id }) = upstream {
+            if let Some(server) = self.server_manager.get_upstream(&server_id) {
                 let response = server
                     .client
                     .peer()
                     .send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest::new(
                         GetTaskResultParams {
                             meta: None,
-                            task_id: upstream.request_id.to_string(),
+                            task_id: upstream_task_id,
                         },
                     )))
                     .await
@@ -2081,27 +2091,43 @@ impl ToolRouter {
             .await
             .mark_cancelled(owner, task_id)?;
         if let Some(upstream) = upstream {
-            if let Some(server) = self.server_manager.get_upstream(&upstream.server_id) {
-                let response = server
-                    .client
-                    .peer()
-                    .send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
-                        CancelTaskParams {
-                            meta: None,
-                            task_id: upstream.request_id.to_string(),
-                        },
-                    )))
-                    .await;
-                if let Ok(ServerResult::CancelTaskResult(result)) = response {
-                    let synced = self
-                        .task_store
-                        .lock()
-                        .await
-                        .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
-                    return Ok(CancelTaskResult {
-                        meta: None,
-                        task: synced,
-                    });
+            match upstream {
+                TaskUpstreamRef::Task { server_id, task_id: upstream_task_id } => {
+                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                        let response = server
+                            .client
+                            .peer()
+                            .send_request(ClientRequest::CancelTaskRequest(
+                                CancelTaskRequest::new(CancelTaskParams {
+                                    meta: None,
+                                    task_id: upstream_task_id,
+                                }),
+                            ))
+                            .await;
+                        if let Ok(ServerResult::CancelTaskResult(result)) = response {
+                            let synced = self
+                                .task_store
+                                .lock()
+                                .await
+                                .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
+                            return Ok(CancelTaskResult {
+                                meta: None,
+                                task: synced,
+                            });
+                        }
+                    }
+                }
+                TaskUpstreamRef::Request { server_id, request_id } => {
+                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                        let _ = server
+                            .client
+                            .peer()
+                            .notify_cancelled(CancelledNotificationParam {
+                                request_id,
+                                reason: Some("task cancelled".to_string()),
+                            })
+                            .await;
+                    }
                 }
             }
         }
@@ -2226,7 +2252,7 @@ impl ToolRouter {
 
             self.task_store.lock().await.set_upstream_request(
                 &task_id,
-                TaskUpstreamRef {
+                TaskUpstreamRef::Request {
                     server_id: server_id.clone(),
                     request_id: request_handle.id.clone(),
                 },

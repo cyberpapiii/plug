@@ -29,9 +29,15 @@ impl TaskOwner {
 }
 
 #[derive(Debug, Clone)]
-pub struct TaskUpstreamRef {
-    pub server_id: String,
-    pub request_id: RequestId,
+pub enum TaskUpstreamRef {
+    Request {
+        server_id: String,
+        request_id: RequestId,
+    },
+    Task {
+        server_id: String,
+        task_id: String,
+    },
 }
 
 struct TaskRecord {

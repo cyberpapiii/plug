@@ -18,7 +18,7 @@ use rmcp::model::{
     ElicitationCapability, FormElicitationCapability, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
-    SetLevelRequestParams, Tool, UrlElicitationCapability,
+    SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
@@ -30,6 +30,8 @@ use crate::config::{Config, ServerConfig, TransportType};
 use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{HealthState, ServerHealth, ServerStatus};
+
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -53,11 +55,18 @@ impl ClientHandler for UpstreamClientHandler {
         info.capabilities.roots = Some(RootsCapabilities {
             list_changed: Some(true),
         });
+        info.capabilities.tasks = Some(TasksCapability::client_default());
         info.capabilities.sampling = Some(SamplingCapability::default());
         info.capabilities.elicitation = Some(ElicitationCapability {
             form: Some(FormElicitationCapability::default()),
             url: Some(UrlElicitationCapability::default()),
         });
+        info = info.with_protocol_version(
+            serde_json::from_value(serde_json::Value::String(
+                LATEST_PROTOCOL_VERSION.to_string(),
+            ))
+            .expect("latest protocol version must parse"),
+        );
         info
     }
 
@@ -1195,12 +1204,14 @@ mod tests {
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
         AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
-        ClientRequest, Content, GetPromptResult, Implementation, InitializeResult,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, Meta,
+        ClientRequest, Content, CreateTaskResult, GetPromptResult, GetTaskInfoParams,
+        GetTaskPayloadResult, GetTaskResult, Implementation, InitializeResult, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, ListToolsResult, Meta,
         NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
         PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
         ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
-        ServerResult, Tool,
+        ServerResult, Task, TaskStatus, TasksCapability, Tool, CancelTaskParams,
+        CancelTaskResult,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -1423,6 +1434,142 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TaskNativeUpstreamHandler {
+        next_id: AtomicUsize,
+        tasks: Mutex<HashMap<String, (Task, serde_json::Value)>>,
+    }
+
+    impl ServerHandler for TaskNativeUpstreamHandler {
+        fn get_info(&self) -> ServerInfo {
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.tools = Some(rmcp::model::ToolsCapability {
+                list_changed: Some(false),
+            });
+            capabilities.tasks = Some(TasksCapability::server_default());
+            ServerInfo::new(capabilities)
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Ok(ListToolsResult::with_all_items(vec![make_tool("echo")])))
+        }
+
+        fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+            std::future::ready(Err(McpError::internal_error(
+                "wrapper mode should not reach upstream call_tool".to_string(),
+                None,
+            )))
+        }
+
+        fn enqueue_task(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
+            let input = request
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("input"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            let id = format!(
+                "upstream-task-{}",
+                self.next_id.fetch_add(1, Ordering::SeqCst) + 1
+            );
+            let now = rmcp::task_manager::current_timestamp();
+            let task = Task::new(id.clone(), TaskStatus::Working, now.clone(), now)
+                .with_status_message("Working")
+                .with_ttl(60_000)
+                .with_poll_interval(25);
+            let payload = serde_json::json!({
+                "content": [{ "type": "text", "text": format!("task-native {input}") }],
+                "isError": false
+            });
+            self.tasks
+                .lock()
+                .unwrap()
+                .insert(id, (task.clone(), payload));
+            std::future::ready(Ok(CreateTaskResult::new(task)))
+        }
+
+        fn list_tasks(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
+            let tasks = self
+                .tasks
+                .lock()
+                .unwrap()
+                .values()
+                .map(|(task, _)| task.clone())
+                .collect::<Vec<_>>();
+            std::future::ready(Ok(ListTasksResult::new(tasks)))
+        }
+
+        fn get_task_info(
+            &self,
+            request: GetTaskInfoParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks
+                .get_mut(&request.task_id)
+                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None))
+                .map(|entry| {
+                    if entry.0.status == TaskStatus::Working {
+                        entry.0.status = TaskStatus::Completed;
+                        entry.0.status_message = Some("Completed".to_string());
+                        entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
+                    }
+                    entry.0.clone()
+                });
+            std::future::ready(task.map(|task| GetTaskResult { meta: None, task }))
+        }
+
+        fn get_task_result(
+            &self,
+            request: rmcp::model::GetTaskResultParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
+            let result = self
+                .tasks
+                .lock()
+                .unwrap()
+                .get(&request.task_id)
+                .map(|(_, payload)| GetTaskPayloadResult::new(payload.clone()))
+                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None));
+            std::future::ready(result)
+        }
+
+        fn cancel_task(
+            &self,
+            request: CancelTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks
+                .get_mut(&request.task_id)
+                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None))
+                .map(|entry| {
+                    entry.0.status = TaskStatus::Cancelled;
+                    entry.0.status_message = Some("Cancelled".to_string());
+                    entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
+                    entry.0.clone()
+                });
+            std::future::ready(task.map(|task| CancelTaskResult { meta: None, task }))
+        }
+    }
+
     async fn make_connected_test_upstream(name: &str) -> UpstreamServer {
         let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer = Arc::clone(&upstream_server.peer);
@@ -1458,6 +1605,48 @@ mod tests {
             client,
             tools,
             capabilities: ServerCapabilities::default(),
+            health: ServerHealth::Healthy,
+        }
+    }
+
+    async fn make_connected_task_native_upstream(
+        name: &str,
+        router: &Arc<crate::proxy::ToolRouter>,
+    ) -> UpstreamServer {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = TaskNativeUpstreamHandler::default()
+                .serve(server_transport)
+                .await
+                .expect("start task-native upstream test server");
+            let _ = server.waiting().await;
+        });
+
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let upstream_handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from(name.to_string()),
+            tools: Arc::clone(&tools),
+            router: Arc::downgrade(router),
+        });
+        let client: McpClient = upstream_handler
+            .serve(client_transport)
+            .await
+            .expect("connect task-native upstream test client");
+        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
+        tools.store(Arc::new(initial_tools));
+
+        let mut capabilities = ServerCapabilities::default();
+        capabilities.tools = Some(rmcp::model::ToolsCapability {
+            list_changed: Some(false),
+        });
+        capabilities.tasks = Some(TasksCapability::server_default());
+
+        UpstreamServer {
+            name: name.to_string(),
+            config: test_server_config(),
+            client,
+            tools,
+            capabilities,
             health: ServerHealth::Healthy,
         }
     }
@@ -1963,6 +2152,111 @@ mod tests {
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(router.tool_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn task_native_upstream_pass_through_proxies_task_lifecycle() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let upstream = tokio::time::timeout(
+            Duration::from_secs(5),
+            make_connected_task_native_upstream("upstream", &router),
+        )
+        .await
+        .expect("connect task-native upstream");
+        server_manager.replace_server("upstream", upstream).await;
+        tokio::time::timeout(Duration::from_secs(5), router.refresh_tools())
+            .await
+            .expect("refresh routed tools");
+
+        let tool_name = router
+            .list_tools()
+            .first()
+            .expect("task-native tool should be exposed")
+            .name
+            .to_string();
+        let owner = crate::tasks::TaskOwner::new(Arc::<str>::from("stdio:test-task-pass-through"));
+
+        let create = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.enqueue_tool_task(
+                &tool_name,
+                Some(
+                    serde_json::json!({"input": "pass-through"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                None,
+                owner.clone(),
+            ),
+        )
+        .await
+        .expect("create passthrough task timed out")
+        .expect("create passthrough task");
+        assert_eq!(create.task.task_id, "task_1");
+        assert_eq!(create.task.status, TaskStatus::Working);
+
+        let info = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.get_task_info_for_owner(&owner, &create.task.task_id),
+        )
+        .await
+        .expect("fetch passthrough task info timed out")
+        .expect("fetch passthrough task info");
+        assert_eq!(info.task.task_id, "task_1");
+        assert_eq!(info.task.status, TaskStatus::Completed);
+
+        let payload = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.get_task_result_for_owner(&owner, &create.task.task_id),
+        )
+        .await
+        .expect("fetch passthrough task result timed out")
+        .expect("fetch passthrough task result");
+        assert!(payload.0.to_string().contains("task-native pass-through"));
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.enqueue_tool_task(
+                &tool_name,
+                Some(
+                    serde_json::json!({"input": "cancel-me"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                None,
+                owner.clone(),
+            ),
+        )
+        .await
+        .expect("create second passthrough task timed out")
+        .expect("create second passthrough task");
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.cancel_task_for_owner(&owner, &second.task.task_id),
+        )
+        .await
+        .expect("cancel passthrough task timed out")
+        .expect("cancel passthrough task");
+        assert_eq!(cancelled.task.task_id, second.task.task_id);
+        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                router.get_task_result_for_owner(&owner, &second.task.task_id),
+            )
+            .await
+            .expect("fetch cancelled passthrough task result timed out")
+            .is_err(),
+            "cancelled passthrough task should not expose a result"
+        );
     }
 
     #[tokio::test]
