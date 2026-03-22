@@ -28,6 +28,23 @@ use crate::types::ClientType;
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
+const PLUG_TITLE: &str = "Plug";
+const PLUG_DESCRIPTION: &str = "MCP multiplexer";
+const PLUG_WEBSITE_URL: &str = "https://github.com/plug-mcp/plug";
+const PLUG_ICON_URL: &str =
+    "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg";
+
+fn plug_implementation() -> Implementation {
+    Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+        .with_title(PLUG_TITLE)
+        .with_description(PLUG_DESCRIPTION)
+        .with_website_url(PLUG_WEBSITE_URL)
+        .with_icons(vec![
+            Icon::new(PLUG_ICON_URL)
+                .with_mime_type("image/svg+xml")
+                .with_sizes(vec!["any".to_string()]),
+        ])
+}
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
@@ -1096,7 +1113,6 @@ impl ToolRouter {
             prefix: String,
             stripped_name: String,
             full_name: String,
-            has_strip_keywords: bool,
         }
 
         let mut classified: Vec<Classified> = Vec::new();
@@ -1128,7 +1144,7 @@ impl ToolRouter {
                     }
                 });
 
-            let (prefix, full_name, stripped_name, has_strip_keywords) =
+            let (prefix, full_name, stripped_name) =
                 if let Some(ref rules) = tool_group_rules {
                     match crate::tool_naming::classify_with_rules(&sanitized, rules) {
                         Some(result) => {
@@ -1136,12 +1152,11 @@ impl ToolRouter {
                                 &result.name,
                                 &result.strip_keywords,
                             );
-                            let has_strip = !result.strip_keywords.is_empty();
-                            (result.prefix, result.name, stripped, has_strip)
+                            (result.prefix, result.name, stripped)
                         }
                         None => {
                             let prefix = crate::tool_naming::format_server_prefix(&server_name);
-                            (prefix, sanitized.clone(), sanitized.clone(), false)
+                            (prefix, sanitized.clone(), sanitized.clone())
                         }
                     }
                 } else {
@@ -1163,7 +1178,7 @@ impl ToolRouter {
                         }
                     }
 
-                    (prefix, name.clone(), name, false)
+                    (prefix, name.clone(), name)
                 };
 
             classified.push(Classified {
@@ -1172,7 +1187,6 @@ impl ToolRouter {
                 prefix,
                 stripped_name,
                 full_name,
-                has_strip_keywords,
             });
         }
 
@@ -1231,16 +1245,14 @@ impl ToolRouter {
                 crate::enrichment::enrich_tool(&mut prefixed_tool);
             }
 
-            // Title always uses stripped name (display-only, no collision risk)
-            let title_name = if c.has_strip_keywords {
-                crate::tool_naming::generate_title(&c.prefix, &c.stripped_name)
-            } else {
-                crate::tool_naming::generate_title(&c.prefix, &final_name)
-            };
+            crate::enrichment::normalize_annotations(&mut prefixed_tool, &final_name);
 
-            // Set wire name and title
+            // Display titles follow the same disambiguation path as wire names.
+            let title_name = crate::tool_naming::generate_title(&c.prefix, &final_name);
+
+            // Set wire name and canonical display metadata
             prefixed_tool.name = Cow::Owned(prefixed_name);
-            prefixed_tool.title = Some(title_name);
+            apply_canonical_tool_title(&mut prefixed_tool, title_name);
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
@@ -2444,6 +2456,12 @@ fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
     }
 }
 
+fn apply_canonical_tool_title(tool: &mut Tool, title: String) {
+    tool.title = Some(title.clone());
+    let annotations = tool.annotations.get_or_insert_with(Default::default);
+    annotations.title = Some(title);
+}
+
 fn sanitize_description(desc: &str) -> String {
     desc.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
@@ -2793,7 +2811,7 @@ impl ProxyHandler {
 impl ServerHandler for ProxyHandler {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(self.router.synthesized_capabilities())
-            .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+            .with_server_info(plug_implementation())
             .with_protocol_version(
                 serde_json::from_value(serde_json::Value::String(
                     LATEST_PROTOCOL_VERSION.to_string(),
@@ -3242,6 +3260,13 @@ mod tests {
         let info = handler.get_info();
 
         assert_eq!(info.server_info.name, "plug");
+        assert_eq!(info.server_info.title.as_deref(), Some("Plug"));
+        assert_eq!(info.server_info.description.as_deref(), Some("MCP multiplexer"));
+        assert_eq!(
+            info.server_info.website_url.as_deref(),
+            Some("https://github.com/plug-mcp/plug")
+        );
+        assert_eq!(info.server_info.icons.as_ref().map(|icons| icons.len()), Some(1));
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.protocol_version.as_str(), LATEST_PROTOCOL_VERSION);
         assert!(info.capabilities.tools.is_none());
@@ -3401,6 +3426,43 @@ mod tests {
         strip_optional_fields(&mut tool, Some(4));
 
         assert_eq!(tool.description.as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn apply_canonical_tool_title_sets_top_level_and_annotation_titles() {
+        let mut tool = Tool::new(
+            Cow::Borrowed("Slack__channels_list"),
+            Cow::Borrowed("Get list of channels"),
+            Arc::new(serde_json::Map::new()),
+        );
+        let mut annotations = ToolAnnotations::default();
+        annotations.title = Some("List Channels".to_string());
+        tool.annotations = Some(annotations);
+
+        apply_canonical_tool_title(&mut tool, "Slack: List Channels".to_string());
+
+        assert_eq!(tool.title.as_deref(), Some("Slack: List Channels"));
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|ann| ann.title.as_deref()),
+            Some("Slack: List Channels")
+        );
+    }
+
+    #[test]
+    fn apply_canonical_tool_title_creates_annotation_title_when_missing() {
+        let mut tool = Tool::new(
+            Cow::Borrowed("Todoist__add_filters"),
+            Cow::Borrowed("Add one or more new personal filters."),
+            Arc::new(serde_json::Map::new()),
+        );
+
+        apply_canonical_tool_title(&mut tool, "Todoist: Add Filters".to_string());
+
+        assert_eq!(tool.title.as_deref(), Some("Todoist: Add Filters"));
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|ann| ann.title.as_deref()),
+            Some("Todoist: Add Filters")
+        );
     }
 
     #[test]

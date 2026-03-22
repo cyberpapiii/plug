@@ -460,8 +460,19 @@ impl ServerHandler for IpcProxyHandler {
             .read()
             .map(|caps| caps.clone())
             .unwrap_or_default();
-        InitializeResult::new(capabilities)
-            .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+        InitializeResult::new(capabilities).with_server_info(
+            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+                .with_title("Plug")
+                .with_description("MCP multiplexer")
+                .with_website_url("https://github.com/plug-mcp/plug")
+                .with_icons(vec![
+                    Icon::new(
+                        "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+                    )
+                    .with_mime_type("image/svg+xml")
+                    .with_sizes(vec!["any".to_string()]),
+                ]),
+        )
             .with_protocol_version(
                 serde_json::from_value(serde_json::Value::String(
                     LATEST_PROTOCOL_VERSION.to_string(),

@@ -1323,7 +1323,19 @@ async fn handle_request(
 /// Build the InitializeResult (same as ProxyHandler::get_info).
 fn build_initialize_result(router: &ToolRouter) -> InitializeResult {
     InitializeResult::new(router.synthesized_capabilities())
-        .with_server_info(Implementation::new("plug", env!("CARGO_PKG_VERSION")))
+        .with_server_info(
+            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+                .with_title("Plug")
+                .with_description("MCP multiplexer")
+                .with_website_url("https://github.com/plug-mcp/plug")
+                .with_icons(vec![
+                    Icon::new(
+                        "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+                    )
+                    .with_mime_type("image/svg+xml")
+                    .with_sizes(vec!["any".to_string()]),
+                ]),
+        )
 }
 
 /// Extract the host from an Origin header value.

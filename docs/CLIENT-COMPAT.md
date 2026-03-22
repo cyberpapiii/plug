@@ -1,6 +1,15 @@
 # Client Compatibility Reference
 
-This is the definitive reference for every AI client's MCP behavior, quirks, and requirements. fanout must handle ALL of these correctly.
+This is the definitive reference for every AI client's MCP behavior, quirks, and requirements. `plug` must handle ALL of these correctly.
+
+## Current Naming Contract
+
+`plug` intentionally keeps the current mixed routed naming model:
+
+- most servers use `ServerName__tool_name`
+- the `workspace` server is decomposed into sub-service prefixes such as `Gmail__...` and `GoogleDocs__...`
+
+Treat this as current truth when reasoning about client display behavior.
 
 ---
 
@@ -25,14 +34,14 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 
 ### Claude Code
 
-**Transport**: stdio via `fanout connect`
+**Transport**: stdio via `plug connect`
 **Config format**: JSON
 ```json
 // .mcp.json (project-level) or ~/.claude.json (global)
 {
   "mcpServers": {
-    "fanout": {
-      "command": "fanout",
+    "plug": {
+      "command": "plug",
       "args": ["connect"]
     }
   }
@@ -42,9 +51,9 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 **Behavior**:
 - Supports roots, sampling
 - Tool Search: when tool definitions exceed ~10% of context window, Claude Code switches to lazy-loading — it sends tool descriptions only (no schemas) and fetches full schemas on demand
-- This is the IDEAL client for fanout — it already handles large tool sets gracefully
+- This is the ideal client for `plug` — it already handles large tool sets gracefully
 
-**fanout implications**:
+**plug implications**:
 - Return full tool list; Claude Code will manage token efficiency itself
 - Support tool search protocol if Claude Code sends it
 
@@ -58,8 +67,8 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 // ~/Library/Application Support/Claude/claude_desktop_config.json
 {
   "mcpServers": {
-    "fanout": {
-      "command": "fanout",
+    "plug": {
+      "command": "plug",
       "args": ["connect"]
     }
   }
@@ -93,8 +102,8 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 // .cursor/mcp.json (project) or ~/.cursor/mcp.json (global)
 {
   "mcpServers": {
-    "fanout": {
-      "command": "fanout",
+    "plug": {
+      "command": "plug",
       "args": ["connect"]
     }
   }
@@ -176,8 +185,8 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 // ~/.gemini/settings.json
 {
   "mcpServers": {
-    "fanout": {
-      "command": "fanout",
+    "plug": {
+      "command": "plug",
       "args": ["connect"]
     }
   }
@@ -207,9 +216,9 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 **Config format**: TOML
 ```toml
 # ~/.codex/config.toml
-[mcp_servers.fanout]
+[mcp_servers.plug]
 type = "stdio"
-command = "fanout"
+command = "plug"
 args = ["connect"]
 # bearer_token_env_var = "FANOUT_TOKEN"  # for HTTP mode
 ```
