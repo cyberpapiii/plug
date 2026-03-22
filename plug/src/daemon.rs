@@ -16,6 +16,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
     CreateMessageRequestParams, CreateMessageResult, PaginatedRequestParams, RequestId,
+    RequestParamsMeta,
 };
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
@@ -1277,13 +1278,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if let Some(ref old_session) = ctx.session_id {
                 ctx.client_registry.deregister(old_session);
             }
-            let registration = match ctx
-                .client_registry
-                .try_register(
-                    client_id.clone(),
-                    client_info.clone(),
-                    MAX_REGISTERED_PROXY_CLIENTS,
-                ) {
+            let registration = match ctx.client_registry.try_register(
+                client_id.clone(),
+                client_info.clone(),
+                MAX_REGISTERED_PROXY_CLIENTS,
+            ) {
                 Ok(registration) => registration,
                 Err(()) => {
                     tracing::warn!(
@@ -1978,26 +1977,25 @@ async fn dispatch_mcp_request(
         }
 
         "tools/call" => {
-            // Extract tool name and arguments from params
-            let (name, arguments) = match params {
-                Some(p) => {
-                    let name = p
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let arguments = p.get("arguments").and_then(|v| v.as_object()).cloned();
-                    (name, arguments)
+            let call_params = match params
+                .map(|p| serde_json::from_value::<rmcp::model::CallToolRequestParams>(p.clone()))
+            {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: format!("tools/call: {e}"),
+                    };
                 }
                 None => {
                     return IpcResponse::Error {
                         code: "INVALID_PARAMS".to_string(),
-                        message: "tools/call requires 'name' in params".to_string(),
+                        message: "tools/call requires params".to_string(),
                     };
                 }
             };
 
-            if name.is_empty() {
+            if call_params.name.is_empty() {
                 return IpcResponse::Error {
                     code: "INVALID_PARAMS".to_string(),
                     message: "tools/call requires non-empty 'name'".to_string(),
@@ -2020,10 +2018,163 @@ async fn dispatch_mcp_request(
                 ))
             };
 
-            match tool_router
-                .call_tool_with_context(&name, arguments, None, downstream_ctx)
-                .await
+            if call_params.task.is_some() {
+                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+                let progress_token = call_params.progress_token();
+                let tool_name = call_params.name.to_string();
+                let arguments = call_params.arguments;
+                match tool_router
+                    .clone()
+                    .enqueue_tool_task(&tool_name, arguments, progress_token, owner)
+                    .await
+                {
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(payload) => IpcResponse::McpResponse { payload },
+                        Err(e) => IpcResponse::Error {
+                            code: "SERIALIZE_ERROR".to_string(),
+                            message: e.to_string(),
+                        },
+                    },
+                    Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                        Ok(payload) => IpcResponse::McpResponse { payload },
+                        Err(e) => IpcResponse::Error {
+                            code: "SERIALIZE_ERROR".to_string(),
+                            message: e.to_string(),
+                        },
+                    },
+                }
+            } else {
+                match tool_router
+                    .call_tool_with_context(
+                        &call_params.name,
+                        call_params.arguments,
+                        None,
+                        downstream_ctx,
+                    )
+                    .await
+                {
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(payload) => IpcResponse::McpResponse { payload },
+                        Err(e) => IpcResponse::Error {
+                            code: "SERIALIZE_ERROR".to_string(),
+                            message: e.to_string(),
+                        },
+                    },
+                    Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                        Ok(payload) => IpcResponse::McpResponse { payload },
+                        Err(e) => IpcResponse::Error {
+                            code: "SERIALIZE_ERROR".to_string(),
+                            message: e.to_string(),
+                        },
+                    },
+                }
+            }
+        }
+
+        "tasks/list" => {
+            let request = params
+                .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            match tool_router.list_tasks_for_owner(&owner, request).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "tasks/get" => {
+            let task_id = match params
+                .and_then(|p| p.get("taskId"))
+                .and_then(|v| v.as_str())
+                .filter(|task_id| !task_id.is_empty())
             {
+                Some(task_id) => task_id,
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "tasks/get requires non-empty 'taskId'".to_string(),
+                    };
+                }
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            match tool_router.get_task_info_for_owner(&owner, task_id).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "tasks/result" => {
+            let task_id = match params
+                .and_then(|p| p.get("taskId"))
+                .and_then(|v| v.as_str())
+                .filter(|task_id| !task_id.is_empty())
+            {
+                Some(task_id) => task_id,
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "tasks/result requires non-empty 'taskId'".to_string(),
+                    };
+                }
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            match tool_router.get_task_result_for_owner(&owner, task_id).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "tasks/cancel" => {
+            let task_id = match params
+                .and_then(|p| p.get("taskId"))
+                .and_then(|v| v.as_str())
+                .filter(|task_id| !task_id.is_empty())
+            {
+                Some(task_id) => task_id,
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "tasks/cancel requires non-empty 'taskId'".to_string(),
+                    };
+                }
+            };
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_session(session_id);
+            match tool_router.cancel_task_for_owner(&owner, task_id).await {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(payload) => IpcResponse::McpResponse { payload },
                     Err(e) => IpcResponse::Error {

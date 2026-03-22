@@ -21,6 +21,7 @@ pub mod proxy;
 pub mod reload;
 pub mod server;
 pub mod session;
+pub mod tasks;
 pub mod tls;
 pub mod tool_naming;
 pub mod transport;

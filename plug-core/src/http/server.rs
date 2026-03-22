@@ -602,12 +602,15 @@ async fn send_http_client_request(
     request: ServerRequest,
     timeout: Option<Duration>,
 ) -> Result<ClientResult, McpError> {
-    let has_live_sse_sender = state.sessions.has_live_sse_sender(session_id).map_err(|_| {
-        McpError::internal_error(
-            "HTTP client has no live SSE stream for reverse requests".to_string(),
-            None,
-        )
-    })?;
+    let has_live_sse_sender = state
+        .sessions
+        .has_live_sse_sender(session_id)
+        .map_err(|_| {
+            McpError::internal_error(
+                "HTTP client has no live SSE stream for reverse requests".to_string(),
+                None,
+            )
+        })?;
     if !has_live_sse_sender {
         return Err(McpError::internal_error(
             "HTTP client has no live SSE stream for reverse requests".to_string(),
@@ -625,12 +628,15 @@ async fn send_http_client_request(
                 .map_err(|e| McpError::internal_error(e.to_string(), None))
         })?;
 
-    let has_live_sse_sender = state.sessions.has_live_sse_sender(session_id).map_err(|_| {
-        McpError::internal_error(
-            "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
-            None,
-        )
-    })?;
+    let has_live_sse_sender = state
+        .sessions
+        .has_live_sse_sender(session_id)
+        .map_err(|_| {
+            McpError::internal_error(
+                "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
+                None,
+            )
+        })?;
     if !has_live_sse_sender {
         return Err(McpError::internal_error(
             "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
@@ -1127,22 +1133,146 @@ async fn handle_request(
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let progress_token = call_req.params.progress_token();
+            let owner =
+                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            if call_req.params.task.is_some() {
+                match state
+                    .router
+                    .clone()
+                    .enqueue_tool_task(
+                        call_req.params.name.as_ref(),
+                        call_req.params.arguments,
+                        progress_token,
+                        owner,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        let response_msg = ServerJsonRpcMessage::response(
+                            ServerResult::CreateTaskResult(result),
+                            request_id,
+                        );
+                        json_response(&response_msg)
+                    }
+                    Err(mcp_err) => {
+                        let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                        json_response(&response_msg)
+                    }
+                }
+            } else {
+                match state
+                    .router
+                    .call_tool_with_context(
+                        call_req.params.name.as_ref(),
+                        call_req.params.arguments,
+                        progress_token,
+                        Some(DownstreamCallContext::http(
+                            Arc::<str>::from(session_id.as_str()),
+                            request_id.clone(),
+                        )),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        let response_msg = ServerJsonRpcMessage::response(
+                            ServerResult::CallToolResult(result),
+                            request_id,
+                        );
+                        json_response(&response_msg)
+                    }
+                    Err(mcp_err) => {
+                        let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                        json_response(&response_msg)
+                    }
+                }
+            }
+        }
+
+        ClientRequest::ListTasksRequest(list_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            let owner =
+                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
             match state
                 .router
-                .call_tool_with_context(
-                    call_req.params.name.as_ref(),
-                    call_req.params.arguments,
-                    progress_token,
-                    Some(DownstreamCallContext::http(
-                        Arc::<str>::from(session_id.as_str()),
-                        request_id.clone(),
-                    )),
-                )
+                .list_tasks_for_owner(&owner, list_req.params)
                 .await
             {
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::CallToolResult(result),
+                        ServerResult::ListTasksResult(result),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::GetTaskInfoRequest(task_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            let owner =
+                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            match state
+                .router
+                .get_task_info_for_owner(&owner, &task_req.params.task_id)
+                .await
+            {
+                Ok(result) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::GetTaskResult(result),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::GetTaskResultRequest(task_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            let owner =
+                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            match state
+                .router
+                .get_task_result_for_owner(&owner, &task_req.params.task_id)
+                .await
+            {
+                Ok(result) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::GetTaskPayloadResult(result),
+                        request_id,
+                    );
+                    json_response(&response_msg)
+                }
+                Err(mcp_err) => {
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    json_response(&response_msg)
+                }
+            }
+        }
+
+        ClientRequest::CancelTaskRequest(task_req) => {
+            let session_id = extract_session_id(headers)?;
+            validate_session_header(headers, state.sessions.as_ref())?;
+            let owner =
+                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            match state
+                .router
+                .cancel_task_for_owner(&owner, &task_req.params.task_id)
+                .await
+            {
+                Ok(result) => {
+                    let response_msg = ServerJsonRpcMessage::response(
+                        ServerResult::CancelTaskResult(result),
                         request_id,
                     );
                     json_response(&response_msg)
@@ -1322,20 +1452,17 @@ async fn handle_request(
 
 /// Build the InitializeResult (same as ProxyHandler::get_info).
 fn build_initialize_result(router: &ToolRouter) -> InitializeResult {
-    InitializeResult::new(router.synthesized_capabilities())
-        .with_server_info(
-            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
-                .with_title("Plug")
-                .with_description("MCP multiplexer")
-                .with_website_url("https://github.com/plug-mcp/plug")
-                .with_icons(vec![
-                    Icon::new(
-                        "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
-                    )
-                    .with_mime_type("image/svg+xml")
-                    .with_sizes(vec!["any".to_string()]),
-                ]),
-        )
+    InitializeResult::new(router.synthesized_capabilities()).with_server_info(
+        Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+            .with_title("Plug")
+            .with_description("MCP multiplexer")
+            .with_website_url("https://github.com/plug-mcp/plug")
+            .with_icons(vec![Icon::new(
+                "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+            )
+            .with_mime_type("image/svg+xml")
+            .with_sizes(vec!["any".to_string()])]),
+    )
 }
 
 /// Extract the host from an Origin header value.
