@@ -57,7 +57,7 @@ if [[ "$RUN_TESTS" -eq 1 ]]; then
 fi
 
 echo "==> Installing plug to $CARGO_BIN_DIR"
-cargo install --path plug --force
+cargo install --path plug --force --locked
 
 mkdir -p "$LOCAL_BIN_DIR"
 
