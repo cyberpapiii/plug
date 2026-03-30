@@ -36,7 +36,7 @@ use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
     CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
     ElicitationCapability, FormElicitationCapability, Implementation, SamplingCapability,
-    SamplingMessage, UrlElicitationCapability,
+    ReadResourceRequestParams, ResourceContents, SamplingMessage, UrlElicitationCapability,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::auth::CredentialStore;
@@ -1187,6 +1187,200 @@ async fn test_stdio_resource_link_passes_through_end_to_end() {
 }
 
 #[tokio::test]
+async fn test_stdio_oversized_tool_result_spills_to_artifact_link() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("artifact_text"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
+        .await
+        .expect("call oversized tool");
+
+    let resource = result
+        .content
+        .iter()
+        .find_map(|content| content.raw.as_resource_link())
+        .expect("artifact resource_link content");
+    assert!(
+        resource.uri.starts_with("plug://artifact/"),
+        "expected plug artifact URI, got {}",
+        resource.uri
+    );
+    assert_eq!(result.is_error, Some(false));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stdio_artifact_manifest_is_readable() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("artifact_text"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
+        .await
+        .expect("call oversized tool");
+    let manifest_uri = result
+        .content
+        .iter()
+        .find_map(|content| content.raw.as_resource_link())
+        .map(|resource| resource.uri.clone())
+        .expect("artifact resource_link content");
+
+    let manifest = client
+        .peer()
+        .read_resource(ReadResourceRequestParams::new(manifest_uri))
+        .await
+        .expect("read artifact manifest");
+    let first = manifest.contents.first().expect("manifest contents");
+    match first {
+        ResourceContents::TextResourceContents { text, .. } => {
+            assert!(
+                text.contains("artifact_text"),
+                "expected manifest to mention source tool, got: {text}"
+            );
+        }
+        other => panic!("expected text manifest contents, got {other:?}"),
+    }
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stdio_artifact_chunk_is_readable() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("artifact_text"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
+        .await
+        .expect("call oversized tool");
+    let manifest_uri = result
+        .content
+        .iter()
+        .find_map(|content| content.raw.as_resource_link())
+        .map(|resource| resource.uri.clone())
+        .expect("artifact resource_link content");
+    let chunk_uri = manifest_uri.replace("/manifest", "/chunk/0");
+
+    let chunk = client
+        .peer()
+        .read_resource(ReadResourceRequestParams::new(chunk_uri))
+        .await
+        .expect("read artifact chunk");
+    let first = chunk.contents.first().expect("chunk contents");
+    match first {
+        ResourceContents::TextResourceContents { text, .. } => {
+            assert!(!text.is_empty(), "expected non-empty chunk text");
+        }
+        other => panic!("expected text chunk contents, got {other:?}"),
+    }
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stdio_attachment_like_tool_result_spills_to_artifact_link() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("attachment_blob"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("Mock__attachment_blob"))
+        .await
+        .expect("call attachment-like tool");
+
+    let resource = result
+        .content
+        .iter()
+        .find_map(|content| content.raw.as_resource_link())
+        .expect("artifact resource_link content");
+    assert!(resource.uri.starts_with("plug://artifact/"));
+    assert_eq!(result.is_error, Some(false));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_http_structured_content_passes_through_end_to_end() {
     let mut config = Config::default();
     config
@@ -1352,6 +1546,91 @@ async fn test_http_resource_link_passes_through_end_to_end() {
     assert_eq!(
         call_json["result"]["content"][0]["name"],
         "mock-resource.txt"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_http_oversized_tool_result_spills_to_artifact_link() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("artifact_text"));
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let state = Arc::new(HttpState {
+        router: engine.tool_router().clone(),
+        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        cancel: CancellationToken::new(),
+        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+        downstream_oauth: None,
+        sse_channel_capacity: 32,
+        allowed_origins: Vec::new(),
+        notification_task_started: std::sync::atomic::AtomicBool::new(false),
+        auth_token: None,
+        roots_capable_sessions: dashmap::DashMap::new(),
+        pending_client_requests: dashmap::DashMap::new(),
+        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+        client_capabilities: dashmap::DashMap::new(),
+    });
+    let app = build_router(state.clone());
+
+    let initialize_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "http-artifact", "version": "1.0" }
+        }
+    });
+    let initialize_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&initialize_body).unwrap()))
+        .unwrap();
+    let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+    let session_id = initialize_resp
+        .headers()
+        .get(HTTP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let call_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "Mock__artifact_text"
+        }
+    });
+    let call_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header(HTTP_SESSION_ID_HEADER, &session_id)
+        .header(HTTP_PROTOCOL_VERSION_HEADER, HTTP_PROTOCOL_VERSION)
+        .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+        .unwrap();
+    let call_resp = app.oneshot(call_req).await.unwrap();
+    let call_bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let call_json: serde_json::Value = serde_json::from_slice(&call_bytes).unwrap();
+    assert_eq!(call_json["result"]["isError"], false);
+    assert_eq!(call_json["result"]["content"][1]["type"], "resource_link");
+    assert!(
+        call_json["result"]["content"][1]["uri"]
+            .as_str()
+            .expect("artifact uri")
+            .starts_with("plug://artifact/")
     );
 
     engine.shutdown().await;

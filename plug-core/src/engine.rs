@@ -34,6 +34,7 @@ const RESTART_COOLDOWN: Duration = Duration::from_secs(10);
 const RECONNECT_RETRY_MAX_ATTEMPTS: u32 = 5;
 const RECONNECT_RETRY_MIN_DELAY: Duration = Duration::from_millis(100);
 const RECONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const ARTIFACT_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Monotonic counter for correlating ToolCallStarted/ToolCallCompleted events.
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -187,6 +188,7 @@ impl Engine {
 
         // Refresh tool cache after startup
         self.tool_router.refresh_tools().await;
+        self.tool_router.prune_artifacts();
 
         let tool_count = self.tool_router.tool_count();
         let _ = self
@@ -216,6 +218,12 @@ impl Engine {
             Arc::clone(self),
             self.cancel.clone(),
             &config,
+            &self.tracker,
+        );
+
+        spawn_artifact_prune_loop(
+            self.tool_router.clone(),
+            self.cancel.clone(),
             &self.tracker,
         );
 
@@ -579,6 +587,25 @@ pub fn spawn_refresh_loops(
         }
         spawn_refresh_loop_for_server(engine.clone(), cancel.clone(), name.clone(), tracker);
     }
+}
+
+pub fn spawn_artifact_prune_loop(
+    tool_router: Arc<ToolRouter>,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+) {
+    tracker.spawn(async move {
+        let mut interval = tokio::time::interval(ARTIFACT_PRUNE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    tool_router.prune_artifacts();
+                }
+            }
+        }
+    });
 }
 
 pub fn spawn_refresh_loop_for_server(

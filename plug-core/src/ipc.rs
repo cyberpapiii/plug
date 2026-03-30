@@ -3,6 +3,7 @@
 //! Shared between `plug-core` (types) and `plug` (socket listener).
 //! Wire format: 4-byte big-endian u32 length prefix + JSON payload.
 
+use base64::Engine as _;
 use std::fmt;
 
 use rmcp::model::{
@@ -15,6 +16,8 @@ use crate::types::{ServerHealth, ServerStatus};
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+/// Raw payload bytes per chunk when a logical daemon response exceeds one frame.
+pub const RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 
@@ -364,6 +367,12 @@ pub enum IpcClientResponse {
 pub enum DaemonToProxyMessage {
     /// Normal response to an `IpcRequest`.
     Response { inner: IpcResponse },
+    /// Fragment of a large logical `IpcResponse`.
+    ResponseChunk {
+        chunk_index: u32,
+        chunk_count: u32,
+        payload_b64: String,
+    },
     /// Reverse request requiring the proxy to respond with an `IpcClientResponse`.
     ReverseRequest {
         id: u64,
@@ -426,6 +435,9 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
     payload: &[u8],
 ) -> anyhow::Result<()> {
+    if payload.len() > MAX_FRAME_SIZE as usize {
+        anyhow::bail!("payload too large: {} bytes (max {MAX_FRAME_SIZE})", payload.len());
+    }
     let len = u32::try_from(payload.len())
         .map_err(|_| anyhow::anyhow!("payload too large: {} bytes", payload.len()))?;
     writer.write_u32(len).await?;
@@ -450,6 +462,29 @@ pub async fn send_daemon_message<W: tokio::io::AsyncWriteExt + Unpin>(
 ) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(message)?;
     write_frame(writer, &payload).await
+}
+
+/// Send an `IpcResponse`, chunking it into daemon envelopes if it exceeds one frame.
+pub async fn send_chunked_response<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    response: &IpcResponse,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(response)?;
+    if payload.len() <= MAX_FRAME_SIZE as usize {
+        return write_frame(writer, &payload).await;
+    }
+
+    let chunk_count = payload.len().div_ceil(RESPONSE_CHUNK_BYTES);
+    for (chunk_index, chunk) in payload.chunks(RESPONSE_CHUNK_BYTES).enumerate() {
+        let message = DaemonToProxyMessage::ResponseChunk {
+            chunk_index: chunk_index as u32,
+            chunk_count: chunk_count as u32,
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
+        };
+        send_daemon_message(writer, &message).await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

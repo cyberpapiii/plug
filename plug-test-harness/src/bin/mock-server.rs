@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use clap::Parser;
 use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
@@ -137,6 +138,34 @@ impl ServerHandler for MockServer {
                         icons: None,
                         meta: None,
                     },
+                )]));
+            }
+
+            if request.name == "artifact_text" {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "A".repeat(18 * 1024 * 1024),
+                )]));
+            }
+
+            if request.name == "chunked_text" {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "B".repeat(6 * 1024 * 1024),
+                )]));
+            }
+
+            if request.name == "attachment_blob" {
+                let raw = vec![0x5a_u8; 3_600_000];
+                let content = base64::engine::general_purpose::STANDARD.encode(raw);
+                let payload = serde_json::json!({
+                    "file_id": "FTEST123",
+                    "filename": "deck.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 3_600_000,
+                    "encoding": "base64",
+                    "content": content,
+                });
+                return Ok(CallToolResult::success(vec![Content::text(
+                    payload.to_string(),
                 )]));
             }
 

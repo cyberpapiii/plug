@@ -43,6 +43,7 @@ forwarding work:
 - daemon-provided transport-complete live session truth in background-service mode
 - pinned operator JSON contracts plus downstream HTTP inventory failure-path coverage
 - performance and efficiency follow-through across auth-store reads, reload batching, SSE fanout, and config env traversal
+- oversized result delivery hardening via artifact spillover, `plug://artifact/...` resource reads, daemon-IPC chunking, and artifact cache maintenance
 - runtime-truth follow-up hardening across `status`, `tools`, `servers`, `clients`, and `doctor`
 - explicit live reverse-request delivery failure handling for downstream HTTP sessions
 - review-hardened task correctness around monotonic state transitions, reconnect-stable IPC ownership, and fail-closed pass-through dispatch
@@ -66,6 +67,7 @@ The current product shape is:
 - pre-serialized broadcast SSE payloads for the hot HTTP notification path
 - centralized env-reference traversal reused by config loading and doctor checks
 - core MCP Tasks support as part of the routed downstream surface
+- oversized tool/task result delivery that preserves success across transports via artifact spillover and daemon-IPC chunking for medium oversized inline responses
 
 ## Remaining Work
 

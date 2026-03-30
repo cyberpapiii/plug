@@ -59,6 +59,11 @@ Implemented on `main`:
   - `tasks/get`
   - `tasks/result`
   - `tasks/cancel`
+- oversized result delivery hardening across stdio, HTTP, and daemon IPC:
+  - artifact-backed success fallback for very large or attachment-like tool/task results
+  - synthetic `plug://artifact/...` manifests and chunk reads via `resources/read`
+  - daemon IPC chunking for medium oversized logical responses that should stay inline
+  - symmetric IPC frame-size enforcement on read and write paths
 - upstream task pass-through when an upstream advertises task-capable `tools/call`, with local wrapper-mode fallback otherwise
 - downstream HTTP live-session operator endpoint with dedicated operator token protection
 - daemon-owned downstream HTTP/HTTPS when the shared background service is running
@@ -71,6 +76,7 @@ Implemented on `main`:
 - bounded concurrent reload startup with single-flight engine reloads and safe shared upstream registration
 - coalesced health-triggered tool refreshes and deduplicated proactive recovery task spawning
 - pre-serialized HTTP/SSE notification fanout payloads
+- artifact cache pruning at startup, periodic background maintenance, and oldest-first size eviction
 - centralized config env traversal reused by doctor env checks, with broader coverage across config fields
 - stricter runtime-truth handling across `status`, `tools`, `servers`, `clients`, and `doctor` when the daemon is reachable but IPC/runtime inspection fails
 

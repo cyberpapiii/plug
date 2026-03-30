@@ -938,7 +938,7 @@ async fn handle_ipc_loop(
             ctx.reverse_request_rx = reverse_rx;
         }
 
-        ipc::send_response(writer, &response).await?;
+        ipc::send_chunked_response(writer, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
         if matches!(request, IpcRequest::Shutdown { .. }) {

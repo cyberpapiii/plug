@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
@@ -138,6 +139,8 @@ impl IpcProxyHandler {
         // response. Forward notifications to the downstream peer and handle
         // reverse requests inline, then keep reading until we get the final
         // response frame.
+        let mut chunked_response = Vec::new();
+        let mut expected_chunks: Option<u32> = None;
         loop {
             let frame = ipc::read_frame(&mut conn.reader)
                 .await
@@ -182,6 +185,47 @@ impl IpcProxyHandler {
                         }
                         other => return Ok(other),
                     },
+                    DaemonToProxyMessage::ResponseChunk {
+                        chunk_index,
+                        chunk_count,
+                        payload_b64,
+                    } => {
+                        if chunk_count == 0 {
+                            return Err(TransportFailure {
+                                message: "invalid response chunk count 0".to_string(),
+                                reconnectable: false,
+                            });
+                        }
+                        if chunk_index == 0 {
+                            chunked_response.clear();
+                            expected_chunks = Some(chunk_count);
+                        } else if expected_chunks != Some(chunk_count) {
+                            return Err(TransportFailure {
+                                message: "response chunk count changed mid-stream".to_string(),
+                                reconnectable: false,
+                            });
+                        }
+
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(payload_b64)
+                            .map_err(|e| TransportFailure {
+                                message: format!("invalid chunk payload: {e}"),
+                                reconnectable: false,
+                            })?;
+                        chunked_response.extend_from_slice(&decoded);
+
+                        if chunk_index + 1 == chunk_count {
+                            let response: IpcResponse = serde_json::from_slice(&chunked_response)
+                                .map_err(|e| TransportFailure {
+                                    message: format!("invalid chunked IPC response: {e}"),
+                                    reconnectable: false,
+                                })?;
+                            chunked_response.clear();
+                            return Ok(response);
+                        }
+
+                        continue;
+                    }
                     DaemonToProxyMessage::ReverseRequest { id, request } => {
                         // Handle reverse request from daemon (elicitation / sampling)
                         let response =
@@ -1225,6 +1269,22 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
+    fn artifact_base_dir() -> PathBuf {
+        directories::ProjectDirs::from("", "", "plug")
+            .map(|dirs| dirs.cache_dir().join("artifacts"))
+            .unwrap_or_else(|| std::env::temp_dir().join("plug-artifacts"))
+    }
+
+    fn cleanup_artifact_uri(uri: &str) {
+        let Some(rest) = uri.strip_prefix("plug://artifact/") else {
+            return;
+        };
+        let Some((id, _)) = rest.split_once('/') else {
+            return;
+        };
+        let _ = std::fs::remove_dir_all(artifact_base_dir().join(id));
+    }
+
     fn ensure_mock_server_built() -> PathBuf {
         static PATH: OnceLock<PathBuf> = OnceLock::new();
         PATH.get_or_init(|| {
@@ -1263,11 +1323,11 @@ mod tests {
         }
     }
 
-    fn mock_server_config() -> ServerConfig {
+    fn mock_server_config_with_tools(tools: &str) -> ServerConfig {
         let mock_server = ensure_mock_server_built();
         ServerConfig {
             command: Some(mock_server.display().to_string()),
-            args: vec!["--tools".to_string(), "echo".to_string()],
+            args: vec!["--tools".to_string(), tools.to_string()],
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
@@ -1285,6 +1345,10 @@ mod tests {
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
         }
+    }
+
+    fn mock_server_config() -> ServerConfig {
+        mock_server_config_with_tools("echo")
     }
 
     async fn spawn_test_daemon(
@@ -1818,6 +1882,378 @@ mod tests {
 
         engine.shutdown().await;
         daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_reassembles_chunked_tool_response() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdchunk-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config.servers.insert(
+            "mock".to_string(),
+            mock_server_config_with_tools("chunked_text"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-chunked".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.call_tool(CallToolRequestParams::new("Mock__chunked_text")),
+        )
+        .await
+        .expect("chunked tool call timeout")
+        .expect("chunked tool call");
+
+        let first = result.content.first().expect("content");
+        let text = first.raw.as_text().expect("text content");
+        assert_eq!(text.text.len(), 6 * 1024 * 1024);
+        assert_eq!(result.is_error, Some(false));
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_spills_large_tool_result_to_artifact_link() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdartifact-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config.servers.insert(
+            "mock".to_string(),
+            mock_server_config_with_tools("artifact_text"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-artifact".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.call_tool(CallToolRequestParams::new("Mock__artifact_text")),
+        )
+        .await
+        .expect("artifact tool call timeout")
+        .expect("artifact tool call");
+
+        let resource = result
+            .content
+            .iter()
+            .find_map(|content| content.raw.as_resource_link())
+            .expect("artifact resource_link content");
+        assert!(resource.uri.starts_with("plug://artifact/"));
+        assert_eq!(result.is_error, Some(false));
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_task_result_spills_to_artifact_link() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdtartifact-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config.servers.insert(
+            "mock".to_string(),
+            mock_server_config_with_tools("artifact_text"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-task-artifact".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let task_request = CallToolRequestParams::new("Mock__artifact_text")
+            .with_task(serde_json::Map::new());
+
+        let create_response = client
+            .peer()
+            .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                task_request,
+            )))
+            .await
+            .expect("task create response");
+        let task_id = match create_response {
+            ServerResult::CreateTaskResult(result) => result.task.task_id,
+            other => panic!("unexpected create task response: {other:?}"),
+        };
+
+        let payload_response = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = client
+                    .peer()
+                    .send_request(ClientRequest::GetTaskResultRequest(
+                        GetTaskResultRequest::new(GetTaskResultParams {
+                            meta: None,
+                            task_id: task_id.clone(),
+                        }),
+                    ))
+                    .await
+                    .expect("task result response");
+                match response {
+                    ServerResult::GetTaskPayloadResult(payload) => break payload,
+                    ServerResult::CallToolResult(result) => {
+                        break GetTaskPayloadResult::new(serde_json::to_value(result).unwrap())
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("task result timeout");
+
+        assert_eq!(payload_response.0["isError"], false);
+        assert_eq!(payload_response.0["content"][1]["type"], "resource_link");
+        assert!(
+            payload_response.0["content"][1]["uri"]
+                .as_str()
+                .expect("artifact uri")
+                .starts_with("plug://artifact/")
+        );
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_artifact_manifest_survives_daemon_restart() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdrehydrate-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config.servers.insert(
+            "mock".to_string(),
+            mock_server_config_with_tools("artifact_text"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine_a, daemon_a) = spawn_test_daemon(config.clone(), config_path.clone()).await;
+
+        let session_a = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-rehydrate-a".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy_a = IpcProxyHandler::new(session_a, Some(config_path.clone()));
+
+        let (server_transport_a, client_transport_a) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_a
+                .serve(server_transport_a)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client_a = TestClient
+            .serve(client_transport_a)
+            .await
+            .expect("connect downstream client");
+
+        let result = client_a
+            .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
+            .await
+            .expect("artifact tool call");
+        let manifest_uri = result
+            .content
+            .iter()
+            .find_map(|content| content.raw.as_resource_link())
+            .expect("artifact resource_link")
+            .uri
+            .clone();
+
+        engine_a.shutdown().await;
+        daemon_a
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        let (engine_b, daemon_b) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session_b = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-rehydrate-b".to_string(),
+            None,
+        )
+        .await
+        .expect("establish replacement daemon proxy session");
+        let proxy_b = IpcProxyHandler::new(session_b, Some(config_path.clone()));
+
+        let (server_transport_b, client_transport_b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy_b
+                .serve(server_transport_b)
+                .await
+                .expect("start replacement IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client_b = TestClient
+            .serve(client_transport_b)
+            .await
+            .expect("connect replacement downstream client");
+
+        let manifest = client_b
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(manifest_uri.clone()))
+            .await
+            .expect("read rehydrated manifest");
+        assert_eq!(manifest.contents.len(), 1);
+
+        cleanup_artifact_uri(&manifest_uri);
+        engine_b.shutdown().await;
+        daemon_b
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");

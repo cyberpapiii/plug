@@ -23,6 +23,7 @@ use crate::client_detect::detect_client;
 use crate::config::Config;
 use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
+use crate::artifacts::ArtifactStore;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
@@ -137,6 +138,7 @@ pub struct ToolRouter {
     /// Weak reference to Engine for session recovery (reconnect on error).
     /// Set after Engine construction via `set_engine()`.
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    artifact_store: ArtifactStore,
     /// Resource subscription registry: upstream URI → set of downstream subscribers.
     resource_subscriptions: DashMap<String, HashSet<NotificationTarget>>,
     /// Cached downstream roots per client. Upstream servers see the union via `list_roots_union()`.
@@ -281,6 +283,7 @@ impl ToolRouter {
             pending_resource_list_changed: AtomicBool::new(false),
             pending_prompt_list_changed: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
+            artifact_store: ArtifactStore::new(),
             resource_subscriptions: DashMap::new(),
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
@@ -306,6 +309,10 @@ impl ToolRouter {
 
     pub fn subscribe_logging(&self) -> broadcast::Receiver<ProtocolNotification> {
         self.logging_tx.subscribe()
+    }
+
+    pub fn prune_artifacts(&self) {
+        self.artifact_store.prune();
     }
 
     /// Map LoggingLevel to numeric severity (Debug=0 .. Emergency=7).
@@ -1757,6 +1764,10 @@ impl ToolRouter {
     }
 
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+        if uri.starts_with("plug://artifact/") {
+            return self.artifact_store.read(uri);
+        }
+
         let snapshot = self.cache.load();
         let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
             McpError::from(ProtocolError::InvalidRequest {
@@ -2073,7 +2084,10 @@ impl ToolRouter {
                             .lock()
                             .await
                             .cache_result_for_owner(owner, task_id, result.0.clone())?;
-                        Ok(result)
+                        self.artifact_store.maybe_spill_task_payload(
+                            &format!("task_result:{task_id}"),
+                            result.0,
+                        )
                     }
                     ServerResult::CallToolResult(result) => {
                         let payload = serde_json::to_value(result).map_err(|e| {
@@ -2086,7 +2100,10 @@ impl ToolRouter {
                             .lock()
                             .await
                             .cache_result_for_owner(owner, task_id, payload.clone())?;
-                        Ok(GetTaskPayloadResult::new(payload))
+                        self.artifact_store.maybe_spill_task_payload(
+                            &format!("task_result:{task_id}"),
+                            payload,
+                        )
                     }
                     _ => Err(McpError::internal_error(
                         "unexpected upstream tasks/result response".to_string(),
@@ -2095,7 +2112,13 @@ impl ToolRouter {
                 };
             }
         }
-        self.task_store.lock().await.get_result_for_owner(owner, task_id)
+        let payload = self
+            .task_store
+            .lock()
+            .await
+            .get_result_for_owner(owner, task_id)?;
+        self.artifact_store
+            .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload.0)
     }
 
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
@@ -2555,7 +2578,8 @@ impl ToolRouter {
                             success: true,
                         });
                     }
-                    Ok(response)
+                    self.artifact_store
+                        .maybe_spill_tool_result(tool_name, response)
                 }
                 Err(e) if is_session_error(&e) && !is_retry => {
                     // Session/transport error on first attempt — try to reconnect and retry
