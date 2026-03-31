@@ -777,16 +777,18 @@ async fn await_oauth_callback_inner(
         .unwrap_or("")
         .to_string();
 
-    // Extract query parameters. OAuth code/state values are opaque ASCII
-    // tokens that do not require percent-decoding.
-    let query = path.split('?').nth(1).unwrap_or("");
-    let params: std::collections::HashMap<&str, &str> = query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
+    // Extract query parameters using standard URL decoding. OAuth callback
+    // values are opaque and must be forwarded exactly as decoded from the URL.
+    let request_url = format!("http://localhost{path}");
+    let params = reqwest::Url::parse(&request_url)
+        .map_err(|e| anyhow::anyhow!("invalid callback URL: {e}"))?;
+    let params: std::collections::HashMap<String, String> = params
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
 
     // Check for an error response from the authorization server.
-    if let Some(&err) = params.get("error") {
+    if let Some(err) = params.get("error") {
         let desc = params
             .get("error_description")
             .map(|d| format!(": {d}"))
@@ -964,6 +966,33 @@ mod tests {
         let (code, state) = handle.await.unwrap().unwrap();
         assert_eq!(code, "abc123");
         assert_eq!(state, "xyz789");
+    }
+
+    /// Proves that percent-encoded callback parameters are decoded before
+    /// token exchange.
+    #[tokio::test]
+    async fn callback_decodes_percent_encoded_code_and_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle =
+            tokio::spawn(
+                async move { await_oauth_callback(listener, Duration::from_secs(5)).await },
+            );
+
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"GET /callback?code=abc%2F123%2Bxyz%3D&state=hello%20world HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (code, state) = handle.await.unwrap().unwrap();
+        assert_eq!(code, "abc/123+xyz=");
+        assert_eq!(state, "hello world");
     }
 
     /// Proves that the listener returns an error when the authorization server
