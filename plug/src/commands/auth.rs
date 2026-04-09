@@ -417,6 +417,7 @@ async fn cmd_auth_complete(
 
 fn injected_client_identity(
     server_config: Option<&plug_core::config::ServerConfig>,
+    existing_client_id: Option<&str>,
     has_refresh_token: bool,
 ) -> (String, bool) {
     let Some(server_config) = server_config else {
@@ -426,6 +427,9 @@ fn injected_client_identity(
         return ("injected".to_string(), false);
     }
     if let Some(client_id) = server_config.oauth_client_id.as_deref() {
+        return (client_id.to_string(), true);
+    }
+    if let Some(client_id) = existing_client_id.filter(|client_id| *client_id != "injected") {
         return (client_id.to_string(), true);
     }
     ("injected".to_string(), false)
@@ -467,8 +471,13 @@ async fn cmd_auth_inject(
         token.set_expires_in(Some(&std::time::Duration::from_secs(secs)));
     }
 
+    let snapshot = store.credential_snapshot();
+    let existing_client_id = snapshot
+        .credentials
+        .as_ref()
+        .map(|creds| creds.client_id.as_str());
     let (client_id, refreshable) =
-        injected_client_identity(Some(server_config), refresh_token.is_some());
+        injected_client_identity(Some(server_config), existing_client_id, refresh_token.is_some());
 
     let stored = StoredCredentials {
         client_id,
@@ -897,14 +906,43 @@ mod tests {
             tool_groups: Vec::new(),
         };
 
-        let (client_id, refreshable) = injected_client_identity(Some(&server), true);
+        let (client_id, refreshable) = injected_client_identity(Some(&server), None, true);
         assert_eq!(client_id, "client-123");
         assert!(refreshable);
 
         let (fallback_client_id, fallback_refreshable) =
-            injected_client_identity(Some(&server), false);
+            injected_client_identity(Some(&server), None, false);
         assert_eq!(fallback_client_id, "injected");
         assert!(!fallback_refreshable);
+    }
+
+    #[test]
+    fn injected_client_identity_reuses_existing_oauth_client_for_refresh() {
+        let server = plug_core::config::ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Http,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: Some("oauth".to_string()),
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+        };
+
+        let (client_id, refreshable) =
+            injected_client_identity(Some(&server), Some("dynamic-client-123"), true);
+        assert_eq!(client_id, "dynamic-client-123");
+        assert!(refreshable);
     }
 
     #[test]

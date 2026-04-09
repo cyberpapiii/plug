@@ -178,7 +178,11 @@ impl Engine {
             if !server_config.enabled || self.server_manager.get_upstream(name).is_some() {
                 continue;
             }
-            // OAuth servers that fail at startup get AuthRequired, not Failed
+            if self.server_manager.health.contains_key(name) {
+                continue;
+            }
+            // Fall back to the old startup classification only if no earlier
+            // start attempt recorded a more specific health state.
             if server_config.auth.as_deref() == Some("oauth") {
                 self.server_manager.mark_auth_required(name);
             } else {

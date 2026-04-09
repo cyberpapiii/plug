@@ -380,7 +380,6 @@ fn set_file_permissions_0600(path: &std::path::Path) -> anyhow::Result<()> {
 fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .truncate(true)
         .write(true)
         .read(true)
         .open(pid_path)
@@ -392,6 +391,7 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
     // Write our PID
     use std::io::Write;
     let mut f = &file;
+    f.set_len(0)?;
     write!(f, "{}", std::process::id())?;
     f.flush()?;
 
@@ -420,16 +420,17 @@ pub async fn run_daemon(
     ensure_dir(&rt_dir)?;
     ensure_dir(&log_directory)?;
 
-    // Generate auth token and write to file with restricted permissions from creation
-    let auth_token = generate_auth_token();
-    let token_file = token_path();
-    plug_core::auth::write_token_file(&token_file, &auth_token)
-        .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
-
     // Acquire PID file lock BEFORE socket operations to prevent TOCTOU races.
     // Two concurrent auto_start_daemon calls: the loser fails here, retries connecting.
     let pid_file_path = pid_path();
     let _pid_lock = acquire_pid_lock(&pid_file_path)?;
+
+    // Generate auth token only after we own the daemon runtime lock so a
+    // losing concurrent startup cannot overwrite the live daemon's control token.
+    let auth_token = generate_auth_token();
+    let token_file = token_path();
+    plug_core::auth::write_token_file(&token_file, &auth_token)
+        .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
 
     // Clean up stale socket if it exists (safe now — we hold the PID lock)
     let sock_path = socket_path();
@@ -1241,7 +1242,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 Ok(()) => IpcResponse::Ok,
                 Err(e) => IpcResponse::Error {
                     code: "RESTART_FAILED".to_string(),
-                    message: e.to_string(),
+                    message: format!("{e:#}"),
                 },
             }
         }
@@ -1730,8 +1731,22 @@ async fn dispatch_inject_token(
         token.set_expires_in(Some(&std::time::Duration::from_secs(*secs)));
     }
 
+    let snapshot = store.credential_snapshot();
+    let existing_client_id = snapshot
+        .credentials
+        .as_ref()
+        .map(|creds| creds.client_id.as_str())
+        .filter(|client_id| *client_id != "injected");
+    let client_id = config
+        .servers
+        .get(server_name)
+        .and_then(|sc| sc.oauth_client_id.as_deref())
+        .or(existing_client_id)
+        .unwrap_or("injected")
+        .to_string();
+
     let stored = StoredCredentials {
-        client_id: "injected".to_string(),
+        client_id,
         token_response: Some(token),
         granted_scopes: vec![],
         token_received_at: Some(now),
@@ -1762,7 +1777,7 @@ async fn dispatch_inject_token(
             IpcResponse::Error {
                 code: "RESTART_FAILED".to_string(),
                 message: format!(
-                    "credentials saved but server restart failed: {e}. \
+                    "credentials saved but server restart failed: {e:#}. \
                      The server may recover on next health check."
                 ),
             }
@@ -2553,6 +2568,37 @@ mod tests {
         let rt = runtime_dir();
         assert!(tok.starts_with(&rt));
         assert!(tok.to_string_lossy().ends_with("plug.token"));
+    }
+
+    #[test]
+    fn acquire_pid_lock_does_not_truncate_existing_file_on_failed_relock() {
+        let temp = std::env::temp_dir().join(format!(
+            "plug-daemon-pid-lock-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let pid_file = temp.join("plug.pid");
+
+        let first_lock = acquire_pid_lock(&pid_file).expect("first pid lock");
+        let initial = std::fs::read_to_string(&pid_file).expect("read pid after first lock");
+        assert!(
+            !initial.trim().is_empty(),
+            "first lock should write the current pid"
+        );
+
+        let second = acquire_pid_lock(&pid_file);
+        assert!(second.is_err(), "second pid lock should fail");
+
+        let after_failed_relock =
+            std::fs::read_to_string(&pid_file).expect("read pid after failed relock");
+        assert_eq!(
+            after_failed_relock, initial,
+            "failed relock must not blank or rewrite the existing pid file"
+        );
+
+        drop(first_lock);
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[tokio::test]

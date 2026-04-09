@@ -186,6 +186,210 @@ impl MockOAuthProvider {
     }
 }
 
+struct MockStatelessOauthProvider {
+    base_url: String,
+    shared: Arc<Mutex<MockOAuthProviderShared>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockStatelessOauthProvider {
+    async fn start() -> Self {
+        let shared = Arc::new(Mutex::new(MockOAuthProviderShared {
+            metadata_requests: 0,
+            authorize_requests: 0,
+            token_grants: Vec::new(),
+            pkce_verified: false,
+            current_access_token: "access-token-1".to_string(),
+            current_refresh_token: "refresh-token-1".to_string(),
+            pending_codes: HashMap::new(),
+            mcp_auth_headers: Vec::new(),
+        }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind mock stateless oauth provider");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider local addr")
+        );
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(mock_oauth_metadata_handler),
+            )
+            .route(
+                "/authorize",
+                axum::routing::get(mock_oauth_authorize_handler),
+            )
+            .route("/token", axum::routing::post(mock_oauth_token_handler))
+            .route("/mcp", axum::routing::post(mock_stateless_oauth_mcp_handler))
+            .with_state(MockOAuthProviderState {
+                base_url: base_url.clone(),
+                shared: Arc::clone(&shared),
+            });
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock stateless oauth provider");
+        });
+
+        Self {
+            base_url,
+            shared,
+            handle,
+        }
+    }
+
+    fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.base_url)
+    }
+}
+
+impl Drop for MockStatelessOauthProvider {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct MockToolListFailureOauthProvider {
+    base_url: String,
+    _shared: Arc<Mutex<MockOAuthProviderShared>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockToolListFailureOauthProvider {
+    async fn start() -> Self {
+        let shared = Arc::new(Mutex::new(MockOAuthProviderShared {
+            metadata_requests: 0,
+            authorize_requests: 0,
+            token_grants: Vec::new(),
+            pkce_verified: false,
+            current_access_token: "access-token-1".to_string(),
+            current_refresh_token: "refresh-token-1".to_string(),
+            pending_codes: HashMap::new(),
+            mcp_auth_headers: Vec::new(),
+        }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind mock failure oauth provider");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider local addr")
+        );
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(mock_oauth_metadata_handler),
+            )
+            .route(
+                "/authorize",
+                axum::routing::get(mock_oauth_authorize_handler),
+            )
+            .route("/token", axum::routing::post(mock_oauth_token_handler))
+            .route("/mcp", axum::routing::post(mock_tool_list_failure_oauth_mcp_handler))
+            .with_state(MockOAuthProviderState {
+                base_url: base_url.clone(),
+                shared: Arc::clone(&shared),
+            });
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock failure oauth provider");
+        });
+
+        Self {
+            base_url,
+            _shared: shared,
+            handle,
+        }
+    }
+
+    fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.base_url)
+    }
+}
+
+impl Drop for MockToolListFailureOauthProvider {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct MockInitializedNotificationFailureOauthProvider {
+    base_url: String,
+    shared: Arc<Mutex<MockOAuthProviderShared>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockInitializedNotificationFailureOauthProvider {
+    async fn start() -> Self {
+        let shared = Arc::new(Mutex::new(MockOAuthProviderShared {
+            metadata_requests: 0,
+            authorize_requests: 0,
+            token_grants: Vec::new(),
+            pkce_verified: false,
+            current_access_token: "access-token-1".to_string(),
+            current_refresh_token: "refresh-token-1".to_string(),
+            pending_codes: HashMap::new(),
+            mcp_auth_headers: Vec::new(),
+        }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind mock initialized-notification failure provider");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider local addr")
+        );
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(mock_oauth_metadata_handler),
+            )
+            .route(
+                "/authorize",
+                axum::routing::get(mock_oauth_authorize_handler),
+            )
+            .route("/token", axum::routing::post(mock_oauth_token_handler))
+            .route(
+                "/mcp",
+                axum::routing::post(mock_initialized_notification_failure_oauth_mcp_handler),
+            )
+            .with_state(MockOAuthProviderState {
+                base_url: base_url.clone(),
+                shared: Arc::clone(&shared),
+            });
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock initialized-notification failure provider");
+        });
+
+        Self {
+            base_url,
+            shared,
+            handle,
+        }
+    }
+
+    fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.base_url)
+    }
+}
+
+impl Drop for MockInitializedNotificationFailureOauthProvider {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl Drop for MockOAuthProvider {
     fn drop(&mut self) {
         self.handle.abort();
@@ -396,6 +600,220 @@ async fn mock_oauth_mcp_handler(
     }
 
     (StatusCode::BAD_REQUEST, session_headers, String::new()).into_response()
+}
+
+async fn mock_stateless_oauth_mcp_handler(
+    State(state): State<MockOAuthProviderState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+
+    let mut shared = state.shared.lock().await;
+    if let Some(ref header) = auth_header {
+        shared.mcp_auth_headers.push(header.clone());
+    }
+
+    let expected = format!("Bearer {}", shared.current_access_token);
+    if auth_header.as_deref() != Some(expected.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    drop(shared);
+
+    let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let method = json_body
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    let sse_headers = [(axum::http::header::CONTENT_TYPE, "text/event-stream")];
+
+    let payload = match method {
+        "initialize" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {
+                    "tools": { "listChanged": true }
+                },
+                "serverInfo": {
+                    "name": "mock-stateless-http-server",
+                    "version": "1.0.0"
+                }
+            }
+        }),
+        "notifications/initialized" => {
+            return (StatusCode::ACCEPTED, sse_headers, String::new()).into_response();
+        }
+        "tools/list" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": {
+                "tools": [{
+                    "name": "search_meetings",
+                    "description": "Search meetings",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }]
+            }
+        }),
+        _ => return (StatusCode::BAD_REQUEST, sse_headers, String::new()).into_response(),
+    };
+
+    let event_stream = format!("event: message\ndata: {payload}\n\n");
+    (StatusCode::OK, sse_headers, event_stream).into_response()
+}
+
+async fn mock_tool_list_failure_oauth_mcp_handler(
+    State(state): State<MockOAuthProviderState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+
+    let mut shared = state.shared.lock().await;
+    if let Some(ref header) = auth_header {
+        shared.mcp_auth_headers.push(header.clone());
+    }
+
+    let expected = format!("Bearer {}", shared.current_access_token);
+    if auth_header.as_deref() != Some(expected.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    drop(shared);
+
+    let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let method = json_body
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    let session_headers = [
+        (
+            axum::http::HeaderName::from_static("mcp-session-id"),
+            "test-session",
+        ),
+        (axum::http::header::CONTENT_TYPE, "application/json"),
+    ];
+
+    match method {
+        "initialize" => {
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {
+                        "tools": { "listChanged": false }
+                    },
+                    "serverInfo": {
+                        "name": "mock-tool-list-failure-server",
+                        "version": "1.0.0"
+                    }
+                }
+            });
+            (StatusCode::OK, session_headers, resp.to_string()).into_response()
+        }
+        "notifications/initialized" => {
+            (StatusCode::ACCEPTED, session_headers, String::new()).into_response()
+        }
+        "tools/list" => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            session_headers,
+            "backend temporarily unavailable".to_string(),
+        )
+            .into_response(),
+        _ => (StatusCode::BAD_REQUEST, session_headers, String::new()).into_response(),
+    }
+}
+
+async fn mock_initialized_notification_failure_oauth_mcp_handler(
+    State(state): State<MockOAuthProviderState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+
+    let mut shared = state.shared.lock().await;
+    if let Some(ref header) = auth_header {
+        shared.mcp_auth_headers.push(header.clone());
+    }
+
+    let expected = format!("Bearer {}", shared.current_access_token);
+    if auth_header.as_deref() != Some(expected.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    drop(shared);
+
+    let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let method = json_body
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    let sse_headers = [(axum::http::header::CONTENT_TYPE, "text/event-stream")];
+
+    match method {
+        "initialize" => {
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {
+                        "tools": { "listChanged": true }
+                    },
+                    "serverInfo": {
+                        "name": "mock-initialized-notification-failure-server",
+                        "version": "1.0.0"
+                    }
+                }
+            });
+            let event_stream = format!("event: message\ndata: {payload}\n\n");
+            (StatusCode::OK, sse_headers, event_stream).into_response()
+        }
+        "notifications/initialized" => StatusCode::UNAUTHORIZED.into_response(),
+        "tools/list" => {
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "tools": [{
+                        "name": "search_meetings",
+                        "description": "Search meetings",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }]
+                }
+            });
+            let event_stream = format!("event: message\ndata: {payload}\n\n");
+            (StatusCode::OK, sse_headers, event_stream).into_response()
+        }
+        _ => (StatusCode::BAD_REQUEST, sse_headers, String::new()).into_response(),
+    }
 }
 
 #[derive(Clone)]
@@ -2328,6 +2746,263 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
         .clear()
         .await
         .expect("clear required OAuth store after test");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test]
+async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy() {
+    let provider = MockStatelessOauthProvider::start().await;
+    let server_name = format!("oauth-stateless-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store
+        .clear()
+        .await
+        .expect("clear OAuth store before test");
+    store
+        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
+        .await
+        .expect("seed oauth credentials");
+
+    let mut engine: Option<Arc<Engine>> = None;
+    let result = AssertUnwindSafe(async {
+        let mut config = Config::default();
+        config.servers.insert(
+            server_name.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 10,
+                call_timeout_secs: 5,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+
+        let started_engine = Arc::new(Engine::new(config));
+        started_engine.start().await.expect("engine start");
+        engine = Some(Arc::clone(&started_engine));
+
+        let statuses = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let statuses = started_engine.server_statuses();
+                if statuses.iter().any(|status| status.server_id == server_name) {
+                    break statuses;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("engine status snapshot should converge");
+
+        let status = statuses
+            .into_iter()
+            .find(|status| status.server_id == server_name)
+            .expect("server status present");
+        assert_eq!(status.health, plug_core::types::ServerHealth::Healthy);
+        assert_eq!(status.auth_status, "oauth");
+        assert_eq!(status.tool_count, 1, "stateless upstream should expose tools");
+
+        let snapshot = provider.shared.lock().await;
+        assert!(
+            snapshot
+                .mcp_auth_headers
+                .iter()
+                .all(|header| header == "Bearer access-token-1"),
+            "expected upstream requests to use the saved bearer token once"
+        );
+    })
+    .catch_unwind()
+    .await;
+
+    if let Some(engine) = engine {
+        tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+    }
+    store.clear().await.expect("clear OAuth store after test");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test]
+async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required() {
+    let provider = MockToolListFailureOauthProvider::start().await;
+    let server_name = format!("oauth-startup-failure-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store
+        .clear()
+        .await
+        .expect("clear OAuth store before test");
+    store
+        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
+        .await
+        .expect("seed oauth credentials");
+
+    let mut engine: Option<Arc<Engine>> = None;
+    let result = AssertUnwindSafe(async {
+        let mut config = Config::default();
+        config.servers.insert(
+            server_name.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 10,
+                call_timeout_secs: 5,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+
+        let started_engine = Arc::new(Engine::new(config));
+        started_engine.start().await.expect("engine start");
+        engine = Some(Arc::clone(&started_engine));
+
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = started_engine
+                    .server_statuses()
+                    .into_iter()
+                    .find(|status| status.server_id == server_name)
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("engine status snapshot should converge");
+
+        assert_eq!(
+            status.health,
+            plug_core::types::ServerHealth::Failed,
+            "valid saved credentials plus a non-auth startup failure should not be classified as re-auth required"
+        );
+        assert_eq!(status.auth_status, "oauth");
+        assert_eq!(status.tool_count, 0);
+    })
+    .catch_unwind()
+    .await;
+
+    if let Some(engine) = engine {
+        tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+    }
+    store.clear().await.expect("clear OAuth store after test");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test]
+async fn test_oauth_server_can_start_when_initialized_notification_is_rejected() {
+    let provider = MockInitializedNotificationFailureOauthProvider::start().await;
+    let server_name = format!("oauth-init-notif-failure-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store
+        .clear()
+        .await
+        .expect("clear OAuth store before test");
+    store
+        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
+        .await
+        .expect("seed oauth credentials");
+
+    let mut engine: Option<Arc<Engine>> = None;
+    let result = AssertUnwindSafe(async {
+        let mut config = Config::default();
+        config.servers.insert(
+            server_name.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 10,
+                call_timeout_secs: 5,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+
+        let started_engine = Arc::new(Engine::new(config));
+        started_engine.start().await.expect("engine start");
+        engine = Some(Arc::clone(&started_engine));
+
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = started_engine
+                    .server_statuses()
+                    .into_iter()
+                    .find(|status| status.server_id == server_name)
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("engine status snapshot should converge");
+
+        assert_eq!(status.health, plug_core::types::ServerHealth::Healthy);
+        assert_eq!(status.auth_status, "oauth");
+        assert_eq!(status.tool_count, 1);
+
+        let snapshot = provider.shared.lock().await;
+        assert!(
+            snapshot
+                .mcp_auth_headers
+                .iter()
+                .all(|header| header == "Bearer access-token-1"),
+            "expected startup requests to continue using the valid bearer token"
+        );
+    })
+    .catch_unwind()
+    .await;
+
+    if let Some(engine) = engine {
+        tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+    }
+    store.clear().await.expect("clear OAuth store after test");
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }

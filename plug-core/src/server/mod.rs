@@ -9,21 +9,24 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::future::join_all;
+use futures::stream::BoxStream;
 use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
-    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
-    ElicitationCapability, FormElicitationCapability, LoggingMessageNotificationParam,
+    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult, ElicitationCapability,
+    FormElicitationCapability, InitializedNotification, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
     SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
-    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+    StreamableHttpClient, StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+    StreamableHttpError, StreamableHttpPostResponse,
 };
+use sse_stream::{Error as SseError, Sse};
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
@@ -39,6 +42,101 @@ const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct InitializedNotificationCompatHttpClient {
+    inner: reqwest::Client,
+    server_name: Arc<str>,
+}
+
+impl InitializedNotificationCompatHttpClient {
+    fn new(server_name: Arc<str>) -> Self {
+        Self {
+            inner: reqwest::Client::new(),
+            server_name,
+        }
+    }
+}
+
+fn is_initialized_notification_message(
+    message: &rmcp::model::ClientJsonRpcMessage,
+) -> bool {
+    matches!(
+        message,
+        rmcp::model::ClientJsonRpcMessage::Notification(notification)
+            if matches!(notification.notification, rmcp::model::ClientNotification::InitializedNotification(InitializedNotification { .. }))
+    )
+}
+
+impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let is_initialized = is_initialized_notification_message(&message);
+        let result = <reqwest::Client as StreamableHttpClient>::post_message(
+            &self.inner,
+            uri,
+            message,
+            session_id.clone(),
+            auth_header,
+            custom_headers,
+        )
+        .await;
+
+        if is_initialized && result.is_err() {
+            tracing::warn!(
+                server = %self.server_name,
+                "ignoring notifications/initialized failure for HTTP upstream; continuing with compatibility fallback"
+            );
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+
+        result
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        <reqwest::Client as StreamableHttpClient>::delete_session(
+            &self.inner,
+            uri,
+            session_id,
+            auth_header,
+            custom_headers,
+        )
+        .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        <reqwest::Client as StreamableHttpClient>::get_stream(
+            &self.inner,
+            uri,
+            session_id,
+            last_event_id,
+            auth_header,
+            custom_headers,
+        )
+        .await
+    }
+}
 
 pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
@@ -267,6 +365,7 @@ pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
     server_map_write_lock: std::sync::Mutex<()>,
     pub(crate) health: DashMap<String, HealthState>,
+    configured_auth: DashMap<String, ConfiguredAuth>,
     pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
     pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
     /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
@@ -275,12 +374,54 @@ pub struct ServerManager {
     tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfiguredAuth {
+    None,
+    Bearer,
+    Oauth,
+}
+
 impl ServerManager {
+    fn configured_auth_for_server(config: &ServerConfig) -> ConfiguredAuth {
+        if config.auth.as_deref() == Some("oauth") {
+            ConfiguredAuth::Oauth
+        } else if config.auth_token.is_some() {
+            ConfiguredAuth::Bearer
+        } else {
+            ConfiguredAuth::None
+        }
+    }
+
+    fn auth_status_from_configured_auth(auth: ConfiguredAuth, health: ServerHealth) -> String {
+        match auth {
+            ConfiguredAuth::Oauth => {
+                if health == ServerHealth::AuthRequired {
+                    "auth-required".to_string()
+                } else {
+                    "oauth".to_string()
+                }
+            }
+            ConfiguredAuth::Bearer => "bearer".to_string(),
+            ConfiguredAuth::None => "none".to_string(),
+        }
+    }
+
+    fn record_start_failure(&self, name: &str, config: &ServerConfig, error: &anyhow::Error) {
+        self.configured_auth
+            .insert(name.to_string(), Self::configured_auth_for_server(config));
+        if config.auth.as_deref() == Some("oauth") && crate::oauth::is_auth_error(&format!("{error:#}")) {
+            self.mark_auth_required(name);
+        } else {
+            self.mark_start_failure(name);
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             servers: ArcSwap::from_pointee(HashMap::new()),
             server_map_write_lock: std::sync::Mutex::new(()),
             health: DashMap::new(),
+            configured_auth: DashMap::new(),
             circuit_breakers: DashMap::new(),
             semaphores: DashMap::new(),
             reconnecting: DashMap::new(),
@@ -389,6 +530,10 @@ impl ServerManager {
                         // Clone current map, insert new server, swap
                         let max_concurrent = upstream.config.max_concurrent;
                         let cb_enabled = upstream.config.circuit_breaker_enabled;
+                        self.configured_auth.insert(
+                            name.clone(),
+                            Self::configured_auth_for_server(&upstream.config),
+                        );
                         self.insert_upstream(name.clone(), Arc::new(upstream));
 
                         // Initialize resilience state for this server
@@ -406,6 +551,9 @@ impl ServerManager {
                     }
                     Ok((name, Err(e))) => {
                         tracing::error!(server = %name, error = %e, "failed to start server");
+                        if let Some(server_config) = config.servers.get(&name) {
+                            self.record_start_failure(&name, server_config, &e);
+                        }
                         // One server failing should not prevent others from starting
                     }
                     Err(e) => {
@@ -569,8 +717,10 @@ impl ServerManager {
                         "connecting to HTTP upstream"
                     );
 
-                    let transport =
-                        StreamableHttpClientTransport::from_config(transport_config);
+                    let transport = StreamableHttpClientTransport::with_client(
+                        InitializedNotificationCompatHttpClient::new(Arc::from(name)),
+                        transport_config,
+                    );
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
                     let handler = Arc::new(UpstreamClientHandler {
@@ -946,6 +1096,7 @@ impl ServerManager {
         .await;
 
         self.health.clear();
+        self.configured_auth.clear();
         self.circuit_breakers.clear();
         self.semaphores.clear();
         self.reconnecting.clear();
@@ -962,17 +1113,10 @@ impl ServerManager {
                     .get(&upstream.name)
                     .map(|h| h.health)
                     .unwrap_or(upstream.health);
-                let auth_status = if upstream.config.auth.as_deref() == Some("oauth") {
-                    if health == ServerHealth::AuthRequired {
-                        "auth-required".to_string()
-                    } else {
-                        "oauth".to_string()
-                    }
-                } else if upstream.config.auth_token.is_some() {
-                    "bearer".to_string()
-                } else {
-                    "none".to_string()
-                };
+                let auth_status = Self::auth_status_from_configured_auth(
+                    Self::configured_auth_for_server(&upstream.config),
+                    health,
+                );
                 ServerStatus {
                     server_id: upstream.name.clone(),
                     health,
@@ -987,11 +1131,13 @@ impl ServerManager {
             if servers.contains_key(entry.key()) {
                 continue;
             }
-            let auth_status = if entry.health == ServerHealth::AuthRequired {
-                "auth-required".to_string()
-            } else {
-                "none".to_string()
-            };
+            let configured_auth = self
+                .configured_auth
+                .get(entry.key())
+                .map(|value| *value)
+                .unwrap_or(ConfiguredAuth::None);
+            let auth_status =
+                Self::auth_status_from_configured_auth(configured_auth, entry.health);
             statuses.push(ServerStatus {
                 server_id: entry.key().clone(),
                 health: entry.health,

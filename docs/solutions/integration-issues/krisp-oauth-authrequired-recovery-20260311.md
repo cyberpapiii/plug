@@ -11,6 +11,22 @@ branch: fix/claude-remote-protocol-version
 
 # Krisp OAuth AuthRequired Recovery Gap
 
+## Historical Note
+
+This write-up captures a real March 2026 runtime-recovery issue, but it is no longer the full story.
+
+Later investigation found two additional factors that can produce Krisp/Todoist-style operator
+symptoms even when credential persistence itself is working:
+
+- a daemon control-token / PID-file race that can leave runtime control surfaces stale
+- HTTP upstream compatibility issues around `notifications/initialized`
+
+See:
+
+- [2026-04-09-daemon-control-token-race-and-http-initialized-compat.md](./2026-04-09-daemon-control-token-race-and-http-initialized-compat.md)
+
+Treat this document as historical context, not the latest complete diagnosis.
+
 ## Problem
 
 Krisp was configured as an upstream HTTP MCP server with OAuth:
