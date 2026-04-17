@@ -868,7 +868,7 @@ fn is_retryable_reconnect_error(error: &anyhow::Error) -> bool {
 }
 
 fn is_auth_reconnect_error(error: &anyhow::Error) -> bool {
-    crate::oauth::is_auth_error(&format!("{error:#}"))
+    crate::oauth::is_auth_error_chain(error)
 }
 
 #[cfg(test)]
