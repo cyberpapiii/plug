@@ -1367,7 +1367,7 @@ mod tests {
         }
         tokio::time::timeout(
             Duration::from_secs(5),
-            crate::runtime::wait_for_daemon_ready(),
+            crate::runtime::wait_for_daemon_ready(None),
         )
         .await
         .unwrap_or_else(|_| {

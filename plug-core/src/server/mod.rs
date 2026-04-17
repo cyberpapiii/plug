@@ -68,6 +68,25 @@ fn is_initialized_notification_message(
     )
 }
 
+fn is_initialized_notification_auth_failure(
+    error: &StreamableHttpError<reqwest::Error>,
+) -> bool {
+    let message = error.to_string().to_lowercase();
+    crate::oauth::is_auth_error(&message)
+        || message.contains("403")
+        || message.contains("forbidden")
+}
+
+fn is_initialized_notification_compat_failure(
+    error: &StreamableHttpError<reqwest::Error>,
+) -> bool {
+    matches!(
+        error,
+        StreamableHttpError::UnexpectedServerResponse(message)
+            if message.starts_with("HTTP 400")
+    )
+}
+
 impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
     type Error = reqwest::Error;
 
@@ -90,12 +109,29 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         )
         .await;
 
-        if is_initialized && result.is_err() {
+        if is_initialized
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(is_initialized_notification_compat_failure)
+        {
             tracing::warn!(
                 server = %self.server_name,
                 "ignoring notifications/initialized failure for HTTP upstream; continuing with compatibility fallback"
             );
             return Ok(StreamableHttpPostResponse::Accepted);
+        }
+
+        if is_initialized
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(is_initialized_notification_auth_failure)
+        {
+            tracing::debug!(
+                server = %self.server_name,
+                "notifications/initialized failure classified as auth rejection"
+            );
         }
 
         result
@@ -409,7 +445,10 @@ impl ServerManager {
     fn record_start_failure(&self, name: &str, config: &ServerConfig, error: &anyhow::Error) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
-        if config.auth.as_deref() == Some("oauth") && crate::oauth::is_auth_error(&format!("{error:#}")) {
+        if config.auth.as_deref() == Some("oauth")
+            && (crate::oauth::is_auth_error_chain(error)
+                || crate::oauth::is_auth_error(&format!("{error:#}")))
+        {
             self.mark_auth_required(name);
         } else {
             self.mark_start_failure(name);
@@ -1166,6 +1205,8 @@ impl ServerManager {
     /// Mark a server as requiring OAuth authentication.
     /// AuthRequired is sticky — it persists until explicit credential provision + reconnect.
     pub fn mark_auth_required(&self, name: &str) {
+        self.configured_auth
+            .insert(name.to_string(), ConfiguredAuth::Oauth);
         self.health.insert(
             name.to_string(),
             HealthState {
@@ -2125,6 +2166,57 @@ mod tests {
         assert_eq!(statuses[0].server_id, "workspace");
         assert_eq!(statuses[0].health, ServerHealth::Failed);
         assert_eq!(statuses[0].tool_count, 0);
+    }
+
+    #[test]
+    fn oauth_start_failure_with_auth_error_chain_marks_auth_required() {
+        let mgr = ServerManager::new();
+        let config = ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Http,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: Some("oauth".to_string()),
+            oauth_client_id: Some("test-client".to_string()),
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+        };
+
+        let err = anyhow::anyhow!(
+            "worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError {{ www_authenticate_header: \"Bearer resource_metadata=\\\"https://example.com/.well-known/oauth-protected-resource/mcp\\\"\" }})"
+        )
+        .context("failed to connect to HTTP upstream");
+
+        mgr.record_start_failure("supabase", &config, &err);
+
+        let statuses = mgr.server_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].server_id, "supabase");
+        assert_eq!(statuses[0].health, ServerHealth::AuthRequired);
+        assert_eq!(statuses[0].auth_status, "auth-required");
+    }
+
+    #[test]
+    fn mark_auth_required_without_upstream_preserves_oauth_status() {
+        let mgr = ServerManager::new();
+
+        mgr.mark_auth_required("todoist");
+
+        let statuses = mgr.server_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].server_id, "todoist");
+        assert_eq!(statuses[0].health, ServerHealth::AuthRequired);
+        assert_eq!(statuses[0].auth_status, "auth-required");
     }
 
     #[tokio::test]

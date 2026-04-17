@@ -415,26 +415,6 @@ async fn cmd_auth_complete(
 // inject
 // ---------------------------------------------------------------------------
 
-fn injected_client_identity(
-    server_config: Option<&plug_core::config::ServerConfig>,
-    existing_client_id: Option<&str>,
-    has_refresh_token: bool,
-) -> (String, bool) {
-    let Some(server_config) = server_config else {
-        return ("injected".to_string(), false);
-    };
-    if !has_refresh_token || server_config.auth.as_deref() != Some("oauth") {
-        return ("injected".to_string(), false);
-    }
-    if let Some(client_id) = server_config.oauth_client_id.as_deref() {
-        return (client_id.to_string(), true);
-    }
-    if let Some(client_id) = existing_client_id.filter(|client_id| *client_id != "injected") {
-        return (client_id.to_string(), true);
-    }
-    ("injected".to_string(), false)
-}
-
 async fn cmd_auth_inject(
     config_path: Option<&PathBuf>,
     server_name: &str,
@@ -476,8 +456,12 @@ async fn cmd_auth_inject(
         .credentials
         .as_ref()
         .map(|creds| creds.client_id.as_str());
-    let (client_id, refreshable) =
-        injected_client_identity(Some(server_config), existing_client_id, refresh_token.is_some());
+    let (client_id, refreshable) = oauth::injected_client_identity(
+        server_config.auth.as_deref() == Some("oauth"),
+        server_config.oauth_client_id.as_deref(),
+        existing_client_id,
+        refresh_token.is_some(),
+    );
 
     let stored = StoredCredentials {
         client_id,
@@ -582,7 +566,7 @@ async fn cmd_auth_status(
             for (name, sc) in &oauth_servers {
                 let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
                 let snapshot = if live.is_none() {
-                    Some(oauth::get_or_create_store(name).credential_snapshot())
+                    Some(oauth::get_or_create_store(name).fallback_auth_snapshot())
                 } else {
                     None
                 };
@@ -668,7 +652,7 @@ async fn cmd_auth_status(
             for (name, sc) in &oauth_servers {
                 let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
                 let snapshot = if live.is_none() {
-                    Some(oauth::get_or_create_store(name).credential_snapshot())
+                    Some(oauth::get_or_create_store(name).fallback_auth_snapshot())
                 } else {
                     None
                 };
@@ -906,12 +890,21 @@ mod tests {
             tool_groups: Vec::new(),
         };
 
-        let (client_id, refreshable) = injected_client_identity(Some(&server), None, true);
+        let (client_id, refreshable) = oauth::injected_client_identity(
+            server.auth.as_deref() == Some("oauth"),
+            server.oauth_client_id.as_deref(),
+            None,
+            true,
+        );
         assert_eq!(client_id, "client-123");
         assert!(refreshable);
 
-        let (fallback_client_id, fallback_refreshable) =
-            injected_client_identity(Some(&server), None, false);
+        let (fallback_client_id, fallback_refreshable) = oauth::injected_client_identity(
+            server.auth.as_deref() == Some("oauth"),
+            server.oauth_client_id.as_deref(),
+            None,
+            false,
+        );
         assert_eq!(fallback_client_id, "injected");
         assert!(!fallback_refreshable);
     }
@@ -939,8 +932,12 @@ mod tests {
             tool_groups: Vec::new(),
         };
 
-        let (client_id, refreshable) =
-            injected_client_identity(Some(&server), Some("dynamic-client-123"), true);
+        let (client_id, refreshable) = oauth::injected_client_identity(
+            server.auth.as_deref() == Some("oauth"),
+            server.oauth_client_id.as_deref(),
+            Some("dynamic-client-123"),
+            true,
+        );
         assert_eq!(client_id, "dynamic-client-123");
         assert!(refreshable);
     }

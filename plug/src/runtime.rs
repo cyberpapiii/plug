@@ -526,8 +526,8 @@ pub(crate) async fn establish_daemon_proxy_session(
     let stream = match daemon::connect_to_daemon().await {
         Some(stream) => stream,
         None => {
-            auto_start_daemon(config_path)?;
-            wait_for_daemon_ready().await?
+            let mut child = auto_start_daemon(config_path)?;
+            wait_for_daemon_ready(Some(&mut child)).await?
         }
     };
 
@@ -624,7 +624,9 @@ pub(crate) async fn connect_standalone(
     Ok(())
 }
 
-pub(crate) fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+pub(crate) fn auto_start_daemon(
+    config_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve").arg("--daemon");
@@ -641,16 +643,22 @@ pub(crate) fn auto_start_daemon(config_path: Option<&std::path::PathBuf>) -> any
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    cmd.spawn()?;
-    Ok(())
+    Ok(cmd.spawn()?)
 }
 
-pub(crate) async fn wait_for_daemon_ready() -> anyhow::Result<tokio::net::UnixStream> {
+pub(crate) async fn wait_for_daemon_ready(
+    mut child: Option<&mut std::process::Child>,
+) -> anyhow::Result<tokio::net::UnixStream> {
     let mut delay = std::time::Duration::from_millis(10);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if let Some(stream) = daemon::connect_to_daemon().await {
             return Ok(stream);
+        }
+        if let Some(child) = child.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("daemon exited before becoming ready (status: {status})");
+            }
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(500));
@@ -663,8 +671,8 @@ pub(crate) async fn ensure_daemon_with_feedback(
     announce: bool,
 ) -> anyhow::Result<bool> {
     if daemon::connect_to_daemon().await.is_none() {
-        auto_start_daemon(config_path)?;
-        wait_for_daemon_ready().await?;
+        let mut child = auto_start_daemon(config_path)?;
+        wait_for_daemon_ready(Some(&mut child)).await?;
         if announce {
             print_info_line("Started background service.");
         }
@@ -861,9 +869,12 @@ async fn serve_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::OnceLock;
+    use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -884,6 +895,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn runtime_path_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     async fn spawn_http_test_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -1143,6 +1159,26 @@ mod tests {
     }
 
     #[test]
+    fn preflight_http_bind_fails_fast_when_port_is_occupied() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind occupied port");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let http = plug_core::config::HttpConfig {
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..plug_core::config::HttpConfig::default()
+        };
+
+        let error = preflight_http_bind(&http).expect_err("expected preflight bind failure");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to bind downstream HTTP address"),
+            "unexpected preflight error: {error}"
+        );
+    }
+
+    #[test]
     fn merge_live_session_sources_marks_transport_complete_when_both_sources_exist() {
         let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
             transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
@@ -1336,6 +1372,134 @@ mod tests {
         assert_eq!(metadata.session_transports.sse, 0);
         assert!(!metadata.availability.partial);
         assert!(metadata.http_sessions_included);
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_ready_fails_fast_when_spawned_process_exits() {
+        let _guard = runtime_path_test_lock().lock().await;
+        let runtime_root = unique_temp_dir("daemon-ready-runtime");
+        let state_root = unique_temp_dir("daemon-ready-state");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived child");
+
+        let error = wait_for_daemon_ready(Some(&mut child))
+            .await
+            .expect_err("expected readiness wait to fail");
+        assert!(
+            error.to_string().contains("daemon exited before becoming ready"),
+            "unexpected readiness failure: {error}"
+        );
+
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_ready_succeeds_when_daemon_is_running() {
+        let _guard = runtime_path_test_lock().lock().await;
+        let temp = std::env::temp_dir().join(format!(
+            "pr-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = runtime_root.join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let engine = Arc::new(plug_core::engine::Engine::new(
+            plug_core::config::Config::default(),
+        ));
+        engine.start().await.expect("engine start");
+
+        let daemon_engine = Arc::clone(&engine);
+        let daemon_handle =
+            tokio::spawn(async move { run_daemon(daemon_engine, config_path, 0, None).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if daemon_handle.is_finished() {
+            let daemon_result = daemon_handle.await.expect("daemon task join");
+            panic!("daemon exited before readiness: {daemon_result:?}");
+        }
+
+        let stream = tokio::time::timeout(Duration::from_secs(5), wait_for_daemon_ready(None))
+            .await
+            .expect("daemon readiness wait timed out")
+            .expect("daemon should become ready");
+        drop(stream);
+
+        engine.shutdown().await;
+        let daemon_result = tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+            .await
+            .expect("daemon join timed out")
+            .expect("daemon task join");
+        assert!(daemon_result.is_ok(), "daemon should shut down cleanly");
+
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_with_feedback_returns_false_when_daemon_is_already_running() {
+        let _guard = runtime_path_test_lock().lock().await;
+        let temp = std::env::temp_dir().join(format!(
+            "pr-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = runtime_root.join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let engine = Arc::new(plug_core::engine::Engine::new(
+            plug_core::config::Config::default(),
+        ));
+        engine.start().await.expect("engine start");
+
+        let daemon_engine = Arc::clone(&engine);
+        let daemon_config_path = config_path.clone();
+        let daemon_handle = tokio::spawn(async move {
+            run_daemon(daemon_engine, daemon_config_path, 0, None).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if daemon_handle.is_finished() {
+            let daemon_result = daemon_handle.await.expect("daemon task join");
+            panic!("daemon exited before readiness: {daemon_result:?}");
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), wait_for_daemon_ready(None))
+            .await
+            .expect("daemon readiness wait timed out")
+            .expect("daemon should become ready");
+
+        let started = ensure_daemon_with_feedback(Some(&config_path), false)
+            .await
+            .expect("ensure_daemon_with_feedback should succeed");
+        assert!(!started, "already-running daemon should not report fresh start");
+
+        engine.shutdown().await;
+        let daemon_result = tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+            .await
+            .expect("daemon join timed out")
+            .expect("daemon task join");
+        assert!(daemon_result.is_ok(), "daemon should shut down cleanly");
+
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
     #[tokio::test]

@@ -472,6 +472,23 @@ impl CompositeCredentialStore {
         Some((cached.token_received_at, cached.expires_in))
     }
 
+    fn remaining_token_lifetime_secs(creds: &StoredCredentials) -> Option<u64> {
+        use oauth2::TokenResponse;
+
+        let token_response = creds.token_response.as_ref()?;
+        let effective = token_response
+            .expires_in()
+            .map(|d| d.as_secs())
+            .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let received_at = creds.token_received_at.unwrap_or(now);
+
+        Some(effective.saturating_sub(now.saturating_sub(received_at)))
+    }
+
     /// Return the full cached credential bundle, if one has been hydrated in-process.
     pub fn cached_credentials(&self) -> Option<StoredCredentials> {
         let guard = self.cache.load();
@@ -529,6 +546,62 @@ impl CompositeCredentialStore {
         Self::compute_backing_store_warnings(file.as_ref(), keyring.as_ref())
     }
 
+    fn fallback_auth_snapshot_inner(&self) -> CredentialSnapshot {
+        let cached = self.cached_credentials();
+        let persisted_file = self.file_load();
+
+        let freshest = Self::choose_fresher_credentials(
+            cached.as_ref().map(|creds| (creds, CredentialSource::Cache)),
+            persisted_file
+                .as_ref()
+                .map(|creds| (creds, CredentialSource::File)),
+        );
+
+        match freshest {
+            Some((creds, CredentialSource::Cache)) => CredentialSnapshot {
+                credentials: Some(creds.clone()),
+                source: Some("cache"),
+                token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
+                warnings: Vec::new(),
+            },
+            Some((creds, CredentialSource::File)) => {
+                self.update_cache(creds);
+                CredentialSnapshot {
+                    credentials: Some(creds.clone()),
+                    source: Some("file"),
+                    token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
+                    warnings: Vec::new(),
+                }
+            }
+            Some((_, CredentialSource::Keyring)) => unreachable!("keyring is not considered here"),
+            None => {
+                let persisted_keyring = self.keyring_load();
+                let warnings = Self::compute_backing_store_warnings(
+                    persisted_file.as_ref(),
+                    persisted_keyring.as_ref(),
+                );
+
+                match persisted_keyring.as_ref() {
+                    Some(creds) => {
+                        self.update_cache(creds);
+                        CredentialSnapshot {
+                            credentials: Some(creds.clone()),
+                            source: Some("keyring"),
+                            token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
+                            warnings,
+                        }
+                    }
+                    None => CredentialSnapshot {
+                        credentials: None,
+                        source: None,
+                        token_expires_in_secs: None,
+                        warnings,
+                    },
+                }
+            }
+        }
+    }
+
     fn credential_snapshot_inner(&self) -> CredentialSnapshot {
         let cached = self.cached_credentials();
         let persisted_file = self.file_load();
@@ -551,15 +624,7 @@ impl CompositeCredentialStore {
             Some((creds, CredentialSource::Cache)) => CredentialSnapshot {
                 credentials: Some(creds.clone()),
                 source: Some("cache"),
-                token_expires_in_secs: self.cached_expiry().map(|(_, expires_in)| {
-                    let effective = expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let received_at = creds.token_received_at.unwrap_or(now);
-                    effective.saturating_sub(now.saturating_sub(received_at))
-                }),
+                token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
                 warnings,
             },
             Some((creds, source)) => {
@@ -585,15 +650,7 @@ impl CompositeCredentialStore {
                         CredentialSource::File => "file",
                         CredentialSource::Keyring => "keyring",
                     }),
-                    token_expires_in_secs: self.cached_expiry().map(|(_, expires_in)| {
-                        let effective = expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let received_at = creds.token_received_at.unwrap_or(now);
-                        effective.saturating_sub(now.saturating_sub(received_at))
-                    }),
+                    token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
                     warnings,
                 }
             }
@@ -608,6 +665,10 @@ impl CompositeCredentialStore {
 
     pub fn credential_snapshot(&self) -> CredentialSnapshot {
         self.credential_snapshot_inner()
+    }
+
+    pub fn fallback_auth_snapshot(&self) -> CredentialSnapshot {
+        self.fallback_auth_snapshot_inner()
     }
 
     /// Return the best currently-known credentials for this server.
@@ -817,10 +878,37 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
     let normalized = message.to_lowercase();
 
     normalized.contains("authorization required")
+        || normalized.contains("authrequired")
         || has_token(&normalized, "invalid_grant")
         || has_token(&normalized, "invalid_token")
+        || normalized.contains("resource_metadata=")
         || has_token(&normalized, "unauthorized")
         || has_token(&normalized, "401")
+}
+
+pub(crate) fn is_auth_error_chain(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| is_auth_error(&cause.to_string()))
+}
+
+pub fn injected_client_identity(
+    is_oauth: bool,
+    configured_client_id: Option<&str>,
+    existing_client_id: Option<&str>,
+    has_refresh_token: bool,
+) -> (String, bool) {
+    if !is_oauth || !has_refresh_token {
+        return ("injected".to_string(), false);
+    }
+
+    if let Some(client_id) = configured_client_id {
+        return (client_id.to_string(), true);
+    }
+
+    if let Some(client_id) = existing_client_id.filter(|client_id| *client_id != "injected") {
+        return (client_id.to_string(), true);
+    }
+
+    ("injected".to_string(), false)
 }
 
 /// Attempt to refresh the OAuth access token for `server_name`.
@@ -926,8 +1014,8 @@ pub async fn refresh_access_token(
             RefreshResult::Refreshed
         }
         Err(e) => {
-            let err_str = e.to_string();
-            if is_auth_error(&err_str) {
+            let err = anyhow::anyhow!("{e:#}");
+            if is_auth_error_chain(&err) {
                 RefreshResult::AuthError(format!("{e}"))
             } else {
                 RefreshResult::TransientError(format!("{e}"))
@@ -1014,6 +1102,12 @@ mod tests {
         assert!(is_auth_error("OAuth authorization required"));
         assert!(is_auth_error("OAuth token refresh failed: invalid_grant"));
         assert!(is_auth_error("server returned 401 unauthorized"));
+        assert!(is_auth_error(
+            "Bearer resource_metadata=\"https://example.com/.well-known/oauth-protected-resource/mcp\""
+        ));
+        assert!(is_auth_error(
+            "AuthRequired(AuthRequiredError { www_authenticate_header: \"Bearer\" })"
+        ));
     }
 
     #[test]
@@ -1028,6 +1122,41 @@ mod tests {
         assert!(!is_auth_error(
             "connection refused while calling http://127.0.0.1:4018/callback"
         ));
+    }
+
+    #[test]
+    fn test_is_auth_error_chain_detects_masked_auth_root_cause() {
+        let err = anyhow::anyhow!(
+            "worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError {{ www_authenticate_header: \"Bearer resource_metadata=\\\"https://example.com/.well-known/oauth-protected-resource/mcp\\\"\" }})"
+        )
+        .context("failed to connect to HTTP upstream");
+
+        assert!(is_auth_error_chain(&err));
+        assert!(!is_auth_error(&err.to_string()));
+    }
+
+    #[test]
+    fn injected_client_identity_prefers_configured_client_id() {
+        let (client_id, refreshable) =
+            injected_client_identity(true, Some("configured-client"), Some("persisted-client"), true);
+        assert_eq!(client_id, "configured-client");
+        assert!(refreshable);
+    }
+
+    #[test]
+    fn injected_client_identity_reuses_existing_persisted_client_id() {
+        let (client_id, refreshable) =
+            injected_client_identity(true, None, Some("persisted-client"), true);
+        assert_eq!(client_id, "persisted-client");
+        assert!(refreshable);
+    }
+
+    #[test]
+    fn injected_client_identity_falls_back_without_refresh_token() {
+        let (client_id, refreshable) =
+            injected_client_identity(true, Some("configured-client"), Some("persisted-client"), false);
+        assert_eq!(client_id, "injected");
+        assert!(!refreshable);
     }
 
     /// Write credentials to file, read back, and verify.
@@ -1274,6 +1403,33 @@ mod tests {
         store.clear_cache();
     }
 
+    #[tokio::test]
+    async fn test_load_prefers_file_mirror_before_keyring_probe() {
+        let name = format!("oauth-file-first-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let mut stale_keyring = make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
+        stale_keyring.token_received_at = Some(100);
+        assert!(store.keyring_save(&stale_keyring));
+
+        let mut fresh_file = make_test_token("file-access", Some("file-refresh"), Some(3600));
+        fresh_file.token_received_at = Some(200);
+        store.file_save(&fresh_file).unwrap();
+        store.clear_cache();
+
+        let loaded = store.load().await.unwrap().expect("expected credentials from file mirror");
+        use oauth2::TokenResponse;
+        let token = loaded
+            .token_response
+            .as_ref()
+            .map(|tr| tr.access_token().secret().to_string());
+        assert_eq!(token.as_deref(), Some("file-access"));
+        assert_eq!(current_access_token(&name).as_deref(), Some("file-access"));
+
+        store.clear().await.unwrap();
+    }
+
     #[test]
     fn choose_fresher_credentials_prefers_newer_timestamp() {
         let mut older = make_test_token("older-access", Some("older-refresh"), Some(3600));
@@ -1358,6 +1514,41 @@ mod tests {
             .as_ref()
             .map(|tr| tr.access_token().secret().to_string());
         assert_eq!(token.as_deref(), Some("keyring-only-access"));
+
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_auth_snapshot_uses_keyring_when_file_mirror_is_missing() {
+        let name = format!("oauth-fallback-keyring-only-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let creds = make_test_token("keyring-only-access", Some("keyring-only-refresh"), Some(3600));
+        store.save(creds).await.unwrap();
+        store.file_clear();
+        store.clear_cache();
+
+        let snapshot = store.fallback_auth_snapshot();
+        let loaded = snapshot
+            .credentials
+            .as_ref()
+            .expect("expected keyring-backed fallback auth snapshot");
+        use oauth2::TokenResponse;
+        let token = loaded
+            .token_response
+            .as_ref()
+            .map(|tr| tr.access_token().secret().to_string());
+        assert_eq!(token.as_deref(), Some("keyring-only-access"));
+        assert_eq!(snapshot.source, Some("keyring"));
+        assert_eq!(
+            snapshot.warnings,
+            vec!["keyring entry exists but token file mirror is missing".to_string()]
+        );
+        assert!(
+            store.file_load().is_none(),
+            "fallback auth snapshot should not repair the token-file mirror"
+        );
 
         store.clear().await.unwrap();
     }

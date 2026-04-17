@@ -266,7 +266,7 @@ async fn check_port_available(config: &Config) -> CheckResult {
                     status: CheckStatus::Fail,
                     message: format!("Port {} is not available: {e}", config.http.port),
                     fix_suggestion: Some(format!(
-                        "Stop the process using port {} or change http.port in config",
+                        "Stop the process using port {} (for example a standalone `plug serve`) or change http.port in config",
                         config.http.port
                     )),
                 }

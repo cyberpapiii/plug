@@ -341,6 +341,22 @@ pub fn token_path() -> PathBuf {
 
 use plug_core::auth::{generate_auth_token, verify_auth_token};
 
+fn restore_token_file(
+    token_file: &std::path::Path,
+    previous_token: Option<&str>,
+) -> anyhow::Result<()> {
+    match previous_token {
+        Some(token) => plug_core::auth::write_token_file(token_file, token)
+            .with_context(|| format!("failed to restore auth token: {}", token_file.display())),
+        None => match std::fs::remove_file(token_file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to remove auth token: {}", token_file.display())),
+        },
+    }
+}
+
 // ──────────────────────────── Directory setup ────────────────────────────────
 
 /// Create a directory with 0700 permissions, creating parents as needed.
@@ -429,29 +445,43 @@ pub async fn run_daemon(
     // losing concurrent startup cannot overwrite the live daemon's control token.
     let auth_token = generate_auth_token();
     let token_file = token_path();
+    let previous_token = std::fs::read_to_string(&token_file).ok();
     plug_core::auth::write_token_file(&token_file, &auth_token)
         .with_context(|| format!("failed to write auth token: {}", token_file.display()))?;
 
-    // Clean up stale socket if it exists (safe now — we hold the PID lock)
-    let sock_path = socket_path();
-    if std::fs::symlink_metadata(&sock_path).is_ok() {
-        // Try connecting to check if another daemon is alive
-        if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
-            anyhow::bail!(
-                "another plug daemon is already running on {}",
-                sock_path.display()
-            );
+    let startup_result = async {
+        // Clean up stale socket if it exists (safe now — we hold the PID lock)
+        let sock_path = socket_path();
+        if std::fs::symlink_metadata(&sock_path).is_ok() {
+            // Try connecting to check if another daemon is alive
+            if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
+                anyhow::bail!(
+                    "another plug daemon is already running on {}",
+                    sock_path.display()
+                );
+            }
+            // Stale socket — remove it
+            std::fs::remove_file(&sock_path).ok();
         }
-        // Stale socket — remove it
-        std::fs::remove_file(&sock_path).ok();
+
+        // Bind Unix socket
+        let listener = UnixListener::bind(&sock_path)
+            .with_context(|| format!("failed to bind Unix socket: {}", sock_path.display()))?;
+
+        #[cfg(unix)]
+        set_file_permissions_0600(&sock_path)?;
+
+        Ok::<_, anyhow::Error>((sock_path, listener))
     }
+    .await;
 
-    // Bind Unix socket
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("failed to bind Unix socket: {}", sock_path.display()))?;
-
-    #[cfg(unix)]
-    set_file_permissions_0600(&sock_path)?;
+    let (sock_path, listener) = match startup_result {
+        Ok(started) => started,
+        Err(error) => {
+            restore_token_file(&token_file, previous_token.as_deref())?;
+            return Err(error);
+        }
+    };
 
     tracing::info!(
         socket = %sock_path.display(),
@@ -1643,7 +1673,7 @@ async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
     let mut servers = Vec::new();
     for (name, sc) in &oauth_servers {
         let store = oauth::get_or_create_store(name);
-        let snapshot = store.credential_snapshot();
+        let snapshot = store.fallback_auth_snapshot();
         let has_creds = snapshot.credentials.is_some();
 
         let health = status_map
@@ -1735,15 +1765,19 @@ async fn dispatch_inject_token(
     let existing_client_id = snapshot
         .credentials
         .as_ref()
-        .map(|creds| creds.client_id.as_str())
-        .filter(|client_id| *client_id != "injected");
-    let client_id = config
-        .servers
-        .get(server_name)
-        .and_then(|sc| sc.oauth_client_id.as_deref())
-        .or(existing_client_id)
-        .unwrap_or("injected")
-        .to_string();
+        .map(|creds| creds.client_id.as_str());
+    let (client_id, _) = oauth::injected_client_identity(
+        config
+            .servers
+            .get(server_name)
+            .is_some_and(|sc| sc.auth.as_deref() == Some("oauth")),
+        config
+            .servers
+            .get(server_name)
+            .and_then(|sc| sc.oauth_client_id.as_deref()),
+        existing_client_id,
+        refresh_token.is_some(),
+    );
 
     let stored = StoredCredentials {
         client_id,
@@ -2602,6 +2636,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_daemon_losing_start_does_not_rotate_existing_token() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "plug-daemon-runtime-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_root = std::env::temp_dir().join(format!(
+            "plug-daemon-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let rt_dir = runtime_dir();
+        std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
+        let token_file = token_path();
+        std::fs::write(&token_file, "stable-token").expect("write seed token");
+        let pid_file = pid_path();
+        let winning_lock = acquire_pid_lock(&pid_file).expect("winning pid lock");
+
+        let config_path = runtime_root.join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+
+        let result = run_daemon(engine, config_path, 0, None).await;
+        assert!(result.is_err(), "losing concurrent start should fail");
+
+        let token_after = std::fs::read_to_string(&token_file).expect("read token after failed start");
+        assert_eq!(token_after, "stable-token");
+
+        drop(winning_lock);
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn run_daemon_restores_existing_token_when_startup_fails_after_token_write() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "plug-daemon-runtime-post-token-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_root = std::env::temp_dir().join(format!(
+            "plug-daemon-state-post-token-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let rt_dir = runtime_dir();
+        std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
+        let token_file = token_path();
+        std::fs::write(&token_file, "stable-token").expect("write seed token");
+        let sock_path = socket_path();
+        std::fs::create_dir_all(&sock_path).expect("create blocking socket directory");
+
+        let config_path = runtime_root.join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+
+        let result = run_daemon(engine, config_path, 0, None).await;
+        assert!(
+            result.is_err(),
+            "startup with a blocking socket directory should fail"
+        );
+
+        let token_after =
+            std::fs::read_to_string(&token_file).expect("read token after failed startup");
+        assert_eq!(token_after, "stable-token");
+
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
     async fn auth_status_without_credentials_reports_auth_required() {
         let config_path = temp_config_path("auth-status-missing");
         let server_name = format!("oauth-missing-{}", std::process::id());
@@ -2650,7 +2765,7 @@ mod tests {
         assert!(servers[0].authenticated);
         assert_eq!(servers[0].health, plug_core::types::ServerHealth::Degraded);
         assert!(servers[0].token_expires_in_secs.is_some());
-        assert_eq!(servers[0].warnings, store.backing_store_warnings());
+        assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);
@@ -2681,10 +2796,55 @@ mod tests {
             servers[0].health,
             plug_core::types::ServerHealth::AuthRequired
         );
-        assert_eq!(servers[0].warnings, store.backing_store_warnings());
+        assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);
+    }
+
+    #[tokio::test]
+    async fn inject_token_reuses_existing_persisted_client_id() {
+        let config_path = temp_config_path("inject-token-client-id");
+        let server_name = format!("oauth-inject-{}", std::process::id());
+        write_oauth_config(&config_path, &[server_name.as_str()]);
+        let mut config = plug_core::config::load_config(Some(&config_path)).unwrap();
+        config
+            .servers
+            .get_mut(&server_name)
+            .expect("server config")
+            .oauth_client_id = None;
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+
+        let store = plug_core::oauth::get_or_create_store(&server_name);
+        clear_store(&server_name).await;
+        let mut existing = seeded_credentials();
+        existing.client_id = "dynamic-client-123".to_string();
+        store.save(existing).await.unwrap();
+
+        let ctx = auth_status_test_context(config_path.clone());
+        let response = dispatch_inject_token(
+            &ctx,
+            &server_name,
+            "new-access-token",
+            &Some("new-refresh-token".to_string()),
+            &Some(3600),
+        )
+        .await;
+
+        match response {
+            IpcResponse::Ok | IpcResponse::Error { .. } => {}
+            other => panic!("unexpected inject response: {other:?}"),
+        }
+
+        let stored = store
+            .load()
+            .await
+            .expect("load injected credentials")
+            .expect("stored credentials");
+        assert_eq!(stored.client_id, "dynamic-client-123");
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&config_path);
     }
 
     #[tokio::test]
