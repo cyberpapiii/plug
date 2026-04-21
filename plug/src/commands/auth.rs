@@ -61,6 +61,62 @@ fn auth_status_json(servers: Vec<serde_json::Value>, live: bool) -> serde_json::
     })
 }
 
+const DEFAULT_MANUAL_OAUTH_CALLBACK_PORT: u16 = 45_875;
+
+fn default_dynamic_oauth_redirect_uri() -> String {
+    format!("http://localhost:{DEFAULT_MANUAL_OAUTH_CALLBACK_PORT}/callback")
+}
+
+struct PersistedOauthClientState {
+    reusable_registration: Option<plug_core::oauth::DynamicOauthClientRegistration>,
+    has_persisted_credentials: bool,
+}
+
+fn persisted_oauth_client_state(
+    server_config: &plug_core::config::ServerConfig,
+    server_name: &str,
+) -> PersistedOauthClientState {
+    let persisted_store = oauth::get_or_create_store(server_name);
+    let reusable_registration = if server_config.oauth_client_id.is_some() {
+        None
+    } else {
+        persisted_store.dynamic_client_registration()
+    };
+
+    PersistedOauthClientState {
+        reusable_registration,
+        has_persisted_credentials: persisted_store.credential_snapshot().credentials.is_some(),
+    }
+}
+
+fn loopback_callback_port(redirect_uri: &str) -> anyhow::Result<u16> {
+    let port_str = redirect_uri
+        .strip_prefix("http://localhost:")
+        .or_else(|| redirect_uri.strip_prefix("http://127.0.0.1:"))
+        .and_then(|suffix| suffix.strip_suffix("/callback"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("expected loopback callback redirect URI ending in /callback")
+        })?;
+
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("redirect URI does not contain a valid TCP port"))?;
+    if port == 0 {
+        anyhow::bail!("redirect URI uses port 0 and cannot be rebound for browser login");
+    }
+
+    Ok(port)
+}
+
+async fn bind_reusable_callback_listener(
+    registration: &plug_core::oauth::DynamicOauthClientRegistration,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let port = loopback_callback_port(&registration.redirect_uri)?;
+    tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind stored callback listener: {e}"))
+}
+
 async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
     if !crate::daemon::socket_path().exists() {
         return Ok(false);
@@ -165,7 +221,7 @@ async fn cmd_auth_login(
     // saved by the manager will be visible to the global store on next load.
     let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
     let state_store = oauth::CompositeStateStore::new(server_name.to_string());
-    auth_manager.set_credential_store(cred_store);
+    auth_manager.set_credential_store(cred_store.clone());
     auth_manager.set_state_store(state_store);
 
     // 3. Discover authorization server metadata --------------------------
@@ -179,10 +235,28 @@ async fn cmd_auth_login(
     // 4. Configure or register client ------------------------------------
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
+    let PersistedOauthClientState {
+        reusable_registration,
+        has_persisted_credentials,
+    } = persisted_oauth_client_state(server_config, server_name);
+
     // Bind the callback listener early so we know the port for the redirect URI.
-    // In --no-browser mode we skip the listener and use manual code entry.
+    // For reusable registrations, bind the previously registered loopback port when possible.
+    // If that redirect cannot be rebound, fall back to manual code entry so we can still
+    // preserve registration compatibility without minting a new provider-side integration.
     let callback_listener = if no_browser {
         None
+    } else if let Some(registration) = reusable_registration.as_ref() {
+        match bind_reusable_callback_listener(registration).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                ui::print_warning_line(format!(
+                    "Stored OAuth registration for '{server_name}' uses redirect URI {} which cannot be rebound locally ({error}). Falling back to manual code entry to preserve the existing registration.",
+                    registration.redirect_uri
+                ));
+                None
+            }
+        }
     } else {
         Some(
             tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -191,16 +265,22 @@ async fn cmd_auth_login(
         )
     };
 
-    let redirect_uri = match &callback_listener {
-        Some(listener) => {
-            let port = listener.local_addr()?.port();
-            format!("http://localhost:{port}/callback")
-        }
-        None => "http://localhost:0/callback".to_string(),
-    };
+    let redirect_uri = reusable_registration
+        .as_ref()
+        .map(|registration| registration.redirect_uri.clone())
+        .unwrap_or_else(|| match &callback_listener {
+            Some(listener) => {
+                let port = listener
+                    .local_addr()
+                    .expect("callback listener local addr")
+                    .port();
+                format!("http://localhost:{port}/callback")
+            }
+            None => default_dynamic_oauth_redirect_uri(),
+        });
 
     if let Some(ref client_id) = server_config.oauth_client_id {
-        // Pre-registered client: configure directly
+        ui::print_info_line("Using configured OAuth client...");
         let oauth_config = rmcp::transport::auth::OAuthClientConfig {
             client_id: client_id.clone(),
             client_secret: None,
@@ -210,17 +290,28 @@ async fn cmd_auth_login(
         auth_manager
             .configure_client(oauth_config)
             .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
+    } else if let Some(registration) = reusable_registration.as_ref() {
+        ui::print_info_line("Reusing existing OAuth client registration...");
+        let oauth_config = registration.to_oauth_client_config(scopes.clone());
+        auth_manager
+            .configure_client(oauth_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
     } else {
         // Dynamic client registration
+        if has_persisted_credentials {
+            ui::print_warning_line(format!(
+                "Stored credentials for '{server_name}' do not include reusable dynamic registration metadata. Plug will register one new OAuth client so future reauth can reuse it safely."
+            ));
+        }
         ui::print_info_line("Registering client with authorization server...");
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
         let reg_config = auth_manager
             .register_client("plug", &redirect_uri, &scope_refs)
             .await
             .map_err(|e| anyhow::anyhow!("client registration failed: {e}"))?;
-        auth_manager
-            .configure_client(reg_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure registered client: {e}"))?;
+        cred_store
+            .remember_dynamic_client_registration(&reg_config)
+            .map_err(|e| anyhow::anyhow!("failed to persist OAuth client registration: {e}"))?;
     }
 
     // 5. Generate the authorization URL ----------------------------------
@@ -348,7 +439,7 @@ async fn cmd_auth_complete(
 
     let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
     let state_store = oauth::CompositeStateStore::new(server_name.to_string());
-    auth_manager.set_credential_store(cred_store);
+    auth_manager.set_credential_store(cred_store.clone());
     auth_manager.set_state_store(state_store);
 
     // 3. Discover metadata and configure client --------------------------
@@ -360,30 +451,39 @@ async fn cmd_auth_complete(
 
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
-    // Use the placeholder redirect URI — in the complete flow the redirect
-    // has already happened externally, so this is only needed for client
-    // configuration / registration parity.
-    let redirect_uri = "http://localhost:0/callback";
+    let PersistedOauthClientState {
+        reusable_registration,
+        has_persisted_credentials,
+    } = persisted_oauth_client_state(server_config, server_name);
+    let redirect_uri = reusable_registration
+        .as_ref()
+        .map(|registration| registration.redirect_uri.clone())
+        .unwrap_or_else(default_dynamic_oauth_redirect_uri);
 
     if let Some(ref client_id) = server_config.oauth_client_id {
         let oauth_config = rmcp::transport::auth::OAuthClientConfig {
             client_id: client_id.clone(),
             client_secret: None,
             scopes: scopes.clone(),
-            redirect_uri: redirect_uri.to_string(),
+            redirect_uri: redirect_uri.clone(),
         };
         auth_manager
             .configure_client(oauth_config)
             .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else {
-        let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let reg_config = auth_manager
-            .register_client("plug", redirect_uri, &scope_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!("client registration failed: {e}"))?;
+    } else if let Some(registration) = reusable_registration.as_ref() {
+        let oauth_config = registration.to_oauth_client_config(scopes.clone());
         auth_manager
-            .configure_client(reg_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure registered client: {e}"))?;
+            .configure_client(oauth_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
+    } else {
+        anyhow::bail!(
+            "server '{server_name}' has no reusable OAuth client registration for non-interactive completion. {} Start the login flow first with `plug auth login --server {server_name} --no-browser` or configure `oauth_client_id`.",
+            if has_persisted_credentials {
+                "Stored credentials exist, but they were created before plug persisted reusable registration metadata."
+            } else {
+                "No prior reusable registration is available."
+            }
+        );
     }
 
     // 4. Exchange code for token -----------------------------------------
@@ -570,14 +670,12 @@ async fn cmd_auth_status(
                 } else {
                     None
                 };
-                let has_creds = live
-                    .map(|live| live.authenticated)
-                    .unwrap_or_else(|| {
-                        snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.credentials.as_ref())
-                            .is_some()
-                    });
+                let has_creds = live.map(|live| live.authenticated).unwrap_or_else(|| {
+                    snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.credentials.as_ref())
+                        .is_some()
+                });
 
                 let health = live.map(|s| s.health);
 
@@ -628,14 +726,12 @@ async fn cmd_auth_status(
                     println!("    Token: expired (refresh pending)");
                 }
 
-                let warnings = live
-                    .map(|s| s.warnings.clone())
-                    .unwrap_or_else(|| {
-                        snapshot
-                            .as_ref()
-                            .map(|snapshot| snapshot.warnings.clone())
-                            .unwrap_or_default()
-                    });
+                let warnings = live.map(|s| s.warnings.clone()).unwrap_or_else(|| {
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.warnings.clone())
+                        .unwrap_or_default()
+                });
                 for warning in warnings {
                     ui::print_warning_line(format!("{name}: {warning}"));
                 }
@@ -656,14 +752,12 @@ async fn cmd_auth_status(
                 } else {
                     None
                 };
-                let has_creds = live
-                    .map(|live| live.authenticated)
-                    .unwrap_or_else(|| {
-                        snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.credentials.as_ref())
-                            .is_some()
-                    });
+                let has_creds = live.map(|live| live.authenticated).unwrap_or_else(|| {
+                    snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.credentials.as_ref())
+                        .is_some()
+                });
                 let health = live.map(|s| s.health);
 
                 servers.push(serde_json::json!({
@@ -840,7 +934,7 @@ fn html_escape(s: &str) -> String {
 async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
     let store = oauth::get_or_create_store(server_name);
     store
-        .clear()
+        .clear_credentials_preserve_registration()
         .await
         .map_err(|e| anyhow::anyhow!("failed to clear credentials: {e}"))?;
 
@@ -866,6 +960,112 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn default_dynamic_oauth_redirect_uri_uses_real_loopback_port() {
+        assert_eq!(
+            default_dynamic_oauth_redirect_uri(),
+            format!("http://localhost:{DEFAULT_MANUAL_OAUTH_CALLBACK_PORT}/callback")
+        );
+    }
+
+    #[test]
+    fn loopback_callback_port_accepts_supported_loopback_redirects() {
+        assert_eq!(
+            loopback_callback_port("http://localhost:43189/callback").unwrap(),
+            43189
+        );
+        assert_eq!(
+            loopback_callback_port("http://127.0.0.1:43189/callback").unwrap(),
+            43189
+        );
+    }
+
+    #[test]
+    fn loopback_callback_port_rejects_port_zero_and_non_loopback_redirects() {
+        assert!(loopback_callback_port("http://localhost:0/callback").is_err());
+        assert!(loopback_callback_port("https://example.com/callback").is_err());
+    }
+
+    #[test]
+    fn reusable_dynamic_registration_skips_configured_clients() {
+        let server = plug_core::config::ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Http,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: Some("oauth".to_string()),
+            oauth_client_id: Some("configured-client".to_string()),
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+        };
+
+        assert!(
+            persisted_oauth_client_state(&server, "configured")
+                .reusable_registration
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reusable_dynamic_registration_loads_persisted_registration() {
+        let server_name = format!("auth-registration-{}", std::process::id());
+        let server = plug_core::config::ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Http,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: Some("oauth".to_string()),
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+        };
+
+        let store = oauth::get_or_create_store(&server_name);
+        store.clear().await.unwrap();
+        store
+            .remember_dynamic_client_registration(&rmcp::transport::auth::OAuthClientConfig {
+                client_id: "dynamic-client-123".to_string(),
+                client_secret: Some("secret-xyz".to_string()),
+                scopes: vec!["read".to_string()],
+                redirect_uri: "http://localhost:43189/callback".to_string(),
+            })
+            .expect("persist registration");
+
+        let registration =
+            persisted_oauth_client_state(&server, &server_name).reusable_registration;
+        let registration = registration.expect("expected reusable registration");
+        assert_eq!(
+            registration,
+            oauth::DynamicOauthClientRegistration {
+                client_id: "dynamic-client-123".to_string(),
+                client_secret: Some("secret-xyz".to_string()),
+                redirect_uri: "http://localhost:43189/callback".to_string(),
+            }
+        );
+
+        store.clear().await.unwrap();
+    }
 
     #[test]
     fn injected_client_identity_requires_configured_oauth_client_for_refresh() {

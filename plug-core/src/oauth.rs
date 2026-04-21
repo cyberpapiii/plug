@@ -12,8 +12,11 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use rmcp::transport::auth::{
-    AuthError, CredentialStore, StateStore, StoredAuthorizationState, StoredCredentials,
+    AuthError, CredentialStore, OAuthClientConfig, StateStore, StoredAuthorizationState,
+    StoredCredentials,
 };
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::config;
@@ -130,6 +133,10 @@ pub fn current_access_token(server_name: &str) -> Option<String> {
     Some(cached.access_token.clone())
 }
 
+pub fn credential_debug_snapshot(server_name: &str) -> CredentialDebugSnapshot {
+    get_or_create_store(server_name).credential_debug_snapshot()
+}
+
 /// Return the current access token for a server, hydrating the in-memory cache
 /// from persisted credentials on cache miss.
 ///
@@ -178,6 +185,34 @@ pub struct CredentialSnapshot {
     pub source: Option<&'static str>,
     pub token_expires_in_secs: Option<u64>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CredentialDebugSnapshot {
+    pub source: Option<&'static str>,
+    pub token_received_at: Option<u64>,
+    pub token_expires_in_secs: Option<u64>,
+    pub client_id: Option<String>,
+    pub has_refresh_token: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicOauthClientRegistration {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+}
+
+impl DynamicOauthClientRegistration {
+    pub fn to_oauth_client_config(&self, scopes: Vec<String>) -> OAuthClientConfig {
+        OAuthClientConfig {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            scopes,
+            redirect_uri: self.redirect_uri.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for CachedCredentials {
@@ -292,46 +327,68 @@ impl CompositeCredentialStore {
         Ok(tokens_dir().join(format!("{safe}.json")))
     }
 
-    fn file_load(&self) -> Option<StoredCredentials> {
-        let path = match self.token_file_path() {
-            Ok(p) => p,
+    fn registration_file_path(&self) -> Result<PathBuf, AuthError> {
+        let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
+            AuthError::InternalError(format!("invalid server name for registration path: {e}"))
+        })?;
+        Ok(tokens_dir().join(format!("{safe}.registration.json")))
+    }
+
+    fn load_json_file<T: DeserializeOwned>(
+        &self,
+        path: Result<PathBuf, AuthError>,
+        file_kind: &'static str,
+    ) -> Option<T> {
+        let path = match path {
+            Ok(path) => path,
             Err(_) => return None,
         };
         let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                warn!(server = %self.server_name, error = %e, "token file: read failed");
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                warn!(
+                    server = %self.server_name,
+                    file_kind,
+                    error = %error,
+                    "credential store read failed"
+                );
                 return None;
             }
         };
-        match serde_json::from_str::<StoredCredentials>(&data) {
-            Ok(creds) => Some(creds),
-            Err(e) => {
-                warn!(server = %self.server_name, error = %e, "token file: invalid JSON, ignoring");
+        match serde_json::from_str::<T>(&data) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    server = %self.server_name,
+                    file_kind,
+                    error = %error,
+                    "credential store JSON invalid; ignoring"
+                );
                 None
             }
         }
     }
 
-    fn file_save(&self, creds: &StoredCredentials) -> Result<(), AuthError> {
+    fn save_json_file<T: Serialize>(
+        &self,
+        path: PathBuf,
+        value: &T,
+        file_kind: &'static str,
+    ) -> Result<(), AuthError> {
         use fs2::FileExt;
         use std::io::Write;
 
-        let path = self.token_file_path()?;
         let dir = path.parent().ok_or_else(|| {
-            AuthError::InternalError("token file path has no parent directory".into())
+            AuthError::InternalError(format!("{file_kind} path has no parent directory"))
         })?;
         std::fs::create_dir_all(dir)
             .map_err(|e| AuthError::InternalError(format!("failed to create tokens dir: {e}")))?;
 
-        let json = serde_json::to_string_pretty(creds)
+        let json = serde_json::to_string_pretty(value)
             .map_err(|e| AuthError::InternalError(format!("serialization failed: {e}")))?;
-
-        // Atomic write: write to temp file in the same directory, then rename.
         let tmp_path = path.with_extension("json.tmp");
 
-        // Open with exclusive lock for cross-process safety.
         #[cfg(unix)]
         let file = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -350,51 +407,83 @@ impl CompositeCredentialStore {
             .open(&tmp_path);
 
         let mut file = file.map_err(|e| {
-            AuthError::InternalError(format!("failed to open temp token file: {e}"))
+            AuthError::InternalError(format!("failed to open temp {file_kind}: {e}"))
         })?;
 
         file.lock_exclusive().map_err(|e| {
-            AuthError::InternalError(format!("failed to lock temp token file: {e}"))
+            AuthError::InternalError(format!("failed to lock temp {file_kind}: {e}"))
         })?;
 
         file.write_all(json.as_bytes()).map_err(|e| {
             let _ = FileExt::unlock(&file);
-            AuthError::InternalError(format!("failed to write temp token file: {e}"))
+            AuthError::InternalError(format!("failed to write temp {file_kind}: {e}"))
         })?;
 
         FileExt::unlock(&file).map_err(|e| {
-            AuthError::InternalError(format!("failed to unlock temp token file: {e}"))
+            AuthError::InternalError(format!("failed to unlock temp {file_kind}: {e}"))
         })?;
 
-        // Atomic rename.
         std::fs::rename(&tmp_path, &path).map_err(|e| {
-            // Clean up temp file on rename failure.
             let _ = std::fs::remove_file(&tmp_path);
-            AuthError::InternalError(format!("failed to rename temp token file: {e}"))
+            AuthError::InternalError(format!("failed to rename temp {file_kind}: {e}"))
         })?;
 
-        // Ensure final file has 0600 permissions (rename preserves tmp perms
-        // on most Unix systems, but be explicit).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
 
-        debug!(server = %self.server_name, "token file: credentials saved");
+        debug!(server = %self.server_name, file_kind, "credential store file saved");
         Ok(())
     }
 
-    fn file_clear(&self) {
-        if let Ok(path) = self.token_file_path() {
+    fn clear_json_file(&self, path: Result<PathBuf, AuthError>, file_kind: &'static str) {
+        if let Ok(path) = path {
             match std::fs::remove_file(&path) {
-                Ok(()) => debug!(server = %self.server_name, "token file: deleted"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    debug!(server = %self.server_name, error = %e, "token file: delete failed");
+                Ok(()) => {
+                    debug!(server = %self.server_name, file_kind, "credential store file deleted")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    debug!(
+                        server = %self.server_name,
+                        file_kind,
+                        error = %error,
+                        "credential store file delete failed"
+                    );
                 }
             }
         }
+    }
+
+    fn file_load(&self) -> Option<StoredCredentials> {
+        self.load_json_file(self.token_file_path(), "token file")
+    }
+
+    fn file_save(&self, creds: &StoredCredentials) -> Result<(), AuthError> {
+        let path = self.token_file_path()?;
+        self.save_json_file(path, creds, "token file")
+    }
+
+    fn file_clear(&self) {
+        self.clear_json_file(self.token_file_path(), "token file");
+    }
+
+    fn registration_load(&self) -> Option<DynamicOauthClientRegistration> {
+        self.load_json_file(self.registration_file_path(), "registration file")
+    }
+
+    fn registration_save(
+        &self,
+        registration: &DynamicOauthClientRegistration,
+    ) -> Result<(), AuthError> {
+        let path = self.registration_file_path()?;
+        self.save_json_file(path, registration, "registration file")
+    }
+
+    fn registration_clear(&self) {
+        self.clear_json_file(self.registration_file_path(), "registration file");
     }
 
     // -- cache helpers ----------------------------------------------------
@@ -501,6 +590,29 @@ impl CompositeCredentialStore {
         self.update_cache(creds);
     }
 
+    pub fn dynamic_client_registration(&self) -> Option<DynamicOauthClientRegistration> {
+        self.registration_load()
+    }
+
+    pub fn remember_dynamic_client_registration(
+        &self,
+        config: &OAuthClientConfig,
+    ) -> Result<(), AuthError> {
+        let registration = DynamicOauthClientRegistration {
+            client_id: config.client_id.clone(),
+            client_secret: config.client_secret.clone(),
+            redirect_uri: config.redirect_uri.clone(),
+        };
+        self.registration_save(&registration)
+    }
+
+    pub async fn clear_credentials_preserve_registration(&self) -> Result<(), AuthError> {
+        self.keyring_clear();
+        self.file_clear();
+        self.clear_cache();
+        Ok(())
+    }
+
     /// Return human-readable warnings about backing-store drift between the
     /// mirrored token file and the keyring entry for this server.
     fn compute_backing_store_warnings(
@@ -510,12 +622,12 @@ impl CompositeCredentialStore {
         let mut warnings = Vec::new();
 
         match (file, keyring) {
-            (Some(_), None) => warnings.push(
-                "token file mirror exists but keyring entry is missing".to_string(),
-            ),
-            (None, Some(_)) => warnings.push(
-                "keyring entry exists but token file mirror is missing".to_string(),
-            ),
+            (Some(_), None) => {
+                warnings.push("token file mirror exists but keyring entry is missing".to_string())
+            }
+            (None, Some(_)) => {
+                warnings.push("keyring entry exists but token file mirror is missing".to_string())
+            }
             (Some(file), Some(keyring)) => {
                 let file_received = file.token_received_at.unwrap_or(0);
                 let keyring_received = keyring.token_received_at.unwrap_or(0);
@@ -551,7 +663,9 @@ impl CompositeCredentialStore {
         let persisted_file = self.file_load();
 
         let freshest = Self::choose_fresher_credentials(
-            cached.as_ref().map(|creds| (creds, CredentialSource::Cache)),
+            cached
+                .as_ref()
+                .map(|creds| (creds, CredentialSource::Cache)),
             persisted_file
                 .as_ref()
                 .map(|creds| (creds, CredentialSource::File)),
@@ -608,17 +722,23 @@ impl CompositeCredentialStore {
         let persisted_keyring = self.keyring_load();
 
         let freshest = Self::choose_fresher_credentials(
-            cached.as_ref().map(|creds| (creds, CredentialSource::Cache)),
+            cached
+                .as_ref()
+                .map(|creds| (creds, CredentialSource::Cache)),
             Self::choose_fresher_credentials(
-                persisted_file.as_ref().map(|creds| (creds, CredentialSource::File)),
+                persisted_file
+                    .as_ref()
+                    .map(|creds| (creds, CredentialSource::File)),
                 persisted_keyring
                     .as_ref()
                     .map(|creds| (creds, CredentialSource::Keyring)),
             ),
         );
 
-        let warnings =
-            Self::compute_backing_store_warnings(persisted_file.as_ref(), persisted_keyring.as_ref());
+        let warnings = Self::compute_backing_store_warnings(
+            persisted_file.as_ref(),
+            persisted_keyring.as_ref(),
+        );
 
         match freshest {
             Some((creds, CredentialSource::Cache)) => CredentialSnapshot {
@@ -671,6 +791,35 @@ impl CompositeCredentialStore {
         self.fallback_auth_snapshot_inner()
     }
 
+    pub fn credential_debug_snapshot(&self) -> CredentialDebugSnapshot {
+        let snapshot = self.credential_snapshot_inner();
+        let (token_received_at, client_id, has_refresh_token) = snapshot
+            .credentials
+            .as_ref()
+            .map(|creds| {
+                use oauth2::TokenResponse;
+
+                (
+                    creds.token_received_at,
+                    Some(creds.client_id.clone()),
+                    creds
+                        .token_response
+                        .as_ref()
+                        .is_some_and(|tr| tr.refresh_token().is_some()),
+                )
+            })
+            .unwrap_or((None, None, false));
+
+        CredentialDebugSnapshot {
+            source: snapshot.source,
+            token_received_at,
+            token_expires_in_secs: snapshot.token_expires_in_secs,
+            client_id,
+            has_refresh_token,
+            warnings: snapshot.warnings,
+        }
+    }
+
     /// Return the best currently-known credentials for this server.
     ///
     /// When cached credentials exist, prefer a newer mirrored token-file entry
@@ -715,6 +864,7 @@ impl CredentialStore for CompositeCredentialStore {
     async fn clear(&self) -> Result<(), AuthError> {
         self.keyring_clear();
         self.file_clear();
+        self.registration_clear();
         self.clear_cache();
         Ok(())
     }
@@ -938,6 +1088,17 @@ pub async fn refresh_access_token(
         Ok(None) => return RefreshResult::NoCredentials,
         Err(e) => return RefreshResult::TransientError(format!("failed to load credentials: {e}")),
     };
+    let load_snapshot = store.credential_debug_snapshot();
+    debug!(
+        server = %server_name,
+        credential_source = ?load_snapshot.source,
+        token_received_at = ?load_snapshot.token_received_at,
+        token_expires_in_secs = ?load_snapshot.token_expires_in_secs,
+        client_id = ?load_snapshot.client_id,
+        has_refresh_token = load_snapshot.has_refresh_token,
+        warnings = ?load_snapshot.warnings,
+        "loaded OAuth credentials for refresh"
+    );
 
     // 2. Injected tokens have no real OAuth client — cannot refresh.
     if creds.client_id == "injected" {
@@ -979,11 +1140,18 @@ pub async fn refresh_access_token(
         .map(|s| s.to_string())
         .unwrap_or_else(|| creds.client_id.clone());
 
+    let dynamic_registration = store
+        .dynamic_client_registration()
+        .filter(|registration| registration.client_id == client_id);
     let config = OAuthClientConfig {
         client_id,
-        client_secret: None,
+        client_secret: dynamic_registration
+            .as_ref()
+            .and_then(|registration| registration.client_secret.clone()),
         scopes: creds.granted_scopes.clone(),
-        redirect_uri: "http://localhost:0/callback".to_string(),
+        redirect_uri: dynamic_registration
+            .map(|registration| registration.redirect_uri)
+            .unwrap_or_else(|| "http://localhost:0/callback".to_string()),
     };
     if let Err(e) = auth_manager.configure_client(config) {
         return RefreshResult::TransientError(format!("failed to configure client: {e}"));
@@ -1010,7 +1178,17 @@ pub async fn refresh_access_token(
                 }
             };
             store.hydrate_credentials(&refreshed);
-            debug!(server = %server_name, "OAuth token refreshed successfully");
+            let refreshed_snapshot = refresh_store.credential_debug_snapshot();
+            debug!(
+                server = %server_name,
+                credential_source = ?refreshed_snapshot.source,
+                token_received_at = ?refreshed_snapshot.token_received_at,
+                token_expires_in_secs = ?refreshed_snapshot.token_expires_in_secs,
+                client_id = ?refreshed_snapshot.client_id,
+                has_refresh_token = refreshed_snapshot.has_refresh_token,
+                warnings = ?refreshed_snapshot.warnings,
+                "OAuth token refreshed successfully"
+            );
             RefreshResult::Refreshed
         }
         Err(e) => {
@@ -1137,8 +1315,12 @@ mod tests {
 
     #[test]
     fn injected_client_identity_prefers_configured_client_id() {
-        let (client_id, refreshable) =
-            injected_client_identity(true, Some("configured-client"), Some("persisted-client"), true);
+        let (client_id, refreshable) = injected_client_identity(
+            true,
+            Some("configured-client"),
+            Some("persisted-client"),
+            true,
+        );
         assert_eq!(client_id, "configured-client");
         assert!(refreshable);
     }
@@ -1153,8 +1335,12 @@ mod tests {
 
     #[test]
     fn injected_client_identity_falls_back_without_refresh_token() {
-        let (client_id, refreshable) =
-            injected_client_identity(true, Some("configured-client"), Some("persisted-client"), false);
+        let (client_id, refreshable) = injected_client_identity(
+            true,
+            Some("configured-client"),
+            Some("persisted-client"),
+            false,
+        );
         assert_eq!(client_id, "injected");
         assert!(!refreshable);
     }
@@ -1207,6 +1393,94 @@ mod tests {
 
         // Clean up directory.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_registration_round_trip() {
+        let server_name = format!("test-registration-{}", std::process::id());
+        let store = CompositeCredentialStore::new(server_name);
+
+        let registration = DynamicOauthClientRegistration {
+            client_id: "dynamic-client-123".to_string(),
+            client_secret: Some("secret-xyz".to_string()),
+            redirect_uri: "http://localhost:43189/callback".to_string(),
+        };
+
+        store.registration_save(&registration).unwrap();
+
+        let loaded = store
+            .dynamic_client_registration()
+            .expect("expected dynamic registration");
+        assert_eq!(loaded, registration);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = store.registration_file_path().unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "registration file should have 0600 permissions"
+            );
+        }
+
+        store.registration_clear();
+        assert!(store.dynamic_client_registration().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_credentials_preserve_registration_keeps_dynamic_client() {
+        let name = format!("oauth-preserve-registration-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let registration = OAuthClientConfig {
+            client_id: "dynamic-client-123".to_string(),
+            client_secret: Some("secret-xyz".to_string()),
+            scopes: vec!["read".to_string()],
+            redirect_uri: "http://localhost:43189/callback".to_string(),
+        };
+        store
+            .remember_dynamic_client_registration(&registration)
+            .expect("persist registration");
+        store
+            .save(make_test_token(
+                "access-token",
+                Some("refresh-token"),
+                Some(3600),
+            ))
+            .await
+            .expect("save credentials");
+
+        store
+            .clear_credentials_preserve_registration()
+            .await
+            .expect("clear credentials");
+
+        assert!(store.load().await.unwrap().is_none());
+        assert!(store.dynamic_client_registration().is_some());
+
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_removes_dynamic_registration() {
+        let name = format!("oauth-clear-registration-{}", std::process::id());
+        let store = get_or_create_store(&name);
+
+        let registration = OAuthClientConfig {
+            client_id: "dynamic-client-123".to_string(),
+            client_secret: Some("secret-xyz".to_string()),
+            scopes: vec!["read".to_string()],
+            redirect_uri: "http://localhost:43189/callback".to_string(),
+        };
+        store
+            .remember_dynamic_client_registration(&registration)
+            .expect("persist registration");
+
+        store.clear().await.unwrap();
+
+        assert!(store.dynamic_client_registration().is_none());
     }
 
     /// Verify that token file paths use sanitized server names.
@@ -1409,7 +1683,8 @@ mod tests {
         let store = get_or_create_store(&name);
         store.clear().await.unwrap();
 
-        let mut stale_keyring = make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
+        let mut stale_keyring =
+            make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
         stale_keyring.token_received_at = Some(100);
         assert!(store.keyring_save(&stale_keyring));
 
@@ -1418,7 +1693,11 @@ mod tests {
         store.file_save(&fresh_file).unwrap();
         store.clear_cache();
 
-        let loaded = store.load().await.unwrap().expect("expected credentials from file mirror");
+        let loaded = store
+            .load()
+            .await
+            .unwrap()
+            .expect("expected credentials from file mirror");
         use oauth2::TokenResponse;
         let token = loaded
             .token_response
@@ -1492,7 +1771,11 @@ mod tests {
         let store = get_or_create_store(&name);
         store.clear().await.unwrap();
 
-        let creds = make_test_token("keyring-only-access", Some("keyring-only-refresh"), Some(3600));
+        let creds = make_test_token(
+            "keyring-only-access",
+            Some("keyring-only-refresh"),
+            Some(3600),
+        );
         store.save(creds.clone()).await.unwrap();
 
         // Simulate the operator state we hit locally: keyring entry exists, but
@@ -1500,7 +1783,10 @@ mod tests {
         store.file_clear();
         store.clear_cache();
 
-        assert!(store.file_load().is_none(), "expected file mirror to be missing before load");
+        assert!(
+            store.file_load().is_none(),
+            "expected file mirror to be missing before load"
+        );
 
         let loaded = store.load().await.unwrap();
         assert!(loaded.is_some(), "expected keyring-backed load to succeed");
@@ -1524,7 +1810,11 @@ mod tests {
         let store = get_or_create_store(&name);
         store.clear().await.unwrap();
 
-        let creds = make_test_token("keyring-only-access", Some("keyring-only-refresh"), Some(3600));
+        let creds = make_test_token(
+            "keyring-only-access",
+            Some("keyring-only-refresh"),
+            Some(3600),
+        );
         store.save(creds).await.unwrap();
         store.file_clear();
         store.clear_cache();

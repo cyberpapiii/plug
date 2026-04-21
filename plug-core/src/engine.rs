@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -225,11 +225,7 @@ impl Engine {
             &self.tracker,
         );
 
-        spawn_artifact_prune_loop(
-            self.tool_router.clone(),
-            self.cancel.clone(),
-            &self.tracker,
-        );
+        spawn_artifact_prune_loop(self.tool_router.clone(), self.cancel.clone(), &self.tracker);
 
         Ok(())
     }
@@ -370,6 +366,14 @@ impl Engine {
             server_config.health_check_interval_secs,
             &self.tracker,
         );
+        self.sync_refresh_loop_for_server(server_name, server_config);
+    }
+
+    fn sync_refresh_loop_for_server(
+        self: &Arc<Self>,
+        server_name: &str,
+        server_config: &crate::config::ServerConfig,
+    ) {
         if server_config.enabled && server_config.auth.as_deref() == Some("oauth") {
             spawn_refresh_loop_for_server(
                 Arc::clone(self),
@@ -389,7 +393,7 @@ impl Engine {
 
     /// Restart a specific upstream server. Rate-limited: at most 1 restart
     /// per server per 10 seconds. Applies to both TUI and IPC callers.
-    pub async fn restart_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
+    pub async fn restart_server(self: &Arc<Self>, server_id: &str) -> Result<(), anyhow::Error> {
         // Atomic rate limit check + timestamp update via entry API
         {
             use dashmap::mapref::entry::Entry;
@@ -428,7 +432,10 @@ impl Engine {
             .await
         {
             Ok(upstream) => {
-                self.server_manager.replace_server(server_id, upstream).await;
+                self.server_manager
+                    .replace_server(server_id, upstream)
+                    .await;
+                self.sync_refresh_loop_for_server(server_id, &server_config);
                 self.tool_router.refresh_tools().await;
 
                 let _ = self.event_tx.send(EngineEvent::ServerStarted {
@@ -524,7 +531,9 @@ impl Engine {
             }
         };
 
-        self.server_manager.replace_server(server_id, upstream).await;
+        self.server_manager
+            .replace_server(server_id, upstream)
+            .await;
         self.tool_router.refresh_tools().await;
 
         let _ = self.event_tx.send(EngineEvent::ServerStarted {
@@ -875,9 +884,48 @@ fn is_auth_reconnect_error(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::config::{Config, TransportType};
+    use std::collections::HashMap;
 
     fn test_config() -> Config {
         Config::default()
+    }
+
+    fn oauth_mock_stdio_config() -> Config {
+        let mut config = Config::default();
+        config.servers.insert(
+            "oauth-mock".to_string(),
+            crate::config::ServerConfig {
+                command: Some("cargo".to_string()),
+                args: vec![
+                    "run".to_string(),
+                    "--quiet".to_string(),
+                    "-p".to_string(),
+                    "plug-test-harness".to_string(),
+                    "--bin".to_string(),
+                    "mock-mcp-server".to_string(),
+                    "--".to_string(),
+                    "--tools".to_string(),
+                    "echo".to_string(),
+                ],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+            },
+        );
+        config
     }
 
     #[test]
@@ -939,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_rate_limit() {
-        let engine = Engine::new(test_config());
+        let engine = Arc::new(Engine::new(test_config()));
         // Insert a recent timestamp
         engine
             .restart_timestamps
@@ -953,11 +1001,34 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_unknown_server() {
-        let engine = Engine::new(test_config());
+        let engine = Arc::new(Engine::new(test_config()));
         let result = engine.restart_server("nonexistent").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown server"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn engine_restart_respawns_refresh_loop_for_oauth_server() {
+        let engine = Arc::new(Engine::new(oauth_mock_stdio_config()));
+        engine.start().await.expect("engine start");
+
+        assert_eq!(
+            engine.current_refresh_task_generation("oauth-mock"),
+            Some(1)
+        );
+
+        engine
+            .restart_server("oauth-mock")
+            .await
+            .expect("restart server");
+
+        assert_eq!(
+            engine.current_refresh_task_generation("oauth-mock"),
+            Some(2)
+        );
+
+        engine.shutdown().await;
     }
 
     #[test]
