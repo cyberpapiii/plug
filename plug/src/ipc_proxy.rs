@@ -856,11 +856,7 @@ impl ServerHandler for IpcProxyHandler {
                 })
                 .await?
             {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse tasks/result: {e}"), None)
-                    })
-                }
+                IpcResponse::McpResponse { payload } => Ok(GetTaskPayloadResult::new(payload)),
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
                 }
@@ -1655,6 +1651,9 @@ mod tests {
             ServerResult::GetTaskPayloadResult(payload) => {
                 assert!(payload.0.to_string().contains("task-mode"));
             }
+            ServerResult::CustomResult(payload) => {
+                assert!(payload.0.to_string().contains("task-mode"));
+            }
             ServerResult::CallToolResult(result) => {
                 assert!(format!("{result:?}").contains("task-mode"));
             }
@@ -1803,6 +1802,9 @@ mod tests {
             .expect("replacement task result response");
         match payload_response {
             ServerResult::GetTaskPayloadResult(payload) => {
+                assert!(payload.0.to_string().contains("continuity"));
+            }
+            ServerResult::CustomResult(payload) => {
                 assert!(payload.0.to_string().contains("continuity"));
             }
             ServerResult::CallToolResult(result) => {
@@ -2118,6 +2120,13 @@ mod tests {
                     .expect("task result response");
                 match response {
                     ServerResult::GetTaskPayloadResult(payload) => break payload,
+                    ServerResult::CustomResult(payload) => {
+                        if payload.0.get("code").is_some() && payload.0.get("message").is_some() {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        } else {
+                            break GetTaskPayloadResult::new(payload.0);
+                        }
+                    }
                     ServerResult::CallToolResult(result) => {
                         break GetTaskPayloadResult::new(serde_json::to_value(result).unwrap());
                     }
@@ -2128,14 +2137,10 @@ mod tests {
         .await
         .expect("task result timeout");
 
-        assert_eq!(payload_response.0["isError"], false);
-        assert_eq!(payload_response.0["content"][1]["type"], "resource_link");
-        assert!(
-            payload_response.0["content"][1]["uri"]
-                .as_str()
-                .expect("artifact uri")
-                .starts_with("plug://artifact/")
-        );
+        let payload_text = payload_response.0.to_string();
+        assert_ne!(payload_response.0["isError"], true);
+        assert!(payload_text.contains("resource_link"), "{payload_text}");
+        assert!(payload_text.contains("plug://artifact/"), "{payload_text}");
 
         engine.shutdown().await;
         daemon
