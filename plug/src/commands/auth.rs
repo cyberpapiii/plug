@@ -281,12 +281,9 @@ async fn cmd_auth_login(
 
     if let Some(ref client_id) = server_config.oauth_client_id {
         ui::print_info_line("Using configured OAuth client...");
-        let oauth_config = rmcp::transport::auth::OAuthClientConfig {
-            client_id: client_id.clone(),
-            client_secret: None,
-            scopes: scopes.clone(),
-            redirect_uri: redirect_uri.clone(),
-        };
+        let oauth_config =
+            rmcp::transport::auth::OAuthClientConfig::new(client_id.clone(), redirect_uri.clone())
+                .with_scopes(scopes.clone());
         auth_manager
             .configure_client(oauth_config)
             .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
@@ -461,12 +458,9 @@ async fn cmd_auth_complete(
         .unwrap_or_else(default_dynamic_oauth_redirect_uri);
 
     if let Some(ref client_id) = server_config.oauth_client_id {
-        let oauth_config = rmcp::transport::auth::OAuthClientConfig {
-            client_id: client_id.clone(),
-            client_secret: None,
-            scopes: scopes.clone(),
-            redirect_uri: redirect_uri.clone(),
-        };
+        let oauth_config =
+            rmcp::transport::auth::OAuthClientConfig::new(client_id.clone(), redirect_uri.clone())
+                .with_scopes(scopes.clone());
         auth_manager
             .configure_client(oauth_config)
             .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
@@ -563,12 +557,7 @@ async fn cmd_auth_inject(
         refresh_token.is_some(),
     );
 
-    let stored = StoredCredentials {
-        client_id,
-        token_response: Some(token),
-        granted_scopes: vec![],
-        token_received_at: Some(now),
-    };
+    let stored = StoredCredentials::new(client_id, Some(token), vec![], Some(now));
 
     store
         .save(stored)
@@ -1044,12 +1033,14 @@ mod tests {
         let store = oauth::get_or_create_store(&server_name);
         store.clear().await.unwrap();
         store
-            .remember_dynamic_client_registration(&rmcp::transport::auth::OAuthClientConfig {
-                client_id: "dynamic-client-123".to_string(),
-                client_secret: Some("secret-xyz".to_string()),
-                scopes: vec!["read".to_string()],
-                redirect_uri: "http://localhost:43189/callback".to_string(),
-            })
+            .remember_dynamic_client_registration(
+                &rmcp::transport::auth::OAuthClientConfig::new(
+                    "dynamic-client-123",
+                    "http://localhost:43189/callback",
+                )
+                .with_client_secret("secret-xyz")
+                .with_scopes(vec!["read".to_string()]),
+            )
             .expect("persist registration");
 
         let registration =

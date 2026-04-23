@@ -72,15 +72,15 @@ impl std::fmt::Debug for LegacySseTransportConfig {
 
 impl LegacySseTransportConfig {
     pub fn with_uri(uri: impl Into<Arc<str>>) -> Self {
+        let mut retry_policy = ExponentialBackoff::default();
+        retry_policy.max_times = None;
+        retry_policy.base_duration = Duration::from_millis(1_000);
         Self {
             uri: uri.into(),
             auth_token: None,
             channel_buffer_capacity: 16,
             endpoint_wait_timeout: Duration::from_secs(5),
-            retry_policy: Arc::new(ExponentialBackoff {
-                max_times: None,
-                base_duration: Duration::from_millis(1_000),
-            }),
+            retry_policy: Arc::new(retry_policy),
         }
     }
 
@@ -147,10 +147,10 @@ impl Worker for LegacySseWorker {
     }
 
     fn config(&self) -> WorkerConfig {
-        WorkerConfig {
-            name: Some("LegacySseWorker".into()),
-            channel_buffer_capacity: self.config.channel_buffer_capacity,
-        }
+        let mut config = WorkerConfig::default();
+        config.name = Some("LegacySseWorker".into());
+        config.channel_buffer_capacity = self.config.channel_buffer_capacity;
+        config
     }
 
     async fn run(

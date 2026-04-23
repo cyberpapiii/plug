@@ -2456,12 +2456,11 @@ impl ToolRouter {
                 upstream_params.set_progress_token(token);
             }
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
-            let options = PeerRequestOptions {
-                timeout: Some(timeout_duration),
-                meta: upstream_progress_token
-                    .clone()
-                    .map(Meta::with_progress_token),
-            };
+            let mut options = PeerRequestOptions::default();
+            options.timeout = Some(timeout_duration);
+            options.meta = upstream_progress_token
+                .clone()
+                .map(Meta::with_progress_token);
 
             let request_handle = match peer.send_cancellable_request(request, options).await {
                 Ok(handle) => handle,
@@ -2675,12 +2674,11 @@ impl ToolRouter {
             }
 
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
-            let options = PeerRequestOptions {
-                timeout: Some(timeout_duration),
-                meta: upstream_progress_token
-                    .clone()
-                    .map(Meta::with_progress_token),
-            };
+            let mut options = PeerRequestOptions::default();
+            options.timeout = Some(timeout_duration);
+            options.meta = upstream_progress_token
+                .clone()
+                .map(Meta::with_progress_token);
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,

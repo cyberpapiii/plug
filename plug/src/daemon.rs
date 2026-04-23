@@ -1840,12 +1840,7 @@ async fn dispatch_inject_token(
         refresh_token.is_some(),
     );
 
-    let stored = StoredCredentials {
-        client_id,
-        token_response: Some(token),
-        granted_scopes: vec![],
-        token_received_at: Some(now),
-    };
+    let stored = StoredCredentials::new(client_id, Some(token), vec![], Some(now));
 
     if let Err(e) = store.save(stored).await {
         return IpcResponse::Error {
@@ -2590,12 +2585,12 @@ mod tests {
         token.set_refresh_token(Some(RefreshToken::new("refresh-token".to_string())));
         token.set_expires_in(Some(&Duration::from_secs(3600)));
 
-        StoredCredentials {
-            client_id: "test-client".to_string(),
-            token_response: Some(token),
-            granted_scopes: vec!["read".to_string()],
-            token_received_at: Some(0),
-        }
+        StoredCredentials::new(
+            "test-client".to_string(),
+            Some(token),
+            vec!["read".to_string()],
+            Some(0),
+        )
     }
 
     fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {

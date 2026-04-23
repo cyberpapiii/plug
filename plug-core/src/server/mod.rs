@@ -2748,13 +2748,13 @@ mod tests {
         let mut params = CallToolRequestParams::new(prefixed_tool_name);
         params.set_progress_token(progress_token.clone());
 
+        let mut options = PeerRequestOptions::default();
+        options.meta = Some(Meta::with_progress_token(progress_token.clone()));
+
         let handle = downstream_client
             .send_cancellable_request(
                 rmcp::model::ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                PeerRequestOptions {
-                    timeout: None,
-                    meta: Some(Meta::with_progress_token(progress_token.clone())),
-                },
+                options,
             )
             .await
             .expect("start downstream call");

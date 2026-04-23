@@ -64,12 +64,7 @@ fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
     token.set_refresh_token(Some(RefreshToken::new(refresh.to_string())));
     token.set_expires_in(Some(&Duration::from_secs(3600)));
 
-    StoredCredentials {
-        client_id: "test-client".to_string(),
-        token_response: Some(token),
-        granted_scopes: vec![],
-        token_received_at: Some(0),
-    }
+    StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(0))
 }
 
 fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
@@ -2696,12 +2691,10 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
             .expect("discover metadata");
         auth_manager.set_metadata(metadata);
         auth_manager
-            .configure_client(OAuthClientConfig {
-                client_id: "test-client".to_string(),
-                client_secret: None,
-                scopes: vec!["read".to_string()],
-                redirect_uri: "http://localhost:0/callback".to_string(),
-            })
+            .configure_client(
+                OAuthClientConfig::new("test-client".to_string(), "http://localhost:0/callback")
+                    .with_scopes(vec!["read".to_string()]),
+            )
             .expect("configure oauth client");
 
         let authorize_url = auth_manager

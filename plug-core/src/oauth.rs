@@ -206,12 +206,26 @@ pub struct DynamicOauthClientRegistration {
 
 impl DynamicOauthClientRegistration {
     pub fn to_oauth_client_config(&self, scopes: Vec<String>) -> OAuthClientConfig {
-        OAuthClientConfig {
-            client_id: self.client_id.clone(),
-            client_secret: self.client_secret.clone(),
+        oauth_client_config(
+            self.client_id.clone(),
+            self.client_secret.clone(),
             scopes,
-            redirect_uri: self.redirect_uri.clone(),
-        }
+            self.redirect_uri.clone(),
+        )
+    }
+}
+
+fn oauth_client_config(
+    client_id: String,
+    client_secret: Option<String>,
+    scopes: Vec<String>,
+    redirect_uri: String,
+) -> OAuthClientConfig {
+    let config = OAuthClientConfig::new(client_id, redirect_uri).with_scopes(scopes);
+    if let Some(secret) = client_secret {
+        config.with_client_secret(secret)
+    } else {
+        config
     }
 }
 
@@ -1076,7 +1090,7 @@ pub async fn refresh_access_token(
     server_url: &str,
     oauth_client_id: Option<&str>,
 ) -> RefreshResult {
-    use rmcp::transport::auth::{AuthorizationManager, OAuthClientConfig};
+    use rmcp::transport::auth::AuthorizationManager;
 
     // Ensure the TLS provider is available (reqwest needs it even for HTTP).
     crate::tls::ensure_rustls_provider_installed();
@@ -1143,16 +1157,16 @@ pub async fn refresh_access_token(
     let dynamic_registration = store
         .dynamic_client_registration()
         .filter(|registration| registration.client_id == client_id);
-    let config = OAuthClientConfig {
+    let config = oauth_client_config(
         client_id,
-        client_secret: dynamic_registration
+        dynamic_registration
             .as_ref()
             .and_then(|registration| registration.client_secret.clone()),
-        scopes: creds.granted_scopes.clone(),
-        redirect_uri: dynamic_registration
+        creds.granted_scopes.clone(),
+        dynamic_registration
             .map(|registration| registration.redirect_uri)
             .unwrap_or_else(|| "http://localhost:0/callback".to_string()),
-    };
+    );
     if let Err(e) = auth_manager.configure_client(config) {
         return RefreshResult::TransientError(format!("failed to configure client: {e}"));
     }
@@ -1358,12 +1372,12 @@ mod tests {
         let server_name = format!("test-server-{}", std::process::id());
         let store = CompositeCredentialStore::new(server_name.clone());
 
-        let creds = StoredCredentials {
-            client_id: "test-client-id".to_string(),
-            token_response: None,
-            granted_scopes: vec!["read".to_string(), "write".to_string()],
-            token_received_at: Some(1234567890),
-        };
+        let creds = StoredCredentials::new(
+            "test-client-id".to_string(),
+            None,
+            vec!["read".to_string(), "write".to_string()],
+            Some(1234567890),
+        );
 
         // Save to file (keyring may or may not work in CI).
         let save_result = store.file_save(&creds);
@@ -1434,12 +1448,12 @@ mod tests {
         let name = format!("oauth-preserve-registration-{}", std::process::id());
         let store = get_or_create_store(&name);
 
-        let registration = OAuthClientConfig {
-            client_id: "dynamic-client-123".to_string(),
-            client_secret: Some("secret-xyz".to_string()),
-            scopes: vec!["read".to_string()],
-            redirect_uri: "http://localhost:43189/callback".to_string(),
-        };
+        let registration = oauth_client_config(
+            "dynamic-client-123".to_string(),
+            Some("secret-xyz".to_string()),
+            vec!["read".to_string()],
+            "http://localhost:43189/callback".to_string(),
+        );
         store
             .remember_dynamic_client_registration(&registration)
             .expect("persist registration");
@@ -1468,12 +1482,12 @@ mod tests {
         let name = format!("oauth-clear-registration-{}", std::process::id());
         let store = get_or_create_store(&name);
 
-        let registration = OAuthClientConfig {
-            client_id: "dynamic-client-123".to_string(),
-            client_secret: Some("secret-xyz".to_string()),
-            scopes: vec!["read".to_string()],
-            redirect_uri: "http://localhost:43189/callback".to_string(),
-        };
+        let registration = oauth_client_config(
+            "dynamic-client-123".to_string(),
+            Some("secret-xyz".to_string()),
+            vec!["read".to_string()],
+            "http://localhost:43189/callback".to_string(),
+        );
         store
             .remember_dynamic_client_registration(&registration)
             .expect("persist registration");
@@ -1524,12 +1538,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        StoredCredentials {
-            client_id: "test-client".to_string(),
-            token_response: Some(token),
-            granted_scopes: vec![],
-            token_received_at: Some(now),
-        }
+        StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(now))
     }
 
     /// No stored credentials → NoCredentials.
