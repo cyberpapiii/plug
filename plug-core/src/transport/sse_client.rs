@@ -281,7 +281,9 @@ fn deliver_notification_best_effort(
     match context.to_handler_tx.try_send(message) {
         Ok(()) => Ok(()),
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!("dropping legacy SSE notification due to downstream handler backpressure");
+            tracing::warn!(
+                "dropping legacy SSE notification due to downstream handler backpressure"
+            );
             Ok(())
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -517,16 +519,14 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
 /// Check if an HTTP connection error suggests the remote server uses legacy SSE
 /// rather than Streamable HTTP. Used by the HTTP→SSE fallback path.
 pub fn should_fallback_http_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| {
-            cause
-                .downcast_ref::<LegacySseError>()
-                .is_some_and(LegacySseError::is_legacy_fallback_hint)
-                || cause
-                    .to_string()
-                    .contains("unexpected server response: HTTP 405 Method Not Allowed")
-        })
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<LegacySseError>()
+            .is_some_and(LegacySseError::is_legacy_fallback_hint)
+            || cause
+                .to_string()
+                .contains("unexpected server response: HTTP 405 Method Not Allowed")
+    })
 }
 
 #[cfg(test)]
@@ -545,9 +545,8 @@ mod tests {
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
         CallToolRequestParams, ClientRequest, Content, Implementation, InitializeResult,
-        ListToolsResult, LoggingLevel, LoggingMessageNotification,
-        LoggingMessageNotificationParam, ServerCapabilities, ServerNotification, ServerResult,
-        Tool, ToolsCapability,
+        ListToolsResult, LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam,
+        ServerCapabilities, ServerNotification, ServerResult, Tool, ToolsCapability,
     };
     use rmcp::service::NotificationContext;
     use serde_json::json;
@@ -706,10 +705,14 @@ mod tests {
         });
 
         let transport = LegacySseClientTransport::from_config(
-            LegacySseTransportConfig::with_uri(server_url).endpoint_wait_timeout(Duration::from_secs(1)),
+            LegacySseTransportConfig::with_uri(server_url)
+                .endpoint_wait_timeout(Duration::from_secs(1)),
         );
 
-        let _client = handler.serve(transport).await.expect("connect legacy SSE client");
+        let _client = handler
+            .serve(transport)
+            .await
+            .expect("connect legacy SSE client");
 
         tokio::time::timeout(Duration::from_secs(2), signal.notified())
             .await
@@ -730,9 +733,13 @@ mod tests {
             notification_delay: Duration::from_millis(50),
         });
         let transport = LegacySseClientTransport::from_config(
-            LegacySseTransportConfig::with_uri(server_url).endpoint_wait_timeout(Duration::from_secs(1)),
+            LegacySseTransportConfig::with_uri(server_url)
+                .endpoint_wait_timeout(Duration::from_secs(1)),
         );
-        let client = handler.serve(transport).await.expect("connect noisy legacy SSE client");
+        let client = handler
+            .serve(transport)
+            .await
+            .expect("connect noisy legacy SSE client");
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -759,7 +766,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind legacy SSE early logging server");
-        let addr = listener.local_addr().expect("legacy SSE early logging addr");
+        let addr = listener
+            .local_addr()
+            .expect("legacy SSE early logging addr");
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -819,38 +828,37 @@ mod tests {
                         list_changed: Some(false),
                     });
                     let logging = ServerJsonRpcMessage::notification(
-                        ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
-                            LoggingMessageNotificationParam::new(
+                        ServerNotification::LoggingMessageNotification(
+                            LoggingMessageNotification::new(LoggingMessageNotificationParam::new(
                                 LoggingLevel::Info,
                                 json!({"phase": "before_initialize_response"}),
-                            ),
-                        )),
+                            )),
+                        ),
                     );
                     let response = ServerJsonRpcMessage::response(
                         ServerResult::InitializeResult(
                             InitializeResult::new(capabilities)
-                            .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
+                                .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
                         ),
                         request.id,
                     );
-                    let _ = state.tx.send(
-                        sse_stream::Sse::default()
-                            .data(serde_json::to_string(&logging).expect("serialize logging notification")),
-                    );
-                    let _ = state.tx.send(
-                        sse_stream::Sse::default()
-                            .data(serde_json::to_string(&response).expect("serialize initialize response")),
-                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&logging).expect("serialize logging notification"),
+                    ));
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize initialize response"),
+                    ));
                 }
                 ClientRequest::ListToolsRequest(_) => {
                     let response = ServerJsonRpcMessage::response(
-                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(Vec::<Tool>::new())),
+                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(
+                            Vec::<Tool>::new(),
+                        )),
                         request.id,
                     );
-                    let _ = state.tx.send(
-                        sse_stream::Sse::default()
-                            .data(serde_json::to_string(&response).expect("serialize list tools response")),
-                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize list tools response"),
+                    ));
                 }
                 _ => {}
             }
@@ -876,10 +884,9 @@ mod tests {
                         ),
                         request.id,
                     );
-                    let _ = state.tx.send(
-                        sse_stream::Sse::default()
-                            .data(serde_json::to_string(&response).expect("serialize initialize response")),
-                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize initialize response"),
+                    ));
                 }
                 ClientRequest::ListToolsRequest(_) => {
                     let mut tool = Tool::default();
@@ -890,24 +897,27 @@ mod tests {
                         ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![tool])),
                         request.id,
                     );
-                    let _ = state.tx.send(
-                        sse_stream::Sse::default()
-                            .data(serde_json::to_string(&response).expect("serialize list tools response")),
-                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize list tools response"),
+                    ));
                 }
                 ClientRequest::CallToolRequest(_) => {
                     for idx in 0..32 {
                         let logging = ServerJsonRpcMessage::notification(
-                            ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
-                                LoggingMessageNotificationParam::new(
-                                    LoggingLevel::Info,
-                                    json!({"burst": idx}),
+                            ServerNotification::LoggingMessageNotification(
+                                LoggingMessageNotification::new(
+                                    LoggingMessageNotificationParam::new(
+                                        LoggingLevel::Info,
+                                        json!({"burst": idx}),
+                                    ),
                                 ),
-                            )),
+                            ),
                         );
                         let _ = state.tx.send(
-                            sse_stream::Sse::default()
-                                .data(serde_json::to_string(&logging).expect("serialize noisy logging notification")),
+                            sse_stream::Sse::default().data(
+                                serde_json::to_string(&logging)
+                                    .expect("serialize noisy logging notification"),
+                            ),
                         );
                     }
                     let response = ServerJsonRpcMessage::response(
@@ -916,10 +926,10 @@ mod tests {
                         ])),
                         request.id,
                     );
-                    let _ = state.tx.send(
-                        sse_stream::Sse::default()
-                            .data(serde_json::to_string(&response).expect("serialize tool response")),
-                    );
+                    let _ =
+                        state.tx.send(sse_stream::Sse::default().data(
+                            serde_json::to_string(&response).expect("serialize tool response"),
+                        ));
                 }
                 _ => {}
             }

@@ -1848,8 +1848,8 @@ impl ToolRouter {
     fn filter_meta_tools(&self, tools: &[Tool]) -> Vec<Tool> {
         tools
             .iter()
-            .cloned()
             .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
+            .cloned()
             .collect()
     }
 
@@ -3940,8 +3940,7 @@ impl ServerHandler for ProxyHandler {
                                 let _ = peer
                                     .notify_logging_message(
                                         ProtocolNotification::control_lagged_logging_params(
-                                            skipped as u64,
-                                            "stdio",
+                                            skipped, "stdio",
                                         ),
                                     )
                                     .await;

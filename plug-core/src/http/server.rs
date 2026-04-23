@@ -255,7 +255,7 @@ impl HttpState {
                                 if let Some(message) = notification_to_sse_message(
                                     ProtocolNotification::LoggingMessage {
                                         params: ProtocolNotification::control_lagged_logging_params(
-                                            skipped as u64,
+                                            skipped,
                                             "http",
                                         ),
                                     },

@@ -158,8 +158,7 @@ impl CircuitBreaker {
             STATE_CLOSED => {
                 self.failure_count.store(0, Ordering::Relaxed);
             }
-            STATE_HALF_OPEN => {
-                // HalfOpen → Closed
+            STATE_HALF_OPEN
                 if self
                     .state
                     .compare_exchange(
@@ -168,11 +167,11 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
-                    .is_ok()
-                {
-                    self.failure_count.store(0, Ordering::Relaxed);
-                    self.open_since_nanos.store(u64::MAX, Ordering::Release);
-                }
+                    .is_ok() =>
+            {
+                // HalfOpen → Closed
+                self.failure_count.store(0, Ordering::Relaxed);
+                self.open_since_nanos.store(u64::MAX, Ordering::Release);
             }
             _ => {}
         }
@@ -205,7 +204,7 @@ impl CircuitBreaker {
                         .store(nanos_since_epoch(), Ordering::Release);
                 }
             }
-            STATE_HALF_OPEN => {
+            STATE_HALF_OPEN
                 if self
                     .state
                     .compare_exchange(
@@ -214,11 +213,10 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
-                    .is_ok()
-                {
-                    self.open_since_nanos
-                        .store(nanos_since_epoch(), Ordering::Release);
-                }
+                    .is_ok() =>
+            {
+                self.open_since_nanos
+                    .store(nanos_since_epoch(), Ordering::Release);
             }
             _ => {}
         }

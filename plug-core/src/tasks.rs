@@ -51,6 +51,8 @@ struct TaskRecord {
     last_touched: Instant,
 }
 
+type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
+
 pub struct TaskStore {
     tasks: HashMap<String, TaskRecord>,
     next_task_id: u64,
@@ -180,7 +182,7 @@ impl TaskStore {
         &mut self,
         owner: &TaskOwner,
         task_id: &str,
-    ) -> Result<(Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>), McpError> {
+    ) -> Result<CancelledTaskParts, McpError> {
         self.prune_expired();
         let (task, upstream, handle) = {
             let record = self
@@ -308,7 +310,10 @@ impl TaskStore {
         task_id: &str,
     ) -> Result<Option<TaskUpstreamRef>, McpError> {
         self.prune_expired();
-        let record = self.tasks.get(task_id).ok_or_else(|| task_not_found(task_id))?;
+        let record = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| task_not_found(task_id))?;
         ensure_owner(owner, record)?;
         Ok(record.upstream.clone())
     }
@@ -548,6 +553,11 @@ mod tests {
             .get_result_for_owner(&owner, &task.task_id)
             .expect("local cached result");
         assert_eq!(payload.0, serde_json::json!({"ok": true}));
-        assert!(store.upstream_for_owner(&owner, &task.task_id).unwrap().is_none());
+        assert!(
+            store
+                .upstream_for_owner(&owner, &task.task_id)
+                .unwrap()
+                .is_none()
+        );
     }
 }

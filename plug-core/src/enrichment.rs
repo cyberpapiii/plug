@@ -96,31 +96,9 @@ fn classify_tool_semantics_with_metadata(
 
 fn classify_tool_semantics_from_tokens(name: &str) -> ToolSemantics {
     let read_tokens = [
-        "get",
-        "list",
-        "search",
-        "read",
-        "fetch",
-        "watch",
-        "query",
-        "resolve",
-        "browse",
-        "audit",
-        "check",
-        "inspect",
-        "validate",
-        "verify",
-        "diagnose",
-        "lint",
-        "find",
-        "capture",
-        "reload",
-        "download",
-        "export",
-        "generate",
-        "history",
-        "debug",
-        "replies",
+        "get", "list", "search", "read", "fetch", "watch", "query", "resolve", "browse", "audit",
+        "check", "inspect", "validate", "verify", "diagnose", "lint", "find", "capture", "reload",
+        "download", "export", "generate", "history", "debug", "replies",
     ];
     let destructive_tokens = ["delete", "remove", "drop", "destroy"];
     let write_tokens = [
@@ -221,7 +199,13 @@ fn classify_tool_semantics_from_text(
     let mut destructive_score = 0;
 
     if let Some(title) = title {
-        score_text(title, 2, &mut read_score, &mut mutating_score, &mut destructive_score);
+        score_text(
+            title,
+            2,
+            &mut read_score,
+            &mut mutating_score,
+            &mut destructive_score,
+        );
     }
 
     if let Some(description) = description {
@@ -245,7 +229,9 @@ fn classify_tool_semantics_from_text(
         );
     }
 
-    if destructive_score > 0 && destructive_score >= mutating_score && destructive_score >= read_score
+    if destructive_score > 0
+        && destructive_score >= mutating_score
+        && destructive_score >= read_score
     {
         ToolSemantics::Destructive
     } else if mutating_score > 0 && mutating_score >= read_score {
@@ -461,14 +447,19 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
         .and_then(|value| value.as_object());
     let property_names = properties
         .map(|props| {
-            props.keys()
+            props
+                .keys()
                 .map(|key| key.to_ascii_lowercase())
                 .collect::<Vec<_>>()
                 .join(" ")
         })
         .unwrap_or_default();
 
-    let description = tool.description.as_deref().unwrap_or("").to_ascii_lowercase();
+    let description = tool
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let lowered_name = name.to_ascii_lowercase();
 
     let collaborative_content_signals = [
@@ -545,10 +536,11 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
         "presentation",
         "workspace",
     ];
-    if closed_world_signals
-        .iter()
-        .any(|signal| property_names.contains(signal) || description.contains(signal) || lowered_name.contains(signal))
-    {
+    if closed_world_signals.iter().any(|signal| {
+        property_names.contains(signal)
+            || description.contains(signal)
+            || lowered_name.contains(signal)
+    }) {
         return ToolWorldScope::Closed;
     }
 
@@ -563,7 +555,11 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
 }
 
 fn infer_task_support(tool: &Tool, name: &str, semantics: ToolSemantics) -> ToolTaskSupportMode {
-    if let Some(task_support) = tool.execution.as_ref().and_then(|execution| execution.task_support) {
+    if let Some(task_support) = tool
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.task_support)
+    {
         return match task_support {
             TaskSupport::Forbidden => ToolTaskSupportMode::Forbidden,
             TaskSupport::Optional => ToolTaskSupportMode::Optional,
@@ -572,7 +568,11 @@ fn infer_task_support(tool: &Tool, name: &str, semantics: ToolSemantics) -> Tool
     }
 
     let lowered_name = name.to_ascii_lowercase();
-    let description = tool.description.as_deref().unwrap_or("").to_ascii_lowercase();
+    let description = tool
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let long_running_signals = [
         "watch",
         "stream",
@@ -717,7 +717,7 @@ mod tests {
             "channels_list",
             "conversations_history",
         ] {
-            let mut tool = make_tool(&name);
+            let mut tool = make_tool(name);
             enrich_tool(&mut tool);
             assert_eq!(
                 tool.annotations.as_ref().unwrap().read_only_hint,
@@ -762,7 +762,7 @@ mod tests {
             "conversations_add_message",
             "batch_update_variables",
         ] {
-            let mut tool = make_tool(&name);
+            let mut tool = make_tool(name);
             enrich_tool(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
             assert_eq!(
@@ -1051,7 +1051,11 @@ mod tests {
                 "usergroups_me",
                 "Slack: Usergroups Me",
                 "Manage your own user group membership.",
-                Some(vec!["list".to_string(), "join".to_string(), "leave".to_string()]),
+                Some(vec![
+                    "list".to_string(),
+                    "join".to_string(),
+                    "leave".to_string(),
+                ]),
                 ToolSemantics::Mutating,
             ),
         ];
@@ -1143,7 +1147,11 @@ mod tests {
         .unwrap();
         normalize_annotations(&mut collaborative_tool, "get_thread_content");
         assert_eq!(
-            collaborative_tool.annotations.as_ref().unwrap().open_world_hint,
+            collaborative_tool
+                .annotations
+                .as_ref()
+                .unwrap()
+                .open_world_hint,
             Some(true)
         );
 
@@ -1176,7 +1184,9 @@ mod tests {
 
         normalize_annotations(&mut tool, "deep_researcher_start");
         assert_eq!(
-            tool.execution.as_ref().and_then(|execution| execution.task_support),
+            tool.execution
+                .as_ref()
+                .and_then(|execution| execution.task_support),
             Some(TaskSupport::Required)
         );
     }

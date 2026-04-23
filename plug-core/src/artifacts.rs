@@ -133,7 +133,10 @@ impl ArtifactStore {
         self.records.insert(id.clone(), record.clone());
         self.prune();
 
-        Ok(build_artifact_result(result.is_error == Some(true), &record))
+        Ok(build_artifact_result(
+            result.is_error == Some(true),
+            &record,
+        ))
     }
 
     pub fn read(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
@@ -184,7 +187,11 @@ impl ArtifactStore {
     }
 
     pub fn prune(&self) {
-        self.prune_with_limits(SystemTime::now(), ARTIFACT_RETENTION, ARTIFACT_STORE_MAX_BYTES);
+        self.prune_with_limits(
+            SystemTime::now(),
+            ARTIFACT_RETENTION,
+            ARTIFACT_STORE_MAX_BYTES,
+        );
     }
 
     fn rehydrate_from_disk(&self) {
@@ -239,6 +246,12 @@ impl ArtifactStore {
                 self.records.remove(&dir.id);
             }
         }
+    }
+}
+
+impl Default for ArtifactStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -335,10 +348,8 @@ fn build_artifact_result(is_error: bool, record: &ArtifactRecord) -> CallToolRes
         "plug/originalSizeBytes".to_string(),
         serde_json::json!(record.original_size_bytes),
     );
-    meta.0.insert(
-        "plug/truncatedInline".to_string(),
-        serde_json::json!(true),
-    );
+    meta.0
+        .insert("plug/truncatedInline".to_string(), serde_json::json!(true));
     meta.0.insert(
         "plug/sourceToolName".to_string(),
         serde_json::json!(record.source_tool),
@@ -392,10 +403,8 @@ fn build_unpersistable_result(
         "plug/artifactStoreMaxBytes".to_string(),
         serde_json::json!(max_store_bytes),
     );
-    meta.0.insert(
-        "plug/truncatedInline".to_string(),
-        serde_json::json!(true),
-    );
+    meta.0
+        .insert("plug/truncatedInline".to_string(), serde_json::json!(true));
     meta.0.insert(
         "plug/sourceToolName".to_string(),
         serde_json::json!(source_tool),
@@ -513,7 +522,10 @@ fn maybe_materialize_attachment(
     let Some(content) = obj.get("content").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let encoding = obj.get("encoding").and_then(Value::as_str).unwrap_or("none");
+    let encoding = obj
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
 
     let bytes = match encoding {
         "base64" => base64::engine::general_purpose::STANDARD.decode(content)?,
@@ -642,7 +654,9 @@ fn collect_artifact_dirs(base_dir: &Path) -> Vec<ArtifactDirInfo> {
                 return None;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
-            let modified = std::fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+            let modified = std::fs::metadata(&path)
+                .ok()
+                .and_then(|meta| meta.modified().ok());
             let size = directory_size(&path);
             Some(ArtifactDirInfo {
                 id,

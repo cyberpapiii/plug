@@ -217,9 +217,9 @@ impl IpcProxyHandler {
                         if chunk_index + 1 == chunk_count {
                             let response: IpcResponse = serde_json::from_slice(&chunked_response)
                                 .map_err(|e| TransportFailure {
-                                    message: format!("invalid chunked IPC response: {e}"),
-                                    reconnectable: false,
-                                })?;
+                                message: format!("invalid chunked IPC response: {e}"),
+                                reconnectable: false,
+                            })?;
                             chunked_response.clear();
                             return Ok(response);
                         }
@@ -1743,13 +1743,10 @@ mod tests {
             other => panic!("unexpected create task response: {other:?}"),
         };
 
-        let session_b = crate::runtime::establish_daemon_proxy_session(
-            Some(&config_path),
-            client_id,
-            None,
-        )
-        .await
-        .expect("establish replacement daemon proxy session");
+        let session_b =
+            crate::runtime::establish_daemon_proxy_session(Some(&config_path), client_id, None)
+                .await
+                .expect("establish replacement daemon proxy session");
         let proxy_b = IpcProxyHandler::new(session_b, Some(config_path.clone()));
 
         let (server_transport_b, client_transport_b) = tokio::io::duplex(4096);
@@ -2092,8 +2089,8 @@ mod tests {
             .await
             .expect("connect downstream client");
 
-        let task_request = CallToolRequestParams::new("Mock__artifact_text")
-            .with_task(serde_json::Map::new());
+        let task_request =
+            CallToolRequestParams::new("Mock__artifact_text").with_task(serde_json::Map::new());
 
         let create_response = client
             .peer()
@@ -2122,7 +2119,7 @@ mod tests {
                 match response {
                     ServerResult::GetTaskPayloadResult(payload) => break payload,
                     ServerResult::CallToolResult(result) => {
-                        break GetTaskPayloadResult::new(serde_json::to_value(result).unwrap())
+                        break GetTaskPayloadResult::new(serde_json::to_value(result).unwrap());
                     }
                     _ => tokio::time::sleep(Duration::from_millis(50)).await,
                 }

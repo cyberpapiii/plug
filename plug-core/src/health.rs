@@ -55,6 +55,7 @@ pub fn spawn_health_checks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_health_check(
     server_manager: Arc<ServerManager>,
     router: Arc<ToolRouter>,

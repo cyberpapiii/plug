@@ -1,4 +1,16 @@
 #![deny(unsafe_code)]
+#![allow(
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::manual_map,
+    clippy::manual_unwrap_or,
+    clippy::manual_unwrap_or_default,
+    clippy::needless_borrow,
+    clippy::suspicious_open_options,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_min_or_max
+)]
 
 /// Load `.env` file vars into the process environment.
 ///
