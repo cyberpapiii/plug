@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
@@ -18,16 +18,16 @@ use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::artifacts::ArtifactStore;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
 use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
-use crate::artifacts::ArtifactStore;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
-use crate::types::ClientType;
+use crate::types::{ClientType, LazyToolMode, LazyToolModeOrigin, ResolvedLazyToolPolicy};
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -36,6 +36,8 @@ const PLUG_DESCRIPTION: &str = "MCP multiplexer";
 const PLUG_WEBSITE_URL: &str = "https://github.com/plug-mcp/plug";
 const PLUG_ICON_URL: &str =
     "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg";
+const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
+const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
 fn plug_implementation() -> Implementation {
     Implementation::new("plug", env!("CARGO_PKG_VERSION"))
@@ -114,15 +116,34 @@ impl From<&Config> for RouterConfig {
 }
 
 impl RouterConfig {
-    fn lazy_mode_for_client(&self, client_type: ClientType) -> crate::types::LazyToolMode {
+    fn lazy_policy_for_client(&self, client_type: ClientType) -> ResolvedLazyToolPolicy {
         let target = client_type.target_slug().unwrap_or("unknown");
         crate::config::resolve_lazy_tool_policy_from_settings(
             self.meta_tool_mode,
             &self.lazy_tools,
             target,
         )
-        .mode
     }
+
+    fn lazy_surface_for_client(&self, client_type: ClientType) -> LazyToolSurface {
+        let policy = self.lazy_policy_for_client(client_type);
+        if policy.origin == LazyToolModeOrigin::LegacyMetaToolMode {
+            return LazyToolSurface::LegacyMeta;
+        }
+        match policy.mode {
+            LazyToolMode::Standard => LazyToolSurface::Standard,
+            LazyToolMode::Native => LazyToolSurface::Native,
+            LazyToolMode::Bridge => LazyToolSurface::Bridge,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LazyToolSurface {
+    Standard,
+    Native,
+    Bridge,
+    LegacyMeta,
 }
 
 /// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
@@ -159,8 +180,8 @@ pub struct ToolRouter {
     client_roots: DashMap<NotificationTarget, Vec<Root>>,
     /// Per-client bridge for forwarding reverse requests (elicitation, sampling).
     downstream_bridges: DashMap<NotificationTarget, Arc<dyn DownstreamBridge>>,
-    /// Session-scoped lazy loaded routed tool names.
-    lazy_working_sets: DashMap<String, HashSet<String>>,
+    /// Session-scoped lazy loaded routed tool names, oldest first.
+    lazy_working_sets: DashMap<String, VecDeque<String>>,
     /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
     task_store: Mutex<TaskStore>,
 }
@@ -176,22 +197,41 @@ pub struct DownstreamCallContext {
     pub transport: DownstreamTransport,
     pub client_id: Arc<str>,
     pub request_id: RequestId,
+    pub client_type: ClientType,
 }
 
 impl DownstreamCallContext {
     pub fn stdio(client_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
+        Self::stdio_for_client(client_id, request_id, ClientType::Unknown)
+    }
+
+    pub fn stdio_for_client(
+        client_id: impl Into<Arc<str>>,
+        request_id: RequestId,
+        client_type: ClientType,
+    ) -> Self {
         Self {
             transport: DownstreamTransport::Stdio,
             client_id: client_id.into(),
             request_id,
+            client_type,
         }
     }
 
     pub fn http(session_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
+        Self::http_for_client(session_id, request_id, ClientType::Unknown)
+    }
+
+    pub fn http_for_client(
+        session_id: impl Into<Arc<str>>,
+        request_id: RequestId,
+        client_type: ClientType,
+    ) -> Self {
         Self {
             transport: DownstreamTransport::Http,
             client_id: session_id.into(),
             request_id,
+            client_type,
         }
     }
 
@@ -1308,7 +1348,9 @@ impl ToolRouter {
         tools.sort_unstable_by(|a, b| priority_sort(a, b, priority));
 
         // Add search_tools meta-tool if tool count exceeds threshold
-        if tools.len() >= self.config.tool_search_threshold {
+        if tools.len() >= self.config.tool_search_threshold
+            && !is_disabled_tool(&self.config.disabled_tools, "plug__search_tools")
+        {
             let meta_tool = build_search_tools_meta_tool();
             routes.insert(
                 meta_tool.name.to_string(),
@@ -1622,13 +1664,10 @@ impl ToolRouter {
     /// Get the current list of tools (zero-copy via Arc). Returns all tools.
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
-        if matches!(
-            self.config.lazy_mode_for_client(ClientType::Unknown),
-            crate::types::LazyToolMode::Bridge
-        ) {
-            Arc::clone(&snapshot.meta_tools_all)
-        } else {
-            Arc::clone(&snapshot.tools_all)
+        match self.config.lazy_surface_for_client(ClientType::Unknown) {
+            LazyToolSurface::Bridge => Arc::new(self.filter_meta_tools(&snapshot.meta_tools_all)),
+            LazyToolSurface::LegacyMeta => Arc::new(self.filtered_legacy_meta_tools()),
+            LazyToolSurface::Standard | LazyToolSurface::Native => Arc::clone(&snapshot.tools_all),
         }
     }
 
@@ -1688,21 +1727,31 @@ impl ToolRouter {
     }
 
     pub fn supports_tasks(&self) -> bool {
-        !matches!(
-            self.config.lazy_mode_for_client(ClientType::Unknown),
-            crate::types::LazyToolMode::Bridge
+        self.supports_tasks_for_client(ClientType::Unknown)
+    }
+
+    pub fn supports_tasks_for_client(&self, client_type: ClientType) -> bool {
+        matches!(
+            self.config.lazy_surface_for_client(client_type),
+            LazyToolSurface::Standard | LazyToolSurface::Native
         ) && !self.cache.load().tools_all.is_empty()
     }
 
     pub fn synthesized_capabilities(&self) -> ServerCapabilities {
+        self.synthesized_capabilities_for_client(ClientType::Unknown)
+    }
+
+    pub fn synthesized_capabilities_for_client(
+        &self,
+        client_type: ClientType,
+    ) -> ServerCapabilities {
         let upstream_caps = self.server_manager.healthy_capabilities();
         let mut capabilities = ServerCapabilities::default();
 
         if matches!(
-            self.config.lazy_mode_for_client(ClientType::Unknown),
-            crate::types::LazyToolMode::Bridge
-        )
-            || !self.list_tools().is_empty()
+            self.config.lazy_surface_for_client(client_type),
+            LazyToolSurface::Bridge | LazyToolSurface::LegacyMeta
+        ) || !self.list_tools_for_client(client_type).is_empty()
             || upstream_caps.iter().any(|caps| caps.tools.is_some())
         {
             capabilities.tools = Some(ToolsCapability {
@@ -1732,7 +1781,7 @@ impl ToolRouter {
         if upstream_caps.iter().any(|caps| caps.logging.is_some()) {
             capabilities.logging = Some(serde_json::Map::new());
         }
-        if self.supports_tasks() {
+        if self.supports_tasks_for_client(client_type) {
             capabilities.tasks = Some(TasksCapability::server_default());
         }
 
@@ -1750,10 +1799,16 @@ impl ToolRouter {
         session_key: Option<&str>,
     ) -> Arc<Vec<Tool>> {
         if matches!(
-            self.config.lazy_mode_for_client(client_type),
-            crate::types::LazyToolMode::Bridge
+            self.config.lazy_surface_for_client(client_type),
+            LazyToolSurface::Bridge
         ) {
             return self.bridge_visible_tools(session_key);
+        }
+        if matches!(
+            self.config.lazy_surface_for_client(client_type),
+            LazyToolSurface::LegacyMeta
+        ) {
+            return Arc::new(self.filtered_legacy_meta_tools());
         }
         if !self.config.tool_filter_enabled {
             return self.list_tools();
@@ -1768,24 +1823,41 @@ impl ToolRouter {
 
     fn bridge_visible_tools(&self, session_key: Option<&str>) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
-        let mut tools = (*snapshot.meta_tools_all).clone();
+        let mut tools = self.filter_meta_tools(&snapshot.meta_tools_all);
         let Some(session_key) = session_key else {
             return Arc::new(tools);
         };
-        let loaded_names = {
-            let loaded = self
-                .lazy_working_sets
-                .entry(session_key.to_string())
-                .or_default();
-            loaded.value().clone()
+        let Some(loaded) = self.lazy_working_sets.get(session_key) else {
+            return Arc::new(tools);
         };
+        let loaded_names = loaded.value().clone();
+        drop(loaded);
 
-        for tool in snapshot.tools_all.iter() {
-            if loaded_names.contains(tool.name.as_ref()) {
+        for loaded_name in loaded_names {
+            if let Some(tool) = snapshot
+                .tools_all
+                .iter()
+                .find(|tool| tool.name.as_ref() == loaded_name)
+            {
                 tools.push(tool.clone());
             }
         }
         Arc::new(tools)
+    }
+
+    fn filter_meta_tools(&self, tools: &[Tool]) -> Vec<Tool> {
+        tools
+            .iter()
+            .cloned()
+            .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
+            .collect()
+    }
+
+    fn filtered_legacy_meta_tools(&self) -> Vec<Tool> {
+        build_legacy_meta_tools()
+            .into_iter()
+            .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
+            .collect()
     }
 
     pub fn list_resources(&self) -> Arc<Vec<Resource>> {
@@ -1991,18 +2063,25 @@ impl ToolRouter {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         progress_token: Option<ProgressToken>,
         owner: TaskOwner,
+        downstream: Option<DownstreamCallContext>,
     ) -> Result<CreateTaskResult, McpError> {
+        if canonical_plug_meta_tool_name(tool_name).is_some() {
+            return Err(McpError::from(ProtocolError::InvalidRequest {
+                detail:
+                    "plug meta-tools do not support task-wrapped calls; call the meta-tool directly"
+                        .to_string(),
+            }));
+        }
+
         let cache = self.cache.load();
-        let (server_id, original_name) = cache
-            .routes
-            .get(tool_name)
-            .cloned()
-            .ok_or_else(|| {
-                McpError::from(ProtocolError::ToolNotFound {
-                    tool_name: tool_name.to_string(),
-                })
-            })?;
+        let (server_id, original_name) = cache.routes.get(tool_name).cloned().ok_or_else(|| {
+            McpError::from(ProtocolError::ToolNotFound {
+                tool_name: tool_name.to_string(),
+            })
+        })?;
         drop(cache);
+
+        self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;
 
         if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
             if upstream
@@ -2094,7 +2173,11 @@ impl ToolRouter {
                 .await
                 .upstream_for_owner(owner, task_id)?
         };
-        if let Some(TaskUpstreamRef::Task { server_id, task_id: upstream_task_id }) = upstream {
+        if let Some(TaskUpstreamRef::Task {
+            server_id,
+            task_id: upstream_task_id,
+        }) = upstream
+        {
             if let Some(server) = self.server_manager.get_upstream(&server_id) {
                 let response = server
                     .client
@@ -2111,11 +2194,11 @@ impl ToolRouter {
                         other => McpError::internal_error(other.to_string(), None),
                     })?;
                 if let ServerResult::GetTaskResult(result) = response {
-                    let synced = self
-                        .task_store
-                        .lock()
-                        .await
-                        .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
+                    let synced = self.task_store.lock().await.sync_from_upstream_for_owner(
+                        owner,
+                        task_id,
+                        &result.task,
+                    )?;
                     return Ok(GetTaskResult {
                         meta: None,
                         task: synced,
@@ -2127,7 +2210,10 @@ impl ToolRouter {
                 ));
             }
         }
-        self.task_store.lock().await.get_info_for_owner(owner, task_id)
+        self.task_store
+            .lock()
+            .await
+            .get_info_for_owner(owner, task_id)
     }
 
     pub async fn get_task_result_for_owner(
@@ -2141,17 +2227,21 @@ impl ToolRouter {
                 .await
                 .upstream_for_owner(owner, task_id)?
         };
-        if let Some(TaskUpstreamRef::Task { server_id, task_id: upstream_task_id }) = upstream {
+        if let Some(TaskUpstreamRef::Task {
+            server_id,
+            task_id: upstream_task_id,
+        }) = upstream
+        {
             if let Some(server) = self.server_manager.get_upstream(&server_id) {
                 let response = server
                     .client
                     .peer()
-                    .send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest::new(
-                        GetTaskResultParams {
+                    .send_request(ClientRequest::GetTaskResultRequest(
+                        GetTaskResultRequest::new(GetTaskResultParams {
                             meta: None,
                             task_id: upstream_task_id,
-                        },
-                    )))
+                        }),
+                    ))
                     .await
                     .map_err(|error| match error {
                         rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
@@ -2159,14 +2249,13 @@ impl ToolRouter {
                     })?;
                 return match response {
                     ServerResult::GetTaskPayloadResult(result) => {
-                        self.task_store
-                            .lock()
-                            .await
-                            .cache_result_for_owner(owner, task_id, result.0.clone())?;
-                        self.artifact_store.maybe_spill_task_payload(
-                            &format!("task_result:{task_id}"),
-                            result.0,
-                        )
+                        self.task_store.lock().await.cache_result_for_owner(
+                            owner,
+                            task_id,
+                            result.0.clone(),
+                        )?;
+                        self.artifact_store
+                            .maybe_spill_task_payload(&format!("task_result:{task_id}"), result.0)
                     }
                     ServerResult::CallToolResult(result) => {
                         let payload = serde_json::to_value(result).map_err(|e| {
@@ -2175,14 +2264,13 @@ impl ToolRouter {
                                 None,
                             )
                         })?;
-                        self.task_store
-                            .lock()
-                            .await
-                            .cache_result_for_owner(owner, task_id, payload.clone())?;
-                        self.artifact_store.maybe_spill_task_payload(
-                            &format!("task_result:{task_id}"),
-                            payload,
-                        )
+                        self.task_store.lock().await.cache_result_for_owner(
+                            owner,
+                            task_id,
+                            payload.clone(),
+                        )?;
+                        self.artifact_store
+                            .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
                     }
                     _ => Err(McpError::internal_error(
                         "unexpected upstream tasks/result response".to_string(),
@@ -2216,17 +2304,20 @@ impl ToolRouter {
             .mark_cancelled(owner, task_id)?;
         if let Some(upstream) = upstream {
             match upstream {
-                TaskUpstreamRef::Task { server_id, task_id: upstream_task_id } => {
+                TaskUpstreamRef::Task {
+                    server_id,
+                    task_id: upstream_task_id,
+                } => {
                     if let Some(server) = self.server_manager.get_upstream(&server_id) {
                         let response = server
                             .client
                             .peer()
-                            .send_request(ClientRequest::CancelTaskRequest(
-                                CancelTaskRequest::new(CancelTaskParams {
+                            .send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+                                CancelTaskParams {
                                     meta: None,
                                     task_id: upstream_task_id,
-                                }),
-                            ))
+                                },
+                            )))
                             .await;
                         if let Ok(ServerResult::CancelTaskResult(result)) = response {
                             let synced = self
@@ -2241,7 +2332,10 @@ impl ToolRouter {
                         }
                     }
                 }
-                TaskUpstreamRef::Request { server_id, request_id } => {
+                TaskUpstreamRef::Request {
+                    server_id,
+                    request_id,
+                } => {
                     if let Some(server) = self.server_manager.get_upstream(&server_id) {
                         let _ = server
                             .client
@@ -2268,8 +2362,15 @@ impl ToolRouter {
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_inner(tool_name, arguments, progress_token, downstream, true, false)
-            .await
+        self.call_tool_inner(
+            tool_name,
+            arguments,
+            progress_token,
+            downstream,
+            true,
+            false,
+        )
+        .await
     }
 
     async fn execute_tool_task(
@@ -2439,28 +2540,30 @@ impl ToolRouter {
     > {
         Box::pin(async move {
             // Intercept plug meta-tools (case-insensitive for LLM casing drift).
-            if tool_name.eq_ignore_ascii_case("plug__list_servers") {
-                return Ok(self.handle_list_servers());
-            }
-            if tool_name.eq_ignore_ascii_case("plug__list_tools") {
-                return self.handle_list_tools(arguments.clone());
-            }
-            if tool_name.eq_ignore_ascii_case("plug__search_tools") {
-                return self.handle_search_tools(arguments.clone());
-            }
-            if tool_name.eq_ignore_ascii_case("plug__load_tool") {
-                return self.handle_load_tool(arguments.clone(), downstream.as_ref());
-            }
-            if tool_name.eq_ignore_ascii_case("plug__evict_tool") {
-                return self.handle_evict_tool(arguments.clone(), downstream.as_ref());
-            }
-            if tool_name.eq_ignore_ascii_case("plug__list_loaded_tools") {
-                return self.handle_list_loaded_tools(downstream.as_ref());
-            }
-            if tool_name.eq_ignore_ascii_case("plug__invoke_tool") {
-                return self
-                    .handle_invoke_tool(arguments.clone(), progress_token, downstream, is_retry)
-                    .await;
+            if let Some(meta_tool_name) = canonical_plug_meta_tool_name(tool_name) {
+                if !self.meta_tool_visible_for_call(meta_tool_name, downstream.as_ref()) {
+                    return Err(McpError::from(ProtocolError::ToolNotFound {
+                        tool_name: tool_name.to_string(),
+                    }));
+                }
+                match meta_tool_name {
+                    "plug__list_servers" => return Ok(self.handle_list_servers()),
+                    "plug__list_tools" => return self.handle_list_tools(arguments.clone()),
+                    "plug__search_tools" => {
+                        return self.handle_search_tools(arguments.clone(), downstream.as_ref());
+                    }
+                    "plug__invoke_tool" => {
+                        return self
+                            .handle_invoke_tool(
+                                arguments.clone(),
+                                progress_token,
+                                downstream,
+                                is_retry,
+                            )
+                            .await;
+                    }
+                    _ => unreachable!("canonical plug meta-tool name is exhaustive"),
+                }
             }
 
             // Look up the server and original name for this exposed tool name
@@ -2793,6 +2896,30 @@ impl ToolRouter {
         })
     }
 
+    fn meta_tool_visible_for_call(
+        &self,
+        meta_tool_name: &str,
+        downstream: Option<&DownstreamCallContext>,
+    ) -> bool {
+        if is_disabled_tool(&self.config.disabled_tools, meta_tool_name) {
+            return false;
+        }
+
+        let surface = downstream
+            .map(|context| self.config.lazy_surface_for_client(context.client_type))
+            .unwrap_or_else(|| self.config.lazy_surface_for_client(ClientType::Unknown));
+        match surface {
+            LazyToolSurface::Bridge => meta_tool_name == "plug__search_tools",
+            LazyToolSurface::LegacyMeta => legacy_meta_tool_names().contains(&meta_tool_name),
+            LazyToolSurface::Standard | LazyToolSurface::Native => self
+                .cache
+                .load()
+                .routes
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(meta_tool_name)),
+        }
+    }
+
     fn handle_list_servers(&self) -> CallToolResult {
         let snapshot = self.cache.load();
         let mut tool_counts: HashMap<&str, usize> = HashMap::new();
@@ -2880,7 +3007,7 @@ impl ToolRouter {
         for (server_id, tool) in matches {
             lines.push(format!("- {} (server: {})", tool.name, server_id));
             if let Some(desc) = tool.description.as_deref() {
-                lines.push(format!("  {}", desc));
+                lines.push(format!("  {desc}"));
             }
         }
 
@@ -2893,13 +3020,15 @@ impl ToolRouter {
     fn handle_search_tools(
         &self,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        downstream: Option<&DownstreamCallContext>,
     ) -> Result<CallToolResult, McpError> {
         let query = arguments
             .as_ref()
             .and_then(|args| args.get("query"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .to_lowercase();
+            .trim()
+            .to_string();
 
         if query.is_empty() {
             return self.json_tool_result(serde_json::json!({
@@ -2907,15 +3036,23 @@ impl ToolRouter {
                 "error": "query is required"
             }));
         }
+        let tokens = tokenize_search_query(&query);
+        if tokens.is_empty() {
+            return self.json_tool_result(serde_json::json!({
+                "matches": [],
+                "error": "query must include searchable text"
+            }));
+        }
+        let query_phrase = tokens.join(" ");
 
         let limit = arguments
             .as_ref()
             .and_then(|args| args.get("limit"))
             .and_then(|value| value.as_u64())
-            .map(|value| value.min(25) as usize)
-            .unwrap_or(10);
+            .map(|value| value.min(BRIDGE_SEARCH_RESULT_MAX as u64) as usize)
+            .unwrap_or(5);
         let snapshot = self.cache.load();
-        let mut matches = Vec::new();
+        let mut ranked = Vec::new();
         for tool in snapshot.tools_all.iter() {
             let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
                 continue;
@@ -2923,103 +3060,124 @@ impl ToolRouter {
             if server_id == "__plug_internal__" {
                 continue;
             }
-            let name = tool.name.to_lowercase();
-            let desc = tool.description.as_deref().unwrap_or("").to_lowercase();
-            if !name.contains(&query) && !desc.contains(&query) {
+            let Some(score) = score_tool_match(tool, server_id, &query_phrase, &tokens) else {
                 continue;
-            }
-            matches.push(serde_json::json!({
-                "name": tool.name.as_ref(),
-                "server_id": server_id,
-                "description": tool.description.as_deref().unwrap_or(""),
-            }));
-            if matches.len() >= limit {
-                break;
-            }
+            };
+            ranked.push((score, server_id.clone(), tool.clone()));
         }
-        self.json_tool_result(serde_json::json!({ "matches": matches }))
-    }
-
-    fn handle_load_tool(
-        &self,
-        arguments: Option<serde_json::Map<String, serde_json::Value>>,
-        downstream: Option<&DownstreamCallContext>,
-    ) -> Result<CallToolResult, McpError> {
-        let session_key = self.lazy_session_key_from_context(downstream)?;
-        let tool_name = required_string_argument(arguments.as_ref(), "tool_name")?;
-        let snapshot = self.cache.load();
-        let tool = snapshot
-            .tools_all
-            .iter()
-            .find(|tool| tool.name.eq_ignore_ascii_case(tool_name))
-            .cloned()
-            .ok_or_else(|| McpError::from(ProtocolError::ToolNotFound {
-                tool_name: tool_name.to_string(),
-            }))?;
-        let canonical_name = tool.name.to_string();
-        let Some((server_id, _)) = snapshot.routes.get(canonical_name.as_str()) else {
-            return Err(McpError::from(ProtocolError::ToolNotFound {
-                tool_name: canonical_name,
-            }));
-        };
-        if server_id == "__plug_internal__" {
-            return Err(McpError::from(ProtocolError::InvalidRequest {
-                detail: "plug meta-tools cannot be loaded into the lazy working set".to_string(),
-            }));
-        }
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.2.name.as_ref().cmp(b.2.name.as_ref()))
+        });
+        ranked.truncate(limit);
         drop(snapshot);
 
-        let inserted = self
-            .lazy_working_sets
-            .entry(session_key)
-            .or_default()
-            .insert(canonical_name.clone());
-        if inserted {
-            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        let mut matches = Vec::new();
+        let mut tools = Vec::new();
+        let mut available_tools = Vec::new();
+        for (score, server_id, tool) in ranked {
+            let canonical_name = tool.name.to_string();
+            matches.push(serde_json::json!({
+                "name": canonical_name.clone(),
+                "server_id": server_id,
+                "description": tool.description.as_deref().unwrap_or(""),
+                "score": score,
+            }));
+            available_tools.push(canonical_name);
+            tools.push(tool.clone());
         }
+
+        let mut newly_loaded_tools = Vec::new();
+        let mut evicted_tools = Vec::new();
+        let mut visible_set_changed = false;
+        if let Some(downstream) = downstream
+            && matches!(
+                self.config.lazy_surface_for_client(downstream.client_type),
+                LazyToolSurface::Bridge
+            )
+            && !available_tools.is_empty()
+        {
+            let session_key = self.lazy_session_key_from_context(Some(downstream))?;
+            let mut loaded = self.lazy_working_sets.entry(session_key).or_default();
+            let before = loaded.iter().cloned().collect::<Vec<_>>();
+            for tool_name in &available_tools {
+                if let Some(position) = loaded.iter().position(|name| name == tool_name) {
+                    loaded.remove(position);
+                } else {
+                    newly_loaded_tools.push(tool_name.clone());
+                }
+                loaded.push_back(tool_name.clone());
+            }
+            while loaded.len() > BRIDGE_WORKING_SET_MAX_TOOLS {
+                if let Some(evicted) = loaded.pop_front() {
+                    evicted_tools.push(evicted);
+                }
+            }
+            visible_set_changed = before != loaded.iter().cloned().collect::<Vec<_>>();
+            drop(loaded);
+            if visible_set_changed {
+                self.publish_protocol_notification(ProtocolNotification::ToolListChangedFor {
+                    target: downstream.notification_target(),
+                });
+            }
+        }
+
         self.json_tool_result(serde_json::json!({
-            "loaded": true,
-            "already_loaded": !inserted,
-            "tool": tool,
+            "matches": matches,
+            "tools": tools,
+            "available_tools": available_tools,
+            "newly_loaded_tools": newly_loaded_tools,
+            "evicted_tools": evicted_tools,
+            "working_set_limit": BRIDGE_WORKING_SET_MAX_TOOLS,
+            "visible_set_changed": visible_set_changed,
+            "next_step": "Call the best matching tool directly by name.",
         }))
     }
 
-    fn handle_evict_tool(
-        &self,
+    fn handle_invoke_tool<'a>(
+        &'a self,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
-        downstream: Option<&DownstreamCallContext>,
-    ) -> Result<CallToolResult, McpError> {
-        let session_key = self.lazy_session_key_from_context(downstream)?;
-        let tool_name = required_string_argument(arguments.as_ref(), "tool_name")?;
-        let removed = self
-            .lazy_working_sets
-            .get_mut(&session_key)
-            .map(|mut tools| remove_loaded_tool_case_insensitive(&mut tools, tool_name))
-            .unwrap_or(false);
-        if removed {
-            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
-        }
-        self.json_tool_result(serde_json::json!({
-            "evicted": removed,
-            "tool_name": tool_name,
-        }))
-    }
+        progress_token: Option<ProgressToken>,
+        downstream: Option<DownstreamCallContext>,
+        is_retry: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let args = arguments.ok_or_else(|| {
+                McpError::from(ProtocolError::InvalidRequest {
+                    detail: "plug__invoke_tool requires arguments".to_string(),
+                })
+            })?;
+            let target = args
+                .get("tool_name")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    McpError::from(ProtocolError::InvalidRequest {
+                        detail: "plug__invoke_tool requires a string tool_name".to_string(),
+                    })
+                })?;
+            if canonical_plug_meta_tool_name(target).is_some() {
+                return Err(McpError::from(ProtocolError::InvalidRequest {
+                    detail: "plug__invoke_tool cannot invoke plug meta-tools".to_string(),
+                }));
+            }
 
-    fn handle_list_loaded_tools(
-        &self,
-        downstream: Option<&DownstreamCallContext>,
-    ) -> Result<CallToolResult, McpError> {
-        let session_key = self.lazy_session_key_from_context(downstream)?;
-        let loaded = self
-            .lazy_working_sets
-            .get(&session_key)
-            .map(|tools| {
-                let mut names = tools.iter().cloned().collect::<Vec<_>>();
-                names.sort();
-                names
-            })
-            .unwrap_or_default();
-        self.json_tool_result(serde_json::json!({ "loaded_tools": loaded }))
+            let forwarded_arguments = args
+                .get("arguments")
+                .and_then(|value| value.as_object())
+                .cloned();
+
+            self.call_tool_inner(
+                target,
+                forwarded_arguments,
+                progress_token,
+                downstream,
+                false,
+                is_retry,
+            )
+            .await
+        })
     }
 
     fn lazy_session_key_from_context(
@@ -3051,70 +3209,35 @@ impl ToolRouter {
         let Some(downstream) = downstream else {
             return Ok(());
         };
-        let session_key = Self::lazy_session_key(
-            downstream.transport,
-            downstream.client_id.as_ref(),
-        );
-        let Some(loaded) = self.lazy_working_sets.get(&session_key) else {
+        if !matches!(
+            self.config.lazy_surface_for_client(downstream.client_type),
+            LazyToolSurface::Bridge
+        ) {
             return Ok(());
+        }
+        let session_key =
+            Self::lazy_session_key(downstream.transport, downstream.client_id.as_ref());
+        let Some(mut loaded) = self.lazy_working_sets.get_mut(&session_key) else {
+            return Err(McpError::from(ProtocolError::InvalidRequest {
+                detail: format!(
+                    "{tool_name} is hidden in this lazy tool session; call plug__search_tools first"
+                ),
+            }));
         };
-        if loaded
+        if let Some(position) = loaded
             .iter()
-            .any(|loaded_name| loaded_name.eq_ignore_ascii_case(tool_name))
+            .position(|loaded_name| loaded_name.eq_ignore_ascii_case(tool_name))
         {
+            if let Some(loaded_name) = loaded.remove(position) {
+                loaded.push_back(loaded_name);
+            }
             return Ok(());
         }
         Err(McpError::from(ProtocolError::InvalidRequest {
             detail: format!(
-                "{tool_name} is hidden in this lazy tool session; call plug__load_tool first"
+                "{tool_name} is hidden in this lazy tool session; call plug__search_tools first"
             ),
         }))
-    }
-
-    fn handle_invoke_tool<'a>(
-        &'a self,
-        arguments: Option<serde_json::Map<String, serde_json::Value>>,
-        progress_token: Option<ProgressToken>,
-        downstream: Option<DownstreamCallContext>,
-        is_retry: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let args = arguments.ok_or_else(|| {
-                McpError::from(ProtocolError::InvalidRequest {
-                    detail: "plug__invoke_tool requires arguments".to_string(),
-                })
-            })?;
-            let target = args
-                .get("tool_name")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    McpError::from(ProtocolError::InvalidRequest {
-                        detail: "plug__invoke_tool requires a string tool_name".to_string(),
-                    })
-                })?;
-            if target.eq_ignore_ascii_case("plug__invoke_tool") {
-                return Err(McpError::from(ProtocolError::InvalidRequest {
-                    detail: "plug__invoke_tool cannot invoke itself".to_string(),
-                }));
-            }
-
-            let forwarded_arguments = args
-                .get("arguments")
-                .and_then(|value| value.as_object())
-                .cloned();
-
-            self.call_tool_inner(
-                target,
-                forwarded_arguments,
-                progress_token,
-                downstream,
-                false,
-                is_retry,
-            )
-            .await
-        })
     }
 
     /// Get a reference to the underlying ServerManager.
@@ -3190,34 +3313,6 @@ fn sanitize_description(desc: &str) -> String {
     desc.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
         .collect()
-}
-
-fn required_string_argument<'a>(
-    arguments: Option<&'a serde_json::Map<String, serde_json::Value>>,
-    name: &str,
-) -> Result<&'a str, McpError> {
-    arguments
-        .and_then(|args| args.get(name))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            McpError::from(ProtocolError::InvalidRequest {
-                detail: format!("{name} must be a string"),
-            })
-        })
-}
-
-fn remove_loaded_tool_case_insensitive(loaded: &mut HashSet<String>, tool_name: &str) -> bool {
-    if loaded.remove(tool_name) {
-        return true;
-    }
-    let Some(canonical_name) = loaded
-        .iter()
-        .find(|loaded_name| loaded_name.eq_ignore_ascii_case(tool_name))
-        .cloned()
-    else {
-        return false;
-    };
-    loaded.remove(&canonical_name)
 }
 
 /// Sort comparator: priority tools first (by priority_tools index), then alphabetical.
@@ -3336,14 +3431,105 @@ fn fingerprint_tool_definition(tool: &Tool) -> u64 {
     hasher.finish()
 }
 
+fn canonical_plug_meta_tool_name(tool_name: &str) -> Option<&'static str> {
+    legacy_meta_tool_names()
+        .iter()
+        .copied()
+        .find(|name| name.eq_ignore_ascii_case(tool_name))
+}
+
+fn legacy_meta_tool_names() -> &'static [&'static str] {
+    &[
+        "plug__list_servers",
+        "plug__list_tools",
+        "plug__search_tools",
+        "plug__invoke_tool",
+    ]
+}
+
+fn tokenize_search_query(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn normalize_search_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn score_tool_match(
+    tool: &Tool,
+    server_id: &str,
+    query_phrase: &str,
+    tokens: &[String],
+) -> Option<i64> {
+    let name = normalize_search_text(tool.name.as_ref());
+    let title = normalize_search_text(tool.title.as_deref().unwrap_or(""));
+    let server = normalize_search_text(server_id);
+    let description = normalize_search_text(tool.description.as_deref().unwrap_or(""));
+    let mut score = 0i64;
+    let mut all_tokens_matched = true;
+
+    if name.contains(query_phrase) {
+        score += 120;
+    }
+    if title.contains(query_phrase) {
+        score += 100;
+    }
+    if description.contains(query_phrase) {
+        score += 60;
+    }
+
+    for token in tokens {
+        let mut token_matched = false;
+        if name.contains(token) {
+            score += 40;
+            token_matched = true;
+        }
+        if title.contains(token) {
+            score += 30;
+            token_matched = true;
+        }
+        if server.contains(token) {
+            score += 25;
+            token_matched = true;
+        }
+        if description.contains(token) {
+            score += 10;
+            token_matched = true;
+        }
+        all_tokens_matched &= token_matched;
+    }
+
+    if all_tokens_matched {
+        score += 50;
+    }
+
+    (score > 0).then_some(score)
+}
+
 fn build_meta_tools() -> Vec<Tool> {
+    vec![build_search_tools_meta_tool()]
+}
+
+fn build_legacy_meta_tools() -> Vec<Tool> {
     vec![
         build_list_servers_meta_tool(),
         build_list_tools_meta_tool(),
         build_search_tools_meta_tool(),
-        build_load_tool_meta_tool(),
-        build_evict_tool_meta_tool(),
-        build_list_loaded_tools_meta_tool(),
         build_invoke_tool_meta_tool(),
     ]
 }
@@ -3360,7 +3546,7 @@ fn build_list_tools_meta_tool() -> Tool {
     Tool::new(
         Cow::Borrowed("plug__list_tools"),
         Cow::Borrowed(
-            "List routed tools hidden behind meta-tool mode, optionally filtered by server or query.",
+            "List routed tools hidden behind legacy meta-tool mode, optionally filtered by server or query.",
         ),
         Arc::new(
             serde_json::json!({
@@ -3394,7 +3580,7 @@ fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
         Cow::Borrowed("plug__search_tools"),
         Cow::Borrowed(
-            "Search hidden routed tools by name or description. Returns compact JSON matches.",
+            "Search hidden routed tools by name or description, load the matches into this session, then call the chosen real tool directly.",
         ),
         Arc::new(
             serde_json::json!({
@@ -3403,6 +3589,12 @@ fn build_search_tools_meta_tool() -> Tool {
                     "query": {
                         "type": "string",
                         "description": "Search query for tool name or description"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "Maximum tool definitions to load and return (default: 5)"
                     }
                 },
                 "required": ["query"]
@@ -3414,65 +3606,11 @@ fn build_search_tools_meta_tool() -> Tool {
     )
 }
 
-fn build_load_tool_meta_tool() -> Tool {
-    Tool::new(
-        Cow::Borrowed("plug__load_tool"),
-        Cow::Borrowed(
-            "Load a hidden routed tool into this session's active tool set. Returns the full tool definition as JSON.",
-        ),
-        Arc::new(
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "description": "Exact routed tool name to load"
-                    }
-                },
-                "required": ["tool_name"]
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        ),
-    )
-}
-
-fn build_evict_tool_meta_tool() -> Tool {
-    Tool::new(
-        Cow::Borrowed("plug__evict_tool"),
-        Cow::Borrowed("Evict a loaded routed tool from this session's active tool set."),
-        Arc::new(
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "description": "Exact routed tool name to evict"
-                    }
-                },
-                "required": ["tool_name"]
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        ),
-    )
-}
-
-fn build_list_loaded_tools_meta_tool() -> Tool {
-    Tool::new(
-        Cow::Borrowed("plug__list_loaded_tools"),
-        Cow::Borrowed("List routed tools currently loaded into this session's active tool set."),
-        Arc::new(serde_json::Map::new()),
-    )
-}
-
 fn build_invoke_tool_meta_tool() -> Tool {
     Tool::new(
         Cow::Borrowed("plug__invoke_tool"),
         Cow::Borrowed(
-            "Invoke a specific routed tool by prefixed name and return the raw upstream result.",
+            "Invoke a specific routed tool by prefixed name and return the raw upstream result. Legacy meta-tool mode only.",
         ),
         Arc::new(
             serde_json::json!({
@@ -3639,16 +3777,32 @@ impl ServerHandler for ProxyHandler {
     fn enqueue_task(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
         let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
         let router = Arc::clone(&self.router);
         let progress_token = request.progress_token();
         let tool_name = request.name.to_string();
         let arguments = request.arguments;
+        let client_type = self
+            .client_type
+            .read()
+            .map(|ct| *ct)
+            .unwrap_or(ClientType::Unknown);
+        let downstream = DownstreamCallContext::stdio_for_client(
+            Arc::clone(&self.client_id),
+            context.id.clone(),
+            client_type,
+        );
         async move {
             router
-                .enqueue_tool_task(&tool_name, arguments, progress_token, owner)
+                .enqueue_tool_task(
+                    &tool_name,
+                    arguments,
+                    progress_token,
+                    owner,
+                    Some(downstream),
+                )
                 .await
         }
     }
@@ -3705,6 +3859,16 @@ impl ServerHandler for ProxyHandler {
                                         error = %error,
                                         "stopping stdio notification fan-out after peer send failure"
                                     );
+                                    break;
+                                }
+                            }
+                            Ok(ProtocolNotification::ToolListChangedFor { target }) => {
+                                if matches!(
+                                    target,
+                                    NotificationTarget::Stdio { client_id: target_id }
+                                        if target_id == client_id
+                                ) && peer.notify_tool_list_changed().await.is_err()
+                                {
                                     break;
                                 }
                             }
@@ -3832,7 +3996,16 @@ impl ServerHandler for ProxyHandler {
                 });
             }
 
-            Ok(self.get_info())
+            Ok(
+                InitializeResult::new(self.router.synthesized_capabilities_for_client(client_type))
+                    .with_server_info(plug_implementation())
+                    .with_protocol_version(
+                        serde_json::from_value(serde_json::Value::String(
+                            LATEST_PROTOCOL_VERSION.to_string(),
+                        ))
+                        .expect("latest protocol version must parse"),
+                    ),
+            )
         }
     }
 
@@ -3930,10 +4103,8 @@ impl ServerHandler for ProxyHandler {
                 .read()
                 .map(|ct| *ct)
                 .unwrap_or(ClientType::Unknown);
-            let session_key = ToolRouter::lazy_session_key(
-                DownstreamTransport::Stdio,
-                self.client_id.as_ref(),
-            );
+            let session_key =
+                ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
             Ok(self
                 .router
                 .list_tools_page_for_client_session(ct, Some(&session_key), request))
@@ -3957,14 +4128,20 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
             let progress_token = request.progress_token();
+            let client_type = self
+                .client_type
+                .read()
+                .map(|ct| *ct)
+                .unwrap_or(ClientType::Unknown);
             self.router
                 .call_tool_with_context(
                     request.name.as_ref(),
                     request.arguments,
                     progress_token,
-                    Some(DownstreamCallContext::stdio(
+                    Some(DownstreamCallContext::stdio_for_client(
                         Arc::clone(&self.client_id),
                         context.id.clone(),
+                        client_type,
                     )),
                 )
                 .await
@@ -4142,15 +4319,44 @@ mod tests {
     }
 
     fn expected_meta_tool_names() -> Vec<&'static str> {
+        vec!["plug__search_tools"]
+    }
+
+    fn expected_legacy_meta_tool_names() -> Vec<&'static str> {
         vec![
             "plug__list_servers",
             "plug__list_tools",
             "plug__search_tools",
-            "plug__load_tool",
-            "plug__evict_tool",
-            "plug__list_loaded_tools",
             "plug__invoke_tool",
         ]
+    }
+
+    fn router_with_git_commit_tool() -> ToolRouter {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let mut routes = HashMap::new();
+        routes.insert(
+            "git__commit".to_string(),
+            ("git".to_string(), "commit".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(vec![Tool::new(
+                Cow::Borrowed("git__commit"),
+                Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+        router
     }
 
     #[test]
@@ -4481,22 +4687,22 @@ mod tests {
         // Search by name
         let mut args = serde_json::Map::new();
         args.insert("query".to_string(), serde_json::json!("git"));
-        let result = router.handle_search_tools(Some(args)).unwrap();
+        let result = router.handle_search_tools(Some(args), None).unwrap();
         let text = format!("{result:?}");
         assert!(text.contains("git__commit"));
         assert!(text.contains("git__push"));
 
-        // Search by description
+        // Search by natural multi-token description
         let mut args = serde_json::Map::new();
-        args.insert("query".to_string(), serde_json::json!("slack"));
-        let result = router.handle_search_tools(Some(args)).unwrap();
+        args.insert("query".to_string(), serde_json::json!("send slack message"));
+        let result = router.handle_search_tools(Some(args), None).unwrap();
         let text = format!("{result:?}");
         assert!(text.contains("slack__send"));
 
         // No matches
         let mut args = serde_json::Map::new();
         args.insert("query".to_string(), serde_json::json!("nonexistent"));
-        let result = router.handle_search_tools(Some(args)).unwrap();
+        let result = router.handle_search_tools(Some(args), None).unwrap();
         let text = format!("{result:?}");
         assert!(text.contains("matches"));
         assert!(text.contains("[]"));
@@ -4540,7 +4746,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(names, expected_meta_tool_names());
+        assert_eq!(names, expected_legacy_meta_tool_names());
 
         let full_tools = router.list_all_tools();
         assert_eq!(full_tools.len(), 1);
@@ -4577,11 +4783,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, expected_meta_tool_names());
 
-        assert_eq!(router.list_tools_for_client(ClientType::ClaudeCode).len(), 1);
+        assert_eq!(
+            router.list_tools_for_client(ClientType::ClaudeCode).len(),
+            1
+        );
     }
 
     #[test]
-    fn bridge_load_tool_adds_real_tool_to_session_visible_set() {
+    fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
         let sm = Arc::new(ServerManager::new());
         let router = ToolRouter::new(sm, test_router_config());
 
@@ -4617,30 +4826,90 @@ mod tests {
         );
 
         let mut args = serde_json::Map::new();
-        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
-        let downstream = DownstreamCallContext::stdio("client-a", RequestId::Number(1));
+        args.insert("query".to_string(), serde_json::json!("commit"));
+        let downstream = DownstreamCallContext::stdio_for_client(
+            "client-a",
+            RequestId::Number(1),
+            ClientType::OpenCode,
+        );
         router
-            .handle_load_tool(Some(args), Some(&downstream))
-            .expect("load tool");
+            .handle_search_tools(Some(args), Some(&downstream))
+            .expect("search and load tool");
 
-        let visible = router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+        let visible =
+            router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
         let names = visible
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
         assert!(names.contains(&"git__commit".to_string()));
-
-        let mut args = serde_json::Map::new();
-        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
-        router
-            .handle_evict_tool(Some(args), Some(&downstream))
-            .expect("evict tool");
-        let visible = router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
-        assert_eq!(visible.len(), expected_meta_tool_names().len());
     }
 
     #[test]
-    fn bridge_load_and_evict_publish_tool_list_changed() {
+    fn bridge_search_keeps_session_working_set_bounded() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let mut routes = HashMap::new();
+        let tools = (0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5))
+            .map(|index| {
+                let name = format!("tool_{index:03}");
+                routes.insert(name.clone(), ("test".to_string(), name.clone()));
+                Tool::new(
+                    Cow::Owned(name),
+                    Cow::Owned(format!("Tool number {index}")),
+                    Arc::new(serde_json::Map::new()),
+                )
+            })
+            .collect::<Vec<_>>();
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(tools),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let downstream = DownstreamCallContext::stdio_for_client(
+            "client-a",
+            RequestId::Number(1),
+            ClientType::OpenCode,
+        );
+        for index in 0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5) {
+            let mut args = serde_json::Map::new();
+            args.insert(
+                "query".to_string(),
+                serde_json::json!(format!("tool_{index:03}")),
+            );
+            args.insert("limit".to_string(), serde_json::json!(1));
+            router
+                .handle_search_tools(Some(args), Some(&downstream))
+                .expect("search and load tool");
+        }
+
+        let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+        let visible =
+            router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+        let names = visible
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.len(),
+            BRIDGE_WORKING_SET_MAX_TOOLS + expected_meta_tool_names().len()
+        );
+        assert!(!names.contains(&"tool_000".to_string()));
+        assert!(names.contains(&format!("tool_{:03}", BRIDGE_WORKING_SET_MAX_TOOLS + 4)));
+    }
+
+    #[test]
+    fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
         let sm = Arc::new(ServerManager::new());
         let router = ToolRouter::new(sm, test_router_config());
 
@@ -4668,25 +4937,33 @@ mod tests {
         }));
 
         let mut notifications = router.subscribe_notifications();
-        let downstream = DownstreamCallContext::stdio("client-a", RequestId::Number(1));
+        let downstream = DownstreamCallContext::stdio_for_client(
+            "client-a",
+            RequestId::Number(1),
+            ClientType::OpenCode,
+        );
         let mut args = serde_json::Map::new();
-        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
+        args.insert("query".to_string(), serde_json::json!("commit"));
         router
-            .handle_load_tool(Some(args), Some(&downstream))
-            .expect("load tool");
+            .handle_search_tools(Some(args), Some(&downstream))
+            .expect("search and load tool");
         assert_eq!(
-            notifications.try_recv().expect("load notification"),
-            ProtocolNotification::ToolListChanged
+            notifications.try_recv().expect("search notification"),
+            ProtocolNotification::ToolListChangedFor {
+                target: NotificationTarget::Stdio {
+                    client_id: Arc::from("client-a"),
+                },
+            }
         );
 
         let mut args = serde_json::Map::new();
-        args.insert("tool_name".to_string(), serde_json::json!("GIT__COMMIT"));
+        args.insert("query".to_string(), serde_json::json!("commit"));
         router
-            .handle_evict_tool(Some(args), Some(&downstream))
-            .expect("evict tool");
-        assert_eq!(
-            notifications.try_recv().expect("evict notification"),
-            ProtocolNotification::ToolListChanged
+            .handle_search_tools(Some(args), Some(&downstream))
+            .expect("repeat search");
+        assert!(
+            notifications.try_recv().is_err(),
+            "repeat search should not notify when it loads no new tools"
         );
     }
 
@@ -4726,14 +5003,137 @@ mod tests {
                 "git__commit",
                 None,
                 None,
-                Some(DownstreamCallContext::stdio(
+                Some(DownstreamCallContext::stdio_for_client(
                     "client-a",
                     RequestId::Number(1),
+                    ClientType::OpenCode,
                 )),
             )
             .await
             .expect_err("unloaded direct call should be rejected");
-        assert!(err.to_string().contains("plug__load_tool"));
+        assert!(err.to_string().contains("plug__search_tools"));
+    }
+
+    #[tokio::test]
+    async fn bridge_session_rejects_unloaded_direct_tool_call_before_tools_list() {
+        let router = router_with_git_commit_tool();
+
+        let err = router
+            .call_tool_with_context(
+                "git__commit",
+                None,
+                None,
+                Some(DownstreamCallContext::stdio_for_client(
+                    "client-a",
+                    RequestId::Number(1),
+                    ClientType::OpenCode,
+                )),
+            )
+            .await
+            .expect_err("unloaded direct call should be rejected before tools/list");
+
+        assert!(err.to_string().contains("plug__search_tools"));
+    }
+
+    #[tokio::test]
+    async fn bridge_session_rejects_unloaded_task_tool_call() {
+        let router = Arc::new(router_with_git_commit_tool());
+
+        let err = router
+            .enqueue_tool_task(
+                "git__commit",
+                None,
+                None,
+                TaskOwner::new(Arc::<str>::from("stdio:client-a")),
+                Some(DownstreamCallContext::stdio_for_client(
+                    "client-a",
+                    RequestId::Number(1),
+                    ClientType::OpenCode,
+                )),
+            )
+            .await
+            .expect_err("unloaded task call should be rejected");
+
+        assert!(err.to_string().contains("plug__search_tools"));
+    }
+
+    #[tokio::test]
+    async fn bridge_session_rejects_task_wrapped_search_meta_tool() {
+        let router = Arc::new(router_with_git_commit_tool());
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), serde_json::json!("commit"));
+
+        let err = router
+            .enqueue_tool_task(
+                "plug__search_tools",
+                Some(args),
+                None,
+                TaskOwner::new(Arc::<str>::from("stdio:client-a")),
+                Some(DownstreamCallContext::stdio_for_client(
+                    "client-a",
+                    RequestId::Number(1),
+                    ClientType::OpenCode,
+                )),
+            )
+            .await
+            .expect_err("task-wrapped meta-tools should be explicitly unsupported");
+
+        assert!(err.to_string().contains("task-wrapped"));
+    }
+
+    #[tokio::test]
+    async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
+        let router = router_with_git_commit_tool();
+        let mut args = serde_json::Map::new();
+        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
+
+        let err = router
+            .call_tool_with_context(
+                "plug__invoke_tool",
+                Some(args),
+                None,
+                Some(DownstreamCallContext::stdio_for_client(
+                    "client-a",
+                    RequestId::Number(1),
+                    ClientType::OpenCode,
+                )),
+            )
+            .await
+            .expect_err("invoke wrapper should not exist in the bridge surface");
+
+        assert!(err.to_string().contains("plug__invoke_tool"));
+    }
+
+    #[tokio::test]
+    async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
+        let sm = Arc::new(ServerManager::new());
+        let mut config = test_router_config();
+        config.disabled_tools = vec!["plug__search_tools".to_string()];
+        let router = ToolRouter::new(sm, config);
+
+        assert!(
+            router
+                .list_tools_for_client(ClientType::OpenCode)
+                .iter()
+                .all(|tool| tool.name.as_ref() != "plug__search_tools")
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), serde_json::json!("commit"));
+        let err = router
+            .call_tool_with_context(
+                "plug__search_tools",
+                Some(args),
+                None,
+                Some(DownstreamCallContext::stdio_for_client(
+                    "client-a",
+                    RequestId::Number(1),
+                    ClientType::OpenCode,
+                )),
+            )
+            .await
+            .expect_err("disabled search meta-tool should reject");
+        assert!(err.to_string().contains("plug__search_tools"));
     }
 
     #[test]
@@ -4771,6 +5171,16 @@ mod tests {
         assert!(tasks.supports_list());
         assert!(tasks.supports_cancel());
         assert!(tasks.supports_tools_call());
+    }
+
+    #[test]
+    fn synthesized_capabilities_suppress_tasks_for_bridge_clients() {
+        let router = router_with_git_commit_tool();
+
+        let caps = router.synthesized_capabilities_for_client(ClientType::OpenCode);
+
+        assert!(caps.tools.is_some());
+        assert!(caps.tasks.is_none());
     }
 
     #[test]

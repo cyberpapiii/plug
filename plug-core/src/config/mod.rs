@@ -139,7 +139,7 @@ pub fn lazy_tool_policy_reason(mode: LazyToolMode, origin: LazyToolModeOrigin) -
                 "default full-tool behavior for clients without a proven lazy discovery path"
             }
             LazyToolMode::Native => "client has its own native lazy/deferred tool discovery",
-            LazyToolMode::Bridge => "client benefits from plug-owned search/load bridge discovery",
+            LazyToolMode::Bridge => "client benefits from plug-owned search bridge discovery",
         },
     }
 }
@@ -528,10 +528,14 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     }
 
     for target in config.lazy_tools.clients.keys() {
-        if target.parse::<crate::export::ExportTarget>().is_err() {
-            errors.push(format!(
+        match canonical_lazy_tool_client_target(target) {
+            Some(canonical) if canonical == target => {}
+            Some(canonical) => errors.push(format!(
+                "lazy_tools.clients target '{target}' is an alias; use canonical target '{canonical}'"
+            )),
+            None => errors.push(format!(
                 "lazy_tools.clients contains unknown client target '{target}'"
-            ));
+            )),
         }
     }
 
@@ -621,6 +625,29 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     }
 
     errors
+}
+
+fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
+    match target.parse::<crate::export::ExportTarget>().ok()? {
+        crate::export::ExportTarget::ClaudeDesktop => Some("claude-desktop"),
+        crate::export::ExportTarget::ClaudeCode => Some("claude-code"),
+        crate::export::ExportTarget::Cursor => Some("cursor"),
+        crate::export::ExportTarget::Windsurf => Some("windsurf"),
+        crate::export::ExportTarget::VSCodeCopilot => Some("vscode"),
+        crate::export::ExportTarget::GeminiCli => Some("gemini-cli"),
+        crate::export::ExportTarget::CodexCli => Some("codex-cli"),
+        crate::export::ExportTarget::OpenCode => Some("opencode"),
+        crate::export::ExportTarget::Zed => Some("zed"),
+        crate::export::ExportTarget::Cline => Some("cline"),
+        crate::export::ExportTarget::ClineCli => Some("cline-cli"),
+        crate::export::ExportTarget::RooCode => Some("roocode"),
+        crate::export::ExportTarget::Factory => Some("factory"),
+        crate::export::ExportTarget::Nanobot => Some("nanobot"),
+        crate::export::ExportTarget::Junie => Some("junie"),
+        crate::export::ExportTarget::Kilo => Some("kilo"),
+        crate::export::ExportTarget::Antigravity => Some("antigravity"),
+        crate::export::ExportTarget::Goose => Some("goose"),
+    }
 }
 
 fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String> {
@@ -1138,6 +1165,26 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("lazy_tools.clients contains unknown client target"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_lazy_tool_client_aliases() {
+        let dir = unique_temp_dir("lazy-policy-alias");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [lazy_tools.clients]
+            codex = "native"
+            "#,
+        )
+        .unwrap();
+
+        let err = load_config(Some(&config_path)).expect_err("alias target should fail");
+        assert!(
+            err.to_string().contains("use canonical target 'codex-cli'"),
             "unexpected error: {err}"
         );
     }

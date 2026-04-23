@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-04-23-lazy-tool-discovery-v2-requirements.md
 
 ## Overview
 
-Redesign `plug`'s current meta-tool mode into a real lazy tool discovery system with one shared internal working-set engine and adaptive client-facing surfaces. The target shape is not "improve the text search wrapper." The target shape is "search, load, evict, then direct-call real routed tools," while preserving a clear operator UX and leaving standard full-tool mode available.
+Redesign `plug`'s current meta-tool mode into a real lazy tool discovery system with one shared internal working-set engine and adaptive client-facing surfaces. The target shape is not "improve the text search wrapper." The target shape for bridge clients is "search, bounded auto-load, then direct-call real routed tools," while preserving a clear operator UX and leaving standard full-tool mode available.
 
 ---
 
@@ -27,18 +27,18 @@ The plan therefore treats the current meta-tool mode as prior art and keeps only
 - R1. One internal lazy-discovery engine shared across supported clients
 - R2. Smart per-client defaults with operator overrides
 - R3. Adaptive client-facing discovery surfaces by client target
-- R4. Bridge clients get real search, load, and eviction actions
+- R4. Bridge clients get a real search action that loads a bounded set of matching real tools
 - R5. Loaded tools appear exactly like normal routed tools
 - R6. Loaded tools are called directly, not through a permanent wrapper
-- R7. Search/load results are machine-readable and expose full definitions at load time
+- R7. Search results are machine-readable and expose full definitions for loaded matches
 - R8. Working set is session-scoped and sticky across turns
-- R9. Working set supports eviction
+- R9. Working set supports automatic bounded eviction
 - R10. Mode is visible/editable in setup and `plug clients`
 - R11. Automatic mode choices are legible enough to inspect during setup
 - R12. Preserve normal permission and approval semantics as far as clients allow
 - R13. Bridge clients get a compact always-visible discovery hint/surface
 - R14. V2 supersedes the current meta-tool contract
-- R15. `plug__invoke_tool` remains fallback/debug only
+- R15. `plug__invoke_tool` is not part of bridge mode; it remains only in deprecated legacy `meta_tool_mode = true` compatibility
 - R16. Standard full-tool mode remains available
 
 **Origin actors:** A1 (Plug operator), A2 (AI client), A3 (Plug runtime)
@@ -49,19 +49,19 @@ The plan therefore treats the current meta-tool mode as prior art and keeps only
 
 ## Current Branch Progress
 
-As of the first implementation slice on `codex/lazy-tool-discovery-v2`:
+As of the review-hardening slice on `codex/lazy-tool-discovery-v2`:
 
-- U1 is implemented: config now has `lazy_tools`, smart per-client defaults, per-client overrides, validation, reload diffing, and `plug clients`/link-flow visibility.
-- U2-U4 are implemented as a functional vertical slice: bridge clients get session-scoped loaded-tool sets, `plug__search_tools`/`plug__load_tool`/`plug__evict_tool`/`plug__list_loaded_tools`, loaded tools reappear under their real routed names, direct hidden calls are rejected until load, and load/evict emits `tools/list_changed`.
-- U5 is partially implemented: `docs/CLIENT-COMPAT.md`, `docs/ARCHITECTURE.md`, and `README.md` now describe the lazy-tool policy matrix and bridge flow. Broader transport/live-client regression coverage still needs to be completed before treating v2 as fully shipped.
+- U1 exists off-main: config now has `lazy_tools`, smart per-client defaults, per-client overrides, validation, reload diffing, and `plug clients`/link-flow visibility.
+- U2-U4 exist off-main as a functional vertical slice: bridge clients see only `plug__search_tools`, search ranks and loads a bounded set of real routed tool definitions, loaded tools reappear under their real routed names, direct hidden calls are rejected until search loads them, and search emits targeted `tools/list_changed` when the visible set changes.
+- U5 exists off-main: `docs/CLIENT-COMPAT.md`, `docs/ARCHITECTURE.md`, and `README.md` describe the lazy-tool policy matrix and one-tool bridge flow. Broader live-client regression coverage still needs to be completed before treating v2 as fully shipped.
 
 Live smoke evidence from this branch:
 
 - Installed branch binary with `./scripts/dev-reinstall.sh --quick`.
 - Restarted the local daemon and verified `plug status` reached `running`.
 - Simulated an OpenCode MCP stdio client with `clientInfo.name = "opencode"`.
-- Verified the initial OpenCode bridge `tools/list` contained only 7 `plug__*` tools.
-- Verified `plug__search_tools` returned machine-readable matches, `plug__load_tool` made a real routed tool visible, an unloaded direct real-tool call was rejected with a `plug__load_tool` hint, and `plug__evict_tool` removed the loaded tool again.
+- Verified the initial OpenCode bridge `tools/list` contained only `plug__search_tools`.
+- Verified `plug__search_tools` returned machine-readable ranked matches, made real routed tools visible under a bounded working set, and an unloaded direct real-tool call was rejected with a `plug__search_tools` hint.
 
 ---
 
@@ -99,7 +99,7 @@ Live smoke evidence from this branch:
 ### External References
 
 - OpenAI tool search documentation describes the target lazy-loading interaction shape: search returns a loaded subset that becomes callable on subsequent turns, with explicit load/unload semantics.
-- OpenCode PR `#12520` is a strong comparison point for bridge-client behavior: compact always-visible guidance, search/load semantics, and avoidance of permanent wrapper-only interaction.
+- OpenCode PR `#12520` is a strong comparison point for bridge-client behavior: compact always-visible guidance, search-driven discovery, and avoidance of permanent wrapper-only interaction.
 
 ---
 
@@ -107,9 +107,9 @@ Live smoke evidence from this branch:
 
 - Replace the single `meta_tool_mode: bool` mindset with a richer client-targeted lazy-discovery policy model. The old boolean can remain as migration input, but it should not be the controlling abstraction.
 - Keep one canonical routed tool catalog globally, and add a session-scoped loaded-tool overlay rather than creating a second routing system.
-- Treat client-facing lazy UX as an adapter layer over the same internal engine. The internal engine owns search, load, evict, and loaded-tool visibility; client adapters decide which bootstrap surface each client sees.
+- Treat client-facing lazy UX as an adapter layer over the same internal engine. The internal engine owns search, bounded loading, automatic eviction, and loaded-tool visibility; client adapters decide which bootstrap surface each client sees.
 - Restore loaded tools to their normal routed identity once loaded. If a client can only see a bridge surface, the bridge should be the bootstrap path, not the permanent call path.
-- Retain `plug__invoke_tool` only as explicit fallback/debug infrastructure.
+- Retain `plug__invoke_tool` only for deprecated legacy `meta_tool_mode = true` compatibility, not bridge mode.
 
 ---
 
@@ -159,7 +159,7 @@ flowchart TD
     F --> K["Eviction and reset path"]
 ```
 
-The implementation should keep the canonical routed tool snapshot intact, add per-session loaded-tool state, and teach `tools/list` to produce a client-specific active set derived from policy plus session state. Search/load/evict mutate only the session overlay; direct tool calls continue to use the normal routed path once a tool has been loaded into the active set.
+The implementation should keep the canonical routed tool snapshot intact, add per-session loaded-tool state, and teach `tools/list` to produce a client-specific active set derived from policy plus session state. Bridge search mutates only the session overlay through bounded auto-load and automatic eviction; direct tool calls continue to use the normal routed path once a tool has been loaded into the active set.
 
 ---
 
@@ -227,7 +227,7 @@ The implementation should keep the canonical routed tool snapshot intact, add pe
 
 **Approach:**
 - Extend session state to track a loaded-tool overlay independently from the canonical routed catalog.
-- Keep load and eviction decisions session-scoped so multiple concurrent sessions of the same client target can evolve independently without corrupting the global catalog.
+- Keep working-set decisions session-scoped so multiple concurrent sessions of the same client target can evolve independently without corrupting the global catalog.
 - Preserve existing routed call behavior by treating the working set as a visibility layer, not a second routing engine.
 - Thread session identity through the daemon/runtime list and call paths wherever downstream clients currently receive tool surfaces based only on client type.
 
@@ -248,9 +248,9 @@ The implementation should keep the canonical routed tool snapshot intact, add pe
 
 ---
 
-- [ ] U3. **Replace text-only bridge discovery with real search, load, and evict actions**
+- [ ] U3. **Replace text-only bridge discovery with real ranked search and bounded auto-load**
 
-**Goal:** Turn bridge-client lazy discovery into a machine-readable bootstrap surface rather than a text search wrapper.
+**Goal:** Turn bridge-client lazy discovery into a machine-readable bootstrap surface rather than a text search wrapper or management-tool cluster.
 
 **Requirements:** R3, R4, R7, R13, R15
 
@@ -265,9 +265,9 @@ The implementation should keep the canonical routed tool snapshot intact, add pe
 - Test: `plug-core/src/http/server.rs`
 
 **Approach:**
-- Replace the current bridge behavior that returns free-form text with explicit machine-readable actions for search/load/evict plus compact always-visible guidance for bridge clients.
+- Replace the current bridge behavior that returns free-form text with one machine-readable `plug__search_tools` action that ranks and bounded-loads matching tools plus compact always-visible guidance for bridge clients.
 - Keep bridge bootstrap tools small and purposeful; they should help the model get to a direct-call state quickly rather than becoming a long-lived management API.
-- Preserve `plug__invoke_tool` as fallback/debug only, not the intended everyday path.
+- Preserve `plug__invoke_tool` only in the deprecated legacy `meta_tool_mode = true` path, not the intended everyday bridge path.
 
 **Patterns to follow:**
 - Existing meta-tool interception in `plug-core/src/proxy/mod.rs`
@@ -280,7 +280,7 @@ The implementation should keep the canonical routed tool snapshot intact, add pe
 - Integration: bridge bootstrap surface is transport-complete across stdio/IPC and HTTP.
 
 **Verification:**
-- A bridge client can search, load, and evict tools without depending on text parsing or permanent wrapper invocation.
+- A bridge client can search for tools, receive loaded real tool definitions, and call those tools directly without depending on text parsing or permanent wrapper invocation.
 
 ---
 
@@ -360,10 +360,10 @@ The implementation should keep the canonical routed tool snapshot intact, add pe
 ## System-Wide Impact
 
 - **Interaction graph:** Client detection, config/reload, session state, router listing, HTTP session handling, stdio/IPC handling, and operator client-management surfaces all change together.
-- **Error propagation:** Search/load/evict failures must be structured enough for bridge clients while preserving the existing routed tool failure path for loaded tools.
+- **Error propagation:** Search and bounded auto-load failures must be structured enough for bridge clients while preserving the existing routed tool failure path for loaded tools.
 - **State lifecycle risks:** Per-session loaded-tool overlays introduce drift, reconnect, and eviction-order risks that do not exist in the current global-only tool snapshot model.
 - **API surface parity:** `tools/list` behavior changes across stdio, IPC-backed sessions, and HTTP sessions; parity is load-bearing for credibility of the new design.
-- **Integration coverage:** Unit tests are not enough; the plan needs end-to-end transport checks that prove search/load changes the visible tool set and preserves direct-call behavior afterward.
+- **Integration coverage:** Unit tests are not enough; the plan needs end-to-end transport checks that prove search changes the visible tool set and preserves direct-call behavior afterward.
 - **Unchanged invariants:** Canonical routed tool naming, standard full-tool mode, and the underlying routed call path remain the source of truth. V2 changes how tools become visible in a session, not what a routed tool fundamentally is.
 
 ---

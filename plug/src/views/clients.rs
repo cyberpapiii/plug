@@ -3,8 +3,7 @@ use dialoguer::console::style;
 
 use crate::OutputFormat;
 use crate::commands::clients::{
-    all_client_targets, client_display_name, client_views, cmd_link, cmd_unlink,
-    live_session_views,
+    all_client_targets, client_display_name, client_views, cmd_link, cmd_unlink, live_session_views,
 };
 use crate::runtime::{
     LiveClientSupport, daemon_running, fetch_live_sessions, live_inventory_metadata,
@@ -100,6 +99,7 @@ fn client_list_json(
     live_client_support: LiveClientSupport,
     live_inventory_scope: plug_core::ipc::LiveSessionInventoryScope,
     daemon_error: Option<&str>,
+    config_error: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "clients": clients,
@@ -112,6 +112,10 @@ fn client_list_json(
         "inventory_unavailable_sources": inventory.availability.unavailable_sources,
         "http_sessions_included": inventory.http_sessions_included,
         "daemon_error": daemon_error,
+        "config_error": config_error,
+        "lazy_tool_policy_scope": "configured",
+        "lazy_tool_live_policy_note": "clients[].lazy_tool_* fields reflect config/default resolution; live sessions keep their daemon-start policy until restart after lazy_tools edits",
+        "restart_required_for_lazy_tool_config_changes": inventory.session_count > 0,
     })
 }
 
@@ -175,16 +179,16 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
             );
         }
         2 => {
-            config
-                .lazy_tools
-                .clients
-                .insert(target.to_string(), plug_core::types::LazyToolSetting::Native);
+            config.lazy_tools.clients.insert(
+                target.to_string(),
+                plug_core::types::LazyToolSetting::Native,
+            );
         }
         3 => {
-            config
-                .lazy_tools
-                .clients
-                .insert(target.to_string(), plug_core::types::LazyToolSetting::Bridge);
+            config.lazy_tools.clients.insert(
+                target.to_string(),
+                plug_core::types::LazyToolSetting::Bridge,
+            );
         }
         _ => unreachable!(),
     }
@@ -197,6 +201,9 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
         policy.mode.label(),
         policy.origin.label()
     ));
+    print_warning_line(
+        "Restart the plug daemon before relying on this lazy tool mode in live client sessions.",
+    );
     Ok(())
 }
 
@@ -246,7 +253,9 @@ pub(crate) async fn cmd_client_list(
         let (live, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live, live_inventory_scope);
-        let config = plug_core::config::load_config(config_path).ok();
+        let config_result = plug_core::config::load_config(config_path);
+        let config_error = config_result.as_ref().err().map(|error| error.to_string());
+        let config = config_result.ok();
         let clients = client_views(&live, config.as_ref());
         let live_sessions = live_session_views(&live);
 
@@ -260,6 +269,7 @@ pub(crate) async fn cmd_client_list(
                     live_client_support,
                     live_inventory_scope,
                     daemon_error.as_deref(),
+                    config_error.as_deref(),
                 ))?
             );
             return Ok(());
@@ -280,6 +290,12 @@ pub(crate) async fn cmd_client_list(
         } else if let Some(error) = &daemon_error {
             print_warning_line(format!(
                 "Live client inspection unavailable: {error}. Showing linked and detected clients from config only."
+            ));
+            println!();
+        }
+        if let Some(error) = &config_error {
+            print_warning_line(format!(
+                "Config validation failed: {error}. Lazy tool modes below fall back to defaults until config is fixed."
             ));
             println!();
         }
@@ -311,6 +327,11 @@ pub(crate) async fn cmd_client_list(
                     inventory.session_transports.sse
                 ),
             );
+            if inventory.session_count > 0 {
+                print_info_line(
+                    "Lazy tool modes below are configured values; live sessions keep their daemon-start policy until restart after lazy_tools edits.",
+                );
+            }
         }
         println!();
         print_heading("Live Sessions");
@@ -415,7 +436,7 @@ mod tests {
             live_transports: vec!["http".to_string()],
             lazy_tool_mode: "bridge".to_string(),
             lazy_tool_mode_origin: "auto_default".to_string(),
-            lazy_tool_mode_reason: "client benefits from plug-owned search/load bridge discovery"
+            lazy_tool_mode_reason: "client benefits from plug-owned search bridge discovery"
                 .to_string(),
         }];
         let live_sessions = vec![LiveSessionView {
@@ -449,6 +470,7 @@ mod tests {
             crate::runtime::LiveClientSupport::Supported,
             plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
             Some("daemon unavailable"),
+            Some("invalid lazy config"),
         );
 
         assert_eq!(json["live_session_count"], 1);
@@ -458,6 +480,9 @@ mod tests {
         assert_eq!(json["inventory_unavailable_sources"][0], "daemon_proxy");
         assert_eq!(json["http_sessions_included"], true);
         assert_eq!(json["daemon_error"], "daemon unavailable");
+        assert_eq!(json["config_error"], "invalid lazy config");
+        assert_eq!(json["lazy_tool_policy_scope"], "configured");
+        assert_eq!(json["restart_required_for_lazy_tool_config_changes"], true);
     }
 
     #[test]

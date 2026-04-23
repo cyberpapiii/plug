@@ -15,9 +15,9 @@ use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
-    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult, ElicitationCapability,
-    FormElicitationCapability, InitializedNotification, LoggingMessageNotificationParam,
-    ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
+    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
+    ElicitationCapability, FormElicitationCapability, InitializedNotification,
+    LoggingMessageNotificationParam, ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
     SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
 };
@@ -58,9 +58,7 @@ impl InitializedNotificationCompatHttpClient {
     }
 }
 
-fn is_initialized_notification_message(
-    message: &rmcp::model::ClientJsonRpcMessage,
-) -> bool {
+fn is_initialized_notification_message(message: &rmcp::model::ClientJsonRpcMessage) -> bool {
     matches!(
         message,
         rmcp::model::ClientJsonRpcMessage::Notification(notification)
@@ -68,18 +66,14 @@ fn is_initialized_notification_message(
     )
 }
 
-fn is_initialized_notification_auth_failure(
-    error: &StreamableHttpError<reqwest::Error>,
-) -> bool {
+fn is_initialized_notification_auth_failure(error: &StreamableHttpError<reqwest::Error>) -> bool {
     let message = error.to_string().to_lowercase();
     crate::oauth::is_auth_error(&message)
         || message.contains("403")
         || message.contains("forbidden")
 }
 
-fn is_initialized_notification_compat_failure(
-    error: &StreamableHttpError<reqwest::Error>,
-) -> bool {
+fn is_initialized_notification_compat_failure(error: &StreamableHttpError<reqwest::Error>) -> bool {
     matches!(
         error,
         StreamableHttpError::UnexpectedServerResponse(message)
@@ -482,7 +476,11 @@ impl ServerManager {
             .unwrap_or_default()
     }
 
-    fn insert_upstream(&self, name: String, upstream: Arc<UpstreamServer>) -> Option<Arc<UpstreamServer>> {
+    fn insert_upstream(
+        &self,
+        name: String,
+        upstream: Arc<UpstreamServer>,
+    ) -> Option<Arc<UpstreamServer>> {
         let _guard = self
             .server_map_write_lock
             .lock()
@@ -837,9 +835,8 @@ impl ServerManager {
             }
         }
 
-        let mut transport_config =
-            LegacySseTransportConfig::with_uri(url)
-                .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs));
+        let mut transport_config = LegacySseTransportConfig::with_uri(url)
+            .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs));
 
         // Resolve auth token: OAuth token from cache, or static bearer token
         let auth_token_value = if config.auth.as_deref() == Some("oauth") {
@@ -1129,8 +1126,9 @@ impl ServerManager {
 
         tracing::info!(count = map.len(), "shutting down upstream servers");
         join_all(
-            map.into_iter()
-                .map(|(name, upstream_arc)| retire_upstream_owned(name, upstream_arc, "shutdown_all")),
+            map.into_iter().map(|(name, upstream_arc)| {
+                retire_upstream_owned(name, upstream_arc, "shutdown_all")
+            }),
         )
         .await;
 
@@ -1175,8 +1173,7 @@ impl ServerManager {
                 .get(entry.key())
                 .map(|value| *value)
                 .unwrap_or(ConfiguredAuth::None);
-            let auth_status =
-                Self::auth_status_from_configured_auth(configured_auth, entry.health);
+            let auth_status = Self::auth_status_from_configured_auth(configured_auth, entry.health);
             statuses.push(ServerStatus {
                 server_id: entry.key().clone(),
                 health: entry.health,
@@ -1390,15 +1387,14 @@ mod tests {
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
-        AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
-        ClientRequest, Content, CreateTaskResult, GetPromptResult, GetTaskInfoParams,
-        GetTaskPayloadResult, GetTaskResult, Implementation, InitializeResult, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, ListToolsResult, Meta,
-        NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
-        PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
-        ServerResult, Task, TaskStatus, TasksCapability, Tool, CancelTaskParams,
-        CancelTaskResult,
+        AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams,
+        CancelTaskResult, ClientJsonRpcMessage, ClientRequest, Content, CreateTaskResult,
+        GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult, Implementation,
+        InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        ListTasksResult, ListToolsResult, Meta, NumberOrString, ProgressNotificationParam,
+        ProgressToken, Prompt, PromptMessage, PromptMessageContent, PromptMessageRole, RawResource,
+        RawResourceTemplate, ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+        ServerJsonRpcMessage, ServerResult, Task, TaskStatus, TasksCapability, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -1819,9 +1815,9 @@ mod tests {
                 tasks: Mutex::new(HashMap::new()),
                 task_result_requests: result_request_count_for_server,
             }
-                .serve(server_transport)
-                .await
-                .expect("start task-native upstream test server");
+            .serve(server_transport)
+            .await
+            .expect("start task-native upstream test server");
             let _ = server.waiting().await;
         });
 
@@ -2067,7 +2063,11 @@ mod tests {
             .serve(client_transport_a)
             .await
             .expect("connect upstream test client a");
-        let initial_tools_a = client_a.peer().list_all_tools().await.expect("initial tools a");
+        let initial_tools_a = client_a
+            .peer()
+            .list_all_tools()
+            .await
+            .expect("initial tools a");
         tools_a.store(Arc::new(initial_tools_a));
 
         mgr.replace_server(
@@ -2084,7 +2084,10 @@ mod tests {
         .await;
 
         let old_upstream = mgr.get_upstream("replace-test").expect("old upstream");
-        assert!(!old_upstream.client.is_closed(), "old upstream should start open");
+        assert!(
+            !old_upstream.client.is_closed(),
+            "old upstream should start open"
+        );
 
         let (upstream_server_b, tools_rx_b) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer_b = Arc::clone(&upstream_server_b.peer);
@@ -2111,7 +2114,11 @@ mod tests {
             .serve(client_transport_b)
             .await
             .expect("connect upstream test client b");
-        let initial_tools_b = client_b.peer().list_all_tools().await.expect("initial tools b");
+        let initial_tools_b = client_b
+            .peer()
+            .list_all_tools()
+            .await
+            .expect("initial tools b");
         tools_b.store(Arc::new(initial_tools_b));
 
         mgr.replace_server(
@@ -2259,18 +2266,18 @@ mod tests {
         tools.store(Arc::new(initial_tools));
 
         server_manager
-        .replace_server(
-            "upstream",
-            UpstreamServer {
-                name: "upstream".to_string(),
-                config: test_server_config(),
-                client,
-                tools,
-                capabilities: ServerCapabilities::default(),
-                health: ServerHealth::Healthy,
-            },
-        )
-        .await;
+            .replace_server(
+                "upstream",
+                UpstreamServer {
+                    name: "upstream".to_string(),
+                    config: test_server_config(),
+                    client,
+                    tools,
+                    capabilities: ServerCapabilities::default(),
+                    health: ServerHealth::Healthy,
+                },
+            )
+            .await;
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
@@ -2359,18 +2366,18 @@ mod tests {
         tools.store(Arc::new(initial_tools));
 
         server_manager
-        .replace_server(
-            "upstream",
-            UpstreamServer {
-                name: "upstream".to_string(),
-                config: test_server_config(),
-                client,
-                tools,
-                capabilities: ServerCapabilities::default(),
-                health: ServerHealth::Healthy,
-            },
-        )
-        .await;
+            .replace_server(
+                "upstream",
+                UpstreamServer {
+                    name: "upstream".to_string(),
+                    config: test_server_config(),
+                    client,
+                    tools,
+                    capabilities: ServerCapabilities::default(),
+                    health: ServerHealth::Healthy,
+                },
+            )
+            .await;
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
@@ -2451,6 +2458,7 @@ mod tests {
                 ),
                 None,
                 owner.clone(),
+                None,
             ),
         )
         .await
@@ -2486,7 +2494,12 @@ mod tests {
         .await
         .expect("fetch cached passthrough task result timed out")
         .expect("fetch cached passthrough task result");
-        assert!(cached_payload.0.to_string().contains("task-native pass-through"));
+        assert!(
+            cached_payload
+                .0
+                .to_string()
+                .contains("task-native pass-through")
+        );
         assert_eq!(
             task_result_request_count.load(Ordering::SeqCst),
             1,
@@ -2505,6 +2518,7 @@ mod tests {
                 ),
                 None,
                 owner.clone(),
+                None,
             ),
         )
         .await
@@ -2532,10 +2546,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_tool_mode_exposes_only_meta_tools_and_invokes_hidden_tool() {
+    async fn bridge_lazy_mode_exposes_search_and_loaded_direct_tool_calls() {
         let server_manager = Arc::new(ServerManager::new());
         let mut config = test_router_config();
-        config.meta_tool_mode = true;
+        config.lazy_tools.mode = crate::types::LazyToolSetting::Bridge;
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
             config,
@@ -2573,18 +2587,18 @@ mod tests {
         tools.store(Arc::new(initial_tools));
 
         server_manager
-        .replace_server(
-            "upstream",
-            UpstreamServer {
-                name: "upstream".to_string(),
-                config: test_server_config(),
-                client,
-                tools,
-                capabilities: ServerCapabilities::default(),
-                health: ServerHealth::Healthy,
-            },
-        )
-        .await;
+            .replace_server(
+                "upstream",
+                UpstreamServer {
+                    name: "upstream".to_string(),
+                    config: test_server_config(),
+                    client,
+                    tools,
+                    capabilities: ServerCapabilities::default(),
+                    health: ServerHealth::Healthy,
+                },
+            )
+            .await;
         router.refresh_tools().await;
 
         let proxy_handler = ProxyHandler::from_router(router.clone());
@@ -2613,37 +2627,43 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(
-            visible_names,
-            vec![
-                "plug__list_servers",
-                "plug__list_tools",
-                "plug__search_tools",
-                "plug__load_tool",
-                "plug__evict_tool",
-                "plug__list_loaded_tools",
-                "plug__invoke_tool",
-            ]
+        assert_eq!(visible_names, vec!["plug__search_tools"]);
+
+        let mut search_args = serde_json::Map::new();
+        search_args.insert(
+            "query".to_string(),
+            serde_json::Value::String("echo".to_string()),
+        );
+        downstream_client
+            .call_tool(CallToolRequestParams::new("plug__search_tools").with_arguments(search_args))
+            .await
+            .expect("search and load hidden tool");
+
+        let visible_tools = downstream_client
+            .list_all_tools()
+            .await
+            .expect("list tools after load");
+        assert!(
+            visible_tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == "Upstream__echo"),
+            "loaded tool should be visible under its routed name"
         );
 
-        let mut invoke_args = serde_json::Map::new();
-        invoke_args.insert(
-            "tool_name".to_string(),
-            serde_json::Value::String("Upstream__echo".to_string()),
-        );
-        invoke_args.insert(
-            "arguments".to_string(),
-            serde_json::json!({"message": "hello"}),
+        let mut call_args = serde_json::Map::new();
+        call_args.insert(
+            "message".to_string(),
+            serde_json::Value::String("hello".to_string()),
         );
         let result = downstream_client
-            .call_tool(CallToolRequestParams::new("plug__invoke_tool").with_arguments(invoke_args))
+            .call_tool(CallToolRequestParams::new("Upstream__echo").with_arguments(call_args))
             .await
-            .expect("invoke hidden tool");
+            .expect("call loaded tool directly");
 
         let rendered = format!("{result:?}");
         assert!(
             rendered.contains("called echo"),
-            "unexpected invoke result: {rendered}"
+            "unexpected direct call result: {rendered}"
         );
         assert_eq!(router.active_call_count(), 0);
     }
@@ -2682,18 +2702,18 @@ mod tests {
         tools.store(Arc::new(initial_tools));
 
         server_manager
-        .replace_server(
-            "upstream",
-            UpstreamServer {
-                name: "upstream".to_string(),
-                config: test_server_config(),
-                client,
-                tools,
-                capabilities: ServerCapabilities::default(),
-                health: ServerHealth::Healthy,
-            },
-        )
-        .await;
+            .replace_server(
+                "upstream",
+                UpstreamServer {
+                    name: "upstream".to_string(),
+                    config: test_server_config(),
+                    client,
+                    tools,
+                    capabilities: ServerCapabilities::default(),
+                    health: ServerHealth::Healthy,
+                },
+            )
+            .await;
         router.refresh_tools().await;
 
         let proxy_handler = ProxyHandler::from_router(router.clone());
@@ -2819,18 +2839,18 @@ mod tests {
         tools.store(Arc::new(initial_tools));
 
         server_manager
-        .replace_server(
-            "catalog",
-            UpstreamServer {
-                name: "catalog".to_string(),
-                config: test_server_config(),
-                client,
-                tools,
-                capabilities,
-                health: ServerHealth::Healthy,
-            },
-        )
-        .await;
+            .replace_server(
+                "catalog",
+                UpstreamServer {
+                    name: "catalog".to_string(),
+                    config: test_server_config(),
+                    client,
+                    tools,
+                    capabilities,
+                    health: ServerHealth::Healthy,
+                },
+            )
+            .await;
 
         router.refresh_tools().await;
 

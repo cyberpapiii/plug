@@ -162,6 +162,20 @@ impl HttpState {
                                             state.sessions.broadcast(message);
                                         }
                                     }
+                                    ProtocolNotification::ToolListChangedFor { target } => {
+                                        if let NotificationTarget::Http { session_id } = target {
+                                            let session_key = session_id.to_string();
+                                            if let Some(message) = notification_to_sse_message(
+                                                ProtocolNotification::ToolListChangedFor {
+                                                    target: NotificationTarget::Http {
+                                                        session_id,
+                                                    },
+                                                },
+                                            ) {
+                                                state.sessions.send_to_session(&session_key, message);
+                                            }
+                                        }
+                                    }
                                     ProtocolNotification::ResourceListChanged => {
                                         if let Some(message) = notification_to_sse_message(
                                             ProtocolNotification::ResourceListChanged,
@@ -1097,7 +1111,7 @@ async fn handle_request(
                 .client_capabilities
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
 
-            let result = build_initialize_result(state.router.as_ref());
+            let result = build_initialize_result(state.router.as_ref(), client_type);
 
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
@@ -1143,9 +1157,18 @@ async fn handle_request(
         ClientRequest::CallToolRequest(call_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
+            let client_type = state
+                .sessions
+                .get_client_type(&session_id)
+                .unwrap_or(crate::types::ClientType::Unknown);
             let progress_token = call_req.params.progress_token();
             let owner =
                 crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            let downstream = DownstreamCallContext::http_for_client(
+                Arc::<str>::from(session_id.as_str()),
+                request_id.clone(),
+                client_type,
+            );
             if call_req.params.task.is_some() {
                 match state
                     .router
@@ -1155,6 +1178,7 @@ async fn handle_request(
                         call_req.params.arguments,
                         progress_token,
                         owner,
+                        Some(downstream),
                     )
                     .await
                 {
@@ -1177,10 +1201,7 @@ async fn handle_request(
                         call_req.params.name.as_ref(),
                         call_req.params.arguments,
                         progress_token,
-                        Some(DownstreamCallContext::http(
-                            Arc::<str>::from(session_id.as_str()),
-                            request_id.clone(),
-                        )),
+                        Some(downstream),
                     )
                     .await
                 {
@@ -1462,8 +1483,11 @@ async fn handle_request(
 // ---------------------------------------------------------------------------
 
 /// Build the InitializeResult (same as ProxyHandler::get_info).
-fn build_initialize_result(router: &ToolRouter) -> InitializeResult {
-    InitializeResult::new(router.synthesized_capabilities()).with_server_info(
+fn build_initialize_result(
+    router: &ToolRouter,
+    client_type: crate::types::ClientType,
+) -> InitializeResult {
+    InitializeResult::new(router.synthesized_capabilities_for_client(client_type)).with_server_info(
         Implementation::new("plug", env!("CARGO_PKG_VERSION"))
             .with_title("Plug")
             .with_description("MCP multiplexer")
@@ -1977,28 +2001,11 @@ mod tests {
                 std::borrow::Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(vec![
-                Tool::new(
-                    std::borrow::Cow::Borrowed("plug__list_servers"),
-                    std::borrow::Cow::Borrowed("List servers"),
-                    Arc::new(serde_json::Map::new()),
-                ),
-                Tool::new(
-                    std::borrow::Cow::Borrowed("plug__list_tools"),
-                    std::borrow::Cow::Borrowed("List tools"),
-                    Arc::new(serde_json::Map::new()),
-                ),
-                Tool::new(
-                    std::borrow::Cow::Borrowed("plug__search_tools"),
-                    std::borrow::Cow::Borrowed("Search tools"),
-                    Arc::new(serde_json::Map::new()),
-                ),
-                Tool::new(
-                    std::borrow::Cow::Borrowed("plug__invoke_tool"),
-                    std::borrow::Cow::Borrowed("Invoke tool"),
-                    Arc::new(serde_json::Map::new()),
-                ),
-            ]),
+            meta_tools_all: Arc::new(vec![Tool::new(
+                std::borrow::Cow::Borrowed("plug__search_tools"),
+                std::borrow::Cow::Borrowed("Search tools"),
+                Arc::new(serde_json::Map::new()),
+            )]),
             tools_windsurf: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),

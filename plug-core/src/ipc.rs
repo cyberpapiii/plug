@@ -280,6 +280,8 @@ pub enum IpcResponse {
     Capabilities { capabilities: serde_json::Value },
     /// Success acknowledgement for mutating commands.
     Ok,
+    /// Config reload result with restart-required warnings.
+    Reloaded { report: crate::reload::ReloadReport },
     /// Liveness acknowledgement for long-lived proxy connections.
     Pong,
     /// Error with machine-parseable code and human-readable message.
@@ -436,7 +438,10 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     if payload.len() > MAX_FRAME_SIZE as usize {
-        anyhow::bail!("payload too large: {} bytes (max {MAX_FRAME_SIZE})", payload.len());
+        anyhow::bail!(
+            "payload too large: {} bytes (max {MAX_FRAME_SIZE})",
+            payload.len()
+        );
     }
     let len = u32::try_from(payload.len())
         .map_err(|_| anyhow::anyhow!("payload too large: {} bytes", payload.len()))?;

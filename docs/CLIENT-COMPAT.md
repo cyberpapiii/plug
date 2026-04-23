@@ -62,19 +62,15 @@ Mode meanings:
 
 - `standard`: expose the normal routed tool catalog, subject to existing client-specific filtering.
 - `native`: expose the normal routed tool catalog and rely on the client to perform its own deferred/lazy loading.
-- `bridge`: expose only compact `plug__*` discovery tools until a session loads specific real routed tools.
+- `bridge`: expose only `plug__search_tools` until search loads a bounded ranked set of real routed tools into the session.
 
-Bridge clients initially see:
+Bridge clients initially see one tool:
 
-- `plug__list_servers`
-- `plug__list_tools`
 - `plug__search_tools`
-- `plug__load_tool`
-- `plug__evict_tool`
-- `plug__list_loaded_tools`
-- `plug__invoke_tool`
 
-The intended bridge flow is `plug__search_tools` -> `plug__load_tool` -> direct call to the real routed tool name. `plug__invoke_tool` remains available for fallback/debug use, but it is not the primary lazy-loading UX.
+The intended bridge flow is `plug__search_tools` -> direct call to the real routed tool name. Search returns ranked matching tool definitions, loads those matches into a bounded session working set, evicts the oldest loaded tools when necessary, and emits a targeted `tools/list_changed` notification so the client can refresh the callable tool list.
+
+Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the legacy meta-tool contract for compatibility, including `plug__invoke_tool`, but OpenCode/default bridge mode does not expose that wrapper.
 
 ---
 
@@ -302,7 +298,7 @@ args = ["connect"]
 - OpenCode can connect via Streamable HTTP (preferred) or legacy SSE
 - Legacy SSE endpoint (`/sse`) still useful for older OpenCode versions
 - Lower priority for legacy SSE implementation since OpenCode now auto-negotiates
-- Bridge mode keeps the initial `tools/list` small and lets the agent search/load real tools into its session working set.
+- Bridge mode keeps the initial `tools/list` small and lets the agent search for real tools, which loads the ranked matches into its session working set.
 - Once loaded, tools appear under the same routed names they use in standard mode, so downstream permission/approval behavior remains as specific as the client allows.
 
 ---

@@ -330,7 +330,7 @@ pub async fn apply_reload(
 }
 
 /// Report of what happened during a reload.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReloadReport {
     pub added: Vec<String>,
     pub removed: Vec<String>,

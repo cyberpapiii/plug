@@ -439,7 +439,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Setup { yes, transport }) => {
             commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
         }
-        Some(Commands::Reload) => commands::misc::cmd_reload().await?,
+        Some(Commands::Reload) => commands::misc::cmd_reload(&cli.output).await?,
         Some(Commands::Config { path, command }) => {
             commands::config::cmd_config(cli.config.as_ref(), path, command, &cli.output)?
         }

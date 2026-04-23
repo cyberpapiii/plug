@@ -76,6 +76,7 @@ No required roadmap work remains for the current production-ready bar.
 
 Optional future scope only:
 
+- exists off-main: `codex/lazy-tool-discovery-v2` contains candidate lazy tool discovery v2 work with OpenCode bridge search, bounded session working sets, client-targeted lazy policy, and legacy `meta_tool_mode` compatibility. It is not current on `main` until merged.
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
