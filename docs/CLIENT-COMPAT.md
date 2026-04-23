@@ -30,6 +30,54 @@ Treat this as current truth when reasoning about client display behavior.
 
 ---
 
+## Lazy Tool Discovery Defaults
+
+`plug` resolves a lazy tool policy per client target. The defaults are intentionally conservative:
+
+| Client | Default lazy mode | Why |
+|--------|-------------------|-----|
+| Claude Code | `native` | Claude Code has native deferred tool discovery and should receive the normal routed catalog. |
+| Cursor | `native` | Cursor has Dynamic Context Discovery and should receive the normal routed catalog. |
+| Codex CLI | `native` | Codex has native lazy/deferred tool search semantics and should receive the normal routed catalog. |
+| OpenCode | `bridge` | OpenCode currently benefits from a `plug`-owned small bridge surface instead of seeing hundreds of tools eagerly. |
+| Claude Desktop | `standard` | No proven lazy/deferred path in `plug`; keep normal full-tool behavior. |
+| Windsurf | `standard` | Keep normal behavior with existing tool-limit filtering. |
+| VS Code Copilot | `standard` | Keep normal behavior with existing tool-limit filtering. |
+| Gemini CLI | `standard` | Keep normal behavior and prioritize fast discovery responses. |
+| Zed | `standard` | Keep normal behavior. |
+| Unknown clients | `standard` | Safe fallback: do not hide tools unless the client target is known or configured. |
+
+Operators can inspect resolved modes with `plug clients` and override them in config:
+
+```toml
+[lazy_tools]
+mode = "auto" # auto, standard, native, bridge
+
+[lazy_tools.clients]
+opencode = "bridge"
+"claude-code" = "native"
+```
+
+Mode meanings:
+
+- `standard`: expose the normal routed tool catalog, subject to existing client-specific filtering.
+- `native`: expose the normal routed tool catalog and rely on the client to perform its own deferred/lazy loading.
+- `bridge`: expose only compact `plug__*` discovery tools until a session loads specific real routed tools.
+
+Bridge clients initially see:
+
+- `plug__list_servers`
+- `plug__list_tools`
+- `plug__search_tools`
+- `plug__load_tool`
+- `plug__evict_tool`
+- `plug__list_loaded_tools`
+- `plug__invoke_tool`
+
+The intended bridge flow is `plug__search_tools` -> `plug__load_tool` -> direct call to the real routed tool name. `plug__invoke_tool` remains available for fallback/debug use, but it is not the primary lazy-loading UX.
+
+---
+
 ## Detailed Client Profiles
 
 ### Claude Code
@@ -54,8 +102,9 @@ Treat this as current truth when reasoning about client display behavior.
 - This is the ideal client for `plug` — it already handles large tool sets gracefully
 
 **plug implications**:
-- Return full tool list; Claude Code will manage token efficiency itself
-- Support tool search protocol if Claude Code sends it
+- Default lazy mode: `native`
+- Return the normal routed tool catalog; Claude Code manages token efficiency itself
+- Support native tool search behavior if Claude Code sends it
 
 ---
 
@@ -121,6 +170,7 @@ Treat this as current truth when reasoning about client display behavior.
 - No tool limit filtering needed for current Cursor versions
 - Still detect Cursor via `clientInfo.name` for any future version-aware behavior
 - Keep configurable tool limits as a safety valve
+- Default lazy mode: `native`
 
 **Forum reference**: https://forum.cursor.com/t/mcp-server-40-tool-limit-in-cursor-is-this-frustrating-your-workflow/81627
 
@@ -236,6 +286,7 @@ args = ["connect"]
 - ALWAYS return `{"resources": []}` for `resources/list` if no upstream servers provide resources
 - Never return an error for `resources/list`
 - Test with Codex as part of compatibility validation
+- Default lazy mode: `native`
 
 ---
 
@@ -247,9 +298,12 @@ args = ["connect"]
 **UPDATED (2026-03-03)**: OpenCode now supports Streamable HTTP with auto-negotiation. Legacy SSE support remains for backwards compatibility but is no longer the only option.
 
 **fanout implications**:
+- Default lazy mode: `bridge`
 - OpenCode can connect via Streamable HTTP (preferred) or legacy SSE
 - Legacy SSE endpoint (`/sse`) still useful for older OpenCode versions
 - Lower priority for legacy SSE implementation since OpenCode now auto-negotiates
+- Bridge mode keeps the initial `tools/list` small and lets the agent search/load real tools into its session working set.
+- Once loaded, tools appear under the same routed names they use in standard mode, so downstream permission/approval behavior remains as specific as the client allows.
 
 ---
 
@@ -299,7 +353,7 @@ This shows which features each client actually supports (not just what the spec 
 | Roots | Yes | Yes | Yes | -- | Yes | -- | -- | -- | -- |
 | Elicitation | -- | -- | Yes | -- | Yes | -- | Yes | -- | -- |
 | Discovery | -- | -- | Yes | Yes | Yes | -- | -- | -- | -- |
-| Tool Search | Yes | -- | -- | -- | -- | -- | -- | -- | -- |
+| Tool Search | Yes | -- | -- | -- | -- | -- | Native | Bridge | -- |
 
 **fanout implications**:
 - Tools must work for ALL clients (universal support)

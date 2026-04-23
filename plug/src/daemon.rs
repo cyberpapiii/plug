@@ -774,6 +774,11 @@ async fn handle_ipc_connection(
                 .await;
         }
         ctx.engine.tool_router().remove_client_log_level(session_id);
+        let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+            plug_core::proxy::DownstreamTransport::Stdio,
+            session_id,
+        );
+        ctx.engine.tool_router().clear_lazy_session(&lazy_session_key);
         if let Some(client_id) = removed_client_id {
             if !ctx.client_registry.client_sessions.contains_key(&client_id) {
                 let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
@@ -1405,6 +1410,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .await;
             }
             ctx.engine.tool_router().remove_client_log_level(session_id);
+            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                plug_core::proxy::DownstreamTransport::Stdio,
+                session_id,
+            );
+            ctx.engine.tool_router().clear_lazy_session(&lazy_session_key);
             if let Some(client_id) = removed_client_id {
                 if !ctx.client_registry.client_sessions.contains_key(&client_id) {
                     let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
@@ -1857,7 +1867,15 @@ async fn dispatch_mcp_request(
 
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let result = tool_router.list_tools_page_for_client(client_type, request);
+            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                plug_core::proxy::DownstreamTransport::Stdio,
+                session_id,
+            );
+            let result = tool_router.list_tools_page_for_client_session(
+                client_type,
+                Some(&lazy_session_key),
+                request,
+            );
             match serde_json::to_value(result) {
                 Ok(payload) => IpcResponse::McpResponse { payload },
                 Err(e) => IpcResponse::Error {

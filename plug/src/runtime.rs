@@ -273,6 +273,11 @@ fn build_configured_http_runtime(
                 tool_router.forward_roots_list_changed_to_upstreams().await;
             }
             tool_router.remove_client_log_level(&session_id);
+            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                plug_core::proxy::DownstreamTransport::Http,
+                &session_id,
+            );
+            tool_router.clear_lazy_session(&lazy_session_key);
             tool_router.unregister_downstream_bridge(&target);
         }
     });

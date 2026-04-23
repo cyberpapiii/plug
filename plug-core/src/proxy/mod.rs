@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
-use crate::config::Config;
+use crate::config::{Config, LazyToolsConfig};
 use crate::engine::{Engine, EngineEvent, next_call_id};
 use crate::error::ProtocolError;
 use crate::artifacts::ArtifactStore;
@@ -86,6 +86,7 @@ pub struct RouterConfig {
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
     pub meta_tool_mode: bool,
+    pub lazy_tools: LazyToolsConfig,
     pub tool_filter_enabled: bool,
     /// Servers with enrichment enabled (annotation inference + title normalization).
     pub enrichment_servers: std::collections::HashSet<String>,
@@ -100,6 +101,7 @@ impl From<&Config> for RouterConfig {
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
             meta_tool_mode: config.meta_tool_mode,
+            lazy_tools: config.lazy_tools.clone(),
             tool_filter_enabled: config.tool_filter_enabled,
             enrichment_servers: config
                 .servers
@@ -108,6 +110,18 @@ impl From<&Config> for RouterConfig {
                 .map(|(name, _)| name.clone())
                 .collect(),
         }
+    }
+}
+
+impl RouterConfig {
+    fn lazy_mode_for_client(&self, client_type: ClientType) -> crate::types::LazyToolMode {
+        let target = client_type.target_slug().unwrap_or("unknown");
+        crate::config::resolve_lazy_tool_policy_from_settings(
+            self.meta_tool_mode,
+            &self.lazy_tools,
+            target,
+        )
+        .mode
     }
 }
 
@@ -145,6 +159,8 @@ pub struct ToolRouter {
     client_roots: DashMap<NotificationTarget, Vec<Root>>,
     /// Per-client bridge for forwarding reverse requests (elicitation, sampling).
     downstream_bridges: DashMap<NotificationTarget, Arc<dyn DownstreamBridge>>,
+    /// Session-scoped lazy loaded routed tool names.
+    lazy_working_sets: DashMap<String, HashSet<String>>,
     /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
     task_store: Mutex<TaskStore>,
 }
@@ -287,6 +303,7 @@ impl ToolRouter {
             resource_subscriptions: DashMap::new(),
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
+            lazy_working_sets: DashMap::new(),
             task_store: Mutex::new(TaskStore::new()),
         }
     }
@@ -366,6 +383,17 @@ impl ToolRouter {
     pub fn remove_client_log_level(&self, client_id: &str) {
         self.client_log_levels.remove(client_id);
         self.recalculate_effective_level();
+    }
+
+    pub fn clear_lazy_session(&self, session_key: &str) {
+        self.lazy_working_sets.remove(session_key);
+    }
+
+    pub fn lazy_session_key(transport: DownstreamTransport, client_id: &str) -> String {
+        match transport {
+            DownstreamTransport::Stdio => format!("stdio:{client_id}"),
+            DownstreamTransport::Http => format!("http:{client_id}"),
+        }
     }
 
     /// Recalculate effective level as the most permissive (lowest severity) across all clients.
@@ -1594,7 +1622,10 @@ impl ToolRouter {
     /// Get the current list of tools (zero-copy via Arc). Returns all tools.
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
-        if self.config.meta_tool_mode {
+        if matches!(
+            self.config.lazy_mode_for_client(ClientType::Unknown),
+            crate::types::LazyToolMode::Bridge
+        ) {
             Arc::clone(&snapshot.meta_tools_all)
         } else {
             Arc::clone(&snapshot.tools_all)
@@ -1606,7 +1637,16 @@ impl ToolRouter {
         client_type: ClientType,
         request: Option<PaginatedRequestParams>,
     ) -> ListToolsResult {
-        let tools = self.list_tools_for_client(client_type);
+        self.list_tools_page_for_client_session(client_type, None, request)
+    }
+
+    pub fn list_tools_page_for_client_session(
+        &self,
+        client_type: ClientType,
+        session_key: Option<&str>,
+        request: Option<PaginatedRequestParams>,
+    ) -> ListToolsResult {
+        let tools = self.list_tools_for_client_session(client_type, session_key);
         paginated_result((*tools).clone(), request, |tools, next_cursor| {
             ListToolsResult {
                 meta: None,
@@ -1648,14 +1688,20 @@ impl ToolRouter {
     }
 
     pub fn supports_tasks(&self) -> bool {
-        !self.config.meta_tool_mode && !self.cache.load().tools_all.is_empty()
+        !matches!(
+            self.config.lazy_mode_for_client(ClientType::Unknown),
+            crate::types::LazyToolMode::Bridge
+        ) && !self.cache.load().tools_all.is_empty()
     }
 
     pub fn synthesized_capabilities(&self) -> ServerCapabilities {
         let upstream_caps = self.server_manager.healthy_capabilities();
         let mut capabilities = ServerCapabilities::default();
 
-        if self.config.meta_tool_mode
+        if matches!(
+            self.config.lazy_mode_for_client(ClientType::Unknown),
+            crate::types::LazyToolMode::Bridge
+        )
             || !self.list_tools().is_empty()
             || upstream_caps.iter().any(|caps| caps.tools.is_some())
         {
@@ -1695,8 +1741,19 @@ impl ToolRouter {
 
     /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
     pub fn list_tools_for_client(&self, client_type: ClientType) -> Arc<Vec<Tool>> {
-        if self.config.meta_tool_mode {
-            return Arc::clone(&self.cache.load().meta_tools_all);
+        self.list_tools_for_client_session(client_type, None)
+    }
+
+    pub fn list_tools_for_client_session(
+        &self,
+        client_type: ClientType,
+        session_key: Option<&str>,
+    ) -> Arc<Vec<Tool>> {
+        if matches!(
+            self.config.lazy_mode_for_client(client_type),
+            crate::types::LazyToolMode::Bridge
+        ) {
+            return self.bridge_visible_tools(session_key);
         }
         if !self.config.tool_filter_enabled {
             return self.list_tools();
@@ -1707,6 +1764,28 @@ impl ToolRouter {
             ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),
             _ => Arc::clone(&snapshot.tools_all),
         }
+    }
+
+    fn bridge_visible_tools(&self, session_key: Option<&str>) -> Arc<Vec<Tool>> {
+        let snapshot = self.cache.load();
+        let mut tools = (*snapshot.meta_tools_all).clone();
+        let Some(session_key) = session_key else {
+            return Arc::new(tools);
+        };
+        let loaded_names = {
+            let loaded = self
+                .lazy_working_sets
+                .entry(session_key.to_string())
+                .or_default();
+            loaded.value().clone()
+        };
+
+        for tool in snapshot.tools_all.iter() {
+            if loaded_names.contains(tool.name.as_ref()) {
+                tools.push(tool.clone());
+            }
+        }
+        Arc::new(tools)
     }
 
     pub fn list_resources(&self) -> Arc<Vec<Resource>> {
@@ -2189,7 +2268,7 @@ impl ToolRouter {
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_inner(tool_name, arguments, progress_token, downstream, false)
+        self.call_tool_inner(tool_name, arguments, progress_token, downstream, true, false)
             .await
     }
 
@@ -2353,6 +2432,7 @@ impl ToolRouter {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
+        enforce_lazy_visibility: bool,
         is_retry: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
@@ -2367,6 +2447,15 @@ impl ToolRouter {
             }
             if tool_name.eq_ignore_ascii_case("plug__search_tools") {
                 return self.handle_search_tools(arguments.clone());
+            }
+            if tool_name.eq_ignore_ascii_case("plug__load_tool") {
+                return self.handle_load_tool(arguments.clone(), downstream.as_ref());
+            }
+            if tool_name.eq_ignore_ascii_case("plug__evict_tool") {
+                return self.handle_evict_tool(arguments.clone(), downstream.as_ref());
+            }
+            if tool_name.eq_ignore_ascii_case("plug__list_loaded_tools") {
+                return self.handle_list_loaded_tools(downstream.as_ref());
             }
             if tool_name.eq_ignore_ascii_case("plug__invoke_tool") {
                 return self
@@ -2397,6 +2486,10 @@ impl ToolRouter {
             let server_id = server_id.clone();
             let original_name = original_name.to_string();
             drop(cache);
+
+            if enforce_lazy_visibility {
+                self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;
+            }
 
             // Health gate — reject calls to Failed servers
             let health_ok = self
@@ -2621,8 +2714,15 @@ impl ToolRouter {
                     }
 
                     // Retry the tool call exactly once
-                    self.call_tool_inner(tool_name, arguments, progress_token, downstream, true)
-                        .await
+                    self.call_tool_inner(
+                        tool_name,
+                        arguments,
+                        progress_token,
+                        downstream,
+                        enforce_lazy_visibility,
+                        true,
+                    )
+                    .await
                 }
                 Err(rmcp::service::ServiceError::Timeout { timeout }) => {
                     tracing::error!(
@@ -2802,15 +2902,173 @@ impl ToolRouter {
             .to_lowercase();
 
         if query.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Please provide a search query.",
-            )]));
+            return self.json_tool_result(serde_json::json!({
+                "matches": [],
+                "error": "query is required"
+            }));
         }
 
-        let mut args = arguments.unwrap_or_default();
-        args.insert("query".to_string(), serde_json::Value::String(query));
-        args.insert("limit".to_string(), serde_json::Value::Number(10.into()));
-        self.handle_list_tools(Some(args))
+        let limit = arguments
+            .as_ref()
+            .and_then(|args| args.get("limit"))
+            .and_then(|value| value.as_u64())
+            .map(|value| value.min(25) as usize)
+            .unwrap_or(10);
+        let snapshot = self.cache.load();
+        let mut matches = Vec::new();
+        for tool in snapshot.tools_all.iter() {
+            let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
+                continue;
+            };
+            if server_id == "__plug_internal__" {
+                continue;
+            }
+            let name = tool.name.to_lowercase();
+            let desc = tool.description.as_deref().unwrap_or("").to_lowercase();
+            if !name.contains(&query) && !desc.contains(&query) {
+                continue;
+            }
+            matches.push(serde_json::json!({
+                "name": tool.name.as_ref(),
+                "server_id": server_id,
+                "description": tool.description.as_deref().unwrap_or(""),
+            }));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        self.json_tool_result(serde_json::json!({ "matches": matches }))
+    }
+
+    fn handle_load_tool(
+        &self,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        downstream: Option<&DownstreamCallContext>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_key = self.lazy_session_key_from_context(downstream)?;
+        let tool_name = required_string_argument(arguments.as_ref(), "tool_name")?;
+        let snapshot = self.cache.load();
+        let tool = snapshot
+            .tools_all
+            .iter()
+            .find(|tool| tool.name.eq_ignore_ascii_case(tool_name))
+            .cloned()
+            .ok_or_else(|| McpError::from(ProtocolError::ToolNotFound {
+                tool_name: tool_name.to_string(),
+            }))?;
+        let canonical_name = tool.name.to_string();
+        let Some((server_id, _)) = snapshot.routes.get(canonical_name.as_str()) else {
+            return Err(McpError::from(ProtocolError::ToolNotFound {
+                tool_name: canonical_name,
+            }));
+        };
+        if server_id == "__plug_internal__" {
+            return Err(McpError::from(ProtocolError::InvalidRequest {
+                detail: "plug meta-tools cannot be loaded into the lazy working set".to_string(),
+            }));
+        }
+        drop(snapshot);
+
+        let inserted = self
+            .lazy_working_sets
+            .entry(session_key)
+            .or_default()
+            .insert(canonical_name.clone());
+        if inserted {
+            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        }
+        self.json_tool_result(serde_json::json!({
+            "loaded": true,
+            "already_loaded": !inserted,
+            "tool": tool,
+        }))
+    }
+
+    fn handle_evict_tool(
+        &self,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        downstream: Option<&DownstreamCallContext>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_key = self.lazy_session_key_from_context(downstream)?;
+        let tool_name = required_string_argument(arguments.as_ref(), "tool_name")?;
+        let removed = self
+            .lazy_working_sets
+            .get_mut(&session_key)
+            .map(|mut tools| remove_loaded_tool_case_insensitive(&mut tools, tool_name))
+            .unwrap_or(false);
+        if removed {
+            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        }
+        self.json_tool_result(serde_json::json!({
+            "evicted": removed,
+            "tool_name": tool_name,
+        }))
+    }
+
+    fn handle_list_loaded_tools(
+        &self,
+        downstream: Option<&DownstreamCallContext>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_key = self.lazy_session_key_from_context(downstream)?;
+        let loaded = self
+            .lazy_working_sets
+            .get(&session_key)
+            .map(|tools| {
+                let mut names = tools.iter().cloned().collect::<Vec<_>>();
+                names.sort();
+                names
+            })
+            .unwrap_or_default();
+        self.json_tool_result(serde_json::json!({ "loaded_tools": loaded }))
+    }
+
+    fn lazy_session_key_from_context(
+        &self,
+        downstream: Option<&DownstreamCallContext>,
+    ) -> Result<String, McpError> {
+        let Some(downstream) = downstream else {
+            return Err(McpError::from(ProtocolError::InvalidRequest {
+                detail: "lazy tool working-set actions require a downstream session".to_string(),
+            }));
+        };
+        Ok(Self::lazy_session_key(
+            downstream.transport,
+            downstream.client_id.as_ref(),
+        ))
+    }
+
+    fn json_tool_result(&self, value: serde_json::Value) -> Result<CallToolResult, McpError> {
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    fn ensure_lazy_tool_loaded_for_direct_call(
+        &self,
+        downstream: Option<&DownstreamCallContext>,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        let Some(downstream) = downstream else {
+            return Ok(());
+        };
+        let session_key = Self::lazy_session_key(
+            downstream.transport,
+            downstream.client_id.as_ref(),
+        );
+        let Some(loaded) = self.lazy_working_sets.get(&session_key) else {
+            return Ok(());
+        };
+        if loaded
+            .iter()
+            .any(|loaded_name| loaded_name.eq_ignore_ascii_case(tool_name))
+        {
+            return Ok(());
+        }
+        Err(McpError::from(ProtocolError::InvalidRequest {
+            detail: format!(
+                "{tool_name} is hidden in this lazy tool session; call plug__load_tool first"
+            ),
+        }))
     }
 
     fn handle_invoke_tool<'a>(
@@ -2852,6 +3110,7 @@ impl ToolRouter {
                 forwarded_arguments,
                 progress_token,
                 downstream,
+                false,
                 is_retry,
             )
             .await
@@ -2931,6 +3190,34 @@ fn sanitize_description(desc: &str) -> String {
     desc.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
         .collect()
+}
+
+fn required_string_argument<'a>(
+    arguments: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    name: &str,
+) -> Result<&'a str, McpError> {
+    arguments
+        .and_then(|args| args.get(name))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("{name} must be a string"),
+            })
+        })
+}
+
+fn remove_loaded_tool_case_insensitive(loaded: &mut HashSet<String>, tool_name: &str) -> bool {
+    if loaded.remove(tool_name) {
+        return true;
+    }
+    let Some(canonical_name) = loaded
+        .iter()
+        .find(|loaded_name| loaded_name.eq_ignore_ascii_case(tool_name))
+        .cloned()
+    else {
+        return false;
+    };
+    loaded.remove(&canonical_name)
 }
 
 /// Sort comparator: priority tools first (by priority_tools index), then alphabetical.
@@ -3054,6 +3341,9 @@ fn build_meta_tools() -> Vec<Tool> {
         build_list_servers_meta_tool(),
         build_list_tools_meta_tool(),
         build_search_tools_meta_tool(),
+        build_load_tool_meta_tool(),
+        build_evict_tool_meta_tool(),
+        build_list_loaded_tools_meta_tool(),
         build_invoke_tool_meta_tool(),
     ]
 }
@@ -3104,7 +3394,7 @@ fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
         Cow::Borrowed("plug__search_tools"),
         Cow::Borrowed(
-            "Search for tools by name or description. Returns matching tools with full schemas.",
+            "Search hidden routed tools by name or description. Returns compact JSON matches.",
         ),
         Arc::new(
             serde_json::json!({
@@ -3121,6 +3411,60 @@ fn build_search_tools_meta_tool() -> Tool {
             .unwrap()
             .clone(),
         ),
+    )
+}
+
+fn build_load_tool_meta_tool() -> Tool {
+    Tool::new(
+        Cow::Borrowed("plug__load_tool"),
+        Cow::Borrowed(
+            "Load a hidden routed tool into this session's active tool set. Returns the full tool definition as JSON.",
+        ),
+        Arc::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Exact routed tool name to load"
+                    }
+                },
+                "required": ["tool_name"]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ),
+    )
+}
+
+fn build_evict_tool_meta_tool() -> Tool {
+    Tool::new(
+        Cow::Borrowed("plug__evict_tool"),
+        Cow::Borrowed("Evict a loaded routed tool from this session's active tool set."),
+        Arc::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Exact routed tool name to evict"
+                    }
+                },
+                "required": ["tool_name"]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ),
+    )
+}
+
+fn build_list_loaded_tools_meta_tool() -> Tool {
+    Tool::new(
+        Cow::Borrowed("plug__list_loaded_tools"),
+        Cow::Borrowed("List routed tools currently loaded into this session's active tool set."),
+        Arc::new(serde_json::Map::new()),
     )
 }
 
@@ -3221,6 +3565,9 @@ pub struct ProxyHandler {
 impl Drop for ProxyHandler {
     fn drop(&mut self) {
         self.shutdown.cancel();
+        let session_key =
+            ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
+        self.router.clear_lazy_session(&session_key);
         self.router
             .unregister_downstream_bridge(&NotificationTarget::Stdio {
                 client_id: Arc::clone(&self.client_id),
@@ -3583,7 +3930,13 @@ impl ServerHandler for ProxyHandler {
                 .read()
                 .map(|ct| *ct)
                 .unwrap_or(ClientType::Unknown);
-            Ok(self.router.list_tools_page_for_client(ct, request))
+            let session_key = ToolRouter::lazy_session_key(
+                DownstreamTransport::Stdio,
+                self.client_id.as_ref(),
+            );
+            Ok(self
+                .router
+                .list_tools_page_for_client_session(ct, Some(&session_key), request))
         }
     }
 
@@ -3782,9 +4135,22 @@ mod tests {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         }
+    }
+
+    fn expected_meta_tool_names() -> Vec<&'static str> {
+        vec![
+            "plug__list_servers",
+            "plug__list_tools",
+            "plug__search_tools",
+            "plug__load_tool",
+            "plug__evict_tool",
+            "plug__list_loaded_tools",
+            "plug__invoke_tool",
+        ]
     }
 
     #[test]
@@ -4132,7 +4498,8 @@ mod tests {
         args.insert("query".to_string(), serde_json::json!("nonexistent"));
         let result = router.handle_search_tools(Some(args)).unwrap();
         let text = format!("{result:?}");
-        assert!(text.contains("No tools matched"));
+        assert!(text.contains("matches"));
+        assert!(text.contains("[]"));
     }
 
     #[test]
@@ -4173,19 +4540,200 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "plug__list_servers",
-                "plug__list_tools",
-                "plug__search_tools",
-                "plug__invoke_tool",
-            ]
-        );
+        assert_eq!(names, expected_meta_tool_names());
 
         let full_tools = router.list_all_tools();
         assert_eq!(full_tools.len(), 1);
         assert_eq!(full_tools[0].1.name.as_ref(), "git__commit");
+    }
+
+    #[test]
+    fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes: HashMap::new(),
+            tools_all: Arc::new(vec![Tool::new(
+                Cow::Borrowed("git__commit"),
+                Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let visible_tools = router.list_tools_for_client(ClientType::OpenCode);
+        let names = visible_tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected_meta_tool_names());
+
+        assert_eq!(router.list_tools_for_client(ClientType::ClaudeCode).len(), 1);
+    }
+
+    #[test]
+    fn bridge_load_tool_adds_real_tool_to_session_visible_set() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "git__commit".to_string(),
+            ("git".to_string(), "commit".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(vec![Tool::new(
+                Cow::Borrowed("git__commit"),
+                Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+        assert_eq!(
+            router
+                .list_tools_for_client_session(ClientType::OpenCode, Some(&session_key))
+                .len(),
+            expected_meta_tool_names().len()
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
+        let downstream = DownstreamCallContext::stdio("client-a", RequestId::Number(1));
+        router
+            .handle_load_tool(Some(args), Some(&downstream))
+            .expect("load tool");
+
+        let visible = router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+        let names = visible
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"git__commit".to_string()));
+
+        let mut args = serde_json::Map::new();
+        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
+        router
+            .handle_evict_tool(Some(args), Some(&downstream))
+            .expect("evict tool");
+        let visible = router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+        assert_eq!(visible.len(), expected_meta_tool_names().len());
+    }
+
+    #[test]
+    fn bridge_load_and_evict_publish_tool_list_changed() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "git__commit".to_string(),
+            ("git".to_string(), "commit".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(vec![Tool::new(
+                Cow::Borrowed("git__commit"),
+                Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let mut notifications = router.subscribe_notifications();
+        let downstream = DownstreamCallContext::stdio("client-a", RequestId::Number(1));
+        let mut args = serde_json::Map::new();
+        args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
+        router
+            .handle_load_tool(Some(args), Some(&downstream))
+            .expect("load tool");
+        assert_eq!(
+            notifications.try_recv().expect("load notification"),
+            ProtocolNotification::ToolListChanged
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert("tool_name".to_string(), serde_json::json!("GIT__COMMIT"));
+        router
+            .handle_evict_tool(Some(args), Some(&downstream))
+            .expect("evict tool");
+        assert_eq!(
+            notifications.try_recv().expect("evict notification"),
+            ProtocolNotification::ToolListChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_session_rejects_unloaded_direct_tool_call() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "git__commit".to_string(),
+            ("git".to_string(), "commit".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(vec![Tool::new(
+                Cow::Borrowed("git__commit"),
+                Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+        }));
+
+        let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+        router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+
+        let err = router
+            .call_tool_with_context(
+                "git__commit",
+                None,
+                None,
+                Some(DownstreamCallContext::stdio(
+                    "client-a",
+                    RequestId::Number(1),
+                )),
+            )
+            .await
+            .expect_err("unloaded direct call should be rejected");
+        assert!(err.to_string().contains("plug__load_tool"));
     }
 
     #[test]

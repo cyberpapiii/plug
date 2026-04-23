@@ -1419,6 +1419,7 @@ mod tests {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: crate::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         }
@@ -2618,6 +2619,9 @@ mod tests {
                 "plug__list_servers",
                 "plug__list_tools",
                 "plug__search_tools",
+                "plug__load_tool",
+                "plug__evict_tool",
+                "plug__list_loaded_tools",
                 "plug__invoke_tool",
             ]
         );

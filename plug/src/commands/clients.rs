@@ -1,7 +1,7 @@
 use dialoguer::console::style;
 use plug_core::export::{ExportTarget, ExportTransport};
 
-use crate::ui::{cli_prompt_theme, print_banner, print_warning_line};
+use crate::ui::{cli_prompt_theme, print_banner, print_info_line, print_warning_line};
 
 #[derive(Debug, Clone)]
 pub(crate) struct LinkedClientConfig {
@@ -20,6 +20,9 @@ pub(crate) struct ClientView {
     pub(crate) live: bool,
     pub(crate) live_sessions: usize,
     pub(crate) live_transports: Vec<String>,
+    pub(crate) lazy_tool_mode: String,
+    pub(crate) lazy_tool_mode_origin: String,
+    pub(crate) lazy_tool_mode_reason: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -54,6 +57,14 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Google Antigravity", "antigravity"),
         ("Goose", "goose"),
     ]
+}
+
+pub(crate) fn client_display_name(target: &str) -> &str {
+    all_client_targets()
+        .iter()
+        .find(|(_, candidate)| *candidate == target)
+        .map(|(name, _)| *name)
+        .unwrap_or(target)
 }
 
 pub(crate) fn linked_client_targets() -> Vec<String> {
@@ -243,21 +254,40 @@ fn known_app_paths(app_names: &[&str]) -> Vec<std::path::PathBuf> {
 }
 
 fn client_target_from_type(client_type: plug_core::types::ClientType) -> Option<&'static str> {
-    match client_type {
-        plug_core::types::ClientType::ClaudeDesktop => Some("claude-desktop"),
-        plug_core::types::ClientType::ClaudeCode => Some("claude-code"),
-        plug_core::types::ClientType::Cursor => Some("cursor"),
-        plug_core::types::ClientType::Windsurf => Some("windsurf"),
-        plug_core::types::ClientType::VSCodeCopilot => Some("vscode"),
-        plug_core::types::ClientType::GeminiCli => Some("gemini-cli"),
-        plug_core::types::ClientType::CodexCli => Some("codex-cli"),
-        plug_core::types::ClientType::OpenCode => Some("opencode"),
-        plug_core::types::ClientType::Zed => Some("zed"),
-        plug_core::types::ClientType::Unknown => None,
+    client_type.target_slug()
+}
+
+pub(crate) fn lazy_tool_policy_for_target(
+    config: Option<&plug_core::config::Config>,
+    target: &str,
+) -> plug_core::types::ResolvedLazyToolPolicy {
+    if let Some(config) = config {
+        plug_core::config::resolve_lazy_tool_policy_for_target(config, target)
+    } else {
+        let config = plug_core::config::Config::default();
+        plug_core::config::resolve_lazy_tool_policy_for_target(&config, target)
     }
 }
 
-pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<ClientView> {
+fn lazy_tool_policy_summary(config: &plug_core::config::Config, target: &str) -> String {
+    let policy = plug_core::config::resolve_lazy_tool_policy_for_target(config, target);
+    format!(
+        "{} lazy tools: {} ({}) - {}",
+        client_display_name(target),
+        policy.mode.label(),
+        policy.origin.label(),
+        policy.reason
+    )
+}
+
+fn print_lazy_tool_policy(config: &plug_core::config::Config, target: &str) {
+    print_info_line(style(lazy_tool_policy_summary(config, target)).dim());
+}
+
+pub(crate) fn client_views(
+    live: &[plug_core::ipc::IpcLiveSessionInfo],
+    config: Option<&plug_core::config::Config>,
+) -> Vec<ClientView> {
     let mut live_counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
     let mut live_transports: std::collections::HashMap<
@@ -297,6 +327,7 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<C
                         .collect()
                 })
                 .unwrap_or_default();
+            let lazy_policy = lazy_tool_policy_for_target(config, target);
             ClientView {
                 name: (*name).to_string(),
                 target: (*target).to_string(),
@@ -307,6 +338,9 @@ pub(crate) fn client_views(live: &[plug_core::ipc::IpcLiveSessionInfo]) -> Vec<C
                 live: live_sessions > 0,
                 live_sessions,
                 live_transports,
+                lazy_tool_mode: lazy_policy.mode.label().to_string(),
+                lazy_tool_mode_origin: lazy_policy.origin.label().to_string(),
+                lazy_tool_mode_reason: lazy_policy.reason,
             }
         })
         .collect::<Vec<_>>();
@@ -434,6 +468,7 @@ pub(crate) fn cmd_link(
     let configured_http_url = configured_http_export_url(config_path)
         .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
     let requested_transport = requested_link_transport(transport, yes);
+    let config_for_policy = plug_core::config::load_config(config_path).unwrap_or_default();
 
     if !targets.is_empty() {
         let transport = prompt_link_transport(
@@ -450,6 +485,7 @@ pub(crate) fn cmd_link(
                 true,
                 false,
             )?;
+            print_lazy_tool_policy(&config_for_policy, target);
         }
         return Ok(());
     }
@@ -481,6 +517,7 @@ pub(crate) fn cmd_link(
                 true,
                 false,
             )?;
+            print_lazy_tool_policy(&config_for_policy, target);
         }
         return Ok(());
     }
@@ -582,6 +619,7 @@ pub(crate) fn cmd_link(
                 true,
                 false,
             )?;
+            print_lazy_tool_policy(&config_for_policy, target);
         } else if !is_selected && *was_linked {
             execute_unlink(target, false)?;
         }

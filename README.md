@@ -118,6 +118,7 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 - **Every client** — Claude Code, Cursor, Gemini CLI, Codex, Windsurf, VS Code Copilot, OpenCode, Zed
 - **Shared connections** — N clients share 1 upstream connection per server (not N connections)
 - **Client-aware** — automatically respects per-client tool limits (Windsurf: 100, VS Code: 128)
+- **Lazy tool discovery** — clients like OpenCode can start with a tiny search/load bridge instead of seeing hundreds of tool schemas up front
 - **Zero dependencies** — single static binary, no Docker, no database, no account required
 - **OAuth built in** — authenticate to remote MCP servers with `plug auth login`, background token refresh handles the rest
 - **Every transport** — upstream stdio, HTTP, and legacy SSE; downstream stdio and Streamable HTTP/HTTPS
@@ -156,6 +157,14 @@ Full configuration reference:
 enable_prefix = true       # Legacy compatibility field; tool names are always prefixed in v0.1
 prefix_delimiter = "__"    # Delimiter between server name and tool name
 daemon_grace_period_secs = 0  # Default: keep the shared daemon alive until explicit shutdown
+
+[lazy_tools]
+mode = "auto"              # auto, standard, native, bridge
+
+[lazy_tools.clients]
+opencode = "bridge"        # search/load/evict bridge, then direct-call loaded routed tools
+"claude-code" = "native"   # let native client-side lazy discovery handle large catalogs
+"codex-cli" = "native"
 
 [http]
 bind_address = "127.0.0.1"
@@ -204,6 +213,18 @@ oauth_scopes = ["mcp:read", "mcp:write"]
 ```
 
 Environment variable references (`$VAR_NAME`) in config values are expanded at startup.
+
+### Lazy Tool Discovery
+
+`plug` can choose a lazy tool mode per downstream client:
+
+- `standard`: expose the normal routed tool catalog.
+- `native`: expose the normal routed catalog and let clients like Claude Code, Cursor, or Codex apply their own deferred tool loading.
+- `bridge`: expose a compact discovery surface first, then let the session load real routed tools by name.
+
+OpenCode defaults to `bridge`, so it initially sees only compact `plug__*` discovery tools such as `plug__search_tools`, `plug__load_tool`, `plug__evict_tool`, and `plug__list_loaded_tools`. After `plug__load_tool`, the loaded tool appears with its normal routed name, for example `Slack__search_messages`, and is called directly rather than through a permanent wrapper.
+
+Use `plug clients` to inspect the resolved mode and whether it came from an automatic default, global override, or per-client override.
 
 ### Tool Naming And Display
 

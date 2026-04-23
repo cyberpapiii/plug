@@ -817,6 +817,11 @@ async fn delete_mcp(
         // Clean up per-client log level to prevent stale entries from
         // keeping the effective level permanently at a permissive value.
         state.router.remove_client_log_level(&session_id);
+        let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
+            crate::proxy::DownstreamTransport::Http,
+            &session_id,
+        );
+        state.router.clear_lazy_session(&lazy_session_key);
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
@@ -1121,9 +1126,15 @@ async fn handle_request(
                 .sessions
                 .get_client_type(&session_id_str)
                 .unwrap_or(crate::types::ClientType::Unknown);
-            let result = state
-                .router
-                .list_tools_page_for_client(client_type, list_req.params);
+            let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
+                crate::proxy::DownstreamTransport::Http,
+                &session_id_str,
+            );
+            let result = state.router.list_tools_page_for_client_session(
+                client_type,
+                Some(&lazy_session_key),
+                list_req.params,
+            );
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListToolsResult(result), request_id);
             json_response(&response_msg)
@@ -1625,6 +1636,7 @@ mod tests {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: crate::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         })
@@ -1794,6 +1806,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },
@@ -1949,6 +1962,7 @@ mod tests {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: true,
+            lazy_tools: crate::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         });
@@ -2580,6 +2594,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },
@@ -2705,6 +2720,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },
@@ -2772,6 +2788,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },
@@ -2830,6 +2847,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },
@@ -2888,6 +2906,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },
@@ -3024,6 +3043,7 @@ mod tests {
                 tool_description_max_chars: None,
                 tool_search_threshold: 50,
                 meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
                 tool_filter_enabled: true,
                 enrichment_servers: std::collections::HashSet::new(),
             },

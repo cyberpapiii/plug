@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::{LazyToolMode, LazyToolModeOrigin, LazyToolSetting, ResolvedLazyToolPolicy};
 pub use expand::expand_env_vars;
 
 /// Top-level configuration for plug.
@@ -30,8 +31,12 @@ pub struct Config {
     #[serde(default = "default_tool_search_threshold")]
     pub tool_search_threshold: usize,
     /// Expose only plug meta-tools instead of the full merged tool catalog.
+    /// Deprecated compatibility input; `lazy_tools` is the controlling policy model.
     #[serde(default)]
     pub meta_tool_mode: bool,
+    /// Client-targeted lazy discovery policy.
+    #[serde(default)]
+    pub lazy_tools: LazyToolsConfig,
     /// Priority tools served first when filtering (tool names).
     #[serde(default)]
     pub priority_tools: Vec<String>,
@@ -62,6 +67,7 @@ impl Default for Config {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: LazyToolsConfig::default(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
             http: HttpConfig::default(),
@@ -69,6 +75,126 @@ impl Default for Config {
             servers: HashMap::new(),
         }
     }
+}
+
+/// Lazy tool discovery policy configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LazyToolsConfig {
+    /// Global policy. `auto` uses the client capability matrix.
+    pub mode: LazyToolSetting,
+    /// Per-client target overrides keyed by export target slug, e.g. `opencode`.
+    pub clients: HashMap<String, LazyToolSetting>,
+}
+
+impl LazyToolsConfig {
+    pub fn has_override_for_target(&self, target: &str) -> bool {
+        self.clients.contains_key(target)
+    }
+}
+
+pub fn default_lazy_tool_mode_for_client(client_type: crate::types::ClientType) -> LazyToolMode {
+    match client_type {
+        crate::types::ClientType::ClaudeCode
+        | crate::types::ClientType::Cursor
+        | crate::types::ClientType::CodexCli => LazyToolMode::Native,
+        crate::types::ClientType::OpenCode => LazyToolMode::Bridge,
+        crate::types::ClientType::ClaudeDesktop
+        | crate::types::ClientType::Windsurf
+        | crate::types::ClientType::VSCodeCopilot
+        | crate::types::ClientType::GeminiCli
+        | crate::types::ClientType::Zed
+        | crate::types::ClientType::Unknown => LazyToolMode::Standard,
+    }
+}
+
+pub fn default_lazy_tool_mode_for_target(target: &str) -> LazyToolMode {
+    lazy_tool_client_type_for_target(target)
+        .map(default_lazy_tool_mode_for_client)
+        .unwrap_or(LazyToolMode::Standard)
+}
+
+pub fn lazy_tool_client_type_for_target(target: &str) -> Option<crate::types::ClientType> {
+    match target {
+        "claude-code" => Some(crate::types::ClientType::ClaudeCode),
+        "claude-desktop" => Some(crate::types::ClientType::ClaudeDesktop),
+        "cursor" => Some(crate::types::ClientType::Cursor),
+        "windsurf" => Some(crate::types::ClientType::Windsurf),
+        "vscode" => Some(crate::types::ClientType::VSCodeCopilot),
+        "gemini-cli" => Some(crate::types::ClientType::GeminiCli),
+        "codex-cli" => Some(crate::types::ClientType::CodexCli),
+        "opencode" => Some(crate::types::ClientType::OpenCode),
+        "zed" => Some(crate::types::ClientType::Zed),
+        _ => None,
+    }
+}
+
+pub fn lazy_tool_policy_reason(mode: LazyToolMode, origin: LazyToolModeOrigin) -> &'static str {
+    match origin {
+        LazyToolModeOrigin::ClientOverride => "configured for this client target",
+        LazyToolModeOrigin::GlobalOverride => "configured globally for all client targets",
+        LazyToolModeOrigin::LegacyMetaToolMode => "mapped from deprecated meta_tool_mode = true",
+        LazyToolModeOrigin::AutoDefault => match mode {
+            LazyToolMode::Standard => {
+                "default full-tool behavior for clients without a proven lazy discovery path"
+            }
+            LazyToolMode::Native => "client has its own native lazy/deferred tool discovery",
+            LazyToolMode::Bridge => "client benefits from plug-owned search/load bridge discovery",
+        },
+    }
+}
+
+pub fn resolve_lazy_tool_policy(
+    config: &Config,
+    client_type: crate::types::ClientType,
+) -> ResolvedLazyToolPolicy {
+    let target = client_type.target_slug();
+    resolve_lazy_tool_policy_for_target(config, target.unwrap_or("unknown"))
+}
+
+pub fn resolve_lazy_tool_policy_for_target(
+    config: &Config,
+    target: &str,
+) -> ResolvedLazyToolPolicy {
+    resolve_lazy_tool_policy_from_settings(config.meta_tool_mode, &config.lazy_tools, target)
+}
+
+pub fn resolve_lazy_tool_policy_from_settings(
+    meta_tool_mode: bool,
+    lazy_tools: &LazyToolsConfig,
+    target: &str,
+) -> ResolvedLazyToolPolicy {
+    if let Some(setting) = lazy_tools.clients.get(target) {
+        if let Some(mode) = setting_to_mode(*setting) {
+            return resolved_policy(mode, LazyToolModeOrigin::ClientOverride);
+        }
+    }
+
+    if let Some(mode) = setting_to_mode(lazy_tools.mode) {
+        return resolved_policy(mode, LazyToolModeOrigin::GlobalOverride);
+    }
+
+    if meta_tool_mode {
+        return resolved_policy(LazyToolMode::Bridge, LazyToolModeOrigin::LegacyMetaToolMode);
+    }
+
+    resolved_policy(
+        default_lazy_tool_mode_for_target(target),
+        LazyToolModeOrigin::AutoDefault,
+    )
+}
+
+fn setting_to_mode(setting: LazyToolSetting) -> Option<LazyToolMode> {
+    match setting {
+        LazyToolSetting::Auto => None,
+        LazyToolSetting::Standard => Some(LazyToolMode::Standard),
+        LazyToolSetting::Native => Some(LazyToolMode::Native),
+        LazyToolSetting::Bridge => Some(LazyToolMode::Bridge),
+    }
+}
+
+fn resolved_policy(mode: LazyToolMode, origin: LazyToolModeOrigin) -> ResolvedLazyToolPolicy {
+    ResolvedLazyToolPolicy::new(mode, origin, lazy_tool_policy_reason(mode, origin))
 }
 
 /// HTTP server configuration.
@@ -401,6 +527,14 @@ pub fn validate_config(config: &Config) -> Vec<String> {
         errors.push("tool_search_threshold must be >= 10".to_string());
     }
 
+    for target in config.lazy_tools.clients.keys() {
+        if target.parse::<crate::export::ExportTarget>().is_err() {
+            errors.push(format!(
+                "lazy_tools.clients contains unknown client target '{target}'"
+            ));
+        }
+    }
+
     for (name, server) in &config.servers {
         if name.is_empty() {
             errors.push("server name must not be empty".to_string());
@@ -491,7 +625,9 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
 fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String> {
     let mut env_map: HashMap<String, String> = std::env::vars().collect();
-    env_map.extend(crate::dotenv::read_dotenv_vars_for_config(Some(config_path)));
+    env_map.extend(crate::dotenv::read_dotenv_vars_for_config(Some(
+        config_path,
+    )));
     env_map
 }
 
@@ -505,6 +641,9 @@ fn transform_env_expandable_strings(
 ) {
     config.log_level = transform(config.log_level.clone());
     config.prefix_delimiter = transform(config.prefix_delimiter.clone());
+    for (target, mode) in config.lazy_tools.clients.drain().collect::<Vec<_>>() {
+        config.lazy_tools.clients.insert(transform(target), mode);
+    }
     for tool in &mut config.priority_tools {
         *tool = transform(tool.clone());
     }
@@ -590,6 +729,9 @@ pub(crate) fn visit_env_expandable_fields(
 ) {
     visit(None, "log_level", &config.log_level);
     visit(None, "prefix_delimiter", &config.prefix_delimiter);
+    for target in config.lazy_tools.clients.keys() {
+        visit(None, "lazy_tools.clients.key", target);
+    }
     for tool in &config.priority_tools {
         visit(None, "priority_tools", tool);
     }
@@ -602,10 +744,18 @@ pub(crate) fn visit_env_expandable_fields(
         visit(None, "http.allowed_origins", origin);
     }
     if let Some(ref cert_path) = config.http.tls_cert_path {
-        visit(None, "http.tls_cert_path", cert_path.to_string_lossy().as_ref());
+        visit(
+            None,
+            "http.tls_cert_path",
+            cert_path.to_string_lossy().as_ref(),
+        );
     }
     if let Some(ref key_path) = config.http.tls_key_path {
-        visit(None, "http.tls_key_path", key_path.to_string_lossy().as_ref());
+        visit(
+            None,
+            "http.tls_key_path",
+            key_path.to_string_lossy().as_ref(),
+        );
     }
     if let Some(ref public_base_url) = config.http.public_base_url {
         visit(None, "http.public_base_url", public_base_url);
@@ -704,7 +854,9 @@ pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figm
         .extract()?;
 
     let mut vars = Vec::new();
-    visit_env_expandable_strings(&config, |value| vars.extend(expand::extract_env_refs(value)));
+    visit_env_expandable_strings(&config, |value| {
+        vars.extend(expand::extract_env_refs(value))
+    });
     vars.sort();
     vars.dedup();
     Ok(vars)
@@ -786,6 +938,12 @@ mod tests {
         assert_eq!(cfg.prefix_delimiter, "__");
         assert!(cfg.enable_prefix);
         assert_eq!(cfg.startup_concurrency, 3);
+        assert_eq!(cfg.lazy_tools.mode, LazyToolSetting::Auto);
+        assert!(cfg.lazy_tools.clients.is_empty());
+        assert_eq!(
+            resolve_lazy_tool_policy_for_target(&cfg, "opencode").mode,
+            LazyToolMode::Bridge
+        );
         assert!(cfg.disabled_tools.is_empty());
         assert!(cfg.servers.is_empty());
     }
@@ -842,6 +1000,79 @@ mod tests {
     }
 
     #[test]
+    fn lazy_tool_policy_loads_global_and_client_overrides() {
+        let cfg = config_from_toml(
+            r#"
+            [lazy_tools]
+            mode = "standard"
+
+            [lazy_tools.clients]
+            opencode = "bridge"
+            "claude-code" = "native"
+            "#,
+        );
+
+        assert_eq!(cfg.lazy_tools.mode, LazyToolSetting::Standard);
+        assert_eq!(
+            cfg.lazy_tools.clients.get("opencode"),
+            Some(&LazyToolSetting::Bridge)
+        );
+        assert_eq!(
+            resolve_lazy_tool_policy_for_target(&cfg, "opencode").mode,
+            LazyToolMode::Bridge
+        );
+        assert_eq!(
+            resolve_lazy_tool_policy_for_target(&cfg, "cursor").mode,
+            LazyToolMode::Standard
+        );
+    }
+
+    #[test]
+    fn lazy_tool_policy_defaults_by_client_capability() {
+        let cfg = Config::default();
+
+        let claude = resolve_lazy_tool_policy_for_target(&cfg, "claude-code");
+        assert_eq!(claude.mode, LazyToolMode::Native);
+        assert_eq!(claude.origin, LazyToolModeOrigin::AutoDefault);
+
+        let opencode = resolve_lazy_tool_policy_for_target(&cfg, "opencode");
+        assert_eq!(opencode.mode, LazyToolMode::Bridge);
+        assert_eq!(opencode.origin, LazyToolModeOrigin::AutoDefault);
+
+        let unknown = resolve_lazy_tool_policy_for_target(&cfg, "unknown-client");
+        assert_eq!(unknown.mode, LazyToolMode::Standard);
+        assert_eq!(unknown.origin, LazyToolModeOrigin::AutoDefault);
+    }
+
+    #[test]
+    fn lazy_tool_policy_client_override_does_not_affect_other_targets() {
+        let mut cfg = Config::default();
+        cfg.lazy_tools
+            .clients
+            .insert("opencode".to_string(), LazyToolSetting::Standard);
+
+        let opencode = resolve_lazy_tool_policy_for_target(&cfg, "opencode");
+        assert_eq!(opencode.mode, LazyToolMode::Standard);
+        assert_eq!(opencode.origin, LazyToolModeOrigin::ClientOverride);
+
+        let claude = resolve_lazy_tool_policy_for_target(&cfg, "claude-code");
+        assert_eq!(claude.mode, LazyToolMode::Native);
+        assert_eq!(claude.origin, LazyToolModeOrigin::AutoDefault);
+    }
+
+    #[test]
+    fn lazy_tool_policy_uses_legacy_meta_tool_mode_as_bridge_input() {
+        let cfg = Config {
+            meta_tool_mode: true,
+            ..Config::default()
+        };
+
+        let policy = resolve_lazy_tool_policy_for_target(&cfg, "claude-desktop");
+        assert_eq!(policy.mode, LazyToolMode::Bridge);
+        assert_eq!(policy.origin, LazyToolModeOrigin::LegacyMetaToolMode);
+    }
+
+    #[test]
     fn load_config_uses_dotenv_adjacent_to_active_config_path() {
         let dir = unique_temp_dir("dotenv-adjacent");
         let config_path = dir.join("config.toml");
@@ -862,7 +1093,9 @@ mod tests {
 
         let cfg = load_config(Some(&config_path)).expect("load config with sibling dotenv");
         assert_eq!(
-            cfg.servers.get("demo").and_then(|server| server.url.as_deref()),
+            cfg.servers
+                .get("demo")
+                .and_then(|server| server.url.as_deref()),
             Some("https://env.example.com/mcp")
         );
     }
@@ -884,6 +1117,27 @@ mod tests {
         let err = load_config(Some(&config_path)).expect_err("semantic validation should fail");
         assert!(
             err.to_string().contains("auth_mode = \"none\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_unknown_lazy_tool_client_target() {
+        let dir = unique_temp_dir("lazy-policy-target");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [lazy_tools.clients]
+            "not-a-client" = "bridge"
+            "#,
+        )
+        .unwrap();
+
+        let err = load_config(Some(&config_path)).expect_err("unknown target should fail");
+        assert!(
+            err.to_string()
+                .contains("lazy_tools.clients contains unknown client target"),
             "unexpected error: {err}"
         );
     }

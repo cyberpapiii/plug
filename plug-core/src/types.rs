@@ -116,12 +116,112 @@ pub enum ClientType {
 }
 
 impl ClientType {
+    /// Stable config/export target slug for known clients.
+    pub fn target_slug(&self) -> Option<&'static str> {
+        match self {
+            ClientType::ClaudeCode => Some("claude-code"),
+            ClientType::ClaudeDesktop => Some("claude-desktop"),
+            ClientType::Cursor => Some("cursor"),
+            ClientType::Windsurf => Some("windsurf"),
+            ClientType::VSCodeCopilot => Some("vscode"),
+            ClientType::GeminiCli => Some("gemini-cli"),
+            ClientType::CodexCli => Some("codex-cli"),
+            ClientType::OpenCode => Some("opencode"),
+            ClientType::Zed => Some("zed"),
+            ClientType::Unknown => None,
+        }
+    }
+
     /// Returns the maximum number of tools this client supports, if known.
     pub fn tool_limit(&self) -> Option<usize> {
         match self {
             ClientType::Windsurf => Some(100),
             ClientType::VSCodeCopilot => Some(128),
             _ => None,
+        }
+    }
+}
+
+/// Operator-facing lazy discovery setting stored in config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LazyToolSetting {
+    /// Let plug choose from the client capability matrix.
+    #[default]
+    Auto,
+    /// Expose the full normal routed tool catalog, subject to existing client limits.
+    Standard,
+    /// Let the downstream client use its own native lazy/deferred tool mechanism.
+    Native,
+    /// Use plug's bridge tools to search, load, evict, then direct-call loaded tools.
+    Bridge,
+}
+
+impl LazyToolSetting {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Standard => "standard",
+            Self::Native => "native",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
+/// Concrete lazy discovery mode after defaults and overrides are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LazyToolMode {
+    Standard,
+    Native,
+    Bridge,
+}
+
+impl LazyToolMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Native => "native",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
+/// Why a lazy discovery mode was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LazyToolModeOrigin {
+    ClientOverride,
+    GlobalOverride,
+    LegacyMetaToolMode,
+    AutoDefault,
+}
+
+impl LazyToolModeOrigin {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ClientOverride => "client_override",
+            Self::GlobalOverride => "global_override",
+            Self::LegacyMetaToolMode => "legacy_meta_tool_mode",
+            Self::AutoDefault => "auto_default",
+        }
+    }
+}
+
+/// Resolved lazy discovery policy for a client target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedLazyToolPolicy {
+    pub mode: LazyToolMode,
+    pub origin: LazyToolModeOrigin,
+    pub reason: String,
+}
+
+impl ResolvedLazyToolPolicy {
+    pub fn new(mode: LazyToolMode, origin: LazyToolModeOrigin, reason: impl Into<String>) -> Self {
+        Self {
+            mode,
+            origin,
+            reason: reason.into(),
         }
     }
 }
