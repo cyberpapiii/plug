@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` @ `ab743da` (post tasks support, metadata enrichment, and review hardening)
+Baseline: `main` after PR #56 and the post-merge truth pass (lazy tool discovery v2)
 
 This is the canonical current-state doc for the project.
 
@@ -23,6 +23,7 @@ Implemented on `main`:
 - tool behavior/metadata enrichment for `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, and `execution.taskSupport`
 - canonical server/tool display metadata including server `title`, `icons`, and normalized tool titles
 - meta-tool mode
+- lazy tool discovery v2 with client-targeted lazy policy, OpenCode bridge search, bounded session working sets, and legacy `meta_tool_mode` compatibility
 - daemon-backed local sharing
 - reconnecting IPC proxy sessions
 - session-store seam / stateless prep
@@ -90,8 +91,6 @@ Partial on `main`:
 Candidate future state only:
 
 - `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, research docs), not mergeable whole-cloth
-- `codex/lazy-tool-discovery-v2` — exists off-main; candidate lazy tool discovery v2 branch with client-targeted lazy policy, OpenCode bridge search, bounded session working sets, and legacy `meta_tool_mode` compatibility
-
 Off-main work must not be described as current implementation.
 
 ## Release Status
@@ -106,6 +105,13 @@ On 2026-03-22, `main` absorbed the core MCP Tasks tranche and related follow-thr
 - prefers upstream task pass-through when supported, with proven wrapper-mode fallback
 - enriched tool semantics and branding metadata for downstream clients
 - closed the blocking review findings around monotonic task state, reconnect-stable IPC task ownership, and fail-closed pass-through dispatch
+
+On 2026-04-24, `main` absorbed lazy tool discovery v2 via PR #56:
+
+- added client-targeted lazy policy with native/bridge/disabled modes
+- added OpenCode bridge discovery as `plug__search_tools` followed by direct routed tool calls
+- bounded bridge session working sets so repeated searches cannot regrow to the full catalog
+- preserved legacy `meta_tool_mode` compatibility separately from bridge mode
 
 On 2026-03-16, the previously working branch/runtime line was reconciled into `main`, verified with
 the full test suite, and pushed as the new canonical baseline.

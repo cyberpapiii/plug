@@ -20,6 +20,7 @@ forwarding work:
 - capability synthesis (honest per-transport masking)
 - tool semantics enrichment (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `taskSupport`) and canonicalized branding/display metadata
 - meta-tool mode
+- lazy tool discovery v2 with client-targeted lazy policy, OpenCode bridge search, bounded session working sets, and legacy `meta_tool_mode` compatibility
 - end-to-end transport coverage
 - daemon continuity recovery (stdio clients via IPC proxy reconnect)
 - session-store abstraction seam and stateless design prep
@@ -60,6 +61,7 @@ The current product shape is:
 - transport-aware operator inventory that can rely on daemon truth directly when the background service is running, while still falling back cleanly during non-daemon foreground HTTP serving
 - targeted notification fan-out to stdio, HTTP, and daemon IPC (resource subscribe still unsupported over IPC)
 - meta-tool mode as an opt-in reduced discovery surface
+- client-targeted lazy tool discovery, including OpenCode bridge mode where agents search with `plug__search_tools` and then call loaded routed tools directly
 - downstream HTTP bearer token auth for non-loopback binding
 - downstream OAuth mode for remote/server-card based authorization flows
 - explicit runtime/auth/operator state vocabulary across `status`, `doctor`, `auth status`, `clients`, and `servers`
@@ -76,10 +78,19 @@ No required roadmap work remains for the current production-ready bar.
 
 Optional future scope only:
 
-- exists off-main: `codex/lazy-tool-discovery-v2` contains candidate lazy tool discovery v2 work with OpenCode bridge search, bounded session working sets, client-targeted lazy policy, and legacy `meta_tool_mode` compatibility. It is not current on `main` until merged.
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
+
+## 2026-04-24 Lazy Tool Discovery V2
+
+On 2026-04-24, `main` absorbed PR #56:
+
+- client-targeted lazy policy for native, bridge, and disabled modes
+- OpenCode bridge search with `plug__search_tools` as the only bridge meta tool
+- search-loaded routed tools that preserve native tool names for direct calls, approvals, and permissions
+- bounded per-session working sets and targeted list-change notifications
+- legacy `meta_tool_mode` retained as deprecated compatibility, separate from bridge mode
 
 ## 2026-03-22 Tasks Tranche
 

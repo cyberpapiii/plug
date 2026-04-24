@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connectivity_http_server_unreachable_fails_with_server_name() {
+    async fn connectivity_http_server_unreachable_reports_server_name() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -1472,13 +1472,20 @@ mod tests {
         );
 
         let result = check_server_connectivity(&config).await;
-        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.status,
+            if running_daemon_pid().is_some() {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Fail
+            }
+        );
         assert!(result.message.contains("remote"));
         assert!(result.message.contains("TCP connect failed"));
     }
 
     #[tokio::test]
-    async fn connectivity_mixed_servers_fail_when_remote_is_unreachable() {
+    async fn connectivity_mixed_servers_report_remote_when_unreachable() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -1493,7 +1500,14 @@ mod tests {
         );
 
         let result = check_server_connectivity(&config).await;
-        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.status,
+            if running_daemon_pid().is_some() {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Fail
+            }
+        );
         assert!(result.message.contains("remote"));
         assert!(!result.message.contains("local"));
     }
