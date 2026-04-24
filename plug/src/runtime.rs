@@ -273,6 +273,11 @@ fn build_configured_http_runtime(
                 tool_router.forward_roots_list_changed_to_upstreams().await;
             }
             tool_router.remove_client_log_level(&session_id);
+            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                plug_core::proxy::DownstreamTransport::Http,
+                &session_id,
+            );
+            tool_router.clear_lazy_session(&lazy_session_key);
             tool_router.unregister_downstream_bridge(&target);
         }
     });
@@ -470,9 +475,9 @@ async fn read_pending_or_matching_response(
     matcher: impl Fn(&plug_core::ipc::IpcResponse) -> Option<PendingIpcResponse>,
 ) -> anyhow::Result<PendingIpcResponse> {
     loop {
-        let frame = plug_core::ipc::read_frame(reader)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("daemon closed connection while waiting for response"))?;
+        let frame = plug_core::ipc::read_frame(reader).await?.ok_or_else(|| {
+            anyhow::anyhow!("daemon closed connection while waiting for response")
+        })?;
         let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)
             .map_err(|e| anyhow::anyhow!("invalid daemon response: {e}"))?;
 
@@ -566,11 +571,11 @@ pub(crate) async fn establish_daemon_proxy_session(
         &client_id,
         &mut pending_notifications,
         |response| match response {
-            plug_core::ipc::IpcResponse::Capabilities { capabilities } => serde_json::from_value(
-                capabilities.clone(),
-            )
-            .ok()
-            .map(PendingIpcResponse::Capabilities),
+            plug_core::ipc::IpcResponse::Capabilities { capabilities } => {
+                serde_json::from_value(capabilities.clone())
+                    .ok()
+                    .map(PendingIpcResponse::Capabilities)
+            }
             _ => None,
         },
     )
@@ -872,8 +877,8 @@ mod tests {
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::sync::OnceLock;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
@@ -1391,7 +1396,9 @@ mod tests {
             .await
             .expect_err("expected readiness wait to fail");
         assert!(
-            error.to_string().contains("daemon exited before becoming ready"),
+            error
+                .to_string()
+                .contains("daemon exited before becoming ready"),
             "unexpected readiness failure: {error}"
         );
 
@@ -1470,9 +1477,10 @@ mod tests {
 
         let daemon_engine = Arc::clone(&engine);
         let daemon_config_path = config_path.clone();
-        let daemon_handle = tokio::spawn(async move {
-            run_daemon(daemon_engine, daemon_config_path, 0, None).await
-        });
+        let daemon_handle =
+            tokio::spawn(
+                async move { run_daemon(daemon_engine, daemon_config_path, 0, None).await },
+            );
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         if daemon_handle.is_finished() {
@@ -1488,7 +1496,10 @@ mod tests {
         let started = ensure_daemon_with_feedback(Some(&config_path), false)
             .await
             .expect("ensure_daemon_with_feedback should succeed");
-        assert!(!started, "already-running daemon should not report fresh start");
+        assert!(
+            !started,
+            "already-running daemon should not report fresh start"
+        );
 
         engine.shutdown().await;
         let daemon_result = tokio::time::timeout(Duration::from_secs(5), daemon_handle)

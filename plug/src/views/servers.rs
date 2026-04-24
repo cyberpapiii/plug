@@ -290,18 +290,18 @@ pub(crate) async fn cmd_server_list(
                 }
             } else {
                 println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "runtime_available": false,
-                            "status_source": if availability.daemon_reachable() {
-                                "ipc_unavailable"
-                            } else {
-                                "config_only"
-                            },
-                            "daemon_running": availability.daemon_reachable(),
-                            "servers": config.servers,
-                        }))?
-                    );
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "runtime_available": false,
+                        "status_source": if availability.daemon_reachable() {
+                            "ipc_unavailable"
+                        } else {
+                            "config_only"
+                        },
+                        "daemon_running": availability.daemon_reachable(),
+                        "servers": config.servers,
+                    }))?
+                );
                 return Ok(());
             }
         }

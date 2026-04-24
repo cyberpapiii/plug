@@ -36,8 +36,8 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
     CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
-    ElicitationCapability, FormElicitationCapability, Implementation, SamplingCapability,
-    ReadResourceRequestParams, ResourceContents, SamplingMessage, UrlElicitationCapability,
+    ElicitationCapability, FormElicitationCapability, Implementation, ReadResourceRequestParams,
+    ResourceContents, SamplingCapability, SamplingMessage, UrlElicitationCapability,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::auth::CredentialStore;
@@ -64,12 +64,7 @@ fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
     token.set_refresh_token(Some(RefreshToken::new(refresh.to_string())));
     token.set_expires_in(Some(&Duration::from_secs(3600)));
 
-    StoredCredentials {
-        client_id: "test-client".to_string(),
-        token_response: Some(token),
-        granted_scopes: vec![],
-        token_received_at: Some(0),
-    }
+    StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(0))
 }
 
 fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
@@ -232,7 +227,10 @@ impl MockStatelessOauthProvider {
                 axum::routing::get(mock_oauth_authorize_handler),
             )
             .route("/token", axum::routing::post(mock_oauth_token_handler))
-            .route("/mcp", axum::routing::post(mock_stateless_oauth_mcp_handler))
+            .route(
+                "/mcp",
+                axum::routing::post(mock_stateless_oauth_mcp_handler),
+            )
             .with_state(MockOAuthProviderState {
                 base_url: base_url.clone(),
                 shared: Arc::clone(&shared),
@@ -300,7 +298,10 @@ impl MockToolListFailureOauthProvider {
                 axum::routing::get(mock_oauth_authorize_handler),
             )
             .route("/token", axum::routing::post(mock_oauth_token_handler))
-            .route("/mcp", axum::routing::post(mock_tool_list_failure_oauth_mcp_handler))
+            .route(
+                "/mcp",
+                axum::routing::post(mock_tool_list_failure_oauth_mcp_handler),
+            )
             .with_state(MockOAuthProviderState {
                 base_url: base_url.clone(),
                 shared: Arc::clone(&shared),
@@ -1226,6 +1227,7 @@ async fn test_proxy_handler_refresh_tools_empty() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: plug_core::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         },
@@ -1253,6 +1255,7 @@ fn test_proxy_handler_get_info() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: plug_core::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         },
@@ -1295,6 +1298,7 @@ fn test_resources_capability_present() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: plug_core::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         },
@@ -1321,6 +1325,7 @@ fn test_prompts_not_advertised() {
             tool_description_max_chars: None,
             tool_search_threshold: 50,
             meta_tool_mode: false,
+            lazy_tools: plug_core::config::LazyToolsConfig::default(),
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         },
@@ -2686,12 +2691,10 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
             .expect("discover metadata");
         auth_manager.set_metadata(metadata);
         auth_manager
-            .configure_client(OAuthClientConfig {
-                client_id: "test-client".to_string(),
-                client_secret: None,
-                scopes: vec!["read".to_string()],
-                redirect_uri: "http://localhost:0/callback".to_string(),
-            })
+            .configure_client(
+                OAuthClientConfig::new("test-client".to_string(), "http://localhost:0/callback")
+                    .with_scopes(vec!["read".to_string()]),
+            )
             .expect("configure oauth client");
 
         let authorize_url = auth_manager
@@ -2997,15 +3000,16 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                     .cloned()
                     .map(|status| (status.server_id.clone(), status))
                     .collect();
-                let healthy_ready = status_map
-                    .get(&oauth_healthy)
-                    .is_some_and(|s| s.auth_status == "oauth" && s.health == plug_core::types::ServerHealth::Healthy);
-                let required_ready = status_map
-                    .get(&oauth_auth_required)
-                    .is_some_and(|s| s.auth_status == "auth-required" && s.health == plug_core::types::ServerHealth::AuthRequired);
-                let stdio_ready = status_map
-                    .get("stdio")
-                    .is_some_and(|s| s.health == plug_core::types::ServerHealth::Healthy && s.tool_count == 1);
+                let healthy_ready = status_map.get(&oauth_healthy).is_some_and(|s| {
+                    s.auth_status == "oauth" && s.health == plug_core::types::ServerHealth::Healthy
+                });
+                let required_ready = status_map.get(&oauth_auth_required).is_some_and(|s| {
+                    s.auth_status == "auth-required"
+                        && s.health == plug_core::types::ServerHealth::AuthRequired
+                });
+                let stdio_ready = status_map.get("stdio").is_some_and(|s| {
+                    s.health == plug_core::types::ServerHealth::Healthy && s.tool_count == 1
+                });
                 if healthy_ready && required_ready && stdio_ready {
                     break statuses;
                 }
@@ -3080,10 +3084,7 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
     let provider = MockStatelessOauthProvider::start().await;
     let server_name = format!("oauth-stateless-{}", std::process::id());
     let store = oauth::get_or_create_store(&server_name);
-    store
-        .clear()
-        .await
-        .expect("clear OAuth store before test");
+    store.clear().await.expect("clear OAuth store before test");
     store
         .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
         .await
@@ -3123,7 +3124,10 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
         let statuses = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let statuses = started_engine.server_statuses();
-                if statuses.iter().any(|status| status.server_id == server_name) {
+                if statuses
+                    .iter()
+                    .any(|status| status.server_id == server_name)
+                {
                     break statuses;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3138,7 +3142,10 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
             .expect("server status present");
         assert_eq!(status.health, plug_core::types::ServerHealth::Healthy);
         assert_eq!(status.auth_status, "oauth");
-        assert_eq!(status.tool_count, 1, "stateless upstream should expose tools");
+        assert_eq!(
+            status.tool_count, 1,
+            "stateless upstream should expose tools"
+        );
 
         let snapshot = provider.shared.lock().await;
         assert!(
@@ -3169,10 +3176,7 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
     let provider = MockToolListFailureOauthProvider::start().await;
     let server_name = format!("oauth-startup-failure-{}", std::process::id());
     let store = oauth::get_or_create_store(&server_name);
-    store
-        .clear()
-        .await
-        .expect("clear OAuth store before test");
+    store.clear().await.expect("clear OAuth store before test");
     store
         .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
         .await
@@ -3256,10 +3260,7 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
         uuid::Uuid::new_v4().simple()
     );
     let store = oauth::get_or_create_store(&server_name);
-    store
-        .clear()
-        .await
-        .expect("clear OAuth store before test");
+    store.clear().await.expect("clear OAuth store before test");
     store
         .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
         .await
@@ -3357,10 +3358,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
         uuid::Uuid::new_v4().simple()
     );
     let store = oauth::get_or_create_store(&server_name);
-    store
-        .clear()
-        .await
-        .expect("clear OAuth store before test");
+    store.clear().await.expect("clear OAuth store before test");
     store
         .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
         .await
@@ -3450,10 +3448,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
         uuid::Uuid::new_v4().simple()
     );
     let store = oauth::get_or_create_store(&server_name);
-    store
-        .clear()
-        .await
-        .expect("clear OAuth store before test");
+    store.clear().await.expect("clear OAuth store before test");
     store
         .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
         .await

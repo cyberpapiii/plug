@@ -72,8 +72,13 @@ pub(crate) async fn cmd_tool_list(
             },
         )
         .await;
-        let config = load_editable_config(config_path).ok().map(|(_, config)| config);
-        let configured_server_count = config.as_ref().map(|config| config.servers.len()).unwrap_or(0);
+        let config = load_editable_config(config_path)
+            .ok()
+            .map(|(_, config)| config);
+        let configured_server_count = config
+            .as_ref()
+            .map(|config| config.servers.len())
+            .unwrap_or(0);
         let runtime_available = status_availability.runtime_available();
         let runtime_servers = runtime_status.unwrap_or_default();
         let (tools_availability, tools_result) = daemon_query(
@@ -135,8 +140,8 @@ pub(crate) async fn cmd_tool_list(
                     })
                     .collect();
                 println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
                         "runtime_available": inventory_available,
                         "status_source": inventory_availability.status_source(),
                         "tool_count": all_tools.len(),
@@ -268,7 +273,10 @@ pub(crate) async fn cmd_tool_list(
 mod tests {
     use super::*;
 
-    fn server_status(server_id: &str, health: plug_core::types::ServerHealth) -> plug_core::types::ServerStatus {
+    fn server_status(
+        server_id: &str,
+        health: plug_core::types::ServerHealth,
+    ) -> plug_core::types::ServerStatus {
         plug_core::types::ServerStatus {
             server_id: server_id.to_string(),
             health,

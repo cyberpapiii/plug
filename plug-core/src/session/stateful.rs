@@ -201,7 +201,10 @@ impl StatefulSessionStore {
 
 impl SessionStore for StatefulSessionStore {
     fn create_session(&self) -> Result<String, HttpError> {
-        let _guard = self.admission_lock.lock().expect("session admission mutex poisoned");
+        let _guard = self
+            .admission_lock
+            .lock()
+            .expect("session admission mutex poisoned");
         self.prune_expired_sessions();
         if self.sessions.len() >= self.max_sessions {
             return Err(HttpError::TooManySessions);
@@ -540,9 +543,10 @@ mod tests {
         store.set_sse_sender(&id, tx).unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
-        store.broadcast(crate::session::SseMessage::from_json_value(
-            serde_json::json!({"type": "test"}),
-        ).unwrap());
+        store.broadcast(
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "test"}))
+                .unwrap(),
+        );
 
         assert!(store.validate(&id).is_err());
         assert!(rx.try_recv().is_err());
@@ -560,14 +564,18 @@ mod tests {
         store.set_sse_sender(&fast_id, fast_tx).unwrap();
 
         slow_tx
-            .try_send(crate::session::SseMessage::from_json_value(
-                serde_json::json!({"type": "already-buffered"}),
-            ).unwrap())
+            .try_send(
+                crate::session::SseMessage::from_json_value(
+                    serde_json::json!({"type": "already-buffered"}),
+                )
+                .unwrap(),
+            )
             .unwrap();
 
-        store.broadcast(crate::session::SseMessage::from_json_value(
-            serde_json::json!({"type": "broadcast"}),
-        ).unwrap());
+        store.broadcast(
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "broadcast"}))
+                .unwrap(),
+        );
 
         let received = tokio::time::timeout(Duration::from_secs(1), fast_rx.recv())
             .await
@@ -583,17 +591,18 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx.clone()).unwrap();
-        tx.try_send(crate::session::SseMessage::from_json_value(
-            serde_json::json!({"type": "already-buffered"}),
-        ).unwrap())
-            .unwrap();
+        tx.try_send(
+            crate::session::SseMessage::from_json_value(
+                serde_json::json!({"type": "already-buffered"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         store.send_to_session(
             &id,
-            crate::session::SseMessage::from_json_value(
-                serde_json::json!({"type": "requeued"}),
-            )
-            .unwrap(),
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "requeued"}))
+                .unwrap(),
         );
 
         let (new_tx, mut new_rx) = mpsc::channel(1);

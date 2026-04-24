@@ -90,6 +90,7 @@ Partial on `main`:
 Candidate future state only:
 
 - `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, research docs), not mergeable whole-cloth
+- `codex/lazy-tool-discovery-v2` — exists off-main; candidate lazy tool discovery v2 branch with client-targeted lazy policy, OpenCode bridge search, bounded session working sets, and legacy `meta_tool_mode` compatibility
 
 Off-main work must not be described as current implementation.
 

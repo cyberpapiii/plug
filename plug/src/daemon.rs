@@ -774,10 +774,20 @@ async fn handle_ipc_connection(
                 .await;
         }
         ctx.engine.tool_router().remove_client_log_level(session_id);
+        let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+            plug_core::proxy::DownstreamTransport::Stdio,
+            session_id,
+        );
+        ctx.engine
+            .tool_router()
+            .clear_lazy_session(&lazy_session_key);
         if let Some(client_id) = removed_client_id {
             if !ctx.client_registry.client_sessions.contains_key(&client_id) {
                 let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                ctx.engine.tool_router().cleanup_tasks_for_owner(&owner).await;
+                ctx.engine
+                    .tool_router()
+                    .cleanup_tasks_for_owner(&owner)
+                    .await;
             }
         }
     }
@@ -1093,6 +1103,17 @@ async fn send_ipc_control_notification(
                 .await
                 .ok();
         }
+        Ok(ProtocolNotification::ToolListChangedFor { target }) => {
+            if matches!(
+                target,
+                NotificationTarget::Stdio { client_id: ref target_id }
+                    if session_id.is_some_and(|sid| target_id.as_ref() == sid)
+            ) {
+                ipc::send_response(writer, &IpcResponse::ToolListChangedNotification)
+                    .await
+                    .ok();
+            }
+        }
         Ok(ProtocolNotification::ResourceListChanged) => {
             ipc::send_response(writer, &IpcResponse::ResourceListChangedNotification)
                 .await
@@ -1287,7 +1308,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                             changed = report.changed.len(),
                             "config reloaded via IPC"
                         );
-                        IpcResponse::Ok
+                        IpcResponse::Reloaded { report }
                     }
                     Err(e) => IpcResponse::Error {
                         code: "RELOAD_FAILED".to_string(),
@@ -1348,6 +1369,28 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     new_session_id = %registration.session_id,
                     "client transport session replaced"
                 );
+                let target = plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from(replaced_session_id.as_str()),
+                };
+                ctx.engine
+                    .tool_router()
+                    .unregister_downstream_bridge(&target);
+                if ctx.engine.tool_router().clear_roots_for_target(&target) {
+                    ctx.engine
+                        .tool_router()
+                        .forward_roots_list_changed_to_upstreams()
+                        .await;
+                }
+                ctx.engine
+                    .tool_router()
+                    .remove_client_log_level(replaced_session_id);
+                let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                    plug_core::proxy::DownstreamTransport::Stdio,
+                    replaced_session_id,
+                );
+                ctx.engine
+                    .tool_router()
+                    .clear_lazy_session(&lazy_session_key);
             }
             let session_id = registration.session_id;
             ctx.session_id = Some(session_id.clone());
@@ -1401,14 +1444,24 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if ctx.engine.tool_router().clear_roots_for_target(&target) {
                 ctx.engine
                     .tool_router()
-                .forward_roots_list_changed_to_upstreams()
-                .await;
+                    .forward_roots_list_changed_to_upstreams()
+                    .await;
             }
             ctx.engine.tool_router().remove_client_log_level(session_id);
+            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                plug_core::proxy::DownstreamTransport::Stdio,
+                session_id,
+            );
+            ctx.engine
+                .tool_router()
+                .clear_lazy_session(&lazy_session_key);
             if let Some(client_id) = removed_client_id {
                 if !ctx.client_registry.client_sessions.contains_key(&client_id) {
                     let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                    ctx.engine.tool_router().cleanup_tasks_for_owner(&owner).await;
+                    ctx.engine
+                        .tool_router()
+                        .cleanup_tasks_for_owner(&owner)
+                        .await;
                 }
             }
             ctx.session_id = None;
@@ -1523,7 +1576,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session is no longer active for this client".to_string(),
                 };
             }
-            let mut caps = ctx.engine.tool_router().synthesized_capabilities();
+            let client_type = ctx
+                .client_registry
+                .client_info(session_id)
+                .map(|info| plug_core::client_detect::detect_client(&info))
+                .unwrap_or(plug_core::types::ClientType::Unknown);
+            let mut caps = ctx
+                .engine
+                .tool_router()
+                .synthesized_capabilities_for_client(client_type);
             // IPC clients cannot subscribe to resources (no long-lived push
             // channel for targeted ResourceUpdated delivery), so mask that.
             if let Some(ref mut resources) = caps.resources {
@@ -1779,12 +1840,7 @@ async fn dispatch_inject_token(
         refresh_token.is_some(),
     );
 
-    let stored = StoredCredentials {
-        client_id,
-        token_response: Some(token),
-        granted_scopes: vec![],
-        token_received_at: Some(now),
-    };
+    let stored = StoredCredentials::new(client_id, Some(token), vec![], Some(now));
 
     if let Err(e) = store.save(stored).await {
         return IpcResponse::Error {
@@ -1857,7 +1913,15 @@ async fn dispatch_mcp_request(
 
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let result = tool_router.list_tools_page_for_client(client_type, request);
+            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+                plug_core::proxy::DownstreamTransport::Stdio,
+                session_id,
+            );
+            let result = tool_router.list_tools_page_for_client_session(
+                client_type,
+                Some(&lazy_session_key),
+                request,
+            );
             match serde_json::to_value(result) {
                 Ok(payload) => IpcResponse::McpResponse { payload },
                 Err(e) => IpcResponse::Error {
@@ -2072,6 +2136,11 @@ async fn dispatch_mcp_request(
 
             // Build downstream context so the ToolRouter can route reverse
             // requests (elicitation, sampling) back to this IPC client.
+            let client_type = ctx
+                .client_registry
+                .client_info(session_id)
+                .map(|info| plug_core::client_detect::detect_client(&info))
+                .unwrap_or(plug_core::types::ClientType::Unknown);
             let downstream_ctx = {
                 use plug_core::proxy::DownstreamCallContext;
                 use rmcp::model::NumberOrString;
@@ -2080,9 +2149,10 @@ async fn dispatch_mcp_request(
                 let request_id = RequestId::from(NumberOrString::String(Arc::from(
                     format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
                 )));
-                Some(DownstreamCallContext::stdio(
+                Some(DownstreamCallContext::stdio_for_client(
                     Arc::from(session_id),
                     request_id,
+                    client_type,
                 ))
             };
 
@@ -2099,7 +2169,7 @@ async fn dispatch_mcp_request(
                 let arguments = call_params.arguments;
                 match tool_router
                     .clone()
-                    .enqueue_tool_task(&tool_name, arguments, progress_token, owner)
+                    .enqueue_tool_task(&tool_name, arguments, progress_token, owner, downstream_ctx)
                     .await
                 {
                     Ok(result) => match serde_json::to_value(result) {
@@ -2515,12 +2585,12 @@ mod tests {
         token.set_refresh_token(Some(RefreshToken::new("refresh-token".to_string())));
         token.set_expires_in(Some(&Duration::from_secs(3600)));
 
-        StoredCredentials {
-            client_id: "test-client".to_string(),
-            token_response: Some(token),
-            granted_scopes: vec!["read".to_string()],
-            token_received_at: Some(0),
-        }
+        StoredCredentials::new(
+            "test-client".to_string(),
+            Some(token),
+            vec!["read".to_string()],
+            Some(0),
+        )
     }
 
     fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
@@ -2665,7 +2735,8 @@ mod tests {
         let result = run_daemon(engine, config_path, 0, None).await;
         assert!(result.is_err(), "losing concurrent start should fail");
 
-        let token_after = std::fs::read_to_string(&token_file).expect("read token after failed start");
+        let token_after =
+            std::fs::read_to_string(&token_file).expect("read token after failed start");
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
@@ -3260,6 +3331,37 @@ mod tests {
         assert!(
             matches!(resp, Some(IpcResponse::ToolListChangedNotification)),
             "expected ToolListChangedNotification, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_routes_targeted_tool_list_changed() {
+        let matching = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::ToolListChangedFor {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: std::sync::Arc::from("sess-1"),
+                },
+            },
+            Some("sess-1"),
+        )
+        .await;
+        assert!(
+            matches!(matching, Some(IpcResponse::ToolListChangedNotification)),
+            "expected targeted ToolListChangedNotification, got: {matching:?}"
+        );
+
+        let non_matching = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::ToolListChangedFor {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: std::sync::Arc::from("sess-2"),
+                },
+            },
+            Some("sess-1"),
+        )
+        .await;
+        assert!(
+            non_matching.is_none(),
+            "expected non-matching targeted notification to be filtered, got: {non_matching:?}"
         );
     }
 

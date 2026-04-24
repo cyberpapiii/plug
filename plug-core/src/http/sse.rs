@@ -199,9 +199,14 @@ mod tests {
         let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = std::sync::Arc::clone(&heartbeats);
 
-        let sse = sse_stream_with_heartbeat_interval(rx, cancel.clone(), Duration::from_millis(10), move || {
-            seen.fetch_add(1, Ordering::SeqCst);
-        });
+        let sse = sse_stream_with_heartbeat_interval(
+            rx,
+            cancel.clone(),
+            Duration::from_millis(10),
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+        );
         let response = sse.into_response();
         let body = response.into_body();
 

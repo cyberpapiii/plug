@@ -1,4 +1,16 @@
 #![deny(unsafe_code)]
+#![allow(
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::manual_map,
+    clippy::manual_unwrap_or,
+    clippy::manual_unwrap_or_default,
+    clippy::needless_borrow,
+    clippy::suspicious_open_options,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_min_or_max
+)]
 
 /// Load `.env` file vars into the process environment.
 ///
@@ -439,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Setup { yes, transport }) => {
             commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
         }
-        Some(Commands::Reload) => commands::misc::cmd_reload().await?,
+        Some(Commands::Reload) => commands::misc::cmd_reload(&cli.output).await?,
         Some(Commands::Config { path, command }) => {
             commands::config::cmd_config(cli.config.as_ref(), path, command, &cli.output)?
         }

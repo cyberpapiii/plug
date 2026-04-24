@@ -17,6 +17,7 @@ repo-local truth and drift-prevention layer on top of CE, not a replacement for 
 - every current-state claim must be supportable by code and, where relevant, tests
 - plans describe intended work, not current truth
 - branch-scoped docs must explicitly say they describe branch state
+- roadmap-affecting branch work may be listed only as `exists off-main` until merged
 - historical docs must not be presented as current-state references
 
 ## Agent Rules

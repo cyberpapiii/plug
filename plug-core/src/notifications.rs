@@ -15,6 +15,9 @@ use rmcp::model::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolNotification {
     ToolListChanged,
+    ToolListChangedFor {
+        target: NotificationTarget,
+    },
     ResourceListChanged,
     PromptListChanged,
     Progress {
@@ -98,7 +101,8 @@ impl ProtocolNotification {
     /// Convert the internal notification to a server-to-client JSON-RPC message.
     pub fn to_server_jsonrpc_message(&self) -> ServerJsonRpcMessage {
         match self {
-            ProtocolNotification::ToolListChanged => {
+            ProtocolNotification::ToolListChanged
+            | ProtocolNotification::ToolListChangedFor { .. } => {
                 ServerJsonRpcMessage::notification(ServerNotification::ToolListChangedNotification(
                     ToolListChangedNotification::default(),
                 ))

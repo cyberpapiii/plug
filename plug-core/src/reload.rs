@@ -159,6 +159,16 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     );
     note_restart_required(
         &mut restart_required,
+        old.meta_tool_mode != new.meta_tool_mode,
+        "meta_tool_mode changed",
+    );
+    note_restart_required(
+        &mut restart_required,
+        old.lazy_tools != new.lazy_tools,
+        "lazy_tools changed",
+    );
+    note_restart_required(
+        &mut restart_required,
         old.priority_tools != new.priority_tools,
         "priority_tools changed",
     );
@@ -320,7 +330,7 @@ pub async fn apply_reload(
 }
 
 /// Report of what happened during a reload.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReloadReport {
     pub added: Vec<String>,
     pub removed: Vec<String>,
@@ -439,6 +449,10 @@ mod tests {
             priority_tools: vec!["plug__search_tools".into()],
             tool_description_max_chars: Some(128),
             tool_filter_enabled: false,
+            lazy_tools: crate::config::LazyToolsConfig {
+                mode: crate::types::LazyToolSetting::Bridge,
+                clients: HashMap::new(),
+            },
             ..Config::default()
         };
 
@@ -459,6 +473,11 @@ mod tests {
             diff.restart_required
                 .iter()
                 .any(|item| item.contains("tool_filter_enabled"))
+        );
+        assert!(
+            diff.restart_required
+                .iter()
+                .any(|item| item.contains("lazy_tools"))
         );
     }
 

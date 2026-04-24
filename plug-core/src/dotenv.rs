@@ -99,11 +99,7 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
                         comment_idx = Some(idx);
                         break;
                     }
-                    if value[..idx]
-                        .chars()
-                        .last()
-                        .is_some_and(char::is_whitespace)
-                    {
+                    if value[..idx].chars().last().is_some_and(char::is_whitespace) {
                         comment_idx = Some(idx);
                         break;
                     }

@@ -600,7 +600,10 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
             .await;
-        assert!(matches!(first, Err(DownstreamOauthError::PkceVerificationFailed)));
+        assert!(matches!(
+            first,
+            Err(DownstreamOauthError::PkceVerificationFailed)
+        ));
 
         let second = manager
             .exchange_authorization_code(

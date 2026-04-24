@@ -215,7 +215,10 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
     let auth_response = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await;
 
     if daemon_reachable
-        && !matches!(status_response, Ok(plug_core::ipc::IpcResponse::Status { .. }))
+        && !matches!(
+            status_response,
+            Ok(plug_core::ipc::IpcResponse::Status { .. })
+        )
     {
         checks.push(plug_core::doctor::CheckResult {
             name: "runtime_availability".to_string(),
@@ -227,7 +230,10 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         });
     }
     if daemon_reachable
-        && !matches!(auth_response, Ok(plug_core::ipc::IpcResponse::AuthStatus { .. }))
+        && !matches!(
+            auth_response,
+            Ok(plug_core::ipc::IpcResponse::AuthStatus { .. })
+        )
     {
         checks.push(plug_core::doctor::CheckResult {
             name: "auth_availability".to_string(),
@@ -556,10 +562,25 @@ fn doctor_next_steps(checks: &[plug_core::doctor::CheckResult]) -> Vec<String> {
     steps
 }
 
-pub(crate) async fn cmd_reload() -> anyhow::Result<()> {
+pub(crate) async fn cmd_reload(output: &OutputFormat) -> anyhow::Result<()> {
     let auth = crate::daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Reload { auth_token: auth };
     match crate::daemon::ipc_request(&req).await? {
+        plug_core::ipc::IpcResponse::Reloaded { report } => {
+            if matches!(output, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.restart_required.is_empty() {
+                print_success_line("Config reloaded.");
+            } else {
+                print_success_line("Config reloaded with restart-required changes.");
+                for warning in report.restart_required {
+                    print_info_line(format!("Restart required: {warning}"));
+                }
+                print_info_line(
+                    "Run `plug stop` then `plug start` before relying on those changes in live sessions.",
+                );
+            }
+        }
         plug_core::ipc::IpcResponse::Ok => {}
         plug_core::ipc::IpcResponse::Error { code, message } => {
             anyhow::bail!("{code}: {message}");

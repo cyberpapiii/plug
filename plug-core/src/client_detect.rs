@@ -115,4 +115,11 @@ mod tests {
         assert_eq!(ClientType::Zed.to_string(), "Zed");
         assert_eq!(ClientType::Unknown.to_string(), "Unknown");
     }
+
+    #[test]
+    fn target_slug_maps_known_clients_to_config_targets() {
+        assert_eq!(ClientType::ClaudeCode.target_slug(), Some("claude-code"));
+        assert_eq!(ClientType::OpenCode.target_slug(), Some("opencode"));
+        assert_eq!(ClientType::Unknown.target_slug(), None);
+    }
 }
