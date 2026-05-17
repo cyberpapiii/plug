@@ -39,6 +39,8 @@ dist build --artifacts=global
 dist build --artifacts=local --target aarch64-apple-darwin
 ```
 
+These commands can produce large local artifacts. Use `scripts/clean-build-artifacts.sh` to inspect generated cleanup candidates and `scripts/clean-build-artifacts.sh --yes` after a release pass when the local build output is no longer needed.
+
 ## Multiplexor Mental Model
 
 Plug is not a leaf MCP server. It owns behavior that a normal single server does not:

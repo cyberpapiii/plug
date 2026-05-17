@@ -523,3 +523,17 @@ Remaining:
 
 - GitHub release artifacts and the Homebrew tap still need a release cut through cargo-dist.
 - The pre-existing unrelated `.letta/claude/*` deletions remain unstaged.
+
+## 2026-05-17 local artifact cleanup
+
+Shipped:
+
+- Removed generated Cargo build output with `cargo clean`; Cargo reported `66.3GiB` removed.
+- Removed stale temporary Plug install/audit directories under `/tmp`.
+- Added `scripts/clean-build-artifacts.sh`, a dry-run-by-default cleanup helper for repo `target/`, `/tmp/plug-*`, and optional runtime artifact cache cleanup.
+- Documented the cleanup helper in `docs/OPERATOR-GUIDE.md` and `CONTRIBUTING.md`.
+
+Kept:
+
+- `~/Library/Application Support/plug` was left intact because it contains live config, OAuth tokens, sockets, PID files, and operator tokens.
+- `~/Library/Caches/plug/artifacts` was left intact by default because it stores recent `plug://artifact/...` result files; the new cleanup script can remove it explicitly with `--runtime-cache`.

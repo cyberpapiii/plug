@@ -206,3 +206,17 @@ dist build --artifacts=local --target aarch64-apple-darwin
 ```
 
 Publish order matters for crates.io: publish `plug-core` before `plug-mcp`, because the CLI package depends on the library package by version. The public install command is `cargo install plug-mcp --locked`; use `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked` only when validating unreleased `main` builds.
+
+Build, package, and install checks can leave large generated directories behind. Before or after a release pass, inspect cleanup candidates with:
+
+```sh
+scripts/clean-build-artifacts.sh
+```
+
+Then clean build/deploy artifacts with:
+
+```sh
+scripts/clean-build-artifacts.sh --yes
+```
+
+Use `--runtime-cache` only when old `plug://artifact/...` result files are no longer needed. The cleanup script never removes Plug config, OAuth tokens, sockets, PID files, or installed binaries.
