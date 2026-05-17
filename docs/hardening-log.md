@@ -506,3 +506,20 @@ Shipped:
 Still blocked:
 
 - crates.io publish still needs a token. The package name remains `plug-mcp`; publish order remains `plug-core` first, then `plug-mcp`.
+
+## 2026-05-17 crates.io publish completion
+
+Shipped:
+
+- Created and saved a crates.io publish token locally with `cargo login`.
+- Added and verified `robdezendorf@gmail.com` on the crates.io account.
+- Published `plug-core 0.1.0` to crates.io.
+- Published `plug-mcp 0.1.0` to crates.io after `plug-core` became available.
+- Verified the public install path with `cargo install plug-mcp --locked --root /tmp/plug-crates-install --force`.
+- Verified the installed binary with `/tmp/plug-crates-install/bin/plug --version`, which returned `plug 0.1.0`.
+- Updated README, user stories, operator guide, and the audit distribution row so crates.io is now the primary Cargo install path and GitHub install is the unreleased-main fallback.
+
+Remaining:
+
+- GitHub release artifacts and the Homebrew tap still need a release cut through cargo-dist.
+- The pre-existing unrelated `.letta/claude/*` deletions remain unstaged.

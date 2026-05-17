@@ -15,7 +15,15 @@ OpenCode ─────┘
 
 ## Installation
 
+### Cargo
+
+```sh
+cargo install plug-mcp --locked
+```
+
 ### Cargo from GitHub
+
+Use this when you want the current `main` branch instead of the latest crates.io release:
 
 ```sh
 cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked
@@ -263,7 +271,7 @@ Notes:
 
 ## Design Principles
 
-1. **Single binary, zero dependencies** — `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked && plug`
+1. **Single binary, zero dependencies** — `cargo install plug-mcp --locked && plug`
 2. **Ruthlessly minimal** — if a feature can't be explained in one sentence, simplify it
 3. **Dual-audience UX** — every command works for humans (pretty) AND agents (`--output json`)
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering

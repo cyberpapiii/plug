@@ -205,4 +205,4 @@ dist build --artifacts=global
 dist build --artifacts=local --target aarch64-apple-darwin
 ```
 
-Publish order matters for crates.io: publish `plug-core` before `plug-mcp`, because the CLI package depends on the library package by version. Until crates.io publish is complete, use `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked`.
+Publish order matters for crates.io: publish `plug-core` before `plug-mcp`, because the CLI package depends on the library package by version. The public install command is `cargo install plug-mcp --locked`; use `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked` only when validating unreleased `main` builds.
