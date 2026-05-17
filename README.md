@@ -54,16 +54,11 @@ After a release is cut, install with Homebrew:
 brew install cyberpapiii/tap/plug
 ```
 
-Or use the shell installer:
+Or use the shell installer, which installs into `$CARGO_HOME/bin` or
+`$HOME/.cargo/bin`:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh
-```
-
-Install to a specific directory:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh -s -- --install-dir ~/.local/bin
 ```
 
 ### Manual

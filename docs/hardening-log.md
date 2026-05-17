@@ -437,9 +437,9 @@ Checks:
 - Live smoke with the installed `plug` binary reported the daemon running, 9 daemon-proxy sessions, 11 healthy upstreams, 339 tools, and live Claude Code plus Codex CLI sessions.
 - `/.well-known/mcp-server-card` returned the `io.github.plug-mcp/plug` card with protected `Authorization` remote header metadata.
 
-Deferred:
+Deferred at the time; resolved later on 2026-05-17:
 
-- The advertised public install commands are release-ready but not yet globally live until Rob completes the org/tap/crates.io owner actions recorded in Phase 5 U13.
+- The advertised public install commands were release-ready but not yet globally live until Rob completed the namespace, tap, and crates.io owner actions recorded in Phase 5 U13.
 
 ## 2026-05-17 Phase 6 U14 - External-user documentation
 
@@ -467,10 +467,10 @@ Surprises:
 
 - `docs/USERS.md` was still entirely branded as the old `fanout` product. README linked to it as a current doc, so leaving it historical would have undercut the external-user readiness pass.
 
-Deferred:
+Deferred at the time; resolved later on 2026-05-17:
 
-- GitHub private vulnerability reporting cannot be fully verified until the public `plug-mcp/plug` repository exists and private reporting is enabled. Reason: this is controlled by GitHub repository settings after the namespace migration. Owner: Rob. Re-review date: before first public release tag.
-- README install commands remain release-ready but not globally live until the Phase 5 owner actions are complete. Reason: GitHub org/tap creation and crates.io publish require Rob-owned credentials. Owner: Rob. Re-review date: before first public release tag.
+- GitHub private vulnerability reporting could not be fully verified until the launch namespace decision was made. Resolution: the launch namespace is `cyberpapiii/plug`, and private vulnerability reporting is enabled there.
+- README install commands remained release-ready but not globally live until the Phase 5 owner actions were complete. Resolution: crates.io, GitHub release, shell installer, and Homebrew install paths are now verified live.
 
 ## 2026-05-17 Owner-action follow-up
 
@@ -519,10 +519,10 @@ Shipped:
 - Verified the installed binary with `/tmp/plug-crates-install/bin/plug --version`, which returned `plug 0.1.0`.
 - Updated README, user stories, operator guide, and the audit distribution row so crates.io is now the primary Cargo install path and GitHub install is the unreleased-main fallback.
 
-Remaining:
+Remaining at the time; resolved later on 2026-05-17:
 
-- GitHub release artifacts and the Homebrew tap still need a release cut through cargo-dist.
-- The pre-existing unrelated `.letta/claude/*` deletions remain unstaged.
+- GitHub release artifacts and the Homebrew tap still needed a release cut through cargo-dist. Resolution: `v0.3.0` release artifacts and `cyberpapiii/tap/plug` are now verified live.
+- The pre-existing unrelated `.letta/claude/*` deletions remained unstaged. Resolution: those local state files were removed in commit `10d2135`.
 
 ## 2026-05-17 local artifact cleanup
 
@@ -568,3 +568,23 @@ Shipped:
 Decision:
 
 - Skipped `0.1.1` because the repository already has a historical `v0.2.0` tag. `0.3.0` gives the public launch a forward-moving tag and avoids making a newer release look older than an existing tag.
+
+## 2026-05-17 v0.3.0 distribution completion
+
+Shipped:
+
+- Published `plug-core 0.3.0` and `plug-mcp 0.3.0` to crates.io.
+- Pushed git tag `v0.3.0` and verified the GitHub release workflow completed successfully.
+- Published GitHub release assets for macOS and Linux, source archives, checksums, and a shell installer at `https://github.com/cyberpapiii/plug/releases/tag/v0.3.0`.
+- Published the Homebrew formula to `cyberpapiii/homebrew-tap` and verified `brew reinstall cyberpapiii/tap/plug`, `/opt/homebrew/opt/plug/bin/plug --version`, and `brew test cyberpapiii/tap/plug`.
+- Verified `cargo install plug-mcp --locked --root /tmp/plug-crates-install-v030 --force` installs `plug 0.3.0`.
+- Verified the live shell installer download installs `plug 0.3.0` into an isolated temporary `CARGO_HOME`.
+- Updated README installer docs to remove the unsupported `--install-dir` example; the cargo-dist shell installer uses `$CARGO_HOME/bin` or `$HOME/.cargo/bin`.
+
+Surprises:
+
+- The custom GitHub release workflow emits root-layout archives named `plug-v0.3.0-<target>.tar.gz`, while cargo-dist's generated shell installer expected `plug-mcp-<target>.tar.gz` archives with a strip-one top-level directory layout. The release was corrected by patching the uploaded installer to use the workflow archive names and root-layout extraction, and the Homebrew formula was pointed at the same stable release-workflow assets.
+
+Deferred:
+
+- Future release automation should be reconciled so cargo-dist and the custom GitHub release workflow produce one consistent archive naming/layout scheme. Owner: Rob. Re-review date: before the next public release tag.
