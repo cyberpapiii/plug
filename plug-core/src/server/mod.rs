@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
