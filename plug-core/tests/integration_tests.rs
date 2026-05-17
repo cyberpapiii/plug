@@ -3602,7 +3602,32 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     let unauth_card: serde_json::Value = serde_json::from_slice(&unauth_body).unwrap();
     assert!(unauth_card.get("servers").is_none());
     assert!(unauth_card.get("tools").is_none());
-    assert_eq!(unauth_card["auth_required"], true);
+    assert_eq!(unauth_card["name"], "io.github.plug-mcp/plug");
+    assert_eq!(
+        unauth_card["remotes"][0]["headers"][0]["name"],
+        "Authorization"
+    );
+
+    let resource_metadata_req = HttpRequest::builder()
+        .method("GET")
+        .uri("/.well-known/oauth-protected-resource")
+        .body(Body::empty())
+        .unwrap();
+    let resource_metadata_resp = app.clone().oneshot(resource_metadata_req).await.unwrap();
+    assert_eq!(resource_metadata_resp.status(), StatusCode::OK);
+    let resource_metadata_body = axum::body::to_bytes(resource_metadata_resp.into_body(), 10_000)
+        .await
+        .unwrap();
+    let resource_metadata: serde_json::Value =
+        serde_json::from_slice(&resource_metadata_body).unwrap();
+    assert_eq!(
+        resource_metadata["resource"],
+        "https://plug.example.com/mcp"
+    );
+    assert_eq!(
+        resource_metadata["authorization_servers"],
+        serde_json::json!(["https://plug.example.com"])
+    );
 
     let verifier = oauth2::PkceCodeVerifier::new("v".repeat(43));
     let challenge = oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier);
@@ -3663,8 +3688,9 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         .await
         .unwrap();
     let auth_card: serde_json::Value = serde_json::from_slice(&auth_body).unwrap();
-    assert!(auth_card.get("servers").is_some());
-    assert!(auth_card.get("tools").is_some());
+    assert!(auth_card.get("servers").is_none());
+    assert!(auth_card.get("tools").is_none());
+    assert_eq!(auth_card["name"], unauth_card["name"]);
 
     let mcp_req = HttpRequest::builder()
         .method("POST")

@@ -42,7 +42,7 @@ pub enum DownstreamAuthChallenge {
 #[derive(Debug, Clone)]
 pub struct TokenResponsePayload {
     pub access_token: String,
-    pub refresh_token: String,
+    pub refresh_token: Option<String>,
     pub expires_in: u64,
     pub scope: Option<String>,
 }
@@ -235,7 +235,7 @@ impl DownstreamOauthManager {
 
         Ok(TokenResponsePayload {
             access_token,
-            refresh_token,
+            refresh_token: Some(refresh_token),
             expires_in: ACCESS_TOKEN_LIFETIME_SECS,
             scope: scope_string(&pending.scopes),
         })
@@ -279,9 +279,50 @@ impl DownstreamOauthManager {
 
         Ok(TokenResponsePayload {
             access_token,
-            refresh_token: refresh_token.to_string(),
+            refresh_token: Some(refresh_token.to_string()),
             expires_in: ACCESS_TOKEN_LIFETIME_SECS,
             scope: scope_string(&refresh.scopes),
+        })
+    }
+
+    pub async fn exchange_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: Option<&str>,
+        requested_scopes: Option<&str>,
+    ) -> Result<TokenResponsePayload, DownstreamOauthError> {
+        self.validate_client_auth(client_id, client_secret)?;
+        if self.config.oauth_client_secret.is_none() {
+            return Err(DownstreamOauthError::UnsupportedClientAuthMethod);
+        }
+
+        let scopes = requested_scopes
+            .map(|s| {
+                s.split_whitespace()
+                    .filter(|part| !part.is_empty() && *part != "offline_access")
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| resource_scopes(&self.config.oauth_scopes));
+
+        let access_token = uuid::Uuid::new_v4().to_string();
+        let mut guard = self.state.lock().await;
+        guard.access_tokens.insert(
+            access_token.clone(),
+            IssuedAccessToken {
+                client_id: client_id.to_string(),
+                refresh_token: String::new(),
+                expires_at: epoch_secs() + ACCESS_TOKEN_LIFETIME_SECS,
+                scopes: scopes.clone(),
+            },
+        );
+        persist_state(&self.config, &guard);
+
+        Ok(TokenResponsePayload {
+            access_token,
+            refresh_token: None,
+            expires_in: ACCESS_TOKEN_LIFETIME_SECS,
+            scope: scope_string(&scopes),
         })
     }
 
@@ -366,6 +407,14 @@ impl DownstreamOauthManager {
             form_client_secret.map(ToString::to_string),
         ))
     }
+}
+
+pub fn resource_scopes(scopes: &[String]) -> Vec<String> {
+    scopes
+        .iter()
+        .filter(|scope| scope.as_str() != "offline_access")
+        .cloned()
+        .collect()
 }
 
 fn epoch_secs() -> u64 {
@@ -524,8 +573,11 @@ mod tests {
 
         let recreated = DownstreamOauthManager::new(test_config(&client_id));
         assert!(recreated.validate_access_token(&issued.access_token).await);
+        let refresh_token = issued
+            .refresh_token
+            .expect("authorization code issues refresh");
         let refreshed = recreated
-            .exchange_refresh_token(&client_id, Some("secret-123"), &issued.refresh_token)
+            .exchange_refresh_token(&client_id, Some("secret-123"), &refresh_token)
             .await
             .expect("refresh token exchange");
         assert!(!refreshed.access_token.is_empty());

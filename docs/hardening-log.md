@@ -321,3 +321,31 @@ Surprises:
 Deferred:
 
 - Canonical server-card `name`, `websiteUrl`, and `repository` may need to change after the Phase 5 namespace decision. Reason: the current workspace metadata still points at `plug-mcp/plug`, but Phase 5 explicitly reserves that repository/org choice for Rob. Owner: Rob. Re-review date: Phase 5 item #15.
+
+## 2026-05-17 Phase 4 U11 - Auth alignment with finalized SEPs
+
+Shipped:
+
+- Added RFC 9728 protected-resource metadata at `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+- Updated downstream OAuth `WWW-Authenticate` challenges so `resource_metadata` points at protected-resource metadata, not authorization-server metadata.
+- Added protected-resource metadata fields for `resource`, `authorization_servers`, `scopes_supported`, and `bearer_methods_supported`.
+- Filtered `offline_access` out of resource-server scopes in protected-resource metadata and challenges, matching SEP-2207 guidance.
+- Advertised `client_credentials` in authorization-server metadata only when the downstream OAuth config has a confidential client secret.
+- Added downstream `grant_type=client_credentials` support for confidential clients. Issued tokens are bearer access tokens only; no refresh token is issued for M2M credentials.
+- Left SEP-991 URL client metadata documents unadvertised because Plug does not yet fetch or validate URL-formatted client IDs and should not claim support before an SSRF-safe trust policy exists.
+
+Tests and checks:
+
+- `cargo test -p plug-core downstream_oauth -- --nocapture` passed, including the downstream OAuth protected discovery card integration test after updating it for static server cards and protected-resource metadata.
+- `cargo test -p plug-core oauth_ -- --nocapture` passed, including protected-resource metadata, client-credentials token issuance, authorization-code flow, refresh flow, and upstream OAuth recovery coverage.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+
+Surprises:
+
+- The old OAuth discovery integration test encoded a now-obsolete `auth_required` server-card field. The server-card U10 change correctly moved auth discoverability into `remotes[].headers` and the protected-resource metadata endpoint.
+
+Deferred:
+
+- SEP-991 URL client metadata documents remain deferred. Reason: implementing them requires outbound metadata fetches from user-supplied client IDs plus SSRF/rate-limit/cache/trust-policy work; advertising support before that would be false. Owner: Rob. Re-review date: 2026-06-15 or when a real remote client needs URL client metadata.
+- SEP-1932 DPoP and SEP-1933 Workload Identity remain deferred. Reason: both were draft SEPs in the audit and should not become Plug-specific public protocol extensions. Owner: Rob. Re-review date: when either SEP becomes Final/Accepted.

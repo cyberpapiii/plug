@@ -24,6 +24,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
+use crate::downstream_oauth::resource_scopes;
 use crate::mcp_http_headers::{HEADER_MISMATCH_CODE, HeaderMismatch, validate_mirrored_headers};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
@@ -334,6 +335,14 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             "/.well-known/oauth-authorization-server",
             get(get_oauth_authorization_server_metadata),
         )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(get_oauth_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(get_oauth_protected_resource_metadata),
+        )
         .route("/oauth/authorize", get(oauth_authorize_not_implemented))
         .route("/oauth/token", post(oauth_token_not_implemented))
         .with_state(state.clone());
@@ -404,12 +413,9 @@ async fn validate_bearer_auth(
             .downstream_oauth
             .as_ref()
             .ok_or_else(|| HttpError::Internal("missing downstream OAuth manager".to_string()))?;
-        let metadata_url = format!(
-            "{}/.well-known/oauth-authorization-server",
-            manager.config.public_base_url.trim_end_matches('/')
-        );
-        let scope = (!manager.config.oauth_scopes.is_empty())
-            .then(|| manager.config.oauth_scopes.join(" "));
+        let metadata_url = protected_resource_metadata_url(manager.base_url());
+        let scopes = resource_scopes(&manager.config.oauth_scopes);
+        let scope = (!scopes.is_empty()).then(|| scopes.join(" "));
 
         let auth_status = if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
             let auth = auth_header
@@ -1005,15 +1011,36 @@ async fn get_oauth_authorization_server_metadata(
         Some(_) => vec!["client_secret_basic", "client_secret_post"],
         None => vec!["none"],
     };
+    let mut grant_types_supported = vec!["authorization_code", "refresh_token"];
+    if manager.config.oauth_client_secret.is_some() {
+        grant_types_supported.push("client_credentials");
+    }
     let response = Json(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "grant_types_supported": grant_types_supported,
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": token_endpoint_auth_methods_supported,
         "scopes_supported": manager.config.oauth_scopes,
+    }));
+    (StatusCode::OK, response).into_response()
+}
+
+async fn get_oauth_protected_resource_metadata(
+    State(state): State<Arc<HttpState>>,
+) -> impl IntoResponse {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let base = manager.base_url();
+    let response = Json(json!({
+        "resource": format!("{base}/mcp"),
+        "authorization_servers": [base],
+        "scopes_supported": resource_scopes(&manager.config.oauth_scopes),
+        "bearer_methods_supported": ["header"],
     }));
     (StatusCode::OK, response).into_response()
 }
@@ -1124,18 +1151,29 @@ async fn oauth_token_not_implemented(
                 .exchange_refresh_token(&client_id, client_secret.as_deref(), refresh_token)
                 .await
         }
+        "client_credentials" => {
+            manager
+                .exchange_client_credentials(
+                    &client_id,
+                    client_secret.as_deref(),
+                    params.get("scope").map(String::as_str),
+                )
+                .await
+        }
         _ => return (StatusCode::BAD_REQUEST, "unsupported grant_type").into_response(),
     };
 
     match result {
         Ok(token) => {
-            let body = json!({
+            let mut body = json!({
                 "access_token": token.access_token,
-                "refresh_token": token.refresh_token,
                 "token_type": "Bearer",
                 "expires_in": token.expires_in,
                 "scope": token.scope,
             });
+            if let Some(refresh_token) = token.refresh_token {
+                body["refresh_token"] = json!(refresh_token);
+            }
             (StatusCode::OK, Json(body)).into_response()
         }
         Err(error) => (
@@ -1144,6 +1182,13 @@ async fn oauth_token_not_implemented(
         )
             .into_response(),
     }
+}
+
+fn protected_resource_metadata_url(base_url: &str) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource",
+        base_url.trim_end_matches('/')
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3229,6 +3274,146 @@ mod tests {
             value["token_endpoint_auth_methods_supported"],
             json!(["client_secret_basic", "client_secret_post"])
         );
+        assert_eq!(
+            value["grant_types_supported"],
+            json!(["authorization_code", "refresh_token", "client_credentials"])
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_metadata_endpoint_returns_rfc9728_metadata() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
+                crate::downstream_oauth::DownstreamOauthConfig {
+                    public_base_url: "https://plug.example.com".to_string(),
+                    oauth_client_id: Some("client-123".to_string()),
+                    oauth_client_secret: Some("secret-123".to_string().into()),
+                    oauth_scopes: vec!["tools:read".to_string(), "offline_access".to_string()],
+                },
+            )),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/oauth-protected-resource")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .expect("body bytes");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(value["resource"], "https://plug.example.com/mcp");
+        assert_eq!(
+            value["authorization_servers"],
+            json!(["https://plug.example.com"])
+        );
+        assert_eq!(value["scopes_supported"], json!(["tools:read"]));
+        assert_eq!(value["bearer_methods_supported"], json!(["header"]));
+    }
+
+    #[tokio::test]
+    async fn oauth_client_credentials_flow_issues_bearer_without_refresh_token() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router,
+            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
+                crate::downstream_oauth::DownstreamOauthConfig {
+                    public_base_url: "https://plug.example.com".to_string(),
+                    oauth_client_id: Some("client-123".to_string()),
+                    oauth_client_secret: Some("secret-123".to_string().into()),
+                    oauth_scopes: vec!["tools:read".to_string(), "offline_access".to_string()],
+                },
+            )),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let token_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header(header::AUTHORIZATION, "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz")
+            .body(Body::from(
+                "grant_type=client_credentials&scope=tools%3Aread+offline_access",
+            ))
+            .unwrap();
+
+        let token_resp = app.clone().oneshot(token_req).await.unwrap();
+        assert_eq!(token_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(token_resp.into_body(), 10_000)
+            .await
+            .expect("body bytes");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert!(value["access_token"].as_str().is_some());
+        assert!(value.get("refresh_token").is_none());
+        assert_eq!(value["scope"], "tools:read");
+
+        let mcp_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", value["access_token"].as_str().unwrap()),
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        let mcp_resp = app.oneshot(mcp_req).await.unwrap();
+        assert_eq!(mcp_resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
@@ -3286,7 +3471,7 @@ mod tests {
                 .get(header::WWW_AUTHENTICATE)
                 .and_then(|v| v.to_str().ok())
                 .expect("www-authenticate"),
-            "Bearer resource_metadata=\"https://plug.example.com/.well-known/oauth-authorization-server\", scope=\"tools:read\""
+            "Bearer resource_metadata=\"https://plug.example.com/.well-known/oauth-protected-resource\", scope=\"tools:read\""
         );
     }
 
