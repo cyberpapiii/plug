@@ -273,6 +273,14 @@ Normal request/response/notification flow.
 - `name` is the stable invocation identifier
 - top-level `title` is the preferred UI display label
 - `annotations.title` is a backward-compatibility display fallback some clients still consume
+- `icons` is the standard visual metadata surface for tools. `plug` preserves explicit upstream tool icons and falls back to the upstream server icon only when a routed tool has no icon.
+
+**Icon normalization in `plug`**:
+- `src` must be an HTTPS URI or a bounded `data:` URI with base64 image data.
+- `mimeType` is normalized when present or inferable. Supported forwarded upstream values are `image/png`, `image/jpeg`, and `image/webp`; `image/jpg` becomes `image/jpeg`. Plug's own trusted top-level SVG icon is still advertised directly, but untrusted upstream SVG is dropped rather than sanitized.
+- `sizes` must be `WIDTHxHEIGHT` with positive integers or `any`; invalid size tokens are dropped. SVG icons with no valid size get `any`.
+- `theme` is preserved when present.
+- Plug does not fetch remote icon bytes or transcode/resize images in this pass; it forwards safe MCP icon metadata and drops unsafe or oversized entries. Server-level `data:` icons remain available in upstream inventory but are not duplicated onto every routed tool/resource/prompt.
 
 ---
 

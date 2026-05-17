@@ -767,6 +767,7 @@ mod tests {
             health: plug_core::types::ServerHealth::AuthRequired,
             tool_count: 0,
             auth_status: "required".to_string(),
+            upstream: None,
             last_seen: None,
         }];
         let json = status_json(

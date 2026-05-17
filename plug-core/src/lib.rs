@@ -14,6 +14,7 @@ pub mod error;
 pub mod export;
 pub mod health;
 pub mod http;
+pub mod icons;
 pub mod import;
 pub mod ipc;
 pub(crate) mod mcp_http_headers;

@@ -11,6 +11,19 @@ This is the definitive reference for every AI client's MCP behavior, quirks, and
 
 Treat this as current truth when reasoning about client display behavior.
 
+## Icon Display Contract
+
+`plug` advertises Plug's own icon in top-level `initialize.serverInfo.icons` because clients connect to Plug as the parent MCP server. Upstream server icons are source metadata, not replacements for Plug's top-level identity.
+
+For clients that render MCP item icons, Plug forwards source-specific icons on routed tools/resources/prompts:
+
+- explicit upstream item `icons` win
+- otherwise the upstream server's normalized HTTPS `serverInfo.icons` are used as a fallback
+- unsafe schemes, untrusted SVG, invalid sizes, and oversized inline `data:` icons are dropped before forwarding
+- server-level `data:` icons stay in upstream inventory instead of being copied onto every routed item
+
+Operator JSON also exposes the normalized upstream metadata so clients or diagnostics can show which routed tools came from which branded upstream server.
+
 ---
 
 ## Client Matrix

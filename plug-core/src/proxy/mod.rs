@@ -1353,6 +1353,10 @@ impl ToolRouter {
             let upstream_annotations = c.tool.annotations.clone();
             let mut prefixed_tool = c.tool.clone();
             let mut inferred_tool = c.tool.clone();
+            let upstream_icons = self
+                .server_manager
+                .get_upstream_metadata(&c.server_name)
+                .and_then(|metadata| metadata.icons);
             inferred_tool.name = Cow::Owned(final_name.clone());
             inferred_tool.annotations = None;
             crate::enrichment::normalize_annotations(&mut inferred_tool, &final_name);
@@ -1371,6 +1375,8 @@ impl ToolRouter {
             // Set wire name and canonical display metadata
             prefixed_tool.name = Cow::Owned(prefixed_name.clone());
             apply_canonical_tool_title(&mut prefixed_tool, title_name);
+            prefixed_tool.icons =
+                normalized_icons_with_fallback(prefixed_tool.icons.as_deref(), upstream_icons);
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
@@ -1480,6 +1486,12 @@ impl ToolRouter {
             if resource.title.is_none() {
                 resource.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
+            resource.icons = normalized_icons_with_fallback(
+                resource.icons.as_deref(),
+                self.server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons),
+            );
             resource.name = routed_name;
             resources_vec.push(resource);
         }
@@ -1498,6 +1510,12 @@ impl ToolRouter {
             if template.title.is_none() {
                 template.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
+            template.icons = normalized_icons_with_fallback(
+                template.icons.as_deref(),
+                self.server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons),
+            );
             template.name = routed_name;
             resource_templates_vec.push(template);
         }
@@ -1520,6 +1538,12 @@ impl ToolRouter {
             if prompt.title.is_none() {
                 prompt.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
+            prompt.icons = normalized_icons_with_fallback(
+                prompt.icons.as_deref(),
+                self.server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons),
+            );
             prompt.name = routed_name;
             prompts_vec.push(prompt);
         }
@@ -3471,6 +3495,25 @@ fn apply_canonical_tool_title(tool: &mut Tool, title: String) {
     annotations.title = Some(title);
 }
 
+fn normalized_icons_with_fallback(
+    item_icons: Option<&[Icon]>,
+    fallback_icons: Option<Vec<Icon>>,
+) -> Option<Vec<Icon>> {
+    match item_icons {
+        Some([]) | None => fallback_icons
+            .map(https_only_icons)
+            .filter(|icons| !icons.is_empty()),
+        Some(icons) => crate::icons::normalize_icons(Some(icons)),
+    }
+}
+
+fn https_only_icons(icons: Vec<Icon>) -> Vec<Icon> {
+    icons
+        .into_iter()
+        .filter(|icon| icon.src.to_ascii_lowercase().starts_with("https://"))
+        .collect()
+}
+
 fn sanitize_description(desc: &str) -> String {
     desc.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
@@ -4675,6 +4718,46 @@ mod tests {
             &["gmail__*".into()],
             "Slack__search_messages"
         ));
+    }
+
+    #[test]
+    fn normalized_icons_preserve_item_icons_before_server_fallback() {
+        let item = Icon::new("https://example.com/tool.png").with_mime_type("image/png");
+        let fallback = Icon::new("https://example.com/server.png").with_mime_type("image/png");
+
+        let icons = normalized_icons_with_fallback(Some(&[item]), Some(vec![fallback]))
+            .expect("tool icon should survive");
+
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].src, "https://example.com/tool.png");
+    }
+
+    #[test]
+    fn normalized_icons_use_https_server_fallback_when_item_icon_is_missing() {
+        let fallback = Icon::new("https://example.com/server.png").with_mime_type("image/png");
+
+        let icons = normalized_icons_with_fallback(None, Some(vec![fallback]))
+            .expect("server fallback should be used");
+
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].src, "https://example.com/server.png");
+    }
+
+    #[test]
+    fn normalized_icons_do_not_fallback_over_invalid_explicit_item_icons() {
+        let unsafe_item = Icon::new("file:///tmp/tool.png").with_mime_type("image/png");
+        let fallback = Icon::new("https://example.com/server.png").with_mime_type("image/png");
+
+        assert!(
+            normalized_icons_with_fallback(Some(&[unsafe_item]), Some(vec![fallback])).is_none()
+        );
+    }
+
+    #[test]
+    fn normalized_icons_do_not_duplicate_data_uri_server_fallbacks() {
+        let fallback = Icon::new("data:image/png;base64,aGVsbG8=");
+
+        assert!(normalized_icons_with_fallback(None, Some(vec![fallback])).is_none());
     }
 
     #[test]

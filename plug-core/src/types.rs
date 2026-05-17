@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+use rmcp::model::Icon;
+
 /// A string that redacts its value in Debug output to prevent secret leakage.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -339,10 +341,27 @@ pub struct ServerStatus {
     /// Auth mechanism in use: `"bearer"`, `"oauth"`, `"auth-required"`, or `"none"`.
     #[serde(default = "default_auth_status")]
     pub auth_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamServerMetadata>,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }
 
 fn default_auth_status() -> String {
     "none".to_string()
+}
+
+/// Sanitized upstream implementation metadata captured from MCP initialize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UpstreamServerMetadata {
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<Icon>>,
 }
