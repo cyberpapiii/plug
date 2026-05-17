@@ -390,3 +390,39 @@ Checks:
 Surprises:
 
 - `plug start` returned a readiness-timeout error while the daemon continued booting; subsequent status showed the daemon healthy. Treat this as an operational sharp edge to revisit if it repeats, but it did not block the Phase 4 gate.
+
+## 2026-05-17 Phase 5 U13 - Distribution namespace and install surface
+
+Shipped:
+
+- Recorded the required owner decision to standardize public distribution on the neutral `plug-mcp` namespace.
+- Renamed the publishable CLI package from `plug` to `plug-mcp` while keeping the installed binary name `plug`.
+- Added workspace `homepage` metadata and inherited repository/homepage metadata into the published crates.
+- Marked `plug-test-harness` as `publish = false` and `dist = false` so release plans do not publish the mock test server.
+- Replaced README `cargo install plug` with `cargo install plug-mcp --locked`, avoiding the occupied crates.io `plug` package.
+- Removed the broken `get.plug.sh` installer path from README and documented the cargo-dist release installer artifact `plug-mcp-installer.sh`.
+- Fixed `dist-workspace.toml` for cargo-dist 0.31.0 by changing the member to `cargo:plug`, enabling Homebrew publish jobs, and adding `profile.dist`.
+- Updated CI/release workflow package selectors from `-p plug` to `-p plug-mcp`.
+
+Checks:
+
+- `cargo info plug` outside the workspace resolves to the unrelated `hecrj/plug` IPC crate.
+- `cargo info plug-mcp` outside the workspace currently reports no such crate, so the name is available as checked.
+- `curl -I https://get.plug.sh` still returns Cloudflare 525; README no longer references it.
+- `cargo check --workspace` passed after the package rename.
+- `dist plan --no-local-paths --allow-dirty` passed and now reports a single `plug-mcp` app, `plug-mcp-installer.sh`, `plug.rb`, and target archives containing the `plug` binary.
+- `dist build --artifacts=global --allow-dirty` produced `source.tar.gz`, `plug-mcp-installer.sh`, `plug.rb`, and `sha256.sum`.
+- `dist build --artifacts=local --target aarch64-apple-darwin --allow-dirty` produced `plug-mcp-aarch64-apple-darwin.tar.gz`; extracting it and running the binary reported `plug 0.1.0`.
+- `cargo package -p plug-core --allow-dirty` verified `plug-core`.
+- `cargo install --path plug --force --locked` installed package `plug-mcp` and replaced the local `plug` binary successfully.
+
+Surprises:
+
+- `dist-workspace.toml` was not merely stale; cargo-dist 0.31.0 could not parse the old unprefixed member syntax.
+- The first cargo-dist plan accidentally included `plug-test-harness` because it has a binary target. Marking it non-publishable/non-distable removed it from the release plan.
+- `cargo package -p plug-mcp` cannot verify until `plug-core 0.1.0` exists on crates.io. This is the normal publish order for the split core/CLI crates, but it means `plug-mcp` package verification is not fully self-contained before the first `plug-core` publish.
+
+Deferred:
+
+- Creating or migrating the GitHub org/repo `plug-mcp/plug` and tap repo `plug-mcp/homebrew-tap` remains an owner action. Reason: GitHub organization creation is outside repo-local code changes. Owner: Rob. Re-review date: before first public release tag.
+- Publishing `plug-core 0.1.0` and then `plug-mcp 0.1.0` to crates.io remains an owner action. Reason: crate publishing requires Rob's crates.io credentials and should happen after namespace migration is complete. Owner: Rob. Re-review date: before README install commands are treated as live public commands.

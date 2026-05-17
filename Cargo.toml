@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"
 repository = "https://github.com/plug-mcp/plug"
+homepage = "https://github.com/plug-mcp/plug"
 
 [workspace.dependencies]
 # MCP SDK
@@ -116,3 +117,6 @@ panic = "abort"
 [profile.ci]
 inherits = "release"
 lto = "thin"
+
+[profile.dist]
+inherits = "release"

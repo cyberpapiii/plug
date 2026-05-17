@@ -1,9 +1,11 @@
 [package]
-name = "plug"
+name = "plug-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "MCP multiplexer — one config, every AI client connected, every server shared"
 
 [[bin]]
@@ -11,7 +13,7 @@ name = "plug"
 path = "src/main.rs"
 
 [dependencies]
-plug-core = { path = "../plug-core" }
+plug-core = { path = "../plug-core", version = "0.1.0" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

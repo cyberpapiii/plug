@@ -24,19 +24,19 @@ brew install plug-mcp/tap/plug
 ### Shell installer (macOS and Linux)
 
 ```sh
-curl -fsSL https://get.plug.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/plug-mcp/plug/releases/latest/download/plug-mcp-installer.sh | sh
 ```
 
 Or install to a specific directory:
 
 ```sh
-curl -fsSL https://get.plug.sh | sh -s -- --install-dir ~/.local/bin
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/plug-mcp/plug/releases/latest/download/plug-mcp-installer.sh | sh -s -- --install-dir ~/.local/bin
 ```
 
 ### Cargo
 
 ```sh
-cargo install plug
+cargo install plug-mcp --locked
 ```
 
 ### Local development reinstall

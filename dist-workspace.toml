@@ -1,5 +1,5 @@
 [workspace]
-members = ["plug"]
+members = ["cargo:plug"]
 
 [dist]
 # cargo-dist configuration
@@ -25,6 +25,9 @@ installers = ["shell", "homebrew"]
 
 # Homebrew tap
 tap = "plug-mcp/homebrew-tap"
+
+# Publish generated formula updates to the tap during release.
+publish-jobs = ["homebrew"]
 
 # Formula name for Homebrew
 formula = "plug"

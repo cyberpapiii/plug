@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 description = "Test utilities and mock MCP server for plug integration tests"
+
+[package.metadata.dist]
+dist = false
 
 [[bin]]
 name = "mock-mcp-server"
