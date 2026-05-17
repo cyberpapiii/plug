@@ -426,3 +426,17 @@ Deferred:
 
 - Creating or migrating the GitHub org/repo `plug-mcp/plug` and tap repo `plug-mcp/homebrew-tap` remains an owner action. Reason: GitHub organization creation is outside repo-local code changes. Owner: Rob. Re-review date: before first public release tag.
 - Publishing `plug-core 0.1.0` and then `plug-mcp 0.1.0` to crates.io remains an owner action. Reason: crate publishing requires Rob's crates.io credentials and should happen after namespace migration is complete. Owner: Rob. Re-review date: before README install commands are treated as live public commands.
+
+## 2026-05-17 Phase 5 gate
+
+Checks:
+
+- `cargo test --workspace -- --test-threads=1` passed after the package rename: 449 `plug-core` tests, 41 integration tests, 145 `plug` binary crate tests, `plug-test-harness`, mock server, and doc tests.
+- `cargo deny check advisories` passed with `advisories ok`.
+- `cargo clippy --workspace -- -D warnings` passed.
+- Live smoke with the installed `plug` binary reported the daemon running, 9 daemon-proxy sessions, 11 healthy upstreams, 339 tools, and live Claude Code plus Codex CLI sessions.
+- `/.well-known/mcp-server-card` returned the `io.github.plug-mcp/plug` card with protected `Authorization` remote header metadata.
+
+Deferred:
+
+- The advertised public install commands are release-ready but not yet globally live until Rob completes the org/tap/crates.io owner actions recorded in Phase 5 U13.
