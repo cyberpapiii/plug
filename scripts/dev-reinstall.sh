@@ -9,6 +9,7 @@ CARGO_PLUG="$CARGO_BIN_DIR/plug"
 LOCAL_PLUG="$LOCAL_BIN_DIR/plug"
 
 RUN_TESTS=1
+CLEAN_AFTER=0
 
 usage() {
   cat <<'EOF'
@@ -21,9 +22,11 @@ normalized to a symlink pointing at ~/.cargo/bin/plug.
 Usage:
   ./scripts/dev-reinstall.sh
   ./scripts/dev-reinstall.sh --quick
+  ./scripts/dev-reinstall.sh --quick --clean
 
 Options:
   --quick   Skip `cargo test -p plug-core`
+  --clean   Remove generated build/deploy artifacts after reinstall
   -h        Show this help
 EOF
 }
@@ -32,6 +35,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick)
       RUN_TESTS=0
+      shift
+      ;;
+    --clean)
+      CLEAN_AFTER=1
       shift
       ;;
     -h|--help)
@@ -77,6 +84,11 @@ fi
 echo "==> Smoke testing installed binary"
 "$CARGO_PLUG" --help >/dev/null
 "$LOCAL_PLUG" --help >/dev/null
+
+if [[ "$CLEAN_AFTER" -eq 1 ]]; then
+  echo "==> Cleaning generated build artifacts"
+  "$ROOT_DIR/scripts/clean-build-artifacts.sh" --yes
+fi
 
 echo
 echo "Installed:"

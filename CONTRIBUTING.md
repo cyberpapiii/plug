@@ -20,6 +20,8 @@ plug status
 
 The development reinstall keeps the PATH binary at `~/.cargo/bin/plug` and normalizes `~/.local/bin/plug` to point at it.
 
+Use `./scripts/dev-reinstall.sh --quick --clean` when you want to reinstall the local binary and immediately remove generated build artifacts.
+
 ## Required Checks
 
 Run these before opening a PR:

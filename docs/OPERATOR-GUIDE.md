@@ -220,3 +220,9 @@ scripts/clean-build-artifacts.sh --yes
 ```
 
 Use `--runtime-cache` only when old `plug://artifact/...` result files are no longer needed. The cleanup script never removes Plug config, OAuth tokens, sockets, PID files, or installed binaries.
+
+For local source reinstalls, the cleanup can be folded into the reinstall command:
+
+```sh
+./scripts/dev-reinstall.sh --quick --clean
+```

@@ -537,3 +537,16 @@ Kept:
 
 - `~/Library/Application Support/plug` was left intact because it contains live config, OAuth tokens, sockets, PID files, and operator tokens.
 - `~/Library/Caches/plug/artifacts` was left intact by default because it stores recent `plug://artifact/...` result files; the new cleanup script can remove it explicitly with `--runtime-cache`.
+
+## 2026-05-17 local reinstall cleanup integration
+
+Shipped:
+
+- Added `--clean` to `scripts/dev-reinstall.sh`.
+- `./scripts/dev-reinstall.sh --quick --clean` now reinstalls the local binary, smoke-tests it, then runs `scripts/clean-build-artifacts.sh --yes`.
+- Documented the flag in README, CONTRIBUTING, and the operator guide.
+
+Decision:
+
+- Cleanup remains opt-in for normal development so repeated compile/test loops do not rebuild the world every time.
+- Release cleanup remains explicit because the repo currently uses direct `dist` commands rather than a single release wrapper script.

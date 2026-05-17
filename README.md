@@ -40,6 +40,12 @@ When working on `plug` locally, use the repo script instead of manually copying 
 This rebuilds the workspace, reinstalls `plug`, and normalizes `~/.local/bin/plug`
 to a symlink pointing at `~/.cargo/bin/plug` so the PATH binary stays in sync.
 
+To clean generated build artifacts after reinstalling:
+
+```sh
+./scripts/dev-reinstall.sh --quick --clean
+```
+
 ### Release installers
 
 After a release is cut, install with Homebrew:
