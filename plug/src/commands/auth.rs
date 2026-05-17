@@ -997,6 +997,8 @@ mod tests {
             enrichment: false,
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         };
 
         assert!(
@@ -1028,6 +1030,8 @@ mod tests {
             enrichment: false,
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         };
 
         let store = oauth::get_or_create_store(&server_name);
@@ -1079,6 +1083,8 @@ mod tests {
             enrichment: false,
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -1121,6 +1127,8 @@ mod tests {
             enrichment: false,
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(

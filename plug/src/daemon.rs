@@ -2659,6 +2659,8 @@ mod tests {
                     enrichment: false,
                     tool_renames: HashMap::new(),
                     tool_groups: Vec::new(),
+
+                    sandbox: None,
                 },
             );
         }

@@ -316,6 +316,8 @@ mod tests {
             enrichment: false,
             tool_renames: Default::default(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         }
     }
 

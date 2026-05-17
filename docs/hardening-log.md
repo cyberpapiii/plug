@@ -375,3 +375,18 @@ Deferred:
 
 - Cross-platform Linux sandbox enforcement remains deferred. Reason: this pass uses the platform primitive available on Rob's current machine; Linux needs a separate design around Bubblewrap/firejail/cgroups and installer prerequisites. Owner: Rob. Re-review date: 2026-06-15.
 - CPU/memory/process-count limits remain deferred. Reason: enforcing them safely requires a supervisor or platform-specific process-control layer that would materially expand scope. Owner: Rob. Re-review date: 2026-06-15.
+
+## 2026-05-17 Phase 4 gate
+
+Checks:
+
+- `cargo test --workspace -- --test-threads=1` passed: `plug` unit tests, `plug-core` unit tests (449), integration tests (41), `plug-test-harness`, mock server, and doc tests.
+- `cargo deny check advisories` passed with `advisories ok`.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `./scripts/dev-reinstall.sh --quick` rebuilt and replaced `/Users/robdezendorf/.cargo/bin/plug`, with `/Users/robdezendorf/.local/bin/plug` pointing at it.
+- Live smoke after restart showed the daemon running with 9 daemon-proxy sessions, 11 healthy upstreams, 339 tools, and live Claude Code plus Codex CLI sessions.
+- `/.well-known/mcp-server-card` returned the static server-card shape with `Authorization` listed as a required remote header for the protected local deployment.
+
+Surprises:
+
+- `plug start` returned a readiness-timeout error while the daemon continued booting; subsequent status showed the daemon healthy. Treat this as an operational sharp edge to revisit if it repeats, but it did not block the Phase 4 gate.
