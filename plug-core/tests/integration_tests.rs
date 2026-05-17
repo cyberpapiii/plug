@@ -1177,6 +1177,8 @@ fn mock_server_config(tools: &str) -> ServerConfig {
         enrichment: false,
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
+
+        sandbox: None,
     }
 }
 
@@ -1465,6 +1467,8 @@ fn test_config_validation_valid() {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         },
     );
     let errors = validate_config(&cfg);
@@ -1495,6 +1499,8 @@ fn test_config_validation_catches_missing_command() {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         },
     );
     let errors = validate_config(&cfg);
@@ -1559,6 +1565,8 @@ async fn test_stdio_timeout_reconnects_cleanly() {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         },
     );
 
@@ -1638,6 +1646,8 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         },
     );
 
@@ -2616,6 +2626,8 @@ async fn test_upstream_http_sends_protocol_version_header() {
         enrichment: false,
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
+
+        sandbox: None,
     };
 
     let upstream = sm
@@ -2818,6 +2830,8 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -2947,6 +2961,8 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         config.servers.insert(
@@ -2970,6 +2986,8 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         config.servers.insert(
@@ -2993,6 +3011,8 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -3122,6 +3142,8 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -3214,6 +3236,8 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -3298,6 +3322,8 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -3396,6 +3422,8 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -3486,6 +3514,8 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -3795,6 +3825,8 @@ fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -
         enrichment: false,
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
+
+        sandbox: None,
     }
 }
 

@@ -813,6 +813,8 @@ mod tests {
             enrichment: false,
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         };
 
         let source = IpcServerSourceInfo::from_config(&config);

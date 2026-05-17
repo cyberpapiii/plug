@@ -341,6 +341,20 @@ pub struct ServerConfig {
     /// When set, tools matching a rule get `GroupPrefix__tool_name` instead of `ServerName__tool_name`.
     #[serde(default)]
     pub tool_groups: Vec<ToolGroupRule>,
+    /// Optional sandbox policy for stdio upstream processes.
+    #[serde(default)]
+    pub sandbox: Option<StdioSandboxConfig>,
+}
+
+/// Opt-in sandbox policy for stdio upstream child processes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StdioSandboxConfig {
+    pub enabled: bool,
+    pub allow_network: bool,
+    pub allow_read: Vec<PathBuf>,
+    pub allow_write: Vec<PathBuf>,
+    pub profile_path: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -597,6 +611,16 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                 max_concurrent = server.max_concurrent,
                 "max_concurrent > 1 for stdio transport — stdio is serial, this may not behave as expected"
             );
+        }
+        if server
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.enabled)
+            && !matches!(server.transport, TransportType::Stdio)
+        {
+            errors.push(format!(
+                "server '{name}': sandbox is only supported for stdio transport"
+            ));
         }
 
         match server.transport {
@@ -1266,10 +1290,36 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_sandbox_only_applies_to_stdio_servers() {
+        let cfg = config_from_toml(
+            r#"
+            [servers.remote]
+            transport = "http"
+            url = "https://example.com/mcp"
+
+            [servers.remote.sandbox]
+            enabled = true
+            allow_network = false
+            "#,
+        );
+
+        let errors = validate_config(&cfg);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("sandbox") && error.contains("stdio transport")),
+            "expected sandbox/stdout validation error, got {errors:?}"
+        );
     }
 
     #[test]
@@ -1296,6 +1346,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1330,6 +1382,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1364,6 +1418,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1553,6 +1609,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1587,6 +1645,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1618,6 +1678,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1648,6 +1710,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1678,6 +1742,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1708,6 +1774,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1742,6 +1810,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         let errors = validate_config(&cfg);

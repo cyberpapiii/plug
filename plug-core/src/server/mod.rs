@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -79,6 +80,95 @@ fn is_initialized_notification_compat_failure(error: &StreamableHttpError<reqwes
         StreamableHttpError::UnexpectedServerResponse(message)
             if message.starts_with("HTTP 400")
     )
+}
+
+fn build_stdio_command(
+    command: &str,
+    args: &[String],
+    config: &ServerConfig,
+) -> Result<tokio::process::Command, anyhow::Error> {
+    let sandbox = config.sandbox.as_ref().filter(|sandbox| sandbox.enabled);
+    let Some(sandbox) = sandbox else {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args);
+        return Ok(cmd);
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
+        if let Some(profile_path) = &sandbox.profile_path {
+            cmd.arg("-f").arg(profile_path);
+        } else {
+            cmd.arg("-p")
+                .arg(build_macos_sandbox_profile(command, sandbox)?);
+        }
+        cmd.arg(command);
+        cmd.args(args);
+        Ok(cmd)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = command;
+        let _ = args;
+        let _ = sandbox;
+        anyhow::bail!("stdio sandboxing is currently implemented only on macOS")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_sandbox_profile(
+    command: &str,
+    sandbox: &crate::config::StdioSandboxConfig,
+) -> Result<String, anyhow::Error> {
+    let mut profile = String::from(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow process*)\n\
+         (allow sysctl-read)\n\
+         (allow file-read-metadata)\n\
+         (allow file-read* (subpath \"/System\") (subpath \"/Library\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/opt/homebrew\") (literal \"/dev/null\"))\n",
+    );
+
+    if Path::new(command).is_absolute() {
+        profile.push_str(&format!(
+            "(allow file-read* (literal {}))\n",
+            sandbox_literal(command)?
+        ));
+    }
+    for path in &sandbox.allow_read {
+        profile.push_str(&format!(
+            "(allow file-read* (subpath {}))\n",
+            sandbox_literal_path(path)?
+        ));
+    }
+    for path in &sandbox.allow_write {
+        profile.push_str(&format!(
+            "(allow file-write* (subpath {}))\n",
+            sandbox_literal_path(path)?
+        ));
+    }
+    if sandbox.allow_network {
+        profile.push_str("(allow network*)\n");
+    }
+    Ok(profile)
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_literal_path(path: &Path) -> Result<String, anyhow::Error> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("sandbox paths must be valid UTF-8"))?;
+    sandbox_literal(path)
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_literal(value: &str) -> Result<String, anyhow::Error> {
+    if value.contains('\0') {
+        anyhow::bail!("sandbox values must not contain NUL bytes");
+    }
+    Ok(format!("{:?}", value))
 }
 
 impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
@@ -638,12 +728,7 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("stdio transport requires a command"))?;
 
-                    // Use native Command — no shell wrapper, no injection risk.
-                    // Arguments are passed directly without shell interpretation.
-                    let mut cmd = tokio::process::Command::new(command);
-                    for arg in &config.args {
-                        cmd.arg(arg);
-                    }
+                    let mut cmd = build_stdio_command(command, &config.args, config)?;
                     // Suppress stderr at the OS level to prevent noisy server logs
                     cmd.stderr(std::process::Stdio::null());
 
@@ -655,6 +740,7 @@ impl ServerManager {
                         server = %name,
                         command = %command,
                         args = ?config.args,
+                        sandbox = config.sandbox.as_ref().is_some_and(|sandbox| sandbox.enabled),
                         "spawning server process"
                     );
 
@@ -1444,7 +1530,45 @@ mod tests {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+            sandbox: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_stdio_sandbox_profile_applies_allowlists() {
+        let sandbox = crate::config::StdioSandboxConfig {
+            enabled: true,
+            allow_network: false,
+            allow_read: vec!["/tmp/read-only".into()],
+            allow_write: vec!["/tmp/write".into()],
+            profile_path: None,
+        };
+
+        let profile =
+            build_macos_sandbox_profile("/usr/bin/env", &sandbox).expect("profile should render");
+
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow file-read* (literal \"/usr/bin/env\"))"));
+        assert!(profile.contains("(allow file-read* (subpath \"/tmp/read-only\"))"));
+        assert!(profile.contains("(allow file-write* (subpath \"/tmp/write\"))"));
+        assert!(!profile.contains("(allow network*)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_stdio_sandbox_profile_can_allow_network() {
+        let sandbox = crate::config::StdioSandboxConfig {
+            enabled: true,
+            allow_network: true,
+            allow_read: Vec::new(),
+            allow_write: Vec::new(),
+            profile_path: None,
+        };
+
+        let profile = build_macos_sandbox_profile("node", &sandbox).expect("profile should render");
+
+        assert!(profile.contains("(allow network*)"));
     }
 
     fn make_tool(name: &str) -> Tool {
@@ -2201,6 +2325,8 @@ mod tests {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         };
 
         let err = anyhow::anyhow!(

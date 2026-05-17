@@ -925,6 +925,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
         config
@@ -1082,6 +1084,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -1118,6 +1122,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -1173,6 +1179,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 
@@ -1247,6 +1255,8 @@ mod tests {
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+
+                sandbox: None,
             },
         );
 

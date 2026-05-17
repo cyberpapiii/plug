@@ -398,6 +398,7 @@ pub(crate) fn cmd_server_add(
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+                sandbox: None,
             }
         }
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
@@ -439,6 +440,7 @@ pub(crate) fn cmd_server_add(
                 enrichment: false,
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
+                sandbox: None,
             };
             if let Some(selection) = noninteractive_remote_auth_selection(
                 auth,
@@ -774,6 +776,8 @@ mod tests {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         }
     }
 
@@ -797,6 +801,8 @@ mod tests {
             enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
+
+            sandbox: None,
         }
     }
 

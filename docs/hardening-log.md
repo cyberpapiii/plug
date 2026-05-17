@@ -349,3 +349,29 @@ Deferred:
 
 - SEP-991 URL client metadata documents remain deferred. Reason: implementing them requires outbound metadata fetches from user-supplied client IDs plus SSRF/rate-limit/cache/trust-policy work; advertising support before that would be false. Owner: Rob. Re-review date: 2026-06-15 or when a real remote client needs URL client metadata.
 - SEP-1932 DPoP and SEP-1933 Workload Identity remain deferred. Reason: both were draft SEPs in the audit and should not become Plug-specific public protocol extensions. Owner: Rob. Re-review date: when either SEP becomes Final/Accepted.
+
+## 2026-05-17 Phase 4 U12 - Opt-in stdio sandboxing
+
+Shipped:
+
+- Added per-stdio-server `sandbox` config with `enabled`, `allow_network`, `allow_read`, `allow_write`, and `profile_path`.
+- When `sandbox.enabled = true` on macOS, Plug launches the upstream child process through `/usr/bin/sandbox-exec`.
+- If `profile_path` is set, Plug uses that operator-supplied profile file.
+- If `profile_path` is absent, Plug generates a deny-by-default macOS sandbox profile with common system read access, configured read/write allowlists, optional network access, and no shell interpolation.
+- Rejected sandbox config on non-stdio transports during config validation.
+- Preserved default behavior: no existing upstream is sandboxed unless explicitly opted in.
+
+Tests and checks:
+
+- `cargo test -p plug-core generated_stdio_sandbox_profile -- --nocapture` passed.
+- `cargo test -p plug-core validate_sandbox -- --nocapture` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+
+Surprises:
+
+- Process resource limits are not safely enforceable through the existing `tokio::process::Command` path without unsafe pre-exec hooks or a separate supervisor. The first launch-ready tranche should enforce filesystem/network policy and document the process-limit gap honestly.
+
+Deferred:
+
+- Cross-platform Linux sandbox enforcement remains deferred. Reason: this pass uses the platform primitive available on Rob's current machine; Linux needs a separate design around Bubblewrap/firejail/cgroups and installer prerequisites. Owner: Rob. Re-review date: 2026-06-15.
+- CPU/memory/process-count limits remain deferred. Reason: enforcing them safely requires a supervisor or platform-specific process-control layer that would materially expand scope. Owner: Rob. Re-review date: 2026-06-15.
