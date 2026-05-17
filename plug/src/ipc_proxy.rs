@@ -517,10 +517,10 @@ impl ServerHandler for IpcProxyHandler {
             Implementation::new("plug", env!("CARGO_PKG_VERSION"))
                 .with_title("Plug")
                 .with_description("MCP multiplexer")
-                .with_website_url("https://github.com/plug-mcp/plug")
+                .with_website_url("https://github.com/cyberpapiii/plug")
                 .with_icons(vec![
                     Icon::new(
-                        "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+                        "https://raw.githubusercontent.com/cyberpapiii/plug/main/docs/assets/plug-icon.svg",
                     )
                     .with_mime_type("image/svg+xml")
                     .with_sizes(vec!["any".to_string()]),

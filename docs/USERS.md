@@ -99,7 +99,7 @@ plug is NOT built for:
 
 | ID | Story | Persona | Priority |
 |----|-------|---------|----------|
-| S1 | As a polyglot, I want to install plug with one command (`brew install plug-mcp/tap/plug`) so that I can get started immediately | 1 | P0 |
+| S1 | As a polyglot, I want to install plug with one command (`cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked`) so that I can get started immediately | 1 | P0 |
 | S2 | As a polyglot, I want plug to auto-detect my existing MCP configs (Claude Desktop, Cursor, Codex, Claude Code) on first run so that I don't have to re-enter everything | 1 | P0 |
 | S3 | As a polyglot, I want to import configs with one keystroke so that migration is effortless | 1 | P0 |
 | S4 | As an automator, I want to run `plug setup --yes` non-interactively so that I can script the setup | 2 | P0 |
@@ -191,7 +191,7 @@ Rob just reformatted his MacBook. He has Claude Code, Cursor, Gemini CLI, and Co
 
 **With plug**:
 ```bash
-brew install plug-mcp/tap/plug
+cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked
 plug
 # Auto-detects existing configs, imports with Y
 # Outputs connection snippets for each client

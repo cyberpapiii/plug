@@ -10,7 +10,7 @@ Do not file a public issue for vulnerabilities, credential exposure, auth bypass
 
 Use GitHub private vulnerability reporting once the public repository is available:
 
-https://github.com/plug-mcp/plug/security/advisories/new
+https://github.com/cyberpapiii/plug/security/advisories/new
 
 If private reporting is not enabled yet, contact the maintainer privately before publishing details. Include:
 

@@ -24,7 +24,7 @@ targets = [
 installers = ["shell", "homebrew"]
 
 # Homebrew tap
-tap = "plug-mcp/homebrew-tap"
+tap = "cyberpapiii/homebrew-tap"
 
 # Publish generated formula updates to the tap during release.
 publish-jobs = ["homebrew"]

@@ -474,6 +474,8 @@ Deferred:
 
 ## 2026-05-17 Owner-action follow-up
 
+Superseded on 2026-05-17: public launch no longer requires creating a separate `plug-mcp` GitHub organization. The launch namespace is the existing public `cyberpapiii/plug` repository, while the crates.io package name remains `plug-mcp` because `plug` is occupied.
+
 Completed:
 
 - Pushed hardened `main` to the current public remote `https://github.com/cyberpapiii/plug` (`39831d7..43b2c86`).
@@ -482,12 +484,24 @@ Completed:
 
 Blocked:
 
-- Creating/migrating to `plug-mcp/plug` is blocked because the `plug-mcp` GitHub owner namespace does not exist. `gh repo create plug-mcp/plug --public --source=. --remote=plug-mcp --push` returned `HTTP 404: Not Found (https://api.github.com/users/plug-mcp)`.
-- Creating `plug-mcp/homebrew-tap` is blocked for the same missing GitHub owner namespace.
 - Publishing `plug-core 0.1.0` and `plug-mcp 0.1.0` is blocked because this machine has no crates.io token configured (`cargo owner --list ...` reports `no token found`; `CARGO_REGISTRY_TOKEN` is unset; no `~/.cargo/credentials*` file exists).
 - `plug-mcp 0.1.0` publish dry-run remains blocked until `plug-core 0.1.0` exists on crates.io, which is the expected publish-order dependency.
 
 Next owner inputs required:
 
-- Create the `plug-mcp` GitHub organization/user namespace, then rerun repository creation/transfer and tap creation.
 - Provide a crates.io API token with publish rights for the first release, then publish `plug-core` before `plug-mcp`.
+
+## 2026-05-17 Personal-namespace launch adjustment
+
+Shipped:
+
+- Dropped the `plug-mcp` GitHub organization requirement for the public launch path.
+- Kept the repository at the existing public `cyberpapiii/plug` remote and kept private vulnerability reporting enabled there.
+- Updated workspace package metadata from `https://github.com/plug-mcp/plug` to `https://github.com/cyberpapiii/plug`.
+- Updated Plug's MCP server-card identity and initialize metadata URLs to `io.github.cyberpapiii/plug` and `https://github.com/cyberpapiii/plug`.
+- Updated cargo-dist Homebrew tap config to the existing public `cyberpapiii/homebrew-tap` repository.
+- Updated README, operator guide, security policy, and user-story docs to use `cyberpapiii/plug`, `cyberpapiii/tap/plug`, and the git-based Cargo install path until crates.io publish is complete.
+
+Still blocked:
+
+- crates.io publish still needs a token. The package name remains `plug-mcp`; publish order remains `plug-core` first, then `plug-mcp`.

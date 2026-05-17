@@ -15,28 +15,10 @@ OpenCode ─────┘
 
 ## Installation
 
-### Homebrew (macOS and Linux)
+### Cargo from GitHub
 
 ```sh
-brew install plug-mcp/tap/plug
-```
-
-### Shell installer (macOS and Linux)
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/plug-mcp/plug/releases/latest/download/plug-mcp-installer.sh | sh
-```
-
-Or install to a specific directory:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/plug-mcp/plug/releases/latest/download/plug-mcp-installer.sh | sh -s -- --install-dir ~/.local/bin
-```
-
-### Cargo
-
-```sh
-cargo install plug-mcp --locked
+cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked
 ```
 
 ### Local development reinstall
@@ -50,9 +32,29 @@ When working on `plug` locally, use the repo script instead of manually copying 
 This rebuilds the workspace, reinstalls `plug`, and normalizes `~/.local/bin/plug`
 to a symlink pointing at `~/.cargo/bin/plug` so the PATH binary stays in sync.
 
+### Release installers
+
+After a release is cut, install with Homebrew:
+
+```sh
+brew install cyberpapiii/tap/plug
+```
+
+Or use the shell installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh
+```
+
+Install to a specific directory:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh -s -- --install-dir ~/.local/bin
+```
+
 ### Manual
 
-Download the binary for your platform from the [releases page](https://github.com/plug-mcp/plug/releases), verify the SHA-256 checksum, and place it in your PATH.
+Download the binary for your platform from the [releases page](https://github.com/cyberpapiii/plug/releases), verify the SHA-256 checksum, and place it in your PATH.
 
 ## Quick Start
 
@@ -261,7 +263,7 @@ Notes:
 
 ## Design Principles
 
-1. **Single binary, zero dependencies** — `brew install plug-mcp/tap/plug && plug`
+1. **Single binary, zero dependencies** — `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked && plug`
 2. **Ruthlessly minimal** — if a feature can't be explained in one sentence, simplify it
 3. **Dual-audience UX** — every command works for humans (pretty) AND agents (`--output json`)
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering

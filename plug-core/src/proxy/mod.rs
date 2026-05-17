@@ -33,9 +33,9 @@ const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 const PLUG_TITLE: &str = "Plug";
 const PLUG_DESCRIPTION: &str = "MCP multiplexer";
-const PLUG_WEBSITE_URL: &str = "https://github.com/plug-mcp/plug";
+const PLUG_WEBSITE_URL: &str = "https://github.com/cyberpapiii/plug";
 const PLUG_ICON_URL: &str =
-    "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg";
+    "https://raw.githubusercontent.com/cyberpapiii/plug/main/docs/assets/plug-icon.svg";
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
@@ -4558,7 +4558,7 @@ mod tests {
         );
         assert_eq!(
             info.server_info.website_url.as_deref(),
-            Some("https://github.com/plug-mcp/plug")
+            Some("https://github.com/cyberpapiii/plug")
         );
         assert_eq!(
             info.server_info.icons.as_ref().map(|icons| icons.len()),

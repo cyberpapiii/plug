@@ -963,13 +963,13 @@ async fn get_server_card(
 
     let card = json!({
         "$schema": "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json",
-        "name": "io.github.plug-mcp/plug",
+        "name": "io.github.cyberpapiii/plug",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "MCP multiplexer for sharing one server configuration across many AI clients",
         "title": "Plug",
-        "websiteUrl": "https://github.com/plug-mcp/plug",
+        "websiteUrl": "https://github.com/cyberpapiii/plug",
         "repository": {
-            "url": "https://github.com/plug-mcp/plug",
+            "url": "https://github.com/cyberpapiii/plug",
             "source": "github"
         },
         "remotes": [remote],
@@ -1608,9 +1608,9 @@ fn build_initialize_result(
             Implementation::new("plug", env!("CARGO_PKG_VERSION"))
                 .with_title("Plug")
                 .with_description("MCP multiplexer")
-                .with_website_url("https://github.com/plug-mcp/plug")
+                .with_website_url("https://github.com/cyberpapiii/plug")
                 .with_icons(vec![Icon::new(
-                    "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+                    "https://raw.githubusercontent.com/cyberpapiii/plug/main/docs/assets/plug-icon.svg",
                 )
                 .with_mime_type("image/svg+xml")
                 .with_sizes(vec!["any".to_string()])]),
@@ -2461,7 +2461,7 @@ mod tests {
             json["$schema"],
             "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
         );
-        assert_eq!(json["name"], "io.github.plug-mcp/plug");
+        assert_eq!(json["name"], "io.github.cyberpapiii/plug");
         assert_eq!(json["title"], "Plug");
         assert!(json["version"].is_string());
         assert_eq!(json["remotes"][0]["type"], "streamable-http");
@@ -2490,7 +2490,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["name"], "io.github.plug-mcp/plug");
+        assert_eq!(json["name"], "io.github.cyberpapiii/plug");
         assert_eq!(json["remotes"][0]["url"], "/mcp");
     }
 

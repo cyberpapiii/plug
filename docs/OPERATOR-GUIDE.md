@@ -189,8 +189,8 @@ Current limits:
 
 Current distribution names:
 
-- GitHub repo: `plug-mcp/plug`
-- Homebrew tap: `plug-mcp/tap/plug`
+- GitHub repo: `cyberpapiii/plug`
+- Homebrew tap: `cyberpapiii/tap/plug`
 - crates.io package: `plug-mcp`
 - Installed binary: `plug`
 
@@ -205,4 +205,4 @@ dist build --artifacts=global
 dist build --artifacts=local --target aarch64-apple-darwin
 ```
 
-Publish order matters for crates.io: publish `plug-core` before `plug-mcp`, because the CLI package depends on the library package by version.
+Publish order matters for crates.io: publish `plug-core` before `plug-mcp`, because the CLI package depends on the library package by version. Until crates.io publish is complete, use `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked`.

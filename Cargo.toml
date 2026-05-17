@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"
-repository = "https://github.com/plug-mcp/plug"
-homepage = "https://github.com/plug-mcp/plug"
+repository = "https://github.com/cyberpapiii/plug"
+homepage = "https://github.com/cyberpapiii/plug"
 
 [workspace.dependencies]
 # MCP SDK
