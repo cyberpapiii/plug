@@ -587,4 +587,26 @@ Surprises:
 
 Deferred:
 
-- Future release automation should be reconciled so cargo-dist and the custom GitHub release workflow produce one consistent archive naming/layout scheme. Owner: Rob. Re-review date: before the next public release tag.
+- Future release automation should be reconciled so cargo-dist and the custom GitHub release workflow produce one consistent archive naming/layout scheme. Owner: Rob. Re-review date: before the next public release tag. Resolved later on 2026-05-17.
+
+## 2026-05-17 release automation reconciliation
+
+Shipped:
+
+- Reworked `.github/workflows/release.yml` so the custom release workflow now packages archives as `plug-mcp-<target>.tar.gz` with a single top-level `plug-mcp-<target>/` directory, matching the generated cargo-dist shell installer contract.
+- Added release-job generation and upload of cargo-dist global artifacts, including `plug-mcp-installer.sh`, `source.tar.gz`, and `source.tar.gz.sha256`.
+- Added workflow-generated `plug.rb` with SHA-256 checksums for macOS arm64, macOS x86_64, Linux arm64 GNU, and Linux x86_64 GNU archives.
+- Added automatic Homebrew tap publishing from the release workflow using the `HOMEBREW_TAP_TOKEN` repository secret.
+- Removed the unsupported Windows target from `dist-workspace.toml` so cargo-dist no longer plans installer entries for a platform the release workflow intentionally does not build.
+
+Checks:
+
+- `gh secret list --repo cyberpapiii/plug` confirms `HOMEBREW_TAP_TOKEN` is configured.
+- YAML parsing for `.github/workflows/release.yml` passed via Ruby's YAML loader.
+- `dist plan --no-local-paths --allow-dirty` now reports only the six supported macOS/Linux archives plus global artifacts.
+- Simulated the release publish job locally using wrapped `plug-mcp-*` archives, generated cargo-dist global artifacts, generated the Homebrew formula, and verified `ruby -c plug.rb`.
+- Served the simulated release artifacts from localhost and verified the generated `plug-mcp-installer.sh` installs `plug 0.3.0` into an isolated temporary `CARGO_HOME`.
+
+Surprises:
+
+- `dist generate --mode=ci --check --allow-dirty` did not rewrite the existing custom workflow, so the fix kept the repo's custom cross-build workflow but aligned its artifact contract with cargo-dist instead of replacing it wholesale.
