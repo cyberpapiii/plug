@@ -440,3 +440,34 @@ Checks:
 Deferred:
 
 - The advertised public install commands are release-ready but not yet globally live until Rob completes the org/tap/crates.io owner actions recorded in Phase 5 U13.
+
+## 2026-05-17 Phase 6 U14 - External-user documentation
+
+Shipped:
+
+- Updated README documentation links and install principle copy to use the `plug-mcp` distribution namespace.
+- Reconciled `docs/MCP-SPEC.md` with the current strict `2025-11-25` protocol-version stance, typed initialize response construction, Streamable HTTP downstream surface, legacy SSE upstream-client scope, static server-card discovery path, and stateless/sessionless future work.
+- Refreshed `docs/USERS.md` from the old `fanout` naming to Plug, current Homebrew install command, `plug setup --yes`, `plug start`, and current server-management command names.
+- Added `docs/OPERATOR-GUIDE.md` covering runtime files, TLS/non-loopback rules, downstream auth, upstream OAuth, observability, operator inventory, opt-in stdio sandboxing, and release-operation checks.
+- Added `SECURITY.md` with private GitHub advisory reporting guidance, supported-version posture, security model, and secret-redaction expectations.
+- Added `CONTRIBUTING.md` with workspace layout, required checks, distribution checks, multiplexor mental model, and PR expectations.
+- Updated `docs/audit-2026-05-17.md` with the Phase 6 external-user documentation status row.
+
+Checks:
+
+- Stale public-doc scan for `fanout`, broken `get.plug.sh`, old `cargo install plug`, old `brew install plug && plug`, old `--headless`, and obsolete protocol-version compatibility claims found no live README/MCP-SPEC/USERS/operator/security/contributing issues. Remaining matches are historical audit evidence and the intentional `cargo install plug-mcp` command.
+- `cargo test --workspace -- --test-threads=1` passed: 449 `plug-core` tests, 41 integration tests, 145 `plug` binary crate tests, `plug-test-harness`, mock server, and doc tests.
+- `cargo deny check advisories` passed with `advisories ok`.
+- `cargo clippy --workspace -- -D warnings` passed.
+- Live smoke with the installed `plug` binary reported the daemon running, 9 daemon-proxy sessions, 11 healthy upstreams, 339 tools, and live Claude Code plus Codex CLI sessions.
+- `/.well-known/mcp-server-card` returned the static `io.github.plug-mcp/plug` card with `2025-11-25` as the supported protocol version and protected `Authorization` remote header metadata.
+- An unauthenticated `/mcp` request returned `401 Unauthorized` with `WWW-Authenticate` pointing at `https://plug.plugtunnel.com/.well-known/oauth-protected-resource`.
+
+Surprises:
+
+- `docs/USERS.md` was still entirely branded as the old `fanout` product. README linked to it as a current doc, so leaving it historical would have undercut the external-user readiness pass.
+
+Deferred:
+
+- GitHub private vulnerability reporting cannot be fully verified until the public `plug-mcp/plug` repository exists and private reporting is enabled. Reason: this is controlled by GitHub repository settings after the namespace migration. Owner: Rob. Re-review date: before first public release tag.
+- README install commands remain release-ready but not globally live until the Phase 5 owner actions are complete. Reason: GitHub org/tap creation and crates.io publish require Rob-owned credentials. Owner: Rob. Re-review date: before first public release tag.

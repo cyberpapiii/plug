@@ -251,6 +251,7 @@ Notes:
 | [VISION.md](docs/VISION.md) | Core principles, design philosophy, non-negotiable rules |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical architecture, component design, data flow |
 | [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | AI client quirks, limits, and configuration |
+| [OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md) | Production operation: TLS, auth, observability, sandboxing |
 | [UX-DESIGN.md](docs/UX-DESIGN.md) | Guided CLI + agent UX patterns |
 | [CRATE-STACK.md](docs/CRATE-STACK.md) | Dependency decisions with rationale |
 | [MCP-SPEC.md](docs/MCP-SPEC.md) | MCP protocol reference relevant to implementation |
@@ -260,7 +261,7 @@ Notes:
 
 ## Design Principles
 
-1. **Single binary, zero dependencies** — `brew install plug && plug`
+1. **Single binary, zero dependencies** — `brew install plug-mcp/tap/plug && plug`
 2. **Ruthlessly minimal** — if a feature can't be explained in one sentence, simplify it
 3. **Dual-audience UX** — every command works for humans (pretty) AND agents (`--output json`)
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering

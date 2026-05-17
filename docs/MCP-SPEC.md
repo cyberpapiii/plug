@@ -1,6 +1,6 @@
 # MCP Specification Reference
 
-This document captures the MCP protocol details that directly affect fanout's implementation. It is not a full spec reproduction — it's a focused reference for implementors.
+This document captures the MCP protocol details that directly affect Plug's implementation. It is not a full spec reproduction -- it is a focused reference for implementors.
 
 **Current spec version**: 2025-11-25
 **Spec URL**: https://modelcontextprotocol.io/specification/2025-11-25
@@ -52,12 +52,12 @@ All MCP communication uses JSON-RPC 2.0, UTF-8 encoded.
 
 - Client launches server as subprocess
 - Messages on stdin/stdout, delimited by newlines (no embedded newlines in messages)
-- Server MAY write UTF-8 to stderr for logging (fanout should capture and route to its own logs)
+- Server MAY write UTF-8 to stderr for logging (Plug suppresses noisy upstream stderr by default and routes Plug's own logs separately)
 - Server MUST NOT write non-MCP content to stdout
 - Shutdown: client closes stdin → wait → SIGTERM → SIGKILL
 
-**fanout implications**:
-- `fanout connect` command reads MCP from its stdin, writes to stdout (this is what clients like Claude Code invoke)
+**Plug implications**:
+- `plug connect` command reads MCP from its stdin, writes to stdout (this is what clients like Claude Code invoke)
 - Upstream stdio servers are spawned as child processes via `tokio::process::Command`
 - Must capture and separate stderr from stdout
 
@@ -120,7 +120,7 @@ Server returns `text/event-stream` or `405 Method Not Allowed`.
 For clients that only support old SSE (e.g., OpenCode):
 - Client attempts POST `InitializeRequest` first
 - If 400/404/405: fall back to GET expecting `endpoint` event (old SSE protocol)
-- fanout should serve BOTH new Streamable HTTP and old SSE for maximum compatibility
+- Plug serves Streamable HTTP downstream and keeps a legacy SSE upstream client for older servers. It does not expose a separate downstream legacy SSE server surface.
 
 ---
 
@@ -159,7 +159,7 @@ Server responds:
       "logging": {},
       "completions": {}
     },
-    "serverInfo": {"name": "fanout", "version": "0.1.0"},
+    "serverInfo": {"name": "plug", "version": "0.1.0"},
     "instructions": "MCP multiplexer with 25 tools from 4 servers"
   }
 }
@@ -176,7 +176,7 @@ Client confirms:
 - Server responds with same version (if supported) or its own latest
 - If incompatible: client SHOULD disconnect
 
-**fanout**: Advertise 2025-11-25. Accept 2025-03-26 and 2024-11-05 with reduced feature set.
+**Plug**: Advertise `2025-11-25`. The current downstream HTTP policy is strict after initialization: non-initialize HTTP requests must include `MCP-Protocol-Version: 2025-11-25`. The HTTP initialize response body is set through typed `InitializeResult` construction, not JSON body mutation. Revisit this only when the accepted stateless/per-request protocol work is implemented.
 
 ### Phase 2: Operation
 
@@ -186,7 +186,7 @@ Normal request/response/notification flow.
 
 - stdio: client closes stdin, server should exit
 - HTTP: client sends DELETE with session ID
-- fanout: on shutdown, close all upstream connections, SIGTERM child processes, wait, SIGKILL
+- Plug: on shutdown, close all upstream connections, signal child processes, and clean daemon/session state.
 
 ---
 
@@ -194,7 +194,7 @@ Normal request/response/notification flow.
 
 ### Client → Server Requests
 
-| Method | fanout Behavior | Priority |
+| Method | Plug Behavior | Priority |
 |--------|----------------|----------|
 | `initialize` | Synthesize capabilities from all upstreams | P0 |
 | `ping` | Respond immediately (don't forward) | P0 |
@@ -212,7 +212,7 @@ Normal request/response/notification flow.
 
 ### Server → Client Requests
 
-| Method | fanout Behavior | Priority |
+| Method | Plug Behavior | Priority |
 |--------|----------------|----------|
 | `ping` | Respond immediately | P0 |
 | `sampling/createMessage` | Forward to the client that initiated the tool call | P2 |
@@ -221,7 +221,7 @@ Normal request/response/notification flow.
 
 ### Notifications
 
-| Notification | fanout Behavior | Priority |
+| Notification | Plug Behavior | Priority |
 |-------------|----------------|----------|
 | `notifications/tools/list_changed` | Invalidate tool cache, re-fan-out, notify ALL clients | P0 |
 | `notifications/resources/list_changed` | Invalidate cache, notify all clients | P1 |
@@ -291,31 +291,32 @@ Normal request/response/notification flow.
 }
 ```
 
-**fanout**: Pass through ALL content types unchanged. Including resource_link, audio, images.
+**Plug**: Pass through all MCP content types unchanged where possible, including `resource_link`, audio, images, `structuredContent`, and `outputSchema`. Oversized local results may spill into `plug://artifact/...` resources.
 
 ---
 
 ## Upcoming Spec Changes to Design For
 
-### Stateless Mode (June 2026, SEP-1442)
+### Stateless Mode (accepted transport SEP work)
 
-- Replace mandatory initialization handshake with self-contained requests
-- Sessions become explicit data (like cookies), not transport artifacts
-- Clients can optimistically attempt operations without initialization
-- Load balancers gain routing visibility without JSON-RPC parsing
+- SEP-2575 pushes MCP toward stateless alternatives to initialization/session-bound transport state.
+- SEP-2567 covers sessionless MCP.
+- Plug still serves the current stateful Streamable HTTP model today, with bounded SSE replay for stateful sessions.
+- Do not deepen session-bound public semantics unless the accepted stateless/sessionless model requires it.
 
-**fanout preparation**: Design sessions as data model concerns. Support both stateful (current) and stateless (future) initialization modes via a config flag.
+**Plug preparation**: Keep session state behind internal session stores so a future stateless mode can be added without rewriting routing, capability synthesis, or reverse-request ownership.
 
-### Server Cards (June 2026)
+### Server Cards
 
-- `/.well-known/mcp.json` endpoint for pre-connection discovery
-- Advertises capabilities, auth requirements, available primitives
+- Plug serves the current draft path `/.well-known/mcp-server-card`.
+- `/.well-known/mcp.json` remains as a legacy compatibility alias.
+- The card is intentionally static and does not expose dynamic tool/server inventory; primitives are discovered through MCP list methods after connection.
 
-**fanout preparation**: Serve a `/.well-known/mcp.json` that describes fanout's aggregated capabilities. Include tool count, server list, supported transports.
+**Plug preparation**: Keep the card close to the Server Card WG / SEP-2127 draft. Do not add Plug-specific public fields unless the draft leaves no standard path.
 
 ### Session Elevation (June 2026)
 
 - Mid-session permission upgrades
 - Client requests additional capabilities after initialization
 
-**fanout preparation**: Don't hardcode capabilities at initialization time. Keep a mutable capability set per session.
+**Plug preparation**: Do not hardcode capabilities at initialization time beyond the current synthesized capability model. Keep a mutable capability set per session.
