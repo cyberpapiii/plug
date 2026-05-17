@@ -15,8 +15,10 @@ type ToolInventoryGroup = Vec<(
     String,
     Option<String>,
     Option<String>,
+    Option<Vec<rmcp::model::Icon>>,
     plug_core::ipc::IpcToolRiskInfo,
     Option<plug_core::ipc::IpcServerSourceInfo>,
+    Option<plug_core::types::UpstreamServerMetadata>,
     plug_core::ipc::IpcTrustInfo,
 )>;
 
@@ -122,8 +124,10 @@ pub(crate) async fn cmd_tool_list(
                 t.server_id.clone(),
                 t.title.clone(),
                 t.description.clone(),
+                t.icons.clone(),
                 t.risk.clone(),
                 t.source.clone(),
+                t.upstream.clone(),
                 t.trust.clone(),
             ));
         }
@@ -138,17 +142,31 @@ pub(crate) async fn cmd_tool_list(
                     .map(|(prefix, tools)| {
                         let entries: Vec<serde_json::Value> = tools
                             .iter()
-                            .map(|(name, server_id, title, desc, risk, source, trust)| {
-                                serde_json::json!({
-                                    "name": name,
-                                    "server_id": server_id,
-                                    "title": title,
-                                    "description": desc,
-                                    "risk": risk,
-                                    "source": source,
-                                    "trust": trust,
-                                })
-                            })
+                            .map(
+                                |(
+                                    name,
+                                    server_id,
+                                    title,
+                                    desc,
+                                    icons,
+                                    risk,
+                                    source,
+                                    upstream,
+                                    trust,
+                                )| {
+                                    serde_json::json!({
+                                        "name": name,
+                                        "server_id": server_id,
+                                        "title": title,
+                                        "description": desc,
+                                        "icons": icons,
+                                        "risk": risk,
+                                        "source": source,
+                                        "upstream": upstream,
+                                        "trust": trust,
+                                    })
+                                },
+                            )
                             .collect();
                         (prefix.clone(), entries)
                     })
@@ -250,7 +268,18 @@ pub(crate) async fn cmd_tool_list(
                         style(format!("{} tools", tools.len())).dim(),
                         annotation
                     );
-                    for (name, _server_id, title, desc, _risk, _source, _trust) in &tools {
+                    for (
+                        name,
+                        _server_id,
+                        title,
+                        desc,
+                        _icons,
+                        _risk,
+                        _source,
+                        _upstream,
+                        _trust,
+                    ) in &tools
+                    {
                         let name_styled = style(format!("  │ {:<28}", name)).cyan();
                         let display_text = title.as_deref().or(desc.as_deref());
                         if let Some(text) = display_text {
@@ -296,6 +325,7 @@ mod tests {
             health,
             auth_status: "oauth".to_string(),
             tool_count: 0,
+            upstream: None,
             last_seen: None,
         }
     }

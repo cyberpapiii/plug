@@ -1604,17 +1604,9 @@ fn build_initialize_result(
     client_type: crate::types::ClientType,
 ) -> InitializeResult {
     InitializeResult::new(router.synthesized_capabilities_for_client(client_type))
-        .with_server_info(
-            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
-                .with_title("Plug")
-                .with_description("MCP multiplexer")
-                .with_website_url("https://github.com/cyberpapiii/plug")
-                .with_icons(vec![Icon::new(
-                    "https://raw.githubusercontent.com/cyberpapiii/plug/main/docs/assets/plug-icon.svg",
-                )
-                .with_mime_type("image/svg+xml")
-                .with_sizes(vec!["any".to_string()])]),
-        )
+        .with_server_info(crate::branding::plug_implementation(env!(
+            "CARGO_PKG_VERSION"
+        )))
         .with_protocol_version(ProtocolVersion::V_2025_11_25)
 }
 
@@ -2397,7 +2389,35 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(json["result"]["protocolVersion"], "2025-11-25");
         assert_eq!(json["result"]["serverInfo"]["name"], "plug");
+        assert_initialize_icons_sequence(&json["result"]["serverInfo"]["icons"]);
         assert!(json["result"]["capabilities"]["tools"].is_null());
+    }
+
+    fn assert_initialize_icons_sequence(icons: &serde_json::Value) {
+        let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
+        let icon_array = icons.as_array().expect("icons array");
+        assert_eq!(icon_array.len(), expected_sizes.len() + 1);
+
+        for (icon, expected_size) in icon_array.iter().zip(expected_sizes) {
+            assert_eq!(icon["mimeType"], "image/png");
+            assert_eq!(icon["sizes"][0], expected_size);
+            assert!(
+                icon["src"]
+                    .as_str()
+                    .expect("png icon src")
+                    .starts_with("data:image/png;base64,")
+            );
+        }
+
+        let svg = icon_array.last().expect("svg icon");
+        assert_eq!(svg["mimeType"], "image/svg+xml");
+        assert_eq!(svg["sizes"][0], "any");
+        assert!(
+            svg["src"]
+                .as_str()
+                .expect("svg icon src")
+                .starts_with("data:image/svg+xml;base64,")
+        );
     }
 
     #[tokio::test]

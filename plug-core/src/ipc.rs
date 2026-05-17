@@ -8,11 +8,11 @@ use std::fmt;
 
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult, ToolAnnotations,
+    CreateMessageRequestParams, CreateMessageResult, Icon, ToolAnnotations,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ServerHealth, ServerStatus};
+use crate::types::{ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
@@ -207,10 +207,14 @@ pub struct IpcToolInfo {
     pub server_id: String,
     pub description: Option<String>,
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<Icon>>,
     #[serde(default)]
     pub risk: IpcToolRiskInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<IpcServerSourceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamServerMetadata>,
     #[serde(default)]
     pub trust: IpcTrustInfo,
 }
@@ -732,6 +736,30 @@ mod tests {
                 clients: 0,
                 uptime_secs: 42,
             },
+            IpcResponse::Tools {
+                tools: vec![IpcToolInfo {
+                    name: "Imessage__send".to_string(),
+                    server_id: "imessage".to_string(),
+                    description: Some("Send an iMessage".to_string()),
+                    title: Some("iMessage: Send".to_string()),
+                    icons: Some(vec![
+                        Icon::new("https://example.com/imessage.png").with_mime_type("image/png"),
+                    ]),
+                    risk: IpcToolRiskInfo::default(),
+                    source: None,
+                    upstream: Some(UpstreamServerMetadata {
+                        name: "iMessage Max".to_string(),
+                        version: "1.2.1".to_string(),
+                        title: Some("iMessage Max".to_string()),
+                        description: None,
+                        website_url: None,
+                        icons: Some(vec![
+                            Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
+                        ]),
+                    }),
+                    trust: IpcTrustInfo::default(),
+                }],
+            },
             IpcResponse::LiveSessions {
                 sessions: vec![IpcLiveSessionInfo {
                     transport: LiveSessionTransport::DaemonProxy,
@@ -790,6 +818,46 @@ mod tests {
             let json2 = serde_json::to_string(&deserialized).unwrap();
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn tools_response_json_includes_icons_and_upstream_metadata() {
+        let response = IpcResponse::Tools {
+            tools: vec![IpcToolInfo {
+                name: "Imessage__send".to_string(),
+                server_id: "imessage".to_string(),
+                description: None,
+                title: Some("iMessage: Send".to_string()),
+                icons: Some(vec![
+                    Icon::new("https://example.com/imessage.png").with_mime_type("image/png"),
+                ]),
+                risk: IpcToolRiskInfo::default(),
+                source: None,
+                upstream: Some(UpstreamServerMetadata {
+                    name: "iMessage Max".to_string(),
+                    version: "1.2.1".to_string(),
+                    title: Some("iMessage Max".to_string()),
+                    description: None,
+                    website_url: None,
+                    icons: Some(vec![
+                        Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
+                    ]),
+                }),
+                trust: IpcTrustInfo::default(),
+            }],
+        };
+
+        let json = serde_json::to_value(response).expect("serialize tools response");
+
+        assert_eq!(
+            json["tools"][0]["icons"][0]["src"],
+            "https://example.com/imessage.png"
+        );
+        assert_eq!(json["tools"][0]["upstream"]["name"], "iMessage Max");
+        assert_eq!(
+            json["tools"][0]["upstream"]["icons"][0]["src"],
+            "data:image/png;base64,aGVsbG8="
+        );
     }
 
     #[test]

@@ -1546,20 +1546,27 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             let config = ctx.engine.config();
             let ipc_tools = tools
                 .into_iter()
-                .map(|(server_id, tool, risk)| plug_core::ipc::IpcToolInfo {
-                    source: config
-                        .servers
-                        .get(&server_id)
-                        .map(plug_core::ipc::IpcServerSourceInfo::from_config),
-                    trust: plug_core::ipc::IpcTrustInfo::for_server(
-                        &server_id,
-                        config.servers.get(&server_id),
-                    ),
-                    risk,
-                    name: tool.name.to_string(),
-                    server_id,
-                    description: tool.description.map(|d| d.to_string()),
-                    title: tool.title.clone(),
+                .map(|(server_id, tool, risk)| {
+                    let upstream = tool_router
+                        .server_manager()
+                        .get_upstream_metadata(&server_id);
+                    plug_core::ipc::IpcToolInfo {
+                        source: config
+                            .servers
+                            .get(&server_id)
+                            .map(plug_core::ipc::IpcServerSourceInfo::from_config),
+                        trust: plug_core::ipc::IpcTrustInfo::for_server(
+                            &server_id,
+                            config.servers.get(&server_id),
+                        ),
+                        risk,
+                        name: tool.name.to_string(),
+                        server_id,
+                        description: tool.description.map(|d| d.to_string()),
+                        title: tool.title.clone(),
+                        icons: tool.icons.clone(),
+                        upstream,
+                    }
                 })
                 .collect();
             IpcResponse::Tools { tools: ipc_tools }

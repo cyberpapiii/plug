@@ -830,6 +830,7 @@ mod tests {
                     health: ServerHealth::Healthy,
                     tool_count: 1,
                     auth_status: "none".to_string(),
+                    upstream: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -837,6 +838,7 @@ mod tests {
                     health: ServerHealth::Failed,
                     tool_count: 0,
                     auth_status: "none".to_string(),
+                    upstream: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -844,6 +846,7 @@ mod tests {
                     health: ServerHealth::AuthRequired,
                     tool_count: 0,
                     auth_status: "oauth".to_string(),
+                    upstream: None,
                     last_seen: None,
                 },
             ],
@@ -873,6 +876,7 @@ mod tests {
                     health: ServerHealth::Healthy,
                     tool_count: 1,
                     auth_status: "none".to_string(),
+                    upstream: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -880,6 +884,7 @@ mod tests {
                     health: ServerHealth::Degraded,
                     tool_count: 12,
                     auth_status: "oauth".to_string(),
+                    upstream: None,
                     last_seen: None,
                 },
             ],

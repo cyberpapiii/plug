@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::ArtifactStore;
+use crate::branding;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
@@ -31,24 +32,11 @@ use crate::types::{ClientType, LazyToolMode, LazyToolModeOrigin, ResolvedLazyToo
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
-const PLUG_TITLE: &str = "Plug";
-const PLUG_DESCRIPTION: &str = "MCP multiplexer";
-const PLUG_WEBSITE_URL: &str = "https://github.com/cyberpapiii/plug";
-const PLUG_ICON_URL: &str =
-    "https://raw.githubusercontent.com/cyberpapiii/plug/main/docs/assets/plug-icon.svg";
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
 fn plug_implementation() -> Implementation {
-    Implementation::new("plug", env!("CARGO_PKG_VERSION"))
-        .with_title(PLUG_TITLE)
-        .with_description(PLUG_DESCRIPTION)
-        .with_website_url(PLUG_WEBSITE_URL)
-        .with_icons(vec![
-            Icon::new(PLUG_ICON_URL)
-                .with_mime_type("image/svg+xml")
-                .with_sizes(vec!["any".to_string()]),
-        ])
+    branding::plug_implementation(env!("CARGO_PKG_VERSION"))
 }
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
@@ -1353,6 +1341,10 @@ impl ToolRouter {
             let upstream_annotations = c.tool.annotations.clone();
             let mut prefixed_tool = c.tool.clone();
             let mut inferred_tool = c.tool.clone();
+            let upstream_icons = self
+                .server_manager
+                .get_upstream_metadata(&c.server_name)
+                .and_then(|metadata| metadata.icons);
             inferred_tool.name = Cow::Owned(final_name.clone());
             inferred_tool.annotations = None;
             crate::enrichment::normalize_annotations(&mut inferred_tool, &final_name);
@@ -1371,6 +1363,8 @@ impl ToolRouter {
             // Set wire name and canonical display metadata
             prefixed_tool.name = Cow::Owned(prefixed_name.clone());
             apply_canonical_tool_title(&mut prefixed_tool, title_name);
+            prefixed_tool.icons =
+                normalized_icons_with_fallback(prefixed_tool.icons.as_deref(), upstream_icons);
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
@@ -1480,6 +1474,12 @@ impl ToolRouter {
             if resource.title.is_none() {
                 resource.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
+            resource.icons = normalized_icons_with_fallback(
+                resource.icons.as_deref(),
+                self.server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons),
+            );
             resource.name = routed_name;
             resources_vec.push(resource);
         }
@@ -1498,6 +1498,12 @@ impl ToolRouter {
             if template.title.is_none() {
                 template.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
+            template.icons = normalized_icons_with_fallback(
+                template.icons.as_deref(),
+                self.server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons),
+            );
             template.name = routed_name;
             resource_templates_vec.push(template);
         }
@@ -1520,6 +1526,12 @@ impl ToolRouter {
             if prompt.title.is_none() {
                 prompt.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
+            prompt.icons = normalized_icons_with_fallback(
+                prompt.icons.as_deref(),
+                self.server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons),
+            );
             prompt.name = routed_name;
             prompts_vec.push(prompt);
         }
@@ -3471,6 +3483,25 @@ fn apply_canonical_tool_title(tool: &mut Tool, title: String) {
     annotations.title = Some(title);
 }
 
+fn normalized_icons_with_fallback(
+    item_icons: Option<&[Icon]>,
+    fallback_icons: Option<Vec<Icon>>,
+) -> Option<Vec<Icon>> {
+    match item_icons {
+        Some([]) | None => fallback_icons
+            .map(https_only_icons)
+            .filter(|icons| !icons.is_empty()),
+        Some(icons) => crate::icons::normalize_icons(Some(icons)),
+    }
+}
+
+fn https_only_icons(icons: Vec<Icon>) -> Vec<Icon> {
+    icons
+        .into_iter()
+        .filter(|icon| icon.src.to_ascii_lowercase().starts_with("https://"))
+        .collect()
+}
+
 fn sanitize_description(desc: &str) -> String {
     desc.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
@@ -4560,14 +4591,34 @@ mod tests {
             info.server_info.website_url.as_deref(),
             Some("https://github.com/cyberpapiii/plug")
         );
-        assert_eq!(
-            info.server_info.icons.as_ref().map(|icons| icons.len()),
-            Some(1)
-        );
+        let icons = info.server_info.icons.as_ref().expect("plug icons");
+        assert_plug_icons_sequence(icons);
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.protocol_version.as_str(), LATEST_PROTOCOL_VERSION);
         assert!(info.capabilities.tools.is_none());
         assert!(info.capabilities.resources.is_none());
+    }
+
+    fn assert_plug_icons_sequence(icons: &[Icon]) {
+        let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
+        assert_eq!(icons.len(), expected_sizes.len() + 1);
+
+        for (icon, expected_size) in icons.iter().zip(expected_sizes) {
+            assert!(icon.src.starts_with("data:image/png;base64,"));
+            assert_eq!(icon.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(
+                icon.sizes
+                    .as_ref()
+                    .and_then(|sizes| sizes.first())
+                    .map(String::as_str),
+                Some(expected_size)
+            );
+        }
+
+        let svg = icons.last().expect("svg fallback icon");
+        assert!(svg.src.starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(svg.mime_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(svg.sizes.as_deref(), Some(&["any".to_string()][..]));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4675,6 +4726,46 @@ mod tests {
             &["gmail__*".into()],
             "Slack__search_messages"
         ));
+    }
+
+    #[test]
+    fn normalized_icons_preserve_item_icons_before_server_fallback() {
+        let item = Icon::new("https://example.com/tool.png").with_mime_type("image/png");
+        let fallback = Icon::new("https://example.com/server.png").with_mime_type("image/png");
+
+        let icons = normalized_icons_with_fallback(Some(&[item]), Some(vec![fallback]))
+            .expect("tool icon should survive");
+
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].src, "https://example.com/tool.png");
+    }
+
+    #[test]
+    fn normalized_icons_use_https_server_fallback_when_item_icon_is_missing() {
+        let fallback = Icon::new("https://example.com/server.png").with_mime_type("image/png");
+
+        let icons = normalized_icons_with_fallback(None, Some(vec![fallback]))
+            .expect("server fallback should be used");
+
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].src, "https://example.com/server.png");
+    }
+
+    #[test]
+    fn normalized_icons_do_not_fallback_over_invalid_explicit_item_icons() {
+        let unsafe_item = Icon::new("file:///tmp/tool.png").with_mime_type("image/png");
+        let fallback = Icon::new("https://example.com/server.png").with_mime_type("image/png");
+
+        assert!(
+            normalized_icons_with_fallback(Some(&[unsafe_item]), Some(vec![fallback])).is_none()
+        );
+    }
+
+    #[test]
+    fn normalized_icons_do_not_duplicate_data_uri_server_fallbacks() {
+        let fallback = Icon::new("data:image/png;base64,aGVsbG8=");
+
+        assert!(normalized_icons_with_fallback(None, Some(vec![fallback])).is_none());
     }
 
     #[test]

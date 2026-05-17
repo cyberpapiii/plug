@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod auth;
+pub mod branding;
 pub mod circuit;
 pub mod client_detect;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod error;
 pub mod export;
 pub mod health;
 pub mod http;
+pub mod icons;
 pub mod import;
 pub mod ipc;
 pub(crate) mod mcp_http_headers;

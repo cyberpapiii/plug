@@ -114,6 +114,7 @@ pub(crate) async fn cmd_server_list(
                                 "health": server.health,
                                 "tool_count": server.tool_count,
                                 "auth_status": server.auth_status,
+                                "upstream": server.upstream,
                                 "source": server_cfg.map(plug_core::ipc::IpcServerSourceInfo::from_config),
                                 "trust": plug_core::ipc::IpcTrustInfo::for_server(&server.server_id, server_cfg),
                             })

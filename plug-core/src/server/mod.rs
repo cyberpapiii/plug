@@ -18,7 +18,7 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
     CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
-    ElicitationCapability, FormElicitationCapability, InitializedNotification,
+    ElicitationCapability, FormElicitationCapability, Implementation, InitializedNotification,
     LoggingMessageNotificationParam, ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
     SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
@@ -34,7 +34,7 @@ use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
 use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
-use crate::types::{HealthState, ServerHealth, ServerStatus};
+use crate::types::{HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -44,6 +44,20 @@ const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+fn upstream_metadata_from_implementation(
+    implementation: &Implementation,
+) -> Option<UpstreamServerMetadata> {
+    let icons = crate::icons::normalize_icons(implementation.icons.as_deref());
+    Some(UpstreamServerMetadata {
+        name: implementation.name.clone(),
+        version: implementation.version.clone(),
+        title: implementation.title.clone(),
+        description: implementation.description.clone(),
+        website_url: implementation.website_url.clone(),
+        icons,
+    })
+}
 
 #[derive(Clone)]
 struct InitializedNotificationCompatHttpClient {
@@ -477,6 +491,7 @@ pub struct UpstreamServer {
     pub(crate) client: McpClient,
     pub(crate) tools: Arc<ArcSwap<Vec<rmcp::model::Tool>>>,
     pub capabilities: ServerCapabilities,
+    pub upstream: Option<UpstreamServerMetadata>,
     pub health: ServerHealth,
 }
 
@@ -769,6 +784,9 @@ impl ServerManager {
                     tools.store(Arc::new(tools_result));
 
                     let server_info = client.peer().peer_info();
+                    let upstream = server_info
+                        .as_ref()
+                        .and_then(|info| upstream_metadata_from_implementation(&info.server_info));
                     if let Some(info) = server_info {
                         tracing::info!(
                             server = %name,
@@ -790,6 +808,7 @@ impl ServerManager {
                         client,
                         tools,
                         capabilities,
+                        upstream,
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -985,6 +1004,9 @@ impl ServerManager {
         tools.store(Arc::new(tools_result));
 
         let server_info = client.peer().peer_info();
+        let upstream = server_info
+            .as_ref()
+            .and_then(|info| upstream_metadata_from_implementation(&info.server_info));
         if let Some(info) = server_info {
             tracing::info!(
                 server = %name,
@@ -1006,6 +1028,7 @@ impl ServerManager {
             client,
             tools,
             capabilities,
+            upstream,
             health: ServerHealth::Healthy,
         })
     }
@@ -1177,6 +1200,13 @@ impl ServerManager {
         servers.get(server_name).cloned()
     }
 
+    pub fn get_upstream_metadata(&self, server_name: &str) -> Option<UpstreamServerMetadata> {
+        let servers = self.servers.load();
+        servers
+            .get(server_name)
+            .and_then(|upstream| upstream.upstream.clone())
+    }
+
     /// Get all healthy upstream servers as (name, server) pairs.
     pub fn healthy_upstreams(&self) -> Vec<(String, Arc<UpstreamServer>)> {
         let servers = self.servers.load();
@@ -1249,6 +1279,7 @@ impl ServerManager {
                     health,
                     tool_count: upstream.tools.load().len(),
                     auth_status,
+                    upstream: upstream.upstream.clone(),
                     last_seen: None,
                 }
             })
@@ -1269,6 +1300,7 @@ impl ServerManager {
                 health: entry.health,
                 tool_count: 0,
                 auth_status,
+                upstream: None,
                 last_seen: None,
             });
         }
@@ -1479,12 +1511,13 @@ mod tests {
     use rmcp::model::{
         AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams,
         CancelTaskResult, ClientJsonRpcMessage, ClientRequest, Content, CreateTaskResult,
-        GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult, Implementation,
-        InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        ListTasksResult, ListToolsResult, Meta, NumberOrString, ProgressNotificationParam,
-        ProgressToken, Prompt, PromptMessage, PromptMessageContent, PromptMessageRole, RawResource,
-        RawResourceTemplate, ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
-        ServerJsonRpcMessage, ServerResult, Task, TaskStatus, TasksCapability, Tool,
+        GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult, Icon,
+        Implementation, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListTasksResult, ListToolsResult, Meta, NumberOrString,
+        ProgressNotificationParam, ProgressToken, Prompt, PromptMessage, PromptMessageContent,
+        PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Task, TaskStatus,
+        TasksCapability, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -1495,6 +1528,42 @@ mod tests {
         let token = crate::types::SecretString::from("real-token".to_string());
         assert_eq!(format!("Bearer {}", token.as_str()), "Bearer real-token");
         assert_eq!(format!("{token}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn upstream_metadata_normalizes_server_icons() {
+        let implementation = Implementation::new("iMessage Max", "1.2.1")
+            .with_title("iMessage Max")
+            .with_description("Local messages")
+            .with_website_url("https://example.com/imessage")
+            .with_icons(vec![
+                Icon::new("data:image/png;base64,aGVsbG8=").with_sizes(vec!["64x64".to_string()]),
+                Icon::new("file:///tmp/icon.png").with_mime_type("image/png"),
+            ]);
+
+        let metadata =
+            upstream_metadata_from_implementation(&implementation).expect("metadata present");
+
+        assert_eq!(metadata.name, "iMessage Max");
+        assert_eq!(metadata.title.as_deref(), Some("iMessage Max"));
+        assert_eq!(metadata.icons.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            metadata.icons.as_ref().unwrap()[0].mime_type.as_deref(),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn upstream_metadata_preserves_required_identity_without_optional_fields() {
+        let implementation = Implementation::new("plain-server", "0.1.0");
+
+        let metadata =
+            upstream_metadata_from_implementation(&implementation).expect("metadata present");
+
+        assert_eq!(metadata.name, "plain-server");
+        assert_eq!(metadata.version, "0.1.0");
+        assert_eq!(metadata.title, None);
+        assert_eq!(metadata.icons, None);
     }
 
     fn test_router_config() -> RouterConfig {
@@ -1926,6 +1995,7 @@ mod tests {
             client,
             tools,
             capabilities: ServerCapabilities::default(),
+            upstream: None,
             health: ServerHealth::Healthy,
         }
     }
@@ -1975,6 +2045,7 @@ mod tests {
                 client,
                 tools,
                 capabilities,
+                upstream: None,
                 health: ServerHealth::Healthy,
             },
             result_request_count,
@@ -2206,6 +2277,7 @@ mod tests {
                 client: client_a,
                 tools: tools_a,
                 capabilities: ServerCapabilities::default(),
+                upstream: None,
                 health: ServerHealth::Healthy,
             },
         )
@@ -2257,6 +2329,7 @@ mod tests {
                 client: client_b,
                 tools: tools_b,
                 capabilities: ServerCapabilities::default(),
+                upstream: None,
                 health: ServerHealth::Healthy,
             },
         )
@@ -2404,6 +2477,7 @@ mod tests {
                     client,
                     tools,
                     capabilities: ServerCapabilities::default(),
+                    upstream: None,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -2504,6 +2578,7 @@ mod tests {
                     client,
                     tools,
                     capabilities: ServerCapabilities::default(),
+                    upstream: None,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -2725,6 +2800,7 @@ mod tests {
                     client,
                     tools,
                     capabilities: ServerCapabilities::default(),
+                    upstream: None,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -2840,6 +2916,7 @@ mod tests {
                     client,
                     tools,
                     capabilities: ServerCapabilities::default(),
+                    upstream: None,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -2977,6 +3054,7 @@ mod tests {
                     client,
                     tools,
                     capabilities,
+                    upstream: None,
                     health: ServerHealth::Healthy,
                 },
             )
