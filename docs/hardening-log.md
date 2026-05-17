@@ -557,3 +557,14 @@ Shipped:
 
 - Reconciled stale `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` wording that still described daemon IPC resource subscribe as unsupported.
 - Current-truth docs now match the hardened implementation and audit row: daemon IPC supports resource subscribe/unsubscribe and targeted resource update delivery.
+
+## 2026-05-17 v0.3.0 release prep
+
+Shipped:
+
+- Bumped the workspace and publishable crate versions from `0.1.0` to `0.3.0` for the public artifact release.
+- Updated `CHANGELOG.md` for the hardening/public-launch release.
+
+Decision:
+
+- Skipped `0.1.1` because the repository already has a historical `v0.2.0` tag. `0.3.0` gives the public launch a forward-moving tag and avoids making a newer release look older than an existing tag.

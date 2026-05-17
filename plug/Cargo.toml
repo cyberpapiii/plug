@@ -13,7 +13,7 @@ name = "plug"
 path = "src/main.rs"
 
 [dependencies]
-plug-core = { path = "../plug-core", version = "0.1.0" }
+plug-core = { path = "../plug-core", version = "0.3.0" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
