@@ -68,3 +68,49 @@ Surprises:
 Deferred:
 
 - None for U2.
+
+## 2026-05-17 Phase 2 U3 - `rmcp` 1.7.0 upgrade
+
+Shipped:
+
+- Upgraded the workspace `rmcp` dependency from `1.5.0` to `1.7.0`.
+- Preserved Plug's custom downstream HTTP server, session handling, routing, task ownership, OAuth, legacy SSE upstream transport, and daemon IPC code.
+- Updated downstream HTTP error-response construction for the `rmcp 1.7.0` API change: `ServerJsonRpcMessage::error(...)` now takes `Option<RequestId>`, so routed HTTP errors pass `Some(request_id)`.
+- Added `http::server::tests::routed_http_error_preserves_request_id` to prove routed JSON-RPC errors still carry the downstream request id after the SDK API change.
+
+Tests and checks:
+
+- `cargo check --workspace` passed.
+- `cargo test -p plug-core http::server::tests::routed_http_error_preserves_request_id -- --nocapture` passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `cargo test --workspace -- --test-threads=1` passed: 143 `plug` tests, 427 `plug-core` tests, 41 integration tests, and doc-test/no-test crates.
+- `cargo deny check advisories` passed with `advisories ok`.
+
+Runtime smoke:
+
+- `./target/debug/plug status --output json` reached the live daemon, reported `transport_complete` inventory, 10 daemon-proxy sessions, downstream OAuth at `https://plug.plugtunnel.com/mcp`, and all configured upstream servers healthy.
+- `./target/debug/plug clients --output json` reported live Claude Code and Codex CLI sessions through daemon IPC. Factory and Google Antigravity are linked but not live; Cursor, Gemini CLI, and OpenCode were detected but not linked/live in this smoke output; VS Code Copilot, Windsurf, and Zed were not detected.
+- I did not restart the live daemon for this smoke because Plug operational guidance says not to restart daemon/runtime processes unless explicitly asked. This validates CLI/operator compatibility with the current live daemon, while the full test suite validates the rebuilt `rmcp 1.7.0` code paths.
+
+Surprises:
+
+- The `rmcp` upgrade was narrower than expected. No model-shape changes affected Plug's current prompt/resource fixtures, OAuth code, task code, or mock server.
+- `ping` is handled successfully by the current HTTP path, so the new request-id regression targets a real routed resource-read error instead of assuming `ping` is unsupported.
+
+Deferred:
+
+- SDK Streamable HTTP server/session-store adoption remains deferred to a separate transport redesign. Reason: this hardening pass explicitly preserves Plug's custom downstream HTTP server and the audit classifies SDK adoption as medium/high wire-risk for clients. Owner: Rob. Re-review date: 2026-07-01 or when the SSE/stateless transport tranche is complete.
+
+## 2026-05-17 Phase 2 gate - Dependency hygiene
+
+Phase 2 is complete:
+
+- U2 replaced `serde_yml`; no direct RustSec advisory remains.
+- U3 upgraded `rmcp` to `1.7.0` without adopting SDK HTTP server internals.
+- Full workspace tests, clippy, formatter check, and advisory check pass.
+- Runtime smoke reached the live daemon and two active client families: Claude Code and Codex CLI.
+
+Deferred:
+
+- Manual GUI-client exercise across every advertised client remains a launch-cut gate, not a Phase 2 blocker. The currently live machine state only exposed Claude Code and Codex CLI sessions non-interactively.

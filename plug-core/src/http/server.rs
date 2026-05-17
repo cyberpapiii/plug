@@ -1185,7 +1185,7 @@ async fn handle_request(
                         json_response(&response_msg)
                     }
                     Err(mcp_err) => {
-                        let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                        let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                         json_response(&response_msg)
                     }
                 }
@@ -1208,7 +1208,7 @@ async fn handle_request(
                         json_response(&response_msg)
                     }
                     Err(mcp_err) => {
-                        let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                        let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                         json_response(&response_msg)
                     }
                 }
@@ -1233,7 +1233,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1257,7 +1257,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1281,7 +1281,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1305,7 +1305,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1342,7 +1342,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1371,7 +1371,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1396,7 +1396,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1421,7 +1421,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1438,7 +1438,7 @@ async fn handle_request(
                     json_response(&response_msg)
                 }
                 Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, request_id);
+                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
                     json_response(&response_msg)
                 }
             }
@@ -1467,7 +1467,7 @@ async fn handle_request(
             // Unsupported method — return JSON-RPC method not found error
             validate_session_header(headers, state.sessions.as_ref())?;
             let error = ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not supported", None);
-            let response_msg = ServerJsonRpcMessage::error(error, request_id);
+            let response_msg = ServerJsonRpcMessage::error(error, Some(request_id));
             json_response(&response_msg)
         }
     }
@@ -1952,6 +1952,40 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn routed_http_error_preserves_request_id() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "request-123",
+            "method": "resources/read",
+            "params": {
+                "uri": "memory://missing"
+            }
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], "request-123");
+        assert!(json["error"]["code"].is_number());
     }
 
     #[tokio::test]
