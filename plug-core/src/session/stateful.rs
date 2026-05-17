@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::http::error::HttpError;
 
 use super::{
-    DownstreamSessionSnapshot, DownstreamTransport, SessionSendOutcome, SessionStore, SseMessage,
+    DownstreamSessionSnapshot, DownstreamTransport, SessionSendOutcome, SessionStore, SseEvent,
+    SseMessage, SseReplayKey,
 };
 
 /// Current in-memory stateful downstream session store.
@@ -26,16 +27,11 @@ pub struct StatefulSessionStore {
 struct SessionState {
     last_activity: Instant,
     created_at: Instant,
-    sse_sender: Option<mpsc::Sender<SseMessage>>,
-    pending_notifications: VecDeque<SseMessage>,
+    sse_sender: Option<mpsc::Sender<SseEvent>>,
+    pending_notifications: VecDeque<SseEvent>,
+    replay_events: VecDeque<SseEvent>,
+    next_event_id: u64,
     client_type: crate::types::ClientType,
-}
-
-enum BroadcastFollowup {
-    Expire,
-    Delivered,
-    QueueIfStillInactive,
-    ClearAndRequeue,
 }
 
 impl StatefulSessionStore {
@@ -105,12 +101,30 @@ impl StatefulSessionStore {
         }
     }
 
-    fn enqueue_pending(entry: &mut SessionState, message: SseMessage) {
+    fn enqueue_pending(entry: &mut SessionState, event: SseEvent) {
         const PENDING_LIMIT: usize = 32;
         if entry.pending_notifications.len() >= PENDING_LIMIT {
             entry.pending_notifications.pop_front();
         }
-        entry.pending_notifications.push_back(message);
+        entry.pending_notifications.push_back(event);
+    }
+
+    fn enqueue_replay(entry: &mut SessionState, event: SseEvent) {
+        const REPLAY_LIMIT: usize = 128;
+        if entry.replay_events.len() >= REPLAY_LIMIT {
+            entry.replay_events.pop_front();
+        }
+        entry.replay_events.push_back(event);
+    }
+
+    fn next_event(entry: &mut SessionState, message: SseMessage) -> SseEvent {
+        let event = SseEvent {
+            id: entry.next_event_id,
+            message,
+        };
+        entry.next_event_id = entry.next_event_id.saturating_add(1);
+        Self::enqueue_replay(entry, event.clone());
+        event
     }
 
     fn with_live_session_mut<T>(
@@ -136,23 +150,29 @@ impl StatefulSessionStore {
     fn try_send_to_session(
         &self,
         session_id: &str,
-        message: &SseMessage,
+        message: SseMessage,
         queue_if_unavailable: bool,
     ) -> SessionSendOutcome {
         let mut remove_session = false;
         let mut clear_sender = false;
-        let mut queue_message = false;
+        let mut queue_event: Option<SseEvent> = None;
         let mut delivered = false;
 
-        if let Some(entry) = self.sessions.get(session_id) {
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
             if entry.last_activity.elapsed() > self.timeout {
                 remove_session = true;
-            } else if let Some(sender) = entry.sse_sender.as_ref() {
-                match sender.try_send(message.clone()) {
-                    Ok(()) => delivered = true,
+            } else if let Some(sender) = entry.sse_sender.clone() {
+                let event = Self::next_event(&mut entry, message);
+                match sender.try_send(event.clone()) {
+                    Ok(()) => {
+                        entry.last_activity = Instant::now();
+                        delivered = true;
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         clear_sender = true;
-                        queue_message = queue_if_unavailable;
+                        if queue_if_unavailable {
+                            queue_event = Some(event);
+                        }
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         tracing::warn!(
@@ -160,9 +180,13 @@ impl StatefulSessionStore {
                             "dropping slow SSE client from targeted notification delivery"
                         );
                         clear_sender = true;
-                        queue_message = queue_if_unavailable;
+                        if queue_if_unavailable {
+                            queue_event = Some(event);
+                        }
                     }
                 }
+            } else if queue_if_unavailable {
+                queue_event = Some(Self::next_event(&mut entry, message));
             }
         } else {
             return SessionSendOutcome::SessionNotFound;
@@ -174,27 +198,64 @@ impl StatefulSessionStore {
             return SessionSendOutcome::SessionNotFound;
         }
 
+        let queued = queue_event.is_some();
         if clear_sender {
             if let Some(mut entry) = self.sessions.get_mut(session_id) {
                 entry.sse_sender = None;
-                if queue_message {
-                    Self::enqueue_pending(&mut entry, message.clone());
+                if let Some(event) = queue_event {
+                    Self::enqueue_pending(&mut entry, event);
                 }
             }
-        } else if let Some(mut entry) = self.sessions.get_mut(session_id) {
-            if delivered {
-                entry.last_activity = Instant::now();
-            } else if entry.sse_sender.is_none() {
-                Self::enqueue_pending(&mut entry, message.clone());
-            }
+        } else if let Some(event) = queue_event
+            && let Some(mut entry) = self.sessions.get_mut(session_id)
+        {
+            Self::enqueue_pending(&mut entry, event);
         }
 
         if delivered {
             SessionSendOutcome::Delivered
-        } else if queue_message {
+        } else if queued {
             SessionSendOutcome::Queued
         } else {
             SessionSendOutcome::SessionNotFound
+        }
+    }
+
+    fn send_replay_events(
+        entry: &mut SessionState,
+        sender: &mpsc::Sender<SseEvent>,
+        last_event_id: Option<u64>,
+    ) {
+        let events: Vec<SseEvent> = match last_event_id {
+            Some(last_id) => entry
+                .replay_events
+                .iter()
+                .filter(|event| event.id > last_id)
+                .cloned()
+                .collect(),
+            None => entry.pending_notifications.drain(..).collect(),
+        };
+
+        let mut sent_through = last_event_id;
+        for event in events {
+            match sender.try_send(event.clone()) {
+                Ok(()) => {
+                    sent_through = Some(event.id);
+                    entry.last_activity = Instant::now();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(event))
+                | Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    Self::enqueue_pending(entry, event);
+                    entry.sse_sender = None;
+                    break;
+                }
+            }
+        }
+
+        if let Some(sent_id) = sent_through {
+            entry
+                .pending_notifications
+                .retain(|event| event.id > sent_id);
         }
     }
 }
@@ -219,6 +280,8 @@ impl SessionStore for StatefulSessionStore {
                 created_at: now,
                 sse_sender: None,
                 pending_notifications: VecDeque::new(),
+                replay_events: VecDeque::new(),
+                next_event_id: 1,
                 client_type: crate::types::ClientType::Unknown,
             },
         );
@@ -246,7 +309,8 @@ impl SessionStore for StatefulSessionStore {
     fn set_sse_sender(
         &self,
         session_id: &str,
-        sender: mpsc::Sender<SseMessage>,
+        sender: mpsc::Sender<SseEvent>,
+        last_event_id: Option<u64>,
     ) -> Result<(), HttpError> {
         let mut entry = self
             .sessions
@@ -254,18 +318,8 @@ impl SessionStore for StatefulSessionStore {
             .ok_or(HttpError::SessionNotFound)?;
         entry.sse_sender = Some(sender);
         entry.last_activity = Instant::now();
-        while let Some(message) = entry.pending_notifications.pop_front() {
-            if let Some(active_sender) = entry.sse_sender.as_ref() {
-                match active_sender.try_send(message) {
-                    Ok(()) => entry.last_activity = Instant::now(),
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(message))
-                    | Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
-                        Self::enqueue_pending(&mut entry, message);
-                        entry.sse_sender = None;
-                        break;
-                    }
-                }
-            }
+        if let Some(active_sender) = entry.sse_sender.clone() {
+            Self::send_replay_events(&mut entry, &active_sender, last_event_id);
         }
         Ok(())
     }
@@ -300,63 +354,56 @@ impl SessionStore for StatefulSessionStore {
     }
 
     fn broadcast(&self, message: SseMessage) {
-        let mut followups: Vec<(String, BroadcastFollowup)> = Vec::new();
+        let session_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
-        for entry in self.sessions.iter() {
-            let session_id: String = entry.key().clone();
-            if entry.last_activity.elapsed() > self.timeout {
-                followups.push((session_id, BroadcastFollowup::Expire));
-                continue;
+        for session_id in session_ids {
+            let mut expired = false;
+            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                if entry.last_activity.elapsed() > self.timeout {
+                    expired = true;
+                } else {
+                    let event = Self::next_event(&mut entry, message.clone());
+                    if let Some(sender) = entry.sse_sender.clone() {
+                        match sender.try_send(event.clone()) {
+                            Ok(()) => entry.last_activity = Instant::now(),
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                            | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                entry.sse_sender = None;
+                                Self::enqueue_pending(&mut entry, event);
+                            }
+                        }
+                    } else {
+                        Self::enqueue_pending(&mut entry, event);
+                    }
+                }
             }
-
-            if let Some(sender) = entry.sse_sender.as_ref() {
-                match sender.try_send(message.clone()) {
-                    Ok(()) => followups.push((session_id, BroadcastFollowup::Delivered)),
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-                    | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        followups.push((session_id, BroadcastFollowup::ClearAndRequeue));
-                    }
-                }
-            } else {
-                followups.push((session_id, BroadcastFollowup::QueueIfStillInactive));
-            }
-        }
-
-        for (session_id, followup) in followups {
-            match followup {
-                BroadcastFollowup::Expire => {
-                    if self.sessions.remove(&session_id).is_some() {
-                        self.notify_expired(&session_id);
-                    }
-                }
-                BroadcastFollowup::Delivered => {
-                    if let Some(mut entry) = self.sessions.get_mut(&session_id) {
-                        entry.last_activity = Instant::now();
-                    }
-                }
-                BroadcastFollowup::QueueIfStillInactive => {
-                    if let Some(mut entry) = self.sessions.get_mut(&session_id)
-                        && entry.sse_sender.is_none()
-                    {
-                        Self::enqueue_pending(&mut entry, message.clone());
-                    }
-                }
-                BroadcastFollowup::ClearAndRequeue => {
-                    if let Some(mut entry) = self.sessions.get_mut(&session_id) {
-                        entry.sse_sender = None;
-                        Self::enqueue_pending(&mut entry, message.clone());
-                    }
-                }
+            if expired && self.sessions.remove(&session_id).is_some() {
+                self.notify_expired(&session_id);
             }
         }
     }
 
     fn send_to_session(&self, session_id: &str, message: SseMessage) {
-        let _ = self.try_send_to_session(session_id, &message, true);
+        let _ = self.try_send_to_session(session_id, message, true);
     }
 
     fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome {
-        self.try_send_to_session(session_id, &message, false)
+        self.try_send_to_session(session_id, message, true)
+    }
+
+    fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            entry
+                .replay_events
+                .retain(|event| event.message.replay_key() != Some(key));
+            entry
+                .pending_notifications
+                .retain(|event| event.message.replay_key() != Some(key));
+        }
     }
 
     fn spawn_cleanup_task(&self, cancel: CancellationToken) {
@@ -447,7 +494,7 @@ mod tests {
         let id = store.create_session().unwrap();
         assert!(!store.has_live_sse_sender(&id).unwrap());
         let (tx, _rx) = mpsc::channel(1);
-        store.set_sse_sender(&id, tx).unwrap();
+        store.set_sse_sender(&id, tx, None).unwrap();
         assert!(store.has_live_sse_sender(&id).unwrap());
     }
 
@@ -540,7 +587,7 @@ mod tests {
         let store = StatefulSessionStore::new(0, 100);
         let id = store.create_session().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
-        store.set_sse_sender(&id, tx).unwrap();
+        store.set_sse_sender(&id, tx, None).unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         store.broadcast(
@@ -560,16 +607,19 @@ mod tests {
 
         let (slow_tx, _slow_rx) = mpsc::channel(1);
         let (fast_tx, mut fast_rx) = mpsc::channel(1);
-        store.set_sse_sender(&slow_id, slow_tx.clone()).unwrap();
-        store.set_sse_sender(&fast_id, fast_tx).unwrap();
+        store
+            .set_sse_sender(&slow_id, slow_tx.clone(), None)
+            .unwrap();
+        store.set_sse_sender(&fast_id, fast_tx, None).unwrap();
 
         slow_tx
-            .try_send(
-                crate::session::SseMessage::from_json_value(
+            .try_send(crate::session::SseEvent {
+                id: 999,
+                message: crate::session::SseMessage::from_json_value(
                     serde_json::json!({"type": "already-buffered"}),
                 )
                 .unwrap(),
-            )
+            })
             .unwrap();
 
         store.broadcast(
@@ -581,7 +631,7 @@ mod tests {
             .await
             .expect("fast receiver should not be blocked")
             .expect("fast receiver message present");
-        assert_eq!(received.to_json_value()["type"], "broadcast");
+        assert_eq!(received.message.to_json_value()["type"], "broadcast");
     }
 
     #[tokio::test]
@@ -590,13 +640,14 @@ mod tests {
         let id = store.create_session().unwrap();
 
         let (tx, _rx) = mpsc::channel(1);
-        store.set_sse_sender(&id, tx.clone()).unwrap();
-        tx.try_send(
-            crate::session::SseMessage::from_json_value(
+        store.set_sse_sender(&id, tx.clone(), None).unwrap();
+        tx.try_send(crate::session::SseEvent {
+            id: 999,
+            message: crate::session::SseMessage::from_json_value(
                 serde_json::json!({"type": "already-buffered"}),
             )
             .unwrap(),
-        )
+        })
         .unwrap();
 
         store.send_to_session(
@@ -606,12 +657,83 @@ mod tests {
         );
 
         let (new_tx, mut new_rx) = mpsc::channel(1);
-        store.set_sse_sender(&id, new_tx).unwrap();
+        store.set_sse_sender(&id, new_tx, None).unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
             .await
             .expect("requeued message should be delivered")
             .expect("requeued message present");
-        assert_eq!(received.to_json_value()["type"], "requeued");
+        assert_eq!(received.message.to_json_value()["type"], "requeued");
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_events_after_last_event_id() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        let (first_tx, mut first_rx) = mpsc::channel(8);
+        store.set_sse_sender(&id, first_tx, None).unwrap();
+        store.send_to_session(
+            &id,
+            crate::session::SseMessage::from_json_value(serde_json::json!({"seq": 1})).unwrap(),
+        );
+        store.send_to_session(
+            &id,
+            crate::session::SseMessage::from_json_value(serde_json::json!({"seq": 2})).unwrap(),
+        );
+
+        let first = first_rx.recv().await.expect("first event");
+        let second = first_rx.recv().await.expect("second event");
+        assert_eq!(first.id, 1);
+        assert_eq!(second.id, 2);
+
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel(8);
+        store
+            .set_sse_sender(&id, reconnect_tx, Some(first.id))
+            .unwrap();
+
+        let replayed = reconnect_rx.recv().await.expect("replayed event");
+        assert_eq!(replayed.id, second.id);
+        assert_eq!(replayed.message.to_json_value()["seq"], 2);
+        assert!(reconnect_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_without_last_event_id_drains_pending_only() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        store.send_to_session(
+            &id,
+            crate::session::SseMessage::from_json_value(serde_json::json!({"seq": 1})).unwrap(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        store.set_sse_sender(&id, tx, None).unwrap();
+
+        let pending = rx.recv().await.expect("pending event");
+        assert_eq!(pending.id, 1);
+        assert_eq!(pending.message.to_json_value()["seq"], 1);
+    }
+
+    #[tokio::test]
+    async fn reverse_request_replay_events_are_removed_by_key() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        store.send_to_session(
+            &id,
+            crate::session::SseMessage::from_json_value_with_replay_key(
+                serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "roots/list"}),
+                crate::session::SseReplayKey::ReverseRequest(7),
+            )
+            .unwrap(),
+        );
+        store.remove_replay_events_by_key(&id, &crate::session::SseReplayKey::ReverseRequest(7));
+
+        let (tx, mut rx) = mpsc::channel(8);
+        store.set_sse_sender(&id, tx, Some(0)).unwrap();
+
+        assert!(rx.try_recv().is_err());
     }
 }

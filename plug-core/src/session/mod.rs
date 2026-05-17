@@ -14,21 +14,54 @@ pub use stateful::StatefulSessionStore;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseMessage {
     serialized: Arc<str>,
+    replay_key: Option<SseReplayKey>,
+}
+
+/// Optional key used to remove replay-buffer events whose lifecycle is shorter
+/// than the session, such as reverse requests once a response arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SseReplayKey {
+    ReverseRequest(i64),
+}
+
+/// Session-owned SSE event with a stable per-session event id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub id: u64,
+    pub message: SseMessage,
 }
 
 impl SseMessage {
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         serde_json::to_string(&value).map(|serialized| Self {
             serialized: Arc::from(serialized),
+            replay_key: None,
         })
     }
 
     pub fn from_serialized(serialized: Arc<str>) -> Self {
-        Self { serialized }
+        Self {
+            serialized,
+            replay_key: None,
+        }
+    }
+
+    pub fn from_json_value_with_replay_key(
+        value: serde_json::Value,
+        replay_key: SseReplayKey,
+    ) -> Result<Self, serde_json::Error> {
+        serde_json::to_string(&value).map(|serialized| Self {
+            serialized: Arc::from(serialized),
+            replay_key: Some(replay_key),
+        })
     }
 
     pub fn as_str(&self) -> &str {
         &self.serialized
+    }
+
+    pub fn replay_key(&self) -> Option<&SseReplayKey> {
+        self.replay_key.as_ref()
     }
 
     #[cfg(test)]
@@ -86,7 +119,8 @@ pub trait SessionStore: Send + Sync {
     fn set_sse_sender(
         &self,
         session_id: &str,
-        sender: mpsc::Sender<SseMessage>,
+        sender: mpsc::Sender<SseEvent>,
+        last_event_id: Option<u64>,
     ) -> Result<(), HttpError>;
     fn set_client_type(
         &self,
@@ -98,6 +132,7 @@ pub trait SessionStore: Send + Sync {
     fn broadcast(&self, message: SseMessage);
     fn send_to_session(&self, session_id: &str, message: SseMessage);
     fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome;
+    fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey);
     fn spawn_cleanup_task(&self, cancel: CancellationToken);
     fn session_count(&self) -> usize;
 

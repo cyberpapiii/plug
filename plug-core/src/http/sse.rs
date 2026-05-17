@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::SseMessage;
+use crate::session::SseEvent;
 
 /// Create an SSE stream from an mpsc receiver with disconnect detection.
 ///
@@ -16,14 +16,14 @@ use crate::session::SseMessage;
 /// - Uses `biased` select to prioritize shutdown over messages
 /// - KeepAlive sends SSE comments (not events) to avoid confusing MCP clients
 pub fn sse_stream(
-    rx: mpsc::Receiver<SseMessage>,
+    rx: mpsc::Receiver<SseEvent>,
     cancel: CancellationToken,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), || {})
 }
 
 pub fn sse_stream_with_heartbeat<F>(
-    rx: mpsc::Receiver<SseMessage>,
+    rx: mpsc::Receiver<SseEvent>,
     cancel: CancellationToken,
     mut on_keepalive: F,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
@@ -36,7 +36,7 @@ where
 }
 
 fn sse_stream_with_heartbeat_interval<F>(
-    rx: mpsc::Receiver<SseMessage>,
+    rx: mpsc::Receiver<SseEvent>,
     cancel: CancellationToken,
     keepalive_interval: Duration,
     mut on_keepalive: F,
@@ -52,7 +52,6 @@ where
         let mut rx = ReceiverStream::new(rx);
         use futures::StreamExt;
 
-        let mut event_id: u64 = 1;
         let mut keepalive = tokio::time::interval(keepalive_interval);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         keepalive.tick().await;
@@ -66,8 +65,7 @@ where
                 msg = rx.next() => {
                     match msg {
                         Some(msg) => {
-                            yield Ok(Event::default().id(event_id.to_string()).data(msg.as_str()));
-                            event_id += 1;
+                            yield Ok(Event::default().id(msg.id.to_string()).data(msg.message.as_str()));
                         }
                         None => {
                             tracing::debug!("SSE sender dropped, closing stream");
@@ -150,12 +148,24 @@ mod tests {
         let body = response.into_body();
 
         // Send two messages
-        tx.send(SseMessage::from_json_value(serde_json::json!({"msg": "hello"})).unwrap())
-            .await
-            .unwrap();
-        tx.send(SseMessage::from_json_value(serde_json::json!({"msg": "world"})).unwrap())
-            .await
-            .unwrap();
+        tx.send(SseEvent {
+            id: 1,
+            message: crate::session::SseMessage::from_json_value(
+                serde_json::json!({"msg": "hello"}),
+            )
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+        tx.send(SseEvent {
+            id: 2,
+            message: crate::session::SseMessage::from_json_value(
+                serde_json::json!({"msg": "world"}),
+            )
+            .unwrap(),
+        })
+        .await
+        .unwrap();
         drop(tx);
 
         let events = collect_sse_events(body, 4).await;
@@ -171,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_closes_stream() {
-        let (_tx, rx) = mpsc::channel::<SseMessage>(8);
+        let (_tx, rx) = mpsc::channel::<SseEvent>(8);
         let cancel = CancellationToken::new();
 
         let sse = sse_stream(rx, cancel.clone());
@@ -194,7 +204,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_emits_comment_and_runs_callback() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let (_tx, rx) = mpsc::channel::<SseMessage>(8);
+        let (_tx, rx) = mpsc::channel::<SseEvent>(8);
         let cancel = CancellationToken::new();
         let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = std::sync::Arc::clone(&heartbeats);

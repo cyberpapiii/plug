@@ -114,3 +114,32 @@ Phase 2 is complete:
 Deferred:
 
 - Manual GUI-client exercise across every advertised client remains a launch-cut gate, not a Phase 2 blocker. The currently live machine state only exposed Claude Code and Codex CLI sessions non-interactively.
+
+## 2026-05-17 Phase 3 U4 - SSE resumability
+
+Shipped:
+
+- Added session-owned monotonic SSE event IDs and a bounded per-session replay buffer for downstream HTTP sessions.
+- Wired `Last-Event-ID` into the HTTP SSE reconnect path so missed notifications replay when the client reconnects with a cursor.
+- Kept first-connect behavior compatible: sessions without `Last-Event-ID` drain pending notifications but do not replay old buffered history.
+- Made upstream reverse requests replayable across a transient SSE disconnect, then remove their replay entries when the downstream client responds or the request times out.
+- Preserved Plug's custom HTTP/session stack; this does not adopt the `rmcp` Streamable HTTP server.
+
+Tests and checks:
+
+- `cargo test -p plug-core session::stateful::tests -- --nocapture` passed, including replay, pending-drain, and reverse-request replay-key pruning tests.
+- `cargo test -p plug-core http::sse::tests -- --nocapture` passed.
+- `cargo test -p plug-core http::server::tests::last_event_id_replays_missed_http_sse_notifications -- --nocapture` passed.
+- `cargo test -p plug-core http::server::tests::queued_reverse_request_replays_on_reconnect -- --nocapture` passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `cargo test --workspace -- --test-threads=1` passed: 143 `plug` tests, 432 `plug-core` tests, 41 integration tests, and doc-test/no-test crates.
+- `cargo deny check advisories` passed with `advisories ok`.
+
+Surprises:
+
+- The reverse-request path needed replay-key cleanup, not just generic notification buffering. Without that, a reconnect after a completed sampling/elicitation call could replay a stale request.
+
+Deferred:
+
+- Stateless/sessionless transport migration remains deferred. Reason: the accepted transport SEPs point away from long-lived session-bound semantics, but Plug's current public HTTP surface is still stateful and existing clients depend on that model. Owner: Rob. Re-review date: 2026-07-01 or when Phase 4 transport alignment starts.

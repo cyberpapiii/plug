@@ -26,7 +26,7 @@ use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
-use crate::session::{SessionSendOutcome, SessionStore, SseMessage};
+use crate::session::{SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -638,7 +638,7 @@ async fn send_http_client_request(
     let message = serde_json::to_value(message)
         .map_err(|e| McpError::internal_error(e.to_string(), None))
         .and_then(|value| {
-            SseMessage::from_json_value(value)
+            SseMessage::from_json_value_with_replay_key(value, SseReplayKey::ReverseRequest(id))
                 .map_err(|e| McpError::internal_error(e.to_string(), None))
         })?;
 
@@ -663,8 +663,8 @@ async fn send_http_client_request(
         .pending_client_requests
         .insert((session_id.to_string(), id), tx);
     match state.sessions.send_to_live_session(session_id, message) {
-        SessionSendOutcome::Delivered => {}
-        SessionSendOutcome::Queued | SessionSendOutcome::SessionNotFound => {
+        SessionSendOutcome::Delivered | SessionSendOutcome::Queued => {}
+        SessionSendOutcome::SessionNotFound => {
             state
                 .pending_client_requests
                 .remove(&(session_id.to_string(), id));
@@ -676,7 +676,12 @@ async fn send_http_client_request(
     }
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, rx).await {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => {
+                state
+                    .sessions
+                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
+                Ok(result)
+            }
             Ok(Err(_)) => Err(McpError::internal_error(
                 "HTTP client response channel closed".to_string(),
                 None,
@@ -686,6 +691,9 @@ async fn send_http_client_request(
                 state
                     .pending_client_requests
                     .remove(&(session_id.to_string(), id));
+                state
+                    .sessions
+                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
                 Err(McpError::internal_error(
                     "HTTP client request timed out".to_string(),
                     None,
@@ -693,7 +701,12 @@ async fn send_http_client_request(
             }
         },
         None => match rx.await {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                state
+                    .sessions
+                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
+                Ok(result)
+            }
             Err(_) => Err(McpError::internal_error(
                 "HTTP client response channel closed".to_string(),
                 None,
@@ -718,6 +731,9 @@ async fn handle_client_response(
         .pending_client_requests
         .remove(&(session_id.to_string(), request_id))
     {
+        state
+            .sessions
+            .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(request_id));
         let _ = tx.send(response.result);
     }
 
@@ -782,7 +798,13 @@ async fn get_mcp(
 
     // 3. Create channel and register SSE sender
     let (tx, rx) = mpsc::channel(state.sse_channel_capacity);
-    state.sessions.set_sse_sender(&session_id, tx)?;
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    state
+        .sessions
+        .set_sse_sender(&session_id, tx, last_event_id)?;
 
     // 4. Build SSE response with appropriate headers
     let session_store = Arc::clone(&state.sessions);
@@ -1609,6 +1631,13 @@ mod tests {
         events
     }
 
+    fn sse_event_id(event: &str) -> Option<u64> {
+        event.lines().find_map(|line| {
+            line.strip_prefix("id: ")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    }
+
     fn test_state_with_router_config(router_config: crate::proxy::RouterConfig) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, router_config));
@@ -2235,14 +2264,17 @@ mod tests {
         let state = test_state();
         let session_id = state.sessions.create_session().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
-        state.sessions.set_sse_sender(&session_id, tx).unwrap();
+        state
+            .sessions
+            .set_sse_sender(&session_id, tx, None)
+            .unwrap();
 
         let state_for_response = Arc::clone(&state);
         let session_id_for_response = session_id.clone();
         tokio::spawn(async move {
             let message = rx.recv().await.expect("reverse request message");
-            let message: ServerJsonRpcMessage =
-                serde_json::from_str(message.as_str()).expect("deserialize reverse request");
+            let message: ServerJsonRpcMessage = serde_json::from_str(message.message.as_str())
+                .expect("deserialize reverse request");
             let request_id = match message {
                 ServerJsonRpcMessage::Request(request) => request.id,
                 other => panic!("unexpected reverse request payload: {other:?}"),
@@ -2273,6 +2305,75 @@ mod tests {
         .await
         .expect("reverse request should succeed");
 
+        match result {
+            ClientResult::ListRootsResult(_) => {}
+            other => panic!("unexpected reverse request result: {other:?}"),
+        }
+        assert!(state.pending_client_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_reverse_request_replays_on_reconnect() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let (blocked_tx, _blocked_rx) = mpsc::channel(1);
+        blocked_tx
+            .try_send(crate::session::SseEvent {
+                id: 999,
+                message: SseMessage::from_json_value(serde_json::json!({"blocked": true})).unwrap(),
+            })
+            .unwrap();
+        state
+            .sessions
+            .set_sse_sender(&session_id, blocked_tx, None)
+            .unwrap();
+
+        let state_for_request = Arc::clone(&state);
+        let session_id_for_request = session_id.clone();
+        let pending = tokio::spawn(async move {
+            send_http_client_request(
+                &state_for_request,
+                &session_id_for_request,
+                ServerRequest::ListRootsRequest(ListRootsRequest {
+                    method: Default::default(),
+                    extensions: Default::default(),
+                }),
+                Some(Duration::from_secs(1)),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel(4);
+        state
+            .sessions
+            .set_sse_sender(&session_id, reconnect_tx, Some(0))
+            .unwrap();
+
+        let event = reconnect_rx.recv().await.expect("replayed reverse request");
+        let message: ServerJsonRpcMessage =
+            serde_json::from_str(event.message.as_str()).expect("deserialize reverse request");
+        let request_id = match message {
+            ServerJsonRpcMessage::Request(request) => request.id,
+            other => panic!("unexpected reverse request payload: {other:?}"),
+        };
+
+        handle_client_response(
+            JsonRpcResponse {
+                jsonrpc: Default::default(),
+                id: request_id,
+                result: ClientResult::ListRootsResult(ListRootsResult::default()),
+            },
+            &session_id,
+            &state,
+        )
+        .await
+        .expect("post reverse request response");
+
+        let result = pending
+            .await
+            .expect("request task")
+            .expect("reverse request should complete after reconnect");
         match result {
             ClientResult::ListRootsResult(_) => {}
             other => panic!("unexpected reverse request result: {other:?}"),
@@ -2398,6 +2499,57 @@ mod tests {
                 .iter()
                 .any(|event| event.contains("notifications/tools/list_changed")),
             "expected SSE stream to contain tools/list_changed notification, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_event_id_replays_missed_http_sse_notifications() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let session_id = state.sessions.create_session().unwrap();
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ToolListChanged,
+        );
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ResourceListChanged,
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        let tool_event = events
+            .iter()
+            .find(|event| event.contains("notifications/tools/list_changed"))
+            .expect("tool list changed event");
+        let last_seen_id = sse_event_id(tool_event).expect("event id");
+
+        let replay_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .header("last-event-id", last_seen_id.to_string())
+            .body(Body::empty())
+            .unwrap();
+        let replay_resp = app.oneshot(replay_req).await.unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+
+        let replayed = collect_sse_events(replay_resp.into_body(), 2).await;
+        assert!(
+            replayed
+                .iter()
+                .any(|event| event.contains("notifications/resources/list_changed")),
+            "expected replayed resource list_changed after id {last_seen_id}, got {replayed:?}"
         );
     }
 
