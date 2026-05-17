@@ -100,8 +100,25 @@ pub(crate) async fn cmd_server_list(
         )
         .await;
         if let Some(servers) = live_status {
+            let config = plug_core::config::load_config(config_path).ok();
             match output {
                 OutputFormat::Json => {
+                    let servers = servers
+                        .into_iter()
+                        .map(|server| {
+                            let server_cfg = config
+                                .as_ref()
+                                .and_then(|cfg| cfg.servers.get(&server.server_id));
+                            serde_json::json!({
+                                "server_id": server.server_id,
+                                "health": server.health,
+                                "tool_count": server.tool_count,
+                                "auth_status": server.auth_status,
+                                "source": server_cfg.map(plug_core::ipc::IpcServerSourceInfo::from_config),
+                                "trust": plug_core::ipc::IpcTrustInfo::for_server(&server.server_id, server_cfg),
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
@@ -122,7 +139,6 @@ pub(crate) async fn cmd_server_list(
                         let mut degraded = 0usize;
                         let mut failed = 0usize;
                         let mut auth_required = 0usize;
-                        let config = plug_core::config::load_config(config_path).ok();
                         for server in &servers {
                             if server.server_id == "__plug_internal__" {
                                 continue;
@@ -289,6 +305,18 @@ pub(crate) async fn cmd_server_list(
                     );
                 }
             } else {
+                let server_inventory = config
+                    .servers
+                    .iter()
+                    .map(|(server_id, server)| {
+                        serde_json::json!({
+                            "server_id": server_id,
+                            "config": server,
+                            "source": plug_core::ipc::IpcServerSourceInfo::from_config(server),
+                            "trust": plug_core::ipc::IpcTrustInfo::for_server(server_id, Some(server)),
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -300,6 +328,7 @@ pub(crate) async fn cmd_server_list(
                         },
                         "daemon_running": availability.daemon_reachable(),
                         "servers": config.servers,
+                        "server_inventory": server_inventory,
                     }))?
                 );
                 return Ok(());

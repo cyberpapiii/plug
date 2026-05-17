@@ -1543,9 +1543,18 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::ListTools => {
             let tool_router = ctx.engine.tool_router();
             let tools = tool_router.list_all_tools();
+            let config = ctx.engine.config();
             let ipc_tools = tools
                 .into_iter()
                 .map(|(server_id, tool)| plug_core::ipc::IpcToolInfo {
+                    source: config
+                        .servers
+                        .get(&server_id)
+                        .map(plug_core::ipc::IpcServerSourceInfo::from_config),
+                    trust: plug_core::ipc::IpcTrustInfo::for_server(
+                        &server_id,
+                        config.servers.get(&server_id),
+                    ),
                     name: tool.name.to_string(),
                     server_id,
                     description: tool.description.map(|d| d.to_string()),

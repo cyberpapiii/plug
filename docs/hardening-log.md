@@ -172,3 +172,29 @@ Surprises:
 Deferred:
 
 - None for U5.
+
+## 2026-05-17 Phase 3 U6 - Operator trust inventory
+
+Shipped:
+
+- Added IPC-level `source` and `trust` metadata for every daemon-listed tool.
+- Classified servers as Plug-internal, configured local process, configured remote server, or runtime unknown based on live config and server id.
+- Exposed non-secret source metadata through `plug tools --output json` per tool.
+- Exposed the same source/trust inventory through `plug servers --output json` per live server, and as additive `server_inventory` metadata when the daemon is unavailable and the CLI falls back to config-only inspection.
+- Preserved existing config-only JSON `servers` shape so automation that reads configured servers does not have to move immediately.
+
+Tests and checks:
+
+- `cargo test -p plug-core ipc::tests -- --nocapture` passed, including `source_and_trust_metadata_do_not_expose_secrets`.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `cargo test --workspace -- --test-threads=1` passed: 145 `plug` tests, 433 `plug-core` tests, 41 integration tests, and doc-test/no-test crates.
+- `cargo deny check advisories` passed with `advisories ok`.
+
+Surprises:
+
+- The CLI server view already had both live and config-only modes, so the safest JSON surface was additive metadata rather than replacing the existing `servers` config map in fallback mode.
+
+Deferred:
+
+- Risk-level annotation semantics stay in U7. This tranche only identifies where a tool/server comes from and which trust boundary it crosses.

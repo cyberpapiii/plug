@@ -10,7 +10,14 @@ use crate::ui::{
     can_prompt_interactively, print_banner, print_heading, print_label_value, terminal_width,
 };
 
-type ToolInventoryGroup = Vec<(String, String, Option<String>, Option<String>)>;
+type ToolInventoryGroup = Vec<(
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<plug_core::ipc::IpcServerSourceInfo>,
+    plug_core::ipc::IpcTrustInfo,
+)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolInventoryEmptyState {
@@ -114,6 +121,8 @@ pub(crate) async fn cmd_tool_list(
                 t.server_id.clone(),
                 t.title.clone(),
                 t.description.clone(),
+                t.source.clone(),
+                t.trust.clone(),
             ));
         }
 
@@ -127,12 +136,14 @@ pub(crate) async fn cmd_tool_list(
                     .map(|(prefix, tools)| {
                         let entries: Vec<serde_json::Value> = tools
                             .iter()
-                            .map(|(name, server_id, title, desc)| {
+                            .map(|(name, server_id, title, desc, source, trust)| {
                                 serde_json::json!({
                                     "name": name,
                                     "server_id": server_id,
                                     "title": title,
                                     "description": desc,
+                                    "source": source,
+                                    "trust": trust,
                                 })
                             })
                             .collect();
@@ -236,7 +247,7 @@ pub(crate) async fn cmd_tool_list(
                         style(format!("{} tools", tools.len())).dim(),
                         annotation
                     );
-                    for (name, _server_id, title, desc) in &tools {
+                    for (name, _server_id, title, desc, _source, _trust) in &tools {
                         let name_styled = style(format!("  │ {:<28}", name)).cyan();
                         let display_text = title.as_deref().or(desc.as_deref());
                         if let Some(text) = display_text {

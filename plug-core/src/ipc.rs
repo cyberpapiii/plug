@@ -207,6 +207,95 @@ pub struct IpcToolInfo {
     pub server_id: String,
     pub description: Option<String>,
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<IpcServerSourceInfo>,
+    #[serde(default)]
+    pub trust: IpcTrustInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcServerSourceInfo {
+    pub transport: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub auth: String,
+}
+
+impl IpcServerSourceInfo {
+    pub fn from_config(config: &crate::config::ServerConfig) -> Self {
+        let auth = if config.auth.as_deref() == Some("oauth") || config.oauth_client_id.is_some() {
+            "oauth"
+        } else if config.auth_token.is_some() {
+            "bearer"
+        } else {
+            "none"
+        };
+        Self {
+            transport: match config.transport {
+                crate::config::TransportType::Stdio => "stdio",
+                crate::config::TransportType::Http => "http",
+                crate::config::TransportType::Sse => "sse",
+            }
+            .to_string(),
+            enabled: config.enabled,
+            command: config.command.clone(),
+            args: config.args.clone(),
+            url: config.url.clone(),
+            auth: auth.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcTrustInfo {
+    pub tier: String,
+    pub source: String,
+    pub boundary: String,
+}
+
+impl Default for IpcTrustInfo {
+    fn default() -> Self {
+        Self {
+            tier: "unknown".to_string(),
+            source: "unknown".to_string(),
+            boundary: "unknown".to_string(),
+        }
+    }
+}
+
+impl IpcTrustInfo {
+    pub fn for_server(server_id: &str, config: Option<&crate::config::ServerConfig>) -> Self {
+        if server_id == "__plug_internal__" {
+            return Self {
+                tier: "plug_internal".to_string(),
+                source: "plug_builtin".to_string(),
+                boundary: "internal".to_string(),
+            };
+        }
+
+        match config.map(|cfg| &cfg.transport) {
+            Some(crate::config::TransportType::Stdio) => Self {
+                tier: "configured_local_process".to_string(),
+                source: "local_config".to_string(),
+                boundary: "local_process".to_string(),
+            },
+            Some(crate::config::TransportType::Http | crate::config::TransportType::Sse) => Self {
+                tier: "configured_remote_server".to_string(),
+                source: "local_config".to_string(),
+                boundary: "network".to_string(),
+            },
+            None => Self {
+                tier: "runtime_unknown".to_string(),
+                source: "runtime".to_string(),
+                boundary: "unknown".to_string(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -634,6 +723,42 @@ mod tests {
             let json2 = serde_json::to_string(&deserialized).unwrap();
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn source_and_trust_metadata_do_not_expose_secrets() {
+        let config = crate::config::ServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["third-party-mcp".to_string()],
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: crate::config::TransportType::Stdio,
+            url: None,
+            auth_token: Some(crate::types::SecretString::from("secret-token".to_string())),
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+        };
+
+        let source = IpcServerSourceInfo::from_config(&config);
+        assert_eq!(source.transport, "stdio");
+        assert_eq!(source.command.as_deref(), Some("uvx"));
+        assert_eq!(source.auth, "bearer");
+        let serialized = serde_json::to_string(&source).expect("serialize source");
+        assert!(!serialized.contains("secret-token"));
+
+        let trust = IpcTrustInfo::for_server("workspace", Some(&config));
+        assert_eq!(trust.tier, "configured_local_process");
+        assert_eq!(trust.source, "local_config");
+        assert_eq!(trust.boundary, "local_process");
     }
 
     #[test]
