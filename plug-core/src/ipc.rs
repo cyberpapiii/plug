@@ -312,6 +312,9 @@ pub enum IpcResponse {
     ToolListChangedNotification,
     /// Push notification: the resource list changed.
     ResourceListChangedNotification,
+    /// Push notification: a subscribed resource changed.
+    /// Payload is a serialized `ResourceUpdatedNotificationParam`.
+    ResourceUpdatedNotification { params: serde_json::Value },
     /// Push notification: the prompt list changed.
     PromptListChangedNotification,
     /// Push notification: progress update for an in-flight tool call.
@@ -598,6 +601,9 @@ mod tests {
             },
             IpcResponse::ToolListChangedNotification,
             IpcResponse::ResourceListChangedNotification,
+            IpcResponse::ResourceUpdatedNotification {
+                params: serde_json::json!({"uri": "file:///tmp/test.txt"}),
+            },
             IpcResponse::PromptListChangedNotification,
             IpcResponse::ProgressNotification {
                 params: serde_json::json!({"progressToken": "tok-1", "progress": 50, "total": 100}),

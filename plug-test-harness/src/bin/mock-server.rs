@@ -36,6 +36,10 @@ struct Args {
     /// When set, call_tool will send a reverse request to the client before returning.
     #[arg(long, default_value = "none")]
     reverse_request: String,
+
+    /// Expose one subscribable mock resource.
+    #[arg(long, default_value_t = false)]
+    resources: bool,
 }
 
 struct MockServer {
@@ -43,6 +47,7 @@ struct MockServer {
     delay: std::time::Duration,
     fail_mode: String,
     reverse_request: String,
+    resources: bool,
 }
 
 impl MockServer {
@@ -71,6 +76,12 @@ impl ServerHandler for MockServer {
         capabilities.tools = Some(ToolsCapability {
             list_changed: Some(false),
         });
+        if self.resources {
+            capabilities.resources = Some(ResourcesCapability {
+                subscribe: Some(true),
+                list_changed: Some(true),
+            });
+        }
 
         InitializeResult::new(capabilities)
             .with_server_info(Implementation::new("mock-mcp-server", "0.1.0"))
@@ -218,6 +229,75 @@ impl ServerHandler for MockServer {
             Ok(CallToolResult::success(vec![Content::text(response_text)]))
         }
     }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        async move {
+            if !self.resources {
+                return Ok(ListResourcesResult::with_all_items(vec![]));
+            }
+            Ok(ListResourcesResult::with_all_items(vec![Resource::new(
+                RawResource::new("file:///tmp/mock-resource.txt", "mock-resource.txt")
+                    .with_title("Mock Resource")
+                    .with_description("Subscribable mock resource")
+                    .with_mime_type("text/plain"),
+                None,
+            )]))
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        async move {
+            if !self.resources || request.uri != "file:///tmp/mock-resource.txt" {
+                return Err(McpError::resource_not_found(
+                    format!("resource not found: {}", request.uri),
+                    None,
+                ));
+            }
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "mock resource contents",
+                request.uri,
+            )]))
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            if !self.resources || request.uri != "file:///tmp/mock-resource.txt" {
+                return Err(McpError::resource_not_found(
+                    format!("resource not found: {}", request.uri),
+                    None,
+                ));
+            }
+            let uri = request.uri;
+            let peer = context.peer;
+            tokio::spawn(async move {
+                let _ = peer
+                    .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                    .await;
+            });
+            Ok(())
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        _request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move { Ok(()) }
+    }
 }
 
 #[tokio::main]
@@ -253,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         delay: std::time::Duration::from_millis(args.delay_ms),
         fail_mode: args.fail_mode,
         reverse_request: args.reverse_request,
+        resources: args.resources,
     };
 
     let transport = rmcp::transport::io::stdio();

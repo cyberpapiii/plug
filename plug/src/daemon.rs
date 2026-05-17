@@ -16,7 +16,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
     CreateMessageRequestParams, CreateMessageResult, PaginatedRequestParams, RequestId,
-    RequestParamsMeta,
+    RequestParamsMeta, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
@@ -766,6 +766,10 @@ async fn handle_ipc_connection(
         };
         ctx.engine
             .tool_router()
+            .cleanup_subscriptions_for_target(&target)
+            .await;
+        ctx.engine
+            .tool_router()
             .unregister_downstream_bridge(&target);
         if ctx.engine.tool_router().clear_roots_for_target(&target) {
             ctx.engine
@@ -1119,6 +1123,18 @@ async fn send_ipc_control_notification(
                 .await
                 .ok();
         }
+        Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
+            if matches!(
+                target,
+                NotificationTarget::Stdio { client_id: ref target_id }
+                    if session_id.is_some_and(|sid| target_id.as_ref() == sid)
+            ) {
+                let notif = IpcResponse::ResourceUpdatedNotification {
+                    params: serde_json::to_value(params).unwrap_or_default(),
+                };
+                ipc::send_response(writer, &notif).await.ok();
+            }
+        }
         Ok(ProtocolNotification::PromptListChanged) => {
             ipc::send_response(writer, &IpcResponse::PromptListChangedNotification)
                 .await
@@ -1167,12 +1183,8 @@ async fn send_ipc_control_notification(
                 ipc::send_response(writer, &notif).await.ok();
             }
         }
-        Ok(
-            ProtocolNotification::LoggingMessage { .. }
-            | ProtocolNotification::ResourceUpdated { .. },
-        ) => {
+        Ok(ProtocolNotification::LoggingMessage { .. }) => {
             // Logging is handled by the dedicated logging channel.
-            // ResourceUpdated is not delivered over IPC (subscribe not supported).
         }
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC control notification lagged");
@@ -1374,6 +1386,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
                 ctx.engine
                     .tool_router()
+                    .cleanup_subscriptions_for_target(&target)
+                    .await;
+                ctx.engine
+                    .tool_router()
                     .unregister_downstream_bridge(&target);
                 if ctx.engine.tool_router().clear_roots_for_target(&target) {
                     ctx.engine
@@ -1438,6 +1454,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: std::sync::Arc::from(session_id.as_str()),
             };
+            ctx.engine
+                .tool_router()
+                .cleanup_subscriptions_for_target(&target)
+                .await;
             ctx.engine
                 .tool_router()
                 .unregister_downstream_bridge(&target);
@@ -1581,15 +1601,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .client_info(session_id)
                 .map(|info| plug_core::client_detect::detect_client(&info))
                 .unwrap_or(plug_core::types::ClientType::Unknown);
-            let mut caps = ctx
+            let caps = ctx
                 .engine
                 .tool_router()
                 .synthesized_capabilities_for_client(client_type);
-            // IPC clients cannot subscribe to resources (no long-lived push
-            // channel for targeted ResourceUpdated delivery), so mask that.
-            if let Some(ref mut resources) = caps.resources {
-                resources.subscribe = None;
-            }
             match serde_json::to_value(caps) {
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },
                 Err(error) => IpcResponse::Error {
@@ -2360,12 +2375,77 @@ async fn dispatch_mcp_request(
             }
         }
 
-        "resources/subscribe" | "resources/unsubscribe" => IpcResponse::Error {
-            code: "UNSUPPORTED_METHOD".to_string(),
-            message: format!(
-                "'{method}' not supported via IPC proxy (no push channel for notifications)"
-            ),
-        },
+        "resources/subscribe" => {
+            let request =
+                match params.map(|p| serde_json::from_value::<SubscribeRequestParams>(p.clone())) {
+                    Some(Ok(request)) => request,
+                    Some(Err(e)) => {
+                        return IpcResponse::Error {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: format!("resources/subscribe: {e}"),
+                        };
+                    }
+                    None => {
+                        return IpcResponse::Error {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "resources/subscribe requires params".to_string(),
+                        };
+                    }
+                };
+            let target = plug_core::notifications::NotificationTarget::Stdio {
+                client_id: Arc::from(session_id),
+            };
+            match tool_router.subscribe_resource(&request.uri, target).await {
+                Ok(()) => IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
+
+        "resources/unsubscribe" => {
+            let request = match params
+                .map(|p| serde_json::from_value::<UnsubscribeRequestParams>(p.clone()))
+            {
+                Some(Ok(request)) => request,
+                Some(Err(e)) => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: format!("resources/unsubscribe: {e}"),
+                    };
+                }
+                None => {
+                    return IpcResponse::Error {
+                        code: "INVALID_PARAMS".to_string(),
+                        message: "resources/unsubscribe requires params".to_string(),
+                    };
+                }
+            };
+            let target = plug_core::notifications::NotificationTarget::Stdio {
+                client_id: Arc::from(session_id),
+            };
+            match tool_router
+                .unsubscribe_resource(&request.uri, &target)
+                .await
+            {
+                Ok(()) => IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
+                },
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
 
         _ => IpcResponse::Error {
             code: "UNSUPPORTED_METHOD".to_string(),
@@ -3376,6 +3456,46 @@ mod tests {
         assert!(
             matches!(resp, Some(IpcResponse::ResourceListChangedNotification)),
             "expected ResourceListChangedNotification, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_notification_forwards_resource_updated_for_matching_session() {
+        let matching = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::ResourceUpdated {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from("sess-42"),
+                },
+                params: rmcp::model::ResourceUpdatedNotificationParam::new(
+                    "file:///tmp/mock-resource.txt",
+                ),
+            },
+            Some("sess-42"),
+        )
+        .await;
+
+        match matching {
+            Some(IpcResponse::ResourceUpdatedNotification { params }) => {
+                assert_eq!(params["uri"], "file:///tmp/mock-resource.txt");
+            }
+            other => panic!("expected ResourceUpdatedNotification, got: {other:?}"),
+        }
+
+        let non_matching = send_and_read_control_notification(
+            plug_core::notifications::ProtocolNotification::ResourceUpdated {
+                target: plug_core::notifications::NotificationTarget::Stdio {
+                    client_id: Arc::from("sess-other"),
+                },
+                params: rmcp::model::ResourceUpdatedNotificationParam::new(
+                    "file:///tmp/mock-resource.txt",
+                ),
+            },
+            Some("sess-42"),
+        )
+        .await;
+        assert!(
+            non_matching.is_none(),
+            "expected non-matching resource update to be filtered, got: {non_matching:?}"
         );
     }
 

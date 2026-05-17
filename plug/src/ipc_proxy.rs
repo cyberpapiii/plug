@@ -176,6 +176,7 @@ impl IpcProxyHandler {
                         }
                         resp @ (IpcResponse::ToolListChangedNotification
                         | IpcResponse::ResourceListChangedNotification
+                        | IpcResponse::ResourceUpdatedNotification { .. }
                         | IpcResponse::PromptListChangedNotification
                         | IpcResponse::ProgressNotification { .. }
                         | IpcResponse::CancelledNotification { .. }
@@ -267,6 +268,7 @@ impl IpcProxyHandler {
                 }
                 resp @ (IpcResponse::ToolListChangedNotification
                 | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::ResourceUpdatedNotification { .. }
                 | IpcResponse::PromptListChangedNotification
                 | IpcResponse::ProgressNotification { .. }
                 | IpcResponse::CancelledNotification { .. }
@@ -437,6 +439,13 @@ async fn forward_control_notification(peer: Option<&Peer<RoleServer>>, response:
         }
         IpcResponse::ResourceListChangedNotification => {
             let _ = peer.notify_resource_list_changed().await;
+        }
+        IpcResponse::ResourceUpdatedNotification { params } => {
+            if let Ok(notif_params) =
+                serde_json::from_value::<ResourceUpdatedNotificationParam>(params)
+            {
+                let _ = peer.notify_resource_updated(notif_params).await;
+            }
         }
         IpcResponse::PromptListChangedNotification => {
             let _ = peer.notify_prompt_list_changed().await;
@@ -1046,6 +1055,80 @@ impl ServerHandler for IpcProxyHandler {
         }
     }
 
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/subscribe".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    if payload.get("code").is_some()
+                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
+                    {
+                        return Err(err);
+                    }
+                    Ok(())
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: "resources/unsubscribe".to_string(),
+                        params: Some(params.clone()),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => {
+                    if payload.get("code").is_some()
+                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
+                    {
+                        return Err(err);
+                    }
+                    Ok(())
+                }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }
+
     fn list_prompts(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -1205,6 +1288,7 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
                         Ok(
                             resp @ (IpcResponse::ToolListChangedNotification
                             | IpcResponse::ResourceListChangedNotification
+                            | IpcResponse::ResourceUpdatedNotification { .. }
                             | IpcResponse::PromptListChangedNotification
                             | IpcResponse::ProgressNotification { .. }
                             | IpcResponse::CancelledNotification { .. }
@@ -1319,6 +1403,32 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ResourceNotifyClient {
+        notify: std::sync::Arc<tokio::sync::Notify>,
+        uri: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    }
+
+    impl ClientHandler for ResourceNotifyClient {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default().with_protocol_version(
+                serde_json::from_value(serde_json::Value::String(
+                    LATEST_PROTOCOL_VERSION.to_string(),
+                ))
+                .expect("latest protocol version must parse"),
+            )
+        }
+
+        async fn on_resource_updated(
+            &self,
+            params: ResourceUpdatedNotificationParam,
+            _context: NotificationContext<rmcp::RoleClient>,
+        ) {
+            *self.uri.lock().await = Some(params.uri);
+            self.notify.notify_one();
+        }
+    }
+
     fn mock_server_config_with_tools(tools: &str) -> ServerConfig {
         let mock_server = ensure_mock_server_built();
         ServerConfig {
@@ -1345,6 +1455,12 @@ mod tests {
 
     fn mock_server_config() -> ServerConfig {
         mock_server_config_with_tools("echo")
+    }
+
+    fn mock_server_config_with_resources() -> ServerConfig {
+        let mut config = mock_server_config_with_tools("echo");
+        config.args.push("--resources".to_string());
+        config
     }
 
     async fn spawn_test_daemon(
@@ -1659,6 +1775,115 @@ mod tests {
             }
             other => panic!("unexpected task payload response: {other:?}"),
         }
+
+        engine.shutdown().await;
+        daemon
+            .await
+            .expect("daemon task join")
+            .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn daemon_backed_proxy_forwards_resource_subscribe_updates() {
+        let _guard = daemon_test_lock().lock().await;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pdr-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let config_path = temp.join("plug.toml");
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server_config_with_resources());
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            Some(&config_path),
+            "client-resources".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let updated_uri = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let client = ResourceNotifyClient {
+            notify: notify.clone(),
+            uri: updated_uri.clone(),
+        }
+        .serve(client_transport)
+        .await
+        .expect("connect downstream client");
+
+        let server_info = client
+            .peer()
+            .peer_info()
+            .expect("server initialize info available");
+        assert_eq!(
+            server_info
+                .capabilities
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.subscribe),
+            Some(true),
+            "daemon-backed proxy should advertise resource subscribe when upstream supports it"
+        );
+
+        let resource_uri = "file:///tmp/mock-resource.txt";
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .peer()
+                .subscribe(SubscribeRequestParams::new(resource_uri)),
+        )
+        .await
+        .expect("resource subscribe timeout")
+        .expect("resource subscribe");
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("resource updated notification timeout");
+        assert_eq!(
+            updated_uri.lock().await.as_deref(),
+            Some(resource_uri),
+            "resource update should be forwarded through daemon IPC to the stdio client"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .peer()
+                .unsubscribe(UnsubscribeRequestParams::new(resource_uri)),
+        )
+        .await
+        .expect("resource unsubscribe timeout")
+        .expect("resource unsubscribe");
 
         engine.shutdown().await;
         daemon

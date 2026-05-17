@@ -143,3 +143,32 @@ Surprises:
 Deferred:
 
 - Stateless/sessionless transport migration remains deferred. Reason: the accepted transport SEPs point away from long-lived session-bound semantics, but Plug's current public HTTP surface is still stateful and existing clients depend on that model. Owner: Rob. Re-review date: 2026-07-01 or when Phase 4 transport alignment starts.
+
+## 2026-05-17 Phase 3 U5 - Resource subscribe over daemon IPC
+
+Shipped:
+
+- Added a `ResourceUpdatedNotification` IPC frame carrying serialized MCP `ResourceUpdatedNotificationParam`.
+- Routed daemon-backed `resources/subscribe` and `resources/unsubscribe` into the existing `ToolRouter` subscription registry instead of creating a daemon-local registry.
+- Forwarded targeted `ResourceUpdated` control notifications through daemon IPC only to the matching stdio session.
+- Removed the daemon capability mask that hid `resources.subscribe` from IPC clients once upstreams support subscriptions.
+- Cleaned resource subscriptions during daemon session replacement, explicit deregistration, and connection-drop auto-deregistration.
+- Extended the test harness mock server with an opt-in subscribable resource fixture.
+
+Tests and checks:
+
+- `cargo test -p plug-core ipc::tests::response_serialization_round_trip -- --nocapture` passed.
+- `cargo test -p plug resource_updated -- --nocapture` passed.
+- `cargo test -p plug ipc_proxy::tests::daemon_backed_proxy_forwards_resource_subscribe_updates -- --nocapture` passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `cargo test --workspace -- --test-threads=1` passed: 145 `plug` tests, 432 `plug-core` tests, 41 integration tests, and doc-test/no-test crates.
+- `cargo deny check advisories` passed with `advisories ok`.
+
+Surprises:
+
+- The safest implementation was deletion of the old capability mask plus reuse of the router-owned subscription cleanup paths. The daemon did not need a second registry.
+
+Deferred:
+
+- None for U5.
