@@ -550,3 +550,10 @@ Decision:
 
 - Cleanup remains opt-in for normal development so repeated compile/test loops do not rebuild the world every time.
 - Release cleanup remains explicit because the repo currently uses direct `dist` commands rather than a single release wrapper script.
+
+## 2026-05-17 current-truth doc reconciliation
+
+Shipped:
+
+- Reconciled stale `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` wording that still described daemon IPC resource subscribe as unsupported.
+- Current-truth docs now match the hardened implementation and audit row: daemon IPC supports resource subscribe/unsubscribe and targeted resource update delivery.

@@ -59,7 +59,7 @@ The current product shape is:
 - shared upstream routing through `Engine`, `ServerManager`, and `ToolRouter`
 - daemon-backed local sharing with reconnecting IPC proxy sessions and daemon-owned downstream HTTP
 - transport-aware operator inventory that can rely on daemon truth directly when the background service is running, while still falling back cleanly during non-daemon foreground HTTP serving
-- targeted notification fan-out to stdio, HTTP, and daemon IPC (resource subscribe still unsupported over IPC)
+- targeted notification fan-out to stdio, HTTP, and daemon IPC, including resource subscribe/unsubscribe and targeted resource update delivery
 - meta-tool mode as an opt-in reduced discovery surface
 - client-targeted lazy tool discovery, including OpenCode bridge mode where agents search with `plug__search_tools` and then call loaded routed tools directly
 - downstream HTTP bearer token auth for non-loopback binding

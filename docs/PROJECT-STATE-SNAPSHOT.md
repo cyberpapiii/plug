@@ -35,7 +35,7 @@ Implemented on `main`:
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
 - OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, doctor checks, and correct HTTP auth header construction (PR #36, PR #47)
 - mock OAuth provider integration coverage for metadata discovery, auth-code exchange persistence with state cleanup, token refresh persistence, and reconnect using refreshed credentials (PR #51)
-- daemon IPC notification parity: progress, cancelled, and list_changed push forwarding (PR #38); resource subscribe remains unsupported over IPC
+- daemon IPC notification parity: progress, cancelled, list_changed, resource subscribe/unsubscribe, and targeted resource update forwarding
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
 - `plug auth complete` for non-interactive OAuth code exchange (PR #40)
 - IPC auth commands: `AuthStatus` query, `InjectToken` credential injection with server reconnect, `AuthStateChanged` push notification (PR #41)
