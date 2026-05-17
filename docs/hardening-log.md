@@ -243,3 +243,32 @@ Surprises:
 Deferred:
 
 - Formal SEP-2243 `Mcp-Method` / `Mcp-Name` validation and response/header emission remains Phase 4 #11. Reason: this tranche establishes end-to-end correlation without adding request rejection behavior. Owner: Rob. Re-review date: 2026-05-24 or at Phase 4 start.
+
+## 2026-05-17 Phase 3 Gate - Multiplexor correctness
+
+Shipped:
+
+- Completed the Phase 3 launch-critical multiplexor correctness tranche: SSE replay, daemon IPC resource subscription parity, operator trust inventory, risk provenance inventory, and trace correlation.
+- Reinstalled the current workspace binary with `./scripts/dev-reinstall.sh --quick` so the shared daemon smoke test exercised the just-built code, not the previously installed daemon binary.
+- Restarted the shared daemon from the normalized `~/.local/bin/plug -> ~/.cargo/bin/plug` install path.
+
+Tests and checks:
+
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `cargo deny check advisories` passed with `advisories ok`.
+- `cargo test --workspace -- --test-threads=1` passed after U8: 145 `plug` tests, 438 `plug-core` tests, 41 integration tests, and doc-test/no-test crates.
+
+Runtime smoke:
+
+- `plug status --output json` reported `runtime_available: true`, 9 daemon-proxy client sessions, and 11 healthy upstream servers: context7, exa, figma, imessage, krisp, notion, oura, slack, svelte, todoist, and workspace.
+- `plug clients --output json` reported live Claude Code and Codex CLI sessions after daemon restart. Other linked/detected clients were not actively connected during this non-interactive smoke.
+- `plug tools --output json` reported `status_source: live_daemon`, 339 tools, 11 server groups, and live tool inventory entries with non-null `source`, `trust`, and `risk` metadata.
+
+Surprises:
+
+- `cargo run -p plug -- start` initially restarted the already-installed daemon binary through `~/.local/bin/plug`, so the first smoke test still showed old IPC defaults for tool metadata. The project reinstall script is required before live daemon smoke when validating daemon IPC schema changes.
+
+Deferred:
+
+- Full GUI-client exercise across every linked client remains a launch-cut manual gate. Reason: only Claude Code and Codex CLI were live and controllable non-interactively in this session. Owner: Rob. Re-review date: 2026-05-24 or before public launch.
