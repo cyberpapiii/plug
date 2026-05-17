@@ -298,3 +298,26 @@ Surprises:
 Deferred:
 
 - Custom `x-mcp-header` / `Mcp-Param-*` mirroring remains deferred. Reason: the execution prompt scoped Phase 4 #11 to `Mcp-Method` / `Mcp-Name`; parameter-level mirroring needs tool-schema validation and could affect tool visibility. Owner: Rob. Re-review date: 2026-06-15 or during the next protocol-version alignment pass.
+
+## 2026-05-17 Phase 4 U10 - Server card alignment
+
+Shipped:
+
+- Added the current SEP-2127 draft discovery path `/.well-known/mcp-server-card`.
+- Preserved the existing `/.well-known/mcp.json` path as a compatibility alias.
+- Replaced Plug's earlier dynamic/full-vs-minimal card with a static server-card shape: `$schema`, `name`, `version`, `description`, `title`, `websiteUrl`, `repository`, and `remotes`.
+- Moved authentication discoverability into the remote `headers` entry for protected deployments instead of exposing Plug-specific `auth_required` fields.
+- Stopped exposing dynamic tool counts and upstream server names in the public card; this matches the draft's guidance that primitives are dynamic and should be discovered through protocol list operations after connection.
+- Added CORS and cache headers expected for browser/discovery consumers.
+
+Tests and checks:
+
+- `cargo test -p plug-core server_card -- --nocapture` passed, covering the new path, legacy alias, external-origin access, protected bearer mode, protected OAuth mode, and authenticated requests that must not expand into dynamic inventory.
+
+Surprises:
+
+- SEP-2127 is still Draft and the path moved from the older `/.well-known/mcp.json` assumption to `/.well-known/mcp-server-card`. The safest compatibility posture is aliasing rather than removing the old path.
+
+Deferred:
+
+- Canonical server-card `name`, `websiteUrl`, and `repository` may need to change after the Phase 5 namespace decision. Reason: the current workspace metadata still points at `plug-mcp/plug`, but Phase 5 explicitly reserves that repository/org choice for Rob. Owner: Rob. Re-review date: Phase 5 item #15.

@@ -329,6 +329,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
     // Discovery endpoint — exempt from origin validation
     let discovery = Router::new()
         .route("/.well-known/mcp.json", get(get_server_card))
+        .route("/.well-known/mcp-server-card", get(get_server_card))
         .route(
             "/.well-known/oauth-authorization-server",
             get(get_oauth_authorization_server_metadata),
@@ -933,75 +934,57 @@ async fn delete_mcp(
     }
 }
 
-/// GET /.well-known/mcp.json — server discovery card.
-///
-/// When auth is required but not provided, returns a minimal card (name,
-/// version, endpoint) to preserve discoverability without leaking server
-/// inventory details (server names, tool counts).
+/// GET /.well-known/mcp-server-card and legacy /.well-known/mcp.json.
 async fn get_server_card(
     State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Check if this is an authenticated request (manual check since discovery
-    // is on a separate router without the auth middleware layer)
-    let is_authenticated = if state.auth_mode == crate::config::DownstreamAuthMode::Oauth {
-        match (
-            state.downstream_oauth.as_ref(),
-            headers.get(header::AUTHORIZATION),
-        ) {
-            (Some(manager), Some(auth_header)) => {
-                if let Some(token) = auth_header
-                    .to_str()
-                    .ok()
-                    .and_then(|value| value.strip_prefix("Bearer "))
-                {
-                    manager.validate_access_token(token).await
-                } else {
-                    false
-                }
+    let mut remote = json!({
+        "type": "streamable-http",
+        "url": "/mcp",
+        "supportedProtocolVersions": [PROTOCOL_VERSION],
+    });
+    if state.auth_mode == crate::config::DownstreamAuthMode::Oauth || state.auth_token.is_some() {
+        remote["headers"] = json!([
+            {
+                "name": "Authorization",
+                "description": "Bearer access token",
+                "isRequired": true,
+                "isSecret": true
             }
-            _ => false,
-        }
-    } else {
-        match &state.auth_token {
-            None => true, // No auth required (loopback)
-            Some(expected) => check_bearer_token(&headers, expected.as_ref()),
-        }
+        ]);
     };
 
-    let card = if is_authenticated {
-        let tool_count = state.router.tool_count();
-        let servers: Vec<String> = state
-            .router
-            .server_manager()
-            .server_statuses()
-            .into_iter()
-            .map(|s| s.server_id)
-            .collect();
-
-        json!({
-            "name": "plug",
-            "version": env!("CARGO_PKG_VERSION"),
-            "description": "MCP multiplexer",
-            "tools": tool_count,
-            "servers": servers,
-            "transports": ["stdio", "streamable-http", "sse"],
-        })
-    } else {
-        // Minimal card: no server names, no tool counts
-        json!({
-            "name": "plug",
-            "version": env!("CARGO_PKG_VERSION"),
-            "endpoint": "/mcp",
-            "transport": "streamable-http",
-            "auth_required": true,
-        })
-    };
+    let card = json!({
+        "$schema": "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json",
+        "name": "io.github.plug-mcp/plug",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "MCP multiplexer for sharing one server configuration across many AI clients",
+        "title": "Plug",
+        "websiteUrl": "https://github.com/plug-mcp/plug",
+        "repository": {
+            "url": "https://github.com/plug-mcp/plug",
+            "source": "github"
+        },
+        "remotes": [remote],
+    });
 
     let mut response = (StatusCode::OK, Json(card)).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("max-age=60"),
+        HeaderValue::from_static("public, max-age=3600"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type"),
     );
     response.headers_mut().insert(
         "X-Content-Type-Options",
@@ -2394,7 +2377,7 @@ mod tests {
 
         let req = HttpRequest::builder()
             .method("GET")
-            .uri("/.well-known/mcp.json")
+            .uri("/.well-known/mcp-server-card")
             .body(Body::empty())
             .unwrap();
 
@@ -2404,7 +2387,19 @@ mod tests {
             resp.headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|v| v.to_str().ok()),
-            Some("max-age=60")
+            Some("public, max-age=3600")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .and_then(|v| v.to_str().ok()),
+            Some("GET")
         );
         assert_eq!(
             resp.headers()
@@ -2417,15 +2412,41 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["name"], "plug");
-        assert_eq!(json["description"], "MCP multiplexer");
-        assert!(json["version"].is_string());
-        assert!(json["tools"].is_number());
-        assert!(json["servers"].is_array());
         assert_eq!(
-            json["transports"],
-            serde_json::json!(["stdio", "streamable-http", "sse"])
+            json["$schema"],
+            "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
         );
+        assert_eq!(json["name"], "io.github.plug-mcp/plug");
+        assert_eq!(json["title"], "Plug");
+        assert!(json["version"].is_string());
+        assert_eq!(json["remotes"][0]["type"], "streamable-http");
+        assert_eq!(json["remotes"][0]["url"], "/mcp");
+        assert_eq!(
+            json["remotes"][0]["supportedProtocolVersions"],
+            serde_json::json!([PROTOCOL_VERSION])
+        );
+        assert!(json.get("tools").is_none());
+        assert!(json.get("servers").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_server_card_path_returns_same_card() {
+        let app = build_router(test_state());
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "io.github.plug-mcp/plug");
+        assert_eq!(json["remotes"][0]["url"], "/mcp");
     }
 
     #[tokio::test]
@@ -3381,7 +3402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_minimal_card_when_unauth_on_protected_server() {
+    async fn discovery_server_card_when_unauth_on_protected_server_is_static() {
         let state = test_state_with_auth("secret_token");
         let app = build_router(state);
 
@@ -3399,15 +3420,15 @@ mod tests {
             .unwrap();
         let card: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Minimal card should NOT contain servers or tool count
         assert!(card.get("servers").is_none());
         assert!(card.get("tools").is_none());
-        assert_eq!(card["auth_required"], true);
-        assert_eq!(card["endpoint"], "/mcp");
+        assert_eq!(card["remotes"][0]["url"], "/mcp");
+        assert_eq!(card["remotes"][0]["headers"][0]["name"], "Authorization");
+        assert_eq!(card["remotes"][0]["headers"][0]["isSecret"], true);
     }
 
     #[tokio::test]
-    async fn discovery_minimal_card_when_unauth_on_oauth_protected_server() {
+    async fn discovery_server_card_when_unauth_on_oauth_protected_server_is_static() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(
             sm,
@@ -3463,12 +3484,11 @@ mod tests {
 
         assert!(card.get("servers").is_none());
         assert!(card.get("tools").is_none());
-        assert_eq!(card["auth_required"], true);
-        assert_eq!(card["endpoint"], "/mcp");
+        assert_eq!(card["remotes"][0]["headers"][0]["name"], "Authorization");
     }
 
     #[tokio::test]
-    async fn discovery_full_card_when_authenticated() {
+    async fn discovery_server_card_does_not_expand_when_authenticated() {
         let token = "secret_token";
         let state = test_state_with_auth(token);
         let app = build_router(state);
@@ -3488,9 +3508,8 @@ mod tests {
             .unwrap();
         let card: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Full card should contain servers and tools
-        assert!(card.get("servers").is_some());
-        assert!(card.get("tools").is_some());
-        assert!(card.get("auth_required").is_none());
+        assert!(card.get("servers").is_none());
+        assert!(card.get("tools").is_none());
+        assert_eq!(card["remotes"][0]["headers"][0]["name"], "Authorization");
     }
 }
