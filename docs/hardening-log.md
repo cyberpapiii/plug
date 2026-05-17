@@ -471,3 +471,23 @@ Deferred:
 
 - GitHub private vulnerability reporting cannot be fully verified until the public `plug-mcp/plug` repository exists and private reporting is enabled. Reason: this is controlled by GitHub repository settings after the namespace migration. Owner: Rob. Re-review date: before first public release tag.
 - README install commands remain release-ready but not globally live until the Phase 5 owner actions are complete. Reason: GitHub org/tap creation and crates.io publish require Rob-owned credentials. Owner: Rob. Re-review date: before first public release tag.
+
+## 2026-05-17 Owner-action follow-up
+
+Completed:
+
+- Pushed hardened `main` to the current public remote `https://github.com/cyberpapiii/plug` (`39831d7..43b2c86`).
+- Enabled GitHub private vulnerability reporting on the current `cyberpapiii/plug` repository through the repository REST API. Verification returned `{"enabled":true}`.
+- Verified `plug-core 0.1.0` packaging and publish dry-run succeed.
+
+Blocked:
+
+- Creating/migrating to `plug-mcp/plug` is blocked because the `plug-mcp` GitHub owner namespace does not exist. `gh repo create plug-mcp/plug --public --source=. --remote=plug-mcp --push` returned `HTTP 404: Not Found (https://api.github.com/users/plug-mcp)`.
+- Creating `plug-mcp/homebrew-tap` is blocked for the same missing GitHub owner namespace.
+- Publishing `plug-core 0.1.0` and `plug-mcp 0.1.0` is blocked because this machine has no crates.io token configured (`cargo owner --list ...` reports `no token found`; `CARGO_REGISTRY_TOKEN` is unset; no `~/.cargo/credentials*` file exists).
+- `plug-mcp 0.1.0` publish dry-run remains blocked until `plug-core 0.1.0` exists on crates.io, which is the expected publish-order dependency.
+
+Next owner inputs required:
+
+- Create the `plug-mcp` GitHub organization/user namespace, then rerun repository creation/transfer and tap creation.
+- Provide a crates.io API token with publish rights for the first release, then publish `plug-core` before `plug-mcp`.
