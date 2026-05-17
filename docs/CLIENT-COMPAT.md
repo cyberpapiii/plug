@@ -15,6 +15,8 @@ Treat this as current truth when reasoning about client display behavior.
 
 `plug` advertises Plug's own icon in top-level `initialize.serverInfo.icons` because clients connect to Plug as the parent MCP server. Upstream server icons are source metadata, not replacements for Plug's top-level identity.
 
+Plug advertises PNG icons first (`16x16` through `512x512`) and keeps the SVG as a final fallback. These top-level Plug icons are embedded as `data:` URIs so clients do not need to fetch Plug branding from GitHub during initialize. This matches the practical client compatibility shape of the MCP spec: clients that render icons must support PNG/JPEG, while SVG support is optional.
+
 For clients that render MCP item icons, Plug forwards source-specific icons on routed tools/resources/prompts:
 
 - explicit upstream item `icons` win
@@ -23,6 +25,10 @@ For clients that render MCP item icons, Plug forwards source-specific icons on r
 - server-level `data:` icons stay in upstream inventory instead of being copied onto every routed item
 
 Operator JSON also exposes the normalized upstream metadata so clients or diagnostics can show which routed tools came from which branded upstream server.
+
+Claude Desktop has a separate MCPB/Desktop Extension icon surface. If you install Plug through an MCPB bundle, Claude's extension/settings UI reads `packaging/mcpb/manifest.json`, whose `icon` and `icons` fields point to the packaged PNG assets. This is distinct from runtime MCP `serverInfo.icons`.
+
+Codex Desktop currently documents MCP server configuration but does not document rendering MCP icon metadata. Treat Plug's `icons` fields as correct metadata for clients that support them, not as a guarantee that Codex Desktop will show the image in its current MCP panel.
 
 ---
 

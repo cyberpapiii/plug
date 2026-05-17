@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod auth;
+pub mod branding;
 pub mod circuit;
 pub mod client_detect;
 pub mod config;

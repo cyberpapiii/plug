@@ -1,0 +1,72 @@
+{
+  "manifest_version": "0.3",
+  "name": "plug",
+  "display_name": "Plug",
+  "version": "0.3.0",
+  "description": "MCP multiplexer for sharing one server catalog across AI clients.",
+  "long_description": "Plug is a local MCP multiplexer. It lets Claude Desktop connect to one local server while Plug routes tools, resources, prompts, sampling, elicitation, and notifications to the upstream MCP servers configured on the machine.",
+  "author": {
+    "name": "Rob Dezendorf",
+    "url": "https://github.com/cyberpapiii"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyberpapiii/plug.git"
+  },
+  "homepage": "https://github.com/cyberpapiii/plug",
+  "documentation": "https://github.com/cyberpapiii/plug#readme",
+  "support": "https://github.com/cyberpapiii/plug/issues",
+  "icon": "assets/plug-icon-128.png",
+  "icons": [
+    {
+      "src": "assets/plug-icon-16.png",
+      "size": "16x16"
+    },
+    {
+      "src": "assets/plug-icon-32.png",
+      "size": "32x32"
+    },
+    {
+      "src": "assets/plug-icon-64.png",
+      "size": "64x64"
+    },
+    {
+      "src": "assets/plug-icon-128.png",
+      "size": "128x128"
+    },
+    {
+      "src": "assets/plug-icon-256.png",
+      "size": "256x256"
+    },
+    {
+      "src": "assets/plug-icon-512.png",
+      "size": "512x512"
+    }
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/plug",
+    "mcp_config": {
+      "command": "${__dirname}/bin/plug",
+      "args": [
+        "connect"
+      ],
+      "env": {}
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "keywords": [
+    "mcp",
+    "multiplexer",
+    "tools",
+    "claude"
+  ],
+  "license": "MIT",
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": [
+      "darwin"
+    ]
+  }
+}

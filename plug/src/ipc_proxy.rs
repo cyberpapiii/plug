@@ -513,19 +513,10 @@ impl ServerHandler for IpcProxyHandler {
             .read()
             .map(|caps| caps.clone())
             .unwrap_or_default();
-        InitializeResult::new(capabilities).with_server_info(
-            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
-                .with_title("Plug")
-                .with_description("MCP multiplexer")
-                .with_website_url("https://github.com/cyberpapiii/plug")
-                .with_icons(vec![
-                    Icon::new(
-                        "https://raw.githubusercontent.com/cyberpapiii/plug/main/docs/assets/plug-icon.svg",
-                    )
-                    .with_mime_type("image/svg+xml")
-                    .with_sizes(vec!["any".to_string()]),
-                ]),
-        )
+        InitializeResult::new(capabilities)
+            .with_server_info(plug_core::branding::plug_implementation(env!(
+                "CARGO_PKG_VERSION"
+            )))
             .with_protocol_version(
                 serde_json::from_value(serde_json::Value::String(
                     LATEST_PROTOCOL_VERSION.to_string(),
@@ -2105,6 +2096,12 @@ mod tests {
             .peer_info()
             .expect("server initialize info available");
         assert_eq!(server_info.protocol_version.as_str(), "2025-11-25");
+        let icons = server_info
+            .server_info
+            .icons
+            .as_ref()
+            .expect("plug icons advertised");
+        assert_ipc_plug_icons_sequence(icons);
 
         engine.shutdown().await;
         daemon
@@ -2114,6 +2111,28 @@ mod tests {
 
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    fn assert_ipc_plug_icons_sequence(icons: &[Icon]) {
+        let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
+        assert_eq!(icons.len(), expected_sizes.len() + 1);
+
+        for (icon, expected_size) in icons.iter().zip(expected_sizes) {
+            assert!(icon.src.starts_with("data:image/png;base64,"));
+            assert_eq!(icon.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(
+                icon.sizes
+                    .as_ref()
+                    .and_then(|sizes| sizes.first())
+                    .map(String::as_str),
+                Some(expected_size)
+            );
+        }
+
+        let svg = icons.last().expect("svg fallback icon");
+        assert!(svg.src.starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(svg.mime_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(svg.sizes.as_deref(), Some(&["any".to_string()][..]));
     }
 
     #[tokio::test]
