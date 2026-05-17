@@ -3632,7 +3632,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     let unauth_card: serde_json::Value = serde_json::from_slice(&unauth_body).unwrap();
     assert!(unauth_card.get("servers").is_none());
     assert!(unauth_card.get("tools").is_none());
-    assert_eq!(unauth_card["name"], "io.github.plug-mcp/plug");
+    assert_eq!(unauth_card["name"], "io.github.cyberpapiii/plug");
     assert_eq!(
         unauth_card["remotes"][0]["headers"][0]["name"],
         "Authorization"
