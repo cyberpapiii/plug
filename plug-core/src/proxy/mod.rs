@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -200,6 +200,7 @@ pub struct DownstreamCallContext {
     pub client_id: Arc<str>,
     pub request_id: RequestId,
     pub client_type: ClientType,
+    pub trace_id: Arc<str>,
 }
 
 impl DownstreamCallContext {
@@ -217,6 +218,7 @@ impl DownstreamCallContext {
             client_id: client_id.into(),
             request_id,
             client_type,
+            trace_id: Arc::from(new_trace_id()),
         }
     }
 
@@ -234,6 +236,22 @@ impl DownstreamCallContext {
             client_id: session_id.into(),
             request_id,
             client_type,
+            trace_id: Arc::from(new_trace_id()),
+        }
+    }
+
+    pub fn http_for_client_with_trace(
+        session_id: impl Into<Arc<str>>,
+        request_id: RequestId,
+        client_type: ClientType,
+        trace_id: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            transport: DownstreamTransport::Http,
+            client_id: session_id.into(),
+            request_id,
+            client_type,
+            trace_id: trace_id.into(),
         }
     }
 
@@ -247,6 +265,14 @@ impl DownstreamCallContext {
             },
         }
     }
+}
+
+static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Generate an OpenTelemetry/W3C-compatible 16-byte trace id as 32 lowercase hex chars.
+pub fn new_trace_id() -> String {
+    let id = NEXT_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+    format!("0000000000000000{id:016x}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2135,6 +2161,10 @@ impl ToolRouter {
         drop(cache);
 
         self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;
+        let trace_id = downstream
+            .as_ref()
+            .map(|context| Arc::clone(&context.trace_id))
+            .unwrap_or_else(|| Arc::from(new_trace_id()));
 
         if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
             if upstream
@@ -2164,6 +2194,13 @@ impl ToolRouter {
                     })?;
 
                 if let ServerResult::CreateTaskResult(result) = response {
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        server = %server_id,
+                        tool = %original_name,
+                        task_id = %result.task.task_id,
+                        "proxy native upstream task created"
+                    );
                     let task = self.task_store.lock().await.create_passthrough(
                         owner,
                         tool_name,
@@ -2195,7 +2232,14 @@ impl ToolRouter {
         let tool_name = tool_name.to_string();
         let handle = tokio::spawn(async move {
             router
-                .execute_tool_task(task_id, tool_name, arguments, progress_token, false)
+                .execute_tool_task(
+                    task_id,
+                    tool_name,
+                    arguments,
+                    progress_token,
+                    false,
+                    trace_id,
+                )
                 .await;
         });
 
@@ -2433,6 +2477,7 @@ impl ToolRouter {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         progress_token: Option<ProgressToken>,
         is_retry: bool,
+        trace_id: Arc<str>,
     ) {
         let cache = self.cache.load();
         let (server_id, original_name) = match cache.routes.get(tool_name.as_str()).or_else(|| {
@@ -2459,6 +2504,15 @@ impl ToolRouter {
 
         loop {
             let call_id = next_call_id();
+            tracing::info!(
+                call_id,
+                trace_id = %trace_id,
+                task_id = %task_id,
+                server = %server_id,
+                tool = %original_name,
+                retry = is_retry,
+                "proxy background task tool call started"
+            );
             let semaphore_timeout = Duration::from_secs(1);
             let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
                 match tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned()).await {
@@ -2540,6 +2594,14 @@ impl ToolRouter {
 
             match result {
                 Ok(ServerResult::CallToolResult(response)) => {
+                    tracing::info!(
+                        call_id,
+                        trace_id = %trace_id,
+                        task_id = %task_id,
+                        server = %server_id,
+                        tool = %original_name,
+                        "proxy background task tool call completed"
+                    );
                     match serde_json::to_value(&response) {
                         Ok(payload) => self.task_store.lock().await.complete(&task_id, payload),
                         Err(error) => self.task_store.lock().await.fail(
@@ -2551,6 +2613,13 @@ impl ToolRouter {
                 }
                 Err(e) if is_session_error(&e) && allow_retry => {
                     if self.reconnect_server_now(&server_id).await.is_ok() {
+                        tracing::info!(
+                            call_id,
+                            trace_id = %trace_id,
+                            task_id = %task_id,
+                            server = %server_id,
+                            "reconnected, retrying background task tool call"
+                        );
                         current_arguments = retry_arguments;
                         allow_retry = false;
                         continue;
@@ -2710,6 +2779,10 @@ impl ToolRouter {
             drop(upstream); // Release Arc early
 
             let call_id = next_call_id();
+            let trace_id = downstream
+                .as_ref()
+                .map(|context| Arc::clone(&context.trace_id))
+                .unwrap_or_else(|| Arc::from(new_trace_id()));
 
             // Build the upstream call with the original (unprefixed) tool name
             let mut upstream_params = CallToolRequestParams::new(original_name.clone());
@@ -2786,9 +2859,22 @@ impl ToolRouter {
                 })?;
 
             self.attach_upstream_request_id(call_id, &server_id, request_handle.id.clone());
+            tracing::info!(
+                call_id,
+                trace_id = %trace_id,
+                downstream_transport = ?downstream.as_ref().map(|context| context.transport),
+                downstream_client = ?downstream.as_ref().map(|context| context.client_id.as_ref()),
+                downstream_request_id = ?downstream.as_ref().map(|context| &context.request_id),
+                upstream_request_id = ?request_handle.id,
+                server = %server_id,
+                tool = %original_name,
+                retry = is_retry,
+                "proxy tool call started"
+            );
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(EngineEvent::ToolCallStarted {
                     call_id,
+                    trace_id: Arc::clone(&trace_id),
                     server_id: Arc::clone(&server_id_arc),
                     tool_name: Arc::clone(&tool_name_arc),
                 });
@@ -2819,12 +2905,21 @@ impl ToolRouter {
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
+                            trace_id: Arc::clone(&trace_id),
                             server_id: Arc::clone(&server_id_arc),
                             tool_name: Arc::clone(&tool_name_arc),
                             duration_ms,
                             success: true,
                         });
                     }
+                    tracing::info!(
+                        call_id,
+                        trace_id = %trace_id,
+                        server = %server_id,
+                        tool = %original_name,
+                        duration_ms,
+                        "proxy tool call completed"
+                    );
                     self.artifact_store
                         .maybe_spill_tool_result(tool_name, response)
                 }
@@ -2833,6 +2928,8 @@ impl ToolRouter {
                     tracing::warn!(
                         server = %server_id,
                         tool = %original_name,
+                        call_id,
+                        trace_id = %trace_id,
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
@@ -2843,6 +2940,7 @@ impl ToolRouter {
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
+                            trace_id: Arc::clone(&trace_id),
                             server_id: Arc::clone(&server_id_arc),
                             tool_name: Arc::clone(&tool_name_arc),
                             duration_ms,
@@ -2852,11 +2950,18 @@ impl ToolRouter {
 
                     match self.reconnect_server_now(&server_id).await {
                         Ok(()) => {
-                            tracing::info!(server = %server_id, "reconnected, retrying tool call");
+                            tracing::info!(
+                                server = %server_id,
+                                call_id,
+                                trace_id = %trace_id,
+                                "reconnected, retrying tool call"
+                            );
                         }
                         Err(reconnect_err) => {
                             tracing::error!(
                                 server = %server_id,
+                                call_id,
+                                trace_id = %trace_id,
                                 error = %reconnect_err,
                                 "reconnect failed, returning original error"
                             );
@@ -2882,6 +2987,8 @@ impl ToolRouter {
                     tracing::error!(
                         server = %server_id,
                         tool = %original_name,
+                        call_id,
+                        trace_id = %trace_id,
                         timeout_secs = timeout.as_secs(),
                         "upstream tool call timed out"
                     );
@@ -2892,6 +2999,7 @@ impl ToolRouter {
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
+                            trace_id: Arc::clone(&trace_id),
                             server_id: Arc::clone(&server_id_arc),
                             tool_name: Arc::clone(&tool_name_arc),
                             duration_ms,
@@ -2909,6 +3017,8 @@ impl ToolRouter {
                     tracing::error!(
                         server = %server_id,
                         tool = %original_name,
+                        call_id,
+                        trace_id = %trace_id,
                         error = %e,
                         "upstream tool call failed"
                     );
@@ -2922,6 +3032,7 @@ impl ToolRouter {
                     if let Some(ref tx) = self.event_tx {
                         let _ = tx.send(EngineEvent::ToolCallCompleted {
                             call_id,
+                            trace_id: Arc::clone(&trace_id),
                             server_id: Arc::clone(&server_id_arc),
                             tool_name: Arc::clone(&tool_name_arc),
                             duration_ms,
@@ -4379,6 +4490,29 @@ mod tests {
             "plug__search_tools",
             "plug__invoke_tool",
         ]
+    }
+
+    #[test]
+    fn trace_ids_are_w3c_sized_hex_values() {
+        let trace_id = new_trace_id();
+        assert_eq!(trace_id.len(), 32);
+        assert!(trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(trace_id, "00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn downstream_context_preserves_supplied_http_trace_id() {
+        let context = DownstreamCallContext::http_for_client_with_trace(
+            "session-a",
+            RequestId::from(NumberOrString::Number(1)),
+            ClientType::ClaudeCode,
+            Arc::<str>::from("4bf92f3577b34da6a3ce929d0e0e4736"),
+        );
+
+        assert_eq!(
+            context.trace_id.as_ref(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
     }
 
     fn router_with_git_commit_tool() -> ToolRouter {

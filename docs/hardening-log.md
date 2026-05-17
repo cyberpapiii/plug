@@ -220,3 +220,26 @@ Surprises:
 Deferred:
 
 - Text-mode risk summaries remain deferred. Reason: the launch-critical need is machine-readable inventory; adding human summaries belongs with the operator guide/UI polish pass. Owner: Rob. Re-review date: 2026-06-15 or during Phase 6 documentation.
+
+## 2026-05-17 Phase 3 U8 - Trace correlation
+
+Shipped:
+
+- Added W3C/OpenTelemetry-shaped 32-hex trace IDs for downstream tool-call contexts.
+- Preserved valid downstream HTTP `traceparent` IDs and accepted `x-plug-trace-id` as an operator/debug fallback.
+- Carried trace IDs through `DownstreamCallContext`, active tool routing, retry/reconnect logs, native upstream task creation, and background task execution logs.
+- Added trace IDs to `ToolCallStarted` and `ToolCallCompleted` engine events so observability consumers can correlate request, router, upstream call, and completion.
+
+Tests and checks:
+
+- `cargo test -p plug-core trace_id -- --nocapture` passed.
+- `cargo test -p plug-core downstream_context_preserves_supplied_http_trace_id -- --nocapture` passed.
+- `cargo check --workspace` passed.
+
+Surprises:
+
+- The useful correlation boundary is the router call context, not the HTTP handler alone. Stdio clients and daemon-backed calls need generated trace IDs just as much as HTTP clients need propagated IDs.
+
+Deferred:
+
+- Formal SEP-2243 `Mcp-Method` / `Mcp-Name` validation and response/header emission remains Phase 4 #11. Reason: this tranche establishes end-to-end correlation without adding request rejection behavior. Owner: Rob. Re-review date: 2026-05-24 or at Phase 4 start.

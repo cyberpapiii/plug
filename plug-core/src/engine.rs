@@ -74,11 +74,13 @@ pub enum EngineEvent {
     },
     ToolCallStarted {
         call_id: u64,
+        trace_id: Arc<str>,
         server_id: Arc<str>,
         tool_name: Arc<str>,
     },
     ToolCallCompleted {
         call_id: u64,
+        trace_id: Arc<str>,
         server_id: Arc<str>,
         tool_name: Arc<str>,
         duration_ms: u64,

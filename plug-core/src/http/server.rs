@@ -33,6 +33,8 @@ const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 /// MCP protocol version header name.
 const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+const TRACEPARENT_HEADER: &str = "traceparent";
+const PLUG_TRACE_ID_HEADER: &str = "x-plug-trace-id";
 
 /// The MCP protocol version we implement.
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -527,10 +529,11 @@ async fn post_mcp(
     })?;
 
     validate_protocol_version_for_post(&headers, &message)?;
+    let trace_id = Arc::<str>::from(extract_trace_id(&headers));
 
     // 3. Route based on message type
     match message {
-        JsonRpcMessage::Request(req) => handle_request(req, &headers, &state).await,
+        JsonRpcMessage::Request(req) => handle_request(req, &headers, &state, trace_id).await,
         JsonRpcMessage::Response(response) => {
             let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
@@ -543,9 +546,11 @@ async fn post_mcp(
             match notification.notification {
                 ClientNotification::CancelledNotification(cancelled) => {
                     state.router.forward_cancel_from_downstream(
-                        &DownstreamCallContext::http(
+                        &DownstreamCallContext::http_for_client_with_trace(
                             Arc::<str>::from(session_id.as_str()),
                             cancelled.params.request_id.clone(),
+                            crate::types::ClientType::Unknown,
+                            Arc::clone(&trace_id),
                         ),
                         cancelled.params.reason,
                     );
@@ -606,6 +611,49 @@ fn validate_protocol_version_for_post(
         None if require_header => Err(HttpError::MissingProtocolVersion),
         None => Ok(()),
     }
+}
+
+fn extract_trace_id(headers: &HeaderMap) -> String {
+    if let Some(trace_id) = headers
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(trace_id_from_traceparent)
+    {
+        return trace_id.to_string();
+    }
+
+    if let Some(trace_id) = headers
+        .get(PLUG_TRACE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| is_valid_trace_id(value))
+    {
+        return trace_id.to_ascii_lowercase();
+    }
+
+    crate::proxy::new_trace_id()
+}
+
+fn trace_id_from_traceparent(value: &str) -> Option<&str> {
+    let mut parts = value.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let parent_id = parts.next()?;
+    let flags = parts.next()?;
+    if parts.next().is_some()
+        || version.len() != 2
+        || parent_id.len() != 16
+        || flags.len() != 2
+        || !is_valid_trace_id(trace_id)
+    {
+        return None;
+    }
+    Some(trace_id)
+}
+
+fn is_valid_trace_id(value: &str) -> bool {
+    value.len() == 32
+        && value != "00000000000000000000000000000000"
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Send a reverse JSON-RPC request to an HTTP client via its SSE stream and
@@ -1104,6 +1152,7 @@ async fn handle_request(
     req: JsonRpcRequest<ClientRequest>,
     headers: &HeaderMap,
     state: &Arc<HttpState>,
+    trace_id: Arc<str>,
 ) -> Result<Response, HttpError> {
     let request_id = req.id.clone();
 
@@ -1118,6 +1167,7 @@ async fn handle_request(
                 client = %client_name,
                 detected = %client_type,
                 session = %session_id,
+                trace_id = %trace_id,
                 "HTTP client connected"
             );
             // Store client type in session
@@ -1181,10 +1231,11 @@ async fn handle_request(
             let progress_token = call_req.params.progress_token();
             let owner =
                 crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
-            let downstream = DownstreamCallContext::http_for_client(
+            let downstream = DownstreamCallContext::http_for_client_with_trace(
                 Arc::<str>::from(session_id.as_str()),
                 request_id.clone(),
                 client_type,
+                Arc::clone(&trace_id),
             );
             if call_req.params.task.is_some() {
                 match state
@@ -1606,6 +1657,30 @@ mod tests {
     use http::Request as HttpRequest;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    #[test]
+    fn trace_id_prefers_valid_w3c_traceparent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TRACEPARENT_HEADER,
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+
+        assert_eq!(
+            extract_trace_id(&headers),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+    }
+
+    #[test]
+    fn trace_id_falls_back_when_header_is_invalid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TRACEPARENT_HEADER, HeaderValue::from_static("invalid"));
+
+        let trace_id = extract_trace_id(&headers);
+        assert_eq!(trace_id.len(), 32);
+        assert_ne!(trace_id, "00000000000000000000000000000000");
+    }
 
     async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
         let mut events = Vec::new();
