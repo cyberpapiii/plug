@@ -501,6 +501,7 @@ Shipped:
 - Updated Plug's MCP server-card identity and initialize metadata URLs to `io.github.cyberpapiii/plug` and `https://github.com/cyberpapiii/plug`.
 - Updated cargo-dist Homebrew tap config to the existing public `cyberpapiii/homebrew-tap` repository.
 - Updated README, operator guide, security policy, and user-story docs to use `cyberpapiii/plug`, `cyberpapiii/tap/plug`, and the git-based Cargo install path until crates.io publish is complete.
+- Started tracking `Cargo.lock` so `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked` is reproducible and does not fall back to an unlocked Git install.
 
 Still blocked:
 
