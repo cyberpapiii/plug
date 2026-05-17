@@ -791,7 +791,7 @@ async fn check_client_configs() -> CheckResult {
                         path.display()
                     ));
                 }
-                if let Err(e) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                if let Err(e) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     issues.push(format!(
                         "{} (invalid YAML in {}: {})",
                         target,

@@ -388,8 +388,8 @@ fn parse_yaml_mcp_extensions(
     source: ClientSource,
     key: &str,
 ) -> Result<Vec<DiscoveredServer>, String> {
-    let value: serde_yml::Value =
-        serde_yml::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
+    let value: serde_norway::Value =
+        serde_norway::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
 
     let servers_obj = match value.get(key).and_then(|v| v.as_mapping()) {
         Some(s) => s,
@@ -418,7 +418,7 @@ fn parse_yaml_mcp_extensions(
 }
 
 /// Convert a YAML entry to a ServerConfig.
-fn yaml_entry_to_server_config(entry: &serde_yml::Value) -> Option<ServerConfig> {
+fn yaml_entry_to_server_config(entry: &serde_norway::Value) -> Option<ServerConfig> {
     let obj = entry.as_mapping()?;
 
     // Goose uses "type: stdio" or "sse"
@@ -1033,6 +1033,55 @@ GITHUB_TOKEN = "$GITHUB_TOKEN"
         assert_eq!(
             servers[0].config.env.get("GITHUB_TOKEN").unwrap(),
             "$GITHUB_TOKEN"
+        );
+    }
+
+    #[test]
+    fn parse_goose_yaml_imports_servers_and_skips_plug() {
+        let yaml = r#"
+extensions:
+  plug:
+    type: sse
+    uri: https://plug.example.com/mcp
+    enabled: true
+  github:
+    type: stdio
+    command: npx
+    args:
+    - "@modelcontextprotocol/server-github"
+    env:
+      GITHUB_TOKEN: "$GITHUB_TOKEN"
+    enabled: true
+  remote:
+    type: sse
+    uri: https://remote.example.com/sse
+"#;
+
+        let servers = parse_yaml_mcp_extensions(yaml, ClientSource::Goose, "extensions").unwrap();
+
+        assert_eq!(servers.len(), 2);
+        let github = servers
+            .iter()
+            .find(|server| server.name == "github")
+            .unwrap();
+        assert_eq!(github.config.command.as_deref(), Some("npx"));
+        assert_eq!(
+            github.config.args,
+            vec!["@modelcontextprotocol/server-github"]
+        );
+        assert_eq!(
+            github.config.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("$GITHUB_TOKEN")
+        );
+
+        let remote = servers
+            .iter()
+            .find(|server| server.name == "remote")
+            .unwrap();
+        assert!(matches!(remote.config.transport, TransportType::Sse));
+        assert_eq!(
+            remote.config.url.as_deref(),
+            Some("https://remote.example.com/sse")
         );
     }
 

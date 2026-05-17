@@ -119,7 +119,7 @@ fn linked_client_config_from_content(
             }
         }
         Some("yaml") | Some("yml") => {
-            let value = serde_yml::from_str::<serde_yml::Value>(&content).ok()?;
+            let value = serde_norway::from_str::<serde_norway::Value>(&content).ok()?;
             let plug = value.get("extensions")?.get("plug")?;
             if let Some(uri) = plug.get("uri").and_then(|value| value.as_str()) {
                 Some(LinkedClientConfig {
@@ -876,9 +876,9 @@ fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
 }
 
 fn merge_yaml_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
-    let mut existing_yml: serde_yml::Value = serde_yml::from_str(existing)
-        .unwrap_or_else(|_| serde_yml::Value::Mapping(serde_yml::Mapping::new()));
-    let snippet_yml: serde_yml::Value = serde_yml::from_str(snippet)?;
+    let mut existing_yml: serde_norway::Value = serde_norway::from_str(existing)
+        .unwrap_or_else(|_| serde_norway::Value::Mapping(serde_norway::Mapping::new()));
+    let snippet_yml: serde_norway::Value = serde_norway::from_str(snippet)?;
 
     if let (Some(e_map), Some(s_map)) = (existing_yml.as_mapping_mut(), snippet_yml.as_mapping()) {
         for (k, v) in s_map {
@@ -895,7 +895,7 @@ fn merge_yaml_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
         }
     }
 
-    Ok(serde_yml::to_string(&existing_yml)?)
+    Ok(serde_norway::to_string(&existing_yml)?)
 }
 
 pub(crate) fn unlink_yaml(existing: &str) -> String {
@@ -1160,6 +1160,42 @@ port = 4444
         assert_eq!(linked.transport, plug_core::export::ExportTransport::Http);
         assert_eq!(
             linked.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn merge_yaml_config_preserves_existing_goose_extensions() {
+        let existing = r#"
+extensions:
+  github:
+    type: stdio
+    command: npx
+    args:
+    - "@modelcontextprotocol/server-github"
+    enabled: true
+"#;
+        let snippet = plug_core::export::export_config(&ExportOptions {
+            target: plug_core::export::ExportTarget::Goose,
+            transport: plug_core::export::ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        });
+
+        let merged = merge_yaml_config(existing, &snippet).expect("merge YAML");
+        let parsed = serde_norway::from_str::<serde_norway::Value>(&merged).expect("valid YAML");
+        let extensions = parsed
+            .get("extensions")
+            .and_then(|value| value.as_mapping())
+            .expect("extensions mapping");
+
+        assert!(extensions.get("github").is_some());
+        assert_eq!(
+            extensions
+                .get("plug")
+                .and_then(|value| value.get("uri"))
+                .and_then(|value| value.as_str()),
             Some("https://plug.example.com/mcp")
         );
     }

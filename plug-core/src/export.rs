@@ -216,47 +216,53 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
 
 /// Generate a YAML MCP config snippet.
 fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
-    let mut plug = serde_yml::Mapping::new();
+    let mut plug = serde_norway::Mapping::new();
 
     match options.transport {
         ExportTransport::Stdio => {
             plug.insert(
-                serde_yml::Value::from("type"),
-                serde_yml::Value::from("stdio"),
+                serde_norway::Value::from("type"),
+                serde_norway::Value::from("stdio"),
             );
             plug.insert(
-                serde_yml::Value::from("command"),
-                serde_yml::Value::from(options.command.clone()),
+                serde_norway::Value::from("command"),
+                serde_norway::Value::from(options.command.clone()),
             );
-            let args = vec![serde_yml::Value::from("connect")];
-            plug.insert(serde_yml::Value::from("args"), serde_yml::Value::from(args));
+            let args = vec![serde_norway::Value::from("connect")];
+            plug.insert(
+                serde_norway::Value::from("args"),
+                serde_norway::Value::from(args),
+            );
         }
         ExportTransport::Http => {
             plug.insert(
-                serde_yml::Value::from("type"),
-                serde_yml::Value::from("sse"),
+                serde_norway::Value::from("type"),
+                serde_norway::Value::from("sse"),
             );
             plug.insert(
-                serde_yml::Value::from("uri"),
-                serde_yml::Value::from(resolved_http_url(options)),
+                serde_norway::Value::from("uri"),
+                serde_norway::Value::from(resolved_http_url(options)),
             );
         }
     }
     plug.insert(
-        serde_yml::Value::from("enabled"),
-        serde_yml::Value::from(true),
+        serde_norway::Value::from("enabled"),
+        serde_norway::Value::from(true),
     );
 
-    let mut extensions = serde_yml::Mapping::new();
-    extensions.insert(serde_yml::Value::from("plug"), serde_yml::Value::from(plug));
+    let mut extensions = serde_norway::Mapping::new();
+    extensions.insert(
+        serde_norway::Value::from("plug"),
+        serde_norway::Value::from(plug),
+    );
 
-    let mut config = serde_yml::Mapping::new();
+    let mut config = serde_norway::Mapping::new();
     config.insert(
-        serde_yml::Value::from(key),
-        serde_yml::Value::from(extensions),
+        serde_norway::Value::from(key),
+        serde_norway::Value::from(extensions),
     );
 
-    serde_yml::to_string(&config).unwrap()
+    serde_norway::to_string(&config).unwrap()
 }
 
 /// Generate VS Code config with nested "mcp" -> "servers".
@@ -531,6 +537,36 @@ mod tests {
         assert_eq!(
             parsed["mcpServers"]["plug"]["url"],
             "https://plug.example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn export_goose_http_yaml_has_expected_shape() {
+        let options = ExportOptions {
+            target: ExportTarget::Goose,
+            transport: ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        };
+        let output = export_config(&options);
+        let parsed: serde_norway::Value = serde_norway::from_str(&output).unwrap();
+        let plug = parsed
+            .get("extensions")
+            .and_then(|value| value.get("plug"))
+            .expect("plug extension");
+
+        assert_eq!(
+            plug.get("type").and_then(|value| value.as_str()),
+            Some("sse")
+        );
+        assert_eq!(
+            plug.get("uri").and_then(|value| value.as_str()),
+            Some("https://plug.example.com/mcp")
+        );
+        assert_eq!(
+            plug.get("enabled").and_then(|value| value.as_bool()),
+            Some(true)
         );
     }
 }
