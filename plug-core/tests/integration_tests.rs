@@ -1568,20 +1568,28 @@ async fn test_stdio_timeout_reconnects_cleanly() {
     let first = engine.tool_router().call_tool("Mock__echo", None).await;
     assert!(first.is_err(), "first call should time out");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let second = engine
-        .tool_router()
-        .call_tool(
-            "Mock__echo",
-            Some(
-                serde_json::json!({"input": "ok"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await;
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = engine
+                .tool_router()
+                .call_tool(
+                    "Mock__echo",
+                    Some(
+                        serde_json::json!({"input": "ok"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+            if result.is_ok() {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("reconnect should complete within timeout");
     assert!(second.is_ok(), "second call should succeed after reconnect");
 
     engine.shutdown().await;

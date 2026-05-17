@@ -1116,12 +1116,7 @@ async fn handle_request(
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
 
-            let mut response_value = serde_json::to_value(&response_msg)
-                .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
-            response_value["result"]["protocolVersion"] =
-                serde_json::Value::String(PROTOCOL_VERSION.to_string());
-
-            json_value_response_with_session(&session_id, &response_value)
+            json_response_with_session(&session_id, &response_msg)
         }
 
         ClientRequest::PingRequest(_) => {
@@ -1487,17 +1482,19 @@ fn build_initialize_result(
     router: &ToolRouter,
     client_type: crate::types::ClientType,
 ) -> InitializeResult {
-    InitializeResult::new(router.synthesized_capabilities_for_client(client_type)).with_server_info(
-        Implementation::new("plug", env!("CARGO_PKG_VERSION"))
-            .with_title("Plug")
-            .with_description("MCP multiplexer")
-            .with_website_url("https://github.com/plug-mcp/plug")
-            .with_icons(vec![Icon::new(
-                "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
-            )
-            .with_mime_type("image/svg+xml")
-            .with_sizes(vec!["any".to_string()])]),
-    )
+    InitializeResult::new(router.synthesized_capabilities_for_client(client_type))
+        .with_server_info(
+            Implementation::new("plug", env!("CARGO_PKG_VERSION"))
+                .with_title("Plug")
+                .with_description("MCP multiplexer")
+                .with_website_url("https://github.com/plug-mcp/plug")
+                .with_icons(vec![Icon::new(
+                    "https://raw.githubusercontent.com/plug-mcp/plug/main/docs/assets/plug-icon.svg",
+                )
+                .with_mime_type("image/svg+xml")
+                .with_sizes(vec!["any".to_string()])]),
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
 }
 
 /// Extract the host from an Origin header value.
@@ -1562,31 +1559,11 @@ fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
     Ok(response)
 }
 
-fn json_value_response(value: &serde_json::Value) -> Result<Response, HttpError> {
-    let body = serde_json::to_vec(value)
-        .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
-
-    let mut response = (StatusCode::OK, body).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response.headers_mut().insert(
-        "X-Content-Type-Options",
-        HeaderValue::from_static("nosniff"),
-    );
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-
-    Ok(response)
-}
-
-fn json_value_response_with_session(
+fn json_response_with_session(
     session_id: &str,
-    value: &serde_json::Value,
+    msg: &ServerJsonRpcMessage,
 ) -> Result<Response, HttpError> {
-    let mut response = json_value_response(value)?;
+    let mut response = json_response(msg)?;
     response.headers_mut().insert(
         SESSION_ID_HEADER,
         HeaderValue::from_str(session_id)

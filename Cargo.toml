@@ -78,8 +78,8 @@ rand = "0.8"
 base64 = "0.22"
 
 # File watching (Phase 5)
-notify = "7"
-notify-debouncer-mini = "0.5"
+notify = "8"
+notify-debouncer-mini = "0.7"
 
 # Daemon (Phase 4)
 tracing-appender = "0.2"
@@ -104,7 +104,7 @@ async-stream = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 http = "1"
 bytes = "1"
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 
 [profile.release]
 strip = true
