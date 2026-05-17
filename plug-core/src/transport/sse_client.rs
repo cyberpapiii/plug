@@ -471,6 +471,9 @@ async fn post_message(
     if let Some(token) = auth_token {
         request = request.bearer_auth(token.as_ref());
     }
+    for (name, value) in crate::mcp_http_headers::mirrored_headers_for_message(&message) {
+        request = request.header(name, value);
+    }
 
     let response = request.json(&message).send().await?;
     let status = response.status();

@@ -24,6 +24,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
+use crate::mcp_http_headers::{HEADER_MISMATCH_CODE, HeaderMismatch, validate_mirrored_headers};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
 use crate::session::{SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
@@ -529,6 +530,9 @@ async fn post_mcp(
     })?;
 
     validate_protocol_version_for_post(&headers, &message)?;
+    if let Err(err) = validate_mirrored_headers(&headers, &message) {
+        return Ok(header_mismatch_response(&message, err));
+    }
     let trace_id = Arc::<str>::from(extract_trace_id(&headers));
 
     // 3. Route based on message type
@@ -586,6 +590,22 @@ async fn post_mcp(
             "unexpected error message from client".into(),
         )),
     }
+}
+
+fn header_mismatch_response(message: &ClientJsonRpcMessage, err: HeaderMismatch) -> Response {
+    let id = match message {
+        JsonRpcMessage::Request(request) => serde_json::to_value(&request.id).unwrap_or_default(),
+        _ => serde_json::Value::Null,
+    };
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": HEADER_MISMATCH_CODE,
+            "message": err.message,
+        }
+    });
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
 fn validate_protocol_version_for_post(
@@ -1795,6 +1815,115 @@ mod tests {
                 .get(PROTOCOL_VERSION_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some(PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_rejects_mismatched_mcp_method_header() {
+        let app = build_router(test_state());
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("Mcp-Method", "tools/list")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], HEADER_MISMATCH_CODE);
+        assert_eq!(value["id"], 9);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Mcp-Method")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_rejects_mismatched_mcp_name_header() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "header-test", "version": "1.0" }
+            }
+        });
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+        let init_resp = app.oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "actual_tool",
+                "arguments": {}
+            }
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "spoofed_tool")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], HEADER_MISMATCH_CODE);
+        assert_eq!(value["id"], 2);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Mcp-Name")
         );
     }
 

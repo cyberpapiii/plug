@@ -16,6 +16,7 @@ pub mod health;
 pub mod http;
 pub mod import;
 pub mod ipc;
+pub(crate) mod mcp_http_headers;
 pub mod notifications;
 pub mod oauth;
 pub mod proxy;

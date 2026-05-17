@@ -272,3 +272,29 @@ Surprises:
 Deferred:
 
 - Full GUI-client exercise across every linked client remains a launch-cut manual gate. Reason: only Claude Code and Codex CLI were live and controllable non-interactively in this session. Owner: Rob. Re-review date: 2026-05-24 or before public launch.
+
+## 2026-05-17 Phase 4 U9 - SEP-2243 HTTP header standardization
+
+Shipped:
+
+- Added a shared MCP HTTP header helper for standard `Mcp-Method` and `Mcp-Name` mirroring.
+- Downstream HTTP now validates present `Mcp-Method` / `Mcp-Name` headers against the JSON-RPC body and rejects mismatches with HTTP 400 plus JSON-RPC error code `-32001` (`HeaderMismatch`).
+- Missing SEP-2243 headers remain accepted for current clients because Plug still advertises `2025-11-25`, and the SEP gates required headers on the protocol version that introduces them.
+- Streamable HTTP upstream requests now receive mirrored `Mcp-Method` / `Mcp-Name` headers through the `rmcp` custom-header map.
+- Legacy SSE upstream POSTs now emit the same mirrored headers.
+
+Tests and checks:
+
+- `cargo test -p plug-core mcp_http_headers -- --nocapture` passed.
+- `cargo test -p plug-core post_rejects_mismatched -- --nocapture` passed.
+- `cargo test -p plug-core explicit_sse_upstream_connects_and_routes_tool_calls -- --nocapture` passed and asserts the upstream received `Mcp-Method: tools/call` and `Mcp-Name: echo`.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+
+Surprises:
+
+- Strict missing-header rejection would be a client-visible wire break today. The implementation validates and emits the Final SEP headers without forcing current clients to send them before a future protocol-version bump.
+
+Deferred:
+
+- Custom `x-mcp-header` / `Mcp-Param-*` mirroring remains deferred. Reason: the execution prompt scoped Phase 4 #11 to `Mcp-Method` / `Mcp-Name`; parameter-level mirroring needs tool-schema validation and could affect tool visibility. Owner: Rob. Re-review date: 2026-06-15 or during the next protocol-version alignment pass.

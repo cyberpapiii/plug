@@ -90,9 +90,12 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         message: rmcp::model::ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_header: Option<String>,
-        custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
+        mut custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let is_initialized = is_initialized_notification_message(&message);
+        custom_headers.extend(crate::mcp_http_headers::mirrored_headers_for_message(
+            &message,
+        ));
         let result = <reqwest::Client as StreamableHttpClient>::post_message(
             &self.inner,
             uri,
@@ -2884,6 +2887,7 @@ mod tests {
         tx: tokio::sync::broadcast::Sender<sse_stream::Sse>,
         expected_auth: Option<String>,
         reject_post_on_stream_path: bool,
+        last_message_headers: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     }
 
     #[derive(Clone)]
@@ -2903,6 +2907,7 @@ mod tests {
                 tx,
                 expected_auth: expected_auth.map(str::to_string),
                 reject_post_on_stream_path,
+                last_message_headers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             };
             let app = Router::new()
                 .route("/mcp", get(legacy_sse_stream).post(legacy_sse_stream_post))
@@ -2940,6 +2945,10 @@ mod tests {
                     ),
                 )
                 .expect("broadcast tool list changed");
+        }
+
+        async fn last_message_headers(&self) -> HashMap<String, String> {
+            self.state.last_message_headers.read().await.clone()
         }
     }
 
@@ -2996,6 +3005,15 @@ mod tests {
     ) -> StatusCode {
         if !legacy_sse_authorized(&headers, &state.expected_auth) {
             return StatusCode::UNAUTHORIZED;
+        }
+        {
+            let mut last_headers = state.last_message_headers.write().await;
+            last_headers.clear();
+            for name in ["Mcp-Method", "Mcp-Name"] {
+                if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+                    last_headers.insert(name.to_string(), value.to_string());
+                }
+            }
         }
 
         match message {
@@ -3074,7 +3092,7 @@ mod tests {
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
-        let (_legacy_server, url) =
+        let (legacy_server, url) =
             LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token"), false).await;
 
         let mut config = test_server_config();
@@ -3101,6 +3119,12 @@ mod tests {
             .await
             .expect("legacy SSE tool call");
         assert!(format!("{result:?}").contains("legacy sse called echo"));
+        let headers = legacy_server.last_message_headers().await;
+        assert_eq!(
+            headers.get("Mcp-Method").map(String::as_str),
+            Some("tools/call")
+        );
+        assert_eq!(headers.get("Mcp-Name").map(String::as_str), Some("echo"));
     }
 
     #[tokio::test]
