@@ -77,6 +77,8 @@ pub(crate) struct RouterSnapshot {
     pub prompt_routes: HashMap<String, (String, String)>,
     /// Fingerprints for routed tool definitions to detect material drift.
     pub tool_definition_fingerprints: HashMap<String, u64>,
+    /// Tool name -> operator-only risk metadata preserving upstream-vs-Plug annotation provenance.
+    pub tool_risk_inventory: HashMap<String, crate::ipc::IpcToolRiskInfo>,
 }
 
 /// Configuration for token efficiency and tool filtering.
@@ -322,6 +324,7 @@ impl ToolRouter {
                 resource_routes: HashMap::new(),
                 prompt_routes: HashMap::new(),
                 tool_definition_fingerprints: HashMap::new(),
+                tool_risk_inventory: HashMap::new(),
             })),
             config,
             event_tx: None,
@@ -1288,6 +1291,7 @@ impl ToolRouter {
         // ── Pass 3: build final tools with collision-safe names ──
         let mut routes = HashMap::new();
         let mut tools = Vec::new();
+        let mut tool_risk_inventory = HashMap::new();
 
         for c in classified {
             let stripped_wire = crate::tool_naming::build_wire_name(
@@ -1320,7 +1324,12 @@ impl ToolRouter {
                 (c.server_name.clone(), c.tool.name.to_string()),
             );
 
+            let upstream_annotations = c.tool.annotations.clone();
             let mut prefixed_tool = c.tool.clone();
+            let mut inferred_tool = c.tool.clone();
+            inferred_tool.name = Cow::Owned(final_name.clone());
+            inferred_tool.annotations = None;
+            crate::enrichment::normalize_annotations(&mut inferred_tool, &final_name);
 
             // Enrich BEFORE setting wire name (so get_* patterns match)
             if self.config.enrichment_servers.contains(&c.server_name) {
@@ -1334,12 +1343,20 @@ impl ToolRouter {
             let title_name = crate::tool_naming::generate_title(&c.prefix, &final_name);
 
             // Set wire name and canonical display metadata
-            prefixed_tool.name = Cow::Owned(prefixed_name);
+            prefixed_tool.name = Cow::Owned(prefixed_name.clone());
             apply_canonical_tool_title(&mut prefixed_tool, title_name);
 
             // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
 
+            tool_risk_inventory.insert(
+                prefixed_name.clone(),
+                crate::ipc::IpcToolRiskInfo::from_annotations(
+                    upstream_annotations.as_ref(),
+                    inferred_tool.annotations.as_ref(),
+                    prefixed_tool.annotations.as_ref(),
+                ),
+            );
             tools.push(prefixed_tool);
         }
 
@@ -1355,6 +1372,14 @@ impl ToolRouter {
             routes.insert(
                 meta_tool.name.to_string(),
                 ("__plug_internal__".to_string(), meta_tool.name.to_string()),
+            );
+            tool_risk_inventory.insert(
+                meta_tool.name.to_string(),
+                crate::ipc::IpcToolRiskInfo::from_annotations(
+                    None,
+                    meta_tool.annotations.as_ref(),
+                    meta_tool.annotations.as_ref(),
+                ),
             );
             // Insert at position 0 so it's always visible
             tools.insert(0, meta_tool);
@@ -1580,6 +1605,7 @@ impl ToolRouter {
             resource_routes,
             prompt_routes,
             tool_definition_fingerprints,
+            tool_risk_inventory,
         }));
 
         if let Some(ref tx) = self.event_tx {
@@ -1708,6 +1734,33 @@ impl ToolRouter {
 
             // Return tool with wire name intact (CLI handles display)
             result.push((server_id, tool.clone()));
+        }
+        result
+    }
+
+    /// List all tools with their source server IDs and operator risk metadata.
+    pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, crate::ipc::IpcToolRiskInfo)> {
+        let snapshot = self.cache.load();
+        let mut result = Vec::new();
+        for tool in snapshot.tools_all.iter() {
+            let server_id = snapshot
+                .routes
+                .get(tool.name.as_ref())
+                .map(|(s, _)| s.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let risk = snapshot
+                .tool_risk_inventory
+                .get(tool.name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::ipc::IpcToolRiskInfo::from_annotations(
+                        None,
+                        tool.annotations.as_ref(),
+                        tool.annotations.as_ref(),
+                    )
+                });
+
+            result.push((server_id, tool.clone(), risk));
         }
         result
     }
@@ -4352,6 +4405,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
         router
     }
@@ -4610,6 +4664,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         assert_eq!(
@@ -4679,6 +4734,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         // Search by name
@@ -4736,6 +4792,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let visible_tools = router.list_tools_for_client(ClientType::ClaudeCode);
@@ -4771,6 +4828,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let visible_tools = router.list_tools_for_client(ClientType::OpenCode);
@@ -4812,6 +4870,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
@@ -4871,6 +4930,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let downstream = DownstreamCallContext::stdio_for_client(
@@ -4931,6 +4991,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let mut notifications = router.subscribe_notifications();
@@ -4990,6 +5051,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
@@ -5160,6 +5222,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let caps = router.synthesized_capabilities();
@@ -5265,6 +5328,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let snapshot = router.cache.load();
@@ -5311,6 +5375,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let call = router.call_tool("Busy__tool", None);
@@ -5350,6 +5415,7 @@ mod tests {
             resource_routes: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
         }));
 
         let first =

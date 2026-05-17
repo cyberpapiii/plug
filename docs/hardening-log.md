@@ -198,3 +198,25 @@ Surprises:
 Deferred:
 
 - Risk-level annotation semantics stay in U7. This tranche only identifies where a tool/server comes from and which trust boundary it crosses.
+
+## 2026-05-17 Phase 3 U7 - Risky-tool annotation inventory
+
+Shipped:
+
+- Added operator-only risk metadata that separates `upstream_declared`, `plug_inferred`, and `effective` tool annotation hints.
+- Preserved this metadata in the router snapshot while leaving the MCP `tools/list` wire payload unchanged.
+- Added `has_conflict` so operators can identify tools where upstream declarations disagree with Plug's normalized safety hints.
+- Exposed the risk inventory through daemon `ListTools` IPC and `plug tools --output json` alongside the existing source/trust metadata.
+
+Tests and checks:
+
+- `cargo test -p plug-core ipc::tests -- --nocapture` passed, including `tool_risk_metadata_separates_declared_inferred_and_effective_hints`.
+- `cargo check --workspace` passed.
+
+Surprises:
+
+- The existing normalization path intentionally overwrites wrong upstream hints before exposing tools to clients. Preserving the pre-normalized hints in router metadata was the clean way to reduce operator overconfidence without changing client-facing behavior.
+
+Deferred:
+
+- Text-mode risk summaries remain deferred. Reason: the launch-critical need is machine-readable inventory; adding human summaries belongs with the operator guide/UI polish pass. Owner: Rob. Re-review date: 2026-06-15 or during Phase 6 documentation.

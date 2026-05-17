@@ -2054,6 +2054,7 @@ mod tests {
             resource_routes: std::collections::HashMap::new(),
             prompt_routes: std::collections::HashMap::new(),
             tool_definition_fingerprints: std::collections::HashMap::new(),
+            tool_risk_inventory: std::collections::HashMap::new(),
         });
 
         let app = build_router(state.clone());

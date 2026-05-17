@@ -8,7 +8,7 @@ use std::fmt;
 
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult,
+    CreateMessageRequestParams, CreateMessageResult, ToolAnnotations,
 };
 use serde::{Deserialize, Serialize};
 
@@ -207,10 +207,77 @@ pub struct IpcToolInfo {
     pub server_id: String,
     pub description: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub risk: IpcToolRiskInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<IpcServerSourceInfo>,
     #[serde(default)]
     pub trust: IpcTrustInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IpcToolRiskInfo {
+    pub upstream_declared: IpcToolRiskHints,
+    pub plug_inferred: IpcToolRiskHints,
+    pub effective: IpcToolRiskHints,
+    pub has_conflict: bool,
+}
+
+impl IpcToolRiskInfo {
+    pub fn from_annotations(
+        upstream_declared: Option<&ToolAnnotations>,
+        plug_inferred: Option<&ToolAnnotations>,
+        effective: Option<&ToolAnnotations>,
+    ) -> Self {
+        let upstream_declared = IpcToolRiskHints::from_annotations(upstream_declared);
+        let plug_inferred = IpcToolRiskHints::from_annotations(plug_inferred);
+        let effective = IpcToolRiskHints::from_annotations(effective);
+        let has_conflict = upstream_declared.conflicts_with(&plug_inferred);
+
+        Self {
+            upstream_declared,
+            plug_inferred,
+            effective,
+            has_conflict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IpcToolRiskHints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world: Option<bool>,
+}
+
+impl IpcToolRiskHints {
+    fn from_annotations(annotations: Option<&ToolAnnotations>) -> Self {
+        match annotations {
+            Some(annotations) => Self {
+                read_only: annotations.read_only_hint,
+                destructive: annotations.destructive_hint,
+                idempotent: annotations.idempotent_hint,
+                open_world: annotations.open_world_hint,
+            },
+            None => Self::default(),
+        }
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        option_conflicts(self.read_only, other.read_only)
+            || option_conflicts(self.destructive, other.destructive)
+            || option_conflicts(self.idempotent, other.idempotent)
+            || option_conflicts(self.open_world, other.open_world)
+    }
+}
+
+fn option_conflicts(left: Option<bool>, right: Option<bool>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -759,6 +826,24 @@ mod tests {
         assert_eq!(trust.tier, "configured_local_process");
         assert_eq!(trust.source, "local_config");
         assert_eq!(trust.boundary, "local_process");
+    }
+
+    #[test]
+    fn tool_risk_metadata_separates_declared_inferred_and_effective_hints() {
+        let declared = ToolAnnotations::new().read_only(true).destructive(false);
+        let inferred = ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(true);
+
+        let risk =
+            IpcToolRiskInfo::from_annotations(Some(&declared), Some(&inferred), Some(&inferred));
+
+        assert_eq!(risk.upstream_declared.read_only, Some(true));
+        assert_eq!(risk.plug_inferred.destructive, Some(true));
+        assert_eq!(risk.effective.idempotent, Some(false));
+        assert!(risk.has_conflict);
     }
 
     #[test]
