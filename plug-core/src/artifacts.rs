@@ -131,7 +131,9 @@ impl ArtifactStore {
         write_metadata(&artifact_dir, &record)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.records.insert(id.clone(), record.clone());
-        self.prune();
+        // Pruning runs on a periodic background loop (`spawn_artifact_prune_loop`)
+        // plus at startup — do not scan the whole artifact directory inline on
+        // every spill, which blocks the async worker on each large result.
 
         Ok(build_artifact_result(
             result.is_error == Some(true),
@@ -153,6 +155,10 @@ impl ArtifactStore {
         })?;
 
         if SystemTime::now() > record.expires_at {
+            // Release the DashMap read guard before `remove()` takes the
+            // same shard's write lock — holding the `Ref` across `remove`
+            // deadlocks the calling thread.
+            drop(record);
             self.records.remove(&request.id);
             let _ = std::fs::remove_dir_all(self.base_dir.join(&request.id));
             return Err(McpError::from(ProtocolError::InvalidRequest {
@@ -489,15 +495,24 @@ fn path_display(path: &Path) -> String {
 }
 
 fn read_chunk_text(record: &ArtifactRecord, index: usize) -> anyhow::Result<String> {
-    let payload = std::fs::read(&record.payload_path)?;
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Read only the requested chunk window instead of loading the entire
+    // (>=16MB) payload to return a single 128KB chunk — paging a large
+    // artifact otherwise costs O(chunks * file_size) cumulative reads.
     let start = index
         .checked_mul(ARTIFACT_CHUNK_BYTES)
-        .ok_or_else(|| anyhow::anyhow!("artifact chunk index overflow"))?;
-    if start >= payload.len() {
+        .ok_or_else(|| anyhow::anyhow!("artifact chunk index overflow"))? as u64;
+    let mut file = std::fs::File::open(&record.payload_path)?;
+    let file_len = file.metadata()?.len();
+    if start >= file_len {
         anyhow::bail!("artifact chunk index out of range");
     }
-    let end = (start + ARTIFACT_CHUNK_BYTES).min(payload.len());
-    Ok(String::from_utf8_lossy(&payload[start..end]).into_owned())
+    let to_read = (file_len - start).min(ARTIFACT_CHUNK_BYTES as u64) as usize;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0_u8; to_read];
+    file.read_exact(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn maybe_materialize_attachment(
@@ -733,6 +748,94 @@ mod tests {
 
         assert!(store.records.is_empty());
         assert!(!artifact_dir.exists());
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn read_expired_record_errors_without_deadlock() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        let base_dir = temp_dir("read-expired");
+        let store = Arc::new(test_store(base_dir.clone()));
+        let artifact_dir = base_dir.join("expired-read-id");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("result.json"), b"{}").unwrap();
+        store.records.insert(
+            "expired-read-id".to_string(),
+            ArtifactRecord {
+                id: "expired-read-id".to_string(),
+                source_tool: "tool".to_string(),
+                original_size_bytes: 2,
+                created_at: SystemTime::UNIX_EPOCH,
+                expires_at: SystemTime::UNIX_EPOCH,
+                payload_path: artifact_dir.join("result.json"),
+                materialized_path: None,
+                chunk_count: 1,
+                preview: String::new(),
+            },
+        );
+
+        // Run read() on a watchdog thread: a regression that holds the
+        // DashMap read guard across remove() deadlocks, so a missing
+        // result within the timeout fails the test instead of hanging CI.
+        let (tx, rx) = mpsc::channel();
+        let reader = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let result = reader.read("plug://artifact/expired-read-id/manifest");
+            let _ = tx.send(result.is_err());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(is_err) => assert!(is_err, "expired artifact read should return an error"),
+            Err(_) => panic!("read() deadlocked on an expired artifact record"),
+        }
+
+        assert!(
+            !store.records.contains_key("expired-read-id"),
+            "expired record should be evicted after a read"
+        );
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn read_chunk_text_reconstructs_payload_across_chunks() {
+        let base_dir = temp_dir("chunk-read");
+        let payload_path = base_dir.join("payload.bin");
+        // Content spanning two full chunks plus a partial third, so the seek
+        // + read_exact path is exercised on full and tail windows.
+        let content: String = ('a'..='z')
+            .cycle()
+            .take(ARTIFACT_CHUNK_BYTES * 2 + 1234)
+            .collect();
+        std::fs::write(&payload_path, content.as_bytes()).unwrap();
+
+        let record = ArtifactRecord {
+            id: "chunk-read-id".to_string(),
+            source_tool: "tool".to_string(),
+            original_size_bytes: content.len(),
+            created_at: SystemTime::now(),
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            payload_path: payload_path.clone(),
+            materialized_path: None,
+            chunk_count: content.len().div_ceil(ARTIFACT_CHUNK_BYTES),
+            preview: String::new(),
+        };
+
+        let mut reconstructed = String::new();
+        for i in 0..record.chunk_count {
+            reconstructed.push_str(&read_chunk_text(&record, i).expect("read chunk"));
+        }
+        assert_eq!(
+            reconstructed, content,
+            "per-chunk reads must reconstruct the full payload byte-for-byte"
+        );
+
+        assert!(
+            read_chunk_text(&record, record.chunk_count).is_err(),
+            "an out-of-range chunk index must error"
+        );
+
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
