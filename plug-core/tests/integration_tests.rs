@@ -1241,6 +1241,34 @@ async fn test_proxy_handler_refresh_tools_empty() {
     assert!(info.capabilities.tools.is_none());
 }
 
+// A connected upstream that stalls on resource listing must be skipped after
+// its per-server call_timeout_secs, not allowed to block the whole refresh.
+#[tokio::test]
+async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
+    let mut config = Config::default();
+    let mut server = mock_server_config("echo");
+    // Advertise resources and hang on list_resources (fail-mode timeout).
+    server.args.push("--resources".to_string());
+    server.args.push("--fail-mode".to_string());
+    server.args.push("timeout".to_string());
+    server.call_timeout_secs = 1;
+    config.servers.insert("mock".to_string(), server);
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    // Without the per-server listing timeout this hangs forever; with it the
+    // stalled upstream is skipped after ~1s and the refresh completes.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        engine.tool_router().refresh_tools(),
+    )
+    .await
+    .expect("refresh_tools must not block on an upstream that stalls on resource listing");
+
+    engine.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // ProxyHandler: get_info returns correct server info
 // ---------------------------------------------------------------------------
