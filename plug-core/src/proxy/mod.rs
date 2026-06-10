@@ -3005,6 +3005,11 @@ impl ToolRouter {
                                 trace_id = %trace_id,
                                 "reconnected, retrying tool call"
                             );
+                            // Count the transient failure that triggered the
+                            // reconnect so the degradation blip is visible; the
+                            // retry below records its own (terminal) outcome.
+                            self.server_manager
+                                .record_call(&server_id, false, duration_ms);
                         }
                         Err(reconnect_err) => {
                             tracing::error!(
@@ -3101,6 +3106,10 @@ impl ToolRouter {
                     }
                 }
                 Ok(other) => {
+                    // An unexpected upstream response is a terminal failure —
+                    // record it like the other terminal branches.
+                    self.server_manager
+                        .record_call(&server_id, false, duration_ms);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }

@@ -635,6 +635,13 @@ impl ServerManager {
             .record(ok, latency_ms);
     }
 
+    fn circuit_state_for(&self, server_id: &str) -> &'static str {
+        self.circuit_breakers
+            .get(server_id)
+            .map(|cb| circuit_state_label(cb.state()))
+            .unwrap_or("closed")
+    }
+
     /// Snapshot per-upstream metrics for status reporting, folding in the
     /// current circuit-breaker state. `None` when the server has no recorded calls.
     pub(crate) fn metrics_snapshot(
@@ -642,12 +649,25 @@ impl ServerManager {
         server_id: &str,
     ) -> Option<crate::types::UpstreamMetricsSnapshot> {
         let metrics = self.metrics.get(server_id)?;
-        let circuit = self
-            .circuit_breakers
-            .get(server_id)
-            .map(|cb| circuit_state_label(cb.state()))
-            .unwrap_or("closed");
-        Some(metrics.snapshot(circuit))
+        Some(metrics.snapshot(self.circuit_state_for(server_id)))
+    }
+
+    /// Like `metrics_snapshot` but returns a zero-valued snapshot (with live
+    /// circuit state) for a known server that has had no calls yet, so the
+    /// `plug status --output json` schema stays stable — every configured
+    /// server always carries a `metrics` object, never a missing key.
+    pub(crate) fn metrics_snapshot_or_default(
+        &self,
+        server_id: &str,
+    ) -> crate::types::UpstreamMetricsSnapshot {
+        let circuit = self.circuit_state_for(server_id);
+        match self.metrics.get(server_id) {
+            Some(metrics) => metrics.snapshot(circuit),
+            None => crate::types::UpstreamMetricsSnapshot {
+                circuit_state: circuit.to_string(),
+                ..Default::default()
+            },
+        }
     }
 
     pub fn set_tool_router(&self, router: std::sync::Weak<ToolRouter>) {
@@ -1411,7 +1431,7 @@ impl ServerManager {
                     tool_count: upstream.tools.load().len(),
                     auth_status,
                     upstream: upstream.upstream.clone(),
-                    metrics: self.metrics_snapshot(&upstream.name),
+                    metrics: Some(self.metrics_snapshot_or_default(&upstream.name)),
                     last_seen: None,
                 }
             })
@@ -1498,6 +1518,7 @@ impl ServerManager {
         if let Some(upstream_arc) = self.remove_upstream(name) {
             self.health.remove(name);
             self.circuit_breakers.remove(name);
+            self.metrics.remove(name);
             self.semaphores.remove(name);
             retire_upstream_owned(name.to_string(), upstream_arc, "stop").await;
         }
@@ -1698,6 +1719,19 @@ mod tests {
             snap.degraded_since_epoch_secs.is_none(),
             "degraded_since should clear after a success"
         );
+    }
+
+    #[test]
+    fn metrics_snapshot_or_default_is_zero_filled_for_uncalled_server() {
+        // Schema stability: a known server with no recorded calls still yields a
+        // zero-valued snapshot (never a missing metrics object).
+        let sm = ServerManager::new();
+        let snap = sm.metrics_snapshot_or_default("never-called");
+        assert_eq!(snap.call_count, 0);
+        assert_eq!(snap.error_count, 0);
+        assert_eq!(snap.last_latency_ms, 0);
+        assert!(snap.degraded_since_epoch_secs.is_none());
+        assert_eq!(snap.circuit_state, "closed");
     }
 
     #[test]

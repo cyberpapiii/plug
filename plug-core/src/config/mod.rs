@@ -396,6 +396,20 @@ pub fn http_bind_is_loopback(bind_address: &str) -> bool {
     matches!(bind_address, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 
+/// True when `public_base_url` is set to a non-loopback origin — i.e. the
+/// server is reachable from off-host even on a loopback bind (the common
+/// tunnel topology: `cloudflared` → `127.0.0.1:3282`). Auth guards must treat
+/// this as externally exposed, not as a trusted local listener.
+pub fn http_public_base_url_is_non_loopback(public_base_url: Option<&str>) -> bool {
+    match public_base_url.and_then(|u| url::Url::parse(u).ok()) {
+        Some(parsed) => !matches!(
+            parsed.host_str(),
+            None | Some("127.0.0.1") | Some("localhost") | Some("::1")
+        ),
+        None => false,
+    }
+}
+
 /// Transport type for upstream servers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -477,15 +491,18 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     {
         errors.push("http.oauth_client_id is required when http.auth_mode = \"oauth\"".to_string());
     }
-    if !http_bind_is_loopback(&config.http.bind_address)
+    let externally_exposed = !http_bind_is_loopback(&config.http.bind_address)
+        || http_public_base_url_is_non_loopback(config.http.public_base_url.as_deref());
+    if externally_exposed
         && matches!(config.http.auth_mode, DownstreamAuthMode::Oauth)
         && config.http.oauth_client_secret.is_none()
     {
         // A public (secretless) OAuth client lets anyone who knows the client_id
-        // mint tokens. That is only acceptable on a loopback bind; a tunneled /
-        // non-loopback listener must use a confidential client.
+        // mint tokens. That is only acceptable for a purely-local loopback
+        // listener; a non-loopback bind OR a non-loopback public_base_url (a
+        // tunneled deployment) must use a confidential client.
         errors.push(
-            "http.oauth_client_secret is required when http.auth_mode = \"oauth\" and binding a non-loopback downstream address"
+            "http.oauth_client_secret is required when http.auth_mode = \"oauth\" and the server is reachable off-loopback (non-loopback bind or non-loopback public_base_url)"
                 .to_string(),
         );
     }
@@ -1469,10 +1486,13 @@ mod tests {
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
         cfg.http.oauth_client_id = Some("client-123".to_string());
+        // A non-loopback public_base_url (a tunneled deployment) requires a
+        // confidential client, so set the secret for a valid config.
+        cfg.http.oauth_client_secret = Some("secret".to_string().into());
         let errors = validate_config(&cfg);
         assert!(
             errors.is_empty(),
-            "expected oauth on loopback to be valid, got {errors:?}"
+            "expected oauth with a confidential client to be valid, got {errors:?}"
         );
     }
 
@@ -1535,6 +1555,25 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("http.oauth_client_secret") && e.contains("non-loopback")),
             "expected secretless-oauth/non-loopback validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_secretless_oauth_on_tunneled_loopback_bind_is_rejected() {
+        // The real tunnel topology: cloudflared -> 127.0.0.1:3282, but the
+        // server is reachable off-host via a non-loopback public_base_url.
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.bind_address = "127.0.0.1".to_string();
+        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        cfg.http.oauth_client_id = Some("client".to_string());
+        cfg.http.oauth_client_secret = None;
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("http.oauth_client_secret") && e.contains("off-loopback")),
+            "secretless oauth tunneled via a non-loopback public_base_url must be rejected, got {errors:?}"
         );
     }
 

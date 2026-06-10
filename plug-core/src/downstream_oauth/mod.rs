@@ -126,6 +126,8 @@ fn redirect_uri_allowed(redirect_uri: &str, allowlist: &[String]) -> bool {
         return true;
     }
     match url::Url::parse(redirect_uri) {
+        // `host_str()` returns IPv6 hosts bracketed (`[::1]`); some url
+        // versions/forms surface `::1` unbracketed — accept both.
         Ok(parsed) => matches!(
             parsed.host_str(),
             Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
@@ -173,7 +175,12 @@ impl DownstreamOauthManager {
         }
         if !redirect_uri_allowed(redirect_uri, &self.config.redirect_uri_allowlist) {
             // Reject unlisted off-host callbacks before issuing a code — do not
-            // redirect to an attacker-controlled URI.
+            // redirect to an attacker-controlled URI. Logged so an operator can
+            // see when a legitimate non-loopback callback needs allowlisting.
+            tracing::warn!(
+                redirect_uri = %redirect_uri,
+                "rejected /oauth/authorize: redirect_uri is not loopback and not on http.oauth_redirect_uri_allowlist"
+            );
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
         }
 
@@ -761,6 +768,61 @@ mod tests {
         assert!(
             redirect.is_ok(),
             "loopback redirect should be allowed without an allowlist entry, got {redirect:?}"
+        );
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn authorize_allows_ipv6_loopback_redirect() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let mut config = test_config(&client_id);
+        config.redirect_uri_allowlist.clear();
+        let manager = DownstreamOauthManager::new(config);
+
+        // host_str() strips the brackets, so [::1] is recognized as loopback.
+        let redirect = manager
+            .build_authorize_redirect(
+                &client_id,
+                "http://[::1]:7777/callback",
+                "abc123",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await;
+        assert!(
+            redirect.is_ok(),
+            "IPv6 loopback redirect should be allowed, got {redirect:?}"
+        );
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_loopback_userinfo_confusion() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let mut config = test_config(&client_id);
+        config.redirect_uri_allowlist.clear();
+        let manager = DownstreamOauthManager::new(config);
+
+        // Host is evil.com, not 127.0.0.1 — must be rejected.
+        let result = manager
+            .build_authorize_redirect(
+                &client_id,
+                "https://127.0.0.1@evil.com/callback",
+                "abc123",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(DownstreamOauthError::InvalidAuthorizationRequest)
+            ),
+            "userinfo host-confusion must be rejected, got {result:?}"
         );
         cleanup_state(&client_id);
     }
