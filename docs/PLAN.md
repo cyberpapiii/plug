@@ -49,6 +49,7 @@ forwarding work:
 - explicit live reverse-request delivery failure handling for downstream HTTP sessions
 - review-hardened task correctness around monotonic state transitions, reconnect-stable IPC ownership, and fail-closed pass-through dispatch
 - downstream OAuth authorize-redirect allowlist and exposure-keyed secretless-OAuth guard, plus per-upstream operability metrics in `plug status --output json` (PR #60)
+- first-class upstream catalog availability (`healthy | degraded | absent`) with last-known-good carry-forward for transient listing failures, closing the PR #58 subscription-rebind residual (PR #61)
 
 ## What Exists Today
 
@@ -82,18 +83,27 @@ Optional future scope only:
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
-- preserve last-known-good resources for a server that times out on listing, so a transient stall does not prune/unsubscribe its active resource subscriptions (follow-up from PR #58)
 - move the ≥16MB artifact write off the async worker via `spawn_blocking` (requires making `ArtifactStore` shareable; deferred from PR #58)
 - end-to-end metrics-recording test plus an RAII recording guard, and an operator-guide note on `degraded_since` vs. health divergence (deferred from PR #60)
 
 ## Designed-But-Deferred Program Phases
 
-The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred three larger items, each with full design captured in that plan:
+The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred larger items. Sequenced **item 3 → item 1 → item 2b**, plus the independent test-infra work:
 
-- **Transport `RequestDispatcher` + parity matrix** — collapse the per-transport (stdio/HTTP/IPC) request handling that repeatedly drifts (features land on stdio/HTTP first, IPC parity follows as bug fixes) into one dispatcher with an explicit parity matrix
-- **Degraded-vs-absent core model** — distinguish "upstream present but degraded" from "upstream absent" in the core, closing the PR #58 subscription-rebind residual at the model level rather than per-call-site
-- **Active upstream supervision** — proactive health-driven supervision beyond the current reactive recovery
+- **Degraded-vs-absent core model** — ✅ done on `main` via PR #61 (see dated entry below). Closed the PR #58 subscription-rebind residual at the model level.
+- **Transport `RequestDispatcher` + parity matrix** — collapse the per-transport (stdio/HTTP/IPC) request handling that repeatedly drifts (features land on stdio/HTTP first, IPC parity follows as bug fixes) into one dispatcher with an explicit parity matrix. Designed to build on the availability model from item 3. *(Next phase; highest-risk change in the repo per the program plan.)*
+- **Active upstream supervision (item 2b)** — proactive restart/reconnect of an upstream that stays `degraded` past a threshold, building on the now-first-class `degraded` state and the per-upstream metrics
 - **Test parallelism (U1/U2)** — remove the global daemon-test mutex and `--test-threads=1` via a per-test-path refactor; investigated during PR #60 and deferred rather than ship a flaky CI
+
+## 2026-06-10 Degraded-vs-Absent Availability (Program Item 3)
+
+On 2026-06-10, `main` absorbed PR #61:
+
+- `ServerManager`'s resource/template/prompt listers stop returning `Ok(Vec::new())` on timeout — they classify each per-server call as fresh or unavailable and carry last-known-good forward for an unavailable-but-routable upstream, so `refresh_tools` sees an unchanged URI set and its subscription prune/unsubscribe loop leaves a stalled server alone
+- first-class `Availability { healthy | degraded | absent }` recomputed each refresh, surfaced additively (schema-stable) on `ServerStatus` / `plug status --output json`; a routable upstream that fails to list reports `degraded` (never falsely `healthy`), `absent` is reserved for upstreams not in the routed set
+- closes the PR #58 subscription-rebind residual; review caught and fixed a real failing-with-no-cache misclassification before merge
+
+Residuals (recorded in PR #61, none a blocker): shared listing-helper extraction, pre-existing `health` vs `availability` JSON casing, an availability-scoped degraded-since timestamp (tied to item 2b), `refresh_tools` single-flight, and template/prompt degraded-path integration coverage.
 
 ## 2026-06-10 Operability + Tunneled-OAuth Hardening
 

@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #60 (tunneled-OAuth hardening + per-upstream operability metrics) and its post-merge truth pass
+Baseline: `main` after PR #61 (first-class degraded-vs-absent upstream availability) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -49,6 +49,7 @@ Implemented on `main`:
 - downstream OAuth authorize-redirect allowlist (loopback-default) closing the open-redirector on `build_authorize_redirect`, with percent-encoded code/state and rejection logging (PR #60)
 - secretless-OAuth exposure guard: config validation rejects `http.auth_mode = "oauth"` without `oauth_client_secret` when the server is reachable off-loopback (non-loopback bind *or* non-loopback `public_base_url`, e.g. a cloudflared tunnel) (PR #60)
 - per-upstream operability metrics in `plug status --output json`: call/error counts, last-latency, degraded-since epoch, and circuit-state label per upstream, with a stable always-present schema (zero-filled for known servers) (PR #60)
+- first-class upstream catalog availability (`healthy | degraded | absent`), distinct from connection health, surfaced additively on `ServerStatus` JSON: a transient listing failure (timeout/error) on a routable upstream is `degraded` and serves its last-known-good resources/prompts (preserving active resource subscriptions instead of pruning them); genuine removal still prunes. Closes the PR #58 subscription-rebind residual (PR #61)
 - clearer operator auth/runtime UX across `plug status`, `plug doctor`, `plug auth status`, `plug clients`, and `plug servers`
 - topology-aware setup/link/repair flows that preserve configured stdio vs HTTP downstream choices
 - transport-aware live session inventory across daemon proxy and downstream HTTP sessions
@@ -102,6 +103,14 @@ The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
 
+On 2026-06-10, `main` absorbed the first-class degraded-vs-absent availability model via PR #61 (deferred program item 3):
+
+- the catalog refresh no longer conflates a stalled listing with an empty one: `ServerManager`'s resource/template/prompt listers classify each per-server call as fresh or unavailable (timeout/error) and carry last-known-good forward for an unavailable-but-routable upstream, so its URI set is unchanged across the cycle and the existing subscription prune/unsubscribe loop leaves it alone
+- added a first-class `Availability { healthy | degraded | absent }` recomputed each refresh and surfaced additively on `ServerStatus` (schema-stable for `plug status --output json`): a routable upstream that fails to list is `degraded` (serving stale if cached, else nothing — never falsely `healthy`); `absent` is reserved for upstreams not in the routed set
+- closes the PR #58 subscription-rebind residual; multi-agent review caught and fixed a real misclassification (failing-with-no-cache reported `healthy`) before merge
+
+Residuals recorded in PR #61: shared listing-helper extraction, pre-existing `health` PascalCase vs `availability` lowercase JSON casing, an availability-scoped degraded-since timestamp (tied to deferred supervision), `refresh_tools` single-flight, and template/prompt degraded-path integration coverage. None is a roadmap blocker.
+
 On 2026-06-10, `main` absorbed the operability + tunneled-OAuth hardening tranche via PR #60:
 
 - closed the downstream OAuth open-redirector: `build_authorize_redirect` now checks the requested `redirect_uri` against a configured allowlist (defaulting to loopback hosts `127.0.0.1` / `localhost` / `::1`) *before* issuing the authorization code, percent-encodes code/state, and logs rejected URIs
@@ -119,7 +128,7 @@ On 2026-06-10, `main` absorbed the code-review stabilization batch via PR #58:
 - `plug server edit --output json` now performs the edit instead of printing the unedited config; `plug doctor` exits with its computed code (1 = fail, 2 = warn) for agent/CI gating
 - removed dead `sighup_reload` / `resource_subscription_count`; corrected stale `rmcp` / `serde` version claims across the docs
 
-Known residual (tracked follow-up, not yet on `main`): a transient listing timeout substitutes an empty result, which can prune and upstream-unsubscribe an active resource subscription on a stalled server without rebinding on recovery; and the ≥16MB artifact write is still synchronous (not yet `spawn_blocking`). Neither is a roadmap blocker.
+Known residual (tracked follow-up, not yet on `main`): the ≥16MB artifact write is still synchronous (not yet `spawn_blocking`). Not a roadmap blocker. (The other PR #58 residual — a transient listing timeout pruning/upstream-unsubscribing an active resource subscription without rebinding — was closed by PR #61.)
 
 On 2026-03-22, `main` absorbed the core MCP Tasks tranche and related follow-through work that:
 
