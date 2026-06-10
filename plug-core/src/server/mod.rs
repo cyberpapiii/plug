@@ -1073,7 +1073,26 @@ impl ServerManager {
             targets
                 .into_iter()
                 .map(|(server_name, upstream)| async move {
-                    let resources = upstream.client.peer().list_all_resources().await;
+                    // Bound each per-server listing call so one stalled-but-
+                    // connected upstream cannot block the whole catalog
+                    // refresh (the rmcp list_all_* calls carry no timeout).
+                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
+                    let resources = match tokio::time::timeout(
+                        timeout,
+                        upstream.client.peer().list_all_resources(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                server = %server_name,
+                                timeout_secs = upstream.config.call_timeout_secs,
+                                "timed out listing resources; skipping for this refresh"
+                            );
+                            Ok(Vec::new())
+                        }
+                    };
                     (server_name, resources)
                 }),
         )
@@ -1115,7 +1134,23 @@ impl ServerManager {
             targets
                 .into_iter()
                 .map(|(server_name, upstream)| async move {
-                    let templates = upstream.client.peer().list_all_resource_templates().await;
+                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
+                    let templates = match tokio::time::timeout(
+                        timeout,
+                        upstream.client.peer().list_all_resource_templates(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                server = %server_name,
+                                timeout_secs = upstream.config.call_timeout_secs,
+                                "timed out listing resource templates; skipping for this refresh"
+                            );
+                            Ok(Vec::new())
+                        }
+                    };
                     (server_name, templates)
                 }),
         )
@@ -1157,7 +1192,23 @@ impl ServerManager {
             targets
                 .into_iter()
                 .map(|(server_name, upstream)| async move {
-                    let prompts = upstream.client.peer().list_all_prompts().await;
+                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
+                    let prompts = match tokio::time::timeout(
+                        timeout,
+                        upstream.client.peer().list_all_prompts(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                server = %server_name,
+                                timeout_secs = upstream.config.call_timeout_secs,
+                                "timed out listing prompts; skipping for this refresh"
+                            );
+                            Ok(Vec::new())
+                        }
+                    };
                     (server_name, prompts)
                 }),
         )

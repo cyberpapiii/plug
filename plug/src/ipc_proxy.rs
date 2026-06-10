@@ -729,10 +729,13 @@ impl ServerHandler for IpcProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
-            let params = serde_json::json!({
-                "name": request.name,
-                "arguments": request.arguments,
-            });
+            // Serialize the full request so `_meta` (including
+            // `progressToken`) survives to the daemon — matching
+            // `enqueue_task`. A hand-built `{name, arguments}` object drops
+            // the progress token and silently disables progress on the
+            // default `plug connect` path.
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             match self
                 .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| {
                     IpcRequest::McpRequest {
@@ -1484,6 +1487,31 @@ mod tests {
         })
         .expect("daemon ready");
         (engine, handle)
+    }
+
+    // Wire-contract guard for the daemon-IPC progress regression: `call_tool`
+    // must serialize the full `CallToolRequestParams` so `_meta.progressToken`
+    // survives to the daemon. The previous hand-built `{name, arguments}`
+    // object dropped it, silently disabling progress on the default
+    // `plug connect` path. (End-to-end progress delivery over the daemon is
+    // a separate harness gap — the mock server emits no progress.)
+    #[test]
+    fn ipc_tools_call_params_preserve_progress_token() {
+        let mut request = CallToolRequestParams::new("Mock__echo");
+        request.meta = Some(Meta::with_progress_token(ProgressToken(
+            NumberOrString::Number(42),
+        )));
+
+        let params = serde_json::to_value(&request).expect("serialize call params");
+
+        assert_eq!(
+            params
+                .get("_meta")
+                .and_then(|m| m.get("progressToken"))
+                .and_then(|t| t.as_i64()),
+            Some(42),
+            "serialized IPC tools/call params must carry _meta.progressToken"
+        );
     }
 
     #[tokio::test]

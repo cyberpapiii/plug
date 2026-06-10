@@ -236,6 +236,13 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
+            // Hang on resource listing so tests can exercise the per-server
+            // listing timeout in refresh_tools (a connected-but-stalled
+            // upstream must not block the whole catalog refresh).
+            if self.fail_mode == "timeout" {
+                eprintln!("mock-mcp-server: timeout mode, hanging on list_resources");
+                std::future::pending::<()>().await;
+            }
             if !self.resources {
                 return Ok(ListResourcesResult::with_all_items(vec![]));
             }

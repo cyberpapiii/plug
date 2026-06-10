@@ -32,6 +32,12 @@ use crate::types::{ClientType, LazyToolMode, LazyToolModeOrigin, ResolvedLazyToo
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
+/// Backstop timeout for a single `refresh_tools` pass inside the notification
+/// refresh task. Per-server listing calls are already bounded by
+/// `call_timeout_secs` (see `ServerManager::get_resources`); this is a last
+/// resort so an unforeseen hang can never wedge the refresh task and silently
+/// disable all future `list_changed` delivery.
+const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
@@ -700,12 +706,47 @@ impl ToolRouter {
 
         let router = Arc::clone(self);
         tokio::spawn(async move {
+            // If this task exits without cleanly clearing the in-progress
+            // flag — a panic, or a cancellation — reset it so future
+            // refreshes can still be scheduled. Without this, a single
+            // abnormal exit permanently wedges `list_changed` delivery.
+            struct RefreshGuard {
+                router: Arc<ToolRouter>,
+                armed: bool,
+            }
+            impl Drop for RefreshGuard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.router
+                            .notification_refresh_in_progress
+                            .store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+            let mut guard = RefreshGuard {
+                router: Arc::clone(&router),
+                armed: true,
+            };
+
             loop {
                 router
                     .notification_refresh_pending
                     .store(false, Ordering::SeqCst);
                 tokio::time::sleep(LIST_CHANGED_REFRESH_DEBOUNCE).await;
-                router.refresh_tools().await;
+
+                // Bound the refresh as a backstop: per-server listing is
+                // already timeout-bounded, but an unforeseen hang here must
+                // not wedge the flag. On timeout, log and continue so the
+                // task keeps making forward progress.
+                if tokio::time::timeout(LIST_CHANGED_REFRESH_MAX, router.refresh_tools())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "tool refresh exceeded {}s backstop; retrying on next change",
+                        LIST_CHANGED_REFRESH_MAX.as_secs()
+                    );
+                }
 
                 if router
                     .pending_tool_list_changed
@@ -748,6 +789,9 @@ impl ToolRouter {
                     continue;
                 }
 
+                // Clean exit: the flag was just cleared above, so disarm the
+                // guard to avoid a redundant store.
+                guard.armed = false;
                 break;
             }
         });
@@ -773,15 +817,6 @@ impl ToolRouter {
     #[cfg(test)]
     pub(crate) fn replace_snapshot(&self, snapshot: RouterSnapshot) {
         self.cache.store(Arc::new(snapshot));
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn resource_subscription_count(&self, uri: &str) -> usize {
-        self.resource_subscriptions
-            .get(uri)
-            .map(|entry| entry.len())
-            .unwrap_or(0)
     }
 
     fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
@@ -4651,6 +4686,37 @@ mod tests {
             rx.try_recv().is_err(),
             "burst should coalesce into a single notification"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+        let mut rx = router.subscribe_notifications();
+
+        // First refresh cycle.
+        router.schedule_tool_list_changed_refresh();
+        tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
+        let first = rx.recv().await.expect("first notification");
+        assert_eq!(first, ProtocolNotification::ToolListChanged);
+
+        // After the cycle completes the in-progress flag must be released —
+        // a wedged flag (the regression) would silently drop every future
+        // refresh.
+        tokio::task::yield_now().await;
+        assert!(
+            !router
+                .notification_refresh_in_progress
+                .load(Ordering::SeqCst),
+            "in-progress flag must be cleared after a refresh cycle"
+        );
+
+        // A second schedule must therefore spawn a fresh task and publish
+        // again.
+        router.schedule_tool_list_changed_refresh();
+        tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
+        let second = rx.recv().await.expect("second notification");
+        assert_eq!(second, ProtocolNotification::ToolListChanged);
     }
 
     #[tokio::test]

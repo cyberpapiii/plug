@@ -443,7 +443,16 @@ async fn main() -> anyhow::Result<()> {
             &cli.output,
         )?,
         Some(Commands::Doctor) => {
-            commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?
+            let exit_code = commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
+            if exit_code != 0 {
+                // Flush before process::exit, which bypasses destructors.
+                // Rust's stdout is line-buffered so the trailing-newline
+                // output is already flushed, but make it explicit so a
+                // future non-newline write can't be truncated when piped.
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                std::process::exit(exit_code);
+            }
         }
         Some(Commands::Repair { targets, all }) => {
             commands::misc::cmd_repair(cli.config.as_ref(), targets, all)?

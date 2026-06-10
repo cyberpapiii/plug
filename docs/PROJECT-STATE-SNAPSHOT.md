@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #56 and the post-merge truth pass (lazy tool discovery v2)
+Baseline: `main` after PR #57 (upstream MCP icon passthrough + client-visible Plug icon assets) and the post-merge truth pass (lazy tool discovery v2)
 
 This is the canonical current-state doc for the project.
 
@@ -28,7 +28,7 @@ Implemented on `main`:
 - reconnecting IPC proxy sessions
 - session-store seam / stateless prep
 - downstream protocol-version validation
-- upstream MCP-Protocol-Version send-side (provided by rmcp 1.1.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
+- upstream MCP-Protocol-Version send-side (provided by rmcp 1.7.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation reverse-request forwarding across stdio, HTTP, and daemon IPC
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC

@@ -71,8 +71,7 @@ Agent workflow guide:
 
 Strategy / planning docs:
 
-- `docs/plans/2026-03-06-strategic-assessment.md`
-- `docs/plans/2026-03-06-v0-1-stabilization-execution-plan.md`
+- `docs/plans/` (dated implementation plans)
 - `todos/029-032`
 
 ## Truth Workflow
@@ -137,7 +136,7 @@ Every roadmap-affecting PR should complete this checklist after merge:
 ## Tech Stack
 
 - Rust 2024 edition
-- `rmcp` 1.1.0
+- `rmcp` 1.7.0
 - Tokio
 - Axum
 - DashMap
@@ -152,8 +151,8 @@ Every roadmap-affecting PR should complete this checklist after merge:
 
 ```bash
 cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace -- --test-threads=1
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
