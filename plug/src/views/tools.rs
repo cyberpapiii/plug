@@ -326,6 +326,7 @@ mod tests {
             auth_status: "oauth".to_string(),
             tool_count: 0,
             upstream: None,
+            metrics: None,
             last_seen: None,
         }
     }

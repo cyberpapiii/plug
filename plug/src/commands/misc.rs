@@ -834,6 +834,7 @@ mod tests {
                     tool_count: 1,
                     auth_status: "none".to_string(),
                     upstream: None,
+                    metrics: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -842,6 +843,7 @@ mod tests {
                     tool_count: 0,
                     auth_status: "none".to_string(),
                     upstream: None,
+                    metrics: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -850,6 +852,7 @@ mod tests {
                     tool_count: 0,
                     auth_status: "oauth".to_string(),
                     upstream: None,
+                    metrics: None,
                     last_seen: None,
                 },
             ],
@@ -880,6 +883,7 @@ mod tests {
                     tool_count: 1,
                     auth_status: "none".to_string(),
                     upstream: None,
+                    metrics: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -888,6 +892,7 @@ mod tests {
                     tool_count: 12,
                     auth_status: "oauth".to_string(),
                     upstream: None,
+                    metrics: None,
                     last_seen: None,
                 },
             ],

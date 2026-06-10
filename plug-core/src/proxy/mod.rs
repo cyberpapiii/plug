@@ -2945,6 +2945,8 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
+                    self.server_manager
+                        .record_call(&server_id, true, duration_ms);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }
@@ -3015,6 +3017,8 @@ impl ToolRouter {
                             if let Some(cb) = &cb {
                                 cb.on_failure();
                             }
+                            self.server_manager
+                                .record_call(&server_id, false, duration_ms);
                             return Err(McpError::internal_error(e.to_string(), None));
                         }
                     }
@@ -3054,6 +3058,9 @@ impl ToolRouter {
                         });
                     }
 
+                    self.server_manager
+                        .record_call(&server_id, false, duration_ms);
+
                     if matches!(transport_type, crate::config::TransportType::Stdio) {
                         self.reconnect_server_in_background(server_id.clone());
                     }
@@ -3072,6 +3079,8 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
+                    self.server_manager
+                        .record_call(&server_id, false, duration_ms);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }
