@@ -1,7 +1,6 @@
 //! Config hot-reload: diff configs and apply changes at runtime.
 //!
 //! Reload is triggered by:
-//! - SIGHUP signal (Unix only)
 //! - `plug reload` CLI command via daemon IPC
 //! - File watcher (`watcher.rs`, 500ms debounce via `notify`)
 

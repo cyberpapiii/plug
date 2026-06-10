@@ -2220,11 +2220,16 @@ async fn dispatch_mcp_request(
                     },
                 }
             } else {
+                // Extract the progress token before moving `arguments`
+                // (partial move forbids a later method call on call_params).
+                // Passing `None` here drops progress on non-task IPC calls,
+                // diverging from the stdio path which forwards it.
+                let progress_token = call_params.progress_token();
                 match tool_router
                     .call_tool_with_context(
                         &call_params.name,
                         call_params.arguments,
-                        None,
+                        progress_token,
                         downstream_ctx,
                     )
                     .await
@@ -2491,46 +2496,6 @@ pub async fn shutdown_signal(cancel: CancellationToken) {
         _ = cancel.cancelled() => {}
     }
     cancel.cancel();
-}
-
-/// Listen for SIGHUP and trigger config reload.
-///
-/// Runs in a loop — each SIGHUP triggers a reload. Exits when cancellation
-/// token is triggered.
-#[cfg(unix)]
-#[allow(dead_code)]
-pub async fn sighup_reload(engine: Arc<Engine>, cancel: CancellationToken) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-    loop {
-        tokio::select! {
-            _ = sighup.recv() => {
-                tracing::info!("received SIGHUP — reloading config");
-                let config_path = plug_core::config::default_config_path();
-                match plug_core::config::load_config(Some(&config_path)) {
-                    Ok(new_config) => match engine.reload_config(new_config).await {
-                        Ok(report) => {
-                            tracing::info!(
-                                added = report.added.len(),
-                                removed = report.removed.len(),
-                                changed = report.changed.len(),
-                                "config reloaded via SIGHUP"
-                            );
-                        }
-                        Err(e) => tracing::error!(error = %e, "config reload failed"),
-                    },
-                    Err(e) => tracing::error!(error = %e, "failed to load config for reload"),
-                }
-            }
-            _ = cancel.cancelled() => break,
-        }
-    }
-}
-
-/// No-op SIGHUP handler for non-Unix platforms.
-#[cfg(not(unix))]
-pub async fn sighup_reload(_engine: Arc<Engine>, cancel: CancellationToken) {
-    cancel.cancelled().await;
 }
 
 /// Fallback for non-Unix platforms.
