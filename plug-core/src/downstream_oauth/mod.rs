@@ -25,6 +25,9 @@ pub struct DownstreamOauthConfig {
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret: Option<crate::types::SecretString>,
     pub oauth_scopes: Vec<String>,
+    /// Exact-match allowlist of non-loopback redirect URIs. Loopback URIs are
+    /// always permitted; everything else must be listed here.
+    pub redirect_uri_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +113,24 @@ impl DownstreamOauthConfig {
             oauth_client_id: http.oauth_client_id.clone(),
             oauth_client_secret: http.oauth_client_secret.clone(),
             oauth_scopes: http.oauth_scopes.clone().unwrap_or_default(),
+            redirect_uri_allowlist: http.oauth_redirect_uri_allowlist.clone(),
         })
+    }
+}
+
+/// Returns true when `redirect_uri`'s host is loopback (always trusted) or the
+/// URI is on the configured allowlist. Prevents `/oauth/authorize` from acting
+/// as an open redirector for arbitrary off-host callbacks.
+fn redirect_uri_allowed(redirect_uri: &str, allowlist: &[String]) -> bool {
+    if allowlist.iter().any(|allowed| allowed == redirect_uri) {
+        return true;
+    }
+    match url::Url::parse(redirect_uri) {
+        Ok(parsed) => matches!(
+            parsed.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
+        ),
+        Err(_) => false,
     }
 }
 
@@ -151,6 +171,11 @@ impl DownstreamOauthManager {
         if code_challenge_method != "S256" {
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
         }
+        if !redirect_uri_allowed(redirect_uri, &self.config.redirect_uri_allowlist) {
+            // Reject unlisted off-host callbacks before issuing a code — do not
+            // redirect to an attacker-controlled URI.
+            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+        }
 
         let auth_code = uuid::Uuid::new_v4().to_string();
         let scopes = requested_scopes
@@ -173,10 +198,14 @@ impl DownstreamOauthManager {
         guard.pending_codes.insert(auth_code.clone(), pending);
         persist_state(&self.config, &guard);
 
+        // Percent-encode code and state so reserved characters in `state`
+        // cannot break out of the query or inject extra parameters.
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code", &auth_code)
+            .append_pair("state", state)
+            .finish();
         let separator = if redirect_uri.contains('?') { '&' } else { '?' };
-        Ok(format!(
-            "{redirect_uri}{separator}code={auth_code}&state={state}"
-        ))
+        Ok(format!("{redirect_uri}{separator}{query}"))
     }
 
     pub async fn exchange_authorization_code(
@@ -527,6 +556,7 @@ mod tests {
             oauth_client_id: Some(client_id.to_string()),
             oauth_client_secret: Some("secret-123".to_string().into()),
             oauth_scopes: vec!["tools:read".to_string()],
+            redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
         }
     }
 
@@ -681,5 +711,86 @@ mod tests {
         let path_a = state_file_path(&config_a).expect("state path a");
         let path_b = state_file_path(&config_b).expect("state path b");
         assert_ne!(path_a, path_b);
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_unlisted_off_host_redirect_uri() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        // Not loopback and not on the allowlist -> rejected, no code issued.
+        let result = manager
+            .build_authorize_redirect(
+                &client_id,
+                "https://attacker.example.com/callback",
+                "abc123",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(DownstreamOauthError::InvalidAuthorizationRequest)
+            ),
+            "unlisted off-host redirect_uri must be rejected, got {result:?}"
+        );
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn authorize_allows_loopback_redirect_without_allowlist() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let mut config = test_config(&client_id);
+        config.redirect_uri_allowlist.clear();
+        let manager = DownstreamOauthManager::new(config);
+
+        let redirect = manager
+            .build_authorize_redirect(
+                &client_id,
+                "http://127.0.0.1:7777/callback",
+                "abc123",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await;
+        assert!(
+            redirect.is_ok(),
+            "loopback redirect should be allowed without an allowlist entry, got {redirect:?}"
+        );
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn authorize_percent_encodes_state() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        // A state value with reserved characters must not break out of the query.
+        let redirect = manager
+            .build_authorize_redirect(
+                &client_id,
+                "https://client.example.com/callback",
+                "a b&c=d",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await
+            .expect("authorize redirect");
+        assert!(
+            redirect.contains("state=a+b%26c%3Dd"),
+            "state must be percent-encoded, got {redirect}"
+        );
+        assert!(
+            !redirect.contains("state=a b&c=d"),
+            "raw unencoded state must not appear, got {redirect}"
+        );
+        cleanup_state(&client_id);
     }
 }

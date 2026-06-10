@@ -213,6 +213,11 @@ pub struct HttpConfig {
     /// OAuth scopes to request for downstream remote connectors.
     #[serde(default)]
     pub oauth_scopes: Option<Vec<String>>,
+    /// Exact-match allowlist of redirect URIs accepted by `/oauth/authorize`.
+    /// Loopback redirect URIs are always allowed; non-loopback URIs (e.g. a
+    /// remote connector's callback) must be listed here.
+    #[serde(default)]
+    pub oauth_redirect_uri_allowlist: Vec<String>,
     /// Bind address for HTTP server.
     pub bind_address: String,
     /// Port for HTTP server.
@@ -240,6 +245,7 @@ impl Default for HttpConfig {
             oauth_client_id: None,
             oauth_client_secret: None,
             oauth_scopes: None,
+            oauth_redirect_uri_allowlist: Vec::new(),
             bind_address: "127.0.0.1".to_string(),
             port: 3282,
             allowed_origins: Vec::new(),
@@ -470,6 +476,18 @@ pub fn validate_config(config: &Config) -> Vec<String> {
         && config.http.oauth_client_id.is_none()
     {
         errors.push("http.oauth_client_id is required when http.auth_mode = \"oauth\"".to_string());
+    }
+    if !http_bind_is_loopback(&config.http.bind_address)
+        && matches!(config.http.auth_mode, DownstreamAuthMode::Oauth)
+        && config.http.oauth_client_secret.is_none()
+    {
+        // A public (secretless) OAuth client lets anyone who knows the client_id
+        // mint tokens. That is only acceptable on a loopback bind; a tunneled /
+        // non-loopback listener must use a confidential client.
+        errors.push(
+            "http.oauth_client_secret is required when http.auth_mode = \"oauth\" and binding a non-loopback downstream address"
+                .to_string(),
+        );
     }
     if !http_bind_is_loopback(&config.http.bind_address)
         && matches!(config.http.auth_mode, DownstreamAuthMode::None)
@@ -1498,6 +1516,61 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("http.auth_mode = \"none\"") && e.contains("non-loopback")),
             "expected none/non-loopback validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_secretless_oauth_on_non_loopback_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.bind_address = "0.0.0.0".to_string();
+        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        cfg.http.oauth_client_id = Some("client".to_string());
+        cfg.http.oauth_client_secret = None;
+        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
+        cfg.http.tls_key_path = Some(PathBuf::from("/tmp/key.pem"));
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("http.oauth_client_secret") && e.contains("non-loopback")),
+            "expected secretless-oauth/non-loopback validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_secretless_oauth_on_loopback_is_allowed() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.bind_address = "127.0.0.1".to_string();
+        cfg.http.public_base_url = Some("http://localhost:3282".to_string());
+        cfg.http.oauth_client_id = Some("client".to_string());
+        cfg.http.oauth_client_secret = None;
+        let errors = validate_config(&cfg);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("http.oauth_client_secret")),
+            "loopback secretless oauth should be allowed, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_confidential_oauth_on_non_loopback_is_allowed() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.bind_address = "0.0.0.0".to_string();
+        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        cfg.http.oauth_client_id = Some("client".to_string());
+        cfg.http.oauth_client_secret = Some("super-secret".to_string().into());
+        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
+        cfg.http.tls_key_path = Some(PathBuf::from("/tmp/key.pem"));
+        let errors = validate_config(&cfg);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("http.oauth_client_secret")),
+            "confidential oauth on non-loopback should be allowed, got {errors:?}"
         );
     }
 

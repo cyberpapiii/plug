@@ -62,6 +62,9 @@ arc-swap = "1.8"
 # Identifiers
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# URL parsing + form encoding (downstream OAuth redirect handling)
+url = "2"
+
 # Paths
 directories = "6"
 dirs = "6"
