@@ -3822,7 +3822,13 @@ mod tests {
 
         /// Issue a `tools/call` and return the raw decoded `IpcResponse`.
         async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> IpcResponse {
-            let params = serde_json::json!({ "name": name, "arguments": arguments });
+            self.call_tool_params(serde_json::json!({ "name": name, "arguments": arguments }))
+                .await
+        }
+
+        /// Issue a `tools/call` with caller-provided params (so a `task` field can
+        /// be included) and return the raw decoded `IpcResponse`.
+        async fn call_tool_params(&mut self, params: serde_json::Value) -> IpcResponse {
             write_ipc(
                 &mut self.stream,
                 &IpcRequest::McpRequest {
@@ -3915,5 +3921,287 @@ mod tests {
             "unexpected error payload: {payload}"
         );
         harness.shutdown().await;
+    }
+
+    // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
+    //
+    // Drives identical tools/call scenarios through the REAL stdio, HTTP, and IPC
+    // downstream transports and asserts identical decoded results and identical
+    // error codes. This is the CI gate that freezes cross-transport parity for the
+    // tools/call method family: a fix or regression that lands on one transport's
+    // shim but not the others fails the assert_eq here.
+    //
+    // Each transport drives its own engine + mock upstream so the only variable is
+    // the downstream transport. Envelopes (HTTP 200-with-error-body, IPC McpResponse
+    // frame, rmcp ServiceError) are normalized to a transport-agnostic ParityOutcome
+    // before comparison.
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ParityOutcome {
+        Success { text: String, is_error: bool },
+        Error { code: i64 },
+    }
+
+    /// Minimal rmcp client handler for driving the stdio transport.
+    struct ParityClient;
+
+    impl rmcp::handler::client::ClientHandler for ParityClient {
+        fn get_info(&self) -> rmcp::model::ClientInfo {
+            rmcp::model::ClientInfo::default()
+        }
+    }
+
+    /// A `tools/call` result JSON is either a `CallToolResult` ({content, isError})
+    /// or a serialized `McpError` ({code, message}). Normalize either to a
+    /// ParityOutcome.
+    fn parity_from_result_json(payload: &serde_json::Value) -> ParityOutcome {
+        if let Some(code) = payload.get("code").and_then(|c| c.as_i64()) {
+            return ParityOutcome::Error { code };
+        }
+        ParityOutcome::Success {
+            text: payload["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            is_error: payload["isError"].as_bool().unwrap_or(false),
+        }
+    }
+
+    fn parity_mock_engine() -> Arc<Engine> {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), ipc_harness_mock_config("echo"));
+        Arc::new(Engine::new(config))
+    }
+
+    /// stdio: drive tools/call through a real ProxyHandler served over a duplex,
+    /// with an rmcp client issuing the call.
+    async fn parity_stdio(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        use rmcp::ServiceExt;
+
+        let engine = parity_mock_engine();
+        engine.start().await.expect("engine start");
+        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            if let Ok(running) = proxy.serve(server_transport).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ParityClient
+            .serve(client_transport)
+            .await
+            .expect("stdio client serve");
+
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        if let Some(obj) = arguments.as_object() {
+            params = params.with_arguments(obj.clone());
+        }
+        let outcome = match client.call_tool(params).await {
+            Ok(result) => parity_from_result_json(&serde_json::to_value(&result).unwrap()),
+            Err(rmcp::service::ServiceError::McpError(m)) => ParityOutcome::Error {
+                code: m.code.0 as i64,
+            },
+            Err(other) => panic!("unexpected stdio service error: {other:?}"),
+        };
+
+        let _ = client.cancel().await;
+        server.abort();
+        engine.shutdown().await;
+        outcome
+    }
+
+    /// HTTP: drive tools/call through the real axum router via tower oneshot.
+    async fn parity_http(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        use tower::ServiceExt as _;
+
+        let engine = parity_mock_engine();
+        engine.start().await.expect("engine start");
+        let state = Arc::new(plug_core::http::server::HttpState {
+            router: engine.tool_router().clone(),
+            sessions: Arc::new(plug_core::http::session::SessionManager::new(1800, 100))
+                as Arc<dyn SessionStore>,
+            cancel: CancellationToken::new(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: std::sync::atomic::AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        let app = plug_core::http::server::build_router(state);
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "parity", "version": "1.0" }
+            }
+        });
+        let init_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&init_body).unwrap(),
+            ))
+            .unwrap();
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .expect("session id header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let call_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        });
+        let call_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("Mcp-Session-Id", &session_id)
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&call_body).unwrap(),
+            ))
+            .unwrap();
+        let call_resp = app.clone().oneshot(call_req).await.unwrap();
+        let bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        engine.shutdown().await;
+
+        if let Some(err) = json.get("error") {
+            ParityOutcome::Error {
+                code: err["code"].as_i64().unwrap_or(0),
+            }
+        } else {
+            parity_from_result_json(&json["result"])
+        }
+    }
+
+    /// IPC: drive tools/call through the real daemon socket loop.
+    async fn parity_ipc(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        let mut harness = IpcTestHarness::start("echo").await;
+        let resp = harness.call_tool(tool, arguments).await;
+        harness.shutdown().await;
+        match resp {
+            IpcResponse::McpResponse { payload } => parity_from_result_json(&payload),
+            other => panic!("unexpected IPC response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_tools_call_success_matches_across_transports() {
+        let args = serde_json::json!({ "input": "parity" });
+        let stdio = parity_stdio("Mock__echo", args.clone()).await;
+        let http = parity_http("Mock__echo", args.clone()).await;
+        let ipc = parity_ipc("Mock__echo", args.clone()).await;
+
+        // All three must produce the identical decoded CallToolResult.
+        assert_eq!(stdio, http, "stdio vs http success divergence");
+        assert_eq!(http, ipc, "http vs ipc success divergence");
+        // And it must actually be the echo success, not a coincidental match.
+        match &stdio {
+            ParityOutcome::Success { text, is_error } => {
+                assert!(!is_error, "echo should not be an error result");
+                assert!(
+                    text.contains("Called echo with") && text.contains("parity"),
+                    "unexpected echo text: {text}"
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_tools_call_unknown_tool_matches_across_transports() {
+        let args = serde_json::json!({});
+        let stdio = parity_stdio("Mock__missing", args.clone()).await;
+        let http = parity_http("Mock__missing", args.clone()).await;
+        let ipc = parity_ipc("Mock__missing", args.clone()).await;
+
+        // All three must surface the identical error code (ToolNotFound ->
+        // METHOD_NOT_FOUND, -32601). A transport that diverged here would fail.
+        assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
+        assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
+        assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
+    }
+
+    /// Documents and locks the intentional task-augmentation divergence between
+    /// transports. The stdio path goes through rmcp's `ServerHandler`, which
+    /// validates the tool's task capability and REJECTS a task-augmented call to a
+    /// non-task tool with INVALID_PARAMS (-32602) before the dispatcher runs. The
+    /// HTTP and IPC paths bypass that rmcp validation and create a plug-side
+    /// passthrough task. This is pre-existing behavior the dispatcher preserves —
+    /// the test pins it so a future change can't silently alter it on one transport.
+    #[tokio::test]
+    async fn parity_task_augmented_call_diverges_stdio_rejects_http_ipc_create_task() {
+        // stdio: rmcp's ServerHandler rejects a task call to a non-task tool.
+        let stdio_err = {
+            use rmcp::ServiceExt;
+            let engine = parity_mock_engine();
+            engine.start().await.expect("engine start");
+            let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+            let (server_transport, client_transport) = tokio::io::duplex(8192);
+            let server = tokio::spawn(async move {
+                if let Ok(running) = proxy.serve(server_transport).await {
+                    let _ = running.waiting().await;
+                }
+            });
+            let client = ParityClient
+                .serve(client_transport)
+                .await
+                .expect("stdio client serve");
+            let mut params = rmcp::model::CallToolRequestParams::new("Mock__echo".to_string());
+            params = params.with_arguments(serde_json::Map::new());
+            params.task = Some(serde_json::Map::new());
+            let err = client
+                .call_tool(params)
+                .await
+                .expect_err("stdio should reject a task call to a non-task tool");
+            let _ = client.cancel().await;
+            server.abort();
+            engine.shutdown().await;
+            err
+        };
+        match stdio_err {
+            rmcp::service::ServiceError::McpError(m) => assert_eq!(
+                m.code.0, -32602,
+                "stdio task rejection should be INVALID_PARAMS"
+            ),
+            other => panic!("unexpected stdio error: {other:?}"),
+        }
+
+        // IPC: the direct path creates a plug-side passthrough task.
+        let mut harness = IpcTestHarness::start("echo").await;
+        let ipc_resp = harness
+            .call_tool_params(serde_json::json!({
+                "name": "Mock__echo",
+                "arguments": {},
+                "task": {}
+            }))
+            .await;
+        harness.shutdown().await;
+        let IpcResponse::McpResponse { payload } = ipc_resp else {
+            panic!("expected IPC McpResponse, got {ipc_resp:?}");
+        };
+        // CreateTaskResult carries a `task` object with a taskId.
+        assert!(
+            payload.get("task").is_some(),
+            "ipc task-augmented call should create a task, got {payload}"
+        );
     }
 }
