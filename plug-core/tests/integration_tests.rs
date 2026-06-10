@@ -3629,6 +3629,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         oauth_client_id: Some("client-123".to_string()),
         oauth_client_secret: None,
         oauth_scopes: vec!["tools:read".to_string()],
+        redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
     };
     let manager = plug_core::downstream_oauth::DownstreamOauthManager::new(oauth_config);
     let app = build_router(Arc::new(HttpState {

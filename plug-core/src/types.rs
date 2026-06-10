@@ -332,6 +332,25 @@ impl Default for HealthState {
     }
 }
 
+/// Per-upstream operability metrics, surfaced to operators via
+/// `plug status --output json`. Read-side only — nothing acts on these.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct UpstreamMetricsSnapshot {
+    /// Total tool calls routed to this upstream since start.
+    pub call_count: u64,
+    /// Of those, how many failed (error or timeout).
+    pub error_count: u64,
+    /// Latency of the most recent call, in milliseconds.
+    pub last_latency_ms: u64,
+    /// Unix epoch seconds since which this upstream has been failing; serialized
+    /// as `null` when the last call succeeded (i.e. currently healthy) — the key
+    /// is always present so the JSON schema is stable for agent consumers.
+    #[serde(default)]
+    pub degraded_since_epoch_secs: Option<u64>,
+    /// Circuit-breaker state: `"closed"`, `"open"`, or `"half-open"`.
+    pub circuit_state: String,
+}
+
 /// Status information for an upstream server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -343,6 +362,12 @@ pub struct ServerStatus {
     pub auth_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<UpstreamServerMetadata>,
+    /// Per-upstream operability metrics (calls, errors, latency, circuit,
+    /// degraded-since). Always present for a configured live server (zero-valued
+    /// before its first call); `null` only for a server no longer in the routed
+    /// set. The key is always present so the agent-facing schema is stable.
+    #[serde(default)]
+    pub metrics: Option<UpstreamMetricsSnapshot>,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }

@@ -5,8 +5,8 @@ use std::future::Future;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -500,12 +500,66 @@ pub struct UpstreamServer {
 /// Uses `ArcSwap` for wait-free reads — critical for HTTP concurrency where
 /// multiple requests resolve tools simultaneously. Writes (server start/stop)
 /// are infrequent and use compare-and-swap.
+/// Runtime per-upstream call metrics (atomics, recorded on the call path).
+/// Observability only — nothing routes on these.
+#[derive(Debug, Default)]
+pub(crate) struct UpstreamMetrics {
+    call_count: AtomicU64,
+    error_count: AtomicU64,
+    last_latency_ms: AtomicU64,
+    /// Unix epoch seconds since which calls have been failing; 0 = healthy.
+    degraded_since_epoch: AtomicU64,
+}
+
+impl UpstreamMetrics {
+    fn record(&self, ok: bool, latency_ms: u64) {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.last_latency_ms.store(latency_ms, Ordering::Relaxed);
+        if ok {
+            self.degraded_since_epoch.store(0, Ordering::Relaxed);
+        } else {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs().max(1))
+                .unwrap_or(1);
+            // Record the start of the degraded streak only on the first failure.
+            let _ = self.degraded_since_epoch.compare_exchange(
+                0,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn snapshot(&self, circuit_state: &str) -> crate::types::UpstreamMetricsSnapshot {
+        let degraded = self.degraded_since_epoch.load(Ordering::Relaxed);
+        crate::types::UpstreamMetricsSnapshot {
+            call_count: self.call_count.load(Ordering::Relaxed),
+            error_count: self.error_count.load(Ordering::Relaxed),
+            last_latency_ms: self.last_latency_ms.load(Ordering::Relaxed),
+            degraded_since_epoch_secs: (degraded != 0).then_some(degraded),
+            circuit_state: circuit_state.to_string(),
+        }
+    }
+}
+
+fn circuit_state_label(state: crate::circuit::CircuitState) -> &'static str {
+    match state {
+        crate::circuit::CircuitState::Closed => "closed",
+        crate::circuit::CircuitState::Open => "open",
+        crate::circuit::CircuitState::HalfOpen => "half-open",
+    }
+}
+
 pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
     server_map_write_lock: std::sync::Mutex<()>,
     pub(crate) health: DashMap<String, HealthState>,
     configured_auth: DashMap<String, ConfiguredAuth>,
     pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
+    pub(crate) metrics: DashMap<String, Arc<UpstreamMetrics>>,
     pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
     /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
     /// all trying to reconnect the same server simultaneously).
@@ -565,9 +619,54 @@ impl ServerManager {
             health: DashMap::new(),
             configured_auth: DashMap::new(),
             circuit_breakers: DashMap::new(),
+            metrics: DashMap::new(),
             semaphores: DashMap::new(),
             reconnecting: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Record the outcome and latency of a tool call to an upstream. Read-side
+    /// observability only — surfaced via `plug status --output json`.
+    pub fn record_call(&self, server_id: &str, ok: bool, latency_ms: u64) {
+        self.metrics
+            .entry(server_id.to_string())
+            .or_default()
+            .record(ok, latency_ms);
+    }
+
+    fn circuit_state_for(&self, server_id: &str) -> &'static str {
+        self.circuit_breakers
+            .get(server_id)
+            .map(|cb| circuit_state_label(cb.state()))
+            .unwrap_or("closed")
+    }
+
+    /// Snapshot per-upstream metrics for status reporting, folding in the
+    /// current circuit-breaker state. `None` when the server has no recorded calls.
+    pub(crate) fn metrics_snapshot(
+        &self,
+        server_id: &str,
+    ) -> Option<crate::types::UpstreamMetricsSnapshot> {
+        let metrics = self.metrics.get(server_id)?;
+        Some(metrics.snapshot(self.circuit_state_for(server_id)))
+    }
+
+    /// Like `metrics_snapshot` but returns a zero-valued snapshot (with live
+    /// circuit state) for a known server that has had no calls yet, so the
+    /// `plug status --output json` schema stays stable — every configured
+    /// server always carries a `metrics` object, never a missing key.
+    pub(crate) fn metrics_snapshot_or_default(
+        &self,
+        server_id: &str,
+    ) -> crate::types::UpstreamMetricsSnapshot {
+        let circuit = self.circuit_state_for(server_id);
+        match self.metrics.get(server_id) {
+            Some(metrics) => metrics.snapshot(circuit),
+            None => crate::types::UpstreamMetricsSnapshot {
+                circuit_state: circuit.to_string(),
+                ..Default::default()
+            },
         }
     }
 
@@ -1306,6 +1405,7 @@ impl ServerManager {
         self.health.clear();
         self.configured_auth.clear();
         self.circuit_breakers.clear();
+        self.metrics.clear();
         self.semaphores.clear();
         self.reconnecting.clear();
     }
@@ -1331,6 +1431,7 @@ impl ServerManager {
                     tool_count: upstream.tools.load().len(),
                     auth_status,
                     upstream: upstream.upstream.clone(),
+                    metrics: Some(self.metrics_snapshot_or_default(&upstream.name)),
                     last_seen: None,
                 }
             })
@@ -1352,6 +1453,7 @@ impl ServerManager {
                 tool_count: 0,
                 auth_status,
                 upstream: None,
+                metrics: self.metrics_snapshot(entry.key()),
                 last_seen: None,
             });
         }
@@ -1416,6 +1518,7 @@ impl ServerManager {
         if let Some(upstream_arc) = self.remove_upstream(name) {
             self.health.remove(name);
             self.circuit_breakers.remove(name);
+            self.metrics.remove(name);
             self.semaphores.remove(name);
             retire_upstream_owned(name.to_string(), upstream_arc, "stop").await;
         }
@@ -1579,6 +1682,56 @@ mod tests {
         let token = crate::types::SecretString::from("real-token".to_string());
         assert_eq!(format!("Bearer {}", token.as_str()), "Bearer real-token");
         assert_eq!(format!("{token}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn upstream_metrics_record_success_error_and_recovery() {
+        let sm = ServerManager::new();
+
+        // No calls yet -> no snapshot.
+        assert!(sm.metrics_snapshot("s1").is_none());
+
+        // Success: counted, no error, not degraded.
+        sm.record_call("s1", true, 10);
+        let snap = sm.metrics_snapshot("s1").expect("metrics after success");
+        assert_eq!(snap.call_count, 1);
+        assert_eq!(snap.error_count, 0);
+        assert_eq!(snap.last_latency_ms, 10);
+        assert!(snap.degraded_since_epoch_secs.is_none());
+        assert_eq!(snap.circuit_state, "closed");
+
+        // Failure: error counted and degraded_since set.
+        sm.record_call("s1", false, 25);
+        let snap = sm.metrics_snapshot("s1").expect("metrics after failure");
+        assert_eq!(snap.call_count, 2);
+        assert_eq!(snap.error_count, 1);
+        assert_eq!(snap.last_latency_ms, 25);
+        assert!(
+            snap.degraded_since_epoch_secs.is_some(),
+            "degraded_since should be set after a failure"
+        );
+
+        // Recovery: a subsequent success clears degraded_since.
+        sm.record_call("s1", true, 5);
+        let snap = sm.metrics_snapshot("s1").expect("metrics after recovery");
+        assert_eq!(snap.error_count, 1, "error count is cumulative");
+        assert!(
+            snap.degraded_since_epoch_secs.is_none(),
+            "degraded_since should clear after a success"
+        );
+    }
+
+    #[test]
+    fn metrics_snapshot_or_default_is_zero_filled_for_uncalled_server() {
+        // Schema stability: a known server with no recorded calls still yields a
+        // zero-valued snapshot (never a missing metrics object).
+        let sm = ServerManager::new();
+        let snap = sm.metrics_snapshot_or_default("never-called");
+        assert_eq!(snap.call_count, 0);
+        assert_eq!(snap.error_count, 0);
+        assert_eq!(snap.last_latency_ms, 0);
+        assert!(snap.degraded_since_epoch_secs.is_none());
+        assert_eq!(snap.circuit_state, "closed");
     }
 
     #[test]

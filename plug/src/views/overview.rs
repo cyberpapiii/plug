@@ -768,6 +768,7 @@ mod tests {
             tool_count: 0,
             auth_status: "required".to_string(),
             upstream: None,
+            metrics: None,
             last_seen: None,
         }];
         let json = status_json(
@@ -790,6 +791,56 @@ mod tests {
         assert_eq!(json["inventory_unavailable_sources"][0], "daemon_proxy");
         assert_eq!(json["runtime_available"], true);
         assert_eq!(json["status_source"], "live_daemon");
+    }
+
+    #[test]
+    fn status_json_includes_per_upstream_metrics() {
+        let inventory = LiveInventoryMetadata {
+            session_count: 0,
+            session_transports: LiveSessionTransportCounts {
+                daemon_proxy: 0,
+                http: 0,
+                sse: 0,
+            },
+            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
+            availability: LiveInventoryAvailability {
+                partial: false,
+                unavailable_sources: vec![],
+            },
+            http_sessions_included: true,
+        };
+        let servers = vec![plug_core::types::ServerStatus {
+            server_id: "imessage".to_string(),
+            health: plug_core::types::ServerHealth::Healthy,
+            tool_count: 12,
+            auth_status: "none".to_string(),
+            upstream: None,
+            metrics: Some(plug_core::types::UpstreamMetricsSnapshot {
+                call_count: 100,
+                error_count: 7,
+                last_latency_ms: 42,
+                degraded_since_epoch_secs: Some(1_700_000_000),
+                circuit_state: "open".to_string(),
+            }),
+            last_seen: None,
+        }];
+        let json = status_json(
+            10,
+            1,
+            &inventory,
+            &servers,
+            crate::runtime::LiveClientSupport::Supported,
+            true,
+            "live_daemon",
+            true,
+        );
+
+        let m = &json["servers"][0]["metrics"];
+        assert_eq!(m["call_count"], 100);
+        assert_eq!(m["error_count"], 7);
+        assert_eq!(m["last_latency_ms"], 42);
+        assert_eq!(m["degraded_since_epoch_secs"], 1_700_000_000_u64);
+        assert_eq!(m["circuit_state"], "open");
     }
 
     #[test]

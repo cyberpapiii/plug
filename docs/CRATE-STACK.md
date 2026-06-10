@@ -31,6 +31,10 @@ about dependency shape, not roadmap status.
 - `uuid`
   Session IDs and logical client IDs.
 
+- `url`
+  URL parsing and percent-encoded form serialization for downstream OAuth
+  redirect-URI allowlist validation and authorize-redirect construction.
+
 ## HTTP And Transport
 
 - `axum`

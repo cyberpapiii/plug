@@ -954,6 +954,7 @@ mod tests {
             oauth_client_id: None,
             oauth_client_secret: None,
             oauth_scopes: None,
+            oauth_redirect_uri_allowlist: Vec::new(),
             bind_address: "127.0.0.1".to_string(),
             port: addr.port(),
             allowed_origins: Vec::new(),
