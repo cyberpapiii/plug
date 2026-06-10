@@ -1149,18 +1149,15 @@ impl ClientHandler for TestClient {
 
 fn mock_server_config(tools: &str) -> ServerConfig {
     ServerConfig {
-        command: Some("cargo".to_string()),
-        args: vec![
-            "run".to_string(),
-            "--quiet".to_string(),
-            "-p".to_string(),
-            "plug-test-harness".to_string(),
-            "--bin".to_string(),
-            "mock-mcp-server".to_string(),
-            "--".to_string(),
-            "--tools".to_string(),
-            tools.to_string(),
-        ],
+        // Exec the prebuilt mock binary directly rather than `cargo run` per spawn:
+        // under parallel test threads, concurrent `cargo run` processes would
+        // contend on Cargo's target lock.
+        command: Some(
+            plug_test_harness::mock_server_bin()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        args: vec!["--tools".to_string(), tools.to_string()],
         env: HashMap::new(),
         enabled: true,
         transport: TransportType::Stdio,

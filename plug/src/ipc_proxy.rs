@@ -1324,8 +1324,7 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
+    use std::path::PathBuf;
 
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
     use plug_core::config::{Config, ServerConfig, TransportType};
@@ -1338,9 +1337,11 @@ mod tests {
     };
     use tokio::task::JoinHandle;
 
+    // Shared with the daemon and runtime test modules: every test that touches the
+    // global runtime-paths slot must serialize on the SAME lock so the suite is
+    // safe under parallel threads (see daemon::runtime_paths_test_lock).
     fn daemon_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        crate::daemon::runtime_paths_test_lock()
     }
 
     fn artifact_base_dir() -> PathBuf {
@@ -1360,27 +1361,7 @@ mod tests {
     }
 
     fn ensure_mock_server_built() -> PathBuf {
-        static PATH: OnceLock<PathBuf> = OnceLock::new();
-        PATH.get_or_init(|| {
-            let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("plug crate should live under workspace root");
-            let status = std::process::Command::new("cargo")
-                .current_dir(workspace_root)
-                .args([
-                    "build",
-                    "--quiet",
-                    "-p",
-                    "plug-test-harness",
-                    "--bin",
-                    "mock-mcp-server",
-                ])
-                .status()
-                .expect("build mock-mcp-server");
-            assert!(status.success(), "mock-mcp-server build failed");
-            plug_test_harness::mock_server_path()
-        })
-        .clone()
+        plug_test_harness::mock_server_bin()
     }
 
     #[derive(Clone)]

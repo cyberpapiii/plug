@@ -197,7 +197,7 @@ Current distribution names:
 Release checks before publishing:
 
 ```sh
-cargo test --workspace -- --test-threads=1
+cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo deny check advisories
 dist plan --no-local-paths

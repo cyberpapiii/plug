@@ -28,7 +28,7 @@ Run these before opening a PR:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace -- --test-threads=1
+cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo deny check advisories
 ```

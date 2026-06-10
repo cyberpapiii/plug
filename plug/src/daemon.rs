@@ -325,6 +325,27 @@ pub(crate) fn clear_test_runtime_paths() {
         .expect("test runtime path mutex poisoned") = None;
 }
 
+/// Single process-wide lock serializing every test that reads or writes the
+/// global `test_runtime_paths` slot (daemon, ipc_proxy, and runtime tests).
+///
+/// The runtime/state paths are a process global, so a test must hold this lock
+/// for the whole window it has them set — otherwise a concurrently-running test
+/// (under parallel threads) could clobber the slot or resolve `socket_path()`
+/// to a foreign temp dir. Using ONE shared lock across all three test modules
+/// (rather than a per-module lock) is what makes dropping `--test-threads=1`
+/// safe: the ~15 path-touching tests serialize among themselves while the rest
+/// of the suite runs in parallel.
+///
+/// Acquire from a `#[tokio::test]` with `.lock().await`, and from a plain
+/// `#[test]` with `.blocking_lock()`. Never call `.blocking_lock()` from inside a
+/// tokio runtime — it panics. The two forms interoperate correctly: a sync
+/// `blocking_lock` holder and an async `.lock().await` waiter mutually exclude.
+#[cfg(test)]
+pub(crate) fn runtime_paths_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("plug.sock")
 }
@@ -2716,24 +2737,29 @@ mod tests {
 
     #[test]
     fn socket_path_is_in_runtime_dir() {
-        let sock = socket_path();
+        // Hold the shared lock so a concurrent setter can't change the global
+        // runtime paths between the two reads below.
+        let _guard = runtime_paths_test_lock().blocking_lock();
         let rt = runtime_dir();
+        let sock = socket_path();
         assert!(sock.starts_with(&rt));
         assert!(sock.to_string_lossy().ends_with("plug.sock"));
     }
 
     #[test]
     fn pid_path_is_in_runtime_dir() {
-        let pid = pid_path();
+        let _guard = runtime_paths_test_lock().blocking_lock();
         let rt = runtime_dir();
+        let pid = pid_path();
         assert!(pid.starts_with(&rt));
         assert!(pid.to_string_lossy().ends_with("plug.pid"));
     }
 
     #[test]
     fn token_path_is_in_runtime_dir() {
-        let tok = token_path();
+        let _guard = runtime_paths_test_lock().blocking_lock();
         let rt = runtime_dir();
+        let tok = token_path();
         assert!(tok.starts_with(&rt));
         assert!(tok.to_string_lossy().ends_with("plug.token"));
     }
@@ -2771,6 +2797,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_daemon_losing_start_does_not_rotate_existing_token() {
+        // Hold the shared lock for the whole window the global paths are set, so
+        // this test is safe to run alongside other global-paths tests in parallel.
+        let _guard = runtime_paths_test_lock().lock().await;
         let runtime_root = std::env::temp_dir().join(format!(
             "plug-daemon-runtime-{}-{}",
             std::process::id(),
@@ -2811,6 +2840,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_daemon_restores_existing_token_when_startup_fails_after_token_write() {
+        let _guard = runtime_paths_test_lock().lock().await;
         let runtime_root = std::env::temp_dir().join(format!(
             "plug-daemon-runtime-post-token-{}-{}",
             std::process::id(),
