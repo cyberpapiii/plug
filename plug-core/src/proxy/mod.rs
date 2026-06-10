@@ -6430,4 +6430,124 @@ mod tests {
             },
         );
     }
+
+    // ── dispatch::dispatch_tools_call characterization (U1) ──────────────────
+    //
+    // These pin the shared adapter's contract before the three transports are
+    // migrated onto it (U2/U3/U4). End-to-end behavior across every transport is
+    // covered by the integration suites and the parity matrix (U6); here we prove
+    // the sync/task branch decision and error propagation in isolation.
+
+    /// Mock transport context for exercising `dispatch_tools_call` without a live
+    /// transport. `supports_tasks` is configurable so we can prove the task-gate.
+    struct MockDownstream {
+        supports_tasks: bool,
+    }
+
+    impl crate::dispatch::DownstreamContext for MockDownstream {
+        fn downstream_call_context(&self) -> DownstreamCallContext {
+            DownstreamCallContext::stdio_for_client(
+                Arc::<str>::from("test-client"),
+                RequestId::from(NumberOrString::Number(1)),
+                ClientType::Unknown,
+            )
+        }
+
+        fn supports_tasks(&self) -> bool {
+            self.supports_tasks
+        }
+
+        fn task_owner(&self) -> Result<TaskOwner, McpError> {
+            Ok(TaskOwner::new(Arc::<str>::from("test-owner")))
+        }
+    }
+
+    /// Build a router with a single route to a server that has no registered
+    /// upstream. The sync path then fails with `ServerUnavailable`, while the task
+    /// path falls through to a local passthrough task and succeeds — making the two
+    /// branches observably distinct.
+    fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+        let mut routes = HashMap::new();
+        routes.insert(
+            "Mock__tool".to_string(),
+            ("mock-server".to_string(), "tool".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        }));
+        router
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
+        let router = router_with_unrouted_single_route();
+        let ctx = MockDownstream {
+            supports_tasks: true,
+        };
+        let params = CallToolRequestParams::new("");
+
+        let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect_err("empty tool name must error");
+
+        // Canonical shape: an unknown/empty tool name routes to ToolNotFound
+        // (the stdio/HTTP behavior, now shared), which maps to METHOD_NOT_FOUND.
+        assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
+        let router = router_with_unrouted_single_route();
+        let ctx = MockDownstream {
+            supports_tasks: true,
+        };
+        let mut params = CallToolRequestParams::new("Mock__tool");
+        params.task = Some(serde_json::Map::new());
+
+        let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect("task-augmented call should enqueue a local passthrough task");
+
+        assert!(
+            matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
+            "expected TaskCreated outcome, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
+        let router = router_with_unrouted_single_route();
+        // stdio-like: cannot return a task result, so a task-augmented call must
+        // fall through to the synchronous path (preserving today's behavior).
+        let ctx = MockDownstream {
+            supports_tasks: false,
+        };
+        let mut params = CallToolRequestParams::new("Mock__tool");
+        params.task = Some(serde_json::Map::new());
+
+        let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect_err("sync path with no upstream must error, not create a task");
+
+        // The sync path with no registered upstream errors ServerUnavailable —
+        // proving the task branch was NOT taken.
+        assert!(
+            err.message.to_lowercase().contains("unavailable")
+                || err.code == ErrorCode::INTERNAL_ERROR,
+            "expected a sync-path unavailable error, got {err:?}"
+        );
+    }
 }
