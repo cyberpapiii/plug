@@ -7,13 +7,13 @@ about dependency shape, not roadmap status.
 
 ## Core Runtime
 
-- `rmcp` 1.1.x
+- `rmcp` 1.7.0
   MCP protocol implementation for both downstream server handlers and upstream client sessions.
 
 - `tokio`
   Shared async runtime across daemon, stdio proxying, and HTTP serving.
 
-- `serde`, `serde_json`, `serde_yml`
+- `serde`, `serde_json`, `serde_norway`
   Config, IPC, and MCP payload serialization.
 
 - `anyhow`, `thiserror`
