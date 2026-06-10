@@ -43,7 +43,7 @@ pub enum ToolCallOutcome {
 /// forwarding (elicitation/sampling), progress, and cancellation continue to flow
 /// through the [`DownstreamCallContext`] this trait builds and the existing bridge
 /// registration — the trait does not abstract the bridge mechanism itself.
-pub trait DownstreamContext {
+pub trait DownstreamContext: Send + Sync {
     /// Build the per-call downstream context the router uses to route reverse
     /// requests, progress, and cancellation back to this client.
     fn downstream_call_context(&self) -> DownstreamCallContext;
