@@ -3698,4 +3698,222 @@ mod tests {
             other => panic!("expected LoggingNotification, got: {other:?}"),
         }
     }
+
+    // ── IPC end-to-end test harness (U5) ─────────────────────────────────────
+    //
+    // Boots a daemon-backed engine with a stdio mock upstream over a TEMPORARY
+    // Unix socket and drives real `tools/call` round-trips through the actual
+    // `handle_ipc_connection` server loop. This is the only end-to-end IPC test
+    // path in the workspace — daemon internals are private to this binary crate,
+    // so it (and the cross-transport parity matrix that builds on it) must live
+    // here rather than in plug-core's integration tests.
+    //
+    // Each harness binds a unique temp socket and touches no global runtime path,
+    // so it is safe under the parallel test suite without the runtime-paths lock.
+
+    /// Build a stdio mock-upstream `ServerConfig` exposing `tools` (comma-separated).
+    fn ipc_harness_mock_config(tools: &str) -> plug_core::config::ServerConfig {
+        plug_core::config::ServerConfig {
+            command: Some(
+                plug_test_harness::mock_server_bin()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            args: vec!["--tools".to_string(), tools.to_string()],
+            env: HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 10,
+            call_timeout_secs: 5,
+            max_concurrent: 4,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+        }
+    }
+
+    /// A connected, registered IPC client wired to a real daemon connection loop
+    /// over a temporary socket, with a mock upstream named `mock`.
+    struct IpcTestHarness {
+        engine: Arc<Engine>,
+        cancel: CancellationToken,
+        server_task: tokio::task::JoinHandle<()>,
+        stream: tokio::net::UnixStream,
+        session_id: String,
+        socket_path: std::path::PathBuf,
+    }
+
+    impl IpcTestHarness {
+        async fn start(tools: &str) -> Self {
+            let mut config = plug_core::config::Config::default();
+            config
+                .servers
+                .insert("mock".to_string(), ipc_harness_mock_config(tools));
+            let engine = Arc::new(Engine::new(config));
+            engine.start().await.expect("engine start");
+
+            // Short unique socket path in /tmp — a Unix socket path must fit in
+            // SUN_LEN (~104 bytes), and the platform temp dir is already long. No
+            // global runtime path is touched, so this is safe under parallel tests.
+            let socket_path = std::path::PathBuf::from(format!(
+                "/tmp/plug-ipc-{}.sock",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            let _ = std::fs::remove_file(&socket_path);
+
+            let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
+            let cancel = CancellationToken::new();
+
+            // Server side: accept exactly one connection and run the real handler.
+            let (client_registry, _count_rx) = ClientRegistry::new();
+            let ctx = ConnectionContext {
+                cancel: cancel.clone(),
+                auth_token: Arc::from("test-token"),
+                server_manager: Arc::clone(engine.server_manager()),
+                engine: Arc::clone(&engine),
+                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
+                started_at: Instant::now(),
+                client_registry: Arc::new(client_registry),
+                http_sessions: None,
+                session_id: None,
+                reverse_request_rx: None,
+            };
+            let server_task = tokio::spawn(async move {
+                if let Ok((stream, _addr)) = listener.accept().await {
+                    let _ = handle_ipc_connection(stream, ctx).await;
+                }
+            });
+
+            // Client side: connect and register to obtain a session id.
+            let mut stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .expect("client connect");
+            write_ipc(
+                &mut stream,
+                &IpcRequest::Register {
+                    protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+                    client_id: uuid::Uuid::new_v4().to_string(),
+                    client_info: Some("plug-test".to_string()),
+                },
+            )
+            .await;
+            let session_id = match read_ipc_response(&mut stream).await {
+                IpcResponse::Registered { session_id, .. } => session_id,
+                other => panic!("expected Registered, got {other:?}"),
+            };
+
+            Self {
+                engine,
+                cancel,
+                server_task,
+                stream,
+                session_id,
+                socket_path,
+            }
+        }
+
+        /// Issue a `tools/call` and return the raw decoded `IpcResponse`.
+        async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> IpcResponse {
+            let params = serde_json::json!({ "name": name, "arguments": arguments });
+            write_ipc(
+                &mut self.stream,
+                &IpcRequest::McpRequest {
+                    session_id: self.session_id.clone(),
+                    method: "tools/call".to_string(),
+                    params: Some(params),
+                },
+            )
+            .await;
+            read_ipc_response(&mut self.stream).await
+        }
+
+        async fn shutdown(self) {
+            self.cancel.cancel();
+            drop(self.stream);
+            let _ = self.server_task.await;
+            self.engine.shutdown().await;
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    async fn write_ipc(stream: &mut tokio::net::UnixStream, req: &IpcRequest) {
+        let payload = serde_json::to_vec(req).expect("serialize ipc request");
+        plug_core::ipc::write_frame(stream, &payload)
+            .await
+            .expect("write frame");
+    }
+
+    /// Read the next non-push `IpcResponse`, skipping any interleaved
+    /// notification frames the daemon may push after registration.
+    async fn read_ipc_response(stream: &mut tokio::net::UnixStream) -> IpcResponse {
+        loop {
+            let frame = plug_core::ipc::read_frame(stream)
+                .await
+                .expect("read frame")
+                .expect("unexpected EOF before response");
+            let resp: IpcResponse =
+                serde_json::from_slice(&frame).expect("decode ipc response frame");
+            if is_ipc_push_notification(&resp) {
+                continue;
+            }
+            return resp;
+        }
+    }
+
+    fn is_ipc_push_notification(resp: &IpcResponse) -> bool {
+        matches!(
+            resp,
+            IpcResponse::LoggingNotification { .. }
+                | IpcResponse::ToolListChangedNotification
+                | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::PromptListChangedNotification
+                | IpcResponse::ResourceUpdatedNotification { .. }
+                | IpcResponse::ProgressNotification { .. }
+                | IpcResponse::CancelledNotification { .. }
+        )
+    }
+
+    #[tokio::test]
+    async fn ipc_tools_call_echo_round_trips() {
+        let mut harness = IpcTestHarness::start("echo").await;
+        let resp = harness
+            .call_tool("Mock__echo", serde_json::json!({ "input": "ipc-hello" }))
+            .await;
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!("expected McpResponse, got {resp:?}");
+        };
+        let text = payload["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("Called") && text.contains("ipc-hello"),
+            "unexpected echo payload: {payload}"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ipc_tools_call_unknown_tool_returns_method_not_found() {
+        let mut harness = IpcTestHarness::start("echo").await;
+        let resp = harness
+            .call_tool("Mock__does_not_exist", serde_json::json!({}))
+            .await;
+        // IPC encodes McpError as McpResponse-with-error payload.
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!("expected McpResponse error payload, got {resp:?}");
+        };
+        // ToolNotFound -> METHOD_NOT_FOUND (-32601).
+        assert_eq!(
+            payload["code"].as_i64(),
+            Some(-32601),
+            "unexpected error payload: {payload}"
+        );
+        harness.shutdown().await;
+    }
 }
