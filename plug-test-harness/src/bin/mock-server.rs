@@ -40,6 +40,18 @@ struct Args {
     /// Expose one subscribable mock resource.
     #[arg(long, default_value_t = false)]
     resources: bool,
+
+    /// When this file exists, `list_resources` returns an error — simulating a
+    /// transient listing failure so tests can drive the degraded carry-forward
+    /// path on demand (create the file, refresh; remove it, refresh to recover).
+    #[arg(long)]
+    list_fail_flag_file: Option<String>,
+
+    /// When this file exists, `list_resources` returns an empty success —
+    /// simulating a genuine resource removal so tests can exercise the
+    /// fresh-empty prune path (distinct from the failure path above).
+    #[arg(long)]
+    list_empty_flag_file: Option<String>,
 }
 
 struct MockServer {
@@ -48,6 +60,8 @@ struct MockServer {
     fail_mode: String,
     reverse_request: String,
     resources: bool,
+    list_fail_flag_file: Option<String>,
+    list_empty_flag_file: Option<String>,
 }
 
 impl MockServer {
@@ -243,6 +257,23 @@ impl ServerHandler for MockServer {
                 eprintln!("mock-mcp-server: timeout mode, hanging on list_resources");
                 std::future::pending::<()>().await;
             }
+            // Test-driven transient failure: error while the flag file exists.
+            if let Some(path) = &self.list_fail_flag_file {
+                if std::path::Path::new(path).exists() {
+                    eprintln!("mock-mcp-server: list_fail flag set, returning error");
+                    return Err(McpError::internal_error(
+                        "mock list_resources transient failure (flag set)",
+                        None,
+                    ));
+                }
+            }
+            // Test-driven genuine removal: empty success while the flag exists.
+            if let Some(path) = &self.list_empty_flag_file {
+                if std::path::Path::new(path).exists() {
+                    eprintln!("mock-mcp-server: list_empty flag set, returning empty list");
+                    return Ok(ListResourcesResult::with_all_items(vec![]));
+                }
+            }
             if !self.resources {
                 return Ok(ListResourcesResult::with_all_items(vec![]));
             }
@@ -341,6 +372,8 @@ async fn main() -> anyhow::Result<()> {
         fail_mode: args.fail_mode,
         reverse_request: args.reverse_request,
         resources: args.resources,
+        list_fail_flag_file: args.list_fail_flag_file,
+        list_empty_flag_file: args.list_empty_flag_file,
     };
 
     let transport = rmcp::transport::io::stdio();

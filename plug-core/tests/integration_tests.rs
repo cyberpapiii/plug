@@ -1266,6 +1266,138 @@ async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
     .await
     .expect("refresh_tools must not block on an upstream that stalls on resource listing");
 
+    // The upstream stalls on its FIRST listing (timeout arm of ListingOutcome::
+    // Unavailable, no last-known-good cached). It is routable but serving nothing,
+    // so it must report `degraded` — not `healthy` (it is failing) and not `absent`
+    // (it is still connected/routable).
+    let availability = engine
+        .server_statuses()
+        .into_iter()
+        .find(|s| s.server_id == "mock")
+        .map(|s| s.availability)
+        .expect("mock server status present");
+    assert_eq!(availability, plug_core::types::Availability::Degraded);
+
+    engine.shutdown().await;
+}
+
+// A transient listing failure must NOT prune an active resource subscription.
+// This is the degraded-vs-absent regression (closes the PR #58 residual): the
+// upstream stays routable, its last-known-good catalog is carried forward, the
+// subscription survives, and the server reports `availability = degraded`. A
+// genuine fresh removal (empty success) must still prune — proving the fix did
+// not simply disable pruning.
+#[tokio::test]
+async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
+    use plug_core::notifications::NotificationTarget;
+    use plug_core::types::Availability;
+
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let fail_flag = tmp.join(format!("plug-degraded-fail-{pid}.flag"));
+    let empty_flag = tmp.join(format!("plug-degraded-empty-{pid}.flag"));
+    // Neither flag exists initially → the mock lists its resource normally.
+    let _ = std::fs::remove_file(&fail_flag);
+    let _ = std::fs::remove_file(&empty_flag);
+
+    let mut config = Config::default();
+    let mut server = mock_server_config("echo");
+    server.args.push("--resources".to_string());
+    server.args.push("--list-fail-flag-file".to_string());
+    server.args.push(fail_flag.to_string_lossy().to_string());
+    server.args.push("--list-empty-flag-file".to_string());
+    server.args.push(empty_flag.to_string_lossy().to_string());
+    server.call_timeout_secs = 2;
+    config.servers.insert("mock".to_string(), server);
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+    let router = engine.tool_router();
+    let uri = "file:///tmp/mock-resource.txt";
+
+    let availability_of = |engine: &Engine| {
+        engine
+            .server_statuses()
+            .into_iter()
+            .find(|s| s.server_id == "mock")
+            .map(|s| s.availability)
+            .expect("mock server status present")
+    };
+
+    // ── Healthy: live listing succeeds, resource enters catalog, cache primed ──
+    router.refresh_tools().await;
+    assert!(
+        router.list_resources().iter().any(|r| r.uri == uri),
+        "resource should be present after a healthy listing"
+    );
+    let target = NotificationTarget::Stdio {
+        client_id: Arc::from("c1"),
+    };
+    // Subscribe a notification receiver BEFORE subscribing so we capture the
+    // resources/updated the mock emits on subscribe — proving the subscription
+    // delivers end-to-end, not just that a registry entry exists.
+    let mut notifications = router.subscribe_notifications();
+    router
+        .subscribe_resource(uri, target.clone())
+        .await
+        .expect("subscribe to mock resource");
+    assert_eq!(router.active_subscription_count(), 1);
+    assert_eq!(availability_of(&engine), Availability::Healthy);
+
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match notifications.recv().await {
+                Ok(plug_core::notifications::ProtocolNotification::ResourceUpdated {
+                    target: t,
+                    params,
+                    ..
+                }) if params.uri == uri && t == target => break true,
+                Ok(_) => continue,
+                Err(_) => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        delivered,
+        "an active subscription must deliver resources/updated to its subscriber"
+    );
+
+    // ── Degraded: live listing errors → carry last-known-good, keep subscription ──
+    std::fs::write(&fail_flag, b"1").expect("set fail flag");
+    router.refresh_tools().await;
+    assert!(
+        router.list_resources().iter().any(|r| r.uri == uri),
+        "degraded listing must carry the last-known-good resource forward"
+    );
+    assert_eq!(
+        router.active_subscription_count(),
+        1,
+        "degraded listing must NOT prune the active subscription (PR #58 residual)"
+    );
+    assert_eq!(availability_of(&engine), Availability::Degraded);
+
+    // ── Recovery: live listing succeeds again → healthy, subscription intact ──
+    std::fs::remove_file(&fail_flag).expect("clear fail flag");
+    router.refresh_tools().await;
+    assert_eq!(router.active_subscription_count(), 1);
+    assert_eq!(availability_of(&engine), Availability::Healthy);
+
+    // ── Control: a genuine fresh removal (empty success) still prunes ──
+    std::fs::write(&empty_flag, b"1").expect("set empty flag");
+    router.refresh_tools().await;
+    assert!(
+        !router.list_resources().iter().any(|r| r.uri == uri),
+        "a genuine fresh-empty listing must drop the resource"
+    );
+    assert_eq!(
+        router.active_subscription_count(),
+        0,
+        "a genuine removal must still prune the subscription"
+    );
+
+    let _ = std::fs::remove_file(&empty_flag);
     engine.shutdown().await;
 }
 

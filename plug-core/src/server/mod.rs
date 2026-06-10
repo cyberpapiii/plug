@@ -1,6 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -34,7 +34,7 @@ use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType};
 use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
-use crate::types::{HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
+use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -545,6 +545,29 @@ impl UpstreamMetrics {
     }
 }
 
+/// Outcome of a single per-server listing call during catalog refresh.
+///
+/// The distinction is the seam the degraded-vs-absent model hinges on: a timeout
+/// or transport error is `Unavailable` (carry last-known-good forward), while a
+/// successful call — even one returning an empty vec — is `Fresh` (apply it,
+/// pruning anything genuinely removed).
+enum ListingOutcome<T> {
+    Fresh(Vec<T>),
+    Unavailable,
+}
+
+/// Aggregated result of listing one catalog dimension (resources / templates /
+/// prompts) across all routable upstreams.
+///
+/// `items` already has last-known-good carried forward for any upstream whose live
+/// listing was `Unavailable`, so the caller's catalog rebuild and subscription
+/// prune logic see an unchanged URI set for a degraded server and leave it alone.
+/// `degraded` names the upstreams that were served from cache this cycle.
+pub(crate) struct ListingResult<T> {
+    pub items: Vec<(String, T)>,
+    pub degraded: BTreeSet<String>,
+}
+
 fn circuit_state_label(state: crate::circuit::CircuitState) -> &'static str {
     match state {
         crate::circuit::CircuitState::Closed => "closed",
@@ -560,6 +583,15 @@ pub struct ServerManager {
     configured_auth: DashMap<String, ConfiguredAuth>,
     pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
     pub(crate) metrics: DashMap<String, Arc<UpstreamMetrics>>,
+    /// Last-known-good resource/template/prompt listings per server, carried
+    /// forward when a live listing times out or errors so a transient stall does
+    /// not prune the catalog (and its active subscriptions). Tools already cache
+    /// on `UpstreamServer.tools`; these give resources/templates/prompts parity.
+    last_resources: DashMap<String, Arc<Vec<Resource>>>,
+    last_resource_templates: DashMap<String, Arc<Vec<ResourceTemplate>>>,
+    last_prompts: DashMap<String, Arc<Vec<Prompt>>>,
+    /// Current per-server catalog availability, recomputed each refresh cycle.
+    availability: DashMap<String, Availability>,
     pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
     /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
     /// all trying to reconnect the same server simultaneously).
@@ -620,6 +652,10 @@ impl ServerManager {
             configured_auth: DashMap::new(),
             circuit_breakers: DashMap::new(),
             metrics: DashMap::new(),
+            last_resources: DashMap::new(),
+            last_resource_templates: DashMap::new(),
+            last_prompts: DashMap::new(),
+            availability: DashMap::new(),
             semaphores: DashMap::new(),
             reconnecting: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
@@ -667,6 +703,57 @@ impl ServerManager {
                 circuit_state: circuit.to_string(),
                 ..Default::default()
             },
+        }
+    }
+
+    /// Recompute per-server catalog availability after a refresh cycle.
+    ///
+    /// `degraded` is the union of upstreams whose live listing was `Unavailable`
+    /// this cycle (whether or not last-known-good was carried forward). A configured,
+    /// routable server in that set is `Degraded`; a routable server not in it is
+    /// `Healthy`; a non-routable server (failed/auth-required) is `Absent`.
+    /// State for servers no longer in the config — availability and any lingering
+    /// last-known-good cache — is dropped.
+    pub(crate) fn update_availability(&self, degraded: &BTreeSet<String>) {
+        let servers = self.servers.load();
+        for (name, _) in servers.iter() {
+            let routable = self
+                .health
+                .get(name)
+                .map(|h| h.health.is_routable())
+                .unwrap_or(true);
+            let availability = if !routable {
+                Availability::Absent
+            } else if degraded.contains(name) {
+                Availability::Degraded
+            } else {
+                Availability::Healthy
+            };
+            self.availability.insert(name.clone(), availability);
+        }
+        // Drop state for servers no longer configured. This also reclaims any
+        // last-known-good cache that a Fresh listing could have resurrected after a
+        // concurrent stop_server, so an unconfigured name cannot leak stale entries.
+        self.availability
+            .retain(|name, _| servers.contains_key(name));
+        self.last_resources
+            .retain(|name, _| servers.contains_key(name));
+        self.last_resource_templates
+            .retain(|name, _| servers.contains_key(name));
+        self.last_prompts
+            .retain(|name, _| servers.contains_key(name));
+    }
+
+    /// Current catalog availability for a server. Falls back to a health-derived
+    /// default when no refresh has recorded it yet: routable ⇒ `Healthy`,
+    /// otherwise `Absent`.
+    fn availability_for(&self, name: &str, health: ServerHealth) -> Availability {
+        if let Some(entry) = self.availability.get(name) {
+            *entry
+        } else if health.is_routable() {
+            Availability::Healthy
+        } else {
+            Availability::Absent
         }
     }
 
@@ -1152,7 +1239,7 @@ impl ServerManager {
         result
     }
 
-    pub async fn get_resources(&self) -> Vec<(String, Resource)> {
+    pub(crate) async fn get_resources(&self) -> ListingResult<Resource> {
         let servers = self.servers.load();
         let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
             .iter()
@@ -1176,44 +1263,61 @@ impl ServerManager {
                     // connected upstream cannot block the whole catalog
                     // refresh (the rmcp list_all_* calls carry no timeout).
                     let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let resources = match tokio::time::timeout(
+                    let outcome = match tokio::time::timeout(
                         timeout,
                         upstream.client.peer().list_all_resources(),
                     )
                     .await
                     {
-                        Ok(result) => result,
+                        Ok(Ok(resources)) => ListingOutcome::Fresh(resources),
+                        Ok(Err(error)) => {
+                            tracing::warn!(server = %server_name, error = %error, "failed to list resources; carrying last-known-good");
+                            ListingOutcome::Unavailable
+                        }
                         Err(_) => {
                             tracing::warn!(
                                 server = %server_name,
                                 timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing resources; skipping for this refresh"
+                                "timed out listing resources; carrying last-known-good"
                             );
-                            Ok(Vec::new())
+                            ListingOutcome::Unavailable
                         }
                     };
-                    (server_name, resources)
+                    (server_name, outcome)
                 }),
         )
         .await;
 
-        let mut collected = Vec::new();
-        for (server_name, resources) in results {
-            match resources {
-                Ok(resources) => {
-                    for resource in resources {
-                        collected.push((server_name.clone(), resource));
+        let mut items = Vec::new();
+        let mut degraded = BTreeSet::new();
+        for (server_name, outcome) in results {
+            match outcome {
+                ListingOutcome::Fresh(resources) => {
+                    let cached = Arc::new(resources);
+                    self.last_resources
+                        .insert(server_name.clone(), Arc::clone(&cached));
+                    for resource in cached.iter() {
+                        items.push((server_name.clone(), resource.clone()));
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(server = %server_name, error = %error, "failed to list resources");
+                ListingOutcome::Unavailable => {
+                    // A routable upstream that fails to list is degraded whether or
+                    // not we have last-known-good to serve — including its first,
+                    // uncached listing. Marking degraded only when a cache exists
+                    // would report a present-but-failing server as healthy.
+                    if let Some(cached) = self.last_resources.get(&server_name) {
+                        for resource in cached.iter() {
+                            items.push((server_name.clone(), resource.clone()));
+                        }
+                    }
+                    degraded.insert(server_name);
                 }
             }
         }
-        collected
+        ListingResult { items, degraded }
     }
 
-    pub async fn get_resource_templates(&self) -> Vec<(String, ResourceTemplate)> {
+    pub(crate) async fn get_resource_templates(&self) -> ListingResult<ResourceTemplate> {
         let servers = self.servers.load();
         let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
             .iter()
@@ -1234,44 +1338,58 @@ impl ServerManager {
                 .into_iter()
                 .map(|(server_name, upstream)| async move {
                     let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let templates = match tokio::time::timeout(
+                    let outcome = match tokio::time::timeout(
                         timeout,
                         upstream.client.peer().list_all_resource_templates(),
                     )
                     .await
                     {
-                        Ok(result) => result,
+                        Ok(Ok(templates)) => ListingOutcome::Fresh(templates),
+                        Ok(Err(error)) => {
+                            tracing::warn!(server = %server_name, error = %error, "failed to list resource templates; carrying last-known-good");
+                            ListingOutcome::Unavailable
+                        }
                         Err(_) => {
                             tracing::warn!(
                                 server = %server_name,
                                 timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing resource templates; skipping for this refresh"
+                                "timed out listing resource templates; carrying last-known-good"
                             );
-                            Ok(Vec::new())
+                            ListingOutcome::Unavailable
                         }
                     };
-                    (server_name, templates)
+                    (server_name, outcome)
                 }),
         )
         .await;
 
-        let mut collected = Vec::new();
-        for (server_name, templates) in results {
-            match templates {
-                Ok(resource_templates) => {
-                    for template in resource_templates {
-                        collected.push((server_name.clone(), template));
+        let mut items = Vec::new();
+        let mut degraded = BTreeSet::new();
+        for (server_name, outcome) in results {
+            match outcome {
+                ListingOutcome::Fresh(templates) => {
+                    let cached = Arc::new(templates);
+                    self.last_resource_templates
+                        .insert(server_name.clone(), Arc::clone(&cached));
+                    for template in cached.iter() {
+                        items.push((server_name.clone(), template.clone()));
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(server = %server_name, error = %error, "failed to list resource templates");
+                ListingOutcome::Unavailable => {
+                    // Degraded whether or not last-known-good exists (see get_resources).
+                    if let Some(cached) = self.last_resource_templates.get(&server_name) {
+                        for template in cached.iter() {
+                            items.push((server_name.clone(), template.clone()));
+                        }
+                    }
+                    degraded.insert(server_name);
                 }
             }
         }
-        collected
+        ListingResult { items, degraded }
     }
 
-    pub async fn get_prompts(&self) -> Vec<(String, Prompt)> {
+    pub(crate) async fn get_prompts(&self) -> ListingResult<Prompt> {
         let servers = self.servers.load();
         let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
             .iter()
@@ -1292,41 +1410,55 @@ impl ServerManager {
                 .into_iter()
                 .map(|(server_name, upstream)| async move {
                     let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let prompts = match tokio::time::timeout(
+                    let outcome = match tokio::time::timeout(
                         timeout,
                         upstream.client.peer().list_all_prompts(),
                     )
                     .await
                     {
-                        Ok(result) => result,
+                        Ok(Ok(prompts)) => ListingOutcome::Fresh(prompts),
+                        Ok(Err(error)) => {
+                            tracing::warn!(server = %server_name, error = %error, "failed to list prompts; carrying last-known-good");
+                            ListingOutcome::Unavailable
+                        }
                         Err(_) => {
                             tracing::warn!(
                                 server = %server_name,
                                 timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing prompts; skipping for this refresh"
+                                "timed out listing prompts; carrying last-known-good"
                             );
-                            Ok(Vec::new())
+                            ListingOutcome::Unavailable
                         }
                     };
-                    (server_name, prompts)
+                    (server_name, outcome)
                 }),
         )
         .await;
 
-        let mut collected = Vec::new();
-        for (server_name, prompts) in results {
-            match prompts {
-                Ok(prompts) => {
-                    for prompt in prompts {
-                        collected.push((server_name.clone(), prompt));
+        let mut items = Vec::new();
+        let mut degraded = BTreeSet::new();
+        for (server_name, outcome) in results {
+            match outcome {
+                ListingOutcome::Fresh(prompts) => {
+                    let cached = Arc::new(prompts);
+                    self.last_prompts
+                        .insert(server_name.clone(), Arc::clone(&cached));
+                    for prompt in cached.iter() {
+                        items.push((server_name.clone(), prompt.clone()));
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(server = %server_name, error = %error, "failed to list prompts");
+                ListingOutcome::Unavailable => {
+                    // Degraded whether or not last-known-good exists (see get_resources).
+                    if let Some(cached) = self.last_prompts.get(&server_name) {
+                        for prompt in cached.iter() {
+                            items.push((server_name.clone(), prompt.clone()));
+                        }
+                    }
+                    degraded.insert(server_name);
                 }
             }
         }
-        collected
+        ListingResult { items, degraded }
     }
 
     pub fn healthy_capabilities(&self) -> Vec<ServerCapabilities> {
@@ -1406,6 +1538,10 @@ impl ServerManager {
         self.configured_auth.clear();
         self.circuit_breakers.clear();
         self.metrics.clear();
+        self.last_resources.clear();
+        self.last_resource_templates.clear();
+        self.last_prompts.clear();
+        self.availability.clear();
         self.semaphores.clear();
         self.reconnecting.clear();
     }
@@ -1432,6 +1568,7 @@ impl ServerManager {
                     auth_status,
                     upstream: upstream.upstream.clone(),
                     metrics: Some(self.metrics_snapshot_or_default(&upstream.name)),
+                    availability: self.availability_for(&upstream.name, health),
                     last_seen: None,
                 }
             })
@@ -1454,6 +1591,7 @@ impl ServerManager {
                 auth_status,
                 upstream: None,
                 metrics: self.metrics_snapshot(entry.key()),
+                availability: self.availability_for(entry.key(), entry.health),
                 last_seen: None,
             });
         }
@@ -1519,6 +1657,10 @@ impl ServerManager {
             self.health.remove(name);
             self.circuit_breakers.remove(name);
             self.metrics.remove(name);
+            self.last_resources.remove(name);
+            self.last_resource_templates.remove(name);
+            self.last_prompts.remove(name);
+            self.availability.remove(name);
             self.semaphores.remove(name);
             retire_upstream_owned(name.to_string(), upstream_arc, "stop").await;
         }
@@ -1526,6 +1668,14 @@ impl ServerManager {
 
     /// Replace an upstream server (used after reconnection).
     /// Updates the servers map and resets circuit breaker and health state.
+    ///
+    /// Unlike [`stop_server`], the last-known-good listing caches (`last_resources`,
+    /// `last_resource_templates`, `last_prompts`) and `availability` are intentionally
+    /// preserved across replacement: the same logical upstream is reconnecting, so
+    /// carrying its catalog forward keeps subscriptions and routes stable until its
+    /// first post-reconnect listing succeeds. They are overwritten on the next Fresh
+    /// listing and reclaimed by `stop_server`/`update_availability` if the server is
+    /// removed from config.
     pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
         let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
 
@@ -1660,6 +1810,50 @@ mod tests {
     use super::*;
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
+
+    #[test]
+    fn availability_for_defaults_by_health_then_prefers_recorded_state() {
+        let sm = ServerManager::new();
+        // No recorded availability yet: derive from health.
+        assert_eq!(
+            sm.availability_for("x", ServerHealth::Healthy),
+            Availability::Healthy
+        );
+        assert_eq!(
+            sm.availability_for("x", ServerHealth::Degraded),
+            Availability::Healthy,
+            "degraded *health* (connection) is still routable; catalog availability defaults healthy until a refresh records otherwise"
+        );
+        assert_eq!(
+            sm.availability_for("x", ServerHealth::Failed),
+            Availability::Absent
+        );
+        assert_eq!(
+            sm.availability_for("x", ServerHealth::AuthRequired),
+            Availability::Absent
+        );
+
+        // A recorded availability takes precedence over the health-derived default.
+        sm.availability
+            .insert("x".to_string(), Availability::Degraded);
+        assert_eq!(
+            sm.availability_for("x", ServerHealth::Healthy),
+            Availability::Degraded
+        );
+    }
+
+    #[test]
+    fn update_availability_evicts_servers_no_longer_configured() {
+        let sm = ServerManager::new();
+        // Seed a stale availability for a server that is not in the (empty) config.
+        sm.availability
+            .insert("ghost".to_string(), Availability::Degraded);
+        sm.update_availability(&BTreeSet::new());
+        assert!(
+            sm.availability.get("ghost").is_none(),
+            "availability for a server absent from config must be dropped"
+        );
+    }
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{

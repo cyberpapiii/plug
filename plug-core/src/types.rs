@@ -100,6 +100,64 @@ mod tests {
         use super::ServerHealth;
         assert!(!ServerHealth::AuthRequired.is_routable());
     }
+
+    #[test]
+    fn availability_serializes_lowercase() {
+        use super::Availability;
+        assert_eq!(
+            serde_json::to_value(Availability::Healthy).unwrap(),
+            serde_json::json!("healthy")
+        );
+        assert_eq!(
+            serde_json::to_value(Availability::Degraded).unwrap(),
+            serde_json::json!("degraded")
+        );
+        assert_eq!(
+            serde_json::to_value(Availability::Absent).unwrap(),
+            serde_json::json!("absent")
+        );
+    }
+
+    #[test]
+    fn availability_default_is_healthy() {
+        use super::Availability;
+        assert_eq!(Availability::default(), Availability::Healthy);
+    }
+
+    #[test]
+    fn server_status_missing_availability_deserializes_as_healthy() {
+        use super::{Availability, ServerHealth, ServerStatus};
+        // An older daemon's JSON without the `availability` key must still
+        // deserialize (schema stability), defaulting to healthy.
+        let json = serde_json::json!({
+            "server_id": "legacy",
+            "health": "Healthy",
+            "tool_count": 3,
+            "auth_status": "none"
+        });
+        let status: ServerStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status.availability, Availability::Healthy);
+        assert_eq!(status.health, ServerHealth::Healthy);
+    }
+
+    #[test]
+    fn server_status_roundtrips_degraded_availability() {
+        use super::{Availability, ServerHealth, ServerStatus};
+        let status = ServerStatus {
+            server_id: "imessage".to_string(),
+            health: ServerHealth::Healthy,
+            tool_count: 1,
+            auth_status: "none".to_string(),
+            upstream: None,
+            metrics: None,
+            availability: Availability::Degraded,
+            last_seen: None,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["availability"], serde_json::json!("degraded"));
+        let back: ServerStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(back.availability, Availability::Degraded);
+    }
 }
 
 /// Known AI client types that connect to plug.
@@ -266,6 +324,35 @@ impl ServerHealth {
     }
 }
 
+/// Catalog availability of an upstream, distinct from connection health.
+///
+/// Where [`ServerHealth`] tracks the connection's health-check state (a failure
+/// counter), `Availability` describes what the merged catalog currently serves for
+/// this upstream. The two are orthogonal and can legitimately disagree — a routable
+/// server (`health = Healthy`) whose listing timed out this cycle reports
+/// `availability = Degraded`. Note both enums spell one state `Degraded`; they mean
+/// different things (connection vs. catalog).
+///
+/// - `Healthy`: the last catalog refresh listed this upstream's resources/prompts live.
+/// - `Degraded`: the upstream is still routable but its last refresh failed to list
+///   (timeout/error). Last-known-good catalog entries are carried forward when they
+///   exist (and resource subscriptions are preserved, not pruned); if there is no
+///   last-known-good yet, the upstream contributes nothing this cycle but is still
+///   reported degraded rather than healthy.
+/// - `Absent`: the upstream is not in the routed set — removed from config, failed, or
+///   awaiting auth.
+///
+/// This is independent of [`UpstreamMetricsSnapshot::degraded_since_epoch_secs`], which
+/// times *tool-call* degradation, not catalog-listing degradation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Availability {
+    #[default]
+    Healthy,
+    Degraded,
+    Absent,
+}
+
 /// Tracked health state with consecutive failure counting for state machine transitions.
 ///
 /// State machine:
@@ -368,6 +455,12 @@ pub struct ServerStatus {
     /// set. The key is always present so the agent-facing schema is stable.
     #[serde(default)]
     pub metrics: Option<UpstreamMetricsSnapshot>,
+    /// Catalog availability — whether the merged catalog entries for this upstream
+    /// are live (`healthy`), carried-forward last-known-good after a failed listing
+    /// (`degraded`), or absent. Additive with a default so the agent-facing schema
+    /// stays stable: an older daemon's JSON without the key deserializes as `healthy`.
+    #[serde(default)]
+    pub availability: Availability,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }
