@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #61 (first-class degraded-vs-absent upstream availability) and its post-merge truth pass
+Baseline: `main` after PR #62 (parallel test suite — `--test-threads=1` removed) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -102,6 +102,8 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed parallel test execution via PR #62 (deferred program item 4): the workspace suite no longer needs `--test-threads=1` — the daemon/ipc/runtime tests that share the process-global runtime-paths slot serialize behind one shared lock while the rest run in parallel, and the mock server is pre-built once instead of `cargo run` per spawn. CI wall-clock for tests roughly thirds. No product-surface change. Full `RuntimePaths` injection (concurrent daemon tests too) remains deferred.
 
 On 2026-06-10, `main` absorbed the first-class degraded-vs-absent availability model via PR #61 (deferred program item 3):
 

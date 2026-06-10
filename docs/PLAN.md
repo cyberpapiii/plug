@@ -93,7 +93,17 @@ The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-op
 - **Degraded-vs-absent core model** — ✅ done on `main` via PR #61 (see dated entry below). Closed the PR #58 subscription-rebind residual at the model level.
 - **Transport `RequestDispatcher` + parity matrix** — collapse the per-transport (stdio/HTTP/IPC) request handling that repeatedly drifts (features land on stdio/HTTP first, IPC parity follows as bug fixes) into one dispatcher with an explicit parity matrix. Designed to build on the availability model from item 3. *(Next phase; highest-risk change in the repo per the program plan.)*
 - **Active upstream supervision (item 2b)** — proactive restart/reconnect of an upstream that stays `degraded` past a threshold, building on the now-first-class `degraded` state and the per-upstream metrics
-- **Test parallelism (U1/U2)** — remove the global daemon-test mutex and `--test-threads=1` via a per-test-path refactor; investigated during PR #60 and deferred rather than ship a flaky CI
+- **Test parallelism (U1/U2)** — ✅ done on `main` via PR #62 (see dated entry below): the suite now runs parallel in CI without `--test-threads=1`. Full `RuntimePaths` injection (so even the ~15 daemon/runtime tests run concurrently) remains a deferred enhancement.
+
+## 2026-06-10 Parallel Test Suite (Program Item 4)
+
+On 2026-06-10, `main` absorbed PR #62:
+
+- the workspace test suite now runs with parallel threads in CI (`--test-threads=1` removed from both CI jobs and the docs). The daemon/ipc/runtime tests that share the process-global runtime-paths slot are unified behind one shared `daemon::runtime_paths_test_lock()`, so they serialize among themselves while the other ~665 tests run in parallel
+- the mock MCP server is pre-built once (`plug_test_harness::mock_server_bin()`) and exec'd directly instead of `cargo run` per spawn, so parallel tests don't contend on Cargo's target lock
+- proven parallel-safe: `cargo test --workspace` green 11/11 consecutive local runs plus both CI test jobs (ubuntu + macos); wall-clock ~135s → ~45s (integration suite 67s → 13s)
+
+Deferred (recorded in PR #62): full `RuntimePaths` injection — delete the global entirely and thread explicit paths through `run_daemon` and the client-discovery sites — so even the ~15 daemon/runtime tests run concurrently.
 
 ## 2026-06-10 Degraded-vs-Absent Availability (Program Item 3)
 
