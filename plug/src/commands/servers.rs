@@ -1256,4 +1256,39 @@ mod tests {
             "expected a structured-no-op error, got: {error}"
         );
     }
+
+    #[tokio::test]
+    async fn cmd_server_edit_json_mode_without_name_errors() {
+        let config_path = test_config_path("edit-json-no-name");
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("demo".to_string(), stdio_server("node"));
+        save_config(&config_path, &config).unwrap();
+
+        // JSON mode must not drop into the interactive server picker; absent
+        // --name it must fail with a clear error.
+        let error = cmd_server_edit(
+            Some(&config_path),
+            None,
+            Some("deno".to_string()),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("requires `--name`"),
+            "expected a missing-name error, got: {error}"
+        );
+    }
 }
