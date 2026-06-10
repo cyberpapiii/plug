@@ -3901,6 +3901,38 @@ fn build_invoke_tool_meta_tool() -> Tool {
     )
 }
 
+/// Stdio adapter for the shared `tools/call` dispatcher. Carries the per-call
+/// identity the dispatcher needs to build a downstream context.
+struct StdioDownstreamContext {
+    client_id: Arc<str>,
+    request_id: RequestId,
+    client_type: ClientType,
+}
+
+impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        DownstreamCallContext::stdio_for_client(
+            Arc::clone(&self.client_id),
+            self.request_id.clone(),
+            self.client_type,
+        )
+    }
+
+    /// stdio's `tools/call` handler can only return a `CallToolResult`, so a
+    /// task-augmented call falls through to the synchronous path (preserving
+    /// today's "task param ignored on stdio" behavior).
+    fn supports_tasks(&self) -> bool {
+        false
+    }
+
+    fn task_owner(&self) -> Result<TaskOwner, McpError> {
+        // Never reached while `supports_tasks()` is false; provided for completeness.
+        Ok(TaskOwner::new(Arc::<str>::from(
+            format!("stdio:{}", self.client_id).as_str(),
+        )))
+    }
+}
+
 /// Stdio-specific bridge for forwarding reverse requests (elicitation, sampling)
 /// back to the downstream client via its `Peer<RoleServer>`.
 struct StdioBridge {
@@ -4393,24 +4425,25 @@ impl ServerHandler for ProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
-            let progress_token = request.progress_token();
             let client_type = self
                 .client_type
                 .read()
                 .map(|ct| *ct)
                 .unwrap_or(ClientType::Unknown);
-            self.router
-                .call_tool_with_context(
-                    request.name.as_ref(),
-                    request.arguments,
-                    progress_token,
-                    Some(DownstreamCallContext::stdio_for_client(
-                        Arc::clone(&self.client_id),
-                        context.id.clone(),
-                        client_type,
-                    )),
-                )
-                .await
+            let ctx = StdioDownstreamContext {
+                client_id: Arc::clone(&self.client_id),
+                request_id: context.id.clone(),
+                client_type,
+            };
+            match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
+                crate::dispatch::ToolCallOutcome::Called(result) => Ok(result),
+                // `supports_tasks()` is false for stdio, so the dispatcher always
+                // takes the synchronous path — a task outcome is unreachable.
+                crate::dispatch::ToolCallOutcome::TaskCreated(_) => Err(McpError::internal_error(
+                    "stdio tools/call unexpectedly produced a task result".to_string(),
+                    None,
+                )),
+            }
         }
     }
 
