@@ -443,7 +443,10 @@ async fn main() -> anyhow::Result<()> {
             &cli.output,
         )?,
         Some(Commands::Doctor) => {
-            commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?
+            let exit_code = commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Some(Commands::Repair { targets, all }) => {
             commands::misc::cmd_repair(cli.config.as_ref(), targets, all)?

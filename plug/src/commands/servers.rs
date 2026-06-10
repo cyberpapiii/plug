@@ -541,6 +541,9 @@ pub(crate) async fn cmd_server_edit(
     let name = match name {
         Some(name) => name,
         None => {
+            if matches!(output, OutputFormat::Json) {
+                anyhow::bail!("`server edit --output json` requires `--name`");
+            }
             let mut names = config.servers.keys().cloned().collect::<Vec<_>>();
             names.sort();
             let index = Select::with_theme(&cli_prompt_theme())
@@ -571,9 +574,14 @@ pub(crate) async fn cmd_server_edit(
             .get_mut(&name)
             .ok_or_else(|| anyhow::anyhow!("unknown server `{name}`"))?;
 
-        if matches!(output, OutputFormat::Json) {
-            println!("{}", serde_json::to_string_pretty(server)?);
-            return Ok(());
+        if matches!(output, OutputFormat::Json) && !non_interactive {
+            // JSON mode never drops into interactive prompts; with no field
+            // flags there is nothing to apply. Fail loudly instead of
+            // silently echoing the unedited config as if the edit succeeded.
+            anyhow::bail!(
+                "`server edit --output json` requires at least one field flag \
+                 (e.g. `--command`, `--url`, `--env`); nothing to update for `{name}`"
+            );
         }
 
         let desired_transport = match transport {
@@ -693,11 +701,26 @@ pub(crate) async fn cmd_server_edit(
         server.auth.as_deref() == Some("oauth")
     };
     save_config(&path, &config)?;
-    print_success_line(format!("Updated server `{name}`."));
-    if oauth_enabled {
-        print_info_line(format!(
-            "Run `plug auth login --server {name}` after saving if this upstream needs fresh authorization."
-        ));
+    match output {
+        OutputFormat::Json => {
+            let server = config.servers.get(&name);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "updated": true,
+                    "server": server,
+                    "oauth_login_required": oauth_enabled,
+                }))?
+            );
+        }
+        OutputFormat::Text => {
+            print_success_line(format!("Updated server `{name}`."));
+            if oauth_enabled {
+                print_info_line(format!(
+                    "Run `plug auth login --server {name}` after saving if this upstream needs fresh authorization."
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1158,6 +1181,79 @@ mod tests {
             error
                 .to_string()
                 .contains("env flags only apply to stdio upstream servers")
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_json_mode_persists_the_edit() {
+        let config_path = test_config_path("edit-json-persists");
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("demo".to_string(), stdio_server("node"));
+        save_config(&config_path, &config).unwrap();
+
+        // JSON mode with a field flag must apply the change, not echo the
+        // unedited config and return success (the review #8 regression).
+        cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            Some("deno".to_string()),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+
+        let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
+        let saved_server = saved.servers.get("demo").unwrap();
+        assert_eq!(
+            saved_server.command.as_deref(),
+            Some("deno"),
+            "JSON-mode edit must persist the new command"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_server_edit_json_mode_without_field_flags_errors() {
+        let config_path = test_config_path("edit-json-no-flags");
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("demo".to_string(), stdio_server("node"));
+        save_config(&config_path, &config).unwrap();
+
+        let error = cmd_server_edit(
+            Some(&config_path),
+            Some("demo".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one field flag"),
+            "expected a structured-no-op error, got: {error}"
         );
     }
 }

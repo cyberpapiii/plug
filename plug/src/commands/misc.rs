@@ -146,10 +146,13 @@ pub(crate) fn cmd_import(
     Ok(())
 }
 
+/// Runs diagnostics and returns the computed process exit code
+/// (`0` = all pass, `1` = at least one failure, `2` = warnings only).
+/// The caller is responsible for exiting the process with this code.
 pub(crate) async fn cmd_doctor(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     let resolved = config_path
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
@@ -205,7 +208,7 @@ pub(crate) async fn cmd_doctor(
             }
         }
     }
-    Ok(())
+    Ok(report.exit_code)
 }
 
 async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
