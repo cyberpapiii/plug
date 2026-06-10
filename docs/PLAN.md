@@ -81,6 +81,21 @@ Optional future scope only:
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
+- preserve last-known-good resources for a server that times out on listing, so a transient stall does not prune/unsubscribe its active resource subscriptions (follow-up from PR #58)
+- move the ≥16MB artifact write off the async worker via `spawn_blocking` (requires making `ArtifactStore` shareable; deferred from PR #58)
+
+## 2026-06-10 Code-Review Stabilization Batch
+
+On 2026-06-10, `main` absorbed PR #58, a batch of validated code-review fixes:
+
+- daemon IPC `tools/call` forwards `_meta.progressToken` (was dropped on the non-task path), completing progress-routing parity with stdio
+- per-server resource/prompt listing in `refresh_tools` is bounded by `call_timeout_secs`; a stalled upstream is skipped rather than freezing the catalog refresh
+- `notification_refresh_in_progress` is cleared via an RAII drop guard with a backstop timeout, so a panic/cancellation cannot wedge `list_changed` delivery
+- DashMap deadlock on expired-artifact reads fixed; `read_chunk_text` reads one chunk instead of the whole payload; per-spill prune scan removed
+- `plug server edit --output json` performs the edit; `plug doctor` exits with its computed code
+- dead `sighup_reload` / `resource_subscription_count` removed; stale `rmcp`/`serde` doc claims corrected
+
+Two follow-ups were deliberately left out of scope and are tracked under Remaining Work above (subscription-rebind on listing timeout; artifact-write off-thread).
 
 ## 2026-04-24 Lazy Tool Discovery V2
 
