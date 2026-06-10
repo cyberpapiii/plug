@@ -91,9 +91,20 @@ Optional future scope only:
 The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred larger items. Sequenced **item 3 → item 1 → item 2b**, plus the independent test-infra work:
 
 - **Degraded-vs-absent core model** — ✅ done on `main` via PR #61 (see dated entry below). Closed the PR #58 subscription-rebind residual at the model level.
-- **Transport `RequestDispatcher` + parity matrix** — collapse the per-transport (stdio/HTTP/IPC) request handling that repeatedly drifts (features land on stdio/HTTP first, IPC parity follows as bug fixes) into one dispatcher with an explicit parity matrix. Designed to build on the availability model from item 3. *(Next phase; highest-risk change in the repo per the program plan.)*
+- **Transport `RequestDispatcher` + parity matrix** — 🟡 partial on `main`: the **`tools/call` slice** shipped via PR #63 (see dated entry below) — a shared `plug-core/src/dispatch` adapter (`DownstreamContext` + `dispatch_tools_call`), all three transports migrated for `tools/call`, the first IPC e2e harness, and a cross-transport parity matrix now gating CI. Remaining method families (`tools/list`, `resources/*`, `prompts/*`, completion) migrate in their own follow-up PRs, each extending the matrix; the `DownstreamTransport::Ipc` identity split is deferred.
 - **Active upstream supervision (item 2b)** — proactive restart/reconnect of an upstream that stays `degraded` past a threshold, building on the now-first-class `degraded` state and the per-upstream metrics
 - **Test parallelism (U1/U2)** — ✅ done on `main` via PR #62 (see dated entry below): the suite now runs parallel in CI without `--test-threads=1`. Full `RuntimePaths` injection (so even the ~15 daemon/runtime tests run concurrently) remains a deferred enhancement.
+
+## 2026-06-10 Transport Dispatcher — `tools/call` Slice (Program Item 1)
+
+On 2026-06-10, `main` absorbed PR #63 — the first slice of item 1 (R8), scoped to the `tools/call` method family only:
+
+- new `plug-core/src/dispatch` module: a `DownstreamContext` trait + `dispatch_tools_call` returning a `ToolCallOutcome` over `CallToolResult`/`CreateTaskResult`, owning the per-transport adapter shell once. The routing core is unchanged — planning corrected the program-plan premise that there were "three duplicated copies of tools/call" (the route was already shared; only the adapter shell + error encoding were duplicated)
+- stdio/HTTP/IPC `tools/call` handlers now delegate to the dispatcher, with the task branch gated per-transport via `supports_tasks()` (stdio false). No product-surface behavior change; an 8-persona review returned zero production-code findings
+- first end-to-end IPC test harness (none existed) + a cross-transport parity matrix asserting identical decoded results and error codes across the real stdio/HTTP/IPC transports — the recurring parity-drift bug class is now a CI gate
+- empty-name response converged across transports (IPC's `INVALID_PARAMS` pre-check removed → all return `METHOD_NOT_FOUND`). Task-augmentation divergence (stdio rejects via rmcp validation; HTTP/IPC create a passthrough task) is intentional and pinned by the parity test
+
+Deferred to follow-up: remaining method families migrate to the dispatcher in their own PRs (each extending the parity matrix); `DownstreamTransport::Ipc` identity split (IPC reuses the stdio identity today, KTD3); consolidating the duplicated mock `ServerConfig` fixture into `plug-test-harness`. Active upstream supervision (item 2b) remains the next sequenced phase after the dispatcher.
 
 ## 2026-06-10 Parallel Test Suite (Program Item 4)
 

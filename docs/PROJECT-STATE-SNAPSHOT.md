@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #62 (parallel test suite — `--test-threads=1` removed) and its post-merge truth pass
+Baseline: `main` after PR #63 (transport-agnostic `tools/call` dispatcher — first slice of program item 1) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -102,6 +102,14 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed the first slice of the transport `RequestDispatcher` via PR #63 (deferred program item 1, requirement R8) — the `tools/call` method family only:
+
+- a new `plug-core/src/dispatch` module owns a transport-agnostic adapter shell (`DownstreamContext` trait + `dispatch_tools_call` returning a `ToolCallOutcome` over `CallToolResult`/`CreateTaskResult`); the routing core (`ToolRouter::call_tool_with_context` / `enqueue_tool_task`) is called unchanged. The program-plan premise of "three duplicated copies of tools/call" was corrected during planning: the route was already shared; only the per-transport adapter shell + error encoding were duplicated
+- stdio (`proxy/mod.rs`), HTTP (`http/server.rs`), and daemon IPC (`daemon.rs`) now delegate their `tools/call` handling to the shared dispatcher; the task branch is gated per-transport via `supports_tasks()` (stdio false). No product-surface behavior change — client-aware filtering, meta-tool mode, progress/cancellation, and reverse-request forwarding preserved (8-persona review found zero production-code findings)
+- a first end-to-end IPC test harness (none existed) plus a cross-transport parity matrix drive identical `tools/call` scenarios through the real stdio/HTTP/IPC transports and assert identical decoded results and error codes — the recurring parity-drift bug class is now a CI gate
+- the empty-name response was converged (IPC's `INVALID_PARAMS` pre-check removed) so all three transports return `METHOD_NOT_FOUND`. Two divergences remain intentional and pinned by tests: none for empty-name (now converged); task-augmented calls reject on stdio (rmcp `ServerHandler` validation) but create a passthrough task on HTTP/IPC — a capability difference, not a defect
+- deferred to follow-up: the remaining method families (`tools/list`, `resources/*`, `prompts/*`, completion) migrate to the dispatcher in their own PRs; a `DownstreamTransport::Ipc` identity split (IPC currently reuses the stdio identity, KTD3); and consolidating the duplicated mock `ServerConfig` fixture into `plug-test-harness`
 
 On 2026-06-10, `main` absorbed parallel test execution via PR #62 (deferred program item 4): the workspace suite no longer needs `--test-threads=1` — the daemon/ipc/runtime tests that share the process-global runtime-paths slot serialize behind one shared lock while the rest run in parallel, and the mock server is pre-built once instead of `cargo run` per spawn. CI wall-clock for tests roughly thirds. No product-surface change. Full `RuntimePaths` injection (concurrent daemon tests too) remains deferred.
 
