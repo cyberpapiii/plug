@@ -48,6 +48,7 @@ forwarding work:
 - runtime-truth follow-up hardening across `status`, `tools`, `servers`, `clients`, and `doctor`
 - explicit live reverse-request delivery failure handling for downstream HTTP sessions
 - review-hardened task correctness around monotonic state transitions, reconnect-stable IPC ownership, and fail-closed pass-through dispatch
+- downstream OAuth authorize-redirect allowlist and exposure-keyed secretless-OAuth guard, plus per-upstream operability metrics in `plug status --output json` (PR #60)
 
 ## What Exists Today
 
@@ -83,6 +84,26 @@ Optional future scope only:
 - further low-priority simplification of internal reload/session/SSE helper structure
 - preserve last-known-good resources for a server that times out on listing, so a transient stall does not prune/unsubscribe its active resource subscriptions (follow-up from PR #58)
 - move the ≥16MB artifact write off the async worker via `spawn_blocking` (requires making `ArtifactStore` shareable; deferred from PR #58)
+- end-to-end metrics-recording test plus an RAII recording guard, and an operator-guide note on `degraded_since` vs. health divergence (deferred from PR #60)
+
+## Designed-But-Deferred Program Phases
+
+The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred three larger items, each with full design captured in that plan:
+
+- **Transport `RequestDispatcher` + parity matrix** — collapse the per-transport (stdio/HTTP/IPC) request handling that repeatedly drifts (features land on stdio/HTTP first, IPC parity follows as bug fixes) into one dispatcher with an explicit parity matrix
+- **Degraded-vs-absent core model** — distinguish "upstream present but degraded" from "upstream absent" in the core, closing the PR #58 subscription-rebind residual at the model level rather than per-call-site
+- **Active upstream supervision** — proactive health-driven supervision beyond the current reactive recovery
+- **Test parallelism (U1/U2)** — remove the global daemon-test mutex and `--test-threads=1` via a per-test-path refactor; investigated during PR #60 and deferred rather than ship a flaky CI
+
+## 2026-06-10 Operability + Tunneled-OAuth Hardening
+
+On 2026-06-10, `main` absorbed PR #60:
+
+- closed the downstream OAuth open-redirector: `build_authorize_redirect` validates the requested `redirect_uri` against a loopback-default allowlist before issuing the authorization code, percent-encodes code/state, and logs rejections
+- added an exposure-keyed secretless-OAuth guard: config validation rejects `auth_mode = "oauth"` without `oauth_client_secret` when reachable off-loopback (non-loopback bind *or* non-loopback `public_base_url`, e.g. a cloudflared tunnel) — the first cut keyed only on bind address and missed the tunnel; review caught it and the merged guard keys on exposure
+- added per-upstream metrics to `plug status --output json` (call/error counts, last-latency-ms, degraded-since epoch, circuit-state label) with a stable always-present schema, zero-filled for known-but-idle servers
+
+Residuals are tracked under Remaining Work above (allowlist migration for remote `redirect_uri`; e2e metrics-recording test + RAII guard; operator-guide degraded-vs-health note).
 
 ## 2026-06-10 Code-Review Stabilization Batch
 

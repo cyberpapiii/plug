@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #58 (code-review stabilization batch) and its post-merge truth pass
+Baseline: `main` after PR #60 (tunneled-OAuth hardening + per-upstream operability metrics) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -46,6 +46,9 @@ Implemented on `main`:
 - initialize response protocol-version simplification/fixups for remote compatibility
 - persisted token hydration before upstream connect
 - downstream OAuth discovery/privacy hardening, more accurate metadata, and richer challenge behavior
+- downstream OAuth authorize-redirect allowlist (loopback-default) closing the open-redirector on `build_authorize_redirect`, with percent-encoded code/state and rejection logging (PR #60)
+- secretless-OAuth exposure guard: config validation rejects `http.auth_mode = "oauth"` without `oauth_client_secret` when the server is reachable off-loopback (non-loopback bind *or* non-loopback `public_base_url`, e.g. a cloudflared tunnel) (PR #60)
+- per-upstream operability metrics in `plug status --output json`: call/error counts, last-latency, degraded-since epoch, and circuit-state label per upstream, with a stable always-present schema (zero-filled for known servers) (PR #60)
 - clearer operator auth/runtime UX across `plug status`, `plug doctor`, `plug auth status`, `plug clients`, and `plug servers`
 - topology-aware setup/link/repair flows that preserve configured stdio vs HTTP downstream choices
 - transport-aware live session inventory across daemon proxy and downstream HTTP sessions
@@ -98,6 +101,14 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed the operability + tunneled-OAuth hardening tranche via PR #60:
+
+- closed the downstream OAuth open-redirector: `build_authorize_redirect` now checks the requested `redirect_uri` against a configured allowlist (defaulting to loopback hosts `127.0.0.1` / `localhost` / `::1`) *before* issuing the authorization code, percent-encodes code/state, and logs rejected URIs
+- added a secretless-OAuth exposure guard in config validation: a server reachable off-loopback (non-loopback bind, or a non-loopback `public_base_url` such as a cloudflared tunnel) with `http.auth_mode = "oauth"` and no `oauth_client_secret` is now rejected at validation time — the original guard keyed only on bind address and missed the tunnel topology; the merged guard keys on exposure
+- added per-upstream metrics to `plug status --output json`: call/error counts, last-latency-ms, degraded-since epoch, and a circuit-state label, surfaced per upstream with a stable schema (always present, zero-filled for known-but-idle servers) so agents can read "server X degraded since T" instead of inferring it
+
+Known residual (tracked follow-up, not yet on `main`): downstream OAuth with a remote (non-loopback) `redirect_uri` now requires adding it to the allowlist (the loopback `plug auth login` path is unaffected; rejections are logged). An end-to-end metrics-recording test and an RAII recording guard remain deferred, as does an operator-guide note on `degraded_since` vs. health divergence. None is a roadmap blocker.
 
 On 2026-06-10, `main` absorbed the code-review stabilization batch via PR #58:
 
