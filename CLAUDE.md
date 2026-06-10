@@ -151,7 +151,7 @@ Every roadmap-affecting PR should complete this checklist after merge:
 
 ```bash
 cargo check
-cargo test --workspace -- --test-threads=1
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```

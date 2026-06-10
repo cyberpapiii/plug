@@ -877,7 +877,6 @@ mod tests {
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
@@ -902,9 +901,10 @@ mod tests {
         path
     }
 
+    // Shared with the daemon and ipc_proxy test modules so all global runtime-path
+    // tests serialize on one lock (see daemon::runtime_paths_test_lock).
     fn runtime_path_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        crate::daemon::runtime_paths_test_lock()
     }
 
     async fn spawn_http_test_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
