@@ -1266,6 +1266,18 @@ async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
     .await
     .expect("refresh_tools must not block on an upstream that stalls on resource listing");
 
+    // The upstream stalls on its FIRST listing (timeout arm of ListingOutcome::
+    // Unavailable, no last-known-good cached). It is routable but serving nothing,
+    // so it must report `degraded` — not `healthy` (it is failing) and not `absent`
+    // (it is still connected/routable).
+    let availability = engine
+        .server_statuses()
+        .into_iter()
+        .find(|s| s.server_id == "mock")
+        .map(|s| s.availability)
+        .expect("mock server status present");
+    assert_eq!(availability, plug_core::types::Availability::Degraded);
+
     engine.shutdown().await;
 }
 
@@ -1321,12 +1333,36 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("c1"),
     };
+    // Subscribe a notification receiver BEFORE subscribing so we capture the
+    // resources/updated the mock emits on subscribe — proving the subscription
+    // delivers end-to-end, not just that a registry entry exists.
+    let mut notifications = router.subscribe_notifications();
     router
-        .subscribe_resource(uri, target)
+        .subscribe_resource(uri, target.clone())
         .await
         .expect("subscribe to mock resource");
     assert_eq!(router.active_subscription_count(), 1);
     assert_eq!(availability_of(&engine), Availability::Healthy);
+
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match notifications.recv().await {
+                Ok(plug_core::notifications::ProtocolNotification::ResourceUpdated {
+                    target: t,
+                    params,
+                    ..
+                }) if params.uri == uri && t == target => break true,
+                Ok(_) => continue,
+                Err(_) => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        delivered,
+        "an active subscription must deliver resources/updated to its subscriber"
+    );
 
     // ── Degraded: live listing errors → carry last-known-good, keep subscription ──
     std::fs::write(&fail_flag, b"1").expect("set fail flag");

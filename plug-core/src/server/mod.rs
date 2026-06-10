@@ -708,11 +708,12 @@ impl ServerManager {
 
     /// Recompute per-server catalog availability after a refresh cycle.
     ///
-    /// `degraded` is the union of upstreams served from last-known-good cache this
-    /// cycle (their live listing was `Unavailable`). A configured, routable server
-    /// in that set is `Degraded`; a routable server not in it is `Healthy`; a
-    /// non-routable server (failed/auth-required) is `Absent`. Availability for
-    /// servers no longer in the config is dropped.
+    /// `degraded` is the union of upstreams whose live listing was `Unavailable`
+    /// this cycle (whether or not last-known-good was carried forward). A configured,
+    /// routable server in that set is `Degraded`; a routable server not in it is
+    /// `Healthy`; a non-routable server (failed/auth-required) is `Absent`.
+    /// State for servers no longer in the config — availability and any lingering
+    /// last-known-good cache — is dropped.
     pub(crate) fn update_availability(&self, degraded: &BTreeSet<String>) {
         let servers = self.servers.load();
         for (name, _) in servers.iter() {
@@ -730,8 +731,16 @@ impl ServerManager {
             };
             self.availability.insert(name.clone(), availability);
         }
-        // Drop availability for servers no longer configured.
+        // Drop state for servers no longer configured. This also reclaims any
+        // last-known-good cache that a Fresh listing could have resurrected after a
+        // concurrent stop_server, so an unconfigured name cannot leak stale entries.
         self.availability
+            .retain(|name, _| servers.contains_key(name));
+        self.last_resources
+            .retain(|name, _| servers.contains_key(name));
+        self.last_resource_templates
+            .retain(|name, _| servers.contains_key(name));
+        self.last_prompts
             .retain(|name, _| servers.contains_key(name));
     }
 
@@ -1292,12 +1301,16 @@ impl ServerManager {
                     }
                 }
                 ListingOutcome::Unavailable => {
+                    // A routable upstream that fails to list is degraded whether or
+                    // not we have last-known-good to serve — including its first,
+                    // uncached listing. Marking degraded only when a cache exists
+                    // would report a present-but-failing server as healthy.
                     if let Some(cached) = self.last_resources.get(&server_name) {
                         for resource in cached.iter() {
                             items.push((server_name.clone(), resource.clone()));
                         }
-                        degraded.insert(server_name);
                     }
+                    degraded.insert(server_name);
                 }
             }
         }
@@ -1363,12 +1376,13 @@ impl ServerManager {
                     }
                 }
                 ListingOutcome::Unavailable => {
+                    // Degraded whether or not last-known-good exists (see get_resources).
                     if let Some(cached) = self.last_resource_templates.get(&server_name) {
                         for template in cached.iter() {
                             items.push((server_name.clone(), template.clone()));
                         }
-                        degraded.insert(server_name);
                     }
+                    degraded.insert(server_name);
                 }
             }
         }
@@ -1434,12 +1448,13 @@ impl ServerManager {
                     }
                 }
                 ListingOutcome::Unavailable => {
+                    // Degraded whether or not last-known-good exists (see get_resources).
                     if let Some(cached) = self.last_prompts.get(&server_name) {
                         for prompt in cached.iter() {
                             items.push((server_name.clone(), prompt.clone()));
                         }
-                        degraded.insert(server_name);
                     }
+                    degraded.insert(server_name);
                 }
             }
         }
@@ -1653,6 +1668,14 @@ impl ServerManager {
 
     /// Replace an upstream server (used after reconnection).
     /// Updates the servers map and resets circuit breaker and health state.
+    ///
+    /// Unlike [`stop_server`], the last-known-good listing caches (`last_resources`,
+    /// `last_resource_templates`, `last_prompts`) and `availability` are intentionally
+    /// preserved across replacement: the same logical upstream is reconnecting, so
+    /// carrying its catalog forward keeps subscriptions and routes stable until its
+    /// first post-reconnect listing succeeds. They are overwritten on the next Fresh
+    /// listing and reclaimed by `stop_server`/`update_availability` if the server is
+    /// removed from config.
     pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
         let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
 

@@ -326,15 +326,24 @@ impl ServerHealth {
 
 /// Catalog availability of an upstream, distinct from connection health.
 ///
-/// Where [`ServerHealth`] tracks the connection's health-check state, `Availability`
-/// describes what the merged catalog currently serves for this upstream:
+/// Where [`ServerHealth`] tracks the connection's health-check state (a failure
+/// counter), `Availability` describes what the merged catalog currently serves for
+/// this upstream. The two are orthogonal and can legitimately disagree — a routable
+/// server (`health = Healthy`) whose listing timed out this cycle reports
+/// `availability = Degraded`. Note both enums spell one state `Degraded`; they mean
+/// different things (connection vs. catalog).
 ///
 /// - `Healthy`: the last catalog refresh listed this upstream's resources/prompts live.
-/// - `Degraded`: the last refresh failed to list (timeout/error) but the upstream is
-///   still routable, so its last-known-good catalog entries are being carried forward
-///   (and its resource subscriptions are preserved, not pruned).
-/// - `Absent`: the upstream contributes nothing to the merged catalog — removed from
-///   config, or failing with no last-known-good to carry forward.
+/// - `Degraded`: the upstream is still routable but its last refresh failed to list
+///   (timeout/error). Last-known-good catalog entries are carried forward when they
+///   exist (and resource subscriptions are preserved, not pruned); if there is no
+///   last-known-good yet, the upstream contributes nothing this cycle but is still
+///   reported degraded rather than healthy.
+/// - `Absent`: the upstream is not in the routed set — removed from config, failed, or
+///   awaiting auth.
+///
+/// This is independent of [`UpstreamMetricsSnapshot::degraded_since_epoch_secs`], which
+/// times *tool-call* degradation, not catalog-listing degradation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Availability {
