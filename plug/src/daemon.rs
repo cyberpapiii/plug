@@ -16,7 +16,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
     CreateMessageRequestParams, CreateMessageResult, PaginatedRequestParams, RequestId,
-    RequestParamsMeta, SubscribeRequestParams, UnsubscribeRequestParams,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
@@ -638,6 +638,36 @@ pub async fn run_daemon(
 
 /// Downstream bridge for IPC proxy clients.
 ///
+/// IPC adapter for the shared `tools/call` dispatcher.
+///
+/// IPC reuses the stdio downstream identity (KTD3 in the dispatcher plan): the
+/// daemon does not yet have its own `DownstreamTransport` variant, so the lazy
+/// session-key namespace stays `stdio:{session_id}` exactly as before. The task
+/// owner is pre-resolved by the shim so the transport-specific `UNKNOWN_SESSION`
+/// error frame is preserved for a task-augmented call whose session vanished.
+struct IpcDownstreamContext {
+    session_id: Arc<str>,
+    request_id: RequestId,
+    client_type: plug_core::types::ClientType,
+    owner: Option<plug_core::tasks::TaskOwner>,
+}
+
+impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
+    fn downstream_call_context(&self) -> plug_core::proxy::DownstreamCallContext {
+        plug_core::proxy::DownstreamCallContext::stdio_for_client(
+            Arc::clone(&self.session_id),
+            self.request_id.clone(),
+            self.client_type,
+        )
+    }
+
+    fn task_owner(&self) -> Result<plug_core::tasks::TaskOwner, McpError> {
+        self.owner.clone().ok_or_else(|| {
+            McpError::internal_error("ipc task owner was not resolved".to_string(), None)
+        })
+    }
+}
+
 /// Forwards reverse requests (elicitation, sampling) from upstream MCP servers
 /// to the IPC proxy client that initiated the tool call. The proxy side listens
 /// on the `reverse_request_rx` end of the channel.
@@ -2180,12 +2210,9 @@ async fn dispatch_mcp_request(
                 }
             };
 
-            if call_params.name.is_empty() {
-                return IpcResponse::Error {
-                    code: "INVALID_PARAMS".to_string(),
-                    message: "tools/call requires non-empty 'name'".to_string(),
-                };
-            }
+            // An empty / unknown tool name is left to the shared dispatcher so all
+            // three transports return the identical router error (ToolNotFound ->
+            // METHOD_NOT_FOUND) rather than IPC short-circuiting with its own frame.
 
             // Build downstream context so the ToolRouter can route reverse
             // requests (elicitation, sampling) back to this IPC client.
@@ -2194,82 +2221,67 @@ async fn dispatch_mcp_request(
                 .client_info(session_id)
                 .map(|info| plug_core::client_detect::detect_client(&info))
                 .unwrap_or(plug_core::types::ClientType::Unknown);
-            let downstream_ctx = {
-                use plug_core::proxy::DownstreamCallContext;
-                use rmcp::model::NumberOrString;
-                // Use a synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
-                // but the context needs one for active call tracking.
-                let request_id = RequestId::from(NumberOrString::String(Arc::from(
-                    format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
-                )));
-                Some(DownstreamCallContext::stdio_for_client(
-                    Arc::from(session_id),
-                    request_id,
-                    client_type,
-                ))
-            };
 
-            if call_params.task.is_some() {
+            // Pre-resolve the task owner so the transport-specific UNKNOWN_SESSION
+            // error frame is preserved for a task-augmented call whose session
+            // vanished (the dispatcher only sees an opaque McpError otherwise).
+            let owner = if call_params.task.is_some() {
                 let Some(client_id) = ctx.client_registry.client_id(session_id) else {
                     return IpcResponse::Error {
                         code: "UNKNOWN_SESSION".to_string(),
                         message: "session not found".to_string(),
                     };
                 };
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                let progress_token = call_params.progress_token();
-                let tool_name = call_params.name.to_string();
-                let arguments = call_params.arguments;
-                match tool_router
-                    .clone()
-                    .enqueue_tool_task(&tool_name, arguments, progress_token, owner, downstream_ctx)
-                    .await
-                {
-                    Ok(result) => match serde_json::to_value(result) {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
-                    Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
-                }
+                Some(plug_core::proxy::ToolRouter::task_owner_for_ipc_client(
+                    &client_id,
+                ))
             } else {
-                // Extract the progress token before moving `arguments`
-                // (partial move forbids a later method call on call_params).
-                // Passing `None` here drops progress on non-task IPC calls,
-                // diverging from the stdio path which forwards it.
-                let progress_token = call_params.progress_token();
-                match tool_router
-                    .call_tool_with_context(
-                        &call_params.name,
-                        call_params.arguments,
-                        progress_token,
-                        downstream_ctx,
-                    )
-                    .await
-                {
-                    Ok(result) => match serde_json::to_value(result) {
+                None
+            };
+
+            // Synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
+            // but the context needs one for active call tracking.
+            let request_id = RequestId::from(rmcp::model::NumberOrString::String(Arc::from(
+                format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
+            )));
+            let downstream_ctx = IpcDownstreamContext {
+                session_id: Arc::from(session_id),
+                request_id,
+                client_type,
+                owner,
+            };
+
+            match plug_core::dispatch::dispatch_tools_call(
+                tool_router,
+                &downstream_ctx,
+                call_params,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let payload = match outcome {
+                        plug_core::dispatch::ToolCallOutcome::Called(result) => {
+                            serde_json::to_value(result)
+                        }
+                        plug_core::dispatch::ToolCallOutcome::TaskCreated(result) => {
+                            serde_json::to_value(result)
+                        }
+                    };
+                    match payload {
                         Ok(payload) => IpcResponse::McpResponse { payload },
                         Err(e) => IpcResponse::Error {
                             code: "SERIALIZE_ERROR".to_string(),
                             message: e.to_string(),
                         },
-                    },
-                    Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
+                    }
                 }
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
             }
         }
 
@@ -3682,5 +3694,575 @@ mod tests {
             }
             other => panic!("expected LoggingNotification, got: {other:?}"),
         }
+    }
+
+    // ── IPC end-to-end test harness (U5) ─────────────────────────────────────
+    //
+    // Boots a daemon-backed engine with a stdio mock upstream over a TEMPORARY
+    // Unix socket and drives real `tools/call` round-trips through the actual
+    // `handle_ipc_connection` server loop. This is the only end-to-end IPC test
+    // path in the workspace — daemon internals are private to this binary crate,
+    // so it (and the cross-transport parity matrix that builds on it) must live
+    // here rather than in plug-core's integration tests.
+    //
+    // Each harness binds a unique temp socket and touches no global runtime path,
+    // so it is safe under the parallel test suite without the runtime-paths lock.
+
+    /// Build a stdio mock-upstream `ServerConfig` exposing `tools` (comma-separated).
+    fn ipc_harness_mock_config(tools: &str) -> plug_core::config::ServerConfig {
+        plug_core::config::ServerConfig {
+            command: Some(
+                plug_test_harness::mock_server_bin()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            args: vec!["--tools".to_string(), tools.to_string()],
+            env: HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 10,
+            call_timeout_secs: 5,
+            max_concurrent: 4,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+        }
+    }
+
+    /// A connected, registered IPC client wired to a real daemon connection loop
+    /// over a temporary socket, with a mock upstream named `mock`.
+    struct IpcTestHarness {
+        engine: Arc<Engine>,
+        cancel: CancellationToken,
+        server_task: Option<tokio::task::JoinHandle<()>>,
+        stream: tokio::net::UnixStream,
+        session_id: String,
+        socket_path: std::path::PathBuf,
+    }
+
+    impl IpcTestHarness {
+        async fn start(tools: &str) -> Self {
+            let mut config = plug_core::config::Config::default();
+            config
+                .servers
+                .insert("mock".to_string(), ipc_harness_mock_config(tools));
+            let engine = Arc::new(Engine::new(config));
+            engine.start().await.expect("engine start");
+
+            // Short unique socket path in /tmp — a Unix socket path must fit in
+            // SUN_LEN (~104 bytes), and the platform temp dir is already long. No
+            // global runtime path is touched, so this is safe under parallel tests.
+            let socket_path = std::path::PathBuf::from(format!(
+                "/tmp/plug-ipc-{}.sock",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            let _ = std::fs::remove_file(&socket_path);
+
+            let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
+            let cancel = CancellationToken::new();
+
+            // Server side: accept exactly one connection and run the real handler.
+            let (client_registry, _count_rx) = ClientRegistry::new();
+            let ctx = ConnectionContext {
+                cancel: cancel.clone(),
+                auth_token: Arc::from("test-token"),
+                server_manager: Arc::clone(engine.server_manager()),
+                engine: Arc::clone(&engine),
+                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
+                started_at: Instant::now(),
+                client_registry: Arc::new(client_registry),
+                http_sessions: None,
+                session_id: None,
+                reverse_request_rx: None,
+            };
+            let server_task = tokio::spawn(async move {
+                if let Ok((stream, _addr)) = listener.accept().await {
+                    let _ = handle_ipc_connection(stream, ctx).await;
+                }
+            });
+
+            // Client side: connect and register to obtain a session id.
+            let mut stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .expect("client connect");
+            write_ipc(
+                &mut stream,
+                &IpcRequest::Register {
+                    protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+                    client_id: uuid::Uuid::new_v4().to_string(),
+                    client_info: Some("plug-test".to_string()),
+                },
+            )
+            .await;
+            let session_id = match read_ipc_response(&mut stream).await {
+                IpcResponse::Registered { session_id, .. } => session_id,
+                other => panic!("expected Registered, got {other:?}"),
+            };
+
+            Self {
+                engine,
+                cancel,
+                server_task: Some(server_task),
+                stream,
+                session_id,
+                socket_path,
+            }
+        }
+
+        /// Issue a `tools/call` and return the raw decoded `IpcResponse`.
+        async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> IpcResponse {
+            self.call_tool_params(serde_json::json!({ "name": name, "arguments": arguments }))
+                .await
+        }
+
+        /// Issue a `tools/call` with caller-provided params (so a `task` field can
+        /// be included) and return the raw decoded `IpcResponse`.
+        async fn call_tool_params(&mut self, params: serde_json::Value) -> IpcResponse {
+            write_ipc(
+                &mut self.stream,
+                &IpcRequest::McpRequest {
+                    session_id: self.session_id.clone(),
+                    method: "tools/call".to_string(),
+                    params: Some(params),
+                },
+            )
+            .await;
+            read_ipc_response(&mut self.stream).await
+        }
+
+        /// Graceful async teardown: cancel the connection loop, join the server
+        /// task, shut the engine down (killing the mock subprocess), and remove the
+        /// socket. Idempotent with `Drop` so a test that asserts before calling this
+        /// still cleans up on panic (via `Drop`), just without the async engine
+        /// shutdown.
+        async fn shutdown(&mut self) {
+            self.cancel.cancel();
+            if let Some(task) = self.server_task.take() {
+                let _ = task.await;
+            }
+            self.engine.shutdown().await;
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    impl Drop for IpcTestHarness {
+        fn drop(&mut self) {
+            // Best-effort synchronous cleanup so a panicking test (e.g. a parity
+            // assertion that fires before `shutdown().await`) does not orphan the
+            // server task or leak the temp socket. The engine's async shutdown can
+            // only run in `shutdown()`; here we cancel + abort to release the task's
+            // engine handle and remove the socket file.
+            self.cancel.cancel();
+            if let Some(task) = self.server_task.take() {
+                task.abort();
+            }
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    async fn write_ipc(stream: &mut tokio::net::UnixStream, req: &IpcRequest) {
+        let payload = serde_json::to_vec(req).expect("serialize ipc request");
+        plug_core::ipc::write_frame(stream, &payload)
+            .await
+            .expect("write frame");
+    }
+
+    /// Read the next non-push `IpcResponse`, skipping any interleaved
+    /// notification frames the daemon may push after registration. Bounded by a
+    /// timeout so a stalled or push-only stream fails the test fast instead of
+    /// hanging indefinitely.
+    async fn read_ipc_response(stream: &mut tokio::net::UnixStream) -> IpcResponse {
+        let deadline = std::time::Duration::from_secs(10);
+        loop {
+            let frame = tokio::time::timeout(deadline, plug_core::ipc::read_frame(stream))
+                .await
+                .expect("timed out waiting for an IPC response frame")
+                .expect("read frame")
+                .expect("unexpected EOF before response");
+            let resp: IpcResponse =
+                serde_json::from_slice(&frame).expect("decode ipc response frame");
+            if is_ipc_push_notification(&resp) {
+                continue;
+            }
+            return resp;
+        }
+    }
+
+    fn is_ipc_push_notification(resp: &IpcResponse) -> bool {
+        matches!(
+            resp,
+            IpcResponse::LoggingNotification { .. }
+                | IpcResponse::ToolListChangedNotification
+                | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::PromptListChangedNotification
+                | IpcResponse::ResourceUpdatedNotification { .. }
+                | IpcResponse::ProgressNotification { .. }
+                | IpcResponse::CancelledNotification { .. }
+        )
+    }
+
+    #[tokio::test]
+    async fn ipc_tools_call_echo_round_trips() {
+        let mut harness = IpcTestHarness::start("echo").await;
+        let resp = harness
+            .call_tool("Mock__echo", serde_json::json!({ "input": "ipc-hello" }))
+            .await;
+        // Tear down before asserting so a failed assertion can't orphan the engine
+        // or mock subprocess (Drop is the backstop; this is the clean path).
+        harness.shutdown().await;
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!("expected McpResponse, got {resp:?}");
+        };
+        let text = payload["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("Called") && text.contains("ipc-hello"),
+            "unexpected echo payload: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_tools_call_unknown_tool_returns_method_not_found() {
+        let mut harness = IpcTestHarness::start("echo").await;
+        let resp = harness
+            .call_tool("Mock__does_not_exist", serde_json::json!({}))
+            .await;
+        harness.shutdown().await;
+        // IPC encodes McpError as McpResponse-with-error payload.
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!("expected McpResponse error payload, got {resp:?}");
+        };
+        // ToolNotFound -> METHOD_NOT_FOUND (-32601).
+        assert_eq!(
+            payload["code"].as_i64(),
+            Some(-32601),
+            "unexpected error payload: {payload}"
+        );
+    }
+
+    // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
+    //
+    // Drives identical tools/call scenarios through the REAL stdio, HTTP, and IPC
+    // downstream transports and asserts identical decoded results and identical
+    // error codes. This is the CI gate that freezes cross-transport parity for the
+    // tools/call method family: a fix or regression that lands on one transport's
+    // shim but not the others fails the assert_eq here.
+    //
+    // Each transport drives its own engine + mock upstream so the only variable is
+    // the downstream transport. Envelopes (HTTP 200-with-error-body, IPC McpResponse
+    // frame, rmcp ServiceError) are normalized to a transport-agnostic ParityOutcome
+    // before comparison.
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ParityOutcome {
+        Success { text: String, is_error: bool },
+        Error { code: i64 },
+    }
+
+    /// Minimal rmcp client handler for driving the stdio transport.
+    struct ParityClient;
+
+    impl rmcp::handler::client::ClientHandler for ParityClient {
+        fn get_info(&self) -> rmcp::model::ClientInfo {
+            rmcp::model::ClientInfo::default()
+        }
+    }
+
+    /// A `tools/call` result JSON is either a `CallToolResult` ({content, isError})
+    /// or a serialized `McpError` ({code, message}). Normalize either to a
+    /// ParityOutcome.
+    fn parity_from_result_json(payload: &serde_json::Value) -> ParityOutcome {
+        if let Some(code) = payload.get("code").and_then(|c| c.as_i64()) {
+            return ParityOutcome::Error { code };
+        }
+        ParityOutcome::Success {
+            text: payload["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            is_error: payload["isError"].as_bool().unwrap_or(false),
+        }
+    }
+
+    fn parity_mock_engine() -> Arc<Engine> {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), ipc_harness_mock_config("echo"));
+        Arc::new(Engine::new(config))
+    }
+
+    /// stdio: drive tools/call through a real ProxyHandler served over a duplex,
+    /// with an rmcp client issuing the call.
+    async fn parity_stdio(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        use rmcp::ServiceExt;
+
+        let engine = parity_mock_engine();
+        engine.start().await.expect("engine start");
+        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            if let Ok(running) = proxy.serve(server_transport).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ParityClient
+            .serve(client_transport)
+            .await
+            .expect("stdio client serve");
+
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        if let Some(obj) = arguments.as_object() {
+            params = params.with_arguments(obj.clone());
+        }
+        let outcome = match client.call_tool(params).await {
+            Ok(result) => parity_from_result_json(&serde_json::to_value(&result).unwrap()),
+            Err(rmcp::service::ServiceError::McpError(m)) => ParityOutcome::Error {
+                code: m.code.0 as i64,
+            },
+            Err(other) => panic!("unexpected stdio service error: {other:?}"),
+        };
+
+        let _ = client.cancel().await;
+        server.abort();
+        engine.shutdown().await;
+        outcome
+    }
+
+    /// HTTP: drive a tools/call through the real axum router (tower oneshot, no
+    /// real port) with the given `params` value and return the raw JSON-RPC
+    /// response. `params` lets callers include a `task` field.
+    async fn http_tools_call_response(params: serde_json::Value) -> serde_json::Value {
+        use tower::ServiceExt as _;
+
+        let engine = parity_mock_engine();
+        engine.start().await.expect("engine start");
+        let state = Arc::new(plug_core::http::server::HttpState {
+            router: engine.tool_router().clone(),
+            sessions: Arc::new(plug_core::http::session::SessionManager::new(1800, 100))
+                as Arc<dyn SessionStore>,
+            cancel: CancellationToken::new(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: std::sync::atomic::AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        let app = plug_core::http::server::build_router(state);
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "parity", "version": "1.0" }
+            }
+        });
+        let init_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&init_body).unwrap(),
+            ))
+            .unwrap();
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .expect("session id header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let call_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": params
+        });
+        let call_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("Mcp-Session-Id", &session_id)
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&call_body).unwrap(),
+            ))
+            .unwrap();
+        let call_resp = app.clone().oneshot(call_req).await.unwrap();
+        let bytes = axum::body::to_bytes(call_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        engine.shutdown().await;
+        json
+    }
+
+    /// HTTP: drive a plain (non-task) tools/call and normalize to a ParityOutcome.
+    async fn parity_http(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        let json =
+            http_tools_call_response(serde_json::json!({ "name": tool, "arguments": arguments }))
+                .await;
+        if let Some(err) = json.get("error") {
+            ParityOutcome::Error {
+                code: err["code"].as_i64().unwrap_or(0),
+            }
+        } else {
+            parity_from_result_json(&json["result"])
+        }
+    }
+
+    /// IPC: drive tools/call through the real daemon socket loop.
+    async fn parity_ipc(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        let mut harness = IpcTestHarness::start("echo").await;
+        let resp = harness.call_tool(tool, arguments).await;
+        harness.shutdown().await;
+        match resp {
+            IpcResponse::McpResponse { payload } => parity_from_result_json(&payload),
+            other => panic!("unexpected IPC response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_tools_call_success_matches_across_transports() {
+        let args = serde_json::json!({ "input": "parity" });
+        let stdio = parity_stdio("Mock__echo", args.clone()).await;
+        let http = parity_http("Mock__echo", args.clone()).await;
+        let ipc = parity_ipc("Mock__echo", args.clone()).await;
+
+        // All three must produce the identical decoded CallToolResult.
+        assert_eq!(stdio, http, "stdio vs http success divergence");
+        assert_eq!(http, ipc, "http vs ipc success divergence");
+        // And it must actually be the echo success, not a coincidental match.
+        match &stdio {
+            ParityOutcome::Success { text, is_error } => {
+                assert!(!is_error, "echo should not be an error result");
+                assert!(
+                    text.contains("Called echo with") && text.contains("parity"),
+                    "unexpected echo text: {text}"
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_tools_call_unknown_tool_matches_across_transports() {
+        let args = serde_json::json!({});
+        let stdio = parity_stdio("Mock__missing", args.clone()).await;
+        let http = parity_http("Mock__missing", args.clone()).await;
+        let ipc = parity_ipc("Mock__missing", args.clone()).await;
+
+        // All three must surface the identical error code (ToolNotFound ->
+        // METHOD_NOT_FOUND, -32601). A transport that diverged here would fail.
+        assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
+        assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
+        assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
+    }
+
+    /// An empty tool name now routes through the shared dispatcher on every
+    /// transport (IPC's old INVALID_PARAMS pre-check was removed), so all three
+    /// return the same router error as any other unknown tool.
+    #[tokio::test]
+    async fn parity_tools_call_empty_name_matches_across_transports() {
+        let args = serde_json::json!({});
+        let stdio = parity_stdio("", args.clone()).await;
+        let http = parity_http("", args.clone()).await;
+        let ipc = parity_ipc("", args.clone()).await;
+
+        assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
+        assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
+        assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
+    }
+
+    /// Documents and locks the intentional task-augmentation divergence between
+    /// transports. The stdio path goes through rmcp's `ServerHandler`, which
+    /// validates the tool's task capability and REJECTS a task-augmented call to a
+    /// non-task tool with INVALID_PARAMS (-32602) before the dispatcher runs. The
+    /// HTTP and IPC paths bypass that rmcp validation and create a plug-side
+    /// passthrough task. This is pre-existing behavior the dispatcher preserves —
+    /// the test pins it so a future change can't silently alter it on one transport.
+    #[tokio::test]
+    async fn parity_task_augmented_call_diverges_stdio_rejects_http_ipc_create_task() {
+        // stdio: rmcp's ServerHandler rejects a task call to a non-task tool.
+        let stdio_err = {
+            use rmcp::ServiceExt;
+            let engine = parity_mock_engine();
+            engine.start().await.expect("engine start");
+            let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+            let (server_transport, client_transport) = tokio::io::duplex(8192);
+            let server = tokio::spawn(async move {
+                if let Ok(running) = proxy.serve(server_transport).await {
+                    let _ = running.waiting().await;
+                }
+            });
+            let client = ParityClient
+                .serve(client_transport)
+                .await
+                .expect("stdio client serve");
+            let mut params = rmcp::model::CallToolRequestParams::new("Mock__echo".to_string());
+            params = params.with_arguments(serde_json::Map::new());
+            params.task = Some(serde_json::Map::new());
+            let err = client
+                .call_tool(params)
+                .await
+                .expect_err("stdio should reject a task call to a non-task tool");
+            let _ = client.cancel().await;
+            server.abort();
+            engine.shutdown().await;
+            err
+        };
+        match stdio_err {
+            rmcp::service::ServiceError::McpError(m) => assert_eq!(
+                m.code.0, -32602,
+                "stdio task rejection should be INVALID_PARAMS"
+            ),
+            other => panic!("unexpected stdio error: {other:?}"),
+        }
+
+        // HTTP: the direct path also creates a plug-side passthrough task.
+        let http_json = http_tools_call_response(serde_json::json!({
+            "name": "Mock__echo",
+            "arguments": {},
+            "task": {}
+        }))
+        .await;
+        // A CreateTaskResult is carried under result.task with a taskId.
+        assert!(
+            http_json["result"].get("task").is_some(),
+            "http task-augmented call should create a task, got {http_json}"
+        );
+
+        // IPC: the direct path creates a plug-side passthrough task.
+        let mut harness = IpcTestHarness::start("echo").await;
+        let ipc_resp = harness
+            .call_tool_params(serde_json::json!({
+                "name": "Mock__echo",
+                "arguments": {},
+                "task": {}
+            }))
+            .await;
+        harness.shutdown().await;
+        let IpcResponse::McpResponse { payload } = ipc_resp else {
+            panic!("expected IPC McpResponse, got {ipc_resp:?}");
+        };
+        // CreateTaskResult carries a `task` object with a taskId.
+        assert!(
+            payload.get("task").is_some(),
+            "ipc task-augmented call should create a task, got {payload}"
+        );
     }
 }

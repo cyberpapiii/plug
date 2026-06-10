@@ -3901,6 +3901,38 @@ fn build_invoke_tool_meta_tool() -> Tool {
     )
 }
 
+/// Stdio adapter for the shared `tools/call` dispatcher. Carries the per-call
+/// identity the dispatcher needs to build a downstream context.
+struct StdioDownstreamContext {
+    client_id: Arc<str>,
+    request_id: RequestId,
+    client_type: ClientType,
+}
+
+impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        DownstreamCallContext::stdio_for_client(
+            Arc::clone(&self.client_id),
+            self.request_id.clone(),
+            self.client_type,
+        )
+    }
+
+    /// stdio's `tools/call` handler can only return a `CallToolResult`, so a
+    /// task-augmented call falls through to the synchronous path (preserving
+    /// today's "task param ignored on stdio" behavior).
+    fn supports_tasks(&self) -> bool {
+        false
+    }
+
+    fn task_owner(&self) -> Result<TaskOwner, McpError> {
+        // Never reached while `supports_tasks()` is false; provided for completeness.
+        Ok(TaskOwner::new(Arc::<str>::from(
+            format!("stdio:{}", self.client_id).as_str(),
+        )))
+    }
+}
+
 /// Stdio-specific bridge for forwarding reverse requests (elicitation, sampling)
 /// back to the downstream client via its `Peer<RoleServer>`.
 struct StdioBridge {
@@ -4393,24 +4425,25 @@ impl ServerHandler for ProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
-            let progress_token = request.progress_token();
             let client_type = self
                 .client_type
                 .read()
                 .map(|ct| *ct)
                 .unwrap_or(ClientType::Unknown);
-            self.router
-                .call_tool_with_context(
-                    request.name.as_ref(),
-                    request.arguments,
-                    progress_token,
-                    Some(DownstreamCallContext::stdio_for_client(
-                        Arc::clone(&self.client_id),
-                        context.id.clone(),
-                        client_type,
-                    )),
-                )
-                .await
+            let ctx = StdioDownstreamContext {
+                client_id: Arc::clone(&self.client_id),
+                request_id: context.id.clone(),
+                client_type,
+            };
+            match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
+                crate::dispatch::ToolCallOutcome::Called(result) => Ok(result),
+                // `supports_tasks()` is false for stdio, so the dispatcher always
+                // takes the synchronous path — a task outcome is unreachable.
+                crate::dispatch::ToolCallOutcome::TaskCreated(_) => Err(McpError::internal_error(
+                    "stdio tools/call unexpectedly produced a task result".to_string(),
+                    None,
+                )),
+            }
         }
     }
 
@@ -6428,6 +6461,126 @@ mod tests {
             NotificationTarget::Stdio {
                 client_id: Arc::from("client-a"),
             },
+        );
+    }
+
+    // ── dispatch::dispatch_tools_call characterization (U1) ──────────────────
+    //
+    // These pin the shared adapter's contract before the three transports are
+    // migrated onto it (U2/U3/U4). End-to-end behavior across every transport is
+    // covered by the integration suites and the parity matrix (U6); here we prove
+    // the sync/task branch decision and error propagation in isolation.
+
+    /// Mock transport context for exercising `dispatch_tools_call` without a live
+    /// transport. `supports_tasks` is configurable so we can prove the task-gate.
+    struct MockDownstream {
+        supports_tasks: bool,
+    }
+
+    impl crate::dispatch::DownstreamContext for MockDownstream {
+        fn downstream_call_context(&self) -> DownstreamCallContext {
+            DownstreamCallContext::stdio_for_client(
+                Arc::<str>::from("test-client"),
+                RequestId::from(NumberOrString::Number(1)),
+                ClientType::Unknown,
+            )
+        }
+
+        fn supports_tasks(&self) -> bool {
+            self.supports_tasks
+        }
+
+        fn task_owner(&self) -> Result<TaskOwner, McpError> {
+            Ok(TaskOwner::new(Arc::<str>::from("test-owner")))
+        }
+    }
+
+    /// Build a router with a single route to a server that has no registered
+    /// upstream. The sync path then fails with `ServerUnavailable`, while the task
+    /// path falls through to a local passthrough task and succeeds — making the two
+    /// branches observably distinct.
+    fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+        let mut routes = HashMap::new();
+        routes.insert(
+            "Mock__tool".to_string(),
+            ("mock-server".to_string(), "tool".to_string()),
+        );
+        router.cache.store(Arc::new(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        }));
+        router
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
+        let router = router_with_unrouted_single_route();
+        let ctx = MockDownstream {
+            supports_tasks: true,
+        };
+        let params = CallToolRequestParams::new("");
+
+        let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect_err("empty tool name must error");
+
+        // Canonical shape: an unknown/empty tool name routes to ToolNotFound
+        // (the stdio/HTTP behavior, now shared), which maps to METHOD_NOT_FOUND.
+        assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
+        let router = router_with_unrouted_single_route();
+        let ctx = MockDownstream {
+            supports_tasks: true,
+        };
+        let mut params = CallToolRequestParams::new("Mock__tool");
+        params.task = Some(serde_json::Map::new());
+
+        let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect("task-augmented call should enqueue a local passthrough task");
+
+        assert!(
+            matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
+            "expected TaskCreated outcome, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
+        let router = router_with_unrouted_single_route();
+        // stdio-like: cannot return a task result, so a task-augmented call must
+        // fall through to the synchronous path (preserving today's behavior).
+        let ctx = MockDownstream {
+            supports_tasks: false,
+        };
+        let mut params = CallToolRequestParams::new("Mock__tool");
+        params.task = Some(serde_json::Map::new());
+
+        // expect_err is itself the branch-distinction proof: the task path returns
+        // Ok(TaskCreated) (see the sibling test), so an Err means the sync path ran.
+        let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect_err("sync path with no upstream must error, not create a task");
+
+        // And it is specifically the sync path's no-upstream ServerUnavailable error.
+        assert!(
+            err.message.to_lowercase().contains("unavailable"),
+            "expected a sync-path ServerUnavailable error, got {err:?}"
         );
     }
 }

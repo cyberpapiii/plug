@@ -64,6 +64,32 @@ pub struct HttpState {
     pub client_capabilities: DashMap<String, ClientCapabilities>,
 }
 
+/// HTTP adapter for the shared `tools/call` dispatcher. Carries the per-call
+/// session identity, request id, and trace id the dispatcher needs.
+struct HttpDownstreamContext {
+    session_id: Arc<str>,
+    request_id: RequestId,
+    client_type: crate::types::ClientType,
+    trace_id: Arc<str>,
+}
+
+impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        DownstreamCallContext::http_for_client_with_trace(
+            Arc::clone(&self.session_id),
+            self.request_id.clone(),
+            self.client_type,
+            Arc::clone(&self.trace_id),
+        )
+    }
+
+    fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
+        Ok(crate::tasks::TaskOwner::new(Arc::<str>::from(
+            format!("http:{}", self.session_id).as_str(),
+        )))
+    }
+}
+
 /// HTTP-specific bridge for forwarding reverse requests (elicitation, sampling)
 /// to a downstream HTTP client via its SSE stream.
 struct HttpBridge {
@@ -1276,64 +1302,31 @@ async fn handle_request(
                 .sessions
                 .get_client_type(&session_id)
                 .unwrap_or(crate::types::ClientType::Unknown);
-            let progress_token = call_req.params.progress_token();
-            let owner =
-                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
-            let downstream = DownstreamCallContext::http_for_client_with_trace(
-                Arc::<str>::from(session_id.as_str()),
-                request_id.clone(),
+            let ctx = HttpDownstreamContext {
+                session_id: Arc::<str>::from(session_id.as_str()),
+                request_id: request_id.clone(),
                 client_type,
-                Arc::clone(&trace_id),
-            );
-            if call_req.params.task.is_some() {
-                match state
-                    .router
-                    .clone()
-                    .enqueue_tool_task(
-                        call_req.params.name.as_ref(),
-                        call_req.params.arguments,
-                        progress_token,
-                        owner,
-                        Some(downstream),
-                    )
+                trace_id: Arc::clone(&trace_id),
+            };
+            let response_msg =
+                match crate::dispatch::dispatch_tools_call(&state.router, &ctx, call_req.params)
                     .await
                 {
-                    Ok(result) => {
-                        let response_msg = ServerJsonRpcMessage::response(
-                            ServerResult::CreateTaskResult(result),
-                            request_id,
-                        );
-                        json_response(&response_msg)
-                    }
-                    Err(mcp_err) => {
-                        let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                        json_response(&response_msg)
-                    }
-                }
-            } else {
-                match state
-                    .router
-                    .call_tool_with_context(
-                        call_req.params.name.as_ref(),
-                        call_req.params.arguments,
-                        progress_token,
-                        Some(downstream),
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        let response_msg = ServerJsonRpcMessage::response(
+                    Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
+                        ServerJsonRpcMessage::response(
                             ServerResult::CallToolResult(result),
                             request_id,
-                        );
-                        json_response(&response_msg)
+                        )
                     }
-                    Err(mcp_err) => {
-                        let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                        json_response(&response_msg)
+                    Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
+                        ServerJsonRpcMessage::response(
+                            ServerResult::CreateTaskResult(result),
+                            request_id,
+                        )
                     }
-                }
-            }
+                    Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
+                };
+            json_response(&response_msg)
         }
 
         ClientRequest::ListTasksRequest(list_req) => {

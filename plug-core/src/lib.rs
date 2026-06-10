@@ -6,6 +6,7 @@ pub mod branding;
 pub mod circuit;
 pub mod client_detect;
 pub mod config;
+pub mod dispatch;
 pub mod doctor;
 pub mod dotenv;
 pub mod downstream_oauth;
