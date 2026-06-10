@@ -769,6 +769,7 @@ mod tests {
             auth_status: "required".to_string(),
             upstream: None,
             metrics: None,
+            availability: Default::default(),
             last_seen: None,
         }];
         let json = status_json(
@@ -822,6 +823,7 @@ mod tests {
                 degraded_since_epoch_secs: Some(1_700_000_000),
                 circuit_state: "open".to_string(),
             }),
+            availability: plug_core::types::Availability::Degraded,
             last_seen: None,
         }];
         let json = status_json(
@@ -841,6 +843,8 @@ mod tests {
         assert_eq!(m["last_latency_ms"], 42);
         assert_eq!(m["degraded_since_epoch_secs"], 1_700_000_000_u64);
         assert_eq!(m["circuit_state"], "open");
+        // Availability rides the same per-server JSON contract.
+        assert_eq!(json["servers"][0]["availability"], "degraded");
     }
 
     #[test]

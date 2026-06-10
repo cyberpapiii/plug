@@ -835,6 +835,7 @@ mod tests {
                     auth_status: "none".to_string(),
                     upstream: None,
                     metrics: None,
+                    availability: Default::default(),
                     last_seen: None,
                 },
                 ServerStatus {
@@ -844,6 +845,7 @@ mod tests {
                     auth_status: "none".to_string(),
                     upstream: None,
                     metrics: None,
+                    availability: Default::default(),
                     last_seen: None,
                 },
                 ServerStatus {
@@ -853,6 +855,7 @@ mod tests {
                     auth_status: "oauth".to_string(),
                     upstream: None,
                     metrics: None,
+                    availability: Default::default(),
                     last_seen: None,
                 },
             ],
@@ -884,6 +887,7 @@ mod tests {
                     auth_status: "none".to_string(),
                     upstream: None,
                     metrics: None,
+                    availability: Default::default(),
                     last_seen: None,
                 },
                 ServerStatus {
@@ -893,6 +897,7 @@ mod tests {
                     auth_status: "oauth".to_string(),
                     upstream: None,
                     metrics: None,
+                    availability: Default::default(),
                     last_seen: None,
                 },
             ],

@@ -1237,9 +1237,23 @@ impl ToolRouter {
     /// swapped atomically to prevent torn reads.
     pub async fn refresh_tools(&self) {
         let upstream_tools = self.server_manager.get_tools().await;
-        let upstream_resources = self.server_manager.get_resources().await;
-        let upstream_resource_templates = self.server_manager.get_resource_templates().await;
-        let upstream_prompts = self.server_manager.get_prompts().await;
+        let resources_result = self.server_manager.get_resources().await;
+        let resource_templates_result = self.server_manager.get_resource_templates().await;
+        let prompts_result = self.server_manager.get_prompts().await;
+
+        // Recompute per-server availability from this cycle's listing outcomes.
+        // A server served from last-known-good cache (its live listing was
+        // unavailable) is degraded; its carried-forward entries below keep its
+        // URI set unchanged, so the subscription prune logic leaves it untouched.
+        let mut degraded_servers = std::collections::BTreeSet::new();
+        degraded_servers.extend(resources_result.degraded.iter().cloned());
+        degraded_servers.extend(resource_templates_result.degraded.iter().cloned());
+        degraded_servers.extend(prompts_result.degraded.iter().cloned());
+        self.server_manager.update_availability(&degraded_servers);
+
+        let upstream_resources = resources_result.items;
+        let upstream_resource_templates = resource_templates_result.items;
+        let upstream_prompts = prompts_result.items;
 
         // ── Pass 1: classify, sanitize, and try keyword stripping ──
         // Each entry: (server_name, tool, prefix, stripped_name, full_name, matched_keyword)
@@ -1988,6 +2002,13 @@ impl ToolRouter {
 
     pub fn list_resources(&self) -> Arc<Vec<Resource>> {
         Arc::clone(&self.cache.load().resources_all)
+    }
+
+    /// Number of resource URIs with at least one active downstream subscriber.
+    /// Read-side observability; also lets tests assert that a degraded upstream's
+    /// subscriptions survive a catalog refresh rather than being pruned.
+    pub fn active_subscription_count(&self) -> usize {
+        self.resource_subscriptions.len()
     }
 
     pub fn list_resources_page(

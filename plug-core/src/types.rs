@@ -100,6 +100,64 @@ mod tests {
         use super::ServerHealth;
         assert!(!ServerHealth::AuthRequired.is_routable());
     }
+
+    #[test]
+    fn availability_serializes_lowercase() {
+        use super::Availability;
+        assert_eq!(
+            serde_json::to_value(Availability::Healthy).unwrap(),
+            serde_json::json!("healthy")
+        );
+        assert_eq!(
+            serde_json::to_value(Availability::Degraded).unwrap(),
+            serde_json::json!("degraded")
+        );
+        assert_eq!(
+            serde_json::to_value(Availability::Absent).unwrap(),
+            serde_json::json!("absent")
+        );
+    }
+
+    #[test]
+    fn availability_default_is_healthy() {
+        use super::Availability;
+        assert_eq!(Availability::default(), Availability::Healthy);
+    }
+
+    #[test]
+    fn server_status_missing_availability_deserializes_as_healthy() {
+        use super::{Availability, ServerHealth, ServerStatus};
+        // An older daemon's JSON without the `availability` key must still
+        // deserialize (schema stability), defaulting to healthy.
+        let json = serde_json::json!({
+            "server_id": "legacy",
+            "health": "Healthy",
+            "tool_count": 3,
+            "auth_status": "none"
+        });
+        let status: ServerStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status.availability, Availability::Healthy);
+        assert_eq!(status.health, ServerHealth::Healthy);
+    }
+
+    #[test]
+    fn server_status_roundtrips_degraded_availability() {
+        use super::{Availability, ServerHealth, ServerStatus};
+        let status = ServerStatus {
+            server_id: "imessage".to_string(),
+            health: ServerHealth::Healthy,
+            tool_count: 1,
+            auth_status: "none".to_string(),
+            upstream: None,
+            metrics: None,
+            availability: Availability::Degraded,
+            last_seen: None,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["availability"], serde_json::json!("degraded"));
+        let back: ServerStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(back.availability, Availability::Degraded);
+    }
 }
 
 /// Known AI client types that connect to plug.
@@ -266,6 +324,26 @@ impl ServerHealth {
     }
 }
 
+/// Catalog availability of an upstream, distinct from connection health.
+///
+/// Where [`ServerHealth`] tracks the connection's health-check state, `Availability`
+/// describes what the merged catalog currently serves for this upstream:
+///
+/// - `Healthy`: the last catalog refresh listed this upstream's resources/prompts live.
+/// - `Degraded`: the last refresh failed to list (timeout/error) but the upstream is
+///   still routable, so its last-known-good catalog entries are being carried forward
+///   (and its resource subscriptions are preserved, not pruned).
+/// - `Absent`: the upstream contributes nothing to the merged catalog — removed from
+///   config, or failing with no last-known-good to carry forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Availability {
+    #[default]
+    Healthy,
+    Degraded,
+    Absent,
+}
+
 /// Tracked health state with consecutive failure counting for state machine transitions.
 ///
 /// State machine:
@@ -368,6 +446,12 @@ pub struct ServerStatus {
     /// set. The key is always present so the agent-facing schema is stable.
     #[serde(default)]
     pub metrics: Option<UpstreamMetricsSnapshot>,
+    /// Catalog availability — whether the merged catalog entries for this upstream
+    /// are live (`healthy`), carried-forward last-known-good after a failed listing
+    /// (`degraded`), or absent. Additive with a default so the agent-facing schema
+    /// stays stable: an older daemon's JSON without the key deserializes as `healthy`.
+    #[serde(default)]
+    pub availability: Availability,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }

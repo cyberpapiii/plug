@@ -327,6 +327,7 @@ mod tests {
             tool_count: 0,
             upstream: None,
             metrics: None,
+            availability: Default::default(),
             last_seen: None,
         }
     }
