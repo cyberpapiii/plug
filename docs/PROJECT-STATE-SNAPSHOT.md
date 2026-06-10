@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #57 (upstream MCP icon passthrough + client-visible Plug icon assets) and the post-merge truth pass (lazy tool discovery v2)
+Baseline: `main` after PR #58 (code-review stabilization batch) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -98,6 +98,17 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed the code-review stabilization batch via PR #58:
+
+- daemon IPC `tools/call` now forwards `_meta.progressToken`, making the progress-routing parity claim above genuinely true for the default `plug connect` path (it previously dropped the token on the non-task path)
+- bounded per-server resource/prompt listing in `refresh_tools` by `call_timeout_secs`, so a connected-but-stalled upstream can no longer freeze the catalog refresh
+- guarded `notification_refresh_in_progress` with an RAII drop guard plus a backstop timeout, so a panic or cancellation cannot permanently wedge `list_changed` delivery
+- fixed a DashMap deadlock when reading a TTL-expired artifact, and made `read_chunk_text` read a single chunk instead of the whole payload
+- `plug server edit --output json` now performs the edit instead of printing the unedited config; `plug doctor` exits with its computed code (1 = fail, 2 = warn) for agent/CI gating
+- removed dead `sighup_reload` / `resource_subscription_count`; corrected stale `rmcp` / `serde` version claims across the docs
+
+Known residual (tracked follow-up, not yet on `main`): a transient listing timeout substitutes an empty result, which can prune and upstream-unsubscribe an active resource subscription on a stalled server without rebinding on recovery; and the ≥16MB artifact write is still synchronous (not yet `spawn_blocking`). Neither is a roadmap blocker.
 
 On 2026-03-22, `main` absorbed the core MCP Tasks tranche and related follow-through work that:
 
