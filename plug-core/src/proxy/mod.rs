@@ -6571,16 +6571,16 @@ mod tests {
         let mut params = CallToolRequestParams::new("Mock__tool");
         params.task = Some(serde_json::Map::new());
 
+        // expect_err is itself the branch-distinction proof: the task path returns
+        // Ok(TaskCreated) (see the sibling test), so an Err means the sync path ran.
         let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
             .await
             .expect_err("sync path with no upstream must error, not create a task");
 
-        // The sync path with no registered upstream errors ServerUnavailable —
-        // proving the task branch was NOT taken.
+        // And it is specifically the sync path's no-upstream ServerUnavailable error.
         assert!(
-            err.message.to_lowercase().contains("unavailable")
-                || err.code == ErrorCode::INTERNAL_ERROR,
-            "expected a sync-path unavailable error, got {err:?}"
+            err.message.to_lowercase().contains("unavailable"),
+            "expected a sync-path ServerUnavailable error, got {err:?}"
         );
     }
 }

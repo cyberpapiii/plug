@@ -3745,7 +3745,7 @@ mod tests {
     struct IpcTestHarness {
         engine: Arc<Engine>,
         cancel: CancellationToken,
-        server_task: tokio::task::JoinHandle<()>,
+        server_task: Option<tokio::task::JoinHandle<()>>,
         stream: tokio::net::UnixStream,
         session_id: String,
         socket_path: std::path::PathBuf,
@@ -3813,7 +3813,7 @@ mod tests {
             Self {
                 engine,
                 cancel,
-                server_task,
+                server_task: Some(server_task),
                 stream,
                 session_id,
                 socket_path,
@@ -3841,11 +3841,32 @@ mod tests {
             read_ipc_response(&mut self.stream).await
         }
 
-        async fn shutdown(self) {
+        /// Graceful async teardown: cancel the connection loop, join the server
+        /// task, shut the engine down (killing the mock subprocess), and remove the
+        /// socket. Idempotent with `Drop` so a test that asserts before calling this
+        /// still cleans up on panic (via `Drop`), just without the async engine
+        /// shutdown.
+        async fn shutdown(&mut self) {
             self.cancel.cancel();
-            drop(self.stream);
-            let _ = self.server_task.await;
+            if let Some(task) = self.server_task.take() {
+                let _ = task.await;
+            }
             self.engine.shutdown().await;
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    impl Drop for IpcTestHarness {
+        fn drop(&mut self) {
+            // Best-effort synchronous cleanup so a panicking test (e.g. a parity
+            // assertion that fires before `shutdown().await`) does not orphan the
+            // server task or leak the temp socket. The engine's async shutdown can
+            // only run in `shutdown()`; here we cancel + abort to release the task's
+            // engine handle and remove the socket file.
+            self.cancel.cancel();
+            if let Some(task) = self.server_task.take() {
+                task.abort();
+            }
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
@@ -3858,11 +3879,15 @@ mod tests {
     }
 
     /// Read the next non-push `IpcResponse`, skipping any interleaved
-    /// notification frames the daemon may push after registration.
+    /// notification frames the daemon may push after registration. Bounded by a
+    /// timeout so a stalled or push-only stream fails the test fast instead of
+    /// hanging indefinitely.
     async fn read_ipc_response(stream: &mut tokio::net::UnixStream) -> IpcResponse {
+        let deadline = std::time::Duration::from_secs(10);
         loop {
-            let frame = plug_core::ipc::read_frame(stream)
+            let frame = tokio::time::timeout(deadline, plug_core::ipc::read_frame(stream))
                 .await
+                .expect("timed out waiting for an IPC response frame")
                 .expect("read frame")
                 .expect("unexpected EOF before response");
             let resp: IpcResponse =
@@ -3893,6 +3918,9 @@ mod tests {
         let resp = harness
             .call_tool("Mock__echo", serde_json::json!({ "input": "ipc-hello" }))
             .await;
+        // Tear down before asserting so a failed assertion can't orphan the engine
+        // or mock subprocess (Drop is the backstop; this is the clean path).
+        harness.shutdown().await;
         let IpcResponse::McpResponse { payload } = resp else {
             panic!("expected McpResponse, got {resp:?}");
         };
@@ -3901,7 +3929,6 @@ mod tests {
             text.contains("Called") && text.contains("ipc-hello"),
             "unexpected echo payload: {payload}"
         );
-        harness.shutdown().await;
     }
 
     #[tokio::test]
@@ -3910,6 +3937,7 @@ mod tests {
         let resp = harness
             .call_tool("Mock__does_not_exist", serde_json::json!({}))
             .await;
+        harness.shutdown().await;
         // IPC encodes McpError as McpResponse-with-error payload.
         let IpcResponse::McpResponse { payload } = resp else {
             panic!("expected McpResponse error payload, got {resp:?}");
@@ -3920,7 +3948,6 @@ mod tests {
             Some(-32601),
             "unexpected error payload: {payload}"
         );
-        harness.shutdown().await;
     }
 
     // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
@@ -4012,8 +4039,10 @@ mod tests {
         outcome
     }
 
-    /// HTTP: drive tools/call through the real axum router via tower oneshot.
-    async fn parity_http(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+    /// HTTP: drive a tools/call through the real axum router (tower oneshot, no
+    /// real port) with the given `params` value and return the raw JSON-RPC
+    /// response. `params` lets callers include a `task` field.
+    async fn http_tools_call_response(params: serde_json::Value) -> serde_json::Value {
         use tower::ServiceExt as _;
 
         let engine = parity_mock_engine();
@@ -4063,7 +4092,7 @@ mod tests {
 
         let call_body = serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments }
+            "params": params
         });
         let call_req = axum::http::Request::builder()
             .method("POST")
@@ -4082,7 +4111,14 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         engine.shutdown().await;
+        json
+    }
 
+    /// HTTP: drive a plain (non-task) tools/call and normalize to a ParityOutcome.
+    async fn parity_http(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
+        let json =
+            http_tools_call_response(serde_json::json!({ "name": tool, "arguments": arguments }))
+                .await;
         if let Some(err) = json.get("error") {
             ParityOutcome::Error {
                 code: err["code"].as_i64().unwrap_or(0),
@@ -4184,6 +4220,19 @@ mod tests {
             ),
             other => panic!("unexpected stdio error: {other:?}"),
         }
+
+        // HTTP: the direct path also creates a plug-side passthrough task.
+        let http_json = http_tools_call_response(serde_json::json!({
+            "name": "Mock__echo",
+            "arguments": {},
+            "task": {}
+        }))
+        .await;
+        // A CreateTaskResult is carried under result.task with a taskId.
+        assert!(
+            http_json["result"].get("task").is_some(),
+            "http task-augmented call should create a task, got {http_json}"
+        );
 
         // IPC: the direct path creates a plug-side passthrough task.
         let mut harness = IpcTestHarness::start("echo").await;
