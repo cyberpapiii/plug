@@ -2210,12 +2210,9 @@ async fn dispatch_mcp_request(
                 }
             };
 
-            if call_params.name.is_empty() {
-                return IpcResponse::Error {
-                    code: "INVALID_PARAMS".to_string(),
-                    message: "tools/call requires non-empty 'name'".to_string(),
-                };
-            }
+            // An empty / unknown tool name is left to the shared dispatcher so all
+            // three transports return the identical router error (ToolNotFound ->
+            // METHOD_NOT_FOUND) rather than IPC short-circuiting with its own frame.
 
             // Build downstream context so the ToolRouter can route reverse
             // requests (elicitation, sampling) back to this IPC client.
@@ -4171,6 +4168,21 @@ mod tests {
 
         // All three must surface the identical error code (ToolNotFound ->
         // METHOD_NOT_FOUND, -32601). A transport that diverged here would fail.
+        assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
+        assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
+        assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
+    }
+
+    /// An empty tool name now routes through the shared dispatcher on every
+    /// transport (IPC's old INVALID_PARAMS pre-check was removed), so all three
+    /// return the same router error as any other unknown tool.
+    #[tokio::test]
+    async fn parity_tools_call_empty_name_matches_across_transports() {
+        let args = serde_json::json!({});
+        let stdio = parity_stdio("", args.clone()).await;
+        let http = parity_http("", args.clone()).await;
+        let ipc = parity_ipc("", args.clone()).await;
+
         assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
         assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
         assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
