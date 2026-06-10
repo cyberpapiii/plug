@@ -16,7 +16,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
     CreateMessageRequestParams, CreateMessageResult, PaginatedRequestParams, RequestId,
-    RequestParamsMeta, SubscribeRequestParams, UnsubscribeRequestParams,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
@@ -638,6 +638,36 @@ pub async fn run_daemon(
 
 /// Downstream bridge for IPC proxy clients.
 ///
+/// IPC adapter for the shared `tools/call` dispatcher.
+///
+/// IPC reuses the stdio downstream identity (KTD3 in the dispatcher plan): the
+/// daemon does not yet have its own `DownstreamTransport` variant, so the lazy
+/// session-key namespace stays `stdio:{session_id}` exactly as before. The task
+/// owner is pre-resolved by the shim so the transport-specific `UNKNOWN_SESSION`
+/// error frame is preserved for a task-augmented call whose session vanished.
+struct IpcDownstreamContext {
+    session_id: Arc<str>,
+    request_id: RequestId,
+    client_type: plug_core::types::ClientType,
+    owner: Option<plug_core::tasks::TaskOwner>,
+}
+
+impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
+    fn downstream_call_context(&self) -> plug_core::proxy::DownstreamCallContext {
+        plug_core::proxy::DownstreamCallContext::stdio_for_client(
+            Arc::clone(&self.session_id),
+            self.request_id.clone(),
+            self.client_type,
+        )
+    }
+
+    fn task_owner(&self) -> Result<plug_core::tasks::TaskOwner, McpError> {
+        self.owner.clone().ok_or_else(|| {
+            McpError::internal_error("ipc task owner was not resolved".to_string(), None)
+        })
+    }
+}
+
 /// Forwards reverse requests (elicitation, sampling) from upstream MCP servers
 /// to the IPC proxy client that initiated the tool call. The proxy side listens
 /// on the `reverse_request_rx` end of the channel.
@@ -2194,82 +2224,67 @@ async fn dispatch_mcp_request(
                 .client_info(session_id)
                 .map(|info| plug_core::client_detect::detect_client(&info))
                 .unwrap_or(plug_core::types::ClientType::Unknown);
-            let downstream_ctx = {
-                use plug_core::proxy::DownstreamCallContext;
-                use rmcp::model::NumberOrString;
-                // Use a synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
-                // but the context needs one for active call tracking.
-                let request_id = RequestId::from(NumberOrString::String(Arc::from(
-                    format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
-                )));
-                Some(DownstreamCallContext::stdio_for_client(
-                    Arc::from(session_id),
-                    request_id,
-                    client_type,
-                ))
-            };
 
-            if call_params.task.is_some() {
+            // Pre-resolve the task owner so the transport-specific UNKNOWN_SESSION
+            // error frame is preserved for a task-augmented call whose session
+            // vanished (the dispatcher only sees an opaque McpError otherwise).
+            let owner = if call_params.task.is_some() {
                 let Some(client_id) = ctx.client_registry.client_id(session_id) else {
                     return IpcResponse::Error {
                         code: "UNKNOWN_SESSION".to_string(),
                         message: "session not found".to_string(),
                     };
                 };
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                let progress_token = call_params.progress_token();
-                let tool_name = call_params.name.to_string();
-                let arguments = call_params.arguments;
-                match tool_router
-                    .clone()
-                    .enqueue_tool_task(&tool_name, arguments, progress_token, owner, downstream_ctx)
-                    .await
-                {
-                    Ok(result) => match serde_json::to_value(result) {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
-                    Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
-                }
+                Some(plug_core::proxy::ToolRouter::task_owner_for_ipc_client(
+                    &client_id,
+                ))
             } else {
-                // Extract the progress token before moving `arguments`
-                // (partial move forbids a later method call on call_params).
-                // Passing `None` here drops progress on non-task IPC calls,
-                // diverging from the stdio path which forwards it.
-                let progress_token = call_params.progress_token();
-                match tool_router
-                    .call_tool_with_context(
-                        &call_params.name,
-                        call_params.arguments,
-                        progress_token,
-                        downstream_ctx,
-                    )
-                    .await
-                {
-                    Ok(result) => match serde_json::to_value(result) {
+                None
+            };
+
+            // Synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
+            // but the context needs one for active call tracking.
+            let request_id = RequestId::from(rmcp::model::NumberOrString::String(Arc::from(
+                format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
+            )));
+            let downstream_ctx = IpcDownstreamContext {
+                session_id: Arc::from(session_id),
+                request_id,
+                client_type,
+                owner,
+            };
+
+            match plug_core::dispatch::dispatch_tools_call(
+                tool_router,
+                &downstream_ctx,
+                call_params,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let payload = match outcome {
+                        plug_core::dispatch::ToolCallOutcome::Called(result) => {
+                            serde_json::to_value(result)
+                        }
+                        plug_core::dispatch::ToolCallOutcome::TaskCreated(result) => {
+                            serde_json::to_value(result)
+                        }
+                    };
+                    match payload {
                         Ok(payload) => IpcResponse::McpResponse { payload },
                         Err(e) => IpcResponse::Error {
                             code: "SERIALIZE_ERROR".to_string(),
                             message: e.to_string(),
                         },
-                    },
-                    Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
+                    }
                 }
+                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
+                    Ok(payload) => IpcResponse::McpResponse { payload },
+                    Err(e) => IpcResponse::Error {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                    },
+                },
             }
         }
 
