@@ -62,6 +62,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         http_auth,
         oauth_config,
         oauth_tokens,
+        codesign,
     ) = tokio::join!(
         check_config_exists(config_path),
         check_config_permissions(config, config_path),
@@ -75,6 +76,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_http_auth(config),
         check_oauth_config(config),
         check_oauth_tokens(config),
+        check_codesign_identity(config),
     );
 
     // Server connectivity is sequential-ish internally but we run it after the rest
@@ -94,6 +96,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         http_auth,
         oauth_config,
         oauth_tokens,
+        codesign,
     ];
 
     DoctorReport::from_checks(checks)
@@ -1068,6 +1071,92 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     }
 }
 
+/// macOS only: warn when the running binary is ad-hoc signed *and* keychain-backed
+/// OAuth upstreams are configured, because the macOS Keychain "Always Allow" ACL
+/// binds to the binary's signature and an ad-hoc signature changes on every
+/// rebuild — so macOS re-prompts for Keychain access constantly. A stable
+/// self-signed identity (via `plug codesign-setup`) makes the approval persist.
+async fn check_codesign_identity(config: &Config) -> CheckResult {
+    let name = "codesign_identity".to_string();
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config;
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "Not macOS — code-signing does not affect Keychain prompts here".to_string(),
+            fix_suggestion: None,
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let oauth_count = config
+            .servers
+            .iter()
+            .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+            .count();
+
+        if oauth_count == 0 {
+            return CheckResult {
+                name,
+                status: CheckStatus::Pass,
+                message: "No keychain-backed OAuth upstreams configured".to_string(),
+                fix_suggestion: None,
+            };
+        }
+
+        match self_is_adhoc_or_unsigned() {
+            Some(true) => CheckResult {
+                name,
+                status: CheckStatus::Warn,
+                message: format!(
+                    "plug is ad-hoc signed, so macOS re-prompts for Keychain access on every rebuild ({oauth_count} OAuth upstream(s) affected)"
+                ),
+                fix_suggestion: Some(
+                    "Run `plug codesign-setup` once to install a stable self-signed code-signing identity so the Keychain \"Always Allow\" approval persists across rebuilds.".to_string(),
+                ),
+            },
+            Some(false) => CheckResult {
+                name,
+                status: CheckStatus::Pass,
+                message: "plug has a stable code-signing identity; Keychain approvals persist"
+                    .to_string(),
+                fix_suggestion: None,
+            },
+            None => CheckResult {
+                name,
+                status: CheckStatus::Pass,
+                message: "Code-signing status could not be determined".to_string(),
+                fix_suggestion: None,
+            },
+        }
+    }
+}
+
+/// Returns `Some(true)` if this binary is ad-hoc signed or unsigned, `Some(false)`
+/// if it carries a real signing authority, or `None` if codesign output was
+/// unrecognized. macOS only.
+#[cfg(target_os = "macos")]
+fn self_is_adhoc_or_unsigned() -> Option<bool> {
+    let exe = std::env::current_exe().ok()?;
+    // codesign writes the display info to stderr.
+    let out = std::process::Command::new("codesign")
+        .arg("-dvv")
+        .arg(&exe)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    if text.contains("adhoc") || text.contains("not signed") {
+        Some(true)
+    } else if text.contains("Authority=") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1574,6 +1663,6 @@ mod tests {
     async fn run_doctor_returns_all_checks() {
         let config = test_config();
         let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 13);
+        assert_eq!(report.checks.len(), 14);
     }
 }

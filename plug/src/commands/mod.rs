@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub(crate) mod clients;
+pub(crate) mod codesign;
 pub(crate) mod config;
 pub(crate) mod misc;
 pub(crate) mod servers;

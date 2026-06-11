@@ -219,6 +219,9 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+    #[command(display_order = 20)]
+    /// macOS: install a stable code-signing identity so Keychain prompts stop recurring
+    CodesignSetup,
 }
 
 #[derive(Subcommand)]
@@ -479,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
+        Some(Commands::CodesignSetup) => commands::codesign::cmd_codesign_setup(&cli.output)?,
     }
 
     Ok(())
