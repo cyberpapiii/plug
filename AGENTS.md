@@ -36,6 +36,8 @@ If unsure, prefer `exists off-main` or `missing`, never `done on main`.
 
 CE remains the operating system. In this repo, doc roles are:
 
+- shared vocabulary:
+  - `CONCEPTS.md` — shared domain vocabulary (entities, named processes, status concepts); relevant when orienting to the codebase or discussing domain concepts
 - current truth:
   - `docs/PROJECT-STATE-SNAPSHOT.md`
   - `docs/PLAN.md`
@@ -46,7 +48,7 @@ CE remains the operating system. In this repo, doc roles are:
 - intended work:
   - `docs/plans/*.md`
 - historical / compound knowledge:
-  - `docs/solutions/*.md`
+  - `docs/solutions/*.md` — searchable store of documented solutions (bugs, best practices, design patterns) by category, with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in a documented area
   - `docs/research/*.md`
   - older phase plans
 - tracked issues:

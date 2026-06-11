@@ -48,3 +48,12 @@ control-plane work.
 - existing router debounce coverage now protects the health-triggered refresh
   path too
 - full workspace tests pass after the change
+
+## Related
+
+- `design-patterns/backoff-reset-requires-sustained-recovery.md` — a companion
+  health-loop-recovery principle from the later active-supervision work: a
+  restart/backoff governor's reset must be gated on *sustained* recovery, because
+  the restart action itself transiently restores the healthy signal. Same domain
+  (don't let a transient health signal re-trigger recovery work), different
+  primitive (backoff-reset timing here vs. debounce + recovery-task dedup above).
