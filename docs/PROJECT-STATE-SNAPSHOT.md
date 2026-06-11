@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #64 (cross-transport parity gate extended to the whole MCP method surface + IPC encode consolidation — finishing the parity deliverable of program item 1) and its post-merge truth pass
+Baseline: `main` after PR #65 (ToolRouter god-object decomposition — `proxy/mod.rs` split 6,586 → 2,464 lines into cohesive seam modules, move-only) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -102,6 +102,8 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed PR #65 — the `ToolRouter` god-object decomposition (program item 1's "decompose along seams" corollary). `plug-core/src/proxy/mod.rs` was split **6,586 → 2,464 lines (63%)** into six cohesive child modules: `proxy/{tests,handler,tasks,completion,subscriptions,catalog}.rs`, each an `impl super::ToolRouter` block. Move-only, zero behavior change — proven by the unchanged full workspace suite (490+169+43) and the cross-transport parity matrix. The genuinely-coupled core stays in `mod.rs` by design: the struct + shared types, the routing engine (`call_tool*`/`call_tool_inner`/`handle_*`), the notification/active-call methods (they share the four `*_lookup` maps), and the cross-cutting `refresh_tools`. Remaining program work: the `DownstreamTransport::Ipc` identity split (KTD3) and active upstream supervision (item 2b / R10) — the next two PRs.
 
 On 2026-06-10, `main` absorbed PR #64 (program item 1, requirement R8) — finishing the cross-transport parity deliverable across the **entire MCP method surface** plus IPC encode consolidation. Scope correction verified during planning: unlike `tools/call`, every other method family is already a single shared `ToolRouter` call behind thin per-transport shells (no progress/task/reverse-request complexity), so the value here is parity coverage + encode de-duplication, not a `DownstreamContext` trait migration:
 
