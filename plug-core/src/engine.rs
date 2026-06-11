@@ -365,12 +365,15 @@ impl Engine {
         let config = self.config();
         let (health, consecutive_failures) = self.server_manager.health_streak(server_name);
         let circuit_open = self.server_manager.circuit_open(server_name);
-        let secs_since_last_restart = self.server_manager.last_restart_epoch(server_name).map(|e| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs().saturating_sub(e))
-                .unwrap_or(0)
-        });
+        let secs_since_last_restart =
+            self.server_manager
+                .last_restart_epoch(server_name)
+                .map(|e| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs().saturating_sub(e))
+                        .unwrap_or(0)
+                });
         let attempts = self
             .supervision_attempts
             .get(server_name)
@@ -385,17 +388,50 @@ impl Engine {
         )
     }
 
-    /// Record that a supervised restart is being attempted: stamp the metric and
-    /// grow the per-server backoff attempt counter.
-    pub(crate) fn note_supervised_restart(&self, server_name: &str) {
+    /// Stamp a restart in the metrics + backoff clock. Called for ANY recovery
+    /// episode (crash/disconnect, Failed-health, or supervised) so the backoff
+    /// clock is consistent: a crash-recovery suppresses an immediate supervised
+    /// restart, and `restart_count` reflects every actual restart.
+    pub(crate) fn note_restart(&self, server_name: &str) {
         self.server_manager.record_restart(server_name);
+    }
+
+    /// Grow the supervised-restart backoff attempt counter (supervised episodes
+    /// only — crash/Failed recoveries stamp the clock but do not escalate it).
+    pub(crate) fn grow_supervision_backoff(&self, server_name: &str) {
         *self
             .supervision_attempts
             .entry(server_name.to_string())
             .or_insert(0) += 1;
     }
 
-    /// Reset a server's supervised-restart backoff after it returns to healthy.
+    /// Convenience for a supervised restart: stamp the clock/metric AND grow the
+    /// escalating backoff.
+    pub(crate) fn note_supervised_restart(&self, server_name: &str) {
+        self.note_restart(server_name);
+        self.grow_supervision_backoff(server_name);
+    }
+
+    /// Whether enough time has passed since the last restart to consider the
+    /// upstream genuinely recovered and clear the escalating backoff. A brief
+    /// post-restart healthy blip (before the upstream re-degrades) is NOT settled,
+    /// so a flapping upstream's backoff keeps escalating instead of resetting to
+    /// the floor every cycle.
+    pub(crate) fn supervision_settled(&self, server_name: &str) -> bool {
+        let max = self.config().supervision.max_restart_interval_secs;
+        match self.server_manager.last_restart_epoch(server_name) {
+            None => true,
+            Some(epoch) => {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs().saturating_sub(epoch))
+                    .unwrap_or(0)
+                    >= max
+            }
+        }
+    }
+
+    /// Reset a server's supervised-restart backoff after it has stably recovered.
     pub(crate) fn reset_supervision(&self, server_name: &str) {
         self.supervision_attempts.remove(server_name);
     }
@@ -1308,7 +1344,16 @@ mod tests {
             "should not immediately re-restart within the backoff window"
         );
 
-        // Recovery to healthy clears the backoff attempt counter.
+        // A brief post-restart healthy blip must NOT be treated as settled (the
+        // restart clock is seconds old, far short of max_restart_interval), so a
+        // flapping upstream keeps its escalating backoff instead of resetting to
+        // the floor — the storm-prevention fix.
+        assert!(
+            !engine.supervision_settled("imessage"),
+            "a just-restarted server is not yet stably recovered"
+        );
+
+        // A healthy server is never *due* regardless of restart history.
         sm.health.insert(
             "imessage".to_string(),
             HealthState {
@@ -1316,9 +1361,10 @@ mod tests {
                 consecutive_failures: 0,
             },
         );
-        engine.reset_supervision("imessage");
-        // A healthy server is never due regardless of restart history.
         assert!(!engine.supervision_due("imessage"));
+
+        // An upstream that has never been restarted is trivially settled.
+        assert!(engine.supervision_settled("never-restarted"));
     }
 
     /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain

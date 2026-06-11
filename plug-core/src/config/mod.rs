@@ -560,7 +560,15 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                     .to_string(),
             );
         }
-        if config.supervision.max_restart_interval_secs < config.supervision.min_restart_interval_secs
+        if config.supervision.min_restart_interval_secs == 0 {
+            errors.push(
+                "supervision.min_restart_interval_secs must be >= 1 when supervision is enabled \
+                 (0 disables the backoff entirely)"
+                    .to_string(),
+            );
+        }
+        if config.supervision.max_restart_interval_secs
+            < config.supervision.min_restart_interval_secs
         {
             errors.push(
                 "supervision.max_restart_interval_secs must be >= min_restart_interval_secs"
@@ -1132,8 +1140,31 @@ mod tests {
         config.supervision.max_restart_interval_secs = 10;
         config.supervision.min_restart_interval_secs = 60;
         let errors = validate_config(&config);
-        assert!(errors.iter().any(|e| e.contains("degraded_restart_threshold")));
-        assert!(errors.iter().any(|e| e.contains("max_restart_interval_secs")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("degraded_restart_threshold"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("max_restart_interval_secs"))
+        );
+    }
+
+    #[test]
+    fn supervision_config_validation_rejects_zero_min_interval() {
+        // A zero floor would disable the backoff entirely (0 * 2^n = 0) and let a
+        // degraded upstream restart on every health tick.
+        let mut config = Config::default();
+        config.supervision.min_restart_interval_secs = 0;
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("min_restart_interval_secs")),
+            "zero min interval must be rejected: {errors:?}"
+        );
     }
 
     /// Helper to load a Config from a TOML string merged over defaults.

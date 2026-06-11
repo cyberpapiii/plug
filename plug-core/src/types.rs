@@ -436,8 +436,9 @@ pub struct UpstreamMetricsSnapshot {
     pub degraded_since_epoch_secs: Option<u64>,
     /// Circuit-breaker state: `"closed"`, `"open"`, or `"half-open"`.
     pub circuit_state: String,
-    /// How many times the supervisor has restarted this upstream since start
-    /// (item 2b). Always present; `0` for a never-restarted upstream.
+    /// How many times this upstream has been restarted since start by recovery
+    /// or supervision (item 2b). Always present; `0` for a never-restarted
+    /// upstream.
     #[serde(default)]
     pub restart_count: u64,
     /// Unix epoch seconds of the most recent supervised restart; serialized as
