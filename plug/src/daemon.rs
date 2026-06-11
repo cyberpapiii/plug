@@ -654,7 +654,7 @@ struct IpcDownstreamContext {
 
 impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
     fn downstream_call_context(&self) -> plug_core::proxy::DownstreamCallContext {
-        plug_core::proxy::DownstreamCallContext::stdio_for_client(
+        plug_core::proxy::DownstreamCallContext::ipc_for_client(
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
@@ -812,7 +812,7 @@ async fn handle_ipc_connection(
     if let Some(ref session_id) = ctx.session_id {
         let removed_client_id = ctx.client_registry.client_id(session_id);
         ctx.client_registry.deregister(session_id);
-        let target = plug_core::notifications::NotificationTarget::Stdio {
+        let target = plug_core::notifications::NotificationTarget::Ipc {
             client_id: std::sync::Arc::from(session_id.as_str()),
         };
         ctx.engine
@@ -830,7 +830,7 @@ async fn handle_ipc_connection(
         }
         ctx.engine.tool_router().remove_client_log_level(session_id);
         let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Stdio,
+            plug_core::proxy::DownstreamTransport::Ipc,
             session_id,
         );
         ctx.engine
@@ -1161,7 +1161,7 @@ async fn send_ipc_control_notification(
         Ok(ProtocolNotification::ToolListChangedFor { target }) => {
             if matches!(
                 target,
-                NotificationTarget::Stdio { client_id: ref target_id }
+                NotificationTarget::Ipc { client_id: ref target_id }
                     if session_id.is_some_and(|sid| target_id.as_ref() == sid)
             ) {
                 ipc::send_response(writer, &IpcResponse::ToolListChangedNotification)
@@ -1177,7 +1177,7 @@ async fn send_ipc_control_notification(
         Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
             if matches!(
                 target,
-                NotificationTarget::Stdio { client_id: ref target_id }
+                NotificationTarget::Ipc { client_id: ref target_id }
                     if session_id.is_some_and(|sid| target_id.as_ref() == sid)
             ) {
                 let notif = IpcResponse::ResourceUpdatedNotification {
@@ -1195,7 +1195,7 @@ async fn send_ipc_control_notification(
             // Only forward if this notification targets our session
             if matches!(
                 target,
-                NotificationTarget::Stdio { client_id: ref target_id }
+                NotificationTarget::Ipc { client_id: ref target_id }
                     if session_id.is_some_and(|sid| target_id.as_ref() == sid)
             ) {
                 let notif = IpcResponse::ProgressNotification {
@@ -1207,7 +1207,7 @@ async fn send_ipc_control_notification(
         Ok(ProtocolNotification::Cancelled { target, params }) => {
             if matches!(
                 target,
-                NotificationTarget::Stdio { client_id: ref target_id }
+                NotificationTarget::Ipc { client_id: ref target_id }
                     if session_id.is_some_and(|sid| target_id.as_ref() == sid)
             ) {
                 let notif = IpcResponse::CancelledNotification {
@@ -1432,7 +1432,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     new_session_id = %registration.session_id,
                     "client transport session replaced"
                 );
-                let target = plug_core::notifications::NotificationTarget::Stdio {
+                let target = plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from(replaced_session_id.as_str()),
                 };
                 ctx.engine
@@ -1452,7 +1452,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     .tool_router()
                     .remove_client_log_level(replaced_session_id);
                 let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                    plug_core::proxy::DownstreamTransport::Stdio,
+                    plug_core::proxy::DownstreamTransport::Ipc,
                     replaced_session_id,
                 );
                 ctx.engine
@@ -1472,7 +1472,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 client_registry: Arc::clone(&ctx.client_registry),
             });
             ctx.engine.tool_router().register_downstream_bridge(
-                plug_core::notifications::NotificationTarget::Stdio {
+                plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from(session_id.as_str()),
                 },
                 bridge,
@@ -1502,7 +1502,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
             let removed_client_id = ctx.client_registry.client_id(session_id);
             ctx.client_registry.deregister(session_id);
-            let target = plug_core::notifications::NotificationTarget::Stdio {
+            let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: std::sync::Arc::from(session_id.as_str()),
             };
             ctx.engine
@@ -1520,7 +1520,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
             ctx.engine.tool_router().remove_client_log_level(session_id);
             let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                plug_core::proxy::DownstreamTransport::Stdio,
+                plug_core::proxy::DownstreamTransport::Ipc,
                 session_id,
             );
             ctx.engine
@@ -1698,7 +1698,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
             match serde_json::from_value::<Vec<rmcp::model::Root>>(roots.clone()) {
                 Ok(parsed_roots) => {
-                    let target = plug_core::notifications::NotificationTarget::Stdio {
+                    let target = plug_core::notifications::NotificationTarget::Ipc {
                         client_id: std::sync::Arc::from(session_id.as_str()),
                     };
                     if ctx
@@ -2023,7 +2023,7 @@ async fn dispatch_mcp_request(
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                plug_core::proxy::DownstreamTransport::Stdio,
+                plug_core::proxy::DownstreamTransport::Ipc,
                 session_id,
             );
             let result = tool_router.list_tools_page_for_client_session(
@@ -2317,7 +2317,7 @@ async fn dispatch_mcp_request(
                         };
                     }
                 };
-            let target = plug_core::notifications::NotificationTarget::Stdio {
+            let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: Arc::from(session_id),
             };
             // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
@@ -2347,7 +2347,7 @@ async fn dispatch_mcp_request(
                     };
                 }
             };
-            let target = plug_core::notifications::NotificationTarget::Stdio {
+            let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: Arc::from(session_id),
             };
             // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
@@ -3301,7 +3301,7 @@ mod tests {
     async fn control_notification_routes_targeted_tool_list_changed() {
         let matching = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::ToolListChangedFor {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: std::sync::Arc::from("sess-1"),
                 },
             },
@@ -3315,7 +3315,7 @@ mod tests {
 
         let non_matching = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::ToolListChangedFor {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: std::sync::Arc::from("sess-2"),
                 },
             },
@@ -3346,7 +3346,7 @@ mod tests {
     async fn control_notification_forwards_resource_updated_for_matching_session() {
         let matching = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::ResourceUpdated {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from("sess-42"),
                 },
                 params: rmcp::model::ResourceUpdatedNotificationParam::new(
@@ -3366,7 +3366,7 @@ mod tests {
 
         let non_matching = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::ResourceUpdated {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from("sess-other"),
                 },
                 params: rmcp::model::ResourceUpdatedNotificationParam::new(
@@ -3410,7 +3410,7 @@ mod tests {
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Progress {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from("sess-42"),
                 },
                 params,
@@ -3444,7 +3444,7 @@ mod tests {
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Progress {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from("sess-OTHER"),
                 },
                 params,
@@ -3470,7 +3470,7 @@ mod tests {
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Cancelled {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from("sess-7"),
                 },
                 params,
@@ -3498,7 +3498,7 @@ mod tests {
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Cancelled {
-                target: plug_core::notifications::NotificationTarget::Stdio {
+                target: plug_core::notifications::NotificationTarget::Ipc {
                     client_id: Arc::from("sess-OTHER"),
                 },
                 params,
