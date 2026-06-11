@@ -425,6 +425,15 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
         async move {
+            // Gate on the capability flag, consistent with list_prompts /
+            // get_prompt / list_resource_templates — so an upstream that did not
+            // advertise completions does not silently answer completion requests.
+            if !self.completions {
+                return Err(McpError::invalid_request(
+                    "completions capability not enabled",
+                    None,
+                ));
+            }
             let completion = CompletionInfo::with_all_values(vec!["mock_completion".to_string()])
                 .expect("single completion value is within the MCP max");
             Ok(CompleteResult::new(completion))

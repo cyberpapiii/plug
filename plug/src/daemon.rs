@@ -3845,6 +3845,15 @@ mod tests {
             panic!("expected McpResponse, got {resp:?}");
         };
         assert_eq!(payload, serde_json::json!({ "a": 1 }));
+
+        // A value that fails serialization (a map with non-string tuple keys)
+        // takes the SERIALIZE_ERROR fallback frame rather than an McpResponse.
+        let mut unserializable = std::collections::BTreeMap::new();
+        unserializable.insert((1_i32, 2_i32), 3_i32);
+        match ipc_ok(unserializable) {
+            IpcResponse::Error { code, .. } => assert_eq!(code, "SERIALIZE_ERROR"),
+            other => panic!("expected SERIALIZE_ERROR frame, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4073,7 +4082,10 @@ mod tests {
 
     /// IPC: drive tools/call through the real daemon socket loop.
     async fn parity_ipc(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
-        let mut harness = IpcTestHarness::start("echo").await;
+        // Use the same full-capability upstream config as the stdio/HTTP parity
+        // drivers (parity_mock_engine) so all three transports share an identical
+        // upstream and the only variable in a parity row is the transport.
+        let mut harness = IpcTestHarness::start_full().await;
         let resp = harness.call_tool(tool, arguments).await;
         harness.shutdown().await;
         match resp {
@@ -4123,7 +4135,13 @@ mod tests {
     /// `McpError` over the same channel) to a `MethodOutcome`. A top-level integer
     /// `code` marks an error; none of the routed result types carry one.
     fn method_outcome_from_payload(payload: &serde_json::Value) -> MethodOutcome {
-        if let Some(code) = payload.get("code").and_then(|c| c.as_i64()) {
+        // A serialized McpError carries BOTH a top-level integer `code` and a
+        // string `message`. Requiring both (not `code` alone) keeps a future
+        // result type that happens to expose a top-level integer `code` from
+        // being misclassified as an error.
+        let code = payload.get("code").and_then(|c| c.as_i64());
+        let has_message = payload.get("message").and_then(|m| m.as_str()).is_some();
+        if let (Some(code), true) = (code, has_message) {
             return MethodOutcome::Error { code };
         }
         MethodOutcome::Result(canonicalize_json(payload))
@@ -4172,6 +4190,21 @@ mod tests {
             };
         }
 
+        // subscribe/unsubscribe return EmptyResult on the wire; the typed rmcp
+        // client discards it to `()`, so normalize Ok to the canonical empty-ok
+        // ({}) that HTTP (EmptyResult) and IPC (json!({})) also produce.
+        macro_rules! outcome_unit {
+            ($call:expr) => {
+                match $call.await {
+                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
+                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                        code: m.code.0 as i64,
+                    },
+                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
+                }
+            };
+        }
+
         let outcome = match method {
             "tools/list" => outcome!(client.list_tools(parity_paginated(&params))),
             "resources/list" => outcome!(client.list_resources(parity_paginated(&params))),
@@ -4186,32 +4219,11 @@ mod tests {
             "completion/complete" => {
                 outcome!(client.complete(serde_json::from_value(params).unwrap()))
             }
-            // subscribe/unsubscribe return EmptyResult on the wire; the typed rmcp
-            // client discards it to `()`, so normalize to the canonical empty-ok
-            // ({}) that HTTP (EmptyResult) and IPC (json!({})) also produce.
             "resources/subscribe" => {
-                match client
-                    .subscribe(serde_json::from_value(params).unwrap())
-                    .await
-                {
-                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
-                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
-                        code: m.code.0 as i64,
-                    },
-                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
-                }
+                outcome_unit!(client.subscribe(serde_json::from_value(params).unwrap()))
             }
             "resources/unsubscribe" => {
-                match client
-                    .unsubscribe(serde_json::from_value(params).unwrap())
-                    .await
-                {
-                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
-                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
-                        code: m.code.0 as i64,
-                    },
-                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
-                }
+                outcome_unit!(client.unsubscribe(serde_json::from_value(params).unwrap()))
             }
             other => panic!("unsupported parity method for stdio: {other}"),
         };
@@ -4474,8 +4486,11 @@ mod tests {
         // Unknown URI is rejected by the shared router before any upstream call,
         // so all three transports must surface the identical error code.
         let params = serde_json::json!({ "uri": "file:///does/not/exist" });
+        // assert_parity already proves the three transports agree on the code;
+        // pin the absolute value too (InvalidRequest -> -32600) so a uniform
+        // drift to a different-but-equal code can't pass silently.
         match assert_parity("resources/read", params).await {
-            MethodOutcome::Error { .. } => {}
+            MethodOutcome::Error { code } => assert_eq!(code, -32600, "unknown-uri error code"),
             other => panic!("expected resources/read error, got {other:?}"),
         }
     }
@@ -4514,8 +4529,10 @@ mod tests {
     #[tokio::test]
     async fn parity_prompts_get_unknown_matches_across_transports() {
         let params = serde_json::json!({ "name": "Mock__nonexistent" });
+        // Pin the absolute code (InvalidRequest -> -32600) in addition to the
+        // cross-transport agreement assert_parity enforces.
         match assert_parity("prompts/get", params).await {
-            MethodOutcome::Error { .. } => {}
+            MethodOutcome::Error { code } => assert_eq!(code, -32600, "unknown-prompt error code"),
             other => panic!("expected prompts/get error, got {other:?}"),
         }
     }
