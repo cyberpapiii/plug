@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #66 (first-class `DownstreamTransport::Ipc` identity — ends the IPC `Stdio` masquerade, KTD3) and its post-merge truth pass
+Baseline: `main` after PR #67 (active upstream supervision — restart-on-degradation, item 2b / R10) and its post-merge truth pass. **The 2026-06-10 operability/hardening program is now fully landed** (PRs #60–#67).
 
 This is the canonical current-state doc for the project.
 
@@ -102,6 +102,8 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed PR #67 — active upstream supervision (item 2b / R10), the final program item. When an upstream stays degraded past a threshold (sustained health-check failures **or** an open circuit breaker — the connected-but-failing case the existing Failed-recovery path doesn't reach, e.g. the iMessage continuation leak), the daemon supervises a bounded restart (process restart for stdio, reconnect-with-reset for HTTP/SSE) instead of waiting for a manual one. A `SupervisionConfig` (enabled by default, conservative thresholds) drives a pure `should_restart` decision with an exponential inter-episode backoff (capped) so a perpetually-failing upstream can't storm; restarts surface additively in `plug status --output json` (`restart_count`, `last_restart_epoch_secs`). An adversarial + reliability review found and this PR fixed four storm vectors (backoff defeated by reset-on-healthy-blip → now gated on stable recovery; zero-min-interval rejected in validation; backoff reset on reload; unified restart accounting). With this, the **2026-06-10 operability/hardening program is complete**: degraded-vs-absent model (#61), transport dispatcher + whole-surface parity gate (#63/#64), ToolRouter god-object decomposition (#65), IPC identity split (#66), and supervision (#67).
 
 On 2026-06-10, `main` absorbed PR #66 — the `DownstreamTransport::Ipc` identity split (KTD3, the last dispatcher-deferred item). Daemon IPC clients no longer masquerade as `Stdio`: they now have a first-class `DownstreamTransport::Ipc`, an `ipc:{id}` lazy-session-key namespace, a `DownstreamCallContext::ipc_for_client` constructor, and `NotificationTarget::Ipc`. Every `daemon.rs` IPC site (reverse-request context, the notification-forwarding match, the `tools/list` lazy key, subscribe/unsubscribe targets, disconnect/replace cleanup, roots, bridge registration) was switched to `Ipc`; the in-process `StdioBridge` keeps `Stdio`. A stdio and an IPC client sharing an id no longer collide in the lazy working-set map. Behavior-affecting (internal namespace + target variant only; no wire change) — an 8-property correctness review and an adversarial dropped-notification/leak/wrong-delivery review both returned zero findings; guarded by the parity matrix + the IPC notification-delivery e2e tests (now exercising the `Ipc` target). Only active upstream supervision (item 2b / R10) remains.
 
