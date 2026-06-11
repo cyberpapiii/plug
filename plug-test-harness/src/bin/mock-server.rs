@@ -41,6 +41,19 @@ struct Args {
     #[arg(long, default_value_t = false)]
     resources: bool,
 
+    /// Expose one mock resource template (requires `--resources` so the
+    /// resources capability is advertised and plug lists templates).
+    #[arg(long, default_value_t = false)]
+    resource_templates: bool,
+
+    /// Advertise the prompts capability and expose one mock prompt.
+    #[arg(long, default_value_t = false)]
+    prompts: bool,
+
+    /// Advertise the completions capability and answer completion requests.
+    #[arg(long, default_value_t = false)]
+    completions: bool,
+
     /// When this file exists, `list_resources` returns an error — simulating a
     /// transient listing failure so tests can drive the degraded carry-forward
     /// path on demand (create the file, refresh; remove it, refresh to recover).
@@ -60,6 +73,9 @@ struct MockServer {
     fail_mode: String,
     reverse_request: String,
     resources: bool,
+    resource_templates: bool,
+    prompts: bool,
+    completions: bool,
     list_fail_flag_file: Option<String>,
     list_empty_flag_file: Option<String>,
 }
@@ -95,6 +111,14 @@ impl ServerHandler for MockServer {
                 subscribe: Some(true),
                 list_changed: Some(true),
             });
+        }
+        if self.prompts {
+            capabilities.prompts = Some(PromptsCapability {
+                list_changed: Some(false),
+            });
+        }
+        if self.completions {
+            capabilities.completions = Some(serde_json::Map::new());
         }
 
         InitializeResult::new(capabilities)
@@ -336,6 +360,78 @@ impl ServerHandler for MockServer {
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
         async move { Ok(()) }
     }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        async move {
+            if !self.resource_templates {
+                return Ok(ListResourceTemplatesResult::with_all_items(vec![]));
+            }
+            Ok(ListResourceTemplatesResult::with_all_items(vec![
+                RawResourceTemplate::new("file:///tmp/mock-templates/{id}.txt", "mock_template")
+                    .with_title("Mock Template")
+                    .with_description("Mock resource template")
+                    .with_mime_type("text/plain")
+                    .no_annotation(),
+            ]))
+        }
+    }
+
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
+        async move {
+            if !self.prompts {
+                return Ok(ListPromptsResult::with_all_items(vec![]));
+            }
+            Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+                "mock_prompt",
+                Some("Mock prompt fixture"),
+                Some(vec![
+                    PromptArgument::new("topic").with_description("Topic to expand"),
+                ]),
+            )]))
+        }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+        async move {
+            if !self.prompts || request.name != "mock_prompt" {
+                return Err(McpError::invalid_params(
+                    format!("prompt not found: {}", request.name),
+                    None,
+                ));
+            }
+            Ok(
+                GetPromptResult::new(vec![PromptMessage::new_text(
+                    PromptMessageRole::User,
+                    "mock prompt body",
+                )])
+                .with_description("Mock prompt fixture"),
+            )
+        }
+    }
+
+    fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        async move {
+            let completion = CompletionInfo::with_all_values(vec!["mock_completion".to_string()])
+                .expect("single completion value is within the MCP max");
+            Ok(CompleteResult::new(completion))
+        }
+    }
 }
 
 #[tokio::main]
@@ -372,6 +468,9 @@ async fn main() -> anyhow::Result<()> {
         fail_mode: args.fail_mode,
         reverse_request: args.reverse_request,
         resources: args.resources,
+        resource_templates: args.resource_templates,
+        prompts: args.prompts,
+        completions: args.completions,
         list_fail_flag_file: args.list_fail_flag_file,
         list_empty_flag_file: args.list_empty_flag_file,
     };
