@@ -68,3 +68,14 @@ A login-session process inherits the approved Keychain ACL for `plug`, so the OA
 - **Never `kill` the daemon while `plug connect` clients are live** — it triggers a competing-daemon storm. Restart the host apps instead, or accept that the connects must re-converge.
 - **Concurrent daemon starts also race OAuth `refresh_token` exchanges** (refresh tokens are single-use/rotating), which can invalidate stored tokens and force a re-auth. One more reason to keep daemon startup single-instance and session-scoped.
 - Latent robustness gap worth a follow-up: a keychain-backed upstream that blocks should not hang daemon startup before the socket binds — bounding/deferring upstream connects (or binding the socket first) would make startup resilient to a hung OAuth read.
+
+## Related
+
+- `local-codesigning-identity-stops-keychain-reprompts.md` — the companion half of
+  "the macOS Keychain ACL is keyed to the plug binary's signing identity." This
+  doc relies on a login-session process inheriting the *approved* Keychain ACL;
+  that doc explains *why the approval kept evaporating* (the ad-hoc binary
+  signature changes on every rebuild, so the ACL never carries forward) and how a
+  stable self-signed code-signing identity fixes it. Signing reduces the
+  re-approval friction but does **not** replace the login-session requirement
+  above — a detached/sandboxed process still blocks on the Keychain read.

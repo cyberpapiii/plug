@@ -66,6 +66,23 @@ fi
 echo "==> Installing plug to $CARGO_BIN_DIR"
 cargo install --path plug --force --locked
 
+# On macOS, re-sign with the stable self-signed identity so the Keychain
+# "Always Allow" ACL persists across rebuilds (a bare install is ad-hoc signed,
+# whose signature changes every build and re-triggers Keychain prompts).
+# See scripts/setup-codesigning.sh and
+# docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  SIGN_IDENTITY="Plug Local Signing"
+  if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
+    echo "==> Code-signing plug with '$SIGN_IDENTITY'"
+    codesign --force -s "$SIGN_IDENTITY" "$CARGO_PLUG"
+    codesign -dv --verbose=2 "$CARGO_PLUG" 2>&1 | grep -E 'Authority' || true
+  else
+    echo "==> Note: '$SIGN_IDENTITY' identity not found — binary stays ad-hoc signed."
+    echo "    Run ./scripts/setup-codesigning.sh once to stop repeated macOS Keychain prompts."
+  fi
+fi
+
 mkdir -p "$LOCAL_BIN_DIR"
 
 if [[ -L "$LOCAL_PLUG" ]]; then

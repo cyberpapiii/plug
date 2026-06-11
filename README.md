@@ -46,6 +46,22 @@ To clean generated build artifacts after reinstalling:
 ./scripts/dev-reinstall.sh --quick --clean
 ```
 
+### macOS: stop repeated Keychain prompts (one-time)
+
+plug stores upstream OAuth credentials in the macOS login Keychain. A
+locally-built binary is ad-hoc signed, and its signature changes on every
+rebuild, so the Keychain "Always Allow" approval never persists and macOS
+re-prompts constantly. Run this once per machine to give plug a stable
+self-signed code-signing identity:
+
+```sh
+./scripts/setup-codesigning.sh
+```
+
+It is idempotent (no-ops on non-macOS, skips if already set up). Afterward,
+`./scripts/dev-reinstall.sh` re-signs automatically on every rebuild. Details:
+`docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md`.
+
 ### Release installers
 
 After a release is cut, install with Homebrew:
