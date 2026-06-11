@@ -4301,6 +4301,30 @@ mod tests {
             "completion/complete" => {
                 outcome!(client.complete(serde_json::from_value(params).unwrap()))
             }
+            // subscribe/unsubscribe return EmptyResult on the wire; the typed rmcp
+            // client discards it to `()`, so normalize to the canonical empty-ok
+            // ({}) that HTTP (EmptyResult) and IPC (json!({})) also produce.
+            "resources/subscribe" => {
+                match client.subscribe(serde_json::from_value(params).unwrap()).await {
+                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
+                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                        code: m.code.0 as i64,
+                    },
+                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
+                }
+            }
+            "resources/unsubscribe" => {
+                match client
+                    .unsubscribe(serde_json::from_value(params).unwrap())
+                    .await
+                {
+                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
+                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                        code: m.code.0 as i64,
+                    },
+                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
+                }
+            }
             other => panic!("unsupported parity method for stdio: {other}"),
         };
 
@@ -4631,5 +4655,38 @@ mod tests {
             }
             other => panic!("expected completion result, got {other:?}"),
         }
+    }
+
+    // ── Subscribe/unsubscribe lifecycle parity (U4) ──────────────────────────
+    //
+    // The three transports encode an empty success differently (stdio's typed
+    // client discards it to `()`, HTTP returns EmptyResult, IPC returns json!({})).
+    // The drivers normalize all three to the canonical empty-ok ({}), so these
+    // rows prove the divergent encodings are equivalent. Each call is a fresh
+    // session, so the unsubscribe row also exercises the idempotent (not-currently-
+    // subscribed) path.
+
+    fn assert_empty_ok(outcome: MethodOutcome, label: &str) {
+        match outcome {
+            MethodOutcome::Result(json) => assert!(
+                json.as_object().is_some_and(|o| o.is_empty()),
+                "{label} should be empty-ok ({{}}), got {json}"
+            ),
+            other => panic!("{label} expected empty-ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_subscribe_matches_across_transports() {
+        let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
+        let outcome = assert_parity("resources/subscribe", params).await;
+        assert_empty_ok(outcome, "subscribe");
+    }
+
+    #[tokio::test]
+    async fn parity_resources_unsubscribe_matches_across_transports() {
+        let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
+        let outcome = assert_parity("resources/unsubscribe", params).await;
+        assert_empty_ok(outcome, "unsubscribe");
     }
 }
