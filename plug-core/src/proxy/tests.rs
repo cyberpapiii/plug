@@ -1851,6 +1851,39 @@ fn test_downstream_context_notification_target() {
     );
 }
 
+/// The IPC identity split (KTD3): an IPC downstream context has a first-class
+/// `Ipc` notification target and an `ipc:` lazy-session-key namespace, distinct
+/// from the `Stdio` masquerade it replaced. A stdio and an IPC client with the
+/// same id now resolve to different lazy buckets and different targets — the
+/// correctness win the split delivers.
+#[test]
+fn ipc_context_has_distinct_identity_from_stdio() {
+    let ipc = DownstreamCallContext::ipc_for_client(
+        Arc::from("sess-1"),
+        RequestId::from(NumberOrString::Number(1)),
+        ClientType::Unknown,
+    );
+    assert_eq!(
+        ipc.notification_target(),
+        NotificationTarget::Ipc {
+            client_id: Arc::from("sess-1"),
+        },
+    );
+
+    // Distinct lazy-session-key namespaces: a stdio and an IPC client sharing an
+    // id no longer collide in the lazy working-set map.
+    let ipc_key = ToolRouter::lazy_session_key(DownstreamTransport::Ipc, "sess-1");
+    let stdio_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "sess-1");
+    assert_eq!(ipc_key, "ipc:sess-1");
+    assert_ne!(ipc_key, stdio_key);
+    // A reconnecting IPC client with the same session id resolves to the same
+    // namespaced key — its working set is not orphaned by the namespace change.
+    assert_eq!(
+        ToolRouter::lazy_session_key(DownstreamTransport::Ipc, "sess-1"),
+        ipc_key,
+    );
+}
+
 // ── dispatch::dispatch_tools_call characterization (U1) ──────────────────
 //
 // These pin the shared adapter's contract before the three transports are

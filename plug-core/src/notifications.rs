@@ -44,10 +44,14 @@ pub enum ProtocolNotification {
     },
 }
 
+// `Stdio` = an in-process stdio client served directly by a `ProxyHandler`/
+// `StdioBridge`. `Ipc` = a daemon IPC client served over the Unix socket
+// (`plug connect`) — a first-class identity rather than masquerading as `Stdio`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotificationTarget {
     Stdio { client_id: Arc<str> },
     Http { session_id: Arc<str> },
+    Ipc { client_id: Arc<str> },
 }
 
 impl ProtocolNotification {

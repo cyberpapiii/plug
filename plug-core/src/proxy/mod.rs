@@ -186,6 +186,10 @@ pub struct ToolRouter {
 pub enum DownstreamTransport {
     Stdio,
     Http,
+    /// Daemon IPC client (`plug connect` over the Unix socket). Has its own
+    /// lazy-session-key namespace (`ipc:`) and `NotificationTarget::Ipc` so it no
+    /// longer masquerades as `Stdio`.
+    Ipc,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +213,20 @@ impl DownstreamCallContext {
     ) -> Self {
         Self {
             transport: DownstreamTransport::Stdio,
+            client_id: client_id.into(),
+            request_id,
+            client_type,
+            trace_id: Arc::from(new_trace_id()),
+        }
+    }
+
+    pub fn ipc_for_client(
+        client_id: impl Into<Arc<str>>,
+        request_id: RequestId,
+        client_type: ClientType,
+    ) -> Self {
+        Self {
+            transport: DownstreamTransport::Ipc,
             client_id: client_id.into(),
             request_id,
             client_type,
@@ -256,6 +274,9 @@ impl DownstreamCallContext {
             },
             DownstreamTransport::Http => NotificationTarget::Http {
                 session_id: Arc::clone(&self.client_id),
+            },
+            DownstreamTransport::Ipc => NotificationTarget::Ipc {
+                client_id: Arc::clone(&self.client_id),
             },
         }
     }
@@ -456,6 +477,7 @@ impl ToolRouter {
         match transport {
             DownstreamTransport::Stdio => format!("stdio:{client_id}"),
             DownstreamTransport::Http => format!("http:{client_id}"),
+            DownstreamTransport::Ipc => format!("ipc:{client_id}"),
         }
     }
 
