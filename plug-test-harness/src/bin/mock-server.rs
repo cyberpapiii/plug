@@ -411,13 +411,11 @@ impl ServerHandler for MockServer {
                     None,
                 ));
             }
-            Ok(
-                GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    "mock prompt body",
-                )])
-                .with_description("Mock prompt fixture"),
-            )
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                PromptMessageRole::User,
+                "mock prompt body",
+            )])
+            .with_description("Mock prompt fixture"))
         }
     }
 

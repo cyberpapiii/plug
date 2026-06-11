@@ -1976,6 +1976,32 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
     }
 }
 
+/// Encode a serializable value as an IPC `McpResponse` payload, falling back to
+/// a `SERIALIZE_ERROR` frame if serialization fails. The single encode primitive
+/// for IPC method results — replaces the per-arm `match serde_json::to_value`
+/// ladder so every arm shares one fallback path.
+fn ipc_ok<T: serde::Serialize>(value: T) -> IpcResponse {
+    match serde_json::to_value(value) {
+        Ok(payload) => IpcResponse::McpResponse { payload },
+        Err(e) => IpcResponse::Error {
+            code: "SERIALIZE_ERROR".to_string(),
+            message: e.to_string(),
+        },
+    }
+}
+
+/// Encode a `Result<T, McpError>` from the shared router as an IPC response:
+/// success serializes to an `McpResponse` payload; an `McpError` serializes into
+/// an `McpResponse`-with-error payload (the IPC convention — errors ride the same
+/// channel, distinguished by a `code` field). Both paths share the
+/// `SERIALIZE_ERROR` fallback via [`ipc_ok`].
+fn ipc_from_mcp_result<T: serde::Serialize>(result: Result<T, McpError>) -> IpcResponse {
+    match result {
+        Ok(value) => ipc_ok(value),
+        Err(err) => ipc_ok(err),
+    }
+}
+
 /// Dispatch an MCP JSON-RPC request through the daemon's shared ToolRouter.
 async fn dispatch_mcp_request(
     ctx: &ConnectionContext,
@@ -2005,39 +2031,21 @@ async fn dispatch_mcp_request(
                 Some(&lazy_session_key),
                 request,
             );
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "resources/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_resources_page(request);
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "resources/templates/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_resource_templates_page(request);
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "resources/read" => {
@@ -2051,35 +2059,14 @@ async fn dispatch_mcp_request(
                 }
             };
 
-            match tool_router.read_resource(uri).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.read_resource(uri).await)
         }
 
         "prompts/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_prompts_page(request);
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "prompts/get" => {
@@ -2097,22 +2084,7 @@ async fn dispatch_mcp_request(
                 .and_then(|v| v.as_object())
                 .cloned();
 
-            match tool_router.get_prompt(name, arguments).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.get_prompt(name, arguments).await)
         }
 
         "completion/complete" => {
@@ -2134,22 +2106,7 @@ async fn dispatch_mcp_request(
                 }
             };
 
-            match tool_router.complete_request(params).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.complete_request(params).await)
         }
 
         "logging/setLevel" => {
@@ -2182,13 +2139,7 @@ async fn dispatch_mcp_request(
             );
             tool_router.set_client_log_level(session_id, level);
             tool_router.forward_set_level_to_upstreams().await;
-            match serde_json::to_value(serde_json::json!({})) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(serde_json::json!({}))
         }
 
         "tools/call" => {
@@ -2258,30 +2209,9 @@ async fn dispatch_mcp_request(
             )
             .await
             {
-                Ok(outcome) => {
-                    let payload = match outcome {
-                        plug_core::dispatch::ToolCallOutcome::Called(result) => {
-                            serde_json::to_value(result)
-                        }
-                        plug_core::dispatch::ToolCallOutcome::TaskCreated(result) => {
-                            serde_json::to_value(result)
-                        }
-                    };
-                    match payload {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    }
-                }
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
+                Ok(plug_core::dispatch::ToolCallOutcome::Called(result)) => ipc_ok(result),
+                Ok(plug_core::dispatch::ToolCallOutcome::TaskCreated(result)) => ipc_ok(result),
+                Err(mcp_err) => ipc_ok(mcp_err),
             }
         }
 
@@ -2295,22 +2225,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.list_tasks_for_owner(&owner, request).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.list_tasks_for_owner(&owner, request).await)
         }
 
         "tasks/get" => {
@@ -2334,22 +2249,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.get_task_info_for_owner(&owner, task_id).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.get_task_info_for_owner(&owner, task_id).await)
         }
 
         "tasks/result" => {
@@ -2373,22 +2273,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.get_task_result_for_owner(&owner, task_id).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.get_task_result_for_owner(&owner, task_id).await)
         }
 
         "tasks/cancel" => {
@@ -2412,22 +2297,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.cancel_task_for_owner(&owner, task_id).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.cancel_task_for_owner(&owner, task_id).await)
         }
 
         "resources/subscribe" => {
@@ -2450,18 +2320,13 @@ async fn dispatch_mcp_request(
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: Arc::from(session_id),
             };
-            match tool_router.subscribe_resource(&request.uri, target).await {
-                Ok(()) => IpcResponse::McpResponse {
-                    payload: serde_json::json!({}),
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
+            ipc_from_mcp_result(
+                tool_router
+                    .subscribe_resource(&request.uri, target)
+                    .await
+                    .map(|()| serde_json::json!({})),
+            )
         }
 
         "resources/unsubscribe" => {
@@ -2485,21 +2350,13 @@ async fn dispatch_mcp_request(
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: Arc::from(session_id),
             };
-            match tool_router
-                .unsubscribe_resource(&request.uri, &target)
-                .await
-            {
-                Ok(()) => IpcResponse::McpResponse {
-                    payload: serde_json::json!({}),
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
+            ipc_from_mcp_result(
+                tool_router
+                    .unsubscribe_resource(&request.uri, &target)
+                    .await
+                    .map(|()| serde_json::json!({})),
+            )
         }
 
         _ => IpcResponse::Error {
@@ -3981,6 +3838,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipc_ok_encodes_value_as_mcp_response() {
+        let resp = ipc_ok(serde_json::json!({ "a": 1 }));
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!("expected McpResponse, got {resp:?}");
+        };
+        assert_eq!(payload, serde_json::json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn ipc_from_mcp_result_encodes_ok_and_err() {
+        // Ok -> McpResponse with the serialized value.
+        let ok = ipc_from_mcp_result::<serde_json::Value>(Ok(serde_json::json!({ "ok": true })));
+        let IpcResponse::McpResponse { payload } = ok else {
+            panic!("expected McpResponse for Ok, got {ok:?}");
+        };
+        assert_eq!(payload, serde_json::json!({ "ok": true }));
+
+        // Err -> McpResponse carrying the serialized McpError (code + message),
+        // the IPC convention where errors ride the same channel.
+        let err = ipc_from_mcp_result::<serde_json::Value>(Err(McpError::invalid_params(
+            "boom".to_string(),
+            None,
+        )));
+        let IpcResponse::McpResponse { payload } = err else {
+            panic!("expected McpResponse for Err, got {err:?}");
+        };
+        assert_eq!(payload["code"].as_i64(), Some(-32602));
+        assert_eq!(payload["message"].as_str(), Some("boom"));
+    }
+
     // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
     //
     // Drives identical tools/call scenarios through the REAL stdio, HTTP, and IPC
@@ -4025,8 +3913,8 @@ mod tests {
         }
     }
 
-    /// Full-capability mock upstream for the cross-transport parity matrix: tools
-    /// + resources + resource templates + prompts + completion, so every method
+    /// Full-capability mock upstream for the cross-transport parity matrix: tools,
+    /// resources, resource templates, prompts, and completion, so every method
     /// family has real routed content to compare across transports. All three
     /// transport drivers build their engine from this identical config so the
     /// only variable in a parity row is the downstream transport.
@@ -4244,12 +4132,9 @@ mod tests {
     /// Build an optional paginated request from a `{ "cursor": "..." }` params
     /// object, matching the rmcp typed list-method signatures.
     fn parity_paginated(params: &serde_json::Value) -> Option<rmcp::model::PaginatedRequestParams> {
-        params
-            .get("cursor")
-            .and_then(|c| c.as_str())
-            .map(|cursor| {
-                rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor.to_string()))
-            })
+        params.get("cursor").and_then(|c| c.as_str()).map(|cursor| {
+            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor.to_string()))
+        })
     }
 
     /// stdio: drive an arbitrary method through a real `ProxyHandler` served over
@@ -4276,12 +4161,12 @@ mod tests {
         macro_rules! outcome {
             ($call:expr) => {
                 match $call.await {
-                    Ok(result) => {
-                        MethodOutcome::Result(canonicalize_json(&serde_json::to_value(&result).unwrap()))
-                    }
-                    Err(rmcp::service::ServiceError::McpError(m)) => {
-                        MethodOutcome::Error { code: m.code.0 as i64 }
-                    }
+                    Ok(result) => MethodOutcome::Result(canonicalize_json(
+                        &serde_json::to_value(&result).unwrap(),
+                    )),
+                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                        code: m.code.0 as i64,
+                    },
                     Err(other) => panic!("unexpected stdio service error: {other:?}"),
                 }
             };
@@ -4305,7 +4190,10 @@ mod tests {
             // client discards it to `()`, so normalize to the canonical empty-ok
             // ({}) that HTTP (EmptyResult) and IPC (json!({})) also produce.
             "resources/subscribe" => {
-                match client.subscribe(serde_json::from_value(params).unwrap()).await {
+                match client
+                    .subscribe(serde_json::from_value(params).unwrap())
+                    .await
+                {
                     Ok(()) => MethodOutcome::Result(serde_json::json!({})),
                     Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
                         code: m.code.0 as i64,
