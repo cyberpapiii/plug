@@ -822,6 +822,8 @@ mod tests {
                 last_latency_ms: 42,
                 degraded_since_epoch_secs: Some(1_700_000_000),
                 circuit_state: "open".to_string(),
+                restart_count: 3,
+                last_restart_epoch_secs: Some(1_700_000_500),
             }),
             availability: plug_core::types::Availability::Degraded,
             last_seen: None,
@@ -843,6 +845,9 @@ mod tests {
         assert_eq!(m["last_latency_ms"], 42);
         assert_eq!(m["degraded_since_epoch_secs"], 1_700_000_000_u64);
         assert_eq!(m["circuit_state"], "open");
+        // Supervision (item 2b) restart metrics ride the same per-upstream contract.
+        assert_eq!(m["restart_count"], 3);
+        assert_eq!(m["last_restart_epoch_secs"], 1_700_000_500_u64);
         // Availability rides the same per-server JSON contract.
         assert_eq!(json["servers"][0]["availability"], "degraded");
     }

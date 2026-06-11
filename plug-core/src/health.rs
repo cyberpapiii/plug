@@ -119,7 +119,7 @@ pub fn spawn_health_check(
                         .is_some_and(|entry| entry.health == ServerHealth::Failed);
 
                     if missing_upstream && startup_failed {
-                        spawn_proactive_recovery_once(&engine, &name, cancel.clone(), &tracker_clone);
+                        trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
                         continue;
                     }
 
@@ -134,8 +134,35 @@ pub fn spawn_health_check(
                         });
 
                         if new == ServerHealth::Failed {
-                            spawn_proactive_recovery_once(&engine, &name, cancel.clone(), &tracker_clone);
+                            // Always-on Failed-recovery (not gated by the
+                            // supervision flag); stamps the restart clock so a
+                            // supervised restart isn't fired again immediately.
+                            trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
                         }
+                    }
+
+                    // Active upstream supervision (item 2b / R10): restart an
+                    // upstream that stays degraded past the threshold or whose
+                    // circuit is open — covering the "connected but failing real
+                    // calls" case (e.g. the iMessage continuation leak) that the
+                    // Failed-recovery path above does not reach. Bounded by the
+                    // SupervisionConfig backoff. The escalating backoff is cleared
+                    // only once the upstream has *stably* recovered (settled), so a
+                    // flapping upstream's backoff keeps escalating rather than
+                    // resetting to the floor on every brief healthy blip.
+                    let (health_now, _) = server_manager.health_streak(&name);
+                    if health_now == ServerHealth::Healthy
+                        && !server_manager.circuit_open(&name)
+                        && engine.supervision_settled(&name)
+                    {
+                        engine.reset_supervision(&name);
+                    } else if engine.supervision_due(&name)
+                        && trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, true)
+                    {
+                        tracing::warn!(
+                            server = %name,
+                            "item 2b: supervising restart of degraded upstream"
+                        );
                     }
                 }
             }
@@ -143,15 +170,42 @@ pub fn spawn_health_check(
     });
 }
 
+/// Start a recovery episode and record it. Returns `true` if a new episode was
+/// started (deduped: at most one per server). When `supervised`, the per-server
+/// escalating backoff counter grows; for every started episode the restart clock
+/// and `restart_count` metric are stamped so the backoff clock is consistent
+/// across crash/Failed and supervised recoveries.
+fn trigger_recovery(
+    engine: &Arc<Engine>,
+    server_name: &str,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+    supervised: bool,
+) -> bool {
+    if !spawn_proactive_recovery_once(engine, server_name, cancel, tracker) {
+        return false;
+    }
+    if supervised {
+        engine.note_supervised_restart(server_name);
+    } else {
+        engine.note_restart(server_name);
+    }
+    true
+}
+
+/// Spawn a backoff-bounded recovery episode for `server_name`, deduplicated so at
+/// most one is active per server. Returns `true` if this call started a new
+/// episode, `false` if one was already running (so the supervisor only counts a
+/// restart when it actually initiates one).
 fn spawn_proactive_recovery_once(
     engine: &Arc<Engine>,
     server_name: &str,
     cancel: CancellationToken,
     tracker: &TaskTracker,
-) {
+) -> bool {
     let Some(flag) = engine.try_claim_recovery_task(server_name) else {
         tracing::debug!(server = %server_name, "proactive recovery task already active");
-        return;
+        return false;
     };
 
     let engine = Arc::clone(engine);
@@ -166,6 +220,7 @@ fn spawn_proactive_recovery_once(
         let _guard = RecoveryGuard(flag);
         spawn_proactive_recovery(&engine, &server_name, cancel).await;
     });
+    true
 }
 
 /// Attempt proactive recovery of a failed server with exponential backoff.

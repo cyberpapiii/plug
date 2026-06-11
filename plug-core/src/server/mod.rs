@@ -509,9 +509,24 @@ pub(crate) struct UpstreamMetrics {
     last_latency_ms: AtomicU64,
     /// Unix epoch seconds since which calls have been failing; 0 = healthy.
     degraded_since_epoch: AtomicU64,
+    /// How many times the supervisor has restarted this upstream since start.
+    restart_count: AtomicU64,
+    /// Unix epoch seconds of the most recent supervised restart; 0 = never.
+    last_restart_epoch: AtomicU64,
 }
 
 impl UpstreamMetrics {
+    /// Record a supervised restart: bump the count and stamp the time. Read back
+    /// through `snapshot()` into `plug status --output json`.
+    fn record_restart(&self) {
+        self.restart_count.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs().max(1))
+            .unwrap_or(1);
+        self.last_restart_epoch.store(now, Ordering::Relaxed);
+    }
+
     fn record(&self, ok: bool, latency_ms: u64) {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         self.last_latency_ms.store(latency_ms, Ordering::Relaxed);
@@ -535,12 +550,15 @@ impl UpstreamMetrics {
 
     fn snapshot(&self, circuit_state: &str) -> crate::types::UpstreamMetricsSnapshot {
         let degraded = self.degraded_since_epoch.load(Ordering::Relaxed);
+        let last_restart = self.last_restart_epoch.load(Ordering::Relaxed);
         crate::types::UpstreamMetricsSnapshot {
             call_count: self.call_count.load(Ordering::Relaxed),
             error_count: self.error_count.load(Ordering::Relaxed),
             last_latency_ms: self.last_latency_ms.load(Ordering::Relaxed),
             degraded_since_epoch_secs: (degraded != 0).then_some(degraded),
             circuit_state: circuit_state.to_string(),
+            restart_count: self.restart_count.load(Ordering::Relaxed),
+            last_restart_epoch_secs: (last_restart != 0).then_some(last_restart),
         }
     }
 }
@@ -669,6 +687,41 @@ impl ServerManager {
             .entry(server_id.to_string())
             .or_default()
             .record(ok, latency_ms);
+    }
+
+    /// Record a supervised restart of `server_id` in its metrics (item 2b).
+    pub(crate) fn record_restart(&self, server_id: &str) {
+        self.metrics
+            .entry(server_id.to_string())
+            .or_default()
+            .record_restart();
+    }
+
+    /// Unix epoch seconds of the most recent supervised restart, or `None` if the
+    /// upstream has never been restarted. Drives the supervisor's backoff clock.
+    pub(crate) fn last_restart_epoch(&self, server_id: &str) -> Option<u64> {
+        let epoch = self
+            .metrics
+            .get(server_id)?
+            .last_restart_epoch
+            .load(Ordering::Relaxed);
+        (epoch != 0).then_some(epoch)
+    }
+
+    /// Whether `server_id`'s circuit breaker is currently open.
+    pub(crate) fn circuit_open(&self, server_id: &str) -> bool {
+        self.circuit_breakers
+            .get(server_id)
+            .is_some_and(|cb| matches!(cb.state(), crate::circuit::CircuitState::Open))
+    }
+
+    /// Current `(health, consecutive_failures)` for `server_id`, defaulting to
+    /// healthy/0 when the server has no recorded health state.
+    pub(crate) fn health_streak(&self, server_id: &str) -> (crate::types::ServerHealth, u32) {
+        self.health
+            .get(server_id)
+            .map(|h| (h.health, h.consecutive_failures))
+            .unwrap_or((crate::types::ServerHealth::Healthy, 0))
     }
 
     fn circuit_state_for(&self, server_id: &str) -> &'static str {
