@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #65 (ToolRouter god-object decomposition — `proxy/mod.rs` split 6,586 → 2,464 lines into cohesive seam modules, move-only) and its post-merge truth pass
+Baseline: `main` after PR #66 (first-class `DownstreamTransport::Ipc` identity — ends the IPC `Stdio` masquerade, KTD3) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -102,6 +102,8 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed PR #66 — the `DownstreamTransport::Ipc` identity split (KTD3, the last dispatcher-deferred item). Daemon IPC clients no longer masquerade as `Stdio`: they now have a first-class `DownstreamTransport::Ipc`, an `ipc:{id}` lazy-session-key namespace, a `DownstreamCallContext::ipc_for_client` constructor, and `NotificationTarget::Ipc`. Every `daemon.rs` IPC site (reverse-request context, the notification-forwarding match, the `tools/list` lazy key, subscribe/unsubscribe targets, disconnect/replace cleanup, roots, bridge registration) was switched to `Ipc`; the in-process `StdioBridge` keeps `Stdio`. A stdio and an IPC client sharing an id no longer collide in the lazy working-set map. Behavior-affecting (internal namespace + target variant only; no wire change) — an 8-property correctness review and an adversarial dropped-notification/leak/wrong-delivery review both returned zero findings; guarded by the parity matrix + the IPC notification-delivery e2e tests (now exercising the `Ipc` target). Only active upstream supervision (item 2b / R10) remains.
 
 On 2026-06-10, `main` absorbed PR #65 — the `ToolRouter` god-object decomposition (program item 1's "decompose along seams" corollary). `plug-core/src/proxy/mod.rs` was split **6,586 → 2,464 lines (63%)** into six cohesive child modules: `proxy/{tests,handler,tasks,completion,subscriptions,catalog}.rs`, each an `impl super::ToolRouter` block. Move-only, zero behavior change — proven by the unchanged full workspace suite (490+169+43) and the cross-transport parity matrix. The genuinely-coupled core stays in `mod.rs` by design: the struct + shared types, the routing engine (`call_tool*`/`call_tool_inner`/`handle_*`), the notification/active-call methods (they share the four `*_lookup` maps), and the cross-cutting `refresh_tools`. Remaining program work: the `DownstreamTransport::Ipc` identity split (KTD3) and active upstream supervision (item 2b / R10) — the next two PRs.
 
