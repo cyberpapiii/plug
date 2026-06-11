@@ -52,6 +52,11 @@ pub struct Config {
     #[serde(default = "default_grace_period")]
     pub daemon_grace_period_secs: u64,
     /// Upstream server definitions.
+    /// Active upstream supervision policy (item 2b): bounded restart of an
+    /// upstream that stays degraded past a threshold.
+    #[serde(default)]
+    pub supervision: SupervisionConfig,
+    /// Upstream server definitions.
     #[serde(default)]
     pub servers: HashMap<String, ServerConfig>,
 }
@@ -72,7 +77,77 @@ impl Default for Config {
             disabled_tools: Vec::new(),
             http: HttpConfig::default(),
             daemon_grace_period_secs: 0,
+            supervision: SupervisionConfig::default(),
             servers: HashMap::new(),
+        }
+    }
+}
+
+/// Active upstream supervision policy (item 2b / R10). When an upstream stays
+/// degraded past a threshold, the supervisor restarts it (process restart for
+/// stdio, reconnect-with-reset for HTTP/SSE), bounded by exponential backoff so
+/// a perpetually-failing upstream cannot cause a restart storm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SupervisionConfig {
+    /// Whether the supervisor may restart degraded upstreams. A never-degraded
+    /// upstream is never touched regardless.
+    pub enabled: bool,
+    /// Consecutive health-check failures (the `HealthState` streak) an upstream
+    /// must accumulate before it is eligible for a supervised restart. An open
+    /// circuit breaker also makes it eligible.
+    pub degraded_restart_threshold: u32,
+    /// Floor of the inter-episode backoff: the supervisor waits at least this
+    /// long after a restart before restarting the same upstream again.
+    pub min_restart_interval_secs: u64,
+    /// Cap of the inter-episode backoff. Each consecutive restart (without a
+    /// recovery to healthy in between) doubles the wait, up to this ceiling.
+    pub max_restart_interval_secs: u64,
+}
+
+impl Default for SupervisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            degraded_restart_threshold: 5,
+            min_restart_interval_secs: 60,
+            max_restart_interval_secs: 600,
+        }
+    }
+}
+
+impl SupervisionConfig {
+    /// Pure decision: should the supervisor restart this upstream now?
+    ///
+    /// `attempts` is the consecutive supervised-restart count since the last
+    /// recovery to healthy — it drives the exponential inter-episode backoff.
+    /// `secs_since_last_restart` is `None` when the upstream has never been
+    /// supervised (so it is immediately eligible once degraded).
+    pub fn should_restart(
+        &self,
+        health: crate::types::ServerHealth,
+        consecutive_failures: u32,
+        circuit_open: bool,
+        secs_since_last_restart: Option<u64>,
+        attempts: u32,
+    ) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let sustained = matches!(
+            health,
+            crate::types::ServerHealth::Degraded | crate::types::ServerHealth::Failed
+        ) && consecutive_failures >= self.degraded_restart_threshold;
+        if !(sustained || circuit_open) {
+            return false;
+        }
+        let required_wait = self
+            .min_restart_interval_secs
+            .saturating_mul(2u64.saturating_pow(attempts.min(16)))
+            .min(self.max_restart_interval_secs);
+        match secs_since_last_restart {
+            None => true,
+            Some(elapsed) => elapsed >= required_wait,
         }
     }
 }
@@ -477,6 +552,22 @@ pub fn sanitize_server_name_for_path(name: &str) -> Result<&str, String> {
 /// Returns an empty vec if the config is valid.
 pub fn validate_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
+
+    if config.supervision.enabled {
+        if config.supervision.degraded_restart_threshold == 0 {
+            errors.push(
+                "supervision.degraded_restart_threshold must be >= 1 when supervision is enabled"
+                    .to_string(),
+            );
+        }
+        if config.supervision.max_restart_interval_secs < config.supervision.min_restart_interval_secs
+        {
+            errors.push(
+                "supervision.max_restart_interval_secs must be >= min_restart_interval_secs"
+                    .to_string(),
+            );
+        }
+    }
 
     if config.http.port == 0 {
         errors.push("http.port must be in range 1-65535".to_string());
@@ -978,6 +1069,72 @@ mod tests {
     use figment::Figment;
     use figment::providers::{Format, Serialized, Toml};
     use std::path::PathBuf;
+
+    use crate::types::ServerHealth;
+
+    fn supervision_cfg() -> SupervisionConfig {
+        SupervisionConfig {
+            enabled: true,
+            degraded_restart_threshold: 5,
+            min_restart_interval_secs: 60,
+            max_restart_interval_secs: 600,
+        }
+    }
+
+    #[test]
+    fn supervision_disabled_never_restarts() {
+        let mut cfg = supervision_cfg();
+        cfg.enabled = false;
+        assert!(!cfg.should_restart(ServerHealth::Failed, 100, true, None, 0));
+    }
+
+    #[test]
+    fn supervision_ignores_healthy_with_closed_circuit() {
+        let cfg = supervision_cfg();
+        assert!(!cfg.should_restart(ServerHealth::Healthy, 0, false, None, 0));
+    }
+
+    #[test]
+    fn supervision_waits_for_the_degraded_threshold() {
+        let cfg = supervision_cfg();
+        // Degraded but below the consecutive-failure threshold.
+        assert!(!cfg.should_restart(ServerHealth::Degraded, 4, false, None, 0));
+        // At the threshold, never restarted -> immediately due.
+        assert!(cfg.should_restart(ServerHealth::Degraded, 5, false, None, 0));
+    }
+
+    #[test]
+    fn supervision_fires_on_open_circuit_even_when_health_probe_passes() {
+        // The iMessage-leak case: health pings pass (Healthy) but real calls fail
+        // and the circuit opens. An open circuit alone makes it due.
+        let cfg = supervision_cfg();
+        assert!(cfg.should_restart(ServerHealth::Healthy, 0, true, None, 0));
+    }
+
+    #[test]
+    fn supervision_backoff_grows_and_caps() {
+        let cfg = supervision_cfg();
+        // attempts=0 -> required wait = min (60s). 30s elapsed is too soon.
+        assert!(!cfg.should_restart(ServerHealth::Failed, 6, false, Some(30), 0));
+        assert!(cfg.should_restart(ServerHealth::Failed, 6, false, Some(60), 0));
+        // attempts=1 -> required = 120s; attempts=2 -> 240s.
+        assert!(!cfg.should_restart(ServerHealth::Failed, 6, false, Some(119), 1));
+        assert!(cfg.should_restart(ServerHealth::Failed, 6, false, Some(120), 1));
+        // Large attempt count caps at max (600s), never overflows.
+        assert!(!cfg.should_restart(ServerHealth::Failed, 6, false, Some(599), 50));
+        assert!(cfg.should_restart(ServerHealth::Failed, 6, false, Some(600), 50));
+    }
+
+    #[test]
+    fn supervision_config_validation_rejects_bad_thresholds() {
+        let mut config = Config::default();
+        config.supervision.degraded_restart_threshold = 0;
+        config.supervision.max_restart_interval_secs = 10;
+        config.supervision.min_restart_interval_secs = 60;
+        let errors = validate_config(&config);
+        assert!(errors.iter().any(|e| e.contains("degraded_restart_threshold")));
+        assert!(errors.iter().any(|e| e.contains("max_restart_interval_secs")));
+    }
 
     /// Helper to load a Config from a TOML string merged over defaults.
     fn config_from_toml(toml: &str) -> Config {
