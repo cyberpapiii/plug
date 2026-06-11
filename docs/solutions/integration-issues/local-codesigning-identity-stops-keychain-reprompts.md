@@ -70,7 +70,20 @@ with it after every build. Because the Keychain ACL binds to the signature's
 *designated requirement* (which references the cert, not the per-build CDHash),
 "Always Allow" then persists across rebuilds.
 
-One-time setup (now scripted as `scripts/setup-codesigning.sh`):
+**Easiest path (any install) — the built-in command:**
+
+```sh
+plug codesign-setup   # creates the identity if missing, then signs the running binary
+```
+
+`plug codesign-setup` is install-path-agnostic (cargo, Homebrew, release download)
+and self-contained — it runs all the steps below for you. `plug doctor` surfaces
+the need for it: a `codesign_identity` check warns when plug is ad-hoc signed and
+keychain-backed OAuth upstreams are configured, and points at the command.
+`scripts/setup-codesigning.sh` is the equivalent standalone shell script for the
+repo clone flow.
+
+The underlying one-time steps (what the command/script automate):
 
 ```sh
 # 1. Self-signed cert — BOTH Key Usage (digitalSignature) AND Extended Key
@@ -131,12 +144,20 @@ Digital Signature** extension (not just Extended Key Usage). Miss either and
 
 ## Prevention
 
+- **`plug doctor` catches it.** The `codesign_identity` check warns when plug is
+  ad-hoc signed and OAuth upstreams are configured, so the condition is
+  discoverable on any install path (not just the repo clone).
+- **`plug codesign-setup` fixes it** in one command, idempotently — it creates the
+  identity if missing and signs the running binary, regardless of install method.
 - **Always re-sign after installing.** Use `scripts/dev-reinstall.sh` (which
   signs automatically when the identity exists) instead of a bare
   `cargo install`. A bare install drops back to ad-hoc and the prompts return.
-- **Run `scripts/setup-codesigning.sh` once per machine** after cloning. It is
-  idempotent: it no-ops on non-macOS, and skips creation if a valid
-  `Plug Local Signing` identity already exists.
+- **Run `plug codesign-setup` (or `scripts/setup-codesigning.sh`) once per
+  machine.** Both are idempotent: they no-op on non-macOS and skip creation when
+  a valid `Plug Local Signing` identity already exists.
+- **Distributed binaries need a real fix:** Developer ID signing + notarization in
+  the release pipeline so release/Homebrew installs are signed out of the box —
+  tracked in `todos/069-pending-p3-release-binary-codesigning-notarization.md`.
 - **When generating a code-signing cert by hand, set both KU and EKU**:
   `keyUsage=critical,digitalSignature` and
   `extendedKeyUsage=critical,codeSigning`. KU-only or EKU-only certs fail the

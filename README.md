@@ -55,10 +55,13 @@ re-prompts constantly. Run this once per machine to give plug a stable
 self-signed code-signing identity:
 
 ```sh
+plug codesign-setup        # built-in; works for any install (cargo, Homebrew, release)
+# or, in a repo clone:
 ./scripts/setup-codesigning.sh
 ```
 
-It is idempotent (no-ops on non-macOS, skips if already set up). Afterward,
+Both are idempotent (no-op on non-macOS, skip if already set up). `plug doctor`
+also flags the condition (`codesign_identity` check). Afterward,
 `./scripts/dev-reinstall.sh` re-signs automatically on every rebuild. Details:
 `docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md`.
 
