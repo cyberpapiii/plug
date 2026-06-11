@@ -640,11 +640,11 @@ pub async fn run_daemon(
 ///
 /// IPC adapter for the shared `tools/call` dispatcher.
 ///
-/// IPC reuses the stdio downstream identity (KTD3 in the dispatcher plan): the
-/// daemon does not yet have its own `DownstreamTransport` variant, so the lazy
-/// session-key namespace stays `stdio:{session_id}` exactly as before. The task
-/// owner is pre-resolved by the shim so the transport-specific `UNKNOWN_SESSION`
-/// error frame is preserved for a task-augmented call whose session vanished.
+/// IPC has a first-class downstream identity: `DownstreamTransport::Ipc`, the
+/// `ipc:{session_id}` lazy session-key namespace, and `NotificationTarget::Ipc`
+/// (the KTD3 split — it no longer masquerades as stdio). The task owner is
+/// pre-resolved by the shim so the transport-specific `UNKNOWN_SESSION` error
+/// frame is preserved for a task-augmented call whose session vanished.
 struct IpcDownstreamContext {
     session_id: Arc<str>,
     request_id: RequestId,
