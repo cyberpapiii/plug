@@ -3710,13 +3710,24 @@ mod tests {
 
     /// Build a stdio mock-upstream `ServerConfig` exposing `tools` (comma-separated).
     fn ipc_harness_mock_config(tools: &str) -> plug_core::config::ServerConfig {
+        ipc_harness_mock_config_with(tools, &[])
+    }
+
+    /// Mock upstream config with extra mock-server flags appended (e.g. to enable
+    /// the resources / prompts / completions capability fixtures).
+    fn ipc_harness_mock_config_with(
+        tools: &str,
+        extra_args: &[&str],
+    ) -> plug_core::config::ServerConfig {
+        let mut args = vec!["--tools".to_string(), tools.to_string()];
+        args.extend(extra_args.iter().map(|a| a.to_string()));
         plug_core::config::ServerConfig {
             command: Some(
                 plug_test_harness::mock_server_bin()
                     .to_string_lossy()
                     .into_owned(),
             ),
-            args: vec!["--tools".to_string(), tools.to_string()],
+            args,
             env: HashMap::new(),
             enabled: true,
             transport: plug_core::config::TransportType::Stdio,
@@ -3750,10 +3761,18 @@ mod tests {
 
     impl IpcTestHarness {
         async fn start(tools: &str) -> Self {
+            Self::start_with_config(ipc_harness_mock_config(tools)).await
+        }
+
+        /// Full-capability variant for the parity matrix: same upstream config as
+        /// the stdio/HTTP parity drivers so every method family is comparable.
+        async fn start_full() -> Self {
+            Self::start_with_config(parity_mock_config()).await
+        }
+
+        async fn start_with_config(mock: plug_core::config::ServerConfig) -> Self {
             let mut config = plug_core::config::Config::default();
-            config
-                .servers
-                .insert("mock".to_string(), ipc_harness_mock_config(tools));
+            config.servers.insert("mock".to_string(), mock);
             let engine = Arc::new(Engine::new(config));
             engine.start().await.expect("engine start");
 
@@ -3815,6 +3834,21 @@ mod tests {
                 session_id,
                 socket_path,
             }
+        }
+
+        /// Issue an arbitrary MCP request over IPC and return the raw decoded
+        /// `IpcResponse`. The method-generic entry point used by the parity matrix.
+        async fn call(&mut self, method: &str, params: serde_json::Value) -> IpcResponse {
+            write_ipc(
+                &mut self.stream,
+                &IpcRequest::McpRequest {
+                    session_id: self.session_id.clone(),
+                    method: method.to_string(),
+                    params: Some(params),
+                },
+            )
+            .await;
+            read_ipc_response(&mut self.stream).await
         }
 
         /// Issue a `tools/call` and return the raw decoded `IpcResponse`.
@@ -3991,11 +4025,28 @@ mod tests {
         }
     }
 
+    /// Full-capability mock upstream for the cross-transport parity matrix: tools
+    /// + resources + resource templates + prompts + completion, so every method
+    /// family has real routed content to compare across transports. All three
+    /// transport drivers build their engine from this identical config so the
+    /// only variable in a parity row is the downstream transport.
+    fn parity_mock_config() -> plug_core::config::ServerConfig {
+        ipc_harness_mock_config_with(
+            "echo",
+            &[
+                "--resources",
+                "--resource-templates",
+                "--prompts",
+                "--completions",
+            ],
+        )
+    }
+
     fn parity_mock_engine() -> Arc<Engine> {
         let mut config = plug_core::config::Config::default();
         config
             .servers
-            .insert("mock".to_string(), ipc_harness_mock_config("echo"));
+            .insert("mock".to_string(), parity_mock_config());
         Arc::new(Engine::new(config))
     }
 
@@ -4036,10 +4087,17 @@ mod tests {
         outcome
     }
 
-    /// HTTP: drive a tools/call through the real axum router (tower oneshot, no
-    /// real port) with the given `params` value and return the raw JSON-RPC
-    /// response. `params` lets callers include a `task` field.
+    /// HTTP: drive a `tools/call` through the real axum router and return the raw
+    /// JSON-RPC response. Thin wrapper over `http_method_response` preserved for
+    /// the task-augmentation tests that pass a `task` field in `params`.
     async fn http_tools_call_response(params: serde_json::Value) -> serde_json::Value {
+        http_method_response("tools/call", params).await
+    }
+
+    /// HTTP: drive an arbitrary MCP method through the real axum router (tower
+    /// oneshot, no real port) with the given `params` value and return the raw
+    /// JSON-RPC response. The method-generic driver used by the parity matrix.
+    async fn http_method_response(method: &str, params: serde_json::Value) -> serde_json::Value {
         use tower::ServiceExt as _;
 
         let engine = parity_mock_engine();
@@ -4088,7 +4146,7 @@ mod tests {
             .to_string();
 
         let call_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 2, "method": method,
             "params": params
         });
         let call_req = axum::http::Request::builder()
@@ -4134,6 +4192,157 @@ mod tests {
             IpcResponse::McpResponse { payload } => parity_from_result_json(&payload),
             other => panic!("unexpected IPC response: {other:?}"),
         }
+    }
+
+    // ── Method-generic parity drivers ────────────────────────────────────────
+    //
+    // The `tools/call` drivers above stay as the characterization guard. These
+    // generic drivers extend the matrix to every other method family: each takes
+    // a JSON-RPC `method` + `params`, drives it through the real transport against
+    // the shared full-capability mock upstream, and normalizes to a transport-
+    // agnostic `MethodOutcome` (a canonicalized result JSON, or an error code).
+
+    /// Normalized cross-transport outcome for any MCP method: either a
+    /// canonicalized result object or an error code. Result JSON is key-sorted so
+    /// structural equality is independent of each transport's serialization order.
+    #[derive(Debug, Clone, PartialEq)]
+    enum MethodOutcome {
+        Result(serde_json::Value),
+        Error { code: i64 },
+    }
+
+    /// Recursively sort object keys so two structurally-equal results with
+    /// different key order compare equal.
+    fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut sorted = serde_json::Map::new();
+                for k in keys {
+                    sorted.insert(k.clone(), canonicalize_json(&map[k]));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Normalize a bare result payload (IPC carries success and a serialized
+    /// `McpError` over the same channel) to a `MethodOutcome`. A top-level integer
+    /// `code` marks an error; none of the routed result types carry one.
+    fn method_outcome_from_payload(payload: &serde_json::Value) -> MethodOutcome {
+        if let Some(code) = payload.get("code").and_then(|c| c.as_i64()) {
+            return MethodOutcome::Error { code };
+        }
+        MethodOutcome::Result(canonicalize_json(payload))
+    }
+
+    /// Build an optional paginated request from a `{ "cursor": "..." }` params
+    /// object, matching the rmcp typed list-method signatures.
+    fn parity_paginated(params: &serde_json::Value) -> Option<rmcp::model::PaginatedRequestParams> {
+        params
+            .get("cursor")
+            .and_then(|c| c.as_str())
+            .map(|cursor| {
+                rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor.to_string()))
+            })
+    }
+
+    /// stdio: drive an arbitrary method through a real `ProxyHandler` served over
+    /// a duplex, with an rmcp client issuing the typed request. The rmcp client is
+    /// typed, so each method maps to its typed call; the Ok result is serialized
+    /// to the same JSON the server emitted, and an `McpError` maps to its code.
+    async fn parity_stdio_call(method: &str, params: serde_json::Value) -> MethodOutcome {
+        use rmcp::ServiceExt;
+
+        let engine = parity_mock_engine();
+        engine.start().await.expect("engine start");
+        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            if let Ok(running) = proxy.serve(server_transport).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ParityClient
+            .serve(client_transport)
+            .await
+            .expect("stdio client serve");
+
+        macro_rules! outcome {
+            ($call:expr) => {
+                match $call.await {
+                    Ok(result) => {
+                        MethodOutcome::Result(canonicalize_json(&serde_json::to_value(&result).unwrap()))
+                    }
+                    Err(rmcp::service::ServiceError::McpError(m)) => {
+                        MethodOutcome::Error { code: m.code.0 as i64 }
+                    }
+                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
+                }
+            };
+        }
+
+        let outcome = match method {
+            "tools/list" => outcome!(client.list_tools(parity_paginated(&params))),
+            "resources/list" => outcome!(client.list_resources(parity_paginated(&params))),
+            "resources/templates/list" => {
+                outcome!(client.list_resource_templates(parity_paginated(&params)))
+            }
+            "resources/read" => {
+                outcome!(client.read_resource(serde_json::from_value(params).unwrap()))
+            }
+            "prompts/list" => outcome!(client.list_prompts(parity_paginated(&params))),
+            "prompts/get" => outcome!(client.get_prompt(serde_json::from_value(params).unwrap())),
+            "completion/complete" => {
+                outcome!(client.complete(serde_json::from_value(params).unwrap()))
+            }
+            other => panic!("unsupported parity method for stdio: {other}"),
+        };
+
+        let _ = client.cancel().await;
+        server.abort();
+        engine.shutdown().await;
+        outcome
+    }
+
+    /// HTTP: drive an arbitrary method through the real axum router and normalize.
+    async fn parity_http_call(method: &str, params: serde_json::Value) -> MethodOutcome {
+        let json = http_method_response(method, params).await;
+        if let Some(err) = json.get("error") {
+            MethodOutcome::Error {
+                code: err["code"].as_i64().unwrap_or(0),
+            }
+        } else {
+            MethodOutcome::Result(canonicalize_json(&json["result"]))
+        }
+    }
+
+    /// IPC: drive an arbitrary method through the real daemon socket loop.
+    async fn parity_ipc_call(method: &str, params: serde_json::Value) -> MethodOutcome {
+        let mut harness = IpcTestHarness::start_full().await;
+        let resp = harness.call(method, params).await;
+        harness.shutdown().await;
+        match resp {
+            IpcResponse::McpResponse { payload } => method_outcome_from_payload(&payload),
+            other => panic!("unexpected IPC response: {other:?}"),
+        }
+    }
+
+    /// Drive `method`+`params` through all three transports and assert the three
+    /// normalized outcomes are identical, returning the agreed outcome for any
+    /// further method-specific assertions. The core parity gate for a method.
+    async fn assert_parity(method: &str, params: serde_json::Value) -> MethodOutcome {
+        let stdio = parity_stdio_call(method, params.clone()).await;
+        let http = parity_http_call(method, params.clone()).await;
+        let ipc = parity_ipc_call(method, params.clone()).await;
+        assert_eq!(stdio, http, "{method}: stdio vs http divergence");
+        assert_eq!(http, ipc, "{method}: http vs ipc divergence");
+        stdio
     }
 
     #[tokio::test]
@@ -4264,5 +4473,163 @@ mod tests {
             payload.get("task").is_some(),
             "ipc task-augmented call should create a task, got {payload}"
         );
+    }
+
+    // ── Method-family parity rows (U3) ───────────────────────────────────────
+    //
+    // Each row drives one method through stdio + HTTP + IPC against the shared
+    // full-capability mock and asserts the three decoded results agree, plus a
+    // light content check so a coincidental three-way error can't pass as success.
+    // Routed names use the "Mock" server prefix (server "mock" -> "Mock__name").
+    // The fixtures fit in one page (PAGE_SIZE = 500), so list results carry no
+    // cursor; first-page parity still asserts nextCursor agreement across all three.
+
+    /// Collect `name`-field values from a result array at `key`.
+    fn result_names(json: &serde_json::Value, key: &str) -> Vec<String> {
+        json[key]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn parity_tools_list_matches_across_transports() {
+        match assert_parity("tools/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "tools");
+                assert!(
+                    names.iter().any(|n| n == "Mock__echo"),
+                    "expected Mock__echo in tools/list, got {names:?}"
+                );
+                assert!(
+                    json.get("nextCursor").is_none() || json["nextCursor"].is_null(),
+                    "single-page fixture should carry no cursor: {json}"
+                );
+            }
+            other => panic!("expected tools/list result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_list_matches_across_transports() {
+        match assert_parity("resources/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "resources");
+                assert!(
+                    names.iter().any(|n| n == "Mock__mock-resource.txt"),
+                    "expected routed mock resource, got {names:?}"
+                );
+            }
+            other => panic!("expected resources/list result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resource_templates_list_matches_across_transports() {
+        match assert_parity("resources/templates/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "resourceTemplates");
+                assert!(
+                    names.iter().any(|n| n == "Mock__mock_template"),
+                    "expected routed mock template, got {names:?}"
+                );
+            }
+            other => panic!("expected templates result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_read_matches_across_transports() {
+        let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
+        match assert_parity("resources/read", params).await {
+            MethodOutcome::Result(json) => {
+                let text = json["contents"][0]["text"].as_str().unwrap_or_default();
+                assert!(
+                    text.contains("mock resource contents"),
+                    "unexpected resource contents: {json}"
+                );
+            }
+            other => panic!("expected resources/read result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_read_unknown_uri_matches_across_transports() {
+        // Unknown URI is rejected by the shared router before any upstream call,
+        // so all three transports must surface the identical error code.
+        let params = serde_json::json!({ "uri": "file:///does/not/exist" });
+        match assert_parity("resources/read", params).await {
+            MethodOutcome::Error { .. } => {}
+            other => panic!("expected resources/read error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_prompts_list_matches_across_transports() {
+        match assert_parity("prompts/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "prompts");
+                assert!(
+                    names.iter().any(|n| n == "Mock__mock_prompt"),
+                    "expected routed mock prompt, got {names:?}"
+                );
+            }
+            other => panic!("expected prompts/list result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_prompts_get_matches_across_transports() {
+        let params = serde_json::json!({ "name": "Mock__mock_prompt" });
+        match assert_parity("prompts/get", params).await {
+            MethodOutcome::Result(json) => {
+                let text = json["messages"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    text.contains("mock prompt body"),
+                    "unexpected prompt body: {json}"
+                );
+            }
+            other => panic!("expected prompts/get result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_prompts_get_unknown_matches_across_transports() {
+        let params = serde_json::json!({ "name": "Mock__nonexistent" });
+        match assert_parity("prompts/get", params).await {
+            MethodOutcome::Error { .. } => {}
+            other => panic!("expected prompts/get error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_completion_complete_matches_across_transports() {
+        let params = serde_json::json!({
+            "ref": { "type": "ref/prompt", "name": "Mock__mock_prompt" },
+            "argument": { "name": "topic", "value": "mo" }
+        });
+        match assert_parity("completion/complete", params).await {
+            MethodOutcome::Result(json) => {
+                let values = json["completion"]["values"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    values.iter().any(|v| v == "mock_completion"),
+                    "unexpected completion values: {json}"
+                );
+            }
+            other => panic!("expected completion result, got {other:?}"),
+        }
     }
 }
