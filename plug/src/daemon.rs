@@ -1976,6 +1976,32 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
     }
 }
 
+/// Encode a serializable value as an IPC `McpResponse` payload, falling back to
+/// a `SERIALIZE_ERROR` frame if serialization fails. The single encode primitive
+/// for IPC method results — replaces the per-arm `match serde_json::to_value`
+/// ladder so every arm shares one fallback path.
+fn ipc_ok<T: serde::Serialize>(value: T) -> IpcResponse {
+    match serde_json::to_value(value) {
+        Ok(payload) => IpcResponse::McpResponse { payload },
+        Err(e) => IpcResponse::Error {
+            code: "SERIALIZE_ERROR".to_string(),
+            message: e.to_string(),
+        },
+    }
+}
+
+/// Encode a `Result<T, McpError>` from the shared router as an IPC response:
+/// success serializes to an `McpResponse` payload; an `McpError` serializes into
+/// an `McpResponse`-with-error payload (the IPC convention — errors ride the same
+/// channel, distinguished by a `code` field). Both paths share the
+/// `SERIALIZE_ERROR` fallback via [`ipc_ok`].
+fn ipc_from_mcp_result<T: serde::Serialize>(result: Result<T, McpError>) -> IpcResponse {
+    match result {
+        Ok(value) => ipc_ok(value),
+        Err(err) => ipc_ok(err),
+    }
+}
+
 /// Dispatch an MCP JSON-RPC request through the daemon's shared ToolRouter.
 async fn dispatch_mcp_request(
     ctx: &ConnectionContext,
@@ -2005,39 +2031,21 @@ async fn dispatch_mcp_request(
                 Some(&lazy_session_key),
                 request,
             );
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "resources/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_resources_page(request);
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "resources/templates/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_resource_templates_page(request);
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "resources/read" => {
@@ -2051,35 +2059,14 @@ async fn dispatch_mcp_request(
                 }
             };
 
-            match tool_router.read_resource(uri).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.read_resource(uri).await)
         }
 
         "prompts/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_prompts_page(request);
-            match serde_json::to_value(result) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(result)
         }
 
         "prompts/get" => {
@@ -2097,22 +2084,7 @@ async fn dispatch_mcp_request(
                 .and_then(|v| v.as_object())
                 .cloned();
 
-            match tool_router.get_prompt(name, arguments).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.get_prompt(name, arguments).await)
         }
 
         "completion/complete" => {
@@ -2134,22 +2106,7 @@ async fn dispatch_mcp_request(
                 }
             };
 
-            match tool_router.complete_request(params).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.complete_request(params).await)
         }
 
         "logging/setLevel" => {
@@ -2182,13 +2139,7 @@ async fn dispatch_mcp_request(
             );
             tool_router.set_client_log_level(session_id, level);
             tool_router.forward_set_level_to_upstreams().await;
-            match serde_json::to_value(serde_json::json!({})) {
-                Ok(payload) => IpcResponse::McpResponse { payload },
-                Err(e) => IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: e.to_string(),
-                },
-            }
+            ipc_ok(serde_json::json!({}))
         }
 
         "tools/call" => {
@@ -2258,30 +2209,9 @@ async fn dispatch_mcp_request(
             )
             .await
             {
-                Ok(outcome) => {
-                    let payload = match outcome {
-                        plug_core::dispatch::ToolCallOutcome::Called(result) => {
-                            serde_json::to_value(result)
-                        }
-                        plug_core::dispatch::ToolCallOutcome::TaskCreated(result) => {
-                            serde_json::to_value(result)
-                        }
-                    };
-                    match payload {
-                        Ok(payload) => IpcResponse::McpResponse { payload },
-                        Err(e) => IpcResponse::Error {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                        },
-                    }
-                }
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
+                Ok(plug_core::dispatch::ToolCallOutcome::Called(result)) => ipc_ok(result),
+                Ok(plug_core::dispatch::ToolCallOutcome::TaskCreated(result)) => ipc_ok(result),
+                Err(mcp_err) => ipc_ok(mcp_err),
             }
         }
 
@@ -2295,22 +2225,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.list_tasks_for_owner(&owner, request).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.list_tasks_for_owner(&owner, request).await)
         }
 
         "tasks/get" => {
@@ -2334,22 +2249,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.get_task_info_for_owner(&owner, task_id).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.get_task_info_for_owner(&owner, task_id).await)
         }
 
         "tasks/result" => {
@@ -2373,22 +2273,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.get_task_result_for_owner(&owner, task_id).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.get_task_result_for_owner(&owner, task_id).await)
         }
 
         "tasks/cancel" => {
@@ -2412,22 +2297,7 @@ async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            match tool_router.cancel_task_for_owner(&owner, task_id).await {
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            ipc_from_mcp_result(tool_router.cancel_task_for_owner(&owner, task_id).await)
         }
 
         "resources/subscribe" => {
@@ -2450,18 +2320,13 @@ async fn dispatch_mcp_request(
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: Arc::from(session_id),
             };
-            match tool_router.subscribe_resource(&request.uri, target).await {
-                Ok(()) => IpcResponse::McpResponse {
-                    payload: serde_json::json!({}),
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
+            ipc_from_mcp_result(
+                tool_router
+                    .subscribe_resource(&request.uri, target)
+                    .await
+                    .map(|()| serde_json::json!({})),
+            )
         }
 
         "resources/unsubscribe" => {
@@ -2485,21 +2350,13 @@ async fn dispatch_mcp_request(
             let target = plug_core::notifications::NotificationTarget::Stdio {
                 client_id: Arc::from(session_id),
             };
-            match tool_router
-                .unsubscribe_resource(&request.uri, &target)
-                .await
-            {
-                Ok(()) => IpcResponse::McpResponse {
-                    payload: serde_json::json!({}),
-                },
-                Err(mcp_err) => match serde_json::to_value(&mcp_err) {
-                    Ok(payload) => IpcResponse::McpResponse { payload },
-                    Err(e) => IpcResponse::Error {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                    },
-                },
-            }
+            // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
+            ipc_from_mcp_result(
+                tool_router
+                    .unsubscribe_resource(&request.uri, &target)
+                    .await
+                    .map(|()| serde_json::json!({})),
+            )
         }
 
         _ => IpcResponse::Error {
@@ -3710,13 +3567,24 @@ mod tests {
 
     /// Build a stdio mock-upstream `ServerConfig` exposing `tools` (comma-separated).
     fn ipc_harness_mock_config(tools: &str) -> plug_core::config::ServerConfig {
+        ipc_harness_mock_config_with(tools, &[])
+    }
+
+    /// Mock upstream config with extra mock-server flags appended (e.g. to enable
+    /// the resources / prompts / completions capability fixtures).
+    fn ipc_harness_mock_config_with(
+        tools: &str,
+        extra_args: &[&str],
+    ) -> plug_core::config::ServerConfig {
+        let mut args = vec!["--tools".to_string(), tools.to_string()];
+        args.extend(extra_args.iter().map(|a| a.to_string()));
         plug_core::config::ServerConfig {
             command: Some(
                 plug_test_harness::mock_server_bin()
                     .to_string_lossy()
                     .into_owned(),
             ),
-            args: vec!["--tools".to_string(), tools.to_string()],
+            args,
             env: HashMap::new(),
             enabled: true,
             transport: plug_core::config::TransportType::Stdio,
@@ -3750,10 +3618,18 @@ mod tests {
 
     impl IpcTestHarness {
         async fn start(tools: &str) -> Self {
+            Self::start_with_config(ipc_harness_mock_config(tools)).await
+        }
+
+        /// Full-capability variant for the parity matrix: same upstream config as
+        /// the stdio/HTTP parity drivers so every method family is comparable.
+        async fn start_full() -> Self {
+            Self::start_with_config(parity_mock_config()).await
+        }
+
+        async fn start_with_config(mock: plug_core::config::ServerConfig) -> Self {
             let mut config = plug_core::config::Config::default();
-            config
-                .servers
-                .insert("mock".to_string(), ipc_harness_mock_config(tools));
+            config.servers.insert("mock".to_string(), mock);
             let engine = Arc::new(Engine::new(config));
             engine.start().await.expect("engine start");
 
@@ -3815,6 +3691,21 @@ mod tests {
                 session_id,
                 socket_path,
             }
+        }
+
+        /// Issue an arbitrary MCP request over IPC and return the raw decoded
+        /// `IpcResponse`. The method-generic entry point used by the parity matrix.
+        async fn call(&mut self, method: &str, params: serde_json::Value) -> IpcResponse {
+            write_ipc(
+                &mut self.stream,
+                &IpcRequest::McpRequest {
+                    session_id: self.session_id.clone(),
+                    method: method.to_string(),
+                    params: Some(params),
+                },
+            )
+            .await;
+            read_ipc_response(&mut self.stream).await
         }
 
         /// Issue a `tools/call` and return the raw decoded `IpcResponse`.
@@ -3947,6 +3838,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipc_ok_encodes_value_as_mcp_response() {
+        let resp = ipc_ok(serde_json::json!({ "a": 1 }));
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!("expected McpResponse, got {resp:?}");
+        };
+        assert_eq!(payload, serde_json::json!({ "a": 1 }));
+
+        // A value that fails serialization (a map with non-string tuple keys)
+        // takes the SERIALIZE_ERROR fallback frame rather than an McpResponse.
+        let mut unserializable = std::collections::BTreeMap::new();
+        unserializable.insert((1_i32, 2_i32), 3_i32);
+        match ipc_ok(unserializable) {
+            IpcResponse::Error { code, .. } => assert_eq!(code, "SERIALIZE_ERROR"),
+            other => panic!("expected SERIALIZE_ERROR frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_from_mcp_result_encodes_ok_and_err() {
+        // Ok -> McpResponse with the serialized value.
+        let ok = ipc_from_mcp_result::<serde_json::Value>(Ok(serde_json::json!({ "ok": true })));
+        let IpcResponse::McpResponse { payload } = ok else {
+            panic!("expected McpResponse for Ok, got {ok:?}");
+        };
+        assert_eq!(payload, serde_json::json!({ "ok": true }));
+
+        // Err -> McpResponse carrying the serialized McpError (code + message),
+        // the IPC convention where errors ride the same channel.
+        let err = ipc_from_mcp_result::<serde_json::Value>(Err(McpError::invalid_params(
+            "boom".to_string(),
+            None,
+        )));
+        let IpcResponse::McpResponse { payload } = err else {
+            panic!("expected McpResponse for Err, got {err:?}");
+        };
+        assert_eq!(payload["code"].as_i64(), Some(-32602));
+        assert_eq!(payload["message"].as_str(), Some("boom"));
+    }
+
     // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
     //
     // Drives identical tools/call scenarios through the REAL stdio, HTTP, and IPC
@@ -3991,11 +3922,28 @@ mod tests {
         }
     }
 
+    /// Full-capability mock upstream for the cross-transport parity matrix: tools,
+    /// resources, resource templates, prompts, and completion, so every method
+    /// family has real routed content to compare across transports. All three
+    /// transport drivers build their engine from this identical config so the
+    /// only variable in a parity row is the downstream transport.
+    fn parity_mock_config() -> plug_core::config::ServerConfig {
+        ipc_harness_mock_config_with(
+            "echo",
+            &[
+                "--resources",
+                "--resource-templates",
+                "--prompts",
+                "--completions",
+            ],
+        )
+    }
+
     fn parity_mock_engine() -> Arc<Engine> {
         let mut config = plug_core::config::Config::default();
         config
             .servers
-            .insert("mock".to_string(), ipc_harness_mock_config("echo"));
+            .insert("mock".to_string(), parity_mock_config());
         Arc::new(Engine::new(config))
     }
 
@@ -4036,10 +3984,17 @@ mod tests {
         outcome
     }
 
-    /// HTTP: drive a tools/call through the real axum router (tower oneshot, no
-    /// real port) with the given `params` value and return the raw JSON-RPC
-    /// response. `params` lets callers include a `task` field.
+    /// HTTP: drive a `tools/call` through the real axum router and return the raw
+    /// JSON-RPC response. Thin wrapper over `http_method_response` preserved for
+    /// the task-augmentation tests that pass a `task` field in `params`.
     async fn http_tools_call_response(params: serde_json::Value) -> serde_json::Value {
+        http_method_response("tools/call", params).await
+    }
+
+    /// HTTP: drive an arbitrary MCP method through the real axum router (tower
+    /// oneshot, no real port) with the given `params` value and return the raw
+    /// JSON-RPC response. The method-generic driver used by the parity matrix.
+    async fn http_method_response(method: &str, params: serde_json::Value) -> serde_json::Value {
         use tower::ServiceExt as _;
 
         let engine = parity_mock_engine();
@@ -4088,7 +4043,7 @@ mod tests {
             .to_string();
 
         let call_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 2, "method": method,
             "params": params
         });
         let call_req = axum::http::Request::builder()
@@ -4127,13 +4082,191 @@ mod tests {
 
     /// IPC: drive tools/call through the real daemon socket loop.
     async fn parity_ipc(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
-        let mut harness = IpcTestHarness::start("echo").await;
+        // Use the same full-capability upstream config as the stdio/HTTP parity
+        // drivers (parity_mock_engine) so all three transports share an identical
+        // upstream and the only variable in a parity row is the transport.
+        let mut harness = IpcTestHarness::start_full().await;
         let resp = harness.call_tool(tool, arguments).await;
         harness.shutdown().await;
         match resp {
             IpcResponse::McpResponse { payload } => parity_from_result_json(&payload),
             other => panic!("unexpected IPC response: {other:?}"),
         }
+    }
+
+    // ── Method-generic parity drivers ────────────────────────────────────────
+    //
+    // The `tools/call` drivers above stay as the characterization guard. These
+    // generic drivers extend the matrix to every other method family: each takes
+    // a JSON-RPC `method` + `params`, drives it through the real transport against
+    // the shared full-capability mock upstream, and normalizes to a transport-
+    // agnostic `MethodOutcome` (a canonicalized result JSON, or an error code).
+
+    /// Normalized cross-transport outcome for any MCP method: either a
+    /// canonicalized result object or an error code. Result JSON is key-sorted so
+    /// structural equality is independent of each transport's serialization order.
+    #[derive(Debug, Clone, PartialEq)]
+    enum MethodOutcome {
+        Result(serde_json::Value),
+        Error { code: i64 },
+    }
+
+    /// Recursively sort object keys so two structurally-equal results with
+    /// different key order compare equal.
+    fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut sorted = serde_json::Map::new();
+                for k in keys {
+                    sorted.insert(k.clone(), canonicalize_json(&map[k]));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Normalize a bare result payload (IPC carries success and a serialized
+    /// `McpError` over the same channel) to a `MethodOutcome`. A top-level integer
+    /// `code` marks an error; none of the routed result types carry one.
+    fn method_outcome_from_payload(payload: &serde_json::Value) -> MethodOutcome {
+        // A serialized McpError carries BOTH a top-level integer `code` and a
+        // string `message`. Requiring both (not `code` alone) keeps a future
+        // result type that happens to expose a top-level integer `code` from
+        // being misclassified as an error.
+        let code = payload.get("code").and_then(|c| c.as_i64());
+        let has_message = payload.get("message").and_then(|m| m.as_str()).is_some();
+        if let (Some(code), true) = (code, has_message) {
+            return MethodOutcome::Error { code };
+        }
+        MethodOutcome::Result(canonicalize_json(payload))
+    }
+
+    /// Build an optional paginated request from a `{ "cursor": "..." }` params
+    /// object, matching the rmcp typed list-method signatures.
+    fn parity_paginated(params: &serde_json::Value) -> Option<rmcp::model::PaginatedRequestParams> {
+        params.get("cursor").and_then(|c| c.as_str()).map(|cursor| {
+            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor.to_string()))
+        })
+    }
+
+    /// stdio: drive an arbitrary method through a real `ProxyHandler` served over
+    /// a duplex, with an rmcp client issuing the typed request. The rmcp client is
+    /// typed, so each method maps to its typed call; the Ok result is serialized
+    /// to the same JSON the server emitted, and an `McpError` maps to its code.
+    async fn parity_stdio_call(method: &str, params: serde_json::Value) -> MethodOutcome {
+        use rmcp::ServiceExt;
+
+        let engine = parity_mock_engine();
+        engine.start().await.expect("engine start");
+        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            if let Ok(running) = proxy.serve(server_transport).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ParityClient
+            .serve(client_transport)
+            .await
+            .expect("stdio client serve");
+
+        macro_rules! outcome {
+            ($call:expr) => {
+                match $call.await {
+                    Ok(result) => MethodOutcome::Result(canonicalize_json(
+                        &serde_json::to_value(&result).unwrap(),
+                    )),
+                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                        code: m.code.0 as i64,
+                    },
+                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
+                }
+            };
+        }
+
+        // subscribe/unsubscribe return EmptyResult on the wire; the typed rmcp
+        // client discards it to `()`, so normalize Ok to the canonical empty-ok
+        // ({}) that HTTP (EmptyResult) and IPC (json!({})) also produce.
+        macro_rules! outcome_unit {
+            ($call:expr) => {
+                match $call.await {
+                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
+                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                        code: m.code.0 as i64,
+                    },
+                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
+                }
+            };
+        }
+
+        let outcome = match method {
+            "tools/list" => outcome!(client.list_tools(parity_paginated(&params))),
+            "resources/list" => outcome!(client.list_resources(parity_paginated(&params))),
+            "resources/templates/list" => {
+                outcome!(client.list_resource_templates(parity_paginated(&params)))
+            }
+            "resources/read" => {
+                outcome!(client.read_resource(serde_json::from_value(params).unwrap()))
+            }
+            "prompts/list" => outcome!(client.list_prompts(parity_paginated(&params))),
+            "prompts/get" => outcome!(client.get_prompt(serde_json::from_value(params).unwrap())),
+            "completion/complete" => {
+                outcome!(client.complete(serde_json::from_value(params).unwrap()))
+            }
+            "resources/subscribe" => {
+                outcome_unit!(client.subscribe(serde_json::from_value(params).unwrap()))
+            }
+            "resources/unsubscribe" => {
+                outcome_unit!(client.unsubscribe(serde_json::from_value(params).unwrap()))
+            }
+            other => panic!("unsupported parity method for stdio: {other}"),
+        };
+
+        let _ = client.cancel().await;
+        server.abort();
+        engine.shutdown().await;
+        outcome
+    }
+
+    /// HTTP: drive an arbitrary method through the real axum router and normalize.
+    async fn parity_http_call(method: &str, params: serde_json::Value) -> MethodOutcome {
+        let json = http_method_response(method, params).await;
+        if let Some(err) = json.get("error") {
+            MethodOutcome::Error {
+                code: err["code"].as_i64().unwrap_or(0),
+            }
+        } else {
+            MethodOutcome::Result(canonicalize_json(&json["result"]))
+        }
+    }
+
+    /// IPC: drive an arbitrary method through the real daemon socket loop.
+    async fn parity_ipc_call(method: &str, params: serde_json::Value) -> MethodOutcome {
+        let mut harness = IpcTestHarness::start_full().await;
+        let resp = harness.call(method, params).await;
+        harness.shutdown().await;
+        match resp {
+            IpcResponse::McpResponse { payload } => method_outcome_from_payload(&payload),
+            other => panic!("unexpected IPC response: {other:?}"),
+        }
+    }
+
+    /// Drive `method`+`params` through all three transports and assert the three
+    /// normalized outcomes are identical, returning the agreed outcome for any
+    /// further method-specific assertions. The core parity gate for a method.
+    async fn assert_parity(method: &str, params: serde_json::Value) -> MethodOutcome {
+        let stdio = parity_stdio_call(method, params.clone()).await;
+        let http = parity_http_call(method, params.clone()).await;
+        let ipc = parity_ipc_call(method, params.clone()).await;
+        assert_eq!(stdio, http, "{method}: stdio vs http divergence");
+        assert_eq!(http, ipc, "{method}: http vs ipc divergence");
+        stdio
     }
 
     #[tokio::test]
@@ -4264,5 +4397,201 @@ mod tests {
             payload.get("task").is_some(),
             "ipc task-augmented call should create a task, got {payload}"
         );
+    }
+
+    // ── Method-family parity rows (U3) ───────────────────────────────────────
+    //
+    // Each row drives one method through stdio + HTTP + IPC against the shared
+    // full-capability mock and asserts the three decoded results agree, plus a
+    // light content check so a coincidental three-way error can't pass as success.
+    // Routed names use the "Mock" server prefix (server "mock" -> "Mock__name").
+    // The fixtures fit in one page (PAGE_SIZE = 500), so list results carry no
+    // cursor; first-page parity still asserts nextCursor agreement across all three.
+
+    /// Collect `name`-field values from a result array at `key`.
+    fn result_names(json: &serde_json::Value, key: &str) -> Vec<String> {
+        json[key]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn parity_tools_list_matches_across_transports() {
+        match assert_parity("tools/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "tools");
+                assert!(
+                    names.iter().any(|n| n == "Mock__echo"),
+                    "expected Mock__echo in tools/list, got {names:?}"
+                );
+                assert!(
+                    json.get("nextCursor").is_none() || json["nextCursor"].is_null(),
+                    "single-page fixture should carry no cursor: {json}"
+                );
+            }
+            other => panic!("expected tools/list result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_list_matches_across_transports() {
+        match assert_parity("resources/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "resources");
+                assert!(
+                    names.iter().any(|n| n == "Mock__mock-resource.txt"),
+                    "expected routed mock resource, got {names:?}"
+                );
+            }
+            other => panic!("expected resources/list result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resource_templates_list_matches_across_transports() {
+        match assert_parity("resources/templates/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "resourceTemplates");
+                assert!(
+                    names.iter().any(|n| n == "Mock__mock_template"),
+                    "expected routed mock template, got {names:?}"
+                );
+            }
+            other => panic!("expected templates result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_read_matches_across_transports() {
+        let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
+        match assert_parity("resources/read", params).await {
+            MethodOutcome::Result(json) => {
+                let text = json["contents"][0]["text"].as_str().unwrap_or_default();
+                assert!(
+                    text.contains("mock resource contents"),
+                    "unexpected resource contents: {json}"
+                );
+            }
+            other => panic!("expected resources/read result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_read_unknown_uri_matches_across_transports() {
+        // Unknown URI is rejected by the shared router before any upstream call,
+        // so all three transports must surface the identical error code.
+        let params = serde_json::json!({ "uri": "file:///does/not/exist" });
+        // assert_parity already proves the three transports agree on the code;
+        // pin the absolute value too (InvalidRequest -> -32600) so a uniform
+        // drift to a different-but-equal code can't pass silently.
+        match assert_parity("resources/read", params).await {
+            MethodOutcome::Error { code } => assert_eq!(code, -32600, "unknown-uri error code"),
+            other => panic!("expected resources/read error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_prompts_list_matches_across_transports() {
+        match assert_parity("prompts/list", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                let names = result_names(&json, "prompts");
+                assert!(
+                    names.iter().any(|n| n == "Mock__mock_prompt"),
+                    "expected routed mock prompt, got {names:?}"
+                );
+            }
+            other => panic!("expected prompts/list result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_prompts_get_matches_across_transports() {
+        let params = serde_json::json!({ "name": "Mock__mock_prompt" });
+        match assert_parity("prompts/get", params).await {
+            MethodOutcome::Result(json) => {
+                let text = json["messages"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    text.contains("mock prompt body"),
+                    "unexpected prompt body: {json}"
+                );
+            }
+            other => panic!("expected prompts/get result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_prompts_get_unknown_matches_across_transports() {
+        let params = serde_json::json!({ "name": "Mock__nonexistent" });
+        // Pin the absolute code (InvalidRequest -> -32600) in addition to the
+        // cross-transport agreement assert_parity enforces.
+        match assert_parity("prompts/get", params).await {
+            MethodOutcome::Error { code } => assert_eq!(code, -32600, "unknown-prompt error code"),
+            other => panic!("expected prompts/get error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_completion_complete_matches_across_transports() {
+        let params = serde_json::json!({
+            "ref": { "type": "ref/prompt", "name": "Mock__mock_prompt" },
+            "argument": { "name": "topic", "value": "mo" }
+        });
+        match assert_parity("completion/complete", params).await {
+            MethodOutcome::Result(json) => {
+                let values = json["completion"]["values"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    values.iter().any(|v| v == "mock_completion"),
+                    "unexpected completion values: {json}"
+                );
+            }
+            other => panic!("expected completion result, got {other:?}"),
+        }
+    }
+
+    // ── Subscribe/unsubscribe lifecycle parity (U4) ──────────────────────────
+    //
+    // The three transports encode an empty success differently (stdio's typed
+    // client discards it to `()`, HTTP returns EmptyResult, IPC returns json!({})).
+    // The drivers normalize all three to the canonical empty-ok ({}), so these
+    // rows prove the divergent encodings are equivalent. Each call is a fresh
+    // session, so the unsubscribe row also exercises the idempotent (not-currently-
+    // subscribed) path.
+
+    fn assert_empty_ok(outcome: MethodOutcome, label: &str) {
+        match outcome {
+            MethodOutcome::Result(json) => assert!(
+                json.as_object().is_some_and(|o| o.is_empty()),
+                "{label} should be empty-ok ({{}}), got {json}"
+            ),
+            other => panic!("{label} expected empty-ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_resources_subscribe_matches_across_transports() {
+        let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
+        let outcome = assert_parity("resources/subscribe", params).await;
+        assert_empty_ok(outcome, "subscribe");
+    }
+
+    #[tokio::test]
+    async fn parity_resources_unsubscribe_matches_across_transports() {
+        let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
+        let outcome = assert_parity("resources/unsubscribe", params).await;
+        assert_empty_ok(outcome, "unsubscribe");
     }
 }
