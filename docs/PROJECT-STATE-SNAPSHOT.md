@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #63 (transport-agnostic `tools/call` dispatcher — first slice of program item 1) and its post-merge truth pass
+Baseline: `main` after PR #64 (cross-transport parity gate extended to the whole MCP method surface + IPC encode consolidation — finishing the parity deliverable of program item 1) and its post-merge truth pass
 
 This is the canonical current-state doc for the project.
 
@@ -102,6 +102,13 @@ Off-main work must not be described as current implementation.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-06-10, `main` absorbed PR #64 (program item 1, requirement R8) — finishing the cross-transport parity deliverable across the **entire MCP method surface** plus IPC encode consolidation. Scope correction verified during planning: unlike `tools/call`, every other method family is already a single shared `ToolRouter` call behind thin per-transport shells (no progress/task/reverse-request complexity), so the value here is parity coverage + encode de-duplication, not a `DownstreamContext` trait migration:
+
+- the parity matrix now drives `tools/list`, `resources/{list,templates,read}` (+ unknown-uri error), `prompts/{list,get}` (+ unknown-prompt error), `completion/complete`, and the `resources/{subscribe,unsubscribe}` lifecycle through the real stdio/HTTP/IPC transports and asserts identical decoded results + error codes. The harness was generalized to method-generic drivers (`parity_{stdio,http,ipc}_call` + `assert_parity`) normalizing to a canonicalized `MethodOutcome`; the existing `tools/call` rows pass unchanged (characterization guard)
+- the mock upstream (`plug-test-harness/src/bin/mock-server.rs`) gained flag-gated prompts / completion / resource-template handlers so the rows compare real routed content, not empty-list agreement
+- the duplicated per-arm IPC `serde_json::to_value → SERIALIZE_ERROR` ladder was consolidated into two shared helpers (`ipc_ok` / `ipc_from_mcp_result`) — behavior-preserving, proven by the matrix staying decoded-identical plus a direct helper unit test. An 8-persona review returned zero production-code findings; six test-quality fixes were applied
+- still deferred: the `DownstreamTransport::Ipc` identity split (KTD3). Investigation showed `NotificationTarget::Stdio` is the shared bridge/delivery key for both the in-process stdio path and daemon IPC across ~64 sites, with subscription-rebind reconstructing `Stdio` targets on route refresh — a full split rewires notification delivery + reconnect-stable ownership, so it ships as its own PR (now de-risked by the parity matrix). The `ToolRouter` god-object decomposition and active upstream supervision (item 2b) remain the next program phases
 
 On 2026-06-10, `main` absorbed the first slice of the transport `RequestDispatcher` via PR #63 (deferred program item 1, requirement R8) — the `tools/call` method family only:
 
