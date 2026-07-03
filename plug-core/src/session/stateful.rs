@@ -155,6 +155,7 @@ impl StatefulSessionStore {
     ) -> SessionSendOutcome {
         let mut remove_session = false;
         let mut clear_sender = false;
+        let mut failed_sender: Option<mpsc::Sender<SseEvent>> = None;
         let mut queue_event: Option<SseEvent> = None;
         let mut delivered = false;
 
@@ -170,6 +171,7 @@ impl StatefulSessionStore {
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         clear_sender = true;
+                        failed_sender = Some(sender);
                         if queue_if_unavailable {
                             queue_event = Some(event);
                         }
@@ -180,6 +182,7 @@ impl StatefulSessionStore {
                             "dropping slow SSE client from targeted notification delivery"
                         );
                         clear_sender = true;
+                        failed_sender = Some(sender);
                         if queue_if_unavailable {
                             queue_event = Some(event);
                         }
@@ -200,12 +203,7 @@ impl StatefulSessionStore {
 
         let queued = queue_event.is_some();
         if clear_sender {
-            if let Some(mut entry) = self.sessions.get_mut(session_id) {
-                entry.sse_sender = None;
-                if let Some(event) = queue_event {
-                    Self::enqueue_pending(&mut entry, event);
-                }
-            }
+            self.clear_sender_if_matching(session_id, failed_sender.as_ref(), queue_event);
         } else if let Some(event) = queue_event
             && let Some(mut entry) = self.sessions.get_mut(session_id)
         {
@@ -218,6 +216,51 @@ impl StatefulSessionStore {
             SessionSendOutcome::Queued
         } else {
             SessionSendOutcome::SessionNotFound
+        }
+    }
+
+    /// Second phase of `try_send_to_session`'s clear path. Only nulls the entry's
+    /// `sse_sender` if it is still the same channel that failed delivery; a
+    /// reconnecting client may have installed a fresh, live sender in the window
+    /// between `try_send_to_session` releasing and re-acquiring this entry's guard,
+    /// and wiping that out would silently break the new connection.
+    ///
+    /// Extracted from `try_send_to_session` so the race-guard decision can be
+    /// exercised directly by tests without relying on real thread interleaving.
+    fn clear_sender_if_matching(
+        &self,
+        session_id: &str,
+        failed_sender: Option<&mpsc::Sender<SseEvent>>,
+        queue_event: Option<SseEvent>,
+    ) {
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            let same = match (&entry.sse_sender, failed_sender) {
+                (Some(current), Some(failed)) => current.same_channel(failed),
+                _ => false,
+            };
+            if same {
+                entry.sse_sender = None;
+                if let Some(event) = queue_event {
+                    Self::enqueue_pending(&mut entry, event);
+                }
+            } else if let Some(event) = queue_event {
+                // A new sender raced in while the old one failed; the event was
+                // never delivered to it, so try delivering it live before falling
+                // back to the pending queue (which is only flushed on the next
+                // reconnect without a Last-Event-Id).
+                match entry.sse_sender.clone() {
+                    Some(new_sender) => match new_sender.try_send(event.clone()) {
+                        Ok(()) => {
+                            entry.last_activity = Instant::now();
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(event))
+                        | Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                            Self::enqueue_pending(&mut entry, event);
+                        }
+                    },
+                    None => Self::enqueue_pending(&mut entry, event),
+                }
+            }
         }
     }
 
@@ -664,6 +707,70 @@ mod tests {
             .expect("requeued message should be delivered")
             .expect("requeued message present");
         assert_eq!(received.message.to_json_value()["type"], "requeued");
+    }
+
+    #[tokio::test]
+    async fn closed_sender_is_cleared_when_no_reconnect_races_in() {
+        // Baseline: preserves the pre-fix behavior when nothing installs a new
+        // sender in the window between clear detection and clearing.
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        let (tx_a, rx_a) = mpsc::channel(1);
+        store.set_sse_sender(&id, tx_a.clone(), None).unwrap();
+        drop(rx_a);
+
+        store.send_to_session(
+            &id,
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "closed"}))
+                .unwrap(),
+        );
+
+        assert!(!store.has_live_sse_sender(&id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn racing_reconnect_sender_is_not_clobbered_by_stale_clear() {
+        // Reproduces the fix directly: `clear_sender_if_matching` is the exact
+        // second-phase decision `try_send_to_session` makes after releasing and
+        // re-acquiring the session guard. Here we drive it with a failed sender
+        // (A) while the entry's live sender has already moved on to a
+        // reconnected sender (B) -- simulating a client reconnect racing into
+        // the window between phase 1 (detecting A failed) and phase 2 (clearing
+        // it). B must survive and receive the event that failed to reach A.
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        // Install A and make it fail (closed receiver), as phase 1 of
+        // try_send_to_session would observe.
+        let (tx_a, rx_a) = mpsc::channel(1);
+        store.set_sse_sender(&id, tx_a.clone(), None).unwrap();
+        drop(rx_a);
+
+        // A reconnecting client installs a fresh, live sender B before phase 2 runs.
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        store.set_sse_sender(&id, tx_b, None).unwrap();
+        assert!(store.has_live_sse_sender(&id).unwrap());
+
+        // Now run phase 2 directly with the stale failed sender A.
+        let event = crate::session::SseEvent {
+            id: 1,
+            message: crate::session::SseMessage::from_json_value(
+                serde_json::json!({"type": "raced"}),
+            )
+            .unwrap(),
+        };
+        store.clear_sender_if_matching(&id, Some(&tx_a), Some(event));
+
+        // B must still be installed -- it was never the sender that failed.
+        assert!(store.has_live_sse_sender(&id).unwrap());
+
+        // And it should have received the event live rather than only queuing it.
+        let received = tokio::time::timeout(Duration::from_secs(1), rx_b.recv())
+            .await
+            .expect("live sender should receive the raced event")
+            .expect("event present");
+        assert_eq!(received.message.to_json_value()["type"], "raced");
     }
 
     #[tokio::test]
