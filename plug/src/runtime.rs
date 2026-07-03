@@ -809,10 +809,14 @@ fn resolve_downstream_bearer_token(
 ) -> anyhow::Result<Option<Arc<str>>> {
     match http.auth_mode {
         plug_core::config::DownstreamAuthMode::Auto => {
-            if !plug_core::config::http_bind_is_loopback(&http.bind_address) {
+            let externally_exposed = !plug_core::config::http_bind_is_loopback(&http.bind_address)
+                || plug_core::config::http_public_base_url_is_non_loopback(
+                    http.public_base_url.as_deref(),
+                );
+            if externally_exposed {
                 let token_path = plug_core::auth::http_auth_token_path(http.port);
                 let token = plug_core::auth::load_or_generate_token(&token_path)?;
-                tracing::info!("HTTP auth enabled (auto mode on non-loopback bind address)");
+                tracing::info!("HTTP auth enabled (auto mode: server reachable off-loopback)");
                 Ok(Some(Arc::<str>::from(token.as_str())))
             } else {
                 Ok(None)
@@ -1141,6 +1145,30 @@ mod tests {
         let token = resolve_downstream_bearer_token(&http).expect("resolve token");
         assert!(token.is_none());
     }
+
+    #[test]
+    fn resolve_downstream_bearer_token_auto_loopback_no_public_base_url_disables_auth() {
+        let http = plug_core::config::HttpConfig {
+            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+            public_base_url: None,
+            ..plug_core::config::HttpConfig::default()
+        };
+        let token = resolve_downstream_bearer_token(&http).expect("resolve token");
+        assert!(token.is_none());
+    }
+
+    // NOTE: Auto + loopback bind + non-loopback public_base_url (the tunnel
+    // topology this fix targets) is *not* exercised here with an assertion on
+    // the returned token, because that path calls
+    // `plug_core::auth::load_or_generate_token`, which writes under the real
+    // user config dir (`plug_core::config::config_dir()`) — there is no
+    // temp-dir override in this codebase for that path, and no existing test
+    // in this module exercises the Bearer/token-write branch either. The
+    // exposure-detection logic itself (bind-or-public_base_url) is covered by
+    // the `validate_none_on_tunneled_loopback_bind_is_rejected` and
+    // `validate_none_on_loopback_without_public_base_url_is_valid` tests in
+    // `plug-core/src/config/mod.rs`, which exercise the same
+    // `http_public_base_url_is_non_loopback` predicate this function uses.
 
     #[test]
     fn resolve_downstream_bearer_token_none_disables_auth() {

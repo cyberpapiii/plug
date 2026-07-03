@@ -605,11 +605,9 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                 .to_string(),
         );
     }
-    if !http_bind_is_loopback(&config.http.bind_address)
-        && matches!(config.http.auth_mode, DownstreamAuthMode::None)
-    {
+    if externally_exposed && matches!(config.http.auth_mode, DownstreamAuthMode::None) {
         errors.push(
-            "http.auth_mode = \"none\" is not allowed when binding a non-loopback downstream address"
+            "http.auth_mode = \"none\" is not allowed when the server is reachable off-loopback (non-loopback bind or non-loopback public_base_url)"
                 .to_string(),
         );
     }
@@ -1724,6 +1722,36 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("http.auth_mode = \"none\"") && e.contains("non-loopback")),
             "expected none/non-loopback validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_none_on_tunneled_loopback_bind_is_rejected() {
+        // The real tunnel topology: cloudflared -> 127.0.0.1:3282, but the
+        // server is reachable off-host via a non-loopback public_base_url.
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::None;
+        cfg.http.bind_address = "127.0.0.1".to_string();
+        cfg.http.public_base_url = Some("https://plug.example.trycloudflare.com".to_string());
+        let errors = validate_config(&cfg);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("http.auth_mode = \"none\"") && e.contains("off-loopback")),
+            "expected none/tunneled-loopback validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_none_on_loopback_without_public_base_url_is_valid() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::None;
+        let errors = validate_config(&cfg);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("http.auth_mode = \"none\"")),
+            "expected no auth_mode=none validation error for pure loopback, got {errors:?}"
         );
     }
 
