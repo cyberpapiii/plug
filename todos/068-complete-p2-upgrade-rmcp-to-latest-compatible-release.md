@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "068"
 tags: [dependency, rmcp, mcp, maintenance, compatibility]
@@ -7,6 +7,8 @@ dependencies: []
 ---
 
 # Upgrade rmcp to the latest compatible release
+
+**Closed 2026-07-02**: the workspace moved to `rmcp = 1.7.0` (see `Cargo.toml`), which already delivered the upgrade this todo requested. Residual value — "track rmcp releases newer than 1.7.0" — does not need an open todo.
 
 ## Problem Statement
 
