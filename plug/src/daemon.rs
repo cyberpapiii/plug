@@ -438,6 +438,115 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
+// ───────────────────────── Grace-period auto-shutdown ─────────────────────────
+
+/// Spawn the grace-period auto-shutdown task.
+///
+/// Watches `count_rx` for IPC client-count changes. When the count drops to
+/// zero, starts a `grace_period_secs` countdown. If the countdown fires while
+/// IPC count is still zero but daemon-owned HTTP sessions are active, the
+/// daemon is kept alive — but instead of falling back to the plain IPC watch
+/// (which would never wake on an HTTP-session-count change, stranding the
+/// daemon alive indefinitely), the task enters a bounded re-check loop that
+/// polls both counts on `recheck_interval` until either an IPC client
+/// reconnects (control returns to the outer watch loop) or HTTP sessions
+/// drain to zero (the daemon is cancelled). The re-check loop does not
+/// restart a fresh grace period — the grace period already expired once;
+/// HTTP sessions were the only thing holding the daemon up, and the
+/// session-store's own timeout already governs their lifetime.
+fn spawn_grace_period_task(
+    grace_period_secs: u64,
+    mut count_rx: tokio::sync::watch::Receiver<usize>,
+    http_sessions: Option<Arc<dyn SessionStore>>,
+    daemon_cancel: CancellationToken,
+    grace_token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        // Bounded: never busier than 1s, never lazier than 30s; scales down
+        // for short test-sized grace periods.
+        let recheck_interval = Duration::from_secs(grace_period_secs.clamp(1, 30));
+
+        loop {
+            // Wait for a change in client count
+            if count_rx.changed().await.is_err() {
+                return; // Sender dropped (registry gone)
+            }
+
+            let count = *count_rx.borrow();
+            if count == 0 {
+                tracing::info!(
+                    grace_secs = grace_period_secs,
+                    "last client disconnected, starting grace period"
+                );
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
+                        // Grace period expired — recheck IPC and daemon-owned HTTP sessions.
+                        let http_session_count = http_sessions
+                            .as_ref()
+                            .map(|sessions| sessions.session_count())
+                            .unwrap_or(0);
+                        if *count_rx.borrow() == 0 && http_session_count == 0 {
+                            tracing::info!("grace period expired with no clients, shutting down");
+                            daemon_cancel.cancel();
+                            return;
+                        } else if *count_rx.borrow() == 0 && http_session_count > 0 {
+                            tracing::info!(
+                                http_session_count,
+                                "grace period expired but HTTP sessions are still active; keeping daemon alive"
+                            );
+
+                            // Re-check loop: HTTP sessions are the only thing keeping the
+                            // daemon alive. Poll until they drain (shut down) or an IPC
+                            // client reconnects (resume the outer watch loop).
+                            'recheck: loop {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(recheck_interval) => {
+                                        if *count_rx.borrow() > 0 {
+                                            tracing::info!("client reconnected, grace period cancelled");
+                                            break 'recheck;
+                                        }
+                                        let http_session_count = http_sessions
+                                            .as_ref()
+                                            .map(|sessions| sessions.session_count())
+                                            .unwrap_or(0);
+                                        if http_session_count == 0 {
+                                            tracing::info!("grace period expired with no clients, shutting down");
+                                            daemon_cancel.cancel();
+                                            return;
+                                        }
+                                        // Still held alive by HTTP sessions; keep polling.
+                                    }
+                                    result = count_rx.changed() => {
+                                        if result.is_err() {
+                                            return;
+                                        }
+                                        if *count_rx.borrow() > 0 {
+                                            tracing::info!("client reconnected, grace period cancelled");
+                                            break 'recheck;
+                                        }
+                                        // Still 0; keep polling the re-check loop.
+                                    }
+                                    _ = grace_token.cancelled() => return,
+                                }
+                            }
+                        }
+                    }
+                    result = count_rx.changed() => {
+                        if result.is_err() {
+                            return;
+                        }
+                        if *count_rx.borrow() > 0 {
+                            tracing::info!("client reconnected, grace period cancelled");
+                        }
+                    }
+                    _ = grace_token.cancelled() => return,
+                }
+            }
+        }
+    });
+}
+
 // ─────────────────────────── Daemon entry point ──────────────────────────────
 
 /// Start the daemon: Engine + Unix socket IPC listener + file logging.
@@ -523,55 +632,13 @@ pub async fn run_daemon(
     let grace_cancel = CancellationToken::new();
 
     if grace_period_secs > 0 {
-        let grace_token = grace_cancel.clone();
-        let daemon_cancel = cancel.clone();
-        let mut count_rx = count_rx;
-        let http_sessions = http_sessions.clone();
-        tokio::spawn(async move {
-            loop {
-                // Wait for a change in client count
-                if count_rx.changed().await.is_err() {
-                    return; // Sender dropped (registry gone)
-                }
-
-                let count = *count_rx.borrow();
-                if count == 0 {
-                    tracing::info!(
-                        grace_secs = grace_period_secs,
-                        "last client disconnected, starting grace period"
-                    );
-
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
-                            // Grace period expired — recheck IPC and daemon-owned HTTP sessions.
-                            let http_session_count = http_sessions
-                                .as_ref()
-                                .map(|sessions| sessions.session_count())
-                                .unwrap_or(0);
-                            if *count_rx.borrow() == 0 && http_session_count == 0 {
-                                tracing::info!("grace period expired with no clients, shutting down");
-                                daemon_cancel.cancel();
-                                return;
-                            } else if *count_rx.borrow() == 0 && http_session_count > 0 {
-                                tracing::info!(
-                                    http_session_count,
-                                    "grace period expired but HTTP sessions are still active; keeping daemon alive"
-                                );
-                            }
-                        }
-                        result = count_rx.changed() => {
-                            if result.is_err() {
-                                return;
-                            }
-                            if *count_rx.borrow() > 0 {
-                                tracing::info!("client reconnected, grace period cancelled");
-                            }
-                        }
-                        _ = grace_token.cancelled() => return,
-                    }
-                }
-            }
-        });
+        spawn_grace_period_task(
+            grace_period_secs,
+            count_rx,
+            http_sessions.clone(),
+            cancel.clone(),
+            grace_cancel.clone(),
+        );
     }
 
     // Accept IPC connections until shutdown
@@ -2602,6 +2669,134 @@ mod tests {
             plug_core::types::ClientType::ClaudeDesktop
         );
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn grace_period_shuts_down_when_no_http_sessions() {
+        let (registry, count_rx) = ClientRegistry::new();
+        let registration = registry
+            .try_register("client-1".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
+            .expect("register");
+
+        let daemon_cancel = CancellationToken::new();
+        let grace_cancel = CancellationToken::new();
+
+        spawn_grace_period_task(
+            1,
+            count_rx,
+            None,
+            daemon_cancel.clone(),
+            grace_cancel.clone(),
+        );
+
+        registry.deregister(&registration.session_id);
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            daemon_cancel.is_cancelled(),
+            "daemon should shut down once grace expires with no IPC clients and no HTTP sessions"
+        );
+
+        grace_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn grace_period_rearms_when_http_sessions_drain_to_zero() {
+        let (registry, count_rx) = ClientRegistry::new();
+        let registration = registry
+            .try_register("client-1".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
+            .expect("register");
+
+        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
+        let http_session_id = session_store.create_session().expect("session");
+        let http_sessions: Arc<dyn SessionStore> = Arc::new(session_store);
+
+        let daemon_cancel = CancellationToken::new();
+        let grace_cancel = CancellationToken::new();
+
+        spawn_grace_period_task(
+            1,
+            count_rx,
+            Some(http_sessions.clone()),
+            daemon_cancel.clone(),
+            grace_cancel.clone(),
+        );
+
+        // Last IPC client disconnects -> grace countdown starts.
+        registry.deregister(&registration.session_id);
+
+        // Grace period (1s) expires while the HTTP session is still active: the
+        // daemon must NOT fall back to an IPC-only wait and must stay alive.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !daemon_cancel.is_cancelled(),
+            "daemon should stay alive while HTTP sessions are active"
+        );
+
+        // Drain the HTTP session; the bounded re-check loop (1s poll) should
+        // notice on its next tick and shut the daemon down.
+        http_sessions.remove(&http_session_id);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            daemon_cancel.is_cancelled(),
+            "daemon should shut down within one re-check interval of HTTP sessions draining to zero"
+        );
+
+        grace_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn grace_period_ipc_reconnect_during_held_alive_resumes_watching() {
+        let (registry, count_rx) = ClientRegistry::new();
+        let registration = registry
+            .try_register("client-1".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
+            .expect("register");
+
+        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
+        let _http_session_id = session_store.create_session().expect("session");
+        let http_sessions: Arc<dyn SessionStore> = Arc::new(session_store);
+
+        let daemon_cancel = CancellationToken::new();
+        let grace_cancel = CancellationToken::new();
+
+        spawn_grace_period_task(
+            1,
+            count_rx,
+            Some(http_sessions),
+            daemon_cancel.clone(),
+            grace_cancel.clone(),
+        );
+
+        registry.deregister(&registration.session_id);
+
+        // Grace period expires with the HTTP session still active -> the daemon
+        // is held alive and enters the bounded re-check loop.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!daemon_cancel.is_cancelled());
+
+        // An IPC client reconnects while the daemon is held alive by the HTTP session.
+        let reconnect = registry
+            .try_register("client-2".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
+            .expect("reconnect");
+
+        // Give the re-check loop's `count_rx.changed()` branch time to observe it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !daemon_cancel.is_cancelled(),
+            "daemon must not shut down once an IPC client reconnects"
+        );
+
+        // Disconnecting again should start a *fresh* grace period (the task
+        // returned to the outer watch loop, not a stale re-check that fires
+        // immediately).
+        registry.deregister(&reconnect.session_id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !daemon_cancel.is_cancelled(),
+            "a fresh grace period should not have expired yet"
+        );
+
+        grace_cancel.cancel();
     }
 
     #[test]
