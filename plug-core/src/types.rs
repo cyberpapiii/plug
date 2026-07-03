@@ -4,7 +4,17 @@ use uuid::Uuid;
 
 use rmcp::model::Icon;
 
-/// A string that redacts its value in Debug output to prevent secret leakage.
+/// A string that redacts its value in `Debug`/`Display` output to prevent
+/// secret leakage.
+///
+/// Redaction covers `Debug` and `Display` only. `Serialize` is
+/// `#[serde(transparent)]` and intentionally emits the plaintext value — this
+/// is required for config persistence (`config.toml` round-tripping through
+/// load → edit → save depends on it). This is a deliberate asymmetry, not a
+/// bug: **never** serialize a `Config` (or any struct containing
+/// `SecretString`) into logs, IPC diagnostics, or status output, since that
+/// path bypasses the `Debug`/`Display` redaction entirely and will leak the
+/// secret in plaintext.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretString(String);
@@ -69,6 +79,18 @@ mod tests {
     fn secret_string_display_is_redacted() {
         let secret = SecretString::from("super-secret".to_string());
         assert_eq!(format!("{secret}"), "[REDACTED]");
+    }
+
+    /// Pins the deliberate asymmetry documented on `SecretString`: `Serialize`
+    /// emits plaintext (required for config persistence) while
+    /// `Debug`/`Display` redact. If this test ever fails because `Serialize`
+    /// stops emitting plaintext, config round-tripping is likely broken;
+    /// don't "fix" it without checking `plug/src/commands/config.rs`.
+    #[test]
+    fn secret_string_serialize_is_plaintext_but_debug_is_redacted() {
+        let secret = SecretString::from("value".to_string());
+        assert_eq!(serde_json::to_string(&secret).unwrap(), "\"value\"");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
     }
 
     #[test]
