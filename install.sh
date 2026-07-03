@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # plug installer
-# Usage: curl -fsSL https://get.plug.sh | sh
-# Or:    curl -fsSL https://get.plug.sh | sh -s -- --install-dir ~/.local/bin
+# Usage: curl -fsSL https://raw.githubusercontent.com/cyberpapiii/plug/main/install.sh | sh
+# Or:    curl -fsSL https://raw.githubusercontent.com/cyberpapiii/plug/main/install.sh | sh -s -- --install-dir ~/.local/bin
 
 set -eu
 
@@ -53,7 +53,7 @@ while [ $# -gt 0 ]; do
 plug installer
 
 USAGE:
-    curl -fsSL https://get.plug.sh | sh [-- OPTIONS]
+    curl -fsSL https://raw.githubusercontent.com/cyberpapiii/plug/main/install.sh | sh [-- OPTIONS]
 
 OPTIONS:
     --install-dir <dir>   Install to this directory (default: ~/.local/bin or /usr/local/bin)
