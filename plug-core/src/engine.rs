@@ -1367,6 +1367,185 @@ mod tests {
         assert!(engine.supervision_settled("never-restarted"));
     }
 
+    // Seam semantics recorded for this suite (plan 005):
+    // - `supervision_due` is a pure read of health streak + circuit state +
+    //   restart history + `SupervisionConfig`; see `Engine::supervision_due`.
+    // - "settled" means enough real wall-clock time (`max_restart_interval_secs`)
+    //   has elapsed since the last supervised restart -- a healthy health-state
+    //   alone is NOT settled. This is the storm-vector fix from PR #67: a
+    //   flapping upstream that bounces healthy immediately after a restart must
+    //   not have its backoff reset, or it could be restarted every cycle forever.
+    // - The inter-episode backoff escalates as
+    //   `min(min_restart_interval_secs * 2^attempts, max_restart_interval_secs)`;
+    //   pure math is covered by `supervision_backoff_grows_and_caps` in
+    //   `config/mod.rs`. `grow_supervision_backoff` / `note_supervised_restart`
+    //   increment the `attempts` counter that feeds that math.
+    // - `reset_supervision` clears the `attempts` counter entirely (returns the
+    //   next required wait to the floor, `min_restart_interval_secs`).
+
+    /// The monitor loop's reset gate (`health.rs`) only calls `reset_supervision`
+    /// when `health == Healthy && !circuit_open && supervision_settled(..)`. This
+    /// test drives that exact three-part gate directly: a brief post-restart
+    /// healthy blip (settled still false, since almost no time has passed) must
+    /// leave the escalated backoff attempts counter untouched. This is the
+    /// single highest-value regression check for the PR #67 storm-vector fix.
+    #[test]
+    fn healthy_blip_does_not_reset_supervision_backoff() {
+        use crate::types::{HealthState, ServerHealth};
+
+        let engine = Engine::new(Config::default());
+        let sm = engine.server_manager();
+
+        sm.health.insert(
+            "imessage".to_string(),
+            HealthState {
+                health: ServerHealth::Degraded,
+                consecutive_failures: 6,
+            },
+        );
+        assert!(engine.supervision_due("imessage"));
+
+        engine.note_supervised_restart("imessage");
+        assert_eq!(
+            *engine.supervision_attempts.get("imessage").unwrap(),
+            1,
+            "one supervised restart should bump the backoff attempt counter once"
+        );
+
+        // The upstream immediately reports healthy again (a blip), but almost no
+        // wall-clock time has passed since the restart.
+        sm.health.insert(
+            "imessage".to_string(),
+            HealthState {
+                health: ServerHealth::Healthy,
+                consecutive_failures: 0,
+            },
+        );
+        assert!(!sm.circuit_open("imessage"));
+        assert!(
+            !engine.supervision_settled("imessage"),
+            "a just-restarted server is not yet stably recovered"
+        );
+
+        // Replicate the monitor loop's exact reset gate (health.rs) rather than
+        // running the real loop: reset only fires when all three conditions hold.
+        let (health_now, _) = sm.health_streak("imessage");
+        if health_now == ServerHealth::Healthy
+            && !sm.circuit_open("imessage")
+            && engine.supervision_settled("imessage")
+        {
+            engine.reset_supervision("imessage");
+        }
+
+        assert_eq!(
+            *engine.supervision_attempts.get("imessage").unwrap(),
+            1,
+            "a healthy blip that isn't settled must NOT reset the escalated backoff"
+        );
+    }
+
+    /// Once the upstream has been healthy AND the settle window has genuinely
+    /// elapsed, the reset gate fires and `reset_supervision` clears the attempt
+    /// counter back to the floor. Uses a tiny `max_restart_interval_secs` so the
+    /// test only needs to wait ~1 real second rather than the default 600s --
+    /// `supervision_settled` reads real `SystemTime`, so paused-tokio-time tricks
+    /// do not apply here (see plan 005 timing note).
+    #[test]
+    fn stable_recovery_resets_supervision_backoff() {
+        use crate::types::{HealthState, ServerHealth};
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let mut config = Config::default();
+        config.supervision.min_restart_interval_secs = 1;
+        config.supervision.max_restart_interval_secs = 1;
+        let engine = Engine::new(config);
+        let sm = engine.server_manager();
+
+        sm.health.insert(
+            "imessage".to_string(),
+            HealthState {
+                health: ServerHealth::Degraded,
+                consecutive_failures: 6,
+            },
+        );
+        assert!(engine.supervision_due("imessage"));
+        engine.note_supervised_restart("imessage");
+        assert_eq!(*engine.supervision_attempts.get("imessage").unwrap(), 1);
+
+        sm.health.insert(
+            "imessage".to_string(),
+            HealthState {
+                health: ServerHealth::Healthy,
+                consecutive_failures: 0,
+            },
+        );
+
+        // Let the (1s) settle window genuinely elapse.
+        sleep(Duration::from_millis(1200));
+        assert!(
+            engine.supervision_settled("imessage"),
+            "the settle window has elapsed, so the server is stably recovered"
+        );
+
+        let (health_now, _) = sm.health_streak("imessage");
+        if health_now == ServerHealth::Healthy
+            && !sm.circuit_open("imessage")
+            && engine.supervision_settled("imessage")
+        {
+            engine.reset_supervision("imessage");
+        }
+
+        assert!(
+            engine.supervision_attempts.get("imessage").is_none(),
+            "a stably-recovered server should have its backoff attempts cleared"
+        );
+    }
+
+    /// `grow_supervision_backoff` / `note_supervised_restart` plumbing: repeated
+    /// supervised restarts (without an intervening reset) accumulate the attempt
+    /// counter that feeds the exponential backoff math (verified in isolation by
+    /// `supervision_backoff_grows_and_caps` in `config/mod.rs`).
+    #[test]
+    fn repeated_supervised_restarts_accumulate_backoff_attempts() {
+        let engine = Engine::new(Config::default());
+
+        engine.note_supervised_restart("imessage");
+        engine.note_supervised_restart("imessage");
+        engine.note_supervised_restart("imessage");
+
+        assert_eq!(
+            *engine.supervision_attempts.get("imessage").unwrap(),
+            3,
+            "three supervised restarts without a reset should leave attempts at 3"
+        );
+    }
+
+    /// `SupervisionConfig::enabled = false` must make `supervision_due` never
+    /// true, even for a badly-degraded upstream with an open circuit. The pure
+    /// math is covered by `supervision_disabled_never_restarts` in
+    /// `config/mod.rs`; this test verifies the engine wiring (health streak +
+    /// circuit lookup) also respects it end-to-end.
+    #[test]
+    fn disabled_supervision_never_becomes_due_via_engine() {
+        use crate::types::{HealthState, ServerHealth};
+
+        let mut config = Config::default();
+        config.supervision.enabled = false;
+        let engine = Engine::new(config);
+        let sm = engine.server_manager();
+
+        sm.health.insert(
+            "imessage".to_string(),
+            HealthState {
+                health: ServerHealth::Failed,
+                consecutive_failures: 100,
+            },
+        );
+
+        assert!(!engine.supervision_due("imessage"));
+    }
+
     /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain
     /// safe while reload_config removes/adds servers. The ArcSwap-based design
     /// guarantees wait-free reads; this test documents that invariant.
