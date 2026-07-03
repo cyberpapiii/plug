@@ -92,10 +92,8 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-Candidate future state only:
-
-- `fix/subscription-rebind-confidence` — large checkpoint branch containing extractable future work (OAuth, SSE client, research docs), not mergeable whole-cloth
-Off-main work must not be described as current implementation.
+No off-main project branches are currently present locally or on `origin`.
+Off-main work must not be described as current implementation unless live git evidence shows it exists.
 
 ## Release Status
 
