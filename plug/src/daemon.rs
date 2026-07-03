@@ -804,7 +804,8 @@ async fn handle_ipc_connection(
     stream: tokio::net::UnixStream,
     mut ctx: ConnectionContext,
 ) -> anyhow::Result<()> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = FrameReader::new(reader);
 
     let result = handle_ipc_loop(&mut reader, &mut writer, &mut ctx).await;
 
@@ -850,9 +851,106 @@ async fn handle_ipc_connection(
     result
 }
 
+/// Owns the IPC connection's read half and mediates access to it in two modes.
+///
+/// - **Direct mode** (unregistered / pre-notification connections): frames are
+///   read straight off the `OwnedReadHalf` via `ipc::read_frame`, exactly as
+///   before this type existed.
+/// - **Multiplexed mode** (once a client has registered and the connection
+///   starts racing frame reads against logging/control notification delivery
+///   in a `select!`): frame reading is moved onto a dedicated task that feeds
+///   an `mpsc` channel. `mpsc::Receiver::recv` is cancellation-safe by
+///   construction, so parking a `select!` arm on it — and dropping that arm
+///   when a notification wins the race — never loses partially-read frame
+///   bytes the way parking directly on `ipc::read_frame` did (`read_frame`
+///   performs two awaits and buffers partial reads inside its own future, so
+///   dropping it mid-frame silently discards those bytes and desyncs the
+///   length-prefixed wire protocol on the next read).
+///
+/// The reverse-request path (`handle_reverse_request`) also reads a frame off
+/// this same connection (the proxy's elicitation/sampling response). It goes
+/// through `next()` too, so once multiplexed mode is active both consumers
+/// pull frames from the same ordered channel — never the raw reader
+/// directly — which preserves frame ordering without the two racing for the
+/// same `OwnedReadHalf`.
+struct FrameReader {
+    reader: Option<tokio::net::unix::OwnedReadHalf>,
+    frame_rx: Option<tokio::sync::mpsc::Receiver<anyhow::Result<Option<Vec<u8>>>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl FrameReader {
+    fn new(reader: tokio::net::unix::OwnedReadHalf) -> Self {
+        Self {
+            reader: Some(reader),
+            frame_rx: None,
+            task: None,
+        }
+    }
+
+    /// Move the read half onto a dedicated reader task the first time this is
+    /// called; subsequent calls are no-ops. Must be called before racing frame
+    /// reads against notification delivery in a `select!`.
+    fn ensure_multiplexed(&mut self) {
+        if self.frame_rx.is_some() {
+            return;
+        }
+        let Some(mut reader) = self.reader.take() else {
+            return;
+        };
+        // Bounded to 1: preserves the one-outstanding-frame backpressure the
+        // direct-read path had, so a slow/stalled request handler still stops
+        // the peer's socket buffer from growing unbounded.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            loop {
+                let frame = ipc::read_frame(&mut reader).await;
+                let is_end = matches!(frame, Ok(None) | Err(_));
+                if tx.send(frame).await.is_err() || is_end {
+                    break;
+                }
+            }
+        });
+        self.frame_rx = Some(rx);
+        self.task = Some(handle);
+    }
+
+    /// Read the next frame. Cancellation-safe once `ensure_multiplexed` has
+    /// been called (backed by `mpsc::Receiver::recv`); before that it is a
+    /// direct, non-cancellation-safe `ipc::read_frame` call, matching prior
+    /// behavior for connections that never reach multiplexed mode.
+    async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some(rx) = self.frame_rx.as_mut() {
+            return match rx.recv().await {
+                Some(result) => result,
+                // Reader task is gone (EOF/error already reported, or it was
+                // dropped) — treat like a clean EOF.
+                None => Ok(None),
+            };
+        }
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("FrameReader read half missing without a reader task");
+        ipc::read_frame(reader).await
+    }
+}
+
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        // Every exit path out of `handle_ipc_loop` drops the `FrameReader`
+        // owned by `handle_ipc_connection`, so the reader task is aborted
+        // here unconditionally — no per-exit-path bookkeeping needed, and no
+        // task leaks per disconnect.
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Inner loop for IPC connection handling.
 async fn handle_ipc_loop(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+    reader: &mut FrameReader,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &mut ConnectionContext,
 ) -> anyhow::Result<()> {
@@ -874,6 +972,7 @@ async fn handle_ipc_loop(
             // notifications. Notifications are sent immediately when idle. During
             // a request dispatch, they queue in the broadcast channel and get
             // drained after the response.
+            reader.ensure_multiplexed();
             'select: loop {
                 tokio::select! {
                     biased;
@@ -890,18 +989,18 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                     }
-                    result = ipc::read_frame(reader) => break 'select result,
+                    result = reader.next() => break 'select result,
                 }
             }
         } else if ctx.session_id.is_some() {
             tokio::select! {
                 _ = ctx.cancel.cancelled() => break,
-                result = ipc::read_frame(reader) => result,
+                result = reader.next() => result,
             }
         } else {
             tokio::select! {
                 _ = ctx.cancel.cancelled() => break,
-                result = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, ipc::read_frame(reader)) => {
+                result = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.next()) => {
                     match result {
                         Ok(result) => result,
                         Err(_) => {
@@ -1263,7 +1362,7 @@ async fn send_ipc_control_notification(
 /// The proxy client's read loop must be prepared to receive `DaemonToProxyMessage::ReverseRequest`
 /// frames interleaved with normal `IpcResponse` frames during a `tools/call`.
 async fn handle_reverse_request(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+    reader: &mut FrameReader,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     request: IpcClientRequest,
     response_tx: tokio::sync::oneshot::Sender<IpcClientResponse>,
@@ -1285,7 +1384,7 @@ async fn handle_reverse_request(
 
     // Read the proxy's response. The proxy sends an IpcClientResponse frame
     // after handling the reverse request.
-    let response = match ipc::read_frame(reader).await? {
+    let response = match reader.next().await? {
         Some(frame) => match serde_json::from_slice::<IpcClientResponse>(&frame) {
             Ok(resp) => resp,
             Err(e) => {
@@ -3815,6 +3914,102 @@ mod tests {
         let text = payload["content"][0]["text"].as_str().unwrap_or_default();
         assert!(
             text.contains("Called") && text.contains("ipc-hello"),
+            "unexpected echo payload: {payload}"
+        );
+    }
+
+    /// Regression test for the frame-reader cancellation-safety fix.
+    ///
+    /// Writes a request frame in two pieces (with a deliberate gap between
+    /// them) while flooding the daemon's logging broadcast channel, so the
+    /// registered-client `select!` races several ready notification arms
+    /// against a not-yet-complete frame read. Before the fix, `ipc::read_frame`
+    /// was polled directly inside that `select!`; when a notification arm won
+    /// the race while `read_frame` was parked mid-frame (e.g. having consumed
+    /// only part of the 4-byte length prefix), the future was dropped and the
+    /// already-consumed bytes were lost — the next read started mid-frame,
+    /// desyncing the length-prefixed protocol and killing the connection with
+    /// a spurious frame error. After the fix, frame reads go through a
+    /// dedicated reader task feeding an `mpsc` channel, whose `recv()` is
+    /// cancellation-safe, so this should round-trip cleanly.
+    ///
+    /// Confirmed to reproduce pre-fix: reverting the `FrameReader` change and
+    /// running this test fails with `frame too large: N bytes (max
+    /// 4194304)` — the exact desync symptom this fix prevents.
+    #[tokio::test]
+    async fn ipc_registered_client_survives_notification_flood_during_fragmented_frame() {
+        let mut harness = IpcTestHarness::start("echo").await;
+
+        let request = IpcRequest::McpRequest {
+            session_id: harness.session_id.clone(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "Mock__echo",
+                "arguments": { "input": "fragmented-hello" }
+            })),
+        };
+        let payload = serde_json::to_vec(&request).expect("serialize ipc request");
+        let len = u32::try_from(payload.len()).expect("payload fits in u32");
+        let len_bytes = len.to_be_bytes();
+
+        harness
+            .stream
+            .write_all(&len_bytes[..2])
+            .await
+            .expect("write partial length prefix");
+        harness.stream.flush().await.expect("flush partial write");
+
+        // Give the daemon's connection task a chance to actually poll
+        // `read_frame` and consume the 2 bytes already on the wire (parking
+        // mid length-prefix, pending the remaining 2). Without this delay,
+        // the notifications below could win the very first `select!` poll
+        // before `read_frame` ever touches the socket, which would not
+        // exercise the bug (nothing consumed yet, so nothing to lose).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Flood the logging broadcast channel while the frame is mid-flight.
+        // Each send makes the registered client's notification arm ready,
+        // racing it against the still-incomplete frame read in the daemon's
+        // `select!`. Uses `Error` level: the engine's default effective log
+        // level is `Warning`, so anything below that is filtered out before
+        // ever reaching the broadcast channel (see
+        // `ToolRouter::route_upstream_logging_message`) and would not
+        // actually race the frame read at all.
+        for i in 0..5 {
+            harness.engine.tool_router().route_upstream_logging_message(
+                "test-server",
+                rmcp::model::LoggingMessageNotificationParam::new(
+                    rmcp::model::LoggingLevel::Error,
+                    serde_json::json!(format!("flood-{i}")),
+                ),
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        harness
+            .stream
+            .write_all(&len_bytes[2..])
+            .await
+            .expect("write remaining length prefix");
+        harness
+            .stream
+            .write_all(&payload)
+            .await
+            .expect("write frame body");
+        harness.stream.flush().await.expect("flush frame body");
+
+        let resp = read_ipc_response(&mut harness.stream).await;
+        harness.shutdown().await;
+
+        let IpcResponse::McpResponse { payload } = resp else {
+            panic!(
+                "expected McpResponse after fragmented frame + notification flood, got: {resp:?}"
+            );
+        };
+        let text = payload["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("Called") && text.contains("fragmented-hello"),
             "unexpected echo payload: {payload}"
         );
     }
