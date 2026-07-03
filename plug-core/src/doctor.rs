@@ -1082,12 +1082,12 @@ async fn check_codesign_identity(config: &Config) -> CheckResult {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = config;
-        return CheckResult {
+        CheckResult {
             name,
             status: CheckStatus::Pass,
             message: "Not macOS — code-signing does not affect Keychain prompts here".to_string(),
             fix_suggestion: None,
-        };
+        }
     }
 
     #[cfg(target_os = "macos")]
