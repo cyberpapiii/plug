@@ -5,7 +5,7 @@
 
 set -eu
 
-PLUG_REPO="plug-mcp/plug"
+PLUG_REPO="cyberpapiii/plug"
 PLUG_BIN="plug"
 PLUG_INSTALL_DIR=""
 
