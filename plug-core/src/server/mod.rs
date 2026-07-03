@@ -596,6 +596,8 @@ fn circuit_state_label(state: crate::circuit::CircuitState) -> &'static str {
 
 pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
+    /// Serializes every writer to `servers` (RCU: lock, load, clone, mutate,
+    /// store, drop the guard). Never hold this across an `await`.
     server_map_write_lock: std::sync::Mutex<()>,
     pub(crate) health: DashMap<String, HealthState>,
     configured_auth: DashMap<String, ConfiguredAuth>,
@@ -1559,33 +1561,42 @@ impl ServerManager {
 
     /// Gracefully shutdown all upstream servers.
     ///
-    /// Swaps in an empty map, then attempts to take ownership of each server
-    /// via `Arc::try_unwrap` and cancel it cleanly. Falls back to dropping
-    /// the Arc if other references still exist (rmcp's Drop handles cleanup).
+    /// Swaps in an empty map (serialized with `server_map_write_lock`, like every
+    /// other writer to `self.servers`), then attempts to take ownership of each
+    /// server via `Arc::try_unwrap` and cancel it cleanly. Falls back to retiring
+    /// via a shared handle if other references to the map still exist — retirement
+    /// and state clearing always run, so shutdown can never silently no-op.
     pub async fn shutdown_all(&self) {
-        // Swap in empty map — after this, no new code can access the servers
-        let old = self.servers.swap(Arc::new(HashMap::new()));
+        // Swap in empty map — after this, no new code can access the servers.
+        // Serialize under the same lock insert_upstream/remove_upstream use so a
+        // concurrent RCU update can't clone the pre-swap map and store() after us.
+        let old = {
+            let _guard = self
+                .server_map_write_lock
+                .lock()
+                .expect("server map write mutex poisoned");
+            self.servers.swap(Arc::new(HashMap::new()))
+        };
 
-        let map = match Arc::try_unwrap(old) {
-            Ok(map) => map,
+        let entries: Vec<(String, Arc<UpstreamServer>)> = match Arc::try_unwrap(old) {
+            Ok(map) => map.into_iter().collect(),
             Err(arc) => {
-                tracing::warn!("other references to server map exist; dropping");
-                drop(arc);
-                return;
+                tracing::warn!(
+                    "other references to server map exist; retiring entries via shared handles"
+                );
+                arc.iter()
+                    .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
+                    .collect()
             }
         };
 
-        if map.is_empty() {
-            return;
-        }
-
-        tracing::info!(count = map.len(), "shutting down upstream servers");
-        join_all(
-            map.into_iter().map(|(name, upstream_arc)| {
+        if !entries.is_empty() {
+            tracing::info!(count = entries.len(), "shutting down upstream servers");
+            join_all(entries.into_iter().map(|(name, upstream_arc)| {
                 retire_upstream_owned(name, upstream_arc, "shutdown_all")
-            }),
-        )
-        .await;
+            }))
+            .await;
+        }
 
         self.health.clear();
         self.configured_auth.clear();
@@ -2682,6 +2693,81 @@ mod tests {
         assert!(servers.contains_key("alpha"));
         assert!(servers.contains_key("beta"));
         assert_eq!(servers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_retires_entries_even_when_map_arc_is_shared() {
+        let mgr = ServerManager::new();
+        let upstream = make_connected_test_upstream("shared-shutdown").await;
+        mgr.insert_upstream("shared-shutdown".to_string(), Arc::new(upstream));
+        mgr.record_call("shared-shutdown", true, 5);
+
+        // Hold a reference to the map Arc so `Arc::try_unwrap` inside
+        // `shutdown_all` fails, exercising the shared-handle fallback path.
+        let held_map = mgr.servers.load_full();
+
+        mgr.shutdown_all().await;
+
+        let upstream_arc = held_map
+            .get("shared-shutdown")
+            .expect("entry still reachable via held map Arc");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if upstream_arc.client.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("upstream should be cancelled even with the map Arc held");
+
+        assert!(
+            mgr.health.is_empty(),
+            "health must be cleared even on the shared-Arc fallback path"
+        );
+        assert!(
+            mgr.metrics.is_empty(),
+            "metrics must be cleared even on the shared-Arc fallback path"
+        );
+        assert!(
+            mgr.circuit_breakers.is_empty(),
+            "circuit breakers must be cleared even on the shared-Arc fallback path"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_is_idempotent() {
+        let mgr = ServerManager::new();
+        let upstream = make_connected_test_upstream("idempotent-shutdown").await;
+        mgr.insert_upstream("idempotent-shutdown".to_string(), Arc::new(upstream));
+
+        mgr.shutdown_all().await;
+        // Calling it again on an already-empty map must not panic and must
+        // leave all state empty.
+        mgr.shutdown_all().await;
+
+        assert!(mgr.servers.load().is_empty());
+        assert!(mgr.health.is_empty());
+        assert!(mgr.metrics.is_empty());
+        assert!(mgr.circuit_breakers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_after_shutdown_all_is_not_resurrected_over() {
+        let mgr = ServerManager::new();
+        let upstream = make_connected_test_upstream("pre-shutdown").await;
+        mgr.insert_upstream("pre-shutdown".to_string(), Arc::new(upstream));
+
+        mgr.shutdown_all().await;
+
+        let fresh = make_connected_test_upstream("post-shutdown").await;
+        mgr.insert_upstream("post-shutdown".to_string(), Arc::new(fresh));
+
+        let servers = mgr.servers.load();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("post-shutdown"));
+        assert!(!servers.contains_key("pre-shutdown"));
     }
 
     #[tokio::test]
