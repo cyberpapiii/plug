@@ -25,6 +25,9 @@ use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcR
 use plug_core::proxy::DownstreamBridge;
 use plug_core::session::SessionStore;
 
+mod framing;
+use framing::FrameReader;
+
 /// Maximum concurrently registered proxy client sessions.
 ///
 /// Short-lived admin/query sockets are not counted toward this limit so runtime
@@ -929,103 +932,6 @@ async fn handle_ipc_connection(
     }
 
     result
-}
-
-/// Owns the IPC connection's read half and mediates access to it in two modes.
-///
-/// - **Direct mode** (unregistered / pre-notification connections): frames are
-///   read straight off the `OwnedReadHalf` via `ipc::read_frame`, exactly as
-///   before this type existed.
-/// - **Multiplexed mode** (once a client has registered and the connection
-///   starts racing frame reads against logging/control notification delivery
-///   in a `select!`): frame reading is moved onto a dedicated task that feeds
-///   an `mpsc` channel. `mpsc::Receiver::recv` is cancellation-safe by
-///   construction, so parking a `select!` arm on it — and dropping that arm
-///   when a notification wins the race — never loses partially-read frame
-///   bytes the way parking directly on `ipc::read_frame` did (`read_frame`
-///   performs two awaits and buffers partial reads inside its own future, so
-///   dropping it mid-frame silently discards those bytes and desyncs the
-///   length-prefixed wire protocol on the next read).
-///
-/// The reverse-request path (`handle_reverse_request`) also reads a frame off
-/// this same connection (the proxy's elicitation/sampling response). It goes
-/// through `next()` too, so once multiplexed mode is active both consumers
-/// pull frames from the same ordered channel — never the raw reader
-/// directly — which preserves frame ordering without the two racing for the
-/// same `OwnedReadHalf`.
-struct FrameReader {
-    reader: Option<tokio::net::unix::OwnedReadHalf>,
-    frame_rx: Option<tokio::sync::mpsc::Receiver<anyhow::Result<Option<Vec<u8>>>>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl FrameReader {
-    fn new(reader: tokio::net::unix::OwnedReadHalf) -> Self {
-        Self {
-            reader: Some(reader),
-            frame_rx: None,
-            task: None,
-        }
-    }
-
-    /// Move the read half onto a dedicated reader task the first time this is
-    /// called; subsequent calls are no-ops. Must be called before racing frame
-    /// reads against notification delivery in a `select!`.
-    fn ensure_multiplexed(&mut self) {
-        if self.frame_rx.is_some() {
-            return;
-        }
-        let Some(mut reader) = self.reader.take() else {
-            return;
-        };
-        // Bounded to 1: preserves the one-outstanding-frame backpressure the
-        // direct-read path had, so a slow/stalled request handler still stops
-        // the peer's socket buffer from growing unbounded.
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let handle = tokio::spawn(async move {
-            loop {
-                let frame = ipc::read_frame(&mut reader).await;
-                let is_end = matches!(frame, Ok(None) | Err(_));
-                if tx.send(frame).await.is_err() || is_end {
-                    break;
-                }
-            }
-        });
-        self.frame_rx = Some(rx);
-        self.task = Some(handle);
-    }
-
-    /// Read the next frame. Cancellation-safe once `ensure_multiplexed` has
-    /// been called (backed by `mpsc::Receiver::recv`); before that it is a
-    /// direct, non-cancellation-safe `ipc::read_frame` call, matching prior
-    /// behavior for connections that never reach multiplexed mode.
-    async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        if let Some(rx) = self.frame_rx.as_mut() {
-            return match rx.recv().await {
-                Some(result) => result,
-                // Reader task is gone (EOF/error already reported, or it was
-                // dropped) — treat like a clean EOF.
-                None => Ok(None),
-            };
-        }
-        let reader = self
-            .reader
-            .as_mut()
-            .expect("FrameReader read half missing without a reader task");
-        ipc::read_frame(reader).await
-    }
-}
-
-impl Drop for FrameReader {
-    fn drop(&mut self) {
-        // Every exit path out of `handle_ipc_loop` drops the `FrameReader`
-        // owned by `handle_ipc_connection`, so the reader task is aborted
-        // here unconditionally — no per-exit-path bookkeeping needed, and no
-        // task leaks per disconnect.
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
 }
 
 /// Inner loop for IPC connection handling.
