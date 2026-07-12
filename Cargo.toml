@@ -110,6 +110,9 @@ http = "1"
 bytes = "1"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 
+# Testing
+tempfile = "3"
+
 [profile.release]
 strip = true
 lto = "fat"
