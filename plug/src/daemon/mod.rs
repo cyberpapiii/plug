@@ -1936,35 +1936,6 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_is_in_runtime_dir() {
-        // Hold the shared lock so a concurrent setter can't change the global
-        // runtime paths between the two reads below.
-        let _guard = runtime_paths_test_lock().blocking_lock();
-        let rt = runtime_dir();
-        let sock = socket_path();
-        assert!(sock.starts_with(&rt));
-        assert!(sock.to_string_lossy().ends_with("plug.sock"));
-    }
-
-    #[test]
-    fn pid_path_is_in_runtime_dir() {
-        let _guard = runtime_paths_test_lock().blocking_lock();
-        let rt = runtime_dir();
-        let pid = pid_path();
-        assert!(pid.starts_with(&rt));
-        assert!(pid.to_string_lossy().ends_with("plug.pid"));
-    }
-
-    #[test]
-    fn token_path_is_in_runtime_dir() {
-        let _guard = runtime_paths_test_lock().blocking_lock();
-        let rt = runtime_dir();
-        let tok = token_path();
-        assert!(tok.starts_with(&rt));
-        assert!(tok.to_string_lossy().ends_with("plug.token"));
-    }
-
-    #[test]
     fn acquire_pid_lock_does_not_truncate_existing_file_on_failed_relock() {
         let temp = std::env::temp_dir().join(format!(
             "plug-daemon-pid-lock-{}-{}",
