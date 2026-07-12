@@ -4,8 +4,9 @@
 local `main` @ `a2d8fd6` (a plans-only docs commit); implementation
 baseline: `e341625` (the commit all plans were written against, equal to
 `origin/main`'s runtime code). This report was written at the end of the
-execution run and corrected on 2026-07-12 after a cross-agent (Codex)
-counter-review; the final code state is the commit this file lands on.
+execution run and updated on 2026-07-12 after two cross-agent (Codex)
+counter-review waves; the final code state is the commit this file
+lands on.
 
 **Outcome**: 23 of 24 plans completed; 1 partial (013). Every plan was
 executed by a dedicated executor agent in an isolated worktree, reviewed by
@@ -15,16 +16,18 @@ Per-plan status with review annotations: `plans/README-claude-fable.md`.
 Each `merge:` commit body on this branch is the detailed review record for
 its plan.
 
-**Final gates** (run at `00364c8`, the last code commit — after the three
-counter-review repairs; see "Counter-review repairs" below. Every wave
-gate passed before the next wave was dispatched — note the wave-1 gate
-initially failed four `watcher::tests::*` config-watcher tests and was
-closed only after they went green; the program's pre-repair gate at
-`c1de241` was also fully green at 812 tests):
+**Final gates** (most recently run at `6d3e59a`, the last code commit —
+after the three wave-2 counter-review repairs; see the two
+"Counter-review repairs" sections below. Every wave gate passed before
+the next wave was dispatched — note the wave-1 execution gate initially
+failed four `watcher::tests::*` config-watcher tests and was closed only
+after they went green; the program's pre-repair gate at `c1de241` was
+fully green at 812 tests and the wave-1 repair gate at `00364c8` at
+828):
 
-- `cargo test --workspace`: 828 tests green (591 plug-core lib + 45
+- `cargo test --workspace`: 843 tests green (606 plug-core lib + 45
   integration + 192 plug bin), up from 730 at the implementation baseline
-  `e341625` (511 + 43 + 176; net +98 — an earlier revision of this report
+  `e341625` (511 + 43 + 176; net +113 — an earlier revision of this report
   wrongly said "802 at program start"; 802 was a mid-program measurement)
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
@@ -107,6 +110,70 @@ the plans index, plan 020's addendum, the snapshot, and session memory —
 all verified against primary evidence (git, a from-scratch baseline test
 run, wave-gate transcripts) before being applied at `013d209`.
 
+## Counter-review repairs, wave 2 (2026-07-12)
+
+Codex's second counter-review (against `f244a60`) independently
+reproduced all six wave-1 gates, then raised three lifecycle defect
+claims and one credential-write claim. All four were adjudicated
+against the code and confirmed by an eight-verifier adversarial
+workflow, with calibrated impact: the 010 skew produces no errors or
+leaks — its harm is silently missed `resources/updated` notifications,
+previously *permanent*; the unbounded-teardown worst consumer is the
+daemon's single serialized idle-expiry loop (a daemon-wide wedge);
+the credential-write hazard sits behind stacked preconditions (low).
+Its wording corrections (literal `exists off-main` in `docs/PLAN.md`,
+TTL as retention-time not cardinality, dropping the "none block the
+merge" claim) were applied at `98df2fa`. Each repair then ran under the
+same protocol as wave 1 — dedicated executor, isolated worktree, full
+diff review, independent re-runs (new concurrency tests 3×), review
+record in the merge body:
+
+- **Repair D (plan 010 follow-up)** — merged `89bcb78`. A first
+  subscriber landing inside `refresh_tools`' classify→publish window
+  bound to the old owner permanently: the running pass classified
+  before the entry existed, and every later refresh compared route
+  snapshots (new==new) rather than the entry's actual owner. Fix:
+  classify now compares each entry's recorded `owner_server_id`
+  against the NEW snapshot at every refresh (unconfirmed entries keep
+  route-diff behavior), and `subscribe_resource` runs a one-shot
+  post-subscribe self-check that rebinds if the route moved
+  mid-subscribe. Deterministic first-subscribe-during-refresh tests
+  cover both interleavings; the executor proved all six pinning tests
+  fail with the fix reverted. (Codex's route-epoch/commit-coordination
+  remedy was again judged over-scoped; this is the "equivalent
+  authoritative revalidation" its report allowed for.) Remaining skew
+  windows are bounded to one refresh period, no longer permanent.
+- **Repair E (plan 019 follow-up)** — merged `6d3e59a`. Teardown was
+  serial and unbounded (rmcp's plain `send_request` has no timeout, so
+  one silent upstream blocked later handles' aborts and could hang
+  HTTP DELETE, IPC teardown, or the idle-expiry loop), and task
+  creation raced the cleanup boundary (native path registered only
+  after the upstream round trip; local path created/spawned/attached
+  in three lock scopes, allowing a handle-less drain to detach a
+  running future still holding its `max_concurrent` permit). Fix:
+  abort-all-local-handles-first, then concurrent upstream
+  cancellations each bounded by that server's `call_timeout_secs`
+  (`cancel_task_for_owner` got the same bound, sync-back unchanged);
+  a per-owner lifecycle ledger (in-flight-create counter + tombstone,
+  entries die at count zero) makes teardown refuse late creates —
+  the native path cancels the just-created upstream task before
+  returning the error — and the local path now creates/spawns/attaches
+  in one lock scope. Gated hung-upstream and create-vs-teardown
+  regression tests, paused-time bounded.
+- **Repair F (plan 020 follow-up)** — merged `ccd38c9`. `persist_state`
+  silently ignored a temp-file chmod failure (`let _ =`) and renamed
+  the possibly-loose file into place as the plaintext token store; a
+  stale crash-left temp also kept its old mode through truncation, and
+  the final file's permissions were never enforced post-rename (unlike
+  the sibling upstream store). Fix: stale temp removed before open,
+  chmod failure warns + removes the temp + returns without renaming,
+  and post-rename 0600 enforcement mirrors `oauth.rs`. Unix-gated
+  tests pin the stale-loose-temp and fresh-persist cases.
+
+Wave-2 final gates all passed at `6d3e59a` (see "Final gates" above):
+843 workspace tests, clippy `-D warnings`, fmt, MSRV 1.88 check,
+`cargo deny check advisories`, and the todo-status guard.
+
 ## Open findings / follow-up candidates
 
 1. **IPC `ping` gap (correctness, new)** — MCP `ping` over the daemon IPC
@@ -135,13 +202,18 @@ run, wave-gate transcripts) before being applied at `013d209`.
    real `run_reload_start_actions`; it reimplements the pattern inline and
    guards nothing. Candidate for a test-coverage pass.
 6. **010 residuals** — two acknowledged residual races were recorded in
-   its merge body; the counter-review then confirmed a third window
+   its merge body; the counter-reviews then confirmed a third window
    (publish-before-rebind), fixed on this branch by repair B
-   (`00364c8`). One residual remains recorded-not-fixed after repair B
-   (pre-existing supersede semantics, cross-owner case): a new
-   subscriber superseding any drain before its upstream call can leave
-   the old owner's subscription unreleased if the subscriber lands on a
-   different owner.
+   (`00364c8`), and a fourth (first-subscribe-during-refresh permanent
+   skew), fixed by repair D (`89bcb78`). What remains is recorded, not
+   fixed: the pre-existing cross-owner supersede case (a new subscriber
+   superseding any drain before its upstream call can leave the old
+   owner's subscription unreleased if the subscriber lands on a
+   different owner), and repair D's bounded windows — its self-check is
+   one-shot (a second mid-subscribe route move waits one refresh) and
+   classify reads the recorded owner outside the transition lock (stale
+   decisions become generation-stamped no-ops). All post-D windows
+   self-heal within one refresh period; none is permanent.
 7. **003 bug-3 residual race (report-only, recorded in its merge body)**.
 8. **015 drift observations** — daemon pushes `AuthStateChanged` as a
    native unfiltered `IpcResponse` where stdio/HTTP flatten to a logging
