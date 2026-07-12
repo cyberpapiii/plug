@@ -933,7 +933,7 @@ impl StateStore for CompositeStateStore {
         let dir = path.parent().ok_or_else(|| {
             AuthError::InternalError("state file path has no parent directory".into())
         })?;
-        std::fs::create_dir_all(dir)
+        crate::fs_perm::ensure_dir_0700(dir)
             .map_err(|e| AuthError::InternalError(format!("failed to create tokens dir: {e}")))?;
 
         let json = serde_json::to_string_pretty(&state)
