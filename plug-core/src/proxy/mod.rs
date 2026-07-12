@@ -1551,12 +1551,7 @@ impl ToolRouter {
     /// as a route-derived fallback (the registry prefers the entry's
     /// recorded owner at drain time) and gate the new owner on subscribe
     /// support.
-    async fn rebind_subscription_route(
-        &self,
-        uri: &str,
-        old_server_id: &str,
-        new_server_id: &str,
-    ) {
+    async fn rebind_subscription_route(&self, uri: &str, old_server_id: &str, new_server_id: &str) {
         let old_upstream = self
             .server_manager
             .get_upstream(old_server_id)
