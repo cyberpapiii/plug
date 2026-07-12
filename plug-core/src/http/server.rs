@@ -2053,6 +2053,75 @@ mod tests {
         assert_eq!(state.router.task_count_for_owner(&owner).await, 0);
     }
 
+    /// Drop guard that flips a flag when the future holding it stops
+    /// running. Proves teardown actually stops execution, not just that the
+    /// task's store record disappears — a bare `retain` that drops a
+    /// `JoinHandle` without aborting it would detach the future (it keeps
+    /// running) while still passing a record-count-only assertion.
+    struct AbortObserver(Arc<AtomicBool>);
+
+    impl Drop for AbortObserver {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_mcp_aborts_still_running_session_task() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let owner = ToolRouter::task_owner_for_http_session(&session_id);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observer = AbortObserver(Arc::clone(&dropped));
+        let handle = tokio::spawn(async move {
+            let _observer = observer;
+            // Never resolves on its own — only `DELETE /mcp` teardown
+            // aborting the handle can stop it, mirroring a real task future
+            // parked waiting on a slow/unresponsive upstream.
+            std::future::pending::<()>().await;
+        });
+        state
+            .router
+            .attach_test_task_with_abort_handle(owner.clone(), "long_running_tool", handle)
+            .await;
+
+        assert_eq!(state.router.task_count_for_owner(&owner).await, 1);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "task must still be running before teardown"
+        );
+
+        let app = build_router(state.clone());
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.router.task_count_for_owner(&owner).await, 0);
+
+        // `JoinHandle::abort()` only requests cancellation — the aborted
+        // future is dropped the next time the runtime polls/schedules it,
+        // which is inherently async relative to the DELETE response above —
+        // so poll within a bound instead of asserting immediately.
+        let mut stopped = false;
+        for _ in 0..200 {
+            if dropped.load(Ordering::SeqCst) {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            stopped,
+            "DELETE /mcp teardown must abort the still-running task future, not just its record"
+        );
+    }
+
     #[tokio::test]
     async fn get_without_accept_header_returns_406() {
         let state = test_state();
