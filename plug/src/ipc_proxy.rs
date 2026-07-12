@@ -1333,6 +1333,9 @@ mod tests {
         CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskInfoParams,
         GetTaskInfoRequest, GetTaskResultParams, GetTaskResultRequest, ServerResult, TaskStatus,
     };
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinHandle;
 
     // Shared with the daemon and runtime test modules: every test that touches the
@@ -2512,6 +2515,776 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    // ── Fake-daemon harness for reconnect / retry-policy / frame-handling
+    // characterization tests (plan 006) ────────────────────────────────────
+    //
+    // The harness above (`spawn_test_daemon`) runs a REAL `Engine` +
+    // `run_daemon` in-process against an actual upstream mock MCP server —
+    // the right tool for end-to-end behavior (tool listing, task lifecycle,
+    // artifact spilling), but it gives no way to inspect exactly which wire
+    // requests a reconnect sends (the daemon's `ClientRegistry` and its
+    // capability tracking are private to `daemon.rs`, invisible from this
+    // module) or to make the daemon emit a malformed frame, a precisely
+    // timed interleaved notification, or an indefinite stall — none of
+    // which the real `Engine` exposes a test hook for, and adding one is
+    // out of scope for this plan. The tests below instead speak
+    // `plug_core::ipc`'s wire protocol directly against a hand-rolled
+    // `UnixListener` bound at the same (test-scoped) `daemon::socket_path()`
+    // used everywhere else in this file, giving full control over
+    // daemon-side responses while exercising the real client-side code
+    // (`session_round_trip`, `try_round_trip_locked`, `reconnect_locked`,
+    // and — where a downstream peer matters — the full `IpcProxyHandler` +
+    // `.serve()` path) completely unmodified. `fake_daemon_handshake`
+    // performs the Register+Capabilities pair that `establish_daemon_proxy_
+    // session` sends on the initial connect AND on every reconnect;
+    // `drive_fake_daemon_initialize` additionally answers the three extra
+    // round trips (`UpdateSession`, `UpdateCapabilities`, a `Capabilities`
+    // refresh) that `IpcProxyHandler::initialize` performs only the first
+    // time a downstream MCP client connects — matching production, this is
+    // also the point at which `shared.peer` becomes populated. Because
+    // `establish_daemon_proxy_session` only touches `config_path` when it
+    // has to auto-spawn a daemon (never true here, since our listener is
+    // already bound), these tests pass `None` for it throughout. All tests
+    // below abort the handler's background heartbeat task right after
+    // construction, before it can independently race a scripted disconnect
+    // against the test's own explicit round trip (`DAEMON_PING_INTERVAL` is
+    // only ~1s, which is not a safe margin under this repo's noted CI
+    // contention). Like the rest of this module they serialize on
+    // `daemon_test_lock()` since they touch the global runtime-paths slot.
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ))
+    }
+
+    fn bind_fake_daemon_socket() -> UnixListener {
+        let path = crate::daemon::socket_path();
+        std::fs::create_dir_all(path.parent().expect("socket path has a parent"))
+            .expect("create daemon socket directory");
+        let _ = std::fs::remove_file(&path);
+        UnixListener::bind(&path).expect("bind fake daemon socket")
+    }
+
+    /// Perform the Register + Capabilities handshake that
+    /// `establish_daemon_proxy_session` sends on the initial connect AND on
+    /// every reconnect, replying with `session_id` and default
+    /// `ServerCapabilities`. Returns the split halves for further scripted
+    /// interaction plus which request types were observed, so callers can
+    /// pin exactly what reconnect does (and does not) replay.
+    async fn fake_daemon_handshake(
+        stream: UnixStream,
+        session_id: &str,
+    ) -> (OwnedReadHalf, OwnedWriteHalf, Vec<String>) {
+        let (mut reader, mut writer) = stream.into_split();
+        let mut seen = Vec::new();
+
+        let frame = ipc::read_frame(&mut reader)
+            .await
+            .expect("read register frame")
+            .expect("connection closed before register");
+        let req: IpcRequest = serde_json::from_slice(&frame).expect("parse register request");
+        let (protocol_version, client_id) = match req {
+            IpcRequest::Register {
+                protocol_version,
+                client_id,
+                ..
+            } => {
+                seen.push("Register".to_string());
+                (protocol_version, client_id)
+            }
+            other => panic!("expected Register, got {other:?}"),
+        };
+        ipc::send_response(
+            &mut writer,
+            &IpcResponse::Registered {
+                protocol_version,
+                client_id,
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
+        .expect("send Registered");
+
+        let frame = ipc::read_frame(&mut reader)
+            .await
+            .expect("read capabilities frame")
+            .expect("connection closed before capabilities");
+        let req: IpcRequest = serde_json::from_slice(&frame).expect("parse capabilities request");
+        match req {
+            IpcRequest::Capabilities { .. } => seen.push("Capabilities".to_string()),
+            other => panic!("expected Capabilities, got {other:?}"),
+        }
+        ipc::send_response(
+            &mut writer,
+            &IpcResponse::Capabilities {
+                capabilities: serde_json::to_value(ServerCapabilities::default())
+                    .expect("serialize default capabilities"),
+            },
+        )
+        .await
+        .expect("send Capabilities");
+
+        (reader, writer, seen)
+    }
+
+    /// Extend `fake_daemon_handshake` with the three extra round trips
+    /// `IpcProxyHandler::initialize` performs the FIRST time a downstream
+    /// MCP client connects (`UpdateSession`, `UpdateCapabilities`, a
+    /// `Capabilities` refresh) — NOT repeated on later reconnects, which
+    /// only redo Register+Capabilities (see
+    /// `reconnect_reregisters_with_register_and_capabilities_only` below).
+    /// Returns once the daemon side has answered the final `Capabilities`
+    /// refresh, matching the point at which production populates
+    /// `shared.peer`.
+    async fn drive_fake_daemon_initialize(
+        stream: UnixStream,
+        session_id: &str,
+    ) -> (OwnedReadHalf, OwnedWriteHalf) {
+        let (mut reader, mut writer, _handshake_seen) =
+            fake_daemon_handshake(stream, session_id).await;
+
+        loop {
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read initialize request")
+                .expect("connection closed during initialize");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse initialize request");
+            match req {
+                IpcRequest::UpdateSession { .. } => {
+                    ipc::send_response(&mut writer, &IpcResponse::Ok)
+                        .await
+                        .expect("send UpdateSession ack");
+                }
+                IpcRequest::UpdateCapabilities { .. } => {
+                    ipc::send_response(&mut writer, &IpcResponse::Ok)
+                        .await
+                        .expect("send UpdateCapabilities ack");
+                }
+                IpcRequest::Capabilities { .. } => {
+                    ipc::send_response(
+                        &mut writer,
+                        &IpcResponse::Capabilities {
+                            capabilities: serde_json::to_value(ServerCapabilities::default())
+                                .expect("serialize default capabilities"),
+                        },
+                    )
+                    .await
+                    .expect("send Capabilities refresh");
+                    return (reader, writer);
+                }
+                other => panic!("unexpected request during fake daemon initialize: {other:?}"),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct LoggingCaptureClient {
+        notify: Arc<tokio::sync::Notify>,
+        messages: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ClientHandler for LoggingCaptureClient {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default().with_protocol_version(
+                serde_json::from_value(serde_json::Value::String(
+                    LATEST_PROTOCOL_VERSION.to_string(),
+                ))
+                .expect("latest protocol version must parse"),
+            )
+        }
+
+        async fn on_logging_message(
+            &self,
+            params: LoggingMessageNotificationParam,
+            _context: NotificationContext<rmcp::RoleClient>,
+        ) {
+            self.messages.lock().await.push(params.data.to_string());
+            self.notify.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_reregisters_with_register_and_capabilities_only() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("reconnect-caps");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            // Connection 1: handshake only, then drop — simulates the daemon
+            // restarting mid-session so the NEXT round trip must reconnect.
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (reader1, writer1, _seen1) = fake_daemon_handshake(stream1, "fake-session-1").await;
+            drop(reader1);
+            drop(writer1);
+
+            // Connection 2: the reconnect. Pin the request shape here — this
+            // is the plan-007 baseline.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+            assert_eq!(
+                seen2,
+                vec!["Register".to_string(), "Capabilities".to_string()],
+                // CHARACTERIZATION: current behavior loses client caps on
+                // reconnect — plan 007 will change this assertion.
+                "reconnect must send ONLY Register+Capabilities; anything else means \
+                 UpdateCapabilities/roots/log-level are being replayed and this test \
+                 (and comment) need updating"
+            );
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read ping")
+                .expect("connection open");
+            let _req: IpcRequest = serde_json::from_slice(&frame).expect("parse ping");
+            ipc::send_response(&mut writer2, &IpcResponse::Pong)
+                .await
+                .expect("send pong");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, "client-caps".to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let initial_session_id = session.session_id.clone();
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let response = proxy
+            .session_round_trip(RetryPolicy::SafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("round trip should succeed after reconnect");
+        assert!(matches!(response, IpcResponse::Pong));
+
+        let final_session_id = { proxy.shared.conn.lock().await.session_id.clone() };
+        assert_ne!(
+            final_session_id, initial_session_id,
+            "reconnect should replace the daemon session id"
+        );
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn retry_policy_safe_rebuilds_against_new_session() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("retry-safe");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (reader1, writer1, _seen1) = fake_daemon_handshake(stream1, "fake-session-1").await;
+            drop(reader1);
+            drop(writer1); // force the first Ping attempt to fail (reconnectable)
+
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read retried ping")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse retried ping");
+            match req {
+                IpcRequest::Ping { session_id } => assert_eq!(
+                    session_id, "fake-session-2",
+                    "SafeToRetry must rebuild the retried request against the NEW session id"
+                ),
+                other => panic!("expected retried Ping, got {other:?}"),
+            }
+            ipc::send_response(&mut writer2, &IpcResponse::Pong)
+                .await
+                .expect("send pong");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-retry-safe".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let response = proxy
+            .session_round_trip(RetryPolicy::SafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("safe retry should succeed after reconnect");
+        assert!(matches!(response, IpcResponse::Pong));
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn retry_policy_unsafe_surfaces_retry_error() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("retry-unsafe");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (reader1, writer1, _seen1) = fake_daemon_handshake(stream1, "fake-session-1").await;
+            drop(reader1);
+            drop(writer1);
+
+            // Reconnect handshake happens even though the original request
+            // is never retried under UnsafeToRetry.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (reader2, writer2, _seen2) = fake_daemon_handshake(stream2, "fake-session-2").await;
+            drop(reader2);
+            drop(writer2);
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-retry-unsafe".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let initial_session_id = { proxy.shared.conn.lock().await.session_id.clone() };
+
+        let error = proxy
+            .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect_err("UnsafeToRetry must surface an error, not silently retry");
+        assert!(
+            error.message.contains("REQUEST_RETRY_UNSAFE"),
+            "unexpected error message: {}",
+            error.message
+        );
+
+        let final_session_id = { proxy.shared.conn.lock().await.session_id.clone() };
+        assert_ne!(
+            final_session_id, initial_session_id,
+            "reconnect should still happen under UnsafeToRetry — only the retried send is skipped"
+        );
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn notifications_interleaved_before_response_are_forwarded() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("interleave");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) =
+                drive_fake_daemon_initialize(stream, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read tools/call frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse tools/call request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected tools/call, got {req:?}"
+            );
+
+            // Interleave a push notification BEFORE the actual response,
+            // exactly as the real daemon does when an upstream server logs
+            // mid-call (plug/src/daemon.rs sends LoggingNotification via
+            // plain ipc::send_response, never enveloped — see the "Plain
+            // IpcResponse" branch of try_round_trip_locked).
+            let notif_params = serde_json::to_value(LoggingMessageNotificationParam::new(
+                LoggingLevel::Info,
+                serde_json::json!("hello from daemon"),
+            ))
+            .expect("serialize logging params");
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::LoggingNotification {
+                    params: notif_params,
+                },
+            )
+            .await
+            .expect("send interleaved notification");
+
+            let call_result =
+                serde_json::to_value(CallToolResult::success(vec![Content::text("ok")]))
+                    .expect("serialize call result");
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::McpResponse {
+                    payload: call_result,
+                },
+            )
+            .await
+            .expect("send tools/call response");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-interleave".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = LoggingCaptureClient {
+            notify: notify.clone(),
+            messages: messages.clone(),
+        }
+        .serve(client_transport)
+        .await
+        .expect("connect downstream client");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("call timeout")
+        .expect("call should succeed despite the interleaved notification");
+        assert!(!result.content.is_empty());
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("expected the interleaved notification to reach the downstream peer");
+        let captured = messages.lock().await.clone();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains("hello from daemon"));
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn chunked_response_reassembly() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("chunked");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) =
+                drive_fake_daemon_initialize(stream, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read tools/call frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse tools/call request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected tools/call, got {req:?}"
+            );
+
+            // > MAX_FRAME_SIZE (4 MiB) so plug_core::ipc::send_chunked_response
+            // — the SAME helper the real daemon uses — must split it into
+            // multiple ResponseChunk envelopes for try_round_trip_locked to
+            // reassemble.
+            let big_text = "x".repeat(6 * 1024 * 1024);
+            let call_result =
+                serde_json::to_value(CallToolResult::success(vec![Content::text(big_text)]))
+                    .expect("serialize call result");
+            ipc::send_chunked_response(
+                &mut writer,
+                &IpcResponse::McpResponse {
+                    payload: call_result,
+                },
+            )
+            .await
+            .expect("send chunked response");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-chunked".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("chunked call timeout")
+        .expect("chunked call should succeed");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .expect("text content");
+        assert_eq!(text.text.len(), 6 * 1024 * 1024);
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_is_reconnectable_failure() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("malformed");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (mut reader1, mut writer1) =
+                drive_fake_daemon_initialize(stream1, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader1)
+                .await
+                .expect("read tools/call frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse tools/call request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected tools/call, got {req:?}"
+            );
+
+            // Write a frame length prefix promising a body, then close
+            // before sending it — read_frame's read_exact hits
+            // UnexpectedEof mid-body, which transport_failure() classifies
+            // reconnectable=true. NOTE: this is the ONE "malformed frame"
+            // flavor the current code treats as reconnectable. A
+            // syntactically-complete frame containing garbage JSON, or a
+            // length prefix over MAX_FRAME_SIZE, are BOTH classified
+            // reconnectable=false today (a parse error / anyhow::bail, not
+            // a std::io::Error) and do NOT auto-recover — see
+            // try_round_trip_locked's parse-error arms, which always set
+            // `reconnectable: false`.
+            writer1
+                .write_u32(64)
+                .await
+                .expect("write bogus length prefix");
+            writer1.flush().await.expect("flush bogus length prefix");
+            drop(reader1);
+            drop(writer1);
+
+            // The reconnect after the transport failure only re-sends
+            // Register + Capabilities (see
+            // reconnect_reregisters_with_register_and_capabilities_only) —
+            // not the full initialize() sequence, which only runs once per
+            // downstream client lifetime.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            let frame2 = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read second tools/call frame")
+                .expect("connection open");
+            let req2: IpcRequest =
+                serde_json::from_slice(&frame2).expect("parse second tools/call request");
+            assert!(
+                matches!(req2, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected retried tools/call, got {req2:?}"
+            );
+            let call_result =
+                serde_json::to_value(CallToolResult::success(vec![Content::text("recovered")]))
+                    .expect("serialize call result");
+            ipc::send_response(
+                &mut writer2,
+                &IpcResponse::McpResponse {
+                    payload: call_result,
+                },
+            )
+            .await
+            .expect("send second tools/call response");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-malformed".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        // call_tool() uses RetryPolicy::UnsafeToRetry: the malformed-frame
+        // failure triggers a reconnect, but the ORIGINAL request is not
+        // resent — the call surfaces REQUEST_RETRY_UNSAFE instead. Confirms
+        // "not a hang, not a panic": this returns promptly with an error.
+        let first_attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("first call timed out — would indicate a hang, not a surfaced error");
+        assert!(
+            first_attempt.is_err(),
+            "expected the first call to surface an error after the malformed frame, not silently succeed"
+        );
+
+        // The proxy has now reconnected (session 2); the next call succeeds.
+        let second_attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("second call timeout")
+        .expect("second call should succeed on the reconnected session");
+        assert_eq!(
+            second_attempt
+                .content
+                .first()
+                .and_then(|c| c.raw.as_text())
+                .map(|t| t.text.as_str()),
+            Some("recovered")
+        );
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn silent_daemon_stall_currently_hangs() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("stall");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, writer) = drive_fake_daemon_initialize(stream, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read tools/call frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse tools/call request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected tools/call, got {req:?}"
+            );
+
+            // Accept the request and never respond — e.g. a wedged upstream
+            // server the daemon is still waiting on. Hold the connection
+            // open (silent) until the test releases us.
+            let _ = release_rx.await;
+            drop(reader);
+            drop(writer);
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, "client-stall".to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        // CHARACTERIZATION: no read watchdog today — plan 009 will turn
+        // this into a reconnectable failure. Keep the timeout short (real
+        // time, not paused: the fake daemon does genuine socket I/O, which
+        // paused/mocked time cannot advance around safely).
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "CHARACTERIZATION: no read watchdog today — a silently stalled daemon currently \
+             hangs the round trip indefinitely instead of surfacing a reconnectable failure"
+        );
+
+        let _ = release_tx.send(());
+        daemon_task.await.expect("daemon task join");
 
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
