@@ -114,6 +114,16 @@ in the test module comment.
 
 ### Step 2: OAuth refresh-under-load e2e
 
+> **Reviewer ruling (2026-07-12, at execution): DEFERRED behind plan 014.**
+> Execution STOPPED here, correctly: `MIN_EXPIRES_IN = 60`
+> (`plug-core/src/oauth.rs:35`) clamps any provider-supplied `expires_in` up to
+> 60s, and the short-lived 50% rule puts the earliest background refresh ~30s
+> after token receipt — two observed refresh windows need ~60s+ of wall clock,
+> past this plan's own STOP threshold. This is the production constraint plan
+> 014's paused/mocked-time work removes; re-attempt this step only after 014
+> lands. Step 3 was executed and merged separately (see the in-code deferral
+> note atop the new test section in `plug-core/tests/integration_tests.rs`).
+
 New test `test_oauth_refresh_under_load_no_auth_errors` (take
 `oauth_integration_test_lock`):
 
