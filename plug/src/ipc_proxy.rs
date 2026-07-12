@@ -4,6 +4,7 @@
 //! all tool calls through the daemon's shared Engine via Unix socket IPC.
 //! This is what `plug connect` uses when a daemon is running.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,37 @@ struct SharedConnection {
     /// Notifications received during daemon session establishment before the
     /// downstream peer exists. Flushed after initialize.
     pending_daemon_notifications: std::sync::Mutex<Vec<IpcResponse>>,
+    /// Client-negotiated session state the daemon does not persist across a
+    /// restart (see `ReplayState`). Replayed onto the fresh daemon session
+    /// in `replay_session_state_locked` after every successful reconnect.
+    ///
+    /// Lock ordering: `conn` is always acquired before `replay` whenever
+    /// both are needed. The only sites that need both are
+    /// `refresh_session_locked`/`refresh_session` (the reconnect path),
+    /// which already hold `conn` when they lock `replay` for the replay
+    /// round trips. Every other mutation site (`initialize`, `subscribe`,
+    /// `unsubscribe`, `set_level`) locks `replay` alone, strictly after its
+    /// own `session_round_trip` call has already released `conn` — never
+    /// while `conn` is held. Do not acquire `replay` and then try to
+    /// acquire `conn`; that ordering is never used and would risk deadlock
+    /// against the reconnect path above.
+    replay: Mutex<ReplayState>,
+}
+
+/// Client-negotiated session state that the daemon cannot recover on its
+/// own after a restart, tracked here so the proxy can replay it onto the
+/// fresh session (see plans/007-ipc-reconnect-state-replay-claude-fable.md).
+///
+/// IMPORTANT: any FUTURE IPC message that represents durable per-session
+/// negotiated client state (in the same family as `UpdateCapabilities`,
+/// `resources/subscribe`/`unsubscribe`, and `logging/setLevel`) must be
+/// added here and replayed in `replay_session_state_locked`, or it will be
+/// silently lost on daemon reconnect exactly like the bug this plan fixes.
+#[derive(Default)]
+struct ReplayState {
+    client_capabilities: Option<ClientCapabilities>,
+    subscriptions: HashSet<String>,
+    log_level: Option<LoggingLevel>,
 }
 
 /// MCP server handler that proxies all requests through the daemon via IPC.
@@ -73,6 +105,7 @@ impl IpcProxyHandler {
             peer: std::sync::OnceLock::new(),
             roots_supported: std::sync::atomic::AtomicBool::new(false),
             pending_daemon_notifications,
+            replay: Mutex::new(ReplayState::default()),
         });
         let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
         Self { shared, heartbeat }
@@ -386,6 +419,7 @@ impl IpcProxyHandler {
             *caps = session.capabilities.clone();
         }
         *conn = session;
+        Self::replay_session_state_locked(&self.shared, conn).await;
         Ok(())
     }
 
@@ -404,7 +438,92 @@ impl IpcProxyHandler {
             *caps = session.capabilities.clone();
         }
         *conn = session;
+        Self::replay_session_state_locked(shared, conn).await;
         Ok(())
+    }
+
+    /// Best-effort replay of client-negotiated session state that the fresh
+    /// daemon session lost in the restart (see `ReplayState`). Called from
+    /// `refresh_session_locked`/`refresh_session` immediately after the new
+    /// session has been installed into `conn`.
+    ///
+    /// CRITICAL: the caller already holds the `shared.conn` lock (`conn` is
+    /// a reborrow of that guard), so every round trip here MUST use the
+    /// locked path (`try_round_trip_locked` via `send_replay_request`), never
+    /// `session_round_trip` — that would try to re-acquire `shared.conn` and
+    /// deadlock. `replay` is locked strictly after `conn` here, matching the
+    /// ordering documented on `SharedConnection::replay`.
+    ///
+    /// A replay failure (transport or daemon-rejected) is logged and does
+    /// NOT fail the reconnect, and does NOT trigger a recursive reconnect —
+    /// a degraded session beats no session, and beats today's silently
+    /// degraded session because it's now logged.
+    async fn replay_session_state_locked(
+        shared: &Arc<SharedConnection>,
+        conn: &mut crate::runtime::DaemonProxySession,
+    ) {
+        let replay = shared.replay.lock().await;
+        let peer = shared.peer.get();
+
+        if let Some(caps) = replay.client_capabilities.clone() {
+            let request = IpcRequest::UpdateCapabilities {
+                session_id: conn.session_id.clone(),
+                capabilities: Box::new(caps),
+            };
+            if let Err(e) = Self::send_replay_request(conn, peer, &request).await {
+                tracing::warn!(error = %e, "reconnect: failed to replay client capabilities");
+            }
+        }
+
+        for uri in &replay.subscriptions {
+            let params = serde_json::to_value(SubscribeRequestParams::new(uri.clone())).ok();
+            let request = IpcRequest::McpRequest {
+                session_id: conn.session_id.clone(),
+                method: "resources/subscribe".to_string(),
+                params,
+            };
+            if let Err(e) = Self::send_replay_request(conn, peer, &request).await {
+                tracing::warn!(%uri, error = %e, "reconnect: failed to replay subscription");
+            }
+        }
+
+        if let Some(level) = replay.log_level {
+            let params = serde_json::json!({ "level": level });
+            let request = IpcRequest::McpRequest {
+                session_id: conn.session_id.clone(),
+                method: "logging/setLevel".to_string(),
+                params: Some(params),
+            };
+            if let Err(e) = Self::send_replay_request(conn, peer, &request).await {
+                tracing::warn!(error = %e, "reconnect: failed to replay log level");
+            }
+        }
+    }
+
+    /// Send a single replay request over the already-locked `conn` and
+    /// classify the result as success/failure, without ever calling
+    /// `reconnect_locked`/`session_round_trip` (see
+    /// `replay_session_state_locked`).
+    async fn send_replay_request(
+        conn: &mut crate::runtime::DaemonProxySession,
+        peer: Option<&Peer<RoleServer>>,
+        request: &IpcRequest,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+        match Self::try_round_trip_locked(conn, &payload, peer).await {
+            Ok(IpcResponse::Ok) => Ok(()),
+            Ok(IpcResponse::McpResponse { payload }) => {
+                if payload.get("code").is_some()
+                    && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
+                {
+                    return Err(err.message.to_string());
+                }
+                Ok(())
+            }
+            Ok(IpcResponse::Error { code, message }) => Err(format!("{code}: {message}")),
+            Ok(other) => Err(format!("unexpected IPC response: {other:?}")),
+            Err(failure) => Err(failure.message),
+        }
     }
 
     fn transport_failure(context: &str, error: anyhow::Error) -> TransportFailure {
@@ -557,7 +676,7 @@ impl ServerHandler for IpcProxyHandler {
 
             // Forward client capabilities to daemon for reverse-request gating
             let capabilities = request.capabilities.clone();
-            if let Err(e) = self
+            match self
                 .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
                     IpcRequest::UpdateCapabilities {
                         session_id: session_id.to_string(),
@@ -566,7 +685,20 @@ impl ServerHandler for IpcProxyHandler {
                 })
                 .await
             {
-                tracing::warn!(error = %e, "failed to update session capabilities");
+                Ok(IpcResponse::Ok) => {
+                    // Record for replay after a future daemon reconnect — see
+                    // `ReplayState`. `conn` is not held here (the round trip
+                    // above already released it), so this locks `replay`
+                    // alone.
+                    self.shared.replay.lock().await.client_capabilities =
+                        Some(capabilities.clone());
+                }
+                Ok(other) => {
+                    tracing::warn!(response = ?other, "unexpected IPC response updating session capabilities");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to update session capabilities");
+                }
             }
 
             // Refresh daemon-derived server capabilities at handshake time so
@@ -920,7 +1052,12 @@ impl ServerHandler for IpcProxyHandler {
                 })
                 .await?
             {
-                IpcResponse::McpResponse { .. } => Ok(()),
+                IpcResponse::McpResponse { .. } => {
+                    // Record for replay after a future daemon reconnect —
+                    // see `ReplayState`. `conn` is not held here.
+                    self.shared.replay.lock().await.log_level = Some(request.level);
+                    Ok(())
+                }
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
                 }
@@ -1071,6 +1208,15 @@ impl ServerHandler for IpcProxyHandler {
                     {
                         return Err(err);
                     }
+                    // Record for replay after a future daemon reconnect —
+                    // see `ReplayState`. `conn` is not held here. Only a
+                    // successful subscribe is replayed.
+                    self.shared
+                        .replay
+                        .lock()
+                        .await
+                        .subscriptions
+                        .insert(request.uri.clone());
                     Ok(())
                 }
                 IpcResponse::Error { code, message } => {
@@ -1108,6 +1254,15 @@ impl ServerHandler for IpcProxyHandler {
                     {
                         return Err(err);
                     }
+                    // Remove from the replay set on success — a failed
+                    // unsubscribe must not stop the subscription from being
+                    // replayed after a future reconnect.
+                    self.shared
+                        .replay
+                        .lock()
+                        .await
+                        .subscriptions
+                        .remove(&request.uri);
                     Ok(())
                 }
                 IpcResponse::Error { code, message } => {
@@ -2711,12 +2866,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_reregisters_with_register_and_capabilities_only() {
+    async fn reconnect_replays_client_capabilities() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("reconnect-caps");
         set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
+        // A non-default capabilities value so the "replayed == negotiated"
+        // assertion below can't trivially pass by matching two empty structs.
+        let negotiated_capabilities = ClientCapabilities::builder()
+            .enable_roots()
+            .enable_roots_list_changed()
+            .build();
+
         let listener = bind_fake_daemon_socket();
+        let expected_capabilities = negotiated_capabilities.clone();
         let daemon_task = tokio::spawn(async move {
             // Connection 1: handshake only, then drop — simulates the daemon
             // restarting mid-session so the NEXT round trip must reconnect.
@@ -2725,20 +2888,38 @@ mod tests {
             drop(reader1);
             drop(writer1);
 
-            // Connection 2: the reconnect. Pin the request shape here — this
-            // is the plan-007 baseline.
+            // Connection 2: the reconnect handshake itself is still exactly
+            // Register+Capabilities...
             let (stream2, _) = listener.accept().await.expect("accept 2");
             let (mut reader2, mut writer2, seen2) =
                 fake_daemon_handshake(stream2, "fake-session-2").await;
             assert_eq!(
                 seen2,
                 vec!["Register".to_string(), "Capabilities".to_string()],
-                // CHARACTERIZATION: current behavior loses client caps on
-                // reconnect — plan 007 will change this assertion.
-                "reconnect must send ONLY Register+Capabilities; anything else means \
-                 UpdateCapabilities/roots/log-level are being replayed and this test \
-                 (and comment) need updating"
+                "reconnect handshake itself is still exactly Register+Capabilities; \
+                 capability replay happens as a SEPARATE round trip right after it"
             );
+
+            // ...followed by a replay of the client capabilities negotiated
+            // before the restart (plan 007) — assert it matches exactly.
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read replayed capabilities frame")
+                .expect("connection open");
+            let req: IpcRequest =
+                serde_json::from_slice(&frame).expect("parse replayed capabilities request");
+            match req {
+                IpcRequest::UpdateCapabilities { capabilities, .. } => {
+                    assert_eq!(
+                        *capabilities, expected_capabilities,
+                        "replayed capabilities must match what was negotiated before reconnect"
+                    );
+                }
+                other => panic!("expected replayed UpdateCapabilities, got {other:?}"),
+            }
+            ipc::send_response(&mut writer2, &IpcResponse::Ok)
+                .await
+                .expect("send replayed UpdateCapabilities ack");
 
             let frame = ipc::read_frame(&mut reader2)
                 .await
@@ -2758,6 +2939,14 @@ mod tests {
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
+        // Seed the replay state as if a downstream client had already
+        // negotiated these capabilities via initialize() before the
+        // restart. The full initialize()-driven capture path (production
+        // code recording `ReplayState::client_capabilities`) is covered
+        // end-to-end by `malformed_frame_is_reconnectable_failure`; this
+        // test isolates the replay-on-reconnect behavior itself.
+        proxy.shared.replay.lock().await.client_capabilities = Some(negotiated_capabilities);
+
         let response = proxy
             .session_round_trip(RetryPolicy::SafeToRetry, |session_id| IpcRequest::Ping {
                 session_id: session_id.to_string(),
@@ -2771,6 +2960,347 @@ mod tests {
             final_session_id, initial_session_id,
             "reconnect should replace the daemon session id"
         );
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_subscriptions() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("reconnect-subs");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            // Connection 1: handshake only, then drop — simulates the daemon
+            // restarting mid-session so the NEXT round trip must reconnect.
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (reader1, writer1, _seen1) = fake_daemon_handshake(stream1, "fake-session-1").await;
+            drop(reader1);
+            drop(writer1);
+
+            // Connection 2: the reconnect handshake, followed by a replay of
+            // the subscription that was active before the restart.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read replayed subscribe frame")
+                .expect("connection open");
+            let req: IpcRequest =
+                serde_json::from_slice(&frame).expect("parse replayed subscribe request");
+            match req {
+                IpcRequest::McpRequest { method, params, .. } => {
+                    assert_eq!(method, "resources/subscribe");
+                    let params = params.expect("subscribe replay must carry params");
+                    assert_eq!(params["uri"], serde_json::json!("test://resource"));
+                }
+                other => panic!("expected replayed resources/subscribe, got {other:?}"),
+            }
+            ipc::send_response(
+                &mut writer2,
+                &IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("send replayed subscribe ack");
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read ping")
+                .expect("connection open");
+            let _req: IpcRequest = serde_json::from_slice(&frame).expect("parse ping");
+            ipc::send_response(&mut writer2, &IpcResponse::Pong)
+                .await
+                .expect("send pong");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, "client-subs".to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        proxy
+            .shared
+            .replay
+            .lock()
+            .await
+            .subscriptions
+            .insert("test://resource".to_string());
+
+        let response = proxy
+            .session_round_trip(RetryPolicy::SafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("round trip should succeed after reconnect");
+        assert!(matches!(response, IpcResponse::Pong));
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn reconnect_replay_failure_does_not_fail_session() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("reconnect-replay-fail");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            // Connection 1: handshake only, then drop — simulates the daemon
+            // restarting mid-session so the NEXT round trip must reconnect.
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (reader1, writer1, _seen1) = fake_daemon_handshake(stream1, "fake-session-1").await;
+            drop(reader1);
+            drop(writer1);
+
+            // Connection 2: the reconnect handshake, then REJECT the
+            // replayed subscribe outright.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read replayed subscribe frame")
+                .expect("connection open");
+            let req: IpcRequest =
+                serde_json::from_slice(&frame).expect("parse replayed subscribe request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "resources/subscribe"),
+                "expected replayed resources/subscribe, got {req:?}"
+            );
+            ipc::send_response(
+                &mut writer2,
+                &IpcResponse::Error {
+                    code: "SUBSCRIBE_REPLAY_REJECTED".to_string(),
+                    message: "simulated replay rejection".to_string(),
+                },
+            )
+            .await
+            .expect("send replay rejection");
+
+            // The reconnect must still complete and the ORIGINAL request
+            // must still be retried against the new session — a rejected
+            // replay is warn-and-continue, not a reconnect failure.
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read retried tools/list")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse retried tools/list");
+            match req {
+                IpcRequest::McpRequest { method, .. } => assert_eq!(method, "tools/list"),
+                other => panic!("expected retried tools/list, got {other:?}"),
+            }
+            ipc::send_response(
+                &mut writer2,
+                &IpcResponse::McpResponse {
+                    payload: serde_json::json!({ "tools": [] }),
+                },
+            )
+            .await
+            .expect("send tools/list response");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-replay-fail".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        proxy
+            .shared
+            .replay
+            .lock()
+            .await
+            .subscriptions
+            .insert("test://rejected".to_string());
+
+        let response = proxy
+            .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                IpcRequest::McpRequest {
+                    session_id: session_id.to_string(),
+                    method: "tools/list".to_string(),
+                    params: None,
+                }
+            })
+            .await
+            .expect("reconnect must succeed even though the replayed subscribe was rejected");
+        assert!(matches!(response, IpcResponse::McpResponse { .. }));
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_removes_from_replay_set() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("unsub-replay");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            // Connection 1: full initialize handshake — the downstream
+            // client subscribes then unsubscribes on this connection.
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (mut reader1, mut writer1) =
+                drive_fake_daemon_initialize(stream1, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader1)
+                .await
+                .expect("read subscribe frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse subscribe request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "resources/subscribe"),
+                "expected resources/subscribe, got {req:?}"
+            );
+            ipc::send_response(
+                &mut writer1,
+                &IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("send subscribe ack");
+
+            let frame = ipc::read_frame(&mut reader1)
+                .await
+                .expect("read unsubscribe frame")
+                .expect("connection open");
+            let req: IpcRequest =
+                serde_json::from_slice(&frame).expect("parse unsubscribe request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "resources/unsubscribe"),
+                "expected resources/unsubscribe, got {req:?}"
+            );
+            ipc::send_response(
+                &mut writer1,
+                &IpcResponse::McpResponse {
+                    payload: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("send unsubscribe ack");
+
+            // Simulate the daemon restarting mid-session.
+            drop(reader1);
+            drop(writer1);
+
+            // Connection 2: the reconnect. Client capabilities negotiated
+            // during initialize() are replayed (see
+            // reconnect_replays_client_capabilities) — but the unsubscribed
+            // URI must NOT be re-subscribed. The very next frame after the
+            // capability replay must be the retried tools/list, not a
+            // resources/subscribe.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read replayed capabilities frame")
+                .expect("connection open");
+            let req: IpcRequest =
+                serde_json::from_slice(&frame).expect("parse replayed capabilities request");
+            assert!(
+                matches!(req, IpcRequest::UpdateCapabilities { .. }),
+                "expected replayed UpdateCapabilities, got {req:?}"
+            );
+            ipc::send_response(&mut writer2, &IpcResponse::Ok)
+                .await
+                .expect("send replayed UpdateCapabilities ack");
+
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read retried tools/list")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse retried tools/list");
+            match req {
+                IpcRequest::McpRequest { method, .. } => assert_eq!(
+                    method, "tools/list",
+                    "unsubscribed URI must NOT be re-subscribed on reconnect"
+                ),
+                other => panic!(
+                    "unsubscribed URI must NOT be re-subscribed on reconnect; expected retried \
+                     tools/list, got {other:?}"
+                ),
+            }
+            ipc::send_response(
+                &mut writer2,
+                &IpcResponse::McpResponse {
+                    payload: serde_json::json!({ "tools": [] }),
+                },
+            )
+            .await
+            .expect("send tools/list response");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, "client-unsub".to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        let resource_uri = "test://unsub-resource";
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .peer()
+                .subscribe(SubscribeRequestParams::new(resource_uri)),
+        )
+        .await
+        .expect("subscribe timeout")
+        .expect("subscribe");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .peer()
+                .unsubscribe(UnsubscribeRequestParams::new(resource_uri)),
+        )
+        .await
+        .expect("unsubscribe timeout")
+        .expect("unsubscribe");
+
+        // Trigger the reconnect (connection 1 was dropped by the daemon
+        // task above) and drive it to completion.
+        let _tools = tokio::time::timeout(Duration::from_secs(5), client.peer().list_all_tools())
+            .await
+            .expect("list_all_tools timeout")
+            .expect("list_all_tools should succeed after reconnect");
 
         daemon_task.await.expect("daemon task join");
 
@@ -3125,12 +3655,29 @@ mod tests {
 
             // The reconnect after the transport failure only re-sends
             // Register + Capabilities (see
-            // reconnect_reregisters_with_register_and_capabilities_only) —
-            // not the full initialize() sequence, which only runs once per
-            // downstream client lifetime.
+            // reconnect_replays_client_capabilities) — not the full
+            // initialize() sequence, which only runs once per downstream
+            // client lifetime. It IS followed by a replay of the client
+            // capabilities negotiated during connection 1's initialize
+            // (plan 007) — consume and ack that before the retried
+            // tools/call.
             let (stream2, _) = listener.accept().await.expect("accept 2");
             let (mut reader2, mut writer2, _seen2) =
                 fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            let replay_frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read replayed capabilities frame")
+                .expect("connection open");
+            let replay_req: IpcRequest =
+                serde_json::from_slice(&replay_frame).expect("parse replayed capabilities request");
+            assert!(
+                matches!(replay_req, IpcRequest::UpdateCapabilities { .. }),
+                "expected replayed UpdateCapabilities before the retried tools/call, got {replay_req:?}"
+            );
+            ipc::send_response(&mut writer2, &IpcResponse::Ok)
+                .await
+                .expect("send replayed UpdateCapabilities ack");
 
             let frame2 = ipc::read_frame(&mut reader2)
                 .await
