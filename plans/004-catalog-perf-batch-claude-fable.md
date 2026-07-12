@@ -247,6 +247,11 @@ behind the `tool_filter_enabled` check. If any other reader exists, STOP.
 - [ ] `cargo fmt --check` exits 0
 - [ ] `paginated_result` takes `&[T]`; no `(*…).clone()` remains at its call sites
 - [ ] The refresh loop performs no `get_upstream`/`get_upstream_metadata` call inside the per-tool body (`grep -n 'get_upstream' plug-core/src/proxy/mod.rs` — remaining hits are outside the loop ranges ~1110-1250)
+  > **Reviewer amendment (2026-07-12, at execution):** two hits legitimately remain
+  > textually inside that range — they sit inside the `ServerRefreshCtx`
+  > `entry().or_insert_with()` closure, which Step 2's own instructions require and
+  > which executes at most once per distinct server per refresh. The criterion's
+  > intent (no per-TOOL lookup) is met; the line-range phrasing was imprecise.
 - [ ] No files outside the in-scope list modified (`git status`)
 - [ ] `plans/README-claude-fable.md` status row updated
 
