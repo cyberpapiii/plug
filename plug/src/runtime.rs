@@ -256,29 +256,7 @@ fn build_configured_http_runtime(
     let http_state_for_expiry = Arc::clone(&http_state);
     tokio::spawn(async move {
         while let Some(session_id) = expiry_rx.recv().await {
-            let target = plug_core::notifications::NotificationTarget::Http {
-                session_id: Arc::from(session_id.as_str()),
-            };
-            tool_router.cleanup_subscriptions_for_target(&target).await;
-            http_state_for_expiry
-                .roots_capable_sessions
-                .remove(&session_id);
-            http_state_for_expiry
-                .client_capabilities
-                .remove(&session_id);
-            http_state_for_expiry
-                .pending_client_requests
-                .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
-            if tool_router.clear_roots_for_target(&target) {
-                tool_router.forward_roots_list_changed_to_upstreams().await;
-            }
-            tool_router.remove_client_log_level(&session_id);
-            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                plug_core::proxy::DownstreamTransport::Http,
-                &session_id,
-            );
-            tool_router.clear_lazy_session(&lazy_session_key);
-            tool_router.unregister_downstream_bridge(&target);
+            cleanup_expired_http_session(&http_state_for_expiry, &tool_router, &session_id).await;
         }
     });
 
@@ -286,6 +264,37 @@ fn build_configured_http_runtime(
         router: build_runtime_router(http_state, operator_token),
         sessions,
     })
+}
+
+/// Clean up all per-session state for an HTTP session that expired via idle
+/// timeout. Mirrors the teardown `delete_mcp` performs for an explicit
+/// `DELETE /mcp`, including the session's task records.
+pub(crate) async fn cleanup_expired_http_session(
+    http_state: &Arc<plug_core::http::server::HttpState>,
+    tool_router: &Arc<plug_core::proxy::ToolRouter>,
+    session_id: &str,
+) {
+    let target = plug_core::notifications::NotificationTarget::Http {
+        session_id: Arc::from(session_id),
+    };
+    tool_router.cleanup_subscriptions_for_target(&target).await;
+    http_state.roots_capable_sessions.remove(session_id);
+    http_state.client_capabilities.remove(session_id);
+    http_state
+        .pending_client_requests
+        .retain(|(pending_session_id, _), _| pending_session_id != session_id);
+    if tool_router.clear_roots_for_target(&target) {
+        tool_router.forward_roots_list_changed_to_upstreams().await;
+    }
+    tool_router.remove_client_log_level(session_id);
+    let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
+        plug_core::proxy::DownstreamTransport::Http,
+        session_id,
+    );
+    tool_router.clear_lazy_session(&lazy_session_key);
+    tool_router.unregister_downstream_bridge(&target);
+    let owner = plug_core::proxy::ToolRouter::task_owner_for_http_session(session_id);
+    tool_router.cleanup_tasks_for_owner(&owner).await;
 }
 
 fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
@@ -1636,6 +1645,93 @@ mod tests {
             parsed.sessions[0].client_type,
             plug_core::types::ClientType::ClaudeDesktop
         );
+        engine.shutdown().await;
+    }
+
+    /// Minimal stdio mock-upstream `ServerConfig` exposing an `echo` tool, so
+    /// a real routable tool exists for `enqueue_tool_task` to create a task
+    /// against. Self-contained rather than reusing daemon.rs's private IPC
+    /// harness helper (`ipc_harness_mock_config`), which lives in a sibling
+    /// module's `#[cfg(test)] mod tests` and is out of scope for this plan.
+    fn task_test_mock_config() -> plug_core::config::ServerConfig {
+        plug_core::config::ServerConfig {
+            command: Some(
+                plug_test_harness::mock_server_bin()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            args: vec!["--tools".to_string(), "echo".to_string()],
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 10,
+            call_timeout_secs: 5,
+            max_concurrent: 4,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_http_session_cleans_up_tasks() {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), task_test_mock_config());
+        let engine = Arc::new(plug_core::engine::Engine::new(config));
+        engine.start().await.expect("engine start");
+        let tool_router = engine.tool_router().clone();
+
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let http_state = Arc::new(plug_core::http::server::HttpState {
+            router: tool_router.clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+
+        let session_id = "expiring-session";
+        let owner = plug_core::proxy::ToolRouter::task_owner_for_http_session(session_id);
+
+        // Spot-check a second cleanup also runs, guarding the extraction from
+        // silently dropping one of the other seven teardown steps.
+        tool_router.set_client_log_level(session_id, rmcp::model::LoggingLevel::Debug);
+        assert_eq!(tool_router.log_level(), rmcp::model::LoggingLevel::Debug);
+
+        tool_router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None)
+            .await
+            .expect("enqueue task for expiring session");
+        assert_eq!(tool_router.task_count_for_owner(&owner).await, 1);
+
+        cleanup_expired_http_session(&http_state, &tool_router, session_id).await;
+
+        assert_eq!(tool_router.task_count_for_owner(&owner).await, 0);
+        assert_eq!(
+            tool_router.log_level(),
+            rmcp::model::LoggingLevel::Warning,
+            "expiry cleanup should also have removed the session's log level"
+        );
+
         engine.shutdown().await;
     }
 

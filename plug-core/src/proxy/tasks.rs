@@ -5,6 +5,10 @@ impl super::ToolRouter {
         TaskOwner::new(Arc::<str>::from(format!("ipc:{client_id}")))
     }
 
+    pub fn task_owner_for_http_session(session_id: &str) -> TaskOwner {
+        TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")))
+    }
+
     pub async fn enqueue_tool_task(
         self: &Arc<Self>,
         tool_name: &str,
@@ -253,6 +257,18 @@ impl super::ToolRouter {
 
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
         self.task_store.lock().await.cleanup_owner(owner);
+    }
+
+    /// Count of task records currently stored for `owner`. Tasks are
+    /// owner-scoped so this cannot observe another owner's records; it
+    /// exists as a test probe for teardown-cleanup assertions.
+    pub async fn task_count_for_owner(&self, owner: &TaskOwner) -> usize {
+        self.task_store
+            .lock()
+            .await
+            .list_for_owner(owner, None)
+            .tasks
+            .len()
     }
 
     pub async fn cancel_task_for_owner(
