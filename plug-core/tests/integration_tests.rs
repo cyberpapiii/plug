@@ -1278,6 +1278,40 @@ async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
     engine.shutdown().await;
 }
 
+// The three live catalog families (resources, resource templates, prompts)
+// must be fetched concurrently, not serially: a refresh's upstream latency
+// should be ~max(family delays), not ~sum(family delays). One upstream
+// delays all three list responses by 600ms; serial fetching would take
+// >=1800ms while concurrent fetching takes ~600ms plus overhead. The
+// 900ms margin (assert < 1500ms) is deliberate anti-flake headroom.
+#[tokio::test]
+async fn catalog_families_fetch_concurrently() {
+    let mut config = Config::default();
+    let mut server = mock_server_config("echo");
+    server.args.push("--resources".to_string());
+    server.args.push("--resource-templates".to_string());
+    server.args.push("--prompts".to_string());
+    server.args.push("--list-delay-ms".to_string());
+    server.args.push("600".to_string());
+    config.servers.insert("mock".to_string(), server);
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let started = std::time::Instant::now();
+    engine.tool_router().refresh_tools().await;
+    let elapsed = started.elapsed();
+    eprintln!("catalog_families_fetch_concurrently: elapsed={elapsed:?}");
+
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "refresh_tools took {elapsed:?}; expected ~600ms (concurrent family fetch), \
+         not ~1800ms (serial family fetch)"
+    );
+
+    engine.shutdown().await;
+}
+
 // A transient listing failure must NOT prune an active resource subscription.
 // This is the degraded-vs-absent regression (closes the PR #58 residual): the
 // upstream stays routable, its last-known-good catalog is carried forward, the

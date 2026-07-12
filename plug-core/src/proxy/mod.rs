@@ -1080,12 +1080,18 @@ impl ToolRouter {
     ///
     /// Builds the full sorted list plus pre-cached filtered views for each
     /// known client tool limit (Windsurf: 100, Copilot: 128). All views are
-    /// swapped atomically to prevent torn reads.
+    /// swapped atomically to prevent torn reads. The three live catalog
+    /// families (resources, resource templates, prompts) are fetched
+    /// concurrently; each is already server-concurrent internally, so a
+    /// refresh's upstream latency is the max of the three instead of their
+    /// sum.
     pub async fn refresh_tools(&self) {
         let upstream_tools = self.server_manager.get_tools().await;
-        let resources_result = self.server_manager.get_resources().await;
-        let resource_templates_result = self.server_manager.get_resource_templates().await;
-        let prompts_result = self.server_manager.get_prompts().await;
+        let (resources_result, resource_templates_result, prompts_result) = tokio::join!(
+            self.server_manager.get_resources(),
+            self.server_manager.get_resource_templates(),
+            self.server_manager.get_prompts(),
+        );
 
         // Recompute per-server availability from this cycle's listing outcomes.
         // A server served from last-known-good cache (its live listing was

@@ -65,6 +65,12 @@ struct Args {
     /// fresh-empty prune path (distinct from the failure path above).
     #[arg(long)]
     list_empty_flag_file: Option<String>,
+
+    /// Simulated delay before responding to list_resources,
+    /// list_resource_templates, and list_prompts, in milliseconds. Default:
+    /// no delay — existing users of the mock are unaffected.
+    #[arg(long, default_value = "0")]
+    list_delay_ms: u64,
 }
 
 struct MockServer {
@@ -78,6 +84,7 @@ struct MockServer {
     completions: bool,
     list_fail_flag_file: Option<String>,
     list_empty_flag_file: Option<String>,
+    list_delay: std::time::Duration,
 }
 
 impl MockServer {
@@ -281,6 +288,9 @@ impl ServerHandler for MockServer {
                 eprintln!("mock-mcp-server: timeout mode, hanging on list_resources");
                 std::future::pending::<()>().await;
             }
+            if !self.list_delay.is_zero() {
+                tokio::time::sleep(self.list_delay).await;
+            }
             // Test-driven transient failure: error while the flag file exists.
             if let Some(path) = &self.list_fail_flag_file
                 && std::path::Path::new(path).exists()
@@ -367,6 +377,9 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
         async move {
+            if !self.list_delay.is_zero() {
+                tokio::time::sleep(self.list_delay).await;
+            }
             if !self.resource_templates {
                 return Ok(ListResourceTemplatesResult::with_all_items(vec![]));
             }
@@ -386,6 +399,9 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
+            if !self.list_delay.is_zero() {
+                tokio::time::sleep(self.list_delay).await;
+            }
             if !self.prompts {
                 return Ok(ListPromptsResult::with_all_items(vec![]));
             }
@@ -480,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
         completions: args.completions,
         list_fail_flag_file: args.list_fail_flag_file,
         list_empty_flag_file: args.list_empty_flag_file,
+        list_delay: std::time::Duration::from_millis(args.list_delay_ms),
     };
 
     let transport = rmcp::transport::io::stdio();
