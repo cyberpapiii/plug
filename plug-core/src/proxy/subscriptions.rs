@@ -1028,7 +1028,41 @@ impl super::ToolRouter {
 
         self.resource_subscriptions
             .subscribe(uri, target, &server_id, as_upstream_ops(upstream))
-            .await
+            .await?;
+
+        // One-shot post-subscribe self-check. The route was resolved from a
+        // snapshot loaded before the upstream transition ran; a
+        // `refresh_tools` publish landing in between can move the URI to a
+        // different server, and if the entry was created inside that pass's
+        // classify→publish window the running pass never saw it. Re-load
+        // the snapshot and heal the drift now instead of waiting for the
+        // next refresh. Runs outside any transition lock (the transition
+        // task released it before reporting its outcome); the rebind's own
+        // transition serializes on the per-URI lock as usual. No loop: if
+        // the route moves again, the next refresh's classify pass (which
+        // compares recorded owner against the new snapshot) reconciles it.
+        // A route that vanished entirely is left alone — the next refresh's
+        // prune plus the entry's recorded owner already drain routeless
+        // entries.
+        let moved_to = {
+            let snapshot = self.cache.load();
+            snapshot
+                .resource_routes
+                .get(uri)
+                .filter(|current| current.as_str() != server_id)
+                .cloned()
+        };
+        if let Some(new_server_id) = moved_to {
+            tracing::debug!(
+                uri = %uri,
+                old_server = %server_id,
+                new_server = %new_server_id,
+                "route moved during subscribe; rebinding to current owner"
+            );
+            self.rebind_subscription_route(uri, &server_id, &new_server_id)
+                .await;
+        }
+        Ok(())
     }
 
     /// Unsubscribe a downstream client from resource updates.

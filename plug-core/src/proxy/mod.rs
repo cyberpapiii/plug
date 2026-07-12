@@ -1538,31 +1538,48 @@ impl ToolRouter {
                 new_server_id,
             } = item
             {
-                let old_upstream = self
-                    .server_manager
-                    .get_upstream(old_server_id)
-                    .map(subscriptions::as_upstream_ops);
-                let new_owner = match self.server_manager.get_upstream(new_server_id) {
-                    None => Err(subscriptions::RebindSkipReason::NewOwnerMissing),
-                    Some(upstream) => {
-                        let supports_subscribe = upstream
-                            .capabilities
-                            .resources
-                            .as_ref()
-                            .and_then(|r| r.subscribe)
-                            .unwrap_or(false);
-                        if supports_subscribe {
-                            Ok(subscriptions::as_upstream_ops(upstream))
-                        } else {
-                            Err(subscriptions::RebindSkipReason::NewOwnerNoSubscribeSupport)
-                        }
-                    }
-                };
-                self.resource_subscriptions
-                    .rebind(uri, old_server_id, old_upstream, new_server_id, new_owner)
+                self.rebind_subscription_route(uri, old_server_id, new_server_id)
                     .await;
             }
         }
+    }
+
+    /// Resolve the upstream handles/capabilities for a subscription rebind
+    /// and execute it, awaiting completion. Shared by `refresh_tools`'
+    /// rebind arm and the post-subscribe owner/route self-check in
+    /// `subscribe_resource` (subscriptions.rs): both resolve the old owner
+    /// as a route-derived fallback (the registry prefers the entry's
+    /// recorded owner at drain time) and gate the new owner on subscribe
+    /// support.
+    async fn rebind_subscription_route(
+        &self,
+        uri: &str,
+        old_server_id: &str,
+        new_server_id: &str,
+    ) {
+        let old_upstream = self
+            .server_manager
+            .get_upstream(old_server_id)
+            .map(subscriptions::as_upstream_ops);
+        let new_owner = match self.server_manager.get_upstream(new_server_id) {
+            None => Err(subscriptions::RebindSkipReason::NewOwnerMissing),
+            Some(upstream) => {
+                let supports_subscribe = upstream
+                    .capabilities
+                    .resources
+                    .as_ref()
+                    .and_then(|r| r.subscribe)
+                    .unwrap_or(false);
+                if supports_subscribe {
+                    Ok(subscriptions::as_upstream_ops(upstream))
+                } else {
+                    Err(subscriptions::RebindSkipReason::NewOwnerNoSubscribeSupport)
+                }
+            }
+        };
+        self.resource_subscriptions
+            .rebind(uri, old_server_id, old_upstream, new_server_id, new_owner)
+            .await;
     }
 
     /// Call a tool by its prefixed name, routing to the correct upstream server.
