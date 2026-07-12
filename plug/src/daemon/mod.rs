@@ -27,10 +27,10 @@ mod framing;
 use framing::FrameReader;
 
 mod paths;
-use paths::{ensure_dir, pid_path, runtime_dir, set_file_permissions_0600, token_path};
-pub use paths::{log_dir, socket_path};
 #[cfg(test)]
 pub(crate) use paths::{clear_test_runtime_paths, runtime_paths_test_lock, set_test_runtime_paths};
+use paths::{ensure_dir, pid_path, runtime_dir, set_file_permissions_0600, token_path};
+pub use paths::{log_dir, socket_path};
 
 mod registry;
 use registry::ClientRegistry;
@@ -1562,7 +1562,6 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
     }
 }
 
-
 // ──────────────────────── Unix signal handling ───────────────────────────────
 
 /// Wait for SIGTERM or SIGINT (for daemon mode).
@@ -2289,7 +2288,6 @@ mod tests {
             err2.message
         );
     }
-
 
     // ── IPC end-to-end test harness (U5) ─────────────────────────────────────
     //

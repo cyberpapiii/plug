@@ -135,7 +135,11 @@ impl ClientRegistry {
     }
 
     /// Update the MCP client capabilities for a session.
-    pub(super) fn update_capabilities(&self, session_id: &str, capabilities: ClientCapabilities) -> bool {
+    pub(super) fn update_capabilities(
+        &self,
+        session_id: &str,
+        capabilities: ClientCapabilities,
+    ) -> bool {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             entry.capabilities = capabilities;
             true

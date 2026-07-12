@@ -66,7 +66,7 @@ pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse
 mod tests {
     use super::*;
     use crate::daemon::tests::{
-        auth_status_test_context, clear_store, cleanup_temp_config, seeded_credentials,
+        auth_status_test_context, cleanup_temp_config, clear_store, seeded_credentials,
         temp_config_path, write_oauth_config,
     };
     use rmcp::transport::auth::CredentialStore;
