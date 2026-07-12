@@ -7,8 +7,12 @@ about dependency shape, not roadmap status.
 
 ## Core Runtime
 
-- `rmcp` 1.7.0
+- `rmcp` `~1.7` (resolved: 1.7.0)
   MCP protocol implementation for both downstream server handlers and upstream client sessions.
+  Version policy: tilde-pinned. Patch releases flow; a minor bump (1.8+) is a
+  deliberate manifest edit that must go through review and the full workspace
+  suite, because rmcp minors can change negotiated protocol behavior. The
+  1.7.0 adoption itself was such a reviewed bump (todo 068).
 
 - `tokio`
   Shared async runtime across daemon, stdio proxying, and HTTP serving.
