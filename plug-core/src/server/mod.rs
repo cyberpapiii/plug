@@ -617,6 +617,17 @@ pub struct ServerManager {
     /// all trying to reconnect the same server simultaneously).
     reconnecting: DashMap<String, Arc<AtomicBool>>,
     tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
+    /// Grace-period retirement tasks spawned by `replace_server` for
+    /// old-generation upstreams still held by in-flight requests. Tracked so
+    /// `shutdown_all` can force them to retire immediately instead of leaving
+    /// them to complete their sleep up to `UPSTREAM_REPLACEMENT_GRACE_PERIOD`
+    /// after the engine reports shutdown complete. Otherwise self-cleaning.
+    retire_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Set to `true` by `shutdown_all` to tell every pending grace-period
+    /// retirement task to skip its sleep and retire now. Normal operation
+    /// (no shutdown) never observes a `true` value, so the grace period is
+    /// unaffected.
+    shutdown_signal: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +676,7 @@ impl ServerManager {
     }
 
     pub fn new() -> Self {
+        let (shutdown_signal, _shutdown_signal_rx) = tokio::sync::watch::channel(false);
         Self {
             servers: ArcSwap::from_pointee(HashMap::new()),
             server_map_write_lock: std::sync::Mutex::new(()),
@@ -679,6 +691,8 @@ impl ServerManager {
             semaphores: DashMap::new(),
             reconnecting: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
+            retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            shutdown_signal,
         }
     }
 
@@ -1564,6 +1578,26 @@ impl ServerManager {
     /// via a shared handle if other references to the map still exist — retirement
     /// and state clearing always run, so shutdown can never silently no-op.
     pub async fn shutdown_all(&self) {
+        // Tell every pending grace-period retirement task (from replace_server)
+        // to skip its sleep and retire now, then wait for them so no
+        // old-generation upstream (child process, HTTP connection, OAuth
+        // refresh timer) outlives the engine reporting shutdown complete.
+        // Bounded: a wedged retirement must not hang shutdown forever.
+        let _ = self.shutdown_signal.send(true);
+        {
+            let mut retire_tasks = self.retire_tasks.lock().await;
+            let bounded_join = tokio::time::timeout(Duration::from_secs(5), async {
+                while retire_tasks.join_next().await.is_some() {}
+            })
+            .await;
+            if bounded_join.is_err() {
+                tracing::warn!(
+                    "grace-period retirement tasks did not finish within the 5s shutdown \
+                     bound; a retirement may be stuck on a dead resource"
+                );
+            }
+        }
+
         // Swap in empty map — after this, no new code can access the servers.
         // Serialize under the same lock insert_upstream/remove_upstream use so a
         // concurrent RCU update can't clone the pre-swap map and store() after us.
@@ -1755,10 +1789,20 @@ impl ServerManager {
         if let Some(old_upstream) = old_upstream {
             if Arc::strong_count(&old_upstream) > 1 {
                 let name = name.to_string();
-                tokio::spawn(async move {
-                    tokio::time::sleep(UPSTREAM_REPLACEMENT_GRACE_PERIOD).await;
+                let mut shutdown_rx = self.shutdown_signal.subscribe();
+                let mut retire_tasks = self.retire_tasks.lock().await;
+                retire_tasks.spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(UPSTREAM_REPLACEMENT_GRACE_PERIOD) => {}
+                        // Engine is shutting down: skip the rest of the grace
+                        // period and retire immediately.
+                        _ = shutdown_rx.wait_for(|v| *v) => {}
+                    }
                     retire_upstream_owned(name, old_upstream, "replace_after_grace").await;
                 });
+                // Reap already-finished grace tasks so the set doesn't grow
+                // unboundedly across many replacements.
+                while retire_tasks.try_join_next().is_some() {}
             } else {
                 retire_upstream_owned(name.to_string(), old_upstream, "replace").await;
             }
@@ -2883,6 +2927,138 @@ mod tests {
         })
         .await
         .expect("replaced upstream should be cancelled even with lingering Arc");
+    }
+
+    // Plan 012: grace-period retirement tasks are tracked so `shutdown_all`
+    // can retire them immediately instead of leaving orphaned upstreams
+    // alive up to `UPSTREAM_REPLACEMENT_GRACE_PERIOD` after shutdown returns.
+
+    #[tokio::test]
+    async fn replace_grace_still_waits_in_normal_operation() {
+        let mgr = ServerManager::new();
+        let upstream = make_connected_test_upstream("grace-normal").await;
+        mgr.insert_upstream("grace-normal".to_string(), Arc::new(upstream));
+
+        // Hold a second reference so replace_server takes the grace-period
+        // path (strong_count > 1) instead of retiring inline.
+        let old_upstream = mgr.get_upstream("grace-normal").expect("initial upstream");
+
+        let replacement = make_connected_test_upstream("grace-normal").await;
+        mgr.replace_server("grace-normal", replacement).await;
+
+        // Immediately after replace_server returns, the grace period (50ms
+        // in test builds) has not elapsed yet — normal operation must not
+        // retire the old upstream early.
+        assert!(
+            !old_upstream.client.is_closed(),
+            "old upstream must not be retired before the grace period elapses"
+        );
+
+        // Once the grace period elapses, it must be retired as before.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if old_upstream.client.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("old upstream should be retired after the grace period elapses");
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_retires_pending_grace_immediately() {
+        let mgr = ServerManager::new();
+        let upstream = make_connected_test_upstream("grace-shutdown").await;
+        mgr.insert_upstream("grace-shutdown".to_string(), Arc::new(upstream));
+
+        // Hold a second reference so replace_server takes the grace-period
+        // path, leaving a pending retirement task asleep for
+        // UPSTREAM_REPLACEMENT_GRACE_PERIOD (50ms in test builds).
+        let old_upstream = mgr
+            .get_upstream("grace-shutdown")
+            .expect("initial upstream");
+
+        let replacement = make_connected_test_upstream("grace-shutdown").await;
+        mgr.replace_server("grace-shutdown", replacement).await;
+        assert!(
+            !old_upstream.client.is_closed(),
+            "grace task should still be pending immediately after replace_server"
+        );
+
+        // shutdown_all must force the pending grace task to retire now
+        // rather than waiting out the remaining grace period. A tight outer
+        // timeout well under the grace period proves shutdown_all didn't
+        // simply get lucky waiting the sleep out.
+        tokio::time::timeout(Duration::from_millis(30), mgr.shutdown_all())
+            .await
+            .expect("shutdown_all must not wait out the grace period for pending retirements");
+
+        assert!(
+            old_upstream.client.is_closed(),
+            "old upstream must be retired by the time shutdown_all returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn stacked_replacements_all_retire_on_shutdown() {
+        let mgr = ServerManager::new();
+        let upstream = make_connected_test_upstream("stacked").await;
+        mgr.insert_upstream("stacked".to_string(), Arc::new(upstream));
+
+        // First replacement: hold gen1 so it gets a pending grace task.
+        let gen1 = mgr.get_upstream("stacked").expect("gen1");
+        let replacement2 = make_connected_test_upstream("stacked").await;
+        mgr.replace_server("stacked", replacement2).await;
+
+        // Second replacement: hold gen2 so it ALSO gets a pending grace
+        // task, stacking two pending retirements for the same server name.
+        let gen2 = mgr.get_upstream("stacked").expect("gen2");
+        let replacement3 = make_connected_test_upstream("stacked").await;
+        mgr.replace_server("stacked", replacement3).await;
+
+        assert!(
+            !gen1.client.is_closed(),
+            "gen1 grace task should be pending"
+        );
+        assert!(
+            !gen2.client.is_closed(),
+            "gen2 grace task should be pending"
+        );
+
+        tokio::time::timeout(Duration::from_millis(30), mgr.shutdown_all())
+            .await
+            .expect("shutdown_all must not wait out the grace period for stacked retirements");
+
+        assert!(
+            gen1.client.is_closed(),
+            "first replaced generation must be retired by shutdown_all"
+        );
+        assert!(
+            gen2.client.is_closed(),
+            "second replaced generation must be retired by shutdown_all"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_all_bounded_when_retirement_wedges() {
+        let mgr = ServerManager::new();
+
+        // Inject a grace-period task that never completes, simulating a
+        // retirement wedged on a dead resource (the mock seam: retire_tasks
+        // is a private field reachable from this child module).
+        {
+            let mut retire_tasks = mgr.retire_tasks.lock().await;
+            retire_tasks.spawn(std::future::pending::<()>());
+        }
+
+        // shutdown_all's internal 5s bound must fire (paused time
+        // auto-advances to it) rather than hanging forever on the wedged
+        // task; shutdown must still complete and return.
+        tokio::time::timeout(Duration::from_secs(20), mgr.shutdown_all())
+            .await
+            .expect("shutdown_all must return once its 5s bound elapses, not hang forever");
     }
 
     #[test]
