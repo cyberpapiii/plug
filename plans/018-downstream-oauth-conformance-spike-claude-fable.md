@@ -19,6 +19,19 @@
 - **Category**: direction / security-conformance
 - **Planned at**: commit `e341625`, 2026-07-11
 
+> **Reviewer reconciliation (2026-07-12, at merge).** The spike executed
+> against base `23e0f51`, which predates plan 020's merge (`0bfa607`). The
+> findings doc flags its plan-020 statements as "pending merge, not on this
+> branch" — reconciled here: 020 IS merged on `improve/integration`, and the
+> reviewer (who reviewed 020's full diff) confirms all four findings F1–F4
+> persist under it. 020 adds an eager expiry sweep and client_credentials
+> token reuse (keyed on scope string equality); it adds NO scope-issuance
+> filtering, NO redirect-URI scheme check, and NO RFC 8707 `resource`
+> handling — indeed 020 deliberately pins the unenforced-scope behavior F4
+> describes with a characterization test. The findings doc's file:line refs
+> are anchored to its stated base commit; post-020 line numbers in
+> `downstream_oauth/mod.rs` have shifted slightly.
+
 ## Why this matters
 
 `plug serve` exposes downstream OAuth so remote HTTP clients (e.g. Claude
