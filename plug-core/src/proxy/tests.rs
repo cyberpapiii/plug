@@ -2131,7 +2131,9 @@ struct SubscribableUpstreamState {
     resources: std::sync::Mutex<Vec<String>>,
     subscribe_log: std::sync::Mutex<Vec<String>>,
     unsubscribe_log: std::sync::Mutex<Vec<String>>,
+    subscribe_gates: std::sync::Mutex<HashMap<String, Arc<SubGate>>>,
     unsubscribe_gates: std::sync::Mutex<HashMap<String, Arc<SubGate>>>,
+    subscribe_entered: tokio::sync::Notify,
     unsubscribe_entered: tokio::sync::Notify,
 }
 
@@ -2141,13 +2143,26 @@ impl SubscribableUpstreamState {
             resources: std::sync::Mutex::new(resources.iter().map(|uri| uri.to_string()).collect()),
             subscribe_log: std::sync::Mutex::new(Vec::new()),
             unsubscribe_log: std::sync::Mutex::new(Vec::new()),
+            subscribe_gates: std::sync::Mutex::new(HashMap::new()),
             unsubscribe_gates: std::sync::Mutex::new(HashMap::new()),
+            subscribe_entered: tokio::sync::Notify::new(),
             unsubscribe_entered: tokio::sync::Notify::new(),
         })
     }
 
     fn set_resources(&self, resources: &[&str]) {
         *self.resources.lock().unwrap() = resources.iter().map(|uri| uri.to_string()).collect();
+    }
+
+    /// All subsequent `resources/subscribe` calls for `uri` park until the
+    /// returned gate is opened.
+    fn close_subscribe_gate(&self, uri: &str) -> Arc<SubGate> {
+        let gate = SubGate::new_closed();
+        self.subscribe_gates
+            .lock()
+            .unwrap()
+            .insert(uri.to_string(), Arc::clone(&gate));
+        gate
     }
 
     /// All subsequent `resources/unsubscribe` calls for `uri` park until the
@@ -2212,12 +2227,25 @@ impl ServerHandler for SubscribableUpstreamHandler {
         request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
-        self.state
-            .subscribe_log
-            .lock()
-            .unwrap()
-            .push(request.uri.clone());
-        std::future::ready(Ok(()))
+        let state = Arc::clone(&self.state);
+        async move {
+            state
+                .subscribe_log
+                .lock()
+                .unwrap()
+                .push(request.uri.clone());
+            let gate = state
+                .subscribe_gates
+                .lock()
+                .unwrap()
+                .get(&request.uri)
+                .cloned();
+            state.subscribe_entered.notify_waiters();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            Ok(())
+        }
     }
 
     fn unsubscribe(
@@ -2543,4 +2571,245 @@ async fn next_refresh_prunes_routeless_entry_via_recorded_owner() {
         2,
         "the prune-with-no-route drain must unsubscribe the recorded old owner"
     );
+}
+
+/// Shared setup for the first-subscribe-during-refresh skew: routes are
+/// flipping x old -> new in a refresh whose prune of y is parked on a gate
+/// (holding the pass pre-publish). Returns with the refresh spawned and
+/// parked inside the old server's `unsubscribe(y)` handler, after classify
+/// ran — so an entry created for x from here on is invisible to the pass.
+async fn setup_refresh_parked_pre_publish() -> (
+    Arc<ServerManager>,
+    Arc<ToolRouter>,
+    Arc<SubscribableUpstreamState>,
+    Arc<SubscribableUpstreamState>,
+    Arc<SubGate>,
+    tokio::task::JoinHandle<()>,
+) {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+
+    let old_state = SubscribableUpstreamState::new(&["memory://x", "memory://y"]);
+    let new_state = SubscribableUpstreamState::new(&[]);
+    sm.replace_server(
+        "old",
+        connect_subscribable_upstream("old", Arc::clone(&old_state)).await,
+    )
+    .await;
+    sm.replace_server(
+        "new",
+        connect_subscribable_upstream("new", Arc::clone(&new_state)).await,
+    )
+    .await;
+
+    router.refresh_tools().await;
+    assert_eq!(
+        router.cache.load().resource_routes.get("memory://x"),
+        Some(&"old".to_string())
+    );
+
+    // Give the refresh a second URI to prune so the pass can be parked
+    // pre-publish. No subscription for x exists yet.
+    router
+        .subscribe_resource("memory://y", sub_target("c"))
+        .await
+        .unwrap();
+
+    // Flip the routes: x migrates old -> new, y vanishes (Prune).
+    old_state.set_resources(&[]);
+    new_state.set_resources(&["memory://x"]);
+    let gate_y = old_state.close_unsubscribe_gate("memory://y");
+
+    // Start the refresh; classify runs (seeing only y), then the prune(y)
+    // drain parks inside the old server's unsubscribe handler.
+    let entered_y = old_state.unsubscribe_entered.notified();
+    let refresh_router = Arc::clone(&router);
+    let refresh = tokio::spawn(async move { refresh_router.refresh_tools().await });
+    entered_y.await;
+
+    (sm, router, old_state, new_state, gate_y, refresh)
+}
+
+/// Defect arm 1 (classify owner/route drift): a FIRST subscriber for x
+/// lands entirely inside the parked pass's pre-publish window, resolves
+/// the OLD snapshot, and binds to the old owner. The pass classified
+/// before the entry existed, so the completed refresh leaves the entry
+/// owned by "old" while the published snapshot routes x to "new" — and a
+/// pure old-vs-new route diff would compare new==new forever after. The
+/// next refresh must heal via the recorded owner: rebound onto "new",
+/// old owner unsubscribed, members (and their notification fan-out)
+/// intact, no zero-member entry left anywhere.
+#[tokio::test]
+async fn first_subscribe_during_refresh_window_heals_on_next_refresh() {
+    let (_sm, router, old_state, new_state, gate_y, refresh) =
+        setup_refresh_parked_pre_publish().await;
+
+    // First subscriber for x arrives inside the window and completes fully
+    // pre-publish: it binds to the old owner (the still-published route).
+    router
+        .subscribe_resource("memory://x", sub_target("a"))
+        .await
+        .unwrap();
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert_eq!(new_state.subscribe_count("memory://x"), 0);
+
+    gate_y.open();
+    refresh.await.unwrap();
+
+    // The completed pass never saw the entry: route says "new", the
+    // subscription still lives on "old".
+    assert_eq!(
+        router.cache.load().resource_routes.get("memory://x"),
+        Some(&"new".to_string())
+    );
+    assert_eq!(new_state.subscribe_count("memory://x"), 0);
+    assert_eq!(old_state.unsubscribe_count("memory://x"), 0);
+
+    // The NEXT refresh compares the entry's recorded owner ("old") against
+    // the new snapshot's route ("new") and must emit the healing rebind
+    // even though the old and new route snapshots agree.
+    router.refresh_tools().await;
+
+    assert_eq!(
+        new_state.subscribe_count("memory://x"),
+        1,
+        "the entry must be rebound onto the new owner"
+    );
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        1,
+        "the old owner must end unsubscribed"
+    );
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("a")]),
+        "members must survive the heal"
+    );
+    assert_eq!(
+        router.resource_subscriptions.len(),
+        1,
+        "no zero-member entry may survive (y pruned, x healed)"
+    );
+
+    // Notification-relevant invariant: an upstream resources/updated for x
+    // still fans out to the surviving member.
+    let mut rx = router.subscribe_notifications();
+    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("memory://x"));
+    match rx.try_recv() {
+        Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
+            assert_eq!(target, sub_target("a"));
+            assert_eq!(params.uri, "memory://x");
+        }
+        other => panic!("expected ResourceUpdated for the healed member, got: {other:?}"),
+    }
+}
+
+/// Defect arm 2 (post-subscribe self-check): the first subscriber for x
+/// resolves the OLD snapshot pre-publish, but its upstream subscribe call
+/// is still parked on the old server when the refresh publishes the new
+/// snapshot (x -> "new"). When the call lands, the entry's owner is
+/// confirmed as "old" while the current route says "new" — the running
+/// pass never saw the entry, so nothing else reconciles it in this test.
+/// `subscribe_resource`'s one-shot self-check must re-load the snapshot
+/// and migrate the subscription to "new" before returning.
+#[tokio::test]
+async fn first_subscribe_straddling_publish_rebinds_via_self_check() {
+    let (_sm, router, old_state, new_state, gate_y, refresh) =
+        setup_refresh_parked_pre_publish().await;
+
+    // The first subscriber's upstream subscribe(x) parks on the old server.
+    let gate_sub_x = old_state.close_subscribe_gate("memory://x");
+    let entered_sub_x = old_state.subscribe_entered.notified();
+    let subscribe_router = Arc::clone(&router);
+    let a = tokio::spawn(async move {
+        subscribe_router
+            .subscribe_resource("memory://x", sub_target("a"))
+            .await
+    });
+    entered_sub_x.await;
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+
+    // Publish happens while the subscribe is still in flight.
+    gate_y.open();
+    refresh.await.unwrap();
+    assert_eq!(
+        router.cache.load().resource_routes.get("memory://x"),
+        Some(&"new".to_string())
+    );
+    assert!(!a.is_finished(), "subscribe must still be parked upstream");
+
+    // The subscribe lands on "old" post-publish; the self-check must see
+    // the moved route and rebind to "new" before returning Ok.
+    gate_sub_x.open();
+    a.await.unwrap().unwrap();
+
+    assert_eq!(
+        new_state.subscribe_count("memory://x"),
+        1,
+        "the self-check must resubscribe on the current owner"
+    );
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        1,
+        "the old owner must end unsubscribed"
+    );
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("a")]),
+        "members must survive the self-check rebind"
+    );
+    assert_eq!(router.resource_subscriptions.len(), 1);
+    assert_eq!(new_state.unsubscribe_count("memory://x"), 0);
+}
+
+/// Routeless-entry-gains-route-elsewhere variant: the racing-subscriber
+/// setup leaves an entry recorded on "old" with no route at all. When a
+/// later refresh routes the URI to a DIFFERENT server ("c"), classify's
+/// old None arm used to do nothing (it only pruned when the new snapshot
+/// also lacked the URI) — owner-vs-route mismatch unreconciled forever.
+/// The recorded owner must now drive a rebind onto "c".
+#[tokio::test]
+async fn routeless_entry_gaining_route_elsewhere_is_rebound() {
+    let (sm, router, old_state) = setup_subscribe_racing_prune().await;
+
+    let c_state = SubscribableUpstreamState::new(&["memory://x"]);
+    sm.replace_server(
+        "c",
+        connect_subscribable_upstream("c", Arc::clone(&c_state)).await,
+    )
+    .await;
+
+    router.refresh_tools().await;
+
+    assert_eq!(
+        router.cache.load().resource_routes.get("memory://x"),
+        Some(&"c".to_string())
+    );
+    assert_eq!(
+        c_state.subscribe_count("memory://x"),
+        1,
+        "the routeless entry must be rebound onto the server now owning the route"
+    );
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        2,
+        "the recorded old owner must be unsubscribed by the rebind"
+    );
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("b")]),
+        "members must survive the rebind"
+    );
+    assert_eq!(router.resource_subscriptions.len(), 1);
 }

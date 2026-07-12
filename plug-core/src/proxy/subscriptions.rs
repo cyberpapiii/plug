@@ -2077,4 +2077,120 @@ mod tests {
         let members = registry.members_snapshot("file:///seed").unwrap();
         assert!(members.contains(&client("seed")));
     }
+
+    /// Seeds a registry with one entry for `uri` whose recorded owner is
+    /// confirmed as `owner` (via a real subscribe transition against a
+    /// mock upstream).
+    async fn registry_with_confirmed_owner(uri: &str, owner: &str) -> Arc<SubscriptionRegistry> {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::new();
+        registry
+            .subscribe(
+                uri,
+                client("a"),
+                owner,
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        registry
+    }
+
+    /// Arm-1 core: an entry whose confirmed owner is A while BOTH route
+    /// snapshots agree the URI belongs to B (the skew left behind by a
+    /// subscribe landing inside a refresh's classify->publish window) must
+    /// classify as exactly one Rebind{A -> B} — pure old-vs-new route
+    /// diffing would skip it forever.
+    #[tokio::test]
+    async fn classify_rebinds_owner_route_drift_when_snapshots_agree() {
+        let registry = registry_with_confirmed_owner("file:///x", "server-a").await;
+
+        let routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
+        let items = registry.classify_route_changes(&routes, &routes);
+
+        assert_eq!(items.len(), 1, "exactly one reconciliation item");
+        match &items[0] {
+            RouteReconciliation::Rebind {
+                uri,
+                old_server_id,
+                new_server_id,
+            } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(old_server_id, "server-a");
+                assert_eq!(new_server_id, "server-b");
+            }
+            RouteReconciliation::Prune { .. } => panic!("expected Rebind, got Prune"),
+        }
+    }
+
+    /// An entry whose owner is not yet confirmed (transition in flight)
+    /// with identical old/new routes must produce nothing — no false
+    /// rebinds for in-flight subscribes.
+    #[test]
+    fn classify_unconfirmed_owner_with_unchanged_route_produces_nothing() {
+        let registry = SubscriptionRegistry::new();
+        // Seed helper records no owner (owner_server_id: None).
+        registry.insert_active_for_test("file:///x", client("a"));
+
+        let routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
+        let items = registry.classify_route_changes(&routes, &routes);
+
+        assert!(
+            items.is_empty(),
+            "owner-less entry with old==new must not reconcile"
+        );
+    }
+
+    /// Routeless-entry-gains-route-elsewhere variant: recorded owner A, no
+    /// route in the old snapshot, new snapshot routes the URI to C. The
+    /// old None arm used to do nothing unless the new snapshot ALSO lacked
+    /// the URI; it must now emit exactly one Rebind{A -> C}.
+    #[tokio::test]
+    async fn classify_rebinds_routeless_entry_gaining_route_elsewhere() {
+        let registry = registry_with_confirmed_owner("file:///x", "server-a").await;
+
+        let old_routes = HashMap::new();
+        let new_routes = HashMap::from([("file:///x".to_string(), "server-c".to_string())]);
+        let items = registry.classify_route_changes(&old_routes, &new_routes);
+
+        assert_eq!(items.len(), 1, "exactly one reconciliation item");
+        match &items[0] {
+            RouteReconciliation::Rebind {
+                uri,
+                old_server_id,
+                new_server_id,
+            } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(old_server_id, "server-a");
+                assert_eq!(new_server_id, "server-c");
+            }
+            RouteReconciliation::Prune { .. } => panic!("expected Rebind, got Prune"),
+        }
+    }
+
+    /// Guard for the untouched arms: a confirmed owner whose URI matches
+    /// the new route produces nothing (heal already complete), and a
+    /// route-vanished URI still prunes exactly as before.
+    #[tokio::test]
+    async fn classify_owner_matching_new_route_produces_nothing_and_vanished_prunes() {
+        let registry = registry_with_confirmed_owner("file:///x", "server-b").await;
+
+        // Owner already matches the new route — even a differing old
+        // snapshot must not manufacture a rebind.
+        let old_routes = HashMap::from([("file:///x".to_string(), "server-a".to_string())]);
+        let new_routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
+        let items = registry.classify_route_changes(&old_routes, &new_routes);
+        assert!(items.is_empty(), "owner==new-route must not reconcile");
+
+        // Route vanished entirely: prune, with the old snapshot's server id.
+        let items = registry.classify_route_changes(&old_routes, &HashMap::new());
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            RouteReconciliation::Prune { uri, old_server_id } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(old_server_id.as_deref(), Some("server-a"));
+            }
+            RouteReconciliation::Rebind { .. } => panic!("expected Prune, got Rebind"),
+        }
+    }
 }
