@@ -654,6 +654,20 @@ impl SubscriptionRegistry {
     /// snapshot pair. Pure decision pass — no registry mutation, no
     /// upstream calls. Emits the same debug logs the old inline `retain`
     /// closure did, at the same point in the decision.
+    ///
+    /// When the URI still has a route in the new snapshot, the "old" side
+    /// of the comparison is the entry's recorded `owner_server_id` — the
+    /// server that last *confirmed* holding the upstream subscription — in
+    /// preference to whatever the old route snapshot said. An entry can be
+    /// created inside a refresh pass's classify→publish window (a first
+    /// subscriber resolving the still-published old snapshot) and end up
+    /// owned by a server the new snapshot no longer routes the URI to;
+    /// pure old-vs-new route diffing would compare identical snapshots on
+    /// every later refresh and never reconcile it. Entries whose owner is
+    /// not yet confirmed (`None`, transition in flight) keep the plain
+    /// route-diff behavior — no false rebinds for in-flight subscribes.
+    /// Route-vanished URIs prune exactly as before; the drain resolves the
+    /// recorded owner itself.
     pub(super) fn classify_route_changes(
         &self,
         old_routes: &HashMap<String, String>,
@@ -662,10 +676,15 @@ impl SubscriptionRegistry {
         let mut out = Vec::new();
         for item in self.entries.iter() {
             let uri = item.key();
-            match old_routes.get(uri) {
-                Some(old_server_id) => match new_routes.get(uri) {
-                    Some(new_server_id) if new_server_id == old_server_id => {}
-                    Some(new_server_id) => {
+            match new_routes.get(uri) {
+                Some(new_server_id) => {
+                    let old_side = match &item.value().owner_server_id {
+                        Some(owner) => Some(owner),
+                        None => old_routes.get(uri),
+                    };
+                    if let Some(old_server_id) = old_side
+                        && old_server_id != new_server_id
+                    {
                         tracing::debug!(
                             uri = %uri,
                             old_server = %old_server_id,
@@ -678,7 +697,9 @@ impl SubscriptionRegistry {
                             new_server_id: new_server_id.clone(),
                         });
                     }
-                    None => {
+                }
+                None => match old_routes.get(uri) {
+                    Some(old_server_id) => {
                         tracing::debug!(
                             uri = %uri,
                             "pruning stale resource subscription after route refresh"
@@ -688,9 +709,7 @@ impl SubscriptionRegistry {
                             old_server_id: Some(old_server_id.clone()),
                         });
                     }
-                },
-                None => {
-                    if !new_routes.contains_key(uri) {
+                    None => {
                         tracing::debug!(
                             uri = %uri,
                             "pruning orphaned resource subscription with no route mapping"
@@ -700,7 +719,7 @@ impl SubscriptionRegistry {
                             old_server_id: None,
                         });
                     }
-                }
+                },
             }
         }
         out
@@ -1009,7 +1028,41 @@ impl super::ToolRouter {
 
         self.resource_subscriptions
             .subscribe(uri, target, &server_id, as_upstream_ops(upstream))
-            .await
+            .await?;
+
+        // One-shot post-subscribe self-check. The route was resolved from a
+        // snapshot loaded before the upstream transition ran; a
+        // `refresh_tools` publish landing in between can move the URI to a
+        // different server, and if the entry was created inside that pass's
+        // classify→publish window the running pass never saw it. Re-load
+        // the snapshot and heal the drift now instead of waiting for the
+        // next refresh. Runs outside any transition lock (the transition
+        // task released it before reporting its outcome); the rebind's own
+        // transition serializes on the per-URI lock as usual. No loop: if
+        // the route moves again, the next refresh's classify pass (which
+        // compares recorded owner against the new snapshot) reconciles it.
+        // A route that vanished entirely is left alone — the next refresh's
+        // prune plus the entry's recorded owner already drain routeless
+        // entries.
+        let moved_to = {
+            let snapshot = self.cache.load();
+            snapshot
+                .resource_routes
+                .get(uri)
+                .filter(|current| current.as_str() != server_id)
+                .cloned()
+        };
+        if let Some(new_server_id) = moved_to {
+            tracing::debug!(
+                uri = %uri,
+                old_server = %server_id,
+                new_server = %new_server_id,
+                "route moved during subscribe; rebinding to current owner"
+            );
+            self.rebind_subscription_route(uri, &server_id, &new_server_id)
+                .await;
+        }
+        Ok(())
     }
 
     /// Unsubscribe a downstream client from resource updates.
@@ -2023,5 +2076,121 @@ mod tests {
         assert_eq!(registry.len(), 1);
         let members = registry.members_snapshot("file:///seed").unwrap();
         assert!(members.contains(&client("seed")));
+    }
+
+    /// Seeds a registry with one entry for `uri` whose recorded owner is
+    /// confirmed as `owner` (via a real subscribe transition against a
+    /// mock upstream).
+    async fn registry_with_confirmed_owner(uri: &str, owner: &str) -> Arc<SubscriptionRegistry> {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::new();
+        registry
+            .subscribe(
+                uri,
+                client("a"),
+                owner,
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        registry
+    }
+
+    /// Arm-1 core: an entry whose confirmed owner is A while BOTH route
+    /// snapshots agree the URI belongs to B (the skew left behind by a
+    /// subscribe landing inside a refresh's classify->publish window) must
+    /// classify as exactly one Rebind{A -> B} — pure old-vs-new route
+    /// diffing would skip it forever.
+    #[tokio::test]
+    async fn classify_rebinds_owner_route_drift_when_snapshots_agree() {
+        let registry = registry_with_confirmed_owner("file:///x", "server-a").await;
+
+        let routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
+        let items = registry.classify_route_changes(&routes, &routes);
+
+        assert_eq!(items.len(), 1, "exactly one reconciliation item");
+        match &items[0] {
+            RouteReconciliation::Rebind {
+                uri,
+                old_server_id,
+                new_server_id,
+            } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(old_server_id, "server-a");
+                assert_eq!(new_server_id, "server-b");
+            }
+            RouteReconciliation::Prune { .. } => panic!("expected Rebind, got Prune"),
+        }
+    }
+
+    /// An entry whose owner is not yet confirmed (transition in flight)
+    /// with identical old/new routes must produce nothing — no false
+    /// rebinds for in-flight subscribes.
+    #[test]
+    fn classify_unconfirmed_owner_with_unchanged_route_produces_nothing() {
+        let registry = SubscriptionRegistry::new();
+        // Seed helper records no owner (owner_server_id: None).
+        registry.insert_active_for_test("file:///x", client("a"));
+
+        let routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
+        let items = registry.classify_route_changes(&routes, &routes);
+
+        assert!(
+            items.is_empty(),
+            "owner-less entry with old==new must not reconcile"
+        );
+    }
+
+    /// Routeless-entry-gains-route-elsewhere variant: recorded owner A, no
+    /// route in the old snapshot, new snapshot routes the URI to C. The
+    /// old None arm used to do nothing unless the new snapshot ALSO lacked
+    /// the URI; it must now emit exactly one Rebind{A -> C}.
+    #[tokio::test]
+    async fn classify_rebinds_routeless_entry_gaining_route_elsewhere() {
+        let registry = registry_with_confirmed_owner("file:///x", "server-a").await;
+
+        let old_routes = HashMap::new();
+        let new_routes = HashMap::from([("file:///x".to_string(), "server-c".to_string())]);
+        let items = registry.classify_route_changes(&old_routes, &new_routes);
+
+        assert_eq!(items.len(), 1, "exactly one reconciliation item");
+        match &items[0] {
+            RouteReconciliation::Rebind {
+                uri,
+                old_server_id,
+                new_server_id,
+            } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(old_server_id, "server-a");
+                assert_eq!(new_server_id, "server-c");
+            }
+            RouteReconciliation::Prune { .. } => panic!("expected Rebind, got Prune"),
+        }
+    }
+
+    /// Guard for the untouched arms: a confirmed owner whose URI matches
+    /// the new route produces nothing (heal already complete), and a
+    /// route-vanished URI still prunes exactly as before.
+    #[tokio::test]
+    async fn classify_owner_matching_new_route_produces_nothing_and_vanished_prunes() {
+        let registry = registry_with_confirmed_owner("file:///x", "server-b").await;
+
+        // Owner already matches the new route — even a differing old
+        // snapshot must not manufacture a rebind.
+        let old_routes = HashMap::from([("file:///x".to_string(), "server-a".to_string())]);
+        let new_routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
+        let items = registry.classify_route_changes(&old_routes, &new_routes);
+        assert!(items.is_empty(), "owner==new-route must not reconcile");
+
+        // Route vanished entirely: prune, with the old snapshot's server id.
+        let items = registry.classify_route_changes(&old_routes, &HashMap::new());
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            RouteReconciliation::Prune { uri, old_server_id } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(old_server_id.as_deref(), Some("server-a"));
+            }
+            RouteReconciliation::Rebind { .. } => panic!("expected Prune, got Rebind"),
+        }
     }
 }
