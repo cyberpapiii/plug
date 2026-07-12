@@ -110,7 +110,7 @@ pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 pub(crate) fn paginated_result<T: Clone, R>(
-    items: Vec<T>,
+    items: &[T],
     request: Option<PaginatedRequestParams>,
     build: impl FnOnce(Vec<T>, Option<String>) -> R,
 ) -> R {
@@ -388,12 +388,10 @@ impl super::ToolRouter {
         request: Option<PaginatedRequestParams>,
     ) -> ListToolsResult {
         let tools = self.list_tools_for_client_session(client_type, session_key);
-        paginated_result((*tools).clone(), request, |tools, next_cursor| {
-            ListToolsResult {
-                meta: None,
-                next_cursor,
-                tools,
-            }
+        paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
+            meta: None,
+            next_cursor,
+            tools,
         })
     }
 
@@ -604,15 +602,14 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
     ) -> ListResourcesResult {
-        paginated_result(
-            (*self.list_resources()).clone(),
-            request,
-            |resources, next_cursor| ListResourcesResult {
+        let resources = self.list_resources();
+        paginated_result(&resources, request, |resources, next_cursor| {
+            ListResourcesResult {
                 meta: None,
                 next_cursor,
                 resources,
-            },
-        )
+            }
+        })
     }
 
     pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
@@ -623,8 +620,9 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
     ) -> ListResourceTemplatesResult {
+        let resource_templates = self.list_resource_templates();
         paginated_result(
-            (*self.list_resource_templates()).clone(),
+            &resource_templates,
             request,
             |resource_templates, next_cursor| ListResourceTemplatesResult {
                 meta: None,
@@ -639,14 +637,13 @@ impl super::ToolRouter {
     }
 
     pub fn list_prompts_page(&self, request: Option<PaginatedRequestParams>) -> ListPromptsResult {
-        paginated_result(
-            (*self.list_prompts()).clone(),
-            request,
-            |prompts, next_cursor| ListPromptsResult {
+        let prompts = self.list_prompts();
+        paginated_result(&prompts, request, |prompts, next_cursor| {
+            ListPromptsResult {
                 meta: None,
                 next_cursor,
                 prompts,
-            },
-        )
+            }
+        })
     }
 }

@@ -1108,13 +1108,47 @@ impl ToolRouter {
             full_name: String,
         }
 
+        // Per-server data resolved at most once per refresh — the distinct
+        // server count is far smaller than the tool count, so this replaces
+        // up to 3 `server_manager` lookups (and a `tool_groups` Vec clone)
+        // PER TOOL with at most one lookup PER SERVER. Reused in pass 3 for
+        // icons so that pass doesn't re-hit `get_upstream_metadata` either.
+        struct ServerRefreshCtx {
+            upstream: Option<Arc<crate::server::UpstreamServer>>,
+            tool_group_rules: Option<Vec<crate::config::ToolGroupRule>>,
+            icons: Option<Vec<Icon>>,
+        }
+
+        let mut server_ctx: HashMap<String, ServerRefreshCtx> = HashMap::new();
         let mut classified: Vec<Classified> = Vec::new();
 
         for (server_name, tool) in upstream_tools {
             let mut exposed_name = tool.name.to_string();
 
+            let ctx = server_ctx.entry(server_name.clone()).or_insert_with(|| {
+                let upstream = self.server_manager.get_upstream(&server_name);
+                let tool_group_rules = upstream.as_ref().and_then(|u| {
+                    if !u.config.tool_groups.is_empty() {
+                        Some(u.config.tool_groups.clone())
+                    } else if server_name == "workspace" {
+                        Some(crate::tool_naming::default_workspace_rules())
+                    } else {
+                        None
+                    }
+                });
+                let icons = self
+                    .server_manager
+                    .get_upstream_metadata(&server_name)
+                    .and_then(|metadata| metadata.icons);
+                ServerRefreshCtx {
+                    upstream,
+                    tool_group_rules,
+                    icons,
+                }
+            });
+
             // 1. Apply manual renames if any
-            if let Some(upstream) = self.server_manager.get_upstream(&server_name)
+            if let Some(upstream) = ctx.upstream.as_ref()
                 && let Some(new_name) = upstream.config.tool_renames.get(&exposed_name)
             {
                 exposed_name = new_name.clone();
@@ -1124,20 +1158,7 @@ impl ToolRouter {
             let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
             // 3. Determine prefix and tool name via rules or server name
-            let tool_group_rules: Option<Vec<crate::config::ToolGroupRule>> = self
-                .server_manager
-                .get_upstream(&server_name)
-                .and_then(|u| {
-                    if !u.config.tool_groups.is_empty() {
-                        Some(u.config.tool_groups.clone())
-                    } else if server_name == "workspace" {
-                        Some(crate::tool_naming::default_workspace_rules())
-                    } else {
-                        None
-                    }
-                });
-
-            let (prefix, full_name, stripped_name) = if let Some(ref rules) = tool_group_rules {
+            let (prefix, full_name, stripped_name) = if let Some(ref rules) = ctx.tool_group_rules {
                 match crate::tool_naming::classify_with_rules(&sanitized, rules) {
                     Some(result) => {
                         let stripped = crate::tool_naming::strip_keywords(
@@ -1233,10 +1254,9 @@ impl ToolRouter {
             let upstream_annotations = c.tool.annotations.clone();
             let mut prefixed_tool = c.tool.clone();
             let mut inferred_tool = c.tool.clone();
-            let upstream_icons = self
-                .server_manager
-                .get_upstream_metadata(&c.server_name)
-                .and_then(|metadata| metadata.icons);
+            let upstream_icons = server_ctx
+                .get(&c.server_name)
+                .and_then(|ctx| ctx.icons.clone());
             inferred_tool.name = Cow::Owned(final_name.clone());
             inferred_tool.annotations = None;
             crate::enrichment::normalize_annotations(&mut inferred_tool, &final_name);
@@ -1334,9 +1354,19 @@ impl ToolRouter {
             "refreshed tool cache"
         );
 
-        // Build pre-cached filtered views
-        let tools_windsurf = Arc::new(tools.iter().take(100).cloned().collect());
-        let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect());
+        // Build pre-cached filtered views — only when tool filtering is
+        // enabled. `list_tools_for_client_session` (catalog.rs) is the only
+        // reader of these two fields, and it always returns early via
+        // `list_tools()` (which serves `tools_all`) when filtering is
+        // disabled, so these views are provably never read in that case.
+        let (tools_windsurf, tools_copilot) = if self.config.tool_filter_enabled {
+            (
+                Arc::new(tools.iter().take(100).cloned().collect()),
+                Arc::new(tools.iter().take(128).cloned().collect()),
+            )
+        } else {
+            (Arc::new(Vec::new()), Arc::new(Vec::new()))
+        };
         let tools_all = Arc::new(tools);
 
         let mut resource_routes = HashMap::new();

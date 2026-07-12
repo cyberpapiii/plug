@@ -443,6 +443,64 @@ fn list_tools_for_client_returns_correct_counts() {
 }
 
 #[test]
+fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() {
+    // Pins the invariant the refresh_tools() filtered-view gate depends on:
+    // when `tool_filter_enabled` is false, `refresh_tools()` no longer
+    // populates `tools_windsurf` / `tools_copilot` (they're left empty).
+    // `list_tools_for_client_session` must still return the FULL catalog for
+    // Windsurf/Copilot in that case — it has to take the early-return path
+    // via `list_tools()` before ever reading those two fields.
+    let sm = Arc::new(ServerManager::new());
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..test_router_config()
+    };
+    let router = ToolRouter::new(sm, config);
+
+    let tools: Vec<Tool> = (0..150)
+        .map(|i| {
+            Tool::new(
+                Cow::Owned(format!("tool_{i:03}")),
+                Cow::Owned(format!("Tool {i}")),
+                Arc::new(serde_json::Map::new()),
+            )
+        })
+        .collect();
+
+    // Simulate what refresh_tools() now produces when filtering is
+    // disabled: tools_windsurf/tools_copilot stay empty.
+    router.cache.store(Arc::new(RouterSnapshot {
+        routes: HashMap::new(),
+        tools_all: Arc::new(tools),
+        meta_tools_all: Arc::new(build_meta_tools()),
+        tools_windsurf: Arc::new(Vec::new()),
+        tools_copilot: Arc::new(Vec::new()),
+        resources_all: Arc::new(Vec::new()),
+        resource_templates_all: Arc::new(Vec::new()),
+        prompts_all: Arc::new(Vec::new()),
+        resource_routes: HashMap::new(),
+        prompt_routes: HashMap::new(),
+        tool_definition_fingerprints: HashMap::new(),
+        tool_risk_inventory: HashMap::new(),
+    }));
+
+    assert_eq!(
+        router
+            .list_tools_for_client_session(ClientType::Windsurf, None)
+            .len(),
+        150,
+        "Windsurf must still see the full catalog, not the empty pre-cached view"
+    );
+    assert_eq!(
+        router
+            .list_tools_for_client_session(ClientType::VSCodeCopilot, None)
+            .len(),
+        150,
+        "Copilot must still see the full catalog, not the empty pre-cached view"
+    );
+}
+
+#[test]
 fn search_tools_returns_matches() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, test_router_config());
@@ -1183,6 +1241,24 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
     let second = router.list_tools_page_for_client(ClientType::Unknown, Some(second_request));
     assert_eq!(second.tools.len(), 250);
     assert!(second.next_cursor.is_none());
+}
+
+#[test]
+fn paginated_result_returns_mid_cursor_page_from_borrowed_slice() {
+    // `paginated_result` now takes `&[T]` instead of an owned `Vec<T>`; this
+    // pins that a mid-cursor page sliced from a borrowed input still returns
+    // the same items and next_cursor as the old owned-Vec implementation.
+    let items: Vec<i32> = (0..750).collect();
+
+    let mut request = PaginatedRequestParams::default();
+    request.cursor = Some("500".to_string());
+
+    let (page, next_cursor) = paginated_result(&items, Some(request), |page, next_cursor| {
+        (page, next_cursor)
+    });
+
+    assert_eq!(page, items[500..750].to_vec());
+    assert!(next_cursor.is_none());
 }
 
 #[tokio::test]
