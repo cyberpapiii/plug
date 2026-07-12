@@ -1,5 +1,5 @@
 ---
-status: done
+status: complete
 priority: p1
 issue_id: "059"
 tags: [daemon, http, runtime, architecture, sessions, ux]

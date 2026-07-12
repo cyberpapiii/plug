@@ -199,7 +199,7 @@ Full configuration reference:
 # ~/.config/plug/config.toml
 
 # Global settings
-enable_prefix = true       # Legacy compatibility field; tool names are always prefixed in v0.1
+enable_prefix = true       # Legacy compatibility field; tool names are always prefixed
 prefix_delimiter = "__"    # Delimiter between server name and tool name
 daemon_grace_period_secs = 0  # Default: keep the shared daemon alive until explicit shutdown
 
@@ -284,7 +284,7 @@ Use `plug clients` to inspect the resolved mode and whether it came from an auto
 
 Notes:
 
-- Wire names are always prefixed in v0.1, regardless of `enable_prefix`
+- Wire names are always prefixed in the current release, regardless of `enable_prefix`
 - Some servers can be split into sub-service prefixes via `tool_groups`
 - Some clients still render raw `name` or synthesize their own labels, so perfect cross-client visual consistency is not always possible
 - Icon metadata is normalized before forwarding: HTTPS and bounded `data:` icon URIs are allowed; PNG/JPEG/WebP are forwarded for upstream icons, untrusted SVG is dropped, invalid schemes, invalid sizes, and oversized inline icons are dropped.
@@ -314,7 +314,7 @@ Notes:
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering
 5. **Clean pass-through** — faithful proxy by default, optional enrichment
 6. **Rock-solid reliable** — circuit breakers, merge cache, graceful degradation
-7. **Future-proof** — MCP 2025-11-25, ready for stateless mode (June 2026)
+7. **Future-proof** — MCP 2025-11-25, session-store seam ready for stateless operation
 
 ## Tech Stack
 
