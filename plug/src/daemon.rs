@@ -1166,6 +1166,10 @@ async fn handle_ipc_loop(
         let mut reverse_rx = ctx.reverse_request_rx.take();
         // Capture session_id before dispatch borrows ctx mutably.
         let dispatch_session_id = ctx.session_id.clone();
+        // Capture whether this request is a Deregister before dispatch — the
+        // Deregister handler drops the bridge channel's sender, closing it,
+        // so the taken-out `reverse_rx` above must not be restored below.
+        let request_was_deregister = is_deregister_request(&request);
 
         let response = {
             use std::pin::pin;
@@ -1193,6 +1197,9 @@ async fn handle_ipc_loop(
                     } => {
                         if let Some((reverse_req, resp_tx)) = reverse {
                             handle_reverse_request(reader, writer, reverse_req, resp_tx).await?;
+                        } else {
+                            // Channel closed (e.g. bridge deregistered) — stop polling it.
+                            reverse_rx = None;
                         }
                     }
                     // Also forward logging notifications while waiting
@@ -1222,7 +1229,11 @@ async fn handle_ipc_loop(
 
         // Restore reverse_request_rx (dispatch_request may have replaced it
         // during a Register call, in which case ctx already has the new one).
-        if ctx.reverse_request_rx.is_none() {
+        // Skip the restore after a Deregister — the handler intentionally
+        // cleared ctx.reverse_request_rx and dropped the bridge's sender, so
+        // the channel we took out above is now closed; restoring it would
+        // resurrect a dead channel that busy-spins Ready(None) on selects.
+        if ctx.reverse_request_rx.is_none() && !request_was_deregister {
             ctx.reverse_request_rx = reverse_rx;
         }
 
@@ -1291,6 +1302,15 @@ async fn handle_ipc_loop(
     }
 
     Ok(())
+}
+
+/// True when `request` is an `IpcRequest::Deregister`. The Deregister handler
+/// in `dispatch_request` clears `ctx.reverse_request_rx` and drops the
+/// bridge channel's sender (closing it), so `handle_ipc_loop`'s post-dispatch
+/// restore step must skip putting the (now-closed) taken-out channel back —
+/// otherwise the next request's select loop busy-spins on `Ready(None)`.
+fn is_deregister_request(request: &IpcRequest) -> bool {
+    matches!(request, IpcRequest::Deregister { .. })
 }
 
 /// Send a logging notification to the IPC client, handling broadcast errors.
@@ -3429,6 +3449,27 @@ mod tests {
         assert!(json.contains("\"session_id\":\"session-123\""));
     }
 
+    #[test]
+    fn is_deregister_request_detects_only_deregister() {
+        // Regression guard for the restore-skip predicate in
+        // `handle_ipc_loop`: only a Deregister request should suppress
+        // restoring `reverse_request_rx`, since only Deregister's handler
+        // closes the channel out from under the dispatch loop.
+        assert!(is_deregister_request(&IpcRequest::Deregister {
+            session_id: "session-123".to_string(),
+        }));
+
+        assert!(!is_deregister_request(&IpcRequest::Status));
+        assert!(!is_deregister_request(&IpcRequest::Ping {
+            session_id: "session-123".to_string(),
+        }));
+        assert!(!is_deregister_request(&IpcRequest::Register {
+            protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+            client_id: "client-123".to_string(),
+            client_info: None,
+        }));
+    }
+
     #[tokio::test]
     async fn daemon_bridge_rejects_elicitation_without_capability() {
         use plug_core::proxy::DownstreamBridge;
@@ -4136,6 +4177,43 @@ mod tests {
         assert!(
             text.contains("Called") && text.contains("ipc-hello"),
             "unexpected echo payload: {payload}"
+        );
+    }
+
+    /// After a `Deregister`, the bridge channel's sender is dropped (closed)
+    /// and `ctx.reverse_request_rx` is cleared. Sending another request on
+    /// the same connection must not resurrect that closed channel — the
+    /// direct regression guard for the restore-skip predicate is
+    /// `is_deregister_request_detects_only_deregister`; this test documents
+    /// the end-to-end sequence still completing normally afterward, matching
+    /// the plan's minimum bar (pre-fix this also passes functionally, since
+    /// a busy-spun `Ready(None)` arm still lets the dispatch future resolve —
+    /// it just burns CPU doing so).
+    #[tokio::test]
+    async fn deregister_then_status_request_completes_normally() {
+        let mut harness = IpcTestHarness::start("echo").await;
+
+        write_ipc(
+            &mut harness.stream,
+            &IpcRequest::Deregister {
+                session_id: harness.session_id.clone(),
+            },
+        )
+        .await;
+        let deregister_resp = read_ipc_response(&mut harness.stream).await;
+        assert!(
+            matches!(deregister_resp, IpcResponse::Ok),
+            "expected Ok, got {deregister_resp:?}"
+        );
+
+        write_ipc(&mut harness.stream, &IpcRequest::Status).await;
+        let status_resp = read_ipc_response(&mut harness.stream).await;
+
+        harness.shutdown().await;
+
+        assert!(
+            matches!(status_resp, IpcResponse::Status { .. }),
+            "expected Status, got {status_resp:?}"
         );
     }
 
