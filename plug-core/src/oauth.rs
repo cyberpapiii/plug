@@ -390,7 +390,7 @@ impl CompositeCredentialStore {
         value: &T,
         file_kind: &'static str,
     ) -> Result<(), AuthError> {
-        use fs2::FileExt;
+        use fs4::FileExt;
         use std::io::Write;
 
         let dir = path.parent().ok_or_else(|| {
@@ -424,7 +424,9 @@ impl CompositeCredentialStore {
             AuthError::InternalError(format!("failed to open temp {file_kind}: {e}"))
         })?;
 
-        file.lock_exclusive().map_err(|e| {
+        // Fully qualified: std's inherent `File::lock` (Rust 1.89+) would
+        // otherwise shadow the fs4 trait method depending on toolchain version.
+        FileExt::lock(&file).map_err(|e| {
             AuthError::InternalError(format!("failed to lock temp {file_kind}: {e}"))
         })?;
 

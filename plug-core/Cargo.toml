@@ -58,7 +58,7 @@ serde_norway.workspace = true
 
 # OAuth token storage
 keyring.workspace = true
-fs2.workspace = true
+fs4.workspace = true
 async-trait.workspace = true
 oauth2.workspace = true
 

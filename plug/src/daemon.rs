@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use dashmap::DashMap;
-use fs2::FileExt as _;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
@@ -422,8 +421,22 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
         .open(pid_path)
         .with_context(|| format!("failed to open PID file: {}", pid_path.display()))?;
 
-    file.try_lock_exclusive()
-        .map_err(|_| anyhow::anyhow!("another plug daemon is already running (PID file locked)"))?;
+    // Fully qualified: std's inherent `File::try_lock` (Rust 1.89+) would
+    // otherwise shadow the fs4 trait method depending on toolchain version.
+    // Contention (`WouldBlock`) means another daemon holds the lock; any
+    // other error is a real I/O failure and is surfaced as such.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => {}
+        Err(fs4::TryLockError::WouldBlock) => {
+            return Err(anyhow::anyhow!(
+                "another plug daemon is already running (PID file locked)"
+            ));
+        }
+        Err(fs4::TryLockError::Error(e)) => {
+            return Err(e)
+                .with_context(|| format!("failed to lock PID file: {}", pid_path.display()));
+        }
+    }
 
     // Write our PID
     use std::io::Write;
