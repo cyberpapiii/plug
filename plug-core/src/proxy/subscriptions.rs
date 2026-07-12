@@ -23,7 +23,10 @@ use tokio::sync::watch;
 ///   the removing transition's `generation` still matches the entry's
 ///   current `generation` — a transition that finishes after its slot was
 ///   already replaced by a fresher one (a piggybacker mid-drain, a rebind,
-///   another prune) must never clobber the replacement.
+///   another prune) must never clobber the replacement. The same applies to
+///   state: a transition upgrades its entry to `Active` only while the slot
+///   is still `Pending` on its own generation — a `Draining` marker set
+///   mid-flight belongs to the queued drain and is never overwritten.
 /// - Every upstream `subscribe`/`unsubscribe` transition runs inside a task
 ///   spawned detached from the calling request (via `Engine::tracker()`,
 ///   falling back to a raw `tokio::spawn` if no engine reference is
@@ -362,8 +365,16 @@ impl SubscriptionRegistry {
             let call_result = upstream.subscribe_resource(&uri).await;
             match &call_result {
                 Ok(()) => {
+                    // Upgrade to Active only from Pending. A `Draining`
+                    // marker set on this same generation mid-flight (last
+                    // member left, or a prune) must not be clobbered: the
+                    // queued drain owns this entry's ending, and a transient
+                    // Active window here would let a new subscriber
+                    // piggyback onto a slot the drain is about to remove out
+                    // from under it.
                     if let Some(mut entry) = self.entries.get_mut(&uri)
                         && entry.generation == generation
+                        && matches!(entry.state, EntryState::Pending(_))
                     {
                         entry.state = EntryState::Active;
                     }
@@ -404,9 +415,16 @@ impl SubscriptionRegistry {
             DashEntry::Occupied(mut o) => {
                 let entry = o.get_mut();
                 entry.members.remove(target);
-                let is_active_and_empty =
-                    matches!(entry.state, EntryState::Active) && entry.members.is_empty();
-                if is_active_and_empty {
+                // Drain when the last member leaves an Active entry, or a
+                // Pending one: the drain queues behind the in-flight
+                // subscribe on the transition lock (same generation) and
+                // unsubscribes after it lands — otherwise a successful
+                // subscribe would upgrade an entry with zero members to
+                // Active and the upstream subscription would leak forever.
+                // Never a Draining entry: that drain is already running.
+                let now_empty = entry.members.is_empty()
+                    && matches!(entry.state, EntryState::Active | EntryState::Pending(_));
+                if now_empty {
                     let generation = entry.generation;
                     let (tx, _rx) = watch::channel(None);
                     entry.state = EntryState::Draining;
@@ -443,9 +461,14 @@ impl SubscriptionRegistry {
             let uri = item.key().clone();
             let entry = item.value_mut();
             entry.members.remove(target);
-            let is_active_and_empty =
-                matches!(entry.state, EntryState::Active) && entry.members.is_empty();
-            if is_active_and_empty {
+            // Same rule as `unsubscribe()`: drain an emptied Active OR
+            // Pending entry (the Pending case queues behind the in-flight
+            // subscribe and unsubscribes after it lands, so a disconnect
+            // racing the subscribe window can't leak the upstream
+            // subscription); never a Draining one.
+            let now_empty = entry.members.is_empty()
+                && matches!(entry.state, EntryState::Active | EntryState::Pending(_));
+            if now_empty {
                 let generation = entry.generation;
                 let (tx, _rx) = watch::channel(None);
                 entry.state = EntryState::Draining;
@@ -751,8 +774,13 @@ impl SubscriptionRegistry {
                 None,
             ))
         } else {
+            // Same rule as `run_subscribe_transition`: only a still-Pending
+            // slot may be upgraded — a Draining marker set on this
+            // generation mid-flight belongs to a queued drain that owns the
+            // entry's ending.
             if let Some(mut entry) = self.entries.get_mut(&uri)
                 && entry.generation == generation
+                && matches!(entry.state, EntryState::Pending(_))
             {
                 entry.state = EntryState::Active;
             }
@@ -1214,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_during_subscribe_uses_drain_generation() {
         let registry = SubscriptionRegistry::new();
-        let mock = MockUpstream::new();
+        let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         registry
             .subscribe(
@@ -1224,7 +1252,76 @@ mod tests {
             )
             .await
             .unwrap();
+        mock.clear_log();
 
+        // A disconnects; cleanup starts a drain whose upstream unsubscribe
+        // is parked on the closed gate.
+        let entered_unsub = mock.unsubscribe_entered.notified();
+        let target = client("a");
+        let mock_for_resolve = Arc::clone(&mock);
+        registry
+            .cleanup_target(&target, move |_uri| {
+                Some(Arc::clone(&mock_for_resolve) as Arc<dyn UpstreamResourceOps>)
+            })
+            .await;
+        entered_unsub.await;
+
+        // B subscribes the same URI while the cleanup drain is mid-flight:
+        // it must start a fresh generation serialized behind the drain, not
+        // race it.
+        let reg_b = Arc::clone(&registry);
+        let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let b =
+            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !b.is_finished(),
+            "subscribe must wait for the in-flight cleanup drain"
+        );
+        assert_eq!(
+            mock.subscribe_call_count(),
+            1,
+            "no fresh subscribe issued yet"
+        );
+
+        mock.unsubscribe_gate.open();
+
+        assert!(b.await.unwrap().is_ok());
+        assert_eq!(mock.log(), vec!["unsubscribe", "subscribe"]);
+        assert_eq!(mock.subscribe_call_count(), 2);
+        let members = registry.members_snapshot("file:///x").unwrap();
+        assert_eq!(members, HashSet::from([client("b")]));
+
+        // Probe that B's fresh-generation entry landed Active: a repeat
+        // subscribe returns immediately without another upstream call.
+        registry
+            .subscribe(
+                "file:///x",
+                client("b"),
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.subscribe_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn last_member_leaving_during_pending_subscribe_drains_after_subscribe() {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::with_closed_subscribe_gate();
+
+        let entered = mock.subscribe_entered.notified();
+        let reg_a = Arc::clone(&registry);
+        let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let a =
+            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        entered.await;
+
+        // A disconnects while its subscribe transition is still parked
+        // upstream: cleanup removes the last member from the Pending entry
+        // and must queue a drain rather than skipping it.
         let target = client("a");
         let mock_for_resolve = Arc::clone(&mock);
         registry
@@ -1233,6 +1330,12 @@ mod tests {
             })
             .await;
 
+        // Release the in-flight subscribe; the queued drain must then
+        // unsubscribe upstream and remove the member-less entry instead of
+        // leaving an Active zombie leaked upstream forever.
+        mock.subscribe_gate.open();
+        let _ = a.await.unwrap();
+
         for _ in 0..50 {
             if registry.is_empty() {
                 break;
@@ -1240,8 +1343,80 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        assert!(registry.is_empty());
+        assert!(
+            registry.is_empty(),
+            "an emptied Pending entry must be drained once its subscribe lands"
+        );
+        assert_eq!(mock.log(), vec!["subscribe", "unsubscribe"]);
         assert_eq!(mock.unsubscribe_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_during_pending_subscribe_prevents_transient_active_piggyback() {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::with_gates(false, false);
+
+        let entered_sub = mock.subscribe_entered.notified();
+        let reg_a = Arc::clone(&registry);
+        let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let a =
+            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        entered_sub.await;
+
+        // A route refresh prunes the URI while A's subscribe transition is
+        // parked upstream: the entry (same generation) is marked Draining
+        // and the prune's drain queues on the transition lock.
+        let reg_prune = Arc::clone(&registry);
+        let mock_prune = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let prune = tokio::spawn(async move {
+            reg_prune
+                .prune("file:///x", Some("old-server"), Some(mock_prune))
+                .await;
+        });
+        tokio::task::yield_now().await;
+
+        // Let A's transition complete while the prune drain is parked on
+        // the closed unsubscribe gate INSIDE the transition lock.
+        let entered_unsub = mock.unsubscribe_entered.notified();
+        mock.subscribe_gate.open();
+        let _ = a.await.unwrap();
+        entered_unsub.await;
+
+        // B subscribes now. The completed subscribe transition must NOT
+        // have flipped the Draining marker back to Active — B has to start
+        // a fresh generation serialized behind the drain, not piggyback on
+        // a transient Active slot the drain is about to remove.
+        let reg_b = Arc::clone(&registry);
+        let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let b =
+            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !b.is_finished(),
+            "B must serialize behind the in-flight prune drain, not complete via a transient Active"
+        );
+
+        mock.unsubscribe_gate.open();
+        prune.await.unwrap();
+        assert!(b.await.unwrap().is_ok());
+
+        assert_eq!(mock.log(), vec!["subscribe", "unsubscribe", "subscribe"]);
+        let members = registry.members_snapshot("file:///x").unwrap();
+        assert_eq!(members, HashSet::from([client("b")]));
+
+        // Probe that B's entry landed Active: a repeat subscribe returns
+        // immediately without another upstream call.
+        registry
+            .subscribe(
+                "file:///x",
+                client("b"),
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.subscribe_call_count(), 2);
     }
 
     #[tokio::test]
