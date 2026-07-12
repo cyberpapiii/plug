@@ -25,6 +25,35 @@ use plug_core::ipc::{
 const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
+/// Max silence (no frames of ANY kind) on a locked read before the daemon is
+/// declared wedged and the connection is torn down for reconnect. Frames
+/// (notifications, chunks, reverse requests) reset the clock, so slow tool
+/// calls that emit progress are unaffected. See plans/009.
+const READ_WATCHDOG: Duration = Duration::from_secs(120);
+
+/// Test-only override for `READ_WATCHDOG` so the suite can exercise watchdog
+/// expiry without a real 120s wait. Zero means "no override, use the real
+/// constant." This must never grow into a runtime/config knob — see
+/// plans/009 maintenance notes. Tests install it via
+/// `tests::ReadWatchdogTestOverride`, which all run under `daemon_test_lock`
+/// so the single global value is never contended across tests.
+#[cfg(test)]
+static READ_WATCHDOG_TEST_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Effective read-watchdog duration: the real constant, unless a test has
+/// installed a shorter override.
+fn read_watchdog() -> Duration {
+    #[cfg(test)]
+    {
+        let override_ms = READ_WATCHDOG_TEST_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if override_ms != 0 {
+            return Duration::from_millis(override_ms);
+        }
+    }
+    READ_WATCHDOG
+}
+
 struct SharedConnection {
     conn: Mutex<crate::runtime::DaemonProxySession>,
     config_path: Option<PathBuf>,
@@ -175,13 +204,33 @@ impl IpcProxyHandler {
         let mut chunked_response = Vec::new();
         let mut expected_chunks: Option<u32> = None;
         loop {
-            let frame = ipc::read_frame(&mut conn.reader)
-                .await
-                .map_err(|e| Self::transport_failure("IPC read failed", e))?
-                .ok_or_else(|| TransportFailure {
-                    message: "daemon closed connection".to_string(),
-                    reconnectable: true,
-                })?;
+            let frame = match tokio::time::timeout(
+                read_watchdog(),
+                ipc::read_frame(&mut conn.reader),
+            )
+            .await
+            {
+                Ok(result) => result
+                    .map_err(|e| Self::transport_failure("IPC read failed", e))?
+                    .ok_or_else(|| TransportFailure {
+                        message: "daemon closed connection".to_string(),
+                        reconnectable: true,
+                    })?,
+                Err(_elapsed) => {
+                    let watchdog = read_watchdog();
+                    tracing::warn!(
+                        secs = watchdog.as_secs(),
+                        "daemon read watchdog expired; forcing reconnect"
+                    );
+                    return Err(TransportFailure {
+                        message: format!(
+                            "daemon read watchdog expired after {}s",
+                            watchdog.as_secs()
+                        ),
+                        reconnectable: true,
+                    });
+                }
+            };
 
             // Discriminate frame type by tag key: DaemonToProxyMessage uses
             // `"envelope"`, plain IpcResponse uses `"type"`. Check for the
@@ -1498,6 +1547,33 @@ mod tests {
     // safe under parallel threads (see daemon::runtime_paths_test_lock).
     fn daemon_test_lock() -> &'static tokio::sync::Mutex<()> {
         crate::daemon::runtime_paths_test_lock()
+    }
+
+    /// RAII guard that installs a short `READ_WATCHDOG` override for the
+    /// life of a test (see `READ_WATCHDOG_TEST_OVERRIDE_MS`), restoring the
+    /// "no override" state on drop — including on panic/unwind, so a failed
+    /// assertion never leaks a short watchdog into a later test. The
+    /// override is a single process-global value, so every test that
+    /// installs one must hold `daemon_test_lock()` for its entire body
+    /// (all fake-daemon tests in this module already do), and this guard
+    /// must be declared AFTER the `daemon_test_lock()` guard so it drops
+    /// (and resets the override) BEFORE the lock is released.
+    struct ReadWatchdogTestOverride;
+
+    impl ReadWatchdogTestOverride {
+        fn install(duration: Duration) -> Self {
+            READ_WATCHDOG_TEST_OVERRIDE_MS.store(
+                duration.as_millis() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Self
+        }
+    }
+
+    impl Drop for ReadWatchdogTestOverride {
+        fn drop(&mut self) {
+            READ_WATCHDOG_TEST_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     fn artifact_base_dir() -> PathBuf {
@@ -3765,18 +3841,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_daemon_stall_currently_hangs() {
+    async fn silent_daemon_stall_triggers_reconnect() {
         let _guard = daemon_test_lock().lock().await;
+        // Real Unix socket reads don't complete under tokio::time::pause, so
+        // (per plans/009) use the test-only override instead of paused time.
+        let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
         let temp = unique_temp_dir("stall");
         set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let daemon_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (mut reader, writer) = drive_fake_daemon_initialize(stream, "fake-session-1").await;
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let (mut reader1, _writer1) =
+                drive_fake_daemon_initialize(stream1, "fake-session-1").await;
 
-            let frame = ipc::read_frame(&mut reader)
+            let frame = ipc::read_frame(&mut reader1)
                 .await
                 .expect("read tools/call frame")
                 .expect("connection open");
@@ -3787,11 +3866,60 @@ mod tests {
             );
 
             // Accept the request and never respond — e.g. a wedged upstream
-            // server the daemon is still waiting on. Hold the connection
-            // open (silent) until the test releases us.
-            let _ = release_rx.await;
-            drop(reader);
-            drop(writer);
+            // server the daemon is still waiting on. Deliberately do NOT
+            // close this connection (that would just retrigger the
+            // pre-existing "daemon closed connection" EOF path exercised by
+            // other tests, not the read watchdog this test targets): leave
+            // reader1/_writer1 open and silent for the rest of this task, so
+            // the client can only recover via watchdog expiry.
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+
+            // The reconnect after watchdog expiry only re-sends Register +
+            // Capabilities (see reconnect_replays_client_capabilities) — not
+            // the full initialize() sequence, which only runs once per
+            // downstream client lifetime. It IS followed by a replay of the
+            // client capabilities negotiated during connection 1's
+            // initialize (plan 007) — consume and ack that before the
+            // retried tools/call.
+            let replay_frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read replayed capabilities frame")
+                .expect("connection open");
+            let replay_req: IpcRequest =
+                serde_json::from_slice(&replay_frame).expect("parse replayed capabilities request");
+            assert!(
+                matches!(replay_req, IpcRequest::UpdateCapabilities { .. }),
+                "expected replayed UpdateCapabilities before the retried tools/call, got {replay_req:?}"
+            );
+            ipc::send_response(&mut writer2, &IpcResponse::Ok)
+                .await
+                .expect("send replayed UpdateCapabilities ack");
+
+            let frame2 = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read second tools/call frame")
+                .expect("connection open");
+            let req2: IpcRequest =
+                serde_json::from_slice(&frame2).expect("parse second tools/call request");
+            assert!(
+                matches!(req2, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected retried tools/call, got {req2:?}"
+            );
+            let call_result =
+                serde_json::to_value(CallToolResult::success(vec![Content::text("recovered")]))
+                    .expect("serialize call result");
+            ipc::send_response(
+                &mut writer2,
+                &IpcResponse::McpResponse {
+                    payload: call_result,
+                },
+            )
+            .await
+            .expect("send second tools/call response");
+
+            drop(reader1);
         });
 
         let session =
@@ -3815,22 +3943,147 @@ mod tests {
             .await
             .expect("connect downstream client");
 
-        // CHARACTERIZATION: no read watchdog today — plan 009 will turn
-        // this into a reconnectable failure. Keep the timeout short (real
-        // time, not paused: the fake daemon does genuine socket I/O, which
-        // paused/mocked time cannot advance around safely).
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
+        // call_tool() uses RetryPolicy::UnsafeToRetry: the watchdog-expiry
+        // failure triggers a reconnect, but the ORIGINAL request is not
+        // resent — the call surfaces REQUEST_RETRY_UNSAFE instead. Confirms
+        // "not a hang, not a panic": this returns promptly (well within 5s,
+        // via the 150ms test-shortened watchdog) with an error, whereas
+        // before plan 009 the same scenario hung until this outer timeout.
+        let first_attempt = tokio::time::timeout(
+            Duration::from_secs(5),
             client.call_tool(CallToolRequestParams::new("whatever")),
         )
-        .await;
+        .await
+        .expect(
+            "first call timed out — the read watchdog should force a reconnect well within 5s, \
+             not hang indefinitely",
+        );
         assert!(
-            outcome.is_err(),
-            "CHARACTERIZATION: no read watchdog today — a silently stalled daemon currently \
-             hangs the round trip indefinitely instead of surfacing a reconnectable failure"
+            first_attempt.is_err(),
+            "expected the first call to surface an error after the watchdog-triggered reconnect, \
+             not silently succeed"
         );
 
-        let _ = release_tx.send(());
+        // The proxy has now reconnected (session 2); the next call succeeds.
+        let second_attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("second call timeout")
+        .expect("second call should succeed on the reconnected session");
+        assert_eq!(
+            second_attempt
+                .content
+                .first()
+                .and_then(|c| c.raw.as_text())
+                .map(|t| t.text.as_str()),
+            Some("recovered")
+        );
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn watchdog_resets_on_interleaved_frames() {
+        let _guard = daemon_test_lock().lock().await;
+        let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
+        let temp = unique_temp_dir("watchdog-reset");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) =
+                drive_fake_daemon_initialize(stream, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read tools/call frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse tools/call request");
+            assert!(
+                matches!(req, IpcRequest::McpRequest { ref method, .. } if method == "tools/call"),
+                "expected tools/call, got {req:?}"
+            );
+
+            // Send a notification every 40ms — comfortably below the 150ms
+            // test watchdog — for 6 rounds (240ms total), THEN the actual
+            // response. Total elapsed (240ms) exceeds the watchdog, but no
+            // single silent gap does, because each arriving frame resets the
+            // per-read clock. If the watchdog were per-request-total instead
+            // of per-frame-inactivity, this round trip would incorrectly
+            // fail.
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                ipc::send_response(&mut writer, &IpcResponse::ToolListChangedNotification)
+                    .await
+                    .expect("send interleaved keep-alive notification");
+            }
+
+            let call_result =
+                serde_json::to_value(CallToolResult::success(vec![Content::text("survived")]))
+                    .expect("serialize call result");
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::McpResponse {
+                    payload: call_result,
+                },
+            )
+            .await
+            .expect("send tools/call response");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-watchdog-reset".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+
+        // If the watchdog fired incorrectly, this would surface
+        // REQUEST_RETRY_UNSAFE (tools/call is UnsafeToRetry) instead of the
+        // real "survived" response — so a successful match here proves the
+        // per-frame reset, not just "did not hang".
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("call timeout")
+        .expect(
+            "call should succeed: total elapsed exceeds the watchdog only via interleaved \
+             frames, each of which resets the clock",
+        );
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|c| c.raw.as_text())
+                .map(|t| t.text.as_str()),
+            Some("survived")
+        );
+
         daemon_task.await.expect("daemon task join");
 
         clear_test_runtime_paths();
