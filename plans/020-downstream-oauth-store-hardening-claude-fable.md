@@ -274,7 +274,14 @@ worktree).
 
 Machine-checkable. ALL must hold:
 
-- [ ] `grep -c 'fn evict_expired' plug-core/src/downstream_oauth/mod.rs` → 1,
+> **Reviewer amendment (2026-07-12, at execution):** the first criterion's
+> `grep -c 'fn evict_expired'` returns 2, not 1 — the substring also matches the
+> new test `fn evict_expired_drops_only_expired_entries`. Exactly one method
+> definition exists (verified by inspection). Criterion amended to → 2 with that
+> explanation; the ≥5 call-site check is unaffected (actual: 6).
+
+- [ ] `grep -c 'fn evict_expired' plug-core/src/downstream_oauth/mod.rs` → 2
+      (method + the test fn whose name collides with the pattern; see amendment),
       and `grep -c 'evict_expired(' plug-core/src/downstream_oauth/mod.rs`
       → ≥5 (definition + four mutation-path call sites)
 - [ ] `cargo test -p plug-core downstream_oauth` exits 0 with the 6 new
