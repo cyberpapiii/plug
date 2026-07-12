@@ -209,6 +209,20 @@ to:
 > up the new value; the job `name` should say 1.88.0). Verification becomes
 > `cargo +1.88.0 check --workspace` → exit 0. The 1.86-based text below is
 > retained for the record.
+>
+> **Amendment 2 (same day).** The 1.88 bump made 27 MSRV-gated clippy lints
+> newly eligible (26× `collapsible_if` let-chain collapses, 1×
+> `manual_is_multiple_of`) across 14 files, most outside this plan's scope
+> list. Reviewer authorized two scope extensions rather than pinning
+> `clippy.toml msrv` to a floor the build no longer supports: (1) a single
+> mechanical commit applying clippy's own suggestions at exactly those lint
+> sites, and (2) converting the third umask `create_dir_all` on the secrets
+> tree (`oauth.rs:937`, `CompositeStateStore::save`) to
+> `crate::fs_perm::ensure_dir_0700` — without it, step 5's 0700 guarantee
+> was incomplete because that path can create the same directory first.
+> Later plans' drift checks will see these lint collapses in otherwise
+> untouched files; that drift is verified-safe and orchestrator-annotated
+> at dispatch time.
 
 In `.github/workflows/ci.yml`, add a job after `check` (same shape as the
 existing jobs, gated like `cross-check`):
