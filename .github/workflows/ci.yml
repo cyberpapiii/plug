@@ -12,7 +12,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  MSRV: "1.86.0"
+  MSRV: "1.88.0"
 
 jobs:
   check:
@@ -26,6 +26,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV check (1.88.0)
+    needs: check
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
 
   test-linux:
     name: Test (ubuntu)
