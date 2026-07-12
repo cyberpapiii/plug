@@ -615,6 +615,22 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        // `mode(0o600)` only applies when the file is created: truncating a
+        // stale temp file (left behind by a crash between write and rename)
+        // keeps its old permission bits. Remove any leftover first so tokens
+        // are only ever written to a freshly created owner-only file.
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    path = %tmp.display(),
+                    error = %e,
+                    "failed to persist downstream oauth state: could not remove stale temp file"
+                );
+                return;
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -641,7 +657,19 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        // Backstop: after the stale-tmp removal above the file was freshly
+        // created with mode 0600, so this should never change anything —
+        // but if it fails, do not rename a possibly-loose temp file into
+        // place as the credential file.
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %tmp.display(),
+                error = %e,
+                "failed to persist downstream oauth state: could not set temp file permissions"
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
     }
     #[cfg(not(unix))]
     {
@@ -664,6 +692,22 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
             "failed to persist downstream oauth state: could not rename temp file into place"
         );
         let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        // Mirror the upstream credential store: enforce owner-only
+        // permissions on the final file after the rename as defense in
+        // depth. On failure, warn but keep the live state file — losing
+        // issued tokens is worse than a permission warning here.
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "persisted downstream oauth state but could not enforce state file permissions"
+            );
+        }
     }
 }
 
@@ -684,6 +728,7 @@ mod tests {
     fn cleanup_state(client_id: &str) {
         let config = test_config(client_id);
         if let Ok(path) = state_file_path(&config) {
+            let _ = std::fs::remove_file(path.with_extension("json.tmp"));
             let _ = std::fs::remove_file(path);
         }
     }
@@ -1361,6 +1406,71 @@ mod tests {
             "a corrupt state file should fall back to empty default state"
         );
         drop(guard);
+
+        cleanup_state(&client_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_loose_tmp_file_is_replaced_and_state_file_is_owner_only() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let config = test_config(&client_id);
+
+        let path = state_file_path(&config).expect("compute state file path");
+        let tmp = path.with_extension("json.tmp");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create state dir");
+        }
+        // Simulate a crash between write and rename that left a temp file
+        // behind with loose permissions. A later persist must not truncate
+        // and reuse it (which would keep the 0644 bits on the token file).
+        std::fs::write(&tmp, b"stale junk from a previous crash").expect("write stale tmp");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen stale tmp permissions");
+
+        let manager = DownstreamOauthManager::new(config.clone());
+        let issued = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("tools:read"))
+            .await
+            .expect("client credentials exchange");
+
+        let meta = std::fs::metadata(&path).expect("state file exists after persist");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "state file must be owner-only even when a loose stale tmp existed"
+        );
+        let reloaded = load_persisted_state(&config).expect("state file parses");
+        assert!(
+            reloaded.access_tokens.contains_key(&issued.access_token),
+            "issued token must be present in the persisted state"
+        );
+        assert!(!tmp.exists(), "no temp file should remain after persist");
+
+        cleanup_state(&client_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_persist_writes_state_file_with_owner_only_permissions() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let config = test_config(&client_id);
+
+        let manager = DownstreamOauthManager::new(config.clone());
+        manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("tools:read"))
+            .await
+            .expect("client credentials exchange");
+
+        let path = state_file_path(&config).expect("compute state file path");
+        let meta = std::fs::metadata(&path).expect("state file exists after persist");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "state file must be owner-only after a normal persist"
+        );
 
         cleanup_state(&client_id);
     }
