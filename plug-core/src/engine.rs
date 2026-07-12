@@ -19,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::circuit::CircuitState;
-use crate::config::Config;
+use crate::config::{Config, ServerConfig};
 use crate::health::spawn_health_checks;
 use crate::proxy::{RouterConfig, ToolRouter};
-use crate::server::ServerManager;
+use crate::reload::server_config_changed;
+use crate::server::{ServerManager, UpstreamServer, retire_upstream_owned};
 use crate::types::{ClientType, ServerHealth, ServerStatus};
 
 /// Broadcast channel capacity. At peak burst (~130 events/sec with 20 servers),
@@ -106,6 +107,23 @@ pub struct EngineSnapshot {
     pub servers: Vec<ServerStatus>,
     pub tool_count: usize,
     pub uptime: Duration,
+}
+
+/// Outcome of [`Engine::commit_replacement`].
+///
+/// Any future code path that installs a freshly-connected upstream into the
+/// live server map outside of `reload_config` itself must go through
+/// `commit_replacement` (and therefore inherits this staleness check) —
+/// never call `ServerManager::replace_server` directly from a new caller.
+pub(crate) enum ReplaceOutcome {
+    /// Config still matches the snapshot the connect was made against —
+    /// upstream installed.
+    Committed,
+    /// The server was removed, or materially reconfigured (per the SAME
+    /// `server_config_changed` predicate reload uses), concurrently with the
+    /// connect — the new upstream was retired and the server map was left
+    /// untouched, because reload already established the desired reality.
+    StaleDiscarded,
 }
 
 /// The core runtime that owns all shared state.
@@ -476,6 +494,68 @@ impl Engine {
         self.config.store(Arc::new(config));
     }
 
+    /// Commit a freshly-connected upstream, unless the server's config changed
+    /// (or the server vanished) since `connected_with` was snapshotted.
+    ///
+    /// Holds `reload_lock` across validate+install so an in-flight
+    /// `reload_config` is either fully before or fully after this commit —
+    /// there is no torn middle to observe. MUST NOT be called from any path
+    /// that already holds `reload_lock` (tokio's `Mutex` is not reentrant);
+    /// today nothing under `reload_lock` reaches this method (verified: no
+    /// caller of `restart_server`/`reconnect_server`/`do_reconnect` is
+    /// reachable from `reload.rs`).
+    ///
+    /// The materiality check MUST use `server_config_changed` — the SAME
+    /// predicate `reload_config` uses to decide restart-vs-skip — never
+    /// whole-struct equality. Reload only takes authoritative action (stop,
+    /// or stop+restart) for servers that predicate calls changed; discarding
+    /// here is only justified by "reload already established the desired
+    /// reality" for exactly those cases. A non-material change (e.g.
+    /// `max_concurrent`, which the predicate deliberately omits) must still
+    /// commit, or a successful reconnection would be silently thrown away
+    /// and the server would be stranded down.
+    ///
+    /// Work under the lock is bounded: one `ArcSwap` load, one comparison,
+    /// and either `replace_server` (a `DashMap` insert plus either a spawned
+    /// grace-period retirement or an awaited retirement bounded by
+    /// `UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT`) or the same bounded
+    /// retirement applied to the discarded upstream. No network connects
+    /// happen under the lock.
+    ///
+    /// The reverse interleaving is benign: if this commit wins the lock
+    /// first, reload's own diff runs immediately after against the
+    /// just-installed upstream and stops/restarts it per the new config —
+    /// the end state is still the new config's.
+    async fn commit_replacement(
+        &self,
+        server_id: &str,
+        connected_with: &ServerConfig,
+        upstream: UpstreamServer,
+    ) -> ReplaceOutcome {
+        let _guard = self.reload_lock.lock().await;
+        let current = self.config.load();
+        match current.servers.get(server_id) {
+            Some(cfg) if !server_config_changed(connected_with, cfg) => {
+                self.server_manager
+                    .replace_server(server_id, upstream)
+                    .await;
+                ReplaceOutcome::Committed
+            }
+            _ => {
+                // Never inserted into the map — we hold the only handle, so
+                // retire inline (no grace period needed; nothing else can be
+                // reading this Arc).
+                retire_upstream_owned(
+                    server_id.to_string(),
+                    Arc::new(upstream),
+                    "discarded: server removed or reconfigured during reconnect/restart",
+                )
+                .await;
+                ReplaceOutcome::StaleDiscarded
+            }
+        }
+    }
+
     /// Restart a specific upstream server. Rate-limited: at most 1 restart
     /// per server per 10 seconds. Applies to both TUI and IPC callers.
     pub async fn restart_server(self: &Arc<Self>, server_id: &str) -> Result<(), anyhow::Error> {
@@ -517,18 +597,30 @@ impl Engine {
             .await
         {
             Ok(upstream) => {
-                self.server_manager
-                    .replace_server(server_id, upstream)
-                    .await;
-                self.sync_refresh_loop_for_server(server_id, &server_config);
-                self.tool_router.refresh_tools().await;
+                match self
+                    .commit_replacement(server_id, &server_config, upstream)
+                    .await
+                {
+                    ReplaceOutcome::Committed => {
+                        self.sync_refresh_loop_for_server(server_id, &server_config);
+                        self.tool_router.refresh_tools().await;
 
-                let _ = self.event_tx.send(EngineEvent::ServerStarted {
-                    server_id: Arc::from(server_id),
-                });
+                        let _ = self.event_tx.send(EngineEvent::ServerStarted {
+                            server_id: Arc::from(server_id),
+                        });
 
-                tracing::info!(server = %server_id, "server restarted");
-                Ok(())
+                        tracing::info!(server = %server_id, "server restarted");
+                        Ok(())
+                    }
+                    ReplaceOutcome::StaleDiscarded => {
+                        // The ServerStopped event above is accurate either way — the
+                        // old instance WAS stopped. This is a user-facing command, so
+                        // it should say why it didn't do what was asked.
+                        Err(anyhow::anyhow!(
+                            "server '{server_id}' was removed or reconfigured by a concurrent config reload; restart abandoned"
+                        ))
+                    }
+                }
             }
             Err(e) => {
                 let _ = self.event_tx.send(EngineEvent::Error {
@@ -584,6 +676,27 @@ impl Engine {
         let mut attempt = 1;
         let mut delay = RECONNECT_RETRY_MIN_DELAY;
         let upstream = loop {
+            // Cheap early-exit (optimization, not the correctness guarantee —
+            // that's commit_replacement below): if the server vanished or was
+            // materially reconfigured since we snapshotted it, stop dialing
+            // now instead of burning the rest of the retry window. Uses the
+            // SAME predicate as the commit check, never equality — a
+            // non-material change (e.g. max_concurrent) must NOT trip this,
+            // or we would abandon a reconnect that reload never replaced,
+            // stranding the server down.
+            let current = self.config.load();
+            match current.servers.get(server_id) {
+                Some(cfg) if !server_config_changed(&server_config, cfg) => {}
+                _ => {
+                    tracing::info!(
+                        server = %server_id,
+                        "reconnect abandoned: server removed or reconfigured during retry"
+                    );
+                    return Ok(());
+                }
+            }
+            drop(current);
+
             match self
                 .server_manager
                 .start_server(server_id, &server_config)
@@ -616,17 +729,31 @@ impl Engine {
             }
         };
 
-        self.server_manager
-            .replace_server(server_id, upstream)
-            .await;
-        self.tool_router.refresh_tools().await;
+        match self
+            .commit_replacement(server_id, &server_config, upstream)
+            .await
+        {
+            ReplaceOutcome::Committed => {
+                self.tool_router.refresh_tools().await;
 
-        let _ = self.event_tx.send(EngineEvent::ServerStarted {
-            server_id: Arc::from(server_id),
-        });
+                let _ = self.event_tx.send(EngineEvent::ServerStarted {
+                    server_id: Arc::from(server_id),
+                });
 
-        tracing::info!(server = %server_id, "server reconnected");
-        Ok(())
+                tracing::info!(server = %server_id, "server reconnected");
+                Ok(())
+            }
+            ReplaceOutcome::StaleDiscarded => {
+                // The reload already established the desired reality for this
+                // server (removed it, or replaced it per the new config) —
+                // there is nothing left for this reconnect to do.
+                tracing::info!(
+                    server = %server_id,
+                    "reconnect abandoned: server removed or reconfigured during retry"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Enable or disable a server. Clones the current config, toggles the
@@ -1013,6 +1140,373 @@ mod tests {
             },
         );
         config
+    }
+
+    /// A real (non-oauth) mock stdio `ServerConfig` backed by
+    /// `plug-test-harness`'s `mock-mcp-server` binary — same connect
+    /// mechanics as `oauth_mock_stdio_config` above, parameterized so tests
+    /// can produce configs that are materially different (`tools` feeds
+    /// `args`, which `server_config_changed` compares) or only
+    /// non-materially different (`max_concurrent`, which it omits).
+    fn mock_stdio_server_config(tools: &str, max_concurrent: usize) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            command: Some("cargo".to_string()),
+            args: vec![
+                "run".to_string(),
+                "--quiet".to_string(),
+                "-p".to_string(),
+                "plug-test-harness".to_string(),
+                "--bin".to_string(),
+                "mock-mcp-server".to_string(),
+                "--".to_string(),
+                "--tools".to_string(),
+                tools.to_string(),
+            ],
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+
+            sandbox: None,
+        }
+    }
+
+    fn mock_stdio_config(name: &str, tools: &str) -> Config {
+        let mut config = Config::default();
+        config
+            .servers
+            .insert(name.to_string(), mock_stdio_server_config(tools, 1));
+        config
+    }
+
+    // ── Plan 011: reconnect/restart vs. reload interlock ──────────────────
+    //
+    // These tests cover `Engine::commit_replacement`, the commit protocol
+    // that stops `do_reconnect`/`restart_server` from resurrecting a server
+    // a concurrent config reload already removed or materially reconfigured.
+
+    /// Bug demonstration (plan 011, step 2): drives the RAW, unconditional
+    /// primitives `ServerManager::start_server` + `ServerManager::replace_server`
+    /// directly — bypassing `do_reconnect`/`commit_replacement` entirely — to
+    /// reproduce the exact defect this plan fixes. `replace_server` itself is
+    /// intentionally left unconditional by this plan (plan 012 owns its
+    /// grace-spawn cleanup), so this test passes both before and after the
+    /// fix: it documents WHY production callers must never call
+    /// `replace_server` directly with a stale snapshot. The paired test
+    /// directly below, `commit_discards_when_server_removed`, proves the same
+    /// scenario is safe once routed through `commit_replacement`.
+    #[tokio::test]
+    async fn raw_replace_server_resurrects_removed_server() {
+        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let snapshot = engine
+            .config()
+            .servers
+            .get("foo")
+            .expect("foo configured")
+            .clone();
+
+        // Connect against the snapshot — the "reconnect in flight" step.
+        let upstream = engine
+            .server_manager()
+            .start_server("foo", &snapshot)
+            .await
+            .expect("mock upstream connects");
+
+        // Meanwhile the operator deletes "foo" and reload runs to completion.
+        engine
+            .reload_config(Config::default())
+            .await
+            .expect("reload succeeds");
+        assert!(
+            !engine.config().servers.contains_key("foo"),
+            "foo should be gone from config after reload"
+        );
+
+        // The stale reconnect's tail, exactly what `do_reconnect` used to do
+        // unconditionally before this plan.
+        engine
+            .server_manager()
+            .replace_server("foo", upstream)
+            .await;
+
+        assert!(
+            engine.server_manager().get_upstream("foo").is_some(),
+            "raw replace_server resurrects a removed server — this is the defect \
+             commit_replacement exists to prevent in the real callers"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Test 1: snapshot matches the live config exactly (no reload in
+    /// between) — commit installs.
+    #[tokio::test]
+    async fn commit_installs_when_config_unchanged() {
+        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let snapshot = engine
+            .config()
+            .servers
+            .get("foo")
+            .expect("foo configured")
+            .clone();
+
+        let upstream = engine
+            .server_manager()
+            .start_server("foo", &snapshot)
+            .await
+            .expect("mock upstream connects");
+
+        let outcome = engine.commit_replacement("foo", &snapshot, upstream).await;
+        assert!(matches!(outcome, ReplaceOutcome::Committed));
+        assert!(
+            engine.server_manager().get_upstream("foo").is_some(),
+            "committed upstream should be installed"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Test 2 (the flipped step-2 demonstration): same setup as
+    /// `raw_replace_server_resurrects_removed_server`, but the stale tail now
+    /// goes through `commit_replacement` — the map must NOT contain "foo".
+    #[tokio::test]
+    async fn commit_discards_when_server_removed() {
+        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let snapshot = engine
+            .config()
+            .servers
+            .get("foo")
+            .expect("foo configured")
+            .clone();
+
+        let upstream = engine
+            .server_manager()
+            .start_server("foo", &snapshot)
+            .await
+            .expect("mock upstream connects");
+
+        engine
+            .reload_config(Config::default())
+            .await
+            .expect("reload succeeds");
+
+        let outcome = engine.commit_replacement("foo", &snapshot, upstream).await;
+        assert!(matches!(outcome, ReplaceOutcome::StaleDiscarded));
+        assert!(
+            engine.server_manager().get_upstream("foo").is_none(),
+            "removed server must not be resurrected by a stale commit"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Test 3: reload materially changes "foo" (different `args`, a field
+    /// `server_config_changed` covers) — reload restarts it with the new
+    /// config. The stale commit must discard and must NOT disturb the
+    /// reload-installed instance.
+    #[tokio::test]
+    async fn commit_discards_on_material_change() {
+        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let snapshot = engine
+            .config()
+            .servers
+            .get("foo")
+            .expect("foo configured")
+            .clone();
+
+        let upstream = engine
+            .server_manager()
+            .start_server("foo", &snapshot)
+            .await
+            .expect("mock upstream connects");
+
+        let mut changed_config = Config::default();
+        changed_config
+            .servers
+            .insert("foo".to_string(), mock_stdio_server_config("echo,greet", 1));
+        let report = engine
+            .reload_config(changed_config)
+            .await
+            .expect("reload succeeds");
+        assert!(
+            report.errors.is_empty(),
+            "reload should start the changed server cleanly: {:?}",
+            report.errors
+        );
+        assert!(report.changed.contains(&"foo".to_string()));
+
+        let reload_installed = engine
+            .server_manager()
+            .get_upstream("foo")
+            .expect("reload should have installed its own replacement");
+
+        let outcome = engine.commit_replacement("foo", &snapshot, upstream).await;
+        assert!(matches!(outcome, ReplaceOutcome::StaleDiscarded));
+
+        let still_installed = engine
+            .server_manager()
+            .get_upstream("foo")
+            .expect("reload-installed instance must remain");
+        assert!(
+            Arc::ptr_eq(&reload_installed, &still_installed),
+            "a stale commit must not disturb the reload-installed upstream"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Test 4 (the whole-struct-equality regression test): reload changes
+    /// ONLY `max_concurrent` — a field `server_config_changed` deliberately
+    /// omits — so reload does not touch "foo" at all. The commit must still
+    /// install: under whole-struct equality this would incorrectly discard a
+    /// successful reconnection and strand the server down.
+    #[tokio::test]
+    async fn commit_installs_on_non_material_change() {
+        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let snapshot = engine
+            .config()
+            .servers
+            .get("foo")
+            .expect("foo configured")
+            .clone();
+
+        let upstream = engine
+            .server_manager()
+            .start_server("foo", &snapshot)
+            .await
+            .expect("mock upstream connects");
+
+        let mut unchanged_config = Config::default();
+        unchanged_config
+            .servers
+            .insert("foo".to_string(), mock_stdio_server_config("echo", 7));
+        let report = engine
+            .reload_config(unchanged_config)
+            .await
+            .expect("reload succeeds");
+        assert!(report.unchanged.contains(&"foo".to_string()));
+        assert!(
+            engine.server_manager().get_upstream("foo").is_none(),
+            "reload must not have started anything for an unchanged server"
+        );
+
+        let outcome = engine.commit_replacement("foo", &snapshot, upstream).await;
+        assert!(
+            matches!(outcome, ReplaceOutcome::Committed),
+            "non-material config drift must not discard a successful reconnect \
+             (regression test for the whole-struct-equality bug)"
+        );
+        assert!(engine.server_manager().get_upstream("foo").is_some());
+
+        engine.shutdown().await;
+    }
+
+    /// Test 6: drives `do_reconnect` (via the public `reconnect_server` entry
+    /// point) end to end. "foo" is configured to hang past its 1s connect
+    /// timeout — every dial reliably fails with a retryable "timed out"
+    /// error, first appending a marker to `dial_log` so the test can count
+    /// real dial attempts deterministically (a wall-clock assertion would be
+    /// timing-sensitive; a file is not). A concurrent reload removes "foo"
+    /// while attempt 1 is still in flight — well before the retry-loop's
+    /// early-exit check runs at the top of attempt 2 — so the loop must
+    /// abandon without dialing again.
+    ///
+    /// Seam note: this works because `do_reconnect`'s retry loop has an
+    /// explicit synchronization point (the inter-attempt sleep) and only
+    /// needs attempt 1 to *fail*, which a command that hangs past
+    /// `timeout_secs` gives deterministically. `restart_server` (test 5) has
+    /// no retry loop — its only window is the single in-flight connect, which
+    /// would need to *succeed* after the interleaving to reach the commit
+    /// call at all; that requires a mock upstream that starts failing then
+    /// starts succeeding on a fixed config, which no existing fixture
+    /// provides. Per the plan, test 5 (and test 7, which has the same
+    /// fail-then-succeed requirement) are documented here as not driveable
+    /// without building new mock-server machinery, rather than built.
+    #[tokio::test]
+    async fn reconnect_abandons_between_retries_when_server_removed() {
+        let dial_log = tempfile::NamedTempFile::new().expect("create dial log");
+        let dial_log_path = dial_log.path().to_string_lossy().to_string();
+
+        let mut config = Config::default();
+        config.servers.insert(
+            "foo".to_string(),
+            crate::config::ServerConfig {
+                command: Some("sh".to_string()),
+                args: vec![
+                    "-c".to_string(),
+                    format!("echo dial >> {dial_log_path}; sleep 5"),
+                ],
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 1,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+
+                sandbox: None,
+            },
+        );
+
+        let engine = Arc::new(Engine::new(config));
+
+        // Remove "foo" partway through attempt 1's ~1s connect timeout —
+        // comfortably before the early-exit check at the top of attempt 2
+        // (which runs only after attempt 1 fails AND the 100ms inter-attempt
+        // sleep elapses, i.e. around the 1.1s mark).
+        let reload_engine = Arc::clone(&engine);
+        let reload_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            reload_engine
+                .reload_config(Config::default())
+                .await
+                .expect("reload succeeds");
+        });
+
+        let result = engine.reconnect_server("foo").await;
+        reload_task.await.expect("reload task panicked");
+
+        assert!(
+            result.is_ok(),
+            "abandoned reconnect should return Ok — reload already established \
+             the desired reality: {result:?}"
+        );
+        assert!(
+            engine.server_manager().get_upstream("foo").is_none(),
+            "removed server must not be resurrected"
+        );
+
+        let dial_count = std::fs::read_to_string(&dial_log_path)
+            .expect("read dial log")
+            .lines()
+            .count();
+        assert_eq!(
+            dial_count, 1,
+            "retry loop must abandon before dialing again once the server is gone"
+        );
+
+        engine.shutdown().await;
     }
 
     #[test]
