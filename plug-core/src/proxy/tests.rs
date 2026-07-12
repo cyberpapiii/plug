@@ -2077,3 +2077,470 @@ async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
         "expected a sync-path ServerUnavailable error, got {err:?}"
     );
 }
+
+// ─── refresh_tools ↔ subscription race tests ────────────────────────────────
+//
+// These drive `refresh_tools` itself against in-process duplex-connected
+// upstreams whose `unsubscribe` handlers can be parked on per-URI gates,
+// letting a test deterministically place a racing downstream subscribe or
+// unsubscribe inside a refresh pass's prune/rebind window.
+
+use rmcp::ServiceExt as _;
+
+use crate::server::{UpstreamClientHandler, UpstreamServer};
+use crate::types::ServerHealth;
+
+/// Async gate: `wait()` parks until `open()`. Same shape as the registry
+/// unit tests' Gate, but per-URI on the upstream side.
+struct SubGate {
+    notify: tokio::sync::Notify,
+    open: AtomicBool,
+}
+
+impl SubGate {
+    fn new_closed() -> Arc<Self> {
+        Arc::new(Self {
+            notify: tokio::sync::Notify::new(),
+            open: AtomicBool::new(false),
+        })
+    }
+
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.open.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.open.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Shared state backing a `SubscribableUpstreamHandler`: the resource list
+/// it serves (mutable between refreshes to flip routes) and per-URI
+/// subscribe/unsubscribe call logs plus gates.
+struct SubscribableUpstreamState {
+    resources: std::sync::Mutex<Vec<String>>,
+    subscribe_log: std::sync::Mutex<Vec<String>>,
+    unsubscribe_log: std::sync::Mutex<Vec<String>>,
+    unsubscribe_gates: std::sync::Mutex<HashMap<String, Arc<SubGate>>>,
+    unsubscribe_entered: tokio::sync::Notify,
+}
+
+impl SubscribableUpstreamState {
+    fn new(resources: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            resources: std::sync::Mutex::new(resources.iter().map(|uri| uri.to_string()).collect()),
+            subscribe_log: std::sync::Mutex::new(Vec::new()),
+            unsubscribe_log: std::sync::Mutex::new(Vec::new()),
+            unsubscribe_gates: std::sync::Mutex::new(HashMap::new()),
+            unsubscribe_entered: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn set_resources(&self, resources: &[&str]) {
+        *self.resources.lock().unwrap() = resources.iter().map(|uri| uri.to_string()).collect();
+    }
+
+    /// All subsequent `resources/unsubscribe` calls for `uri` park until the
+    /// returned gate is opened.
+    fn close_unsubscribe_gate(&self, uri: &str) -> Arc<SubGate> {
+        let gate = SubGate::new_closed();
+        self.unsubscribe_gates
+            .lock()
+            .unwrap()
+            .insert(uri.to_string(), Arc::clone(&gate));
+        gate
+    }
+
+    fn subscribe_count(&self, uri: &str) -> usize {
+        self.subscribe_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|logged| logged.as_str() == uri)
+            .count()
+    }
+
+    fn unsubscribe_count(&self, uri: &str) -> usize {
+        self.unsubscribe_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|logged| logged.as_str() == uri)
+            .count()
+    }
+}
+
+struct SubscribableUpstreamHandler {
+    state: Arc<SubscribableUpstreamState>,
+}
+
+impl ServerHandler for SubscribableUpstreamHandler {
+    fn get_info(&self) -> ServerInfo {
+        let mut capabilities = ServerCapabilities::default();
+        capabilities.resources = Some(rmcp::model::ResourcesCapability {
+            subscribe: Some(true),
+            list_changed: Some(false),
+        });
+        ServerInfo::new(capabilities)
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        let uris = self.state.resources.lock().unwrap().clone();
+        std::future::ready(Ok(ListResourcesResult::with_all_items(
+            uris.iter()
+                .map(|uri| RawResource::new(uri.as_str(), uri.as_str()).no_annotation())
+                .collect(),
+        )))
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        self.state
+            .subscribe_log
+            .lock()
+            .unwrap()
+            .push(request.uri.clone());
+        std::future::ready(Ok(()))
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        let state = Arc::clone(&self.state);
+        async move {
+            state
+                .unsubscribe_log
+                .lock()
+                .unwrap()
+                .push(request.uri.clone());
+            let gate = state
+                .unsubscribe_gates
+                .lock()
+                .unwrap()
+                .get(&request.uri)
+                .cloned();
+            state.unsubscribe_entered.notify_waiters();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Build a real, duplex-connected `UpstreamServer` backed by the given
+/// state, mirroring the pattern in `server::tests`.
+async fn connect_subscribable_upstream(
+    name: &str,
+    state: Arc<SubscribableUpstreamState>,
+) -> UpstreamServer {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = SubscribableUpstreamHandler { state }
+            .serve(server_transport)
+            .await
+            .expect("start subscribable upstream test server");
+        let _ = server.waiting().await;
+    });
+
+    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+    let handler = Arc::new(UpstreamClientHandler::new_for_tests(
+        Arc::from(name.to_string()),
+        Arc::clone(&tools),
+        std::sync::Weak::new(),
+    ));
+    let client = handler
+        .serve(client_transport)
+        .await
+        .expect("connect subscribable upstream test client");
+
+    let mut capabilities = ServerCapabilities::default();
+    capabilities.resources = Some(rmcp::model::ResourcesCapability {
+        subscribe: Some(true),
+        list_changed: Some(false),
+    });
+
+    UpstreamServer {
+        name: name.to_string(),
+        config: subscribable_test_server_config(),
+        client,
+        tools,
+        capabilities,
+        upstream: None,
+        health: ServerHealth::Healthy,
+    }
+}
+
+fn subscribable_test_server_config() -> crate::config::ServerConfig {
+    crate::config::ServerConfig {
+        command: Some("fake".to_string()),
+        args: Vec::new(),
+        env: HashMap::new(),
+        enabled: true,
+        transport: crate::config::TransportType::Stdio,
+        url: None,
+        auth_token: None,
+        auth: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        timeout_secs: 30,
+        call_timeout_secs: 30,
+        max_concurrent: 1,
+        health_check_interval_secs: 60,
+        circuit_breaker_enabled: false,
+        enrichment: false,
+        tool_renames: HashMap::new(),
+        tool_groups: Vec::new(),
+        sandbox: None,
+    }
+}
+
+fn sub_target(id: &str) -> NotificationTarget {
+    NotificationTarget::Stdio {
+        client_id: Arc::from(id),
+    }
+}
+
+/// Race manifestation 1 (rebind side): a last-member unsubscribe lands
+/// while a `refresh_tools` pass that will rebind the URI is still inside
+/// its (pre-publish) prune phase, so the rebind reaches a zero-member
+/// entry whose drain is still in flight. Without the empty-entry guard,
+/// rebind revived the entry onto the new owner: a zero-member Active entry
+/// holding a live new-owner subscription nothing would ever drain.
+#[tokio::test]
+async fn refresh_rebind_with_racing_last_unsubscribe_leaves_no_orphan() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+
+    let old_state = SubscribableUpstreamState::new(&["memory://x", "memory://y"]);
+    let new_state = SubscribableUpstreamState::new(&[]);
+    sm.replace_server(
+        "old",
+        connect_subscribable_upstream("old", Arc::clone(&old_state)).await,
+    )
+    .await;
+    sm.replace_server(
+        "new",
+        connect_subscribable_upstream("new", Arc::clone(&new_state)).await,
+    )
+    .await;
+
+    router.refresh_tools().await;
+    assert_eq!(
+        router.cache.load().resource_routes.get("memory://x"),
+        Some(&"old".to_string())
+    );
+
+    router
+        .subscribe_resource("memory://x", sub_target("a"))
+        .await
+        .unwrap();
+    router
+        .subscribe_resource("memory://y", sub_target("c"))
+        .await
+        .unwrap();
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+
+    // Flip the routes: x migrates old -> new (Rebind), y vanishes (Prune).
+    old_state.set_resources(&[]);
+    new_state.set_resources(&["memory://x"]);
+    let gate_y = old_state.close_unsubscribe_gate("memory://y");
+    let gate_x = old_state.close_unsubscribe_gate("memory://x");
+
+    // Start the refresh; its prune(y) drain parks inside the old server's
+    // unsubscribe handler, holding the pass in its pre-publish window.
+    let entered_y = old_state.unsubscribe_entered.notified();
+    let refresh_router = Arc::clone(&router);
+    let refresh = tokio::spawn(async move { refresh_router.refresh_tools().await });
+    entered_y.await;
+
+    // The last member of x unsubscribes inside the window. The entry
+    // empties and its drain is gated; when the refresh proceeds to
+    // rebind(x), the entry is still present with zero members.
+    let entered_x = old_state.unsubscribe_entered.notified();
+    router
+        .unsubscribe_resource("memory://x", &sub_target("a"))
+        .await
+        .unwrap();
+
+    gate_y.open();
+    // Whichever drain generation performs the upstream call (the member's
+    // gated drain, or the guard's drain queued behind it) enters here.
+    entered_x.await;
+    gate_x.open();
+    refresh.await.unwrap();
+
+    // Let any superseded drain finish its no-op before asserting.
+    for _ in 0..50 {
+        if router.resource_subscriptions.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .is_none(),
+        "no zero-member entry may survive the rebind"
+    );
+    assert_eq!(router.resource_subscriptions.len(), 0);
+    assert_eq!(
+        new_state.subscribe_count("memory://x"),
+        0,
+        "the new owner must never be subscribed for an emptied entry"
+    );
+    assert_eq!(new_state.unsubscribe_count("memory://x"), 0);
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert!(
+        old_state.unsubscribe_count("memory://x") >= 1,
+        "the old owner must end unsubscribed"
+    );
+    assert_eq!(old_state.unsubscribe_count("memory://y"), 1);
+}
+
+/// Shared setup for the prune-side race (manifestation 3): a downstream
+/// subscribe lands while a `refresh_tools` pass is draining the URI's
+/// prune (pre-publish), resolves the OLD route, and supersedes the drain;
+/// the published snapshot then has no route for the URI. Returns with the
+/// racing subscriber tracked on the old owner and the route gone.
+async fn setup_subscribe_racing_prune() -> (
+    Arc<ServerManager>,
+    Arc<ToolRouter>,
+    Arc<SubscribableUpstreamState>,
+) {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+
+    let old_state = SubscribableUpstreamState::new(&["memory://x"]);
+    sm.replace_server(
+        "old",
+        connect_subscribable_upstream("old", Arc::clone(&old_state)).await,
+    )
+    .await;
+
+    router.refresh_tools().await;
+    router
+        .subscribe_resource("memory://x", sub_target("a"))
+        .await
+        .unwrap();
+
+    // The route vanishes; the refresh's prune drain parks inside the old
+    // server's unsubscribe handler, pre-publish.
+    old_state.set_resources(&[]);
+    let gate_x = old_state.close_unsubscribe_gate("memory://x");
+    let entered_x = old_state.unsubscribe_entered.notified();
+    let refresh_router = Arc::clone(&router);
+    let refresh = tokio::spawn(async move { refresh_router.refresh_tools().await });
+    entered_x.await;
+
+    // B subscribes in the window: the wrapper resolves the still-published
+    // OLD snapshot, and the registry replaces the Draining entry with a
+    // fresh generation queued behind the parked drain.
+    let subscribe_router = Arc::clone(&router);
+    let b = tokio::spawn(async move {
+        subscribe_router
+            .subscribe_resource("memory://x", sub_target("b"))
+            .await
+    });
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!b.is_finished(), "B must queue behind the in-flight drain");
+
+    gate_x.open();
+    refresh.await.unwrap();
+    assert!(b.await.unwrap().is_ok(), "racing subscriber must get Ok");
+
+    // The racing subscriber is correctly tracked on the old owner while the
+    // published snapshot has no route for the URI.
+    assert!(
+        !router
+            .cache
+            .load()
+            .resource_routes
+            .contains_key("memory://x")
+    );
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("b")])
+    );
+    assert_eq!(old_state.subscribe_count("memory://x"), 2);
+    assert_eq!(old_state.unsubscribe_count("memory://x"), 1);
+
+    (sm, router, old_state)
+}
+
+/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe
+/// used to fail "resource not found" (route gone) without touching the
+/// registry. It must now drain via the recorded owner.
+#[tokio::test]
+async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
+    let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
+
+    router
+        .unsubscribe_resource("memory://x", &sub_target("b"))
+        .await
+        .expect("unsubscribe of a tracked routeless entry must succeed");
+
+    for _ in 0..50 {
+        if router.resource_subscriptions.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(router.resource_subscriptions.len(), 0);
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        2,
+        "the drain must unsubscribe the recorded old owner"
+    );
+
+    // With neither an entry nor a route left, the historical error stands.
+    let err = router
+        .unsubscribe_resource("memory://x", &sub_target("b"))
+        .await
+        .expect_err("no entry and no route must still be an error");
+    assert!(err.message.contains("resource not found"));
+}
+
+/// Prune-side race, next-refresh ending: the following refresh pass
+/// classifies the surviving routeless entry as a prune with no old server
+/// id (upstream fallback `None`). It used to remove the entry with no
+/// upstream unsubscribe ever sent; the recorded owner must drain it.
+#[tokio::test]
+async fn next_refresh_prunes_routeless_entry_via_recorded_owner() {
+    let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
+
+    router.refresh_tools().await;
+
+    assert_eq!(router.resource_subscriptions.len(), 0);
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        2,
+        "the prune-with-no-route drain must unsubscribe the recorded old owner"
+    );
+}

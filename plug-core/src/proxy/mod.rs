@@ -353,6 +353,19 @@ impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
+        let resource_subscriptions = subscriptions::SubscriptionRegistry::new();
+        // Drains resolve an entry's recorded owning server to a live handle
+        // at drain time — never trusting a handle resolved earlier from the
+        // route cache, which can point at the wrong server on either side
+        // of a refresh_tools snapshot publish.
+        {
+            let server_manager = Arc::clone(&server_manager);
+            resource_subscriptions.set_owner_resolver(Arc::new(move |server_id: &str| {
+                server_manager
+                    .get_upstream(server_id)
+                    .map(subscriptions::as_upstream_ops)
+            }));
+        }
         Self {
             server_manager,
             cache: Arc::new(ArcSwap::from_pointee(RouterSnapshot {
@@ -386,7 +399,7 @@ impl ToolRouter {
             pending_prompt_list_changed: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
             artifact_store: ArtifactStore::new(),
-            resource_subscriptions: subscriptions::SubscriptionRegistry::new(),
+            resource_subscriptions,
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
