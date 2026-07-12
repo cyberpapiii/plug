@@ -1955,6 +1955,7 @@ impl ToolRouter {
                     );
                     self.artifact_store
                         .maybe_spill_tool_result(tool_name, response)
+                        .await
                 }
                 Err(e) if is_session_error(&e) && !is_retry => {
                     // Session/transport error on first attempt — try to reconnect and retry

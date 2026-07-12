@@ -73,15 +73,16 @@ impl ArtifactStore {
         store
     }
 
-    pub fn maybe_spill_tool_result(
+    pub async fn maybe_spill_tool_result(
         &self,
         source_tool: &str,
         result: CallToolResult,
     ) -> Result<CallToolResult, McpError> {
         self.maybe_spill_tool_result_with_limit(source_tool, result, ARTIFACT_STORE_MAX_BYTES)
+            .await
     }
 
-    fn maybe_spill_tool_result_with_limit(
+    async fn maybe_spill_tool_result_with_limit(
         &self,
         source_tool: &str,
         result: CallToolResult,
@@ -107,25 +108,39 @@ impl ArtifactStore {
 
         let id = uuid::Uuid::new_v4().simple().to_string();
         let artifact_dir = self.base_dir.join(&id);
-        std::fs::create_dir_all(&artifact_dir)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
         let payload_path = artifact_dir.join(PAYLOAD_FILE);
-        std::fs::write(&payload_path, &serialized)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        // Dir creation, the multi-MB payload write, and attachment
+        // materialization are blocking filesystem work — run them in a single
+        // `spawn_blocking` hop so they do not stall the tokio worker thread.
+        // The closure takes owned paths plus only the piece of `result` the
+        // attachment helper needs; `result` itself stays available for the
+        // preview and error-flag reads below.
+        let attachment_source = result
+            .content
+            .iter()
+            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()));
+        let write_dir = artifact_dir.clone();
+        let write_payload_path = payload_path.clone();
+        let materialized_path = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&write_dir)?;
+            std::fs::write(&write_payload_path, &serialized)?;
+            maybe_materialize_attachment(&write_dir, attachment_source.as_deref())
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let created_at = SystemTime::now();
-        let materialized_path = maybe_materialize_attachment(&artifact_dir, &result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let record = ArtifactRecord {
             id: id.clone(),
             source_tool: source_tool.to_string(),
             original_size_bytes: size,
             created_at,
             expires_at: created_at + ARTIFACT_RETENTION,
-            payload_path: payload_path.clone(),
+            payload_path,
             materialized_path,
-            chunk_count: serialized.len().div_ceil(ARTIFACT_CHUNK_BYTES),
+            chunk_count: size.div_ceil(ARTIFACT_CHUNK_BYTES),
             preview: build_preview(&result),
         };
         write_metadata(&artifact_dir, &record)
@@ -176,14 +191,14 @@ impl ArtifactStore {
         ]))
     }
 
-    pub fn maybe_spill_task_payload(
+    pub async fn maybe_spill_task_payload(
         &self,
         source_tool: &str,
         payload: Value,
     ) -> Result<GetTaskPayloadResult, McpError> {
         match serde_json::from_value::<CallToolResult>(payload.clone()) {
             Ok(result) => {
-                let spilled = self.maybe_spill_tool_result(source_tool, result)?;
+                let spilled = self.maybe_spill_tool_result(source_tool, result).await?;
                 let value = serde_json::to_value(spilled)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(GetTaskPayloadResult::new(value))
@@ -515,15 +530,16 @@ fn read_chunk_text(record: &ArtifactRecord, index: usize) -> anyhow::Result<Stri
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Materialize an attachment-shaped payload as a file next to the artifact.
+///
+/// `attachment_source` is the first text content of the tool result,
+/// extracted by the caller so the blocking write task does not need to own
+/// the whole `CallToolResult`.
 fn maybe_materialize_attachment(
     artifact_dir: &Path,
-    result: &CallToolResult,
+    attachment_source: Option<&str>,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let Some(text) = result
-        .content
-        .iter()
-        .find_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
-    else {
+    let Some(text) = attachment_source else {
         return Ok(None);
     };
 
@@ -858,8 +874,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
-    #[test]
-    fn rehydrate_loads_metadata_back_into_index() {
+    #[tokio::test]
+    async fn rehydrate_loads_metadata_back_into_index() {
         let base_dir = temp_dir("rehydrate");
         let store = test_store(base_dir.clone());
         let result = CallToolResult::success(vec![Content::text(
@@ -867,6 +883,7 @@ mod tests {
         )]);
         let spilled = store
             .maybe_spill_tool_result("rehydrate_tool", result)
+            .await
             .expect("spill result");
         let uri = spilled
             .content
@@ -884,14 +901,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
-    #[test]
-    fn oversized_single_result_returns_clear_non_artifact_fallback() {
+    #[tokio::test]
+    async fn oversized_single_result_returns_clear_non_artifact_fallback() {
         let base_dir = temp_dir("oversized-single");
         let store = test_store(base_dir.clone());
         let result = CallToolResult::success(vec![Content::text("X".repeat(2_000_000))]);
 
         let spilled = store
             .maybe_spill_tool_result_with_limit("Mock__attachment_get_data", result, 1_024)
+            .await
             .expect("fallback result");
 
         assert_eq!(spilled.is_error, Some(false));
@@ -912,6 +930,54 @@ mod tests {
             Some("artifact-too-large")
         );
         assert!(store.records.is_empty());
+
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[tokio::test]
+    async fn oversized_attachment_result_becomes_artifact_with_materialized_file() {
+        let base_dir = temp_dir("attachment-roundtrip");
+        let store = test_store(base_dir.clone());
+        let attachment_body = "A".repeat(INLINE_RESULT_MAX_BYTES + 1);
+        let text = serde_json::json!({
+            "filename": "report.txt",
+            "encoding": "none",
+            "content": attachment_body,
+        })
+        .to_string();
+        let result = CallToolResult::success(vec![Content::text(text)]);
+
+        let spilled = store
+            .maybe_spill_tool_result("Mock__attachment_get_data", result)
+            .await
+            .expect("spill result");
+
+        assert!(
+            spilled
+                .content
+                .iter()
+                .any(|content| content.raw.as_resource_link().is_some()),
+            "spilled result must link to the artifact"
+        );
+        let record = store
+            .records
+            .iter()
+            .next()
+            .map(|entry| entry.value().clone())
+            .expect("artifact record");
+        let materialized = record
+            .materialized_path
+            .as_ref()
+            .expect("materialized attachment path");
+        assert_eq!(
+            std::fs::read(materialized).expect("read materialized attachment"),
+            attachment_body.as_bytes(),
+            "materialized attachment must contain the original content"
+        );
+        assert!(
+            record.payload_path.exists(),
+            "payload file must be written to disk"
+        );
 
         let _ = std::fs::remove_dir_all(base_dir);
     }
