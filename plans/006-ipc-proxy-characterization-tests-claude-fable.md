@@ -145,6 +145,17 @@ Add tests driving `try_round_trip_locked`'s read loop:
    an oversized frame header; assert the proxy surfaces a transport failure
    and recovers via reconnect on the next call (not a hang, not a panic).
 
+   > **Reviewer note (2026-07-12, at execution)**: the plan's suggested
+   > flavors were partly wrong. `transport_failure()` (`ipc_proxy.rs:410`)
+   > classifies only specific `std::io::Error` kinds (incl. `UnexpectedEof`)
+   > as `reconnectable: true`; garbage-JSON frames and oversized length
+   > prefixes hit parse-error/`anyhow::bail!` arms that are ALL
+   > `reconnectable: false` and do NOT auto-recover today. The merged test
+   > uses the genuinely reconnectable flavor (length prefix promised, then
+   > EOF mid-body) and documents the other two in an inline comment.
+   > **Plan 009 should weigh whether non-reconnectable malformed-frame
+   > classification is itself a wedge-adjacent bug.**
+
 **Verify**: `cargo test -p plug-mcp ipc_proxy` → all pass, 6 new tests total.
 
 ### Step 4: Characterize the wedge (the plan-009 baseline)
