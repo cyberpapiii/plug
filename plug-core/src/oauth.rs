@@ -390,13 +390,13 @@ impl CompositeCredentialStore {
         value: &T,
         file_kind: &'static str,
     ) -> Result<(), AuthError> {
-        use fs2::FileExt;
+        use fs4::FileExt;
         use std::io::Write;
 
         let dir = path.parent().ok_or_else(|| {
             AuthError::InternalError(format!("{file_kind} path has no parent directory"))
         })?;
-        std::fs::create_dir_all(dir)
+        crate::fs_perm::ensure_dir_0700(dir)
             .map_err(|e| AuthError::InternalError(format!("failed to create tokens dir: {e}")))?;
 
         let json = serde_json::to_string_pretty(value)
@@ -424,7 +424,9 @@ impl CompositeCredentialStore {
             AuthError::InternalError(format!("failed to open temp {file_kind}: {e}"))
         })?;
 
-        file.lock_exclusive().map_err(|e| {
+        // Fully qualified: std's inherent `File::lock` (Rust 1.89+) would
+        // otherwise shadow the fs4 trait method depending on toolchain version.
+        FileExt::lock(&file).map_err(|e| {
             AuthError::InternalError(format!("failed to lock temp {file_kind}: {e}"))
         })?;
 
@@ -767,14 +769,13 @@ impl CompositeCredentialStore {
                         .as_ref()
                         .map(|file| !Self::persisted_credentials_match(file, creds))
                         .unwrap_or(true)
+                    && let Err(error) = self.file_save(creds)
                 {
-                    if let Err(error) = self.file_save(creds) {
-                        warn!(
-                            server = %self.server_name,
-                            error = %error,
-                            "token file mirror repair failed after keyring-backed load"
-                        );
-                    }
+                    warn!(
+                        server = %self.server_name,
+                        error = %error,
+                        "token file mirror repair failed after keyring-backed load"
+                    );
                 }
                 self.update_cache(creds);
                 CredentialSnapshot {
@@ -932,7 +933,7 @@ impl StateStore for CompositeStateStore {
         let dir = path.parent().ok_or_else(|| {
             AuthError::InternalError("state file path has no parent directory".into())
         })?;
-        std::fs::create_dir_all(dir)
+        crate::fs_perm::ensure_dir_0700(dir)
             .map_err(|e| AuthError::InternalError(format!("failed to create tokens dir: {e}")))?;
 
         let json = serde_json::to_string_pretty(&state)

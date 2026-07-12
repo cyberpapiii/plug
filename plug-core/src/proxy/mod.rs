@@ -1114,10 +1114,10 @@ impl ToolRouter {
             let mut exposed_name = tool.name.to_string();
 
             // 1. Apply manual renames if any
-            if let Some(upstream) = self.server_manager.get_upstream(&server_name) {
-                if let Some(new_name) = upstream.config.tool_renames.get(&exposed_name) {
-                    exposed_name = new_name.clone();
-                }
+            if let Some(upstream) = self.server_manager.get_upstream(&server_name)
+                && let Some(new_name) = upstream.config.tool_renames.get(&exposed_name)
+            {
+                exposed_name = new_name.clone();
             }
 
             // 2. Sanitize to snake_case (hyphens, camelCase, dots -> snake_case)
@@ -1342,15 +1342,15 @@ impl ToolRouter {
         let mut resource_routes = HashMap::new();
         let mut resources_vec = Vec::new();
         for (server_name, mut resource) in upstream_resources {
-            if let Some(existing_server) = resource_routes.get(&resource.uri) {
-                if existing_server != &server_name {
-                    tracing::warn!(
-                        uri = %resource.uri,
-                        first_server = %existing_server,
-                        ignored_server = %server_name,
-                        "resource URI collision detected; keeping first route"
-                    );
-                }
+            if let Some(existing_server) = resource_routes.get(&resource.uri)
+                && existing_server != &server_name
+            {
+                tracing::warn!(
+                    uri = %resource.uri,
+                    first_server = %existing_server,
+                    ignored_server = %server_name,
+                    "resource URI collision detected; keeping first route"
+                );
             }
             resource_routes
                 .entry(resource.uri.clone())
@@ -1506,20 +1506,19 @@ impl ToolRouter {
 
         // Send upstream unsubscribes for pruned URIs (best-effort).
         for (uri, server_id) in stale_unsubscribes {
-            if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
-                if let Err(error) = upstream
+            if let Some(upstream) = self.server_manager.get_upstream(&server_id)
+                && let Err(error) = upstream
                     .client
                     .peer()
                     .unsubscribe(make_unsubscribe(&uri))
                     .await
-                {
-                    tracing::warn!(
-                        uri = %uri,
-                        server_id = %server_id,
-                        error = %error,
-                        "failed to unsubscribe stale resource during route refresh"
-                    );
-                }
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    server_id = %server_id,
+                    error = %error,
+                    "failed to unsubscribe stale resource during route refresh"
+                );
             }
         }
 
@@ -1545,21 +1544,20 @@ impl ToolRouter {
         // Rebind subscriptions whose URI still exists but ownership changed.
         for (uri, old_server_id, new_server_id, subscribers) in rebind_subscriptions {
             let mut old_unsubscribe_failed = false;
-            if let Some(old_upstream) = self.server_manager.get_upstream(&old_server_id) {
-                if let Err(error) = old_upstream
+            if let Some(old_upstream) = self.server_manager.get_upstream(&old_server_id)
+                && let Err(error) = old_upstream
                     .client
                     .peer()
                     .unsubscribe(make_unsubscribe(&uri))
                     .await
-                {
-                    tracing::warn!(
-                        uri = %uri,
-                        server_id = %old_server_id,
-                        error = %error,
-                        "failed to unsubscribe old resource owner during route refresh; skipping rebind to avoid dual subscription"
-                    );
-                    old_unsubscribe_failed = true;
-                }
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    server_id = %old_server_id,
+                    error = %error,
+                    "failed to unsubscribe old resource owner during route refresh; skipping rebind to avoid dual subscription"
+                );
+                old_unsubscribe_failed = true;
             }
 
             if old_unsubscribe_failed {
@@ -2162,10 +2160,10 @@ impl ToolRouter {
             if server_id == "__plug_internal__" {
                 continue;
             }
-            if let Some(filter) = server_filter.as_ref() {
-                if server_id.to_lowercase() != *filter {
-                    continue;
-                }
+            if let Some(filter) = server_filter.as_ref()
+                && server_id.to_lowercase() != *filter
+            {
+                continue;
             }
             if let Some(query) = query.as_ref() {
                 let name = tool.name.to_lowercase();

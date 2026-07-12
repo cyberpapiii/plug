@@ -239,10 +239,10 @@ pub fn resolve_lazy_tool_policy_from_settings(
     lazy_tools: &LazyToolsConfig,
     target: &str,
 ) -> ResolvedLazyToolPolicy {
-    if let Some(setting) = lazy_tools.clients.get(target) {
-        if let Some(mode) = setting_to_mode(*setting) {
-            return resolved_policy(mode, LazyToolModeOrigin::ClientOverride);
-        }
+    if let Some(setting) = lazy_tools.clients.get(target)
+        && let Some(mode) = setting_to_mode(*setting)
+    {
+        return resolved_policy(mode, LazyToolModeOrigin::ClientOverride);
     }
 
     if let Some(mode) = setting_to_mode(lazy_tools.mode) {
@@ -715,12 +715,12 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                 ));
             }
         }
-        if let Some(ref auth) = server.auth {
-            if auth != "oauth" {
-                errors.push(format!(
-                    "server '{name}': auth must be \"oauth\" if set (got \"{auth}\")"
-                ));
-            }
+        if let Some(ref auth) = server.auth
+            && auth != "oauth"
+        {
+            errors.push(format!(
+                "server '{name}': auth must be \"oauth\" if set (got \"{auth}\")"
+            ));
         }
 
         if server.timeout_secs == 0 {

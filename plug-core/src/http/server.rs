@@ -270,13 +270,12 @@ impl HttpState {
                                         | ProtocolNotification::TokenRefreshExchanged { .. }
                                         | ProtocolNotification::AuthStateChanged { .. }
                                     ) => {
-                                        if let Some(params) = notification.as_logging_message_params() {
-                                            if let Some(message) = notification_to_sse_message(
+                                        if let Some(params) = notification.as_logging_message_params()
+                                            && let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::LoggingMessage { params },
                                             ) {
                                                 state.sessions.broadcast(message);
                                             }
-                                        }
                                     }
                                 }
                             }

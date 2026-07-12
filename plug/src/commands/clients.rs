@@ -820,15 +820,15 @@ fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
                 inner.remove("plug");
             }
         }
-        if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) {
-            if let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut()) {
-                srv.remove("plug");
-            }
+        if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut())
+            && let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut())
+        {
+            srv.remove("plug");
         }
-        if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_object_mut()) {
-            if let Some(srv) = tools.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
-                srv.remove("plug");
-            }
+        if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_object_mut())
+            && let Some(srv) = tools.get_mut("mcpServers").and_then(|v| v.as_object_mut())
+        {
+            srv.remove("plug");
         }
     }
     Ok(serde_json::to_string_pretty(&json)?)

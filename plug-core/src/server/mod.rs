@@ -771,7 +771,7 @@ impl ServerManager {
     /// last-known-good cache — is dropped.
     pub(crate) fn update_availability(&self, degraded: &BTreeSet<String>) {
         let servers = self.servers.load();
-        for (name, _) in servers.iter() {
+        for name in servers.keys() {
             let routable = self
                 .health
                 .get(name)
@@ -900,17 +900,17 @@ impl ServerManager {
 
                         // Apply current effective log level to new server so all
                         // upstreams converge to the same level regardless of start order.
-                        if upstream.capabilities.logging.is_some() {
-                            if let Some(router) = self.tool_router().upgrade() {
-                                let level = router.log_level();
-                                let params = SetLevelRequestParams::new(level);
-                                if let Err(e) = upstream.client.peer().set_level(params).await {
-                                    tracing::debug!(
-                                        server = %name,
-                                        error = %e,
-                                        "failed to apply initial log level"
-                                    );
-                                }
+                        if upstream.capabilities.logging.is_some()
+                            && let Some(router) = self.tool_router().upgrade()
+                        {
+                            let level = router.log_level();
+                            let params = SetLevelRequestParams::new(level);
+                            if let Err(e) = upstream.client.peer().set_level(params).await {
+                                tracing::debug!(
+                                    server = %name,
+                                    error = %e,
+                                    "failed to apply initial log level"
+                                );
                             }
                         }
 
@@ -1067,13 +1067,12 @@ impl ServerManager {
                     let parsed = url
                         .parse::<http::Uri>()
                         .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-                    if let Some(host) = parsed.host() {
-                        if is_blocked_host(host) {
+                    if let Some(host) = parsed.host()
+                        && is_blocked_host(host) {
                             anyhow::bail!(
                                 "URL host '{host}' is blocked — private, loopback, or metadata endpoint"
                             );
                         }
-                    }
 
                     let mut transport_config =
                         StreamableHttpClientTransportConfig::with_uri(url);
@@ -1177,12 +1176,10 @@ impl ServerManager {
         let parsed = url
             .parse::<http::Uri>()
             .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-        if let Some(host) = parsed.host() {
-            if is_blocked_host(host) {
-                anyhow::bail!(
-                    "URL host '{host}' is blocked — private, loopback, or metadata endpoint"
-                );
-            }
+        if let Some(host) = parsed.host()
+            && is_blocked_host(host)
+        {
+            anyhow::bail!("URL host '{host}' is blocked — private, loopback, or metadata endpoint");
         }
 
         let mut transport_config = LegacySseTransportConfig::with_uri(url)

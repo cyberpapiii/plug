@@ -660,10 +660,10 @@ pub(crate) async fn wait_for_daemon_ready(
         if let Some(stream) = daemon::connect_to_daemon().await {
             return Ok(stream);
         }
-        if let Some(child) = child.as_mut() {
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!("daemon exited before becoming ready (status: {status})");
-            }
+        if let Some(child) = child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            anyhow::bail!("daemon exited before becoming ready (status: {status})");
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(500));

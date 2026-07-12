@@ -507,7 +507,7 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
         Some(dir) => dir,
         None => return,
     };
-    if std::fs::create_dir_all(dir).is_err() {
+    if crate::fs_perm::ensure_dir_0700(dir).is_err() {
         return;
     }
 

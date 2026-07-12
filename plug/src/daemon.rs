@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use dashmap::DashMap;
-use fs2::FileExt as _;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
@@ -422,8 +421,22 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
         .open(pid_path)
         .with_context(|| format!("failed to open PID file: {}", pid_path.display()))?;
 
-    file.try_lock_exclusive()
-        .map_err(|_| anyhow::anyhow!("another plug daemon is already running (PID file locked)"))?;
+    // Fully qualified: std's inherent `File::try_lock` (Rust 1.89+) would
+    // otherwise shadow the fs4 trait method depending on toolchain version.
+    // Contention (`WouldBlock`) means another daemon holds the lock; any
+    // other error is a real I/O failure and is surfaced as such.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => {}
+        Err(fs4::TryLockError::WouldBlock) => {
+            return Err(anyhow::anyhow!(
+                "another plug daemon is already running (PID file locked)"
+            ));
+        }
+        Err(fs4::TryLockError::Error(e)) => {
+            return Err(e)
+                .with_context(|| format!("failed to lock PID file: {}", pid_path.display()));
+        }
+    }
 
     // Write our PID
     use std::io::Write;
@@ -904,14 +917,14 @@ async fn handle_ipc_connection(
         ctx.engine
             .tool_router()
             .clear_lazy_session(&lazy_session_key);
-        if let Some(client_id) = removed_client_id {
-            if !ctx.client_registry.client_sessions.contains_key(&client_id) {
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                ctx.engine
-                    .tool_router()
-                    .cleanup_tasks_for_owner(&owner)
-                    .await;
-            }
+        if let Some(client_id) = removed_client_id
+            && !ctx.client_registry.client_sessions.contains_key(&client_id)
+        {
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            ctx.engine
+                .tool_router()
+                .cleanup_tasks_for_owner(&owner)
+                .await;
         }
     }
 
@@ -1692,14 +1705,14 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             ctx.engine
                 .tool_router()
                 .clear_lazy_session(&lazy_session_key);
-            if let Some(client_id) = removed_client_id {
-                if !ctx.client_registry.client_sessions.contains_key(&client_id) {
-                    let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                    ctx.engine
-                        .tool_router()
-                        .cleanup_tasks_for_owner(&owner)
-                        .await;
-                }
+            if let Some(client_id) = removed_client_id
+                && !ctx.client_registry.client_sessions.contains_key(&client_id)
+            {
+                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                ctx.engine
+                    .tool_router()
+                    .cleanup_tasks_for_owner(&owner)
+                    .await;
             }
             ctx.session_id = None;
             ctx.reverse_request_rx = None;

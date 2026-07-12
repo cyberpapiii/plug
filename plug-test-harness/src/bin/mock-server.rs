@@ -282,21 +282,21 @@ impl ServerHandler for MockServer {
                 std::future::pending::<()>().await;
             }
             // Test-driven transient failure: error while the flag file exists.
-            if let Some(path) = &self.list_fail_flag_file {
-                if std::path::Path::new(path).exists() {
-                    eprintln!("mock-mcp-server: list_fail flag set, returning error");
-                    return Err(McpError::internal_error(
-                        "mock list_resources transient failure (flag set)",
-                        None,
-                    ));
-                }
+            if let Some(path) = &self.list_fail_flag_file
+                && std::path::Path::new(path).exists()
+            {
+                eprintln!("mock-mcp-server: list_fail flag set, returning error");
+                return Err(McpError::internal_error(
+                    "mock list_resources transient failure (flag set)",
+                    None,
+                ));
             }
             // Test-driven genuine removal: empty success while the flag exists.
-            if let Some(path) = &self.list_empty_flag_file {
-                if std::path::Path::new(path).exists() {
-                    eprintln!("mock-mcp-server: list_empty flag set, returning empty list");
-                    return Ok(ListResourcesResult::with_all_items(vec![]));
-                }
+            if let Some(path) = &self.list_empty_flag_file
+                && std::path::Path::new(path).exists()
+            {
+                eprintln!("mock-mcp-server: list_empty flag set, returning empty list");
+                return Ok(ListResourcesResult::with_all_items(vec![]));
             }
             if !self.resources {
                 return Ok(ListResourcesResult::with_all_items(vec![]));
