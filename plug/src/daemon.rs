@@ -2829,7 +2829,11 @@ mod tests {
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
-    #[tokio::test]
+    // Paused time: spawn_grace_period_task only awaits in-memory watch
+    // channels and a fixed timer (no real I/O), so tokio's auto-advance
+    // fires the grace-period timer instantly instead of burning 1.5s of
+    // wall-clock per test.
+    #[tokio::test(start_paused = true)]
     async fn grace_period_shuts_down_when_no_http_sessions() {
         let (registry, count_rx) = ClientRegistry::new();
         let registration = registry
@@ -2858,7 +2862,8 @@ mod tests {
         grace_cancel.cancel();
     }
 
-    #[tokio::test]
+    // Paused time: same rationale as grace_period_shuts_down_when_no_http_sessions.
+    #[tokio::test(start_paused = true)]
     async fn grace_period_rearms_when_http_sessions_drain_to_zero() {
         let (registry, count_rx) = ClientRegistry::new();
         let registration = registry
@@ -2903,7 +2908,8 @@ mod tests {
         grace_cancel.cancel();
     }
 
-    #[tokio::test]
+    // Paused time: same rationale as grace_period_shuts_down_when_no_http_sessions.
+    #[tokio::test(start_paused = true)]
     async fn grace_period_ipc_reconnect_during_held_alive_resumes_watching() {
         let (registry, count_rx) = ClientRegistry::new();
         let registration = registry
