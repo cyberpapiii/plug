@@ -61,9 +61,107 @@ struct TaskRecord {
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
 
+/// Per-owner lifecycle state: how many `enqueue_tool_task` calls are
+/// currently in flight for the owner, and whether the owner was torn down
+/// (`cleanup_owner`) while any of them were. Entries exist only while
+/// `in_flight_creates > 0` — `end_create` removes the entry (tombstone
+/// included) when the count returns to zero, so the ledger cannot grow
+/// per-owner forever.
+#[derive(Debug, Default)]
+struct OwnerLifecycleState {
+    in_flight_creates: usize,
+    torn_down: bool,
+}
+
+/// Owner-lifecycle ledger closing the create-vs-teardown race: an enqueue
+/// registers itself here (under the async `TaskStore` lock) *before* any
+/// upstream await, so a `cleanup_owner` that runs during the round trip can
+/// leave a tombstone that makes the late `create`/`create_passthrough`
+/// refuse to insert a record for the already-torn-down owner.
+///
+/// The ledger sits behind its own std mutex (not the async store lock)
+/// solely so the RAII [`OwnerCreateGuard`] can decrement synchronously from
+/// `Drop`. Every compound check-then-act on it — cleanup's count-check +
+/// tombstone record, create's tombstone-check + record insert — still runs
+/// while the caller holds the async `TaskStore` lock, which is what makes
+/// those pairs mutually atomic. No `.await` ever happens while the std
+/// mutex is held.
+#[derive(Debug, Default)]
+struct OwnerLifecycleLedger {
+    states: std::sync::Mutex<HashMap<TaskOwner, OwnerLifecycleState>>,
+}
+
+impl OwnerLifecycleLedger {
+    fn lock_states(&self) -> std::sync::MutexGuard<'_, HashMap<TaskOwner, OwnerLifecycleState>> {
+        // The critical sections are single-step map updates; on the poison
+        // path the state is still coherent, so recover rather than cascade
+        // the panic through teardown.
+        self.states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn begin_create(self: &Arc<Self>, owner: &TaskOwner) -> OwnerCreateGuard {
+        self.lock_states()
+            .entry(owner.clone())
+            .or_default()
+            .in_flight_creates += 1;
+        OwnerCreateGuard {
+            ledger: Arc::clone(self),
+            owner: owner.clone(),
+        }
+    }
+
+    fn end_create(&self, owner: &TaskOwner) {
+        let mut states = self.lock_states();
+        if let Some(state) = states.get_mut(owner) {
+            state.in_flight_creates = state.in_flight_creates.saturating_sub(1);
+            if state.in_flight_creates == 0 {
+                // Removing the entry is what keeps memory bounded: no owner
+                // key outlives its last in-flight create, and the tombstone
+                // dies with the entry — so a fresh create for the same owner
+                // key after everything resolved starts clean.
+                states.remove(owner);
+            }
+        }
+    }
+
+    fn tombstone_if_in_flight(&self, owner: &TaskOwner) {
+        if let Some(state) = self.lock_states().get_mut(owner)
+            && state.in_flight_creates > 0
+        {
+            state.torn_down = true;
+        }
+    }
+
+    fn is_tombstoned(&self, owner: &TaskOwner) -> bool {
+        self.lock_states()
+            .get(owner)
+            .is_some_and(|state| state.torn_down)
+    }
+}
+
+/// RAII registration of one in-flight task create for an owner. Obtained
+/// from [`TaskStore::begin_owner_create`] at `enqueue_tool_task` entry;
+/// dropping it (on any path — success, error, panic unwind) deregisters the
+/// create and clears the owner's tombstone once no creates remain in
+/// flight.
+#[must_use = "dropping the guard immediately deregisters the in-flight create"]
+pub struct OwnerCreateGuard {
+    ledger: Arc<OwnerLifecycleLedger>,
+    owner: TaskOwner,
+}
+
+impl Drop for OwnerCreateGuard {
+    fn drop(&mut self) {
+        self.ledger.end_create(&self.owner);
+    }
+}
+
 pub struct TaskStore {
     tasks: HashMap<String, TaskRecord>,
     next_task_id: u64,
+    lifecycle: Arc<OwnerLifecycleLedger>,
 }
 
 impl Default for TaskStore {
@@ -77,10 +175,35 @@ impl TaskStore {
         Self {
             tasks: HashMap::new(),
             next_task_id: 1,
+            lifecycle: Arc::new(OwnerLifecycleLedger::default()),
         }
     }
 
-    pub fn create(&mut self, owner: TaskOwner, name: &str) -> Task {
+    /// Registers an in-flight create for `owner`. Call this (under the
+    /// store lock) before any upstream await in an enqueue path, so a
+    /// concurrent `cleanup_owner` knows a create may land late and leaves a
+    /// tombstone for it. The returned guard deregisters on drop.
+    pub fn begin_owner_create(&self, owner: &TaskOwner) -> OwnerCreateGuard {
+        self.lifecycle.begin_create(owner)
+    }
+
+    /// Refuses record creation for an owner that was torn down while this
+    /// create was in flight (see [`OwnerLifecycleLedger`]). Without this,
+    /// a create landing after `cleanup_owner` would insert a Working record
+    /// nothing ever cleans up until the stale-in-flight TTL.
+    fn ensure_owner_accepts_creates(&self, owner: &TaskOwner) -> Result<(), McpError> {
+        if self.lifecycle.is_tombstoned(owner) {
+            return Err(McpError::new(
+                ErrorCode::INVALID_REQUEST,
+                "session closed during task creation",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn create(&mut self, owner: TaskOwner, name: &str) -> Result<Task, McpError> {
+        self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
         self.next_task_id += 1;
@@ -105,7 +228,7 @@ impl TaskStore {
         );
 
         self.enforce_owner_completed_retention();
-        task
+        Ok(task)
     }
 
     pub fn attach_abort_handle(&mut self, task_id: &str, handle: JoinHandle<()>) {
@@ -140,7 +263,8 @@ impl TaskStore {
         name: &str,
         upstream_task: &Task,
         upstream: TaskUpstreamRef,
-    ) -> Task {
+    ) -> Result<Task, McpError> {
+        self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
         self.next_task_id += 1;
@@ -165,7 +289,7 @@ impl TaskStore {
         );
 
         self.enforce_owner_completed_retention();
-        task
+        Ok(task)
     }
 
     pub fn complete(&mut self, task_id: &str, result: Value) {
@@ -277,10 +401,17 @@ impl TaskStore {
     /// cancellation upstream. Already-terminal records naturally yield
     /// `(None, None)` since `complete`/`fail`/`mark_cancelled` already clear
     /// both fields, so they no-op for the caller.
+    ///
+    /// If the owner has creates in flight (registered via
+    /// [`Self::begin_owner_create`]), a tombstone is recorded so those
+    /// creates cannot insert a record for this now-torn-down owner when they
+    /// resolve. The tombstone is cleared once the last in-flight create's
+    /// guard drops.
     pub fn cleanup_owner(
         &mut self,
         owner: &TaskOwner,
     ) -> Vec<(Option<TaskUpstreamRef>, Option<JoinHandle<()>>)> {
+        self.lifecycle.tombstone_if_in_flight(owner);
         let owned_ids: Vec<String> = self
             .tasks
             .iter()
@@ -515,7 +646,9 @@ mod tests {
         let mut store = TaskStore::new();
         let owner_a = TaskOwner::new(Arc::<str>::from("stdio:a"));
         let owner_b = TaskOwner::new(Arc::<str>::from("stdio:b"));
-        let task = store.create(owner_a.clone(), "Mock__echo");
+        let task = store
+            .create(owner_a.clone(), "Mock__echo")
+            .expect("create task");
         store.complete(&task.task_id, serde_json::json!({"ok": true}));
 
         assert!(store.get_info_for_owner(&owner_a, &task.task_id).is_ok());
@@ -530,9 +663,15 @@ mod tests {
         let owner_a = TaskOwner::new(Arc::<str>::from("stdio:a"));
         let owner_b = TaskOwner::new(Arc::<str>::from("stdio:b"));
 
-        store.create(owner_a.clone(), "Mock__echo");
-        store.create(owner_a.clone(), "Mock__echo");
-        store.create(owner_b.clone(), "Mock__echo");
+        store
+            .create(owner_a.clone(), "Mock__echo")
+            .expect("create task");
+        store
+            .create(owner_a.clone(), "Mock__echo")
+            .expect("create task");
+        store
+            .create(owner_b.clone(), "Mock__echo")
+            .expect("create task");
 
         let list_a = store.list_for_owner(&owner_a, None);
         let list_b = store.list_for_owner(&owner_b, None);
@@ -544,7 +683,9 @@ mod tests {
     fn terminal_task_states_are_monotonic() {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("stdio:a"));
-        let task = store.create(owner.clone(), "Mock__echo");
+        let task = store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create task");
 
         store.complete(&task.task_id, serde_json::json!({"ok": true}));
         let completed = store
@@ -571,8 +712,12 @@ mod tests {
         let owner_a = TaskOwner::new(Arc::<str>::from("ipc:a"));
         let owner_b = TaskOwner::new(Arc::<str>::from("ipc:b"));
 
-        let task_a = store.create(owner_a.clone(), "Mock__echo");
-        let task_b = store.create(owner_b.clone(), "Mock__echo");
+        let task_a = store
+            .create(owner_a.clone(), "Mock__echo")
+            .expect("create task");
+        let task_b = store
+            .create(owner_b.clone(), "Mock__echo")
+            .expect("create task");
 
         store.cleanup_owner(&owner_a);
 
@@ -589,7 +734,9 @@ mod tests {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
 
-        let running = store.create(owner.clone(), "Mock__echo");
+        let running = store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create task");
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
@@ -603,7 +750,9 @@ mod tests {
         );
         assert_eq!(pending, None);
 
-        let completed = store.create(owner.clone(), "Mock__echo");
+        let completed = store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create task");
         store.complete(&completed.task_id, serde_json::json!({"ok": true}));
 
         let mut drained = store.cleanup_owner(&owner);
@@ -644,20 +793,22 @@ mod tests {
     fn cached_result_is_returned_locally() {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
-        let task = store.create_passthrough(
-            owner.clone(),
-            "Mock__echo",
-            &Task::new(
-                "upstream-task-1".to_string(),
-                TaskStatus::Working,
-                rmcp::task_manager::current_timestamp(),
-                rmcp::task_manager::current_timestamp(),
-            ),
-            TaskUpstreamRef::Task {
-                server_id: "mock".to_string(),
-                task_id: "upstream-task-1".to_string(),
-            },
-        );
+        let task = store
+            .create_passthrough(
+                owner.clone(),
+                "Mock__echo",
+                &Task::new(
+                    "upstream-task-1".to_string(),
+                    TaskStatus::Working,
+                    rmcp::task_manager::current_timestamp(),
+                    rmcp::task_manager::current_timestamp(),
+                ),
+                TaskUpstreamRef::Task {
+                    server_id: "mock".to_string(),
+                    task_id: "upstream-task-1".to_string(),
+                },
+            )
+            .expect("create passthrough task");
 
         store
             .cache_result_for_owner(&owner, &task.task_id, serde_json::json!({"ok": true}))
@@ -686,7 +837,9 @@ mod tests {
         // `set_upstream_request`'s return value once the ref lands.
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
-        let task = store.create(owner.clone(), "Mock__echo");
+        let task = store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create task");
 
         // Cancel arrives first — no upstream ref has been set yet.
         let (cancelled_task, upstream, _handle) = store
@@ -733,7 +886,7 @@ mod tests {
         // a pending-cancel reason.
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
-        let task = store.create(owner, "Mock__echo");
+        let task = store.create(owner, "Mock__echo").expect("create task");
 
         let pending = store.set_upstream_request(
             &task.task_id,
@@ -743,5 +896,102 @@ mod tests {
             },
         );
         assert_eq!(pending, None);
+    }
+
+    fn upstream_working_task(task_id: &str) -> Task {
+        Task::new(
+            task_id.to_string(),
+            TaskStatus::Working,
+            rmcp::task_manager::current_timestamp(),
+            rmcp::task_manager::current_timestamp(),
+        )
+    }
+
+    /// Deterministic store-layer replay of the create-vs-teardown race: a
+    /// teardown that interleaves with an in-flight enqueue (guard held)
+    /// must tombstone the owner so the late `create`/`create_passthrough`
+    /// refuses to insert a record for the torn-down owner.
+    #[test]
+    fn cleanup_with_in_flight_create_tombstones_late_creates() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("http:racy"));
+
+        // Enqueue entry: register the in-flight create, as `enqueue_tool_task`
+        // does before its upstream await.
+        let guard = store.begin_owner_create(&owner);
+
+        // Teardown interleaves while the create is parked upstream.
+        let drained = store.cleanup_owner(&owner);
+        assert!(drained.is_empty(), "no records existed yet to drain");
+
+        // The late create (either path) must be refused, not inserted.
+        let create_err = store
+            .create(owner.clone(), "Mock__echo")
+            .expect_err("local create after teardown must be refused");
+        assert_eq!(create_err.code, ErrorCode::INVALID_REQUEST);
+        let passthrough_err = store
+            .create_passthrough(
+                owner.clone(),
+                "Mock__echo",
+                &upstream_working_task("upstream-task-1"),
+                TaskUpstreamRef::Task {
+                    server_id: "mock".to_string(),
+                    task_id: "upstream-task-1".to_string(),
+                },
+            )
+            .expect_err("passthrough create after teardown must be refused");
+        assert_eq!(passthrough_err.code, ErrorCode::INVALID_REQUEST);
+        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+
+        // Tombstone hygiene: once the in-flight enqueue resolves (guard
+        // drops), the tombstone is gone and a fresh create for the same
+        // owner key succeeds.
+        drop(guard);
+        store
+            .create(owner.clone(), "Mock__echo")
+            .expect("fresh create after the in-flight enqueue resolved");
+        assert_eq!(store.list_for_owner(&owner, None).tasks.len(), 1);
+    }
+
+    /// The tombstone must survive until the LAST in-flight create resolves —
+    /// clearing it on the first guard drop would let the second late create
+    /// slip an orphan record in.
+    #[test]
+    fn tombstone_persists_until_all_in_flight_creates_resolve() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("ipc:racy"));
+
+        let guard_a = store.begin_owner_create(&owner);
+        let guard_b = store.begin_owner_create(&owner);
+        store.cleanup_owner(&owner);
+
+        drop(guard_a);
+        assert!(
+            store.create(owner.clone(), "Mock__echo").is_err(),
+            "tombstone must persist while another create is still in flight"
+        );
+
+        drop(guard_b);
+        store
+            .create(owner.clone(), "Mock__echo")
+            .expect("tombstone cleared once the last in-flight create resolved");
+    }
+
+    /// Teardown with NO creates in flight must not leave a tombstone —
+    /// otherwise a later reconnect reusing the same owner key (IPC client
+    /// ids) could never create tasks again.
+    #[test]
+    fn cleanup_without_in_flight_creates_leaves_no_tombstone() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("ipc:reused"));
+
+        store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create task");
+        store.cleanup_owner(&owner);
+
+        store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create for the same owner key after a quiescent teardown");
     }
 }
