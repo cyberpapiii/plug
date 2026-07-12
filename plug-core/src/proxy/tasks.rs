@@ -448,13 +448,26 @@ impl super::ToolRouter {
                 }
             };
 
-            self.task_store.lock().await.set_upstream_request(
+            let pending_cancel_reason = self.task_store.lock().await.set_upstream_request(
                 &task_id,
                 TaskUpstreamRef::Request {
                     server_id: server_id.clone(),
                     request_id: request_handle.id.clone(),
                 },
             );
+
+            // A cancel arrived before the upstream request id was recorded
+            // above (see `mark_cancelled` / `set_upstream_request` on
+            // `TaskStore`) — replay it now so the upstream stops running the
+            // call instead of completing it for a result nobody wants.
+            if let Some(reason) = pending_cancel_reason {
+                let _ = peer
+                    .notify_cancelled(CancelledNotificationParam {
+                        request_id: request_handle.id.clone(),
+                        reason: Some(reason),
+                    })
+                    .await;
+            }
 
             let result = request_handle.await_response().await;
             drop(permit);

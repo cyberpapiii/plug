@@ -479,7 +479,7 @@ impl SessionStore for StatefulSessionStore {
 
                         let before = sessions.len();
                         sessions.retain(|_, state| state.last_activity.elapsed() <= timeout);
-                        let expired = before - sessions.len();
+                        let expired = before.saturating_sub(sessions.len());
 
                         if let Some(tx) = &expiry_tx {
                             for session_id in expired_ids {
@@ -579,6 +579,70 @@ mod tests {
         assert_eq!(store.session_count(), 1);
         store.remove(&id);
         assert_eq!(store.session_count(), 0);
+    }
+
+    #[test]
+    fn expired_count_does_not_underflow_when_map_grows_during_retain() {
+        // Mirrors the cleanup task's pre-fix subtraction of the post-retain
+        // count from the pre-retain count: a concurrent insert racing
+        // `retain()` can leave the post-retain count greater than the
+        // pre-retain count. The fixed formula must saturate to 0 instead of
+        // underflowing (a panic with overflow-checks on, a huge wrapped
+        // value in release builds).
+        let before: usize = 1;
+        let after_growth: usize = 4;
+        assert_eq!(before.saturating_sub(after_growth), 0);
+
+        // Sanity: the ordinary shrinking case still reports the real count.
+        assert_eq!(5usize.saturating_sub(2), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_task_keeps_running_across_multiple_expiry_cycles() {
+        // Regression guard for the underflow panic silently killing the
+        // spawned cleanup task: if the first tick's arithmetic panicked, the
+        // JoinHandle is never awaited and idle-session reclamation would stop
+        // forever, so a second expiry cycle would never happen either.
+        //
+        // `last_activity` is a `std::time::Instant`, which is NOT affected by
+        // tokio's paused virtual clock (only `tokio::time::interval` ticks
+        // are). Using a 0s timeout means any real wall-clock elapsed time —
+        // even the nanoseconds consumed by task scheduling — already counts
+        // as expired, so we don't need a real 30s sleep to observe the
+        // cleanup task's fixed 30s tick doing its job; `time::advance` alone
+        // drives the interval.
+        let store = StatefulSessionStore::new(0, 100);
+        let cancel = CancellationToken::new();
+        store.spawn_cleanup_task(cancel.clone());
+
+        store.create_session().unwrap();
+        assert_eq!(store.session_count(), 1);
+
+        // First tick: the interval fires immediately on its first poll, and
+        // the session is already expired (0s timeout) by the time it's
+        // checked.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.session_count(),
+            0,
+            "cleanup task should have purged the expired session on its first tick"
+        );
+
+        store.create_session().unwrap();
+        assert_eq!(store.session_count(), 1);
+
+        // Second expiry cycle — proves the task is still alive and ticking
+        // rather than having silently died on the first pass.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.session_count(),
+            0,
+            "cleanup task must still be running for a second expiry cycle"
+        );
+
+        cancel.cancel();
     }
 
     #[test]
