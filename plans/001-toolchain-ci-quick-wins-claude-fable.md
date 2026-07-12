@@ -194,6 +194,22 @@ to:
 
 ### Step 2: Add an MSRV check job
 
+> **Amendment (2026-07-12, execution round).** The original verify step fired
+> its own STOP condition: `cargo +1.86.0 check --workspace` fails before
+> compiling anything because six locked dependencies declare `rust-version`
+> above the workspace's declared MSRV of 1.86.0 —
+> `darling`/`darling_core`/`darling_macro` 0.23.0 (need 1.88, via
+> `rmcp-macros`), `process-wrap` 9.1.0 (needs 1.87, via `rmcp`), and
+> `time` 0.3.47/`time-core` 0.1.8 (need 1.88, via `tracing-appender`/`rcgen`).
+> The declared MSRV was already unbuildable — a fiction, not a floor.
+> Reviewer decision: align the declaration with reality rather than pin six
+> crates backward. The step as executed: bump `rust-version` at workspace
+> `Cargo.toml:8` AND `env.MSRV` at `.github/workflows/ci.yml:15` to
+> `"1.88.0"`, then add the job below (its `${{ env.MSRV }}` reference picks
+> up the new value; the job `name` should say 1.88.0). Verification becomes
+> `cargo +1.88.0 check --workspace` → exit 0. The 1.86-based text below is
+> retained for the record.
+
 In `.github/workflows/ci.yml`, add a job after `check` (same shape as the
 existing jobs, gated like `cross-check`):
 
