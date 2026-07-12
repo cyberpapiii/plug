@@ -1,8 +1,11 @@
 # Improve-program execution report (2026-07-11/12)
 
-**Branch**: `improve/integration` (local only, never pushed). Base: `main`
-@ `e341625`. This report was written at the end of the execution run; the
-final code state is the commit this file lands on.
+**Branch**: `improve/integration` (local only, never pushed). Fork point:
+local `main` @ `a2d8fd6` (a plans-only docs commit); implementation
+baseline: `e341625` (the commit all plans were written against, equal to
+`origin/main`'s runtime code). This report was written at the end of the
+execution run and corrected on 2026-07-12 after a cross-agent (Codex)
+counter-review; the final code state is the commit this file lands on.
 
 **Outcome**: 23 of 24 plans completed; 1 partial (013). Every plan was
 executed by a dedicated executor agent in an isolated worktree, reviewed by
@@ -12,11 +15,15 @@ Per-plan status with review annotations: `plans/README-claude-fable.md`.
 Each `merge:` commit body on this branch is the detailed review record for
 its plan.
 
-**Final gates** (run at the wave-5 gate, `c1de241`, and green at every
-prior wave gate too):
+**Final gates** (run at the wave-5 gate, `c1de241`; every wave gate passed
+before the next wave was dispatched — note the wave-1 gate initially failed
+four `watcher::tests::*` config-watcher tests and was closed only after
+they went green):
 
 - `cargo test --workspace`: 812 tests green (575 plug-core lib + 45
-  integration + 192 plug bin), up from 802 at program start
+  integration + 192 plug bin), up from 730 at the implementation baseline
+  `e341625` (511 + 43 + 176; net +82 — an earlier revision of this report
+  wrongly said "802 at program start"; 802 was a mid-program measurement)
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
 - `cargo +1.88.0 check --workspace` (MSRV): clean

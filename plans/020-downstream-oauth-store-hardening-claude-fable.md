@@ -55,12 +55,23 @@ scope mean in an MCP multiplexer" is a design question that belongs to plan
 018's conformance spike (todo 057, `ready`/p1, already flags downstream
 OAuth standards gaps).
 
-One false alarm to put to rest (so nobody re-audits it): **persistence is
-fine.** Tokens survive restart via an atomic temp+rename 0600 JSON file
-under the config dir; auth codes are intentionally non-persistent; there is
-no dynamic client registration (client identity is the single static
+On persistence: the **mechanism** is sound — tokens survive restart via an
+atomic temp+rename 0600 JSON file under the config dir; auth codes are
+intentionally non-persistent; there is no dynamic client registration
+(client identity is the single static
 `oauth_client_id`/`oauth_client_secret` pair from config), so there is no
 client-registration state to persist.
+
+> **Correction (2026-07-12, counter-review):** an earlier revision of this
+> paragraph called persistence "a false alarm to put to rest (so nobody
+> re-audits it)". That framing was wrong: the happy path is fine, but
+> **error observability is not** — `persist_state` silently swallowed every
+> filesystem failure (six exit paths, zero logging) and startup did
+> `load_persisted_state(..).unwrap_or_default()`, silently wiping all
+> issued tokens (including 30-day refresh tokens) on a corrupt/unreadable
+> state file. Fail-closed (availability, not security), pre-existing at the
+> baseline — but real. Fixed on this branch by the counter-review repair
+> (warn-level logging on every persist failure exit and on load-default).
 
 ## Current state
 
