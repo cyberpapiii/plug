@@ -178,8 +178,24 @@ was accidentally touched).
 
 ## Done criteria
 
+> **Reviewer amendments (2026-07-12, at execution):**
+> 1. The `grep -l '^status: done'` criterion is amended to: → no output **except**
+>    `todos/045-done-p2-http-elicitation-timeout-resource-leak.md`. That file is
+>    internally consistent (filename token and frontmatter both say `done`), predates
+>    this plan's stamp commit, and the plan's own scope restriction ("only the six
+>    status contradictions are in scope") forbids touching it. The criterion as
+>    originally written contradicted the scope section — plan-authoring error, not
+>    executor error. Normalizing 045's `done`→`complete` synonym is a possible
+>    trivial follow-up, not part of this plan.
+> 2. The current-state table's claim that `todos/062-*` had "(empty — no value after
+>    `status:`)" was wrong: the file had **no YAML frontmatter block at all** (the
+>    only such file in the tracker; it used a plaintext `Status:` header). The
+>    executor converted it to the standard frontmatter convention matching every
+>    sibling todo, with content preserved — approved as within the plan's
+>    frontmatter-edit scope for that file.
+
 - [ ] `./scripts/check-todo-status.sh` exits 0
-- [ ] `grep -l '^status: done' todos/*.md` → no output
+- [ ] `grep -l '^status: done' todos/*.md` → no output except `todos/045-done-p2-http-elicitation-timeout-resource-leak.md` (see amendment 1)
 - [ ] `grep -n 'v0\.1\|June 2026' README.md` → no matches
 - [ ] `git status` shows only in-scope files changed (six todos, README.md, the new script)
 - [ ] `cargo test --workspace` exits 0
