@@ -647,9 +647,24 @@ impl SubscriptionRegistry {
         let _ = Self::await_transition(rx).await;
     }
 
-    /// Execute a rebind decision from `classify_route_changes`. Always
-    /// bumps the entry's generation and re-points it at a fresh `Pending`
-    /// transition, taking over whatever state the entry is currently in.
+    /// Execute a rebind decision from `classify_route_changes`.
+    ///
+    /// For an entry that still has members, bumps the generation and
+    /// re-points the slot at a fresh `Pending` transition (taking over
+    /// whatever state it was in), then migrates the upstream subscription
+    /// from the old owner to the new one.
+    ///
+    /// For an entry whose member set is already empty — a last-member
+    /// unsubscribe or disconnect landed between the route-change decision
+    /// and this call — reviving it would manufacture a zero-member `Active`
+    /// entry holding a live new-owner subscription that nothing ever
+    /// drains (the generation bump makes the member's queued drain a total
+    /// no-op). Instead the entry is drained in place against the OLD
+    /// owner: the generation bump still supersedes the queued drain (whose
+    /// handle may have been resolved from the already-published new route
+    /// snapshot, i.e. the wrong upstream), and the new owner is never
+    /// subscribed.
+    ///
     /// Awaits completion so `refresh_tools`'s own await reflects final
     /// state, matching historical synchronous-return semantics.
     pub(super) async fn rebind(
@@ -660,39 +675,72 @@ impl SubscriptionRegistry {
         new_server_id: &str,
         new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
     ) {
-        let Some((generation, tx, rx)) = (match self.entries.get_mut(uri) {
-            None => None,
+        enum Decision {
+            Migrate {
+                generation: u64,
+                tx: watch::Sender<TransitionSignal>,
+                rx: watch::Receiver<TransitionSignal>,
+            },
+            DrainEmpty {
+                generation: u64,
+                tx: watch::Sender<TransitionSignal>,
+                rx: watch::Receiver<TransitionSignal>,
+            },
+        }
+
+        let decision = match self.entries.get_mut(uri) {
+            None => {
+                // No active subscribers left to migrate.
+                return;
+            }
             Some(mut entry) => {
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let (tx, rx) = watch::channel(None);
                 entry.generation = generation;
-                entry.state = EntryState::Pending(rx.clone());
-                Some((generation, tx, rx))
+                if entry.members.is_empty() {
+                    entry.state = EntryState::Draining;
+                    Decision::DrainEmpty { generation, tx, rx }
+                } else {
+                    entry.state = EntryState::Pending(rx.clone());
+                    Decision::Migrate { generation, tx, rx }
+                }
             }
-        }) else {
-            // No active subscribers left to migrate.
-            return;
         };
 
-        let registry = Arc::clone(self);
-        let uri_owned = uri.to_string();
-        let old_server_id = old_server_id.to_string();
-        let new_server_id = new_server_id.to_string();
-        self.spawn_detached(async move {
-            registry
-                .run_rebind_transition(
-                    uri_owned,
+        match decision {
+            Decision::DrainEmpty { generation, tx, rx } => {
+                self.spawn_drain_transition(
+                    uri.to_string(),
                     generation,
-                    old_server_id,
                     old_upstream,
-                    new_server_id,
-                    new_owner,
+                    DrainOrigin::Prune {
+                        server_id: old_server_id.to_string(),
+                    },
                     tx,
-                )
-                .await;
-        });
-
-        let _ = Self::await_transition(rx).await;
+                );
+                let _ = Self::await_transition(rx).await;
+            }
+            Decision::Migrate { generation, tx, rx } => {
+                let registry = Arc::clone(self);
+                let uri_owned = uri.to_string();
+                let old_server_id = old_server_id.to_string();
+                let new_server_id = new_server_id.to_string();
+                self.spawn_detached(async move {
+                    registry
+                        .run_rebind_transition(
+                            uri_owned,
+                            generation,
+                            old_server_id,
+                            old_upstream,
+                            new_server_id,
+                            new_owner,
+                            tx,
+                        )
+                        .await;
+                });
+                let _ = Self::await_transition(rx).await;
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1550,6 +1598,70 @@ mod tests {
         rebind_task.await.unwrap();
         assert!(c.await.unwrap().is_ok());
         assert_eq!(registry.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rebind_of_emptied_entry_drains_old_owner_instead_of_reviving() {
+        let registry = SubscriptionRegistry::new();
+        let old_mock = MockUpstream::new();
+        let new_mock = MockUpstream::new();
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_mock.subscribe_call_count(), 1);
+
+        // The last member leaves: the entry is now zero-member Draining with
+        // a queued drain that has not been polled yet (current-thread
+        // runtime; neither `unsubscribe` nor the code below yields before
+        // `rebind` runs its synchronous mutation).
+        registry
+            .unsubscribe(
+                "file:///x",
+                &client("a"),
+                Some(Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await;
+
+        // A route refresh rebinds the URI old -> new while the entry is
+        // empty. The guard must drain against the old owner instead of
+        // reviving the entry onto the new owner.
+        registry
+            .rebind(
+                "file:///x",
+                "old-server",
+                Some(Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>),
+                "new-server",
+                Ok(Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await;
+
+        // The superseded original drain is a total no-op; give it a chance
+        // to (incorrectly) do anything before asserting.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            registry.is_empty(),
+            "no zero-member entry may survive the rebind"
+        );
+        assert_eq!(
+            old_mock.unsubscribe_call_count(),
+            1,
+            "old owner must be unsubscribed exactly once"
+        );
+        assert_eq!(
+            new_mock.subscribe_call_count(),
+            0,
+            "new owner must never be subscribed for an empty entry"
+        );
+        assert_eq!(new_mock.unsubscribe_call_count(), 0);
     }
 
     #[tokio::test]
