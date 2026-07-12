@@ -83,7 +83,7 @@ Optional future scope only:
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
-- move the ≥16MB artifact write off the async worker via `spawn_blocking` (requires making `ArtifactStore` shareable; deferred from PR #58)
+- move the ≥16MB artifact write off the async worker via `spawn_blocking` (requires making `ArtifactStore` shareable; deferred from PR #58) — ✅ implemented off-main on the `improve/integration` line (improve-program plan 005, re-scoped to `spawn_blocking` for oversized payload writes); done on `main` only when that branch merges
 - end-to-end metrics-recording test plus an RAII recording guard, and an operator-guide note on `degraded_since` vs. health divergence (deferred from PR #60)
 
 ## Designed-But-Deferred Program Phases
