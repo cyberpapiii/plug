@@ -78,6 +78,19 @@ struct DownstreamOauthState {
     refresh_tokens: HashMap<String, IssuedRefreshToken>,
 }
 
+impl DownstreamOauthState {
+    /// Eagerly drops entries that expired at or before `now` from all three
+    /// maps. Called on the rare mutation paths (never on the hot
+    /// `validate_access_token` read path) so issued-and-never-presented
+    /// tokens and abandoned auth codes don't linger in memory or in the
+    /// persisted state file forever.
+    fn evict_expired(&mut self, now: u64) {
+        self.pending_codes.retain(|_, c| c.expires_at >= now);
+        self.access_tokens.retain(|_, t| t.expires_at >= now);
+        self.refresh_tokens.retain(|_, t| t.expires_at >= now);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingAuthorizationCode {
     client_id: String,
@@ -202,6 +215,7 @@ impl DownstreamOauthManager {
             scopes,
         };
         let mut guard = self.state.lock().await;
+        guard.evict_expired(epoch_secs());
         guard.pending_codes.insert(auth_code.clone(), pending);
         persist_state(&self.config, &guard);
 
@@ -226,6 +240,7 @@ impl DownstreamOauthManager {
         self.validate_client_auth(client_id, client_secret)?;
 
         let mut guard = self.state.lock().await;
+        guard.evict_expired(epoch_secs());
         let pending = guard
             .pending_codes
             .get(code)
@@ -286,6 +301,7 @@ impl DownstreamOauthManager {
         self.validate_client_auth(client_id, client_secret)?;
 
         let mut guard = self.state.lock().await;
+        guard.evict_expired(epoch_secs());
         let refresh = guard
             .refresh_tokens
             .get(refresh_token)
@@ -341,8 +357,33 @@ impl DownstreamOauthManager {
             })
             .unwrap_or_else(|| resource_scopes(&self.config.oauth_scopes));
 
-        let access_token = uuid::Uuid::new_v4().to_string();
         let mut guard = self.state.lock().await;
+        guard.evict_expired(epoch_secs());
+
+        // Reuse a live client_credentials-issued token for this client+scope
+        // set instead of minting a fresh one on every call. This is the CC
+        // marker: `refresh_token.is_empty()`. A 60s floor avoids handing out
+        // a token that's about to die; if none qualifies, fall through to
+        // minting a new one.
+        let now = epoch_secs();
+        if let Some((existing_token, existing_record)) =
+            guard.access_tokens.iter().find(|(_, t)| {
+                t.client_id == client_id
+                    && t.refresh_token.is_empty()
+                    && t.scopes == scopes
+                    && t.expires_at >= now + 60
+            })
+        {
+            let response = TokenResponsePayload {
+                access_token: existing_token.clone(),
+                refresh_token: None,
+                expires_in: existing_record.expires_at - now,
+                scope: scope_string(&scopes),
+            };
+            return Ok(response);
+        }
+
+        let access_token = uuid::Uuid::new_v4().to_string();
         guard.access_tokens.insert(
             access_token.clone(),
             IssuedAccessToken {
@@ -853,6 +894,262 @@ mod tests {
             !redirect.contains("state=a b&c=d"),
             "raw unencoded state must not appear, got {redirect}"
         );
+        cleanup_state(&client_id);
+    }
+
+    #[test]
+    fn evict_expired_drops_only_expired_entries() {
+        let now = 1_000_000u64;
+        let mut state = DownstreamOauthState::default();
+
+        state.pending_codes.insert(
+            "live-code".to_string(),
+            PendingAuthorizationCode {
+                client_id: "c".to_string(),
+                redirect_uri: "https://client.example.com/callback".to_string(),
+                code_challenge: "chal".to_string(),
+                expires_at: now + 10,
+                scopes: vec!["tools:read".to_string()],
+            },
+        );
+        state.pending_codes.insert(
+            "expired-code".to_string(),
+            PendingAuthorizationCode {
+                client_id: "c".to_string(),
+                redirect_uri: "https://client.example.com/callback".to_string(),
+                code_challenge: "chal".to_string(),
+                expires_at: now - 10,
+                scopes: vec!["tools:read".to_string()],
+            },
+        );
+
+        state.access_tokens.insert(
+            "live-access".to_string(),
+            IssuedAccessToken {
+                client_id: "c".to_string(),
+                refresh_token: "r".to_string(),
+                expires_at: now + 10,
+                scopes: vec!["tools:read".to_string()],
+            },
+        );
+        state.access_tokens.insert(
+            "expired-access".to_string(),
+            IssuedAccessToken {
+                client_id: "c".to_string(),
+                refresh_token: "r".to_string(),
+                expires_at: now - 10,
+                scopes: vec!["tools:read".to_string()],
+            },
+        );
+
+        state.refresh_tokens.insert(
+            "live-refresh".to_string(),
+            IssuedRefreshToken {
+                client_id: "c".to_string(),
+                expires_at: now + 10,
+                scopes: vec!["tools:read".to_string()],
+            },
+        );
+        state.refresh_tokens.insert(
+            "expired-refresh".to_string(),
+            IssuedRefreshToken {
+                client_id: "c".to_string(),
+                expires_at: now - 10,
+                scopes: vec!["tools:read".to_string()],
+            },
+        );
+
+        state.evict_expired(now);
+
+        assert!(state.pending_codes.contains_key("live-code"));
+        assert!(!state.pending_codes.contains_key("expired-code"));
+        assert!(state.access_tokens.contains_key("live-access"));
+        assert!(!state.access_tokens.contains_key("expired-access"));
+        assert!(state.refresh_tokens.contains_key("live-refresh"));
+        assert!(!state.refresh_tokens.contains_key("expired-refresh"));
+    }
+
+    #[tokio::test]
+    async fn abandoned_auth_code_swept_on_next_mutation() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        let redirect = manager
+            .build_authorize_redirect(
+                &client_id,
+                "https://client.example.com/callback",
+                "abc123",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "S256",
+                Some("tools:read"),
+            )
+            .await
+            .expect("authorize redirect");
+        let code = redirect
+            .split("code=")
+            .nth(1)
+            .and_then(|v| v.split('&').next())
+            .expect("auth code")
+            .to_string();
+
+        // Force the pending code to already be expired, simulating an
+        // abandoned authorization that outlived AUTH_CODE_LIFETIME_SECS,
+        // without waiting 300s of real time.
+        {
+            let mut guard = manager.state.lock().await;
+            assert!(
+                guard.pending_codes.contains_key(&code),
+                "pending code should be present before the sweep"
+            );
+            if let Some(pending) = guard.pending_codes.get_mut(&code) {
+                pending.expires_at = epoch_secs().saturating_sub(1);
+            }
+        }
+
+        // Unrelated mutation: a client_credentials exchange should sweep the
+        // now-expired code as a side effect.
+        manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), None)
+            .await
+            .expect("client credentials exchange");
+
+        {
+            let guard = manager.state.lock().await;
+            assert!(
+                !guard.pending_codes.contains_key(&code),
+                "expired auth code should be swept on next mutation"
+            );
+        }
+
+        let reloaded =
+            load_persisted_state(&test_config(&client_id)).expect("reload persisted state");
+        assert!(
+            !reloaded.pending_codes.contains_key(&code),
+            "swept code must not reappear from the persisted file"
+        );
+
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn client_credentials_reuses_live_token() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        let first = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("tools:read"))
+            .await
+            .expect("first client credentials exchange");
+        let second = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("tools:read"))
+            .await
+            .expect("second client credentials exchange");
+
+        assert_eq!(
+            first.access_token, second.access_token,
+            "identical CC exchanges should reuse the same access token"
+        );
+        assert!(
+            second.expires_in <= first.expires_in,
+            "reused token's remaining lifetime should not exceed the original: first={} second={}",
+            first.expires_in,
+            second.expires_in
+        );
+
+        let guard = manager.state.lock().await;
+        let cc_entries = guard
+            .access_tokens
+            .values()
+            .filter(|t| t.client_id == client_id && t.refresh_token.is_empty())
+            .count();
+        assert_eq!(
+            cc_entries, 1,
+            "expected exactly one CC entry for this scope set"
+        );
+        drop(guard);
+
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn client_credentials_mints_new_token_for_different_scopes() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        let a = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("a"))
+            .await
+            .expect("scope a exchange");
+        let b = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("b"))
+            .await
+            .expect("scope b exchange");
+
+        assert_ne!(
+            a.access_token, b.access_token,
+            "different scope sets must not share a reused token"
+        );
+        assert!(manager.validate_access_token(&a.access_token).await);
+        assert!(manager.validate_access_token(&b.access_token).await);
+
+        cleanup_state(&client_id);
+    }
+
+    // CHARACTERIZATION: scopes are issued and persisted but NOT enforced.
+    // `validate_access_token` only checks expiry and returns a bare bool; it
+    // does not consult the record's scopes at all, so any valid token grants
+    // full access to every merged tool/resource/prompt. This test pins
+    // today's behavior so that a future enforcement change (owned by plan
+    // 018's conformance spike) is a deliberate, visible test edit rather
+    // than an unnoticed regression.
+    #[tokio::test]
+    async fn any_valid_token_grants_full_access() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        let issued = manager
+            .exchange_client_credentials(
+                &client_id,
+                Some("secret-123"),
+                Some("narrow:scope-that-should-not-exist"),
+            )
+            .await
+            .expect("client credentials exchange");
+
+        assert!(
+            manager.validate_access_token(&issued.access_token).await,
+            "a token with a narrow, made-up scope still validates as fully authorized"
+        );
+
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn client_credentials_reused_token_survives_manager_recreation() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        cleanup_state(&client_id);
+        let manager = DownstreamOauthManager::new(test_config(&client_id));
+
+        let first = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("tools:read"))
+            .await
+            .expect("first client credentials exchange");
+        let second = manager
+            .exchange_client_credentials(&client_id, Some("secret-123"), Some("tools:read"))
+            .await
+            .expect("second client credentials exchange");
+        assert_eq!(first.access_token, second.access_token);
+
+        let recreated = DownstreamOauthManager::new(test_config(&client_id));
+        assert!(
+            recreated.validate_access_token(&second.access_token).await,
+            "reused CC token must survive manager recreation via persisted state"
+        );
+
         cleanup_state(&client_id);
     }
 }
