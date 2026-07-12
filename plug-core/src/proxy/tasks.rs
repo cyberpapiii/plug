@@ -17,6 +17,21 @@ impl super::ToolRouter {
         owner: TaskOwner,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CreateTaskResult, McpError> {
+        // Owner-lifecycle guard, registered before anything else: a teardown
+        // (`cleanup_tasks_for_owner`) that runs while this enqueue is in
+        // flight — most importantly across the native path's upstream round
+        // trip below — tombstones the owner, so the late
+        // `create`/`create_passthrough` refuses to insert a record for the
+        // already-torn-down owner instead of leaving an untracked Working
+        // record (and, on the native path, an upstream task nobody cancels).
+        //
+        // Known residual, not fixable at this layer: a teardown that fully
+        // COMPLETED before this statement ran leaves no tombstone, so an
+        // enqueue racing in after it still inserts a record. That record is
+        // bounded — pruned by the stale-in-flight TTL — and its local
+        // execution is bounded by the upstream's `call_timeout_secs`.
+        let _create_guard = self.task_store.lock().await.begin_owner_create(&owner);
+
         if canonical_plug_meta_tool_name(tool_name).is_some() {
             return Err(McpError::from(ProtocolError::InvalidRequest {
                 detail:
@@ -74,16 +89,40 @@ impl super::ToolRouter {
                     task_id = %result.task.task_id,
                     "proxy native upstream task created"
                 );
-                let task = self.task_store.lock().await.create_passthrough(
+                let created = self.task_store.lock().await.create_passthrough(
                     owner,
                     tool_name,
                     &result.task,
                     TaskUpstreamRef::Task {
-                        server_id,
+                        server_id: server_id.clone(),
                         task_id: result.task.task_id.clone(),
                     },
                 );
-                return Ok(CreateTaskResult::new(task));
+                return match created {
+                    Ok(task) => Ok(CreateTaskResult::new(task)),
+                    Err(error) => {
+                        // The owner was torn down during the upstream round
+                        // trip: the native task exists upstream but nothing
+                        // tracks it locally anymore. Best-effort bounded
+                        // cancel so the upstream stops instead of running to
+                        // completion for a result nobody will ever collect.
+                        tracing::info!(
+                            trace_id = %trace_id,
+                            server = %server_id,
+                            task_id = %result.task.task_id,
+                            "owner torn down during native task creation; cancelling upstream task"
+                        );
+                        if let Some(cancellation) =
+                            self.spawn_bounded_upstream_cancellation(TaskUpstreamRef::Task {
+                                server_id,
+                                task_id: result.task.task_id.clone(),
+                            })
+                        {
+                            let _ = cancellation.await;
+                        }
+                        Err(error)
+                    }
+                };
             }
 
             return Err(McpError::internal_error(
@@ -94,31 +133,37 @@ impl super::ToolRouter {
             ));
         }
 
+        // Create + spawn + attach in ONE task_store lock scope: `tokio::spawn`
+        // is synchronous, and the spawned future's own store accesses simply
+        // queue on this same lock, so no teardown can interleave between the
+        // record insert and the abort-handle attach. (Previously these were
+        // three separate lock scopes; a `cleanup_owner` interleaving drained a
+        // record whose handle was still `None`, `attach_abort_handle` then
+        // silently no-opped on the missing record and dropped the JoinHandle —
+        // detaching the future, which kept running and kept holding its
+        // server's `max_concurrent` semaphore permit.) No await is held
+        // across this scope other than acquiring the lock itself.
         let task = {
             let mut store = self.task_store.lock().await;
-            store.create(owner, tool_name)
+            let task = store.create(owner, tool_name)?;
+            let task_id = task.task_id.clone();
+            let router = Arc::clone(self);
+            let tool_name = tool_name.to_string();
+            let handle = tokio::spawn(async move {
+                router
+                    .execute_tool_task(
+                        task_id,
+                        tool_name,
+                        arguments,
+                        progress_token,
+                        false,
+                        trace_id,
+                    )
+                    .await;
+            });
+            store.attach_abort_handle(&task.task_id, handle);
+            task
         };
-
-        let task_id = task.task_id.clone();
-        let router = Arc::clone(self);
-        let tool_name = tool_name.to_string();
-        let handle = tokio::spawn(async move {
-            router
-                .execute_tool_task(
-                    task_id,
-                    tool_name,
-                    arguments,
-                    progress_token,
-                    false,
-                    trace_id,
-                )
-                .await;
-        });
-
-        self.task_store
-            .lock()
-            .await
-            .attach_abort_handle(&task.task_id, handle);
 
         Ok(CreateTaskResult::new(task))
     }
@@ -274,52 +319,116 @@ impl super::ToolRouter {
     /// minus the store sync-back — the records are already gone by the time
     /// cancellation is forwarded, so there is nothing left to update. Errors
     /// notifying any one upstream are ignored and never skip the rest.
+    ///
+    /// Returns in bounded time regardless of upstream behavior: local aborts
+    /// happen first and synchronously, and every upstream cancellation is
+    /// forwarded concurrently under a per-upstream timeout (see
+    /// `spawn_bounded_upstream_cancellation`). Callers include the daemon's
+    /// idle-session expiry loop, which is a single serialized loop — an
+    /// unbounded hang here would permanently stop idle cleanup daemon-wide.
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
         let drained = self.task_store.lock().await.cleanup_owner(owner);
 
+        // Phase A: abort every still-running local future synchronously,
+        // before any upstream await — one unresponsive upstream must never
+        // delay stopping the other records' local execution.
+        let mut upstreams = Vec::new();
         for (upstream, handle) in drained {
             if let Some(handle) = handle {
                 handle.abort();
             }
+            if let Some(upstream) = upstream {
+                upstreams.push(upstream);
+            }
+        }
 
-            let Some(upstream) = upstream else {
-                continue;
-            };
+        // Phase B: forward best-effort cancellations concurrently, each
+        // bounded by its own server's call timeout. The spawned tasks run
+        // independently, so joining them serially still completes in
+        // max(per-server bound), not the sum — and a cancellation outlives
+        // even a caller that gets aborted mid-await (e.g. an HTTP DELETE
+        // request task).
+        let cancellations: Vec<_> = upstreams
+            .into_iter()
+            .filter_map(|upstream| self.spawn_bounded_upstream_cancellation(upstream))
+            .collect();
+        for cancellation in cancellations {
+            let _ = cancellation.await;
+        }
+    }
+
+    /// Spawns a best-effort cancellation of `upstream` (task cancel request
+    /// or request-cancel notification), bounded by the owning server's
+    /// `call_timeout_secs`. rmcp's plain `send_request` sets no timeout of
+    /// its own and awaits the response oneshot forever, so without this
+    /// bound a single unresponsive upstream would wedge the caller.
+    /// Returns `None` when the server is no longer registered (nothing left
+    /// to cancel). Timeouts and errors are logged, never propagated.
+    fn spawn_bounded_upstream_cancellation(
+        &self,
+        upstream: TaskUpstreamRef,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let server_id = match &upstream {
+            TaskUpstreamRef::Task { server_id, .. }
+            | TaskUpstreamRef::Request { server_id, .. } => server_id,
+        };
+        let server = self.server_manager.get_upstream(server_id)?;
+        let bound = Duration::from_secs(server.config.call_timeout_secs);
+        let peer = server.client.peer().clone();
+        drop(server);
+
+        Some(tokio::spawn(async move {
             match upstream {
                 TaskUpstreamRef::Task {
                     server_id,
                     task_id: upstream_task_id,
                 } => {
-                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        let _ = server
-                            .client
-                            .peer()
-                            .send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
-                                CancelTaskParams {
-                                    meta: None,
-                                    task_id: upstream_task_id,
-                                },
-                            )))
-                            .await;
+                    let send = peer.send_request(ClientRequest::CancelTaskRequest(
+                        CancelTaskRequest::new(CancelTaskParams {
+                            meta: None,
+                            task_id: upstream_task_id.clone(),
+                        }),
+                    ));
+                    match tokio::time::timeout(bound, send).await {
+                        Err(_) => tracing::warn!(
+                            server = %server_id,
+                            upstream_task_id = %upstream_task_id,
+                            timeout_secs = bound.as_secs(),
+                            "upstream tasks/cancel timed out during task teardown"
+                        ),
+                        Ok(Err(error)) => tracing::debug!(
+                            server = %server_id,
+                            upstream_task_id = %upstream_task_id,
+                            %error,
+                            "upstream tasks/cancel failed during task teardown"
+                        ),
+                        Ok(Ok(_)) => {}
                     }
                 }
                 TaskUpstreamRef::Request {
                     server_id,
                     request_id,
                 } => {
-                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        let _ = server
-                            .client
-                            .peer()
-                            .notify_cancelled(CancelledNotificationParam {
-                                request_id,
-                                reason: Some("task owner disconnected".to_string()),
-                            })
-                            .await;
+                    let send = peer.notify_cancelled(CancelledNotificationParam {
+                        request_id,
+                        reason: Some("task owner disconnected".to_string()),
+                    });
+                    match tokio::time::timeout(bound, send).await {
+                        Err(_) => tracing::warn!(
+                            server = %server_id,
+                            timeout_secs = bound.as_secs(),
+                            "upstream cancellation notify timed out during task teardown"
+                        ),
+                        Ok(Err(error)) => tracing::debug!(
+                            server = %server_id,
+                            %error,
+                            "upstream cancellation notify failed during task teardown"
+                        ),
+                        Ok(Ok(())) => {}
                     }
                 }
             }
-        }
+        }))
     }
 
     /// Count of task records currently stored for `owner`. Tasks are
@@ -347,7 +456,9 @@ impl super::ToolRouter {
         handle: tokio::task::JoinHandle<()>,
     ) -> Task {
         let mut store = self.task_store.lock().await;
-        let task = store.create(owner, name);
+        let task = store
+            .create(owner, name)
+            .expect("test task owner must not be tombstoned");
         store.attach_abort_handle(&task.task_id, handle);
         task
     }
@@ -369,26 +480,45 @@ impl super::ToolRouter {
                     task_id: upstream_task_id,
                 } => {
                     if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        let response = server
-                            .client
-                            .peer()
-                            .send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
-                                CancelTaskParams {
+                        // Bounded like the teardown path: rmcp's plain
+                        // `send_request` awaits its response forever, and an
+                        // unresponsive upstream must not wedge the caller. On
+                        // timeout we fall through to returning the locally
+                        // cancelled task, exactly like any other non-
+                        // CancelTaskResult response.
+                        let bound = Duration::from_secs(server.config.call_timeout_secs);
+                        let response = tokio::time::timeout(
+                            bound,
+                            server.client.peer().send_request(
+                                ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+                                    CancelTaskParams {
+                                        meta: None,
+                                        task_id: upstream_task_id,
+                                    },
+                                )),
+                            ),
+                        )
+                        .await;
+                        match response {
+                            Ok(Ok(ServerResult::CancelTaskResult(result))) => {
+                                let synced =
+                                    self.task_store.lock().await.sync_from_upstream_for_owner(
+                                        owner,
+                                        task_id,
+                                        &result.task,
+                                    )?;
+                                return Ok(CancelTaskResult {
                                     meta: None,
-                                    task_id: upstream_task_id,
-                                },
-                            )))
-                            .await;
-                        if let Ok(ServerResult::CancelTaskResult(result)) = response {
-                            let synced = self
-                                .task_store
-                                .lock()
-                                .await
-                                .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
-                            return Ok(CancelTaskResult {
-                                meta: None,
-                                task: synced,
-                            });
+                                    task: synced,
+                                });
+                            }
+                            Err(_) => tracing::debug!(
+                                server = %server_id,
+                                task_id = %task_id,
+                                timeout_secs = bound.as_secs(),
+                                "upstream tasks/cancel timed out; returning locally cancelled task"
+                            ),
+                            Ok(_) => {}
                         }
                     }
                 }
@@ -397,14 +527,23 @@ impl super::ToolRouter {
                     request_id,
                 } => {
                     if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        let _ = server
-                            .client
-                            .peer()
-                            .notify_cancelled(CancelledNotificationParam {
-                                request_id,
-                                reason: Some("task cancelled".to_string()),
-                            })
-                            .await;
+                        let bound = Duration::from_secs(server.config.call_timeout_secs);
+                        let notify =
+                            server
+                                .client
+                                .peer()
+                                .notify_cancelled(CancelledNotificationParam {
+                                    request_id,
+                                    reason: Some("task cancelled".to_string()),
+                                });
+                        if tokio::time::timeout(bound, notify).await.is_err() {
+                            tracing::debug!(
+                                server = %server_id,
+                                task_id = %task_id,
+                                timeout_secs = bound.as_secs(),
+                                "upstream cancellation notify timed out during task cancel"
+                            );
+                        }
                     }
                 }
             }
@@ -666,7 +805,9 @@ mod tests {
 
         {
             let mut store = router.task_store.lock().await;
-            let task = store.create(owner.clone(), "long_running_tool");
+            let task = store
+                .create(owner.clone(), "long_running_tool")
+                .expect("create task");
             store.attach_abort_handle(&task.task_id, handle);
         }
 
@@ -718,7 +859,9 @@ mod tests {
 
         {
             let mut store = router.task_store.lock().await;
-            let task = store.create(owner_b.clone(), "long_running_tool");
+            let task = store
+                .create(owner_b.clone(), "long_running_tool")
+                .expect("create task");
             store.attach_abort_handle(&task.task_id, handle);
         }
 
