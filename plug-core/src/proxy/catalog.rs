@@ -594,6 +594,10 @@ impl super::ToolRouter {
     /// Number of resource URIs with at least one active downstream subscriber.
     /// Read-side observability; also lets tests assert that a degraded upstream's
     /// subscriptions survive a catalog refresh rather than being pruned.
+    ///
+    /// Counts tracked URIs regardless of transition state (Pending/Active/
+    /// Draining), matching the historical `DashMap::len()` semantics this
+    /// replaced.
     pub fn active_subscription_count(&self) -> usize {
         self.resource_subscriptions.len()
     }
