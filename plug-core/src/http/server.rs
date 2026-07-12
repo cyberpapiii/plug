@@ -84,9 +84,9 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        Ok(crate::tasks::TaskOwner::new(Arc::<str>::from(
-            format!("http:{}", self.session_id).as_str(),
-        )))
+        Ok(crate::proxy::ToolRouter::task_owner_for_http_session(
+            &self.session_id,
+        ))
     }
 }
 
@@ -958,6 +958,8 @@ async fn delete_mcp(
             &session_id,
         );
         state.router.clear_lazy_session(&lazy_session_key);
+        let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
+        state.router.cleanup_tasks_for_owner(&owner).await;
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
@@ -1331,8 +1333,7 @@ async fn handle_request(
         ClientRequest::ListTasksRequest(list_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
-            let owner =
-                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
             match state
                 .router
                 .list_tasks_for_owner(&owner, list_req.params)
@@ -1355,8 +1356,7 @@ async fn handle_request(
         ClientRequest::GetTaskInfoRequest(task_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
-            let owner =
-                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
             match state
                 .router
                 .get_task_info_for_owner(&owner, &task_req.params.task_id)
@@ -1379,8 +1379,7 @@ async fn handle_request(
         ClientRequest::GetTaskResultRequest(task_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
-            let owner =
-                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
             match state
                 .router
                 .get_task_result_for_owner(&owner, &task_req.params.task_id)
@@ -1403,8 +1402,7 @@ async fn handle_request(
         ClientRequest::CancelTaskRequest(task_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
-            let owner =
-                crate::tasks::TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")));
+            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
             match state
                 .router
                 .cancel_task_for_owner(&owner, &task_req.params.task_id)
@@ -1989,6 +1987,56 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_mcp_cleans_up_session_tasks() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+
+        // Give the router a routable tool so `enqueue_tool_task` can create a
+        // task record for this session without needing a live upstream.
+        state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes: std::collections::HashMap::from([(
+                "git__commit".to_string(),
+                ("git".to_string(), "commit".to_string()),
+            )]),
+            tools_all: Arc::new(vec![Tool::new(
+                std::borrow::Cow::Borrowed("git__commit"),
+                std::borrow::Cow::Borrowed("Create a git commit"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: std::collections::HashMap::new(),
+            prompt_routes: std::collections::HashMap::new(),
+            tool_definition_fingerprints: std::collections::HashMap::new(),
+            tool_risk_inventory: std::collections::HashMap::new(),
+        });
+
+        let owner = ToolRouter::task_owner_for_http_session(&session_id);
+        state
+            .router
+            .enqueue_tool_task("git__commit", None, None, owner.clone(), None)
+            .await
+            .expect("enqueue task for departing session");
+        assert_eq!(state.router.task_count_for_owner(&owner).await, 1);
+
+        let app = build_router(state.clone());
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.router.task_count_for_owner(&owner).await, 0);
     }
 
     #[tokio::test]
