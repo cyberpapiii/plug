@@ -151,7 +151,16 @@ fn redirect_uri_allowed(redirect_uri: &str, allowlist: &[String]) -> bool {
 
 impl DownstreamOauthManager {
     pub fn new(config: DownstreamOauthConfig) -> Self {
-        let state = load_persisted_state(&config).unwrap_or_default();
+        let state = match load_persisted_state(&config) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "starting with default downstream oauth state; all previously issued tokens are now invalid"
+                );
+                DownstreamOauthState::default()
+            }
+        };
         Self {
             config,
             state: Arc::new(Mutex::new(state)),
@@ -559,13 +568,30 @@ fn load_persisted_state(config: &DownstreamOauthConfig) -> Result<DownstreamOaut
 fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
     let path = match state_file_path(config) {
         Ok(path) => path,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to persist downstream oauth state: could not compute state file path"
+            );
+            return;
+        }
     };
     let dir = match path.parent() {
         Some(dir) => dir,
-        None => return,
+        None => {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to persist downstream oauth state: state file path has no parent directory"
+            );
+            return;
+        }
     };
-    if crate::fs_perm::ensure_dir_0700(dir).is_err() {
+    if let Err(e) = crate::fs_perm::ensure_dir_0700(dir) {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "failed to persist downstream oauth state: could not create state directory"
+        );
         return;
     }
 
@@ -574,7 +600,14 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
 
     let json = match serde_json::to_string_pretty(&persisted) {
         Ok(json) => json,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to persist downstream oauth state: could not serialize state"
+            );
+            return;
+        }
     };
 
     let tmp = path.with_extension("json.tmp");
@@ -590,9 +623,21 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
             .open(&tmp);
         let mut file = match file {
             Ok(file) => file,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!(
+                    path = %tmp.display(),
+                    error = %e,
+                    "failed to persist downstream oauth state: could not open temp file"
+                );
+                return;
+            }
         };
-        if file.write_all(json.as_bytes()).is_err() {
+        if let Err(e) = file.write_all(json.as_bytes()) {
+            tracing::warn!(
+                path = %tmp.display(),
+                error = %e,
+                "failed to persist downstream oauth state: could not write temp file"
+            );
             let _ = std::fs::remove_file(&tmp);
             return;
         }
@@ -600,13 +645,24 @@ fn persist_state(config: &DownstreamOauthConfig, state: &DownstreamOauthState) {
     }
     #[cfg(not(unix))]
     {
-        if std::fs::write(&tmp, &json).is_err() {
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            tracing::warn!(
+                path = %tmp.display(),
+                error = %e,
+                "failed to persist downstream oauth state: could not write temp file"
+            );
             let _ = std::fs::remove_file(&tmp);
             return;
         }
     }
 
-    if std::fs::rename(&tmp, &path).is_err() {
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(
+            from = %tmp.display(),
+            to = %path.display(),
+            error = %e,
+            "failed to persist downstream oauth state: could not rename temp file into place"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -1279,6 +1335,32 @@ mod tests {
             first.access_token, second.access_token,
             "config-default scopes and an explicit reordered request for the same set should reuse the token"
         );
+
+        cleanup_state(&client_id);
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_file_falls_back_to_default_state_without_panic() {
+        let client_id = format!("test-client-{}", uuid::Uuid::new_v4());
+        let config = test_config(&client_id);
+        cleanup_state(&client_id);
+
+        let path = state_file_path(&config).expect("compute state file path");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create state dir");
+        }
+        std::fs::write(&path, b"not valid json{{{").expect("write corrupt state file");
+
+        // Must not panic even though the on-disk state is unreadable.
+        let manager = DownstreamOauthManager::new(config);
+        let guard = manager.state.lock().await;
+        assert!(
+            guard.access_tokens.is_empty()
+                && guard.refresh_tokens.is_empty()
+                && guard.pending_codes.is_empty(),
+            "a corrupt state file should fall back to empty default state"
+        );
+        drop(guard);
 
         cleanup_state(&client_id);
     }
