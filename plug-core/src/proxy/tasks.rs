@@ -224,6 +224,7 @@ impl super::ToolRouter {
                     )?;
                     self.artifact_store
                         .maybe_spill_task_payload(&format!("task_result:{task_id}"), result.0)
+                        .await
                 }
                 ServerResult::CallToolResult(result) => {
                     let payload = serde_json::to_value(result).map_err(|e| {
@@ -239,6 +240,7 @@ impl super::ToolRouter {
                     )?;
                     self.artifact_store
                         .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
+                        .await
                 }
                 _ => Err(McpError::internal_error(
                     "unexpected upstream tasks/result response".to_string(),
@@ -253,6 +255,7 @@ impl super::ToolRouter {
             .get_result_for_owner(owner, task_id)?;
         self.artifact_store
             .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload.0)
+            .await
     }
 
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
