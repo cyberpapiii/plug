@@ -546,7 +546,11 @@ mod tests {
         assert_eq!(diff.changed[0].0, "github");
     }
 
-    #[tokio::test]
+    // Paused time: the 25ms sleeps are a synthetic in-memory "task duration"
+    // used only to create overlap between the buffered futures (no I/O), so
+    // tokio's auto-advance resolves them instantly while preserving the
+    // buffer_unordered(2) concurrency-cap ordering the test asserts on.
+    #[tokio::test(start_paused = true)]
     async fn run_reload_start_actions_is_bounded_and_concurrent() {
         let actions = vec![
             ReloadStartAction {
