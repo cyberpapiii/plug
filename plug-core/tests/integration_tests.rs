@@ -1837,6 +1837,393 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
     let _ = std::fs::remove_dir_all(&temp);
 }
 
+// ---------------------------------------------------------------------------
+// HTTP upstream crash-restart supervision (plan 013 step 3)
+// ---------------------------------------------------------------------------
+//
+// Harness notes (plan 013 step 1):
+// - The inline axum mocks in this file all bind port 0 (OS-assigned) and none
+//   supported stop/restart, so `MockRestartableHttpUpstream` below adds a
+//   test-local restartable mock: bind port 0 once, capture the port, then
+//   re-bind the SAME captured port for the restart. If the port is racily
+//   stolen between drop and re-bind, the whole scenario retries (bounded).
+// - DEFERRED: plan 013 step 2's companion test
+//   (`test_oauth_refresh_under_load_no_auth_errors`) is deferred pending
+//   time-control work (plan 014). `MIN_EXPIRES_IN` (60s) in
+//   `plug-core/src/oauth.rs` clamps every provider-supplied `expires_in`
+//   upward, and the short-lived 50%-of-lifetime rule floors the first
+//   background refresh at ~30s of real time per cycle — two observed refresh
+//   windows cannot fit an integration-test budget without production changes.
+
+/// Per-incarnation state for the restartable mock HTTP upstream.
+///
+/// Sessions are scoped to one incarnation: a restarted incarnation starts
+/// with an empty session set, so requests carrying a stale session id get
+/// HTTP 404 — exactly what a real streamable HTTP server does after losing
+/// its session state in a crash.
+#[derive(Clone)]
+struct MockRestartableHttpUpstreamState {
+    sessions: Arc<Mutex<std::collections::HashSet<String>>>,
+    session_counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+struct MockRestartableHttpUpstream {
+    addr: SocketAddr,
+    shutdown: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockRestartableHttpUpstream {
+    /// Bind `addr` and serve a session-aware mock MCP upstream on `/mcp`.
+    /// Pass port 0 to let the OS choose; pass a captured `addr` to restart
+    /// a previous incarnation on the same port.
+    async fn start(addr: SocketAddr) -> Result<Self, std::io::Error> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+
+        let state = MockRestartableHttpUpstreamState {
+            sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            session_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/mcp",
+                axum::routing::post(mock_restartable_http_upstream_handler),
+            )
+            .with_state(state);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown_signal.cancelled().await })
+                .await
+                .expect("serve mock restartable http upstream");
+        });
+
+        Ok(Self {
+            addr,
+            shutdown,
+            handle,
+        })
+    }
+
+    /// Gracefully stop this incarnation and wait until the listener socket is
+    /// released, so the port can be re-bound by the next incarnation.
+    async fn stop(self) {
+        self.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), self.handle)
+            .await
+            .expect("mock restartable http upstream shutdown timed out")
+            .expect("mock restartable http upstream task panicked");
+    }
+}
+
+async fn mock_restartable_http_upstream_handler(
+    State(state): State<MockRestartableHttpUpstreamState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let method = json_body
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    let json_headers = |session_id: String| {
+        [
+            (
+                axum::http::HeaderName::from_static("mcp-session-id"),
+                session_id,
+            ),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            ),
+        ]
+    };
+
+    if method == "initialize" {
+        let session_id = format!(
+            "sess-{}",
+            state
+                .session_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        state.sessions.lock().await.insert(session_id.clone());
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "tools": { "listChanged": false }
+                },
+                "serverInfo": {
+                    "name": "mock-restartable-http-upstream",
+                    "version": "1.0.0"
+                }
+            }
+        });
+        return (StatusCode::OK, json_headers(session_id), resp.to_string()).into_response();
+    }
+
+    // Every non-initialize message must carry a session id this incarnation
+    // minted; stale/absent sessions get 404 like a real restarted server.
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let session_known = match &session_id {
+        Some(id) => state.sessions.lock().await.contains(id),
+        None => false,
+    };
+    let Some(session_id) = session_id.filter(|_| session_known) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match method {
+        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "tools/list" => {
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Echo the input back",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "input": { "type": "string" }
+                            }
+                        }
+                    }]
+                }
+            });
+            (StatusCode::OK, json_headers(session_id), resp.to_string()).into_response()
+        }
+        "tools/call" => {
+            let arguments = json_body
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Called echo with {arguments}")
+                    }],
+                    "isError": false
+                }
+            });
+            (StatusCode::OK, json_headers(session_id), resp.to_string()).into_response()
+        }
+        _ => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+enum HttpCrashRestartOutcome {
+    Completed,
+    PortStolen,
+}
+
+/// One full crash-restart scenario. Returns `PortStolen` if the captured
+/// port was grabbed by another process between drop and re-bind (the caller
+/// retries the whole setup a bounded number of times).
+async fn run_http_upstream_crash_restart_scenario(
+    recovery_deadline: Duration,
+    recovery_poll: Duration,
+) -> HttpCrashRestartOutcome {
+    let mock = MockRestartableHttpUpstream::start(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind mock restartable http upstream");
+    let addr = mock.addr;
+
+    let mut config = Config::default();
+    config.servers.insert(
+        "httpcrash".to_string(),
+        ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Http,
+            url: Some(format!("http://{addr}/mcp")),
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 10,
+            call_timeout_secs: 5,
+            max_concurrent: 4,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: false,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+
+            sandbox: None,
+        },
+    );
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    // Phase 1: baseline call succeeds against the live upstream.
+    let result = engine
+        .tool_router()
+        .call_tool(
+            "Httpcrash__echo",
+            Some(
+                serde_json::json!({"input": "before-crash"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "baseline tools/call should succeed: {result:?}"
+    );
+    let rendered = format!("{:?}", result.unwrap());
+    assert!(
+        rendered.contains("before-crash"),
+        "unexpected baseline result: {rendered}"
+    );
+
+    // Phase 2: kill the upstream (graceful shutdown releases the port and
+    // severs keep-alive connections). A call must now fail.
+    mock.stop().await;
+    let result = engine
+        .tool_router()
+        .call_tool(
+            "Httpcrash__echo",
+            Some(
+                serde_json::json!({"input": "while-dead"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "tools/call should fail while the upstream is down: {result:?}"
+    );
+
+    // Phase 3: restart the upstream on the SAME port.
+    let mock = match MockRestartableHttpUpstream::start(addr).await {
+        Ok(mock) => mock,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            engine.shutdown().await;
+            return HttpCrashRestartOutcome::PortStolen;
+        }
+        Err(error) => panic!("re-bind mock upstream on {addr}: {error}"),
+    };
+
+    // Phase 4: poll until calls flow again. The restarted incarnation 404s
+    // the stale session, which the client stack recovers from.
+    let deadline = tokio::time::Instant::now() + recovery_deadline;
+    let recovered = loop {
+        let result = engine
+            .tool_router()
+            .call_tool(
+                "Httpcrash__echo",
+                Some(
+                    serde_json::json!({"input": "after-restart"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+        match result {
+            Ok(value) => break value,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(recovery_poll).await;
+            }
+            Err(error) => {
+                panic!("tools/call did not recover within {recovery_deadline:?}: {error:?}")
+            }
+        }
+    };
+    let rendered = format!("{recovered:?}");
+    assert!(
+        rendered.contains("after-restart"),
+        "unexpected post-restart result: {rendered}"
+    );
+
+    // Phase 5: deterministically exercise the engine reconnect path
+    // (`do_reconnect` success: fresh connect + `replace_server` +
+    // `refresh_tools`) against the restarted upstream — the same entry point
+    // health-monitor proactive recovery and call-path reactive recovery use.
+    engine
+        .reconnect_server("httpcrash")
+        .await
+        .expect("explicit reconnect against restarted upstream");
+    let result = engine
+        .tool_router()
+        .call_tool(
+            "Httpcrash__echo",
+            Some(
+                serde_json::json!({"input": "after-reconnect"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "tools/call should succeed after explicit reconnect: {result:?}"
+    );
+    let rendered = format!("{:?}", result.unwrap());
+    assert!(
+        rendered.contains("after-reconnect"),
+        "unexpected post-reconnect result: {rendered}"
+    );
+
+    engine.shutdown().await;
+    mock.stop().await;
+    HttpCrashRestartOutcome::Completed
+}
+
+#[tokio::test]
+async fn test_http_upstream_crash_restart_recovers_cleanly() {
+    // Poll bounds as named consts (plan 013 maintenance note): if monitor or
+    // reconnect cadences change in config defaults, adjust these to match.
+    const HTTP_CRASH_RECOVERY_DEADLINE: Duration = Duration::from_secs(15);
+    const HTTP_CRASH_RECOVERY_POLL: Duration = Duration::from_millis(250);
+    const HTTP_CRASH_SETUP_ATTEMPTS: usize = 3;
+
+    for attempt in 1..=HTTP_CRASH_SETUP_ATTEMPTS {
+        match run_http_upstream_crash_restart_scenario(
+            HTTP_CRASH_RECOVERY_DEADLINE,
+            HTTP_CRASH_RECOVERY_POLL,
+        )
+        .await
+        {
+            HttpCrashRestartOutcome::Completed => return,
+            HttpCrashRestartOutcome::PortStolen => {
+                eprintln!(
+                    "mock upstream port stolen between drop and re-bind \
+                     (attempt {attempt}/{HTTP_CRASH_SETUP_ATTEMPTS}); retrying full setup"
+                );
+            }
+        }
+    }
+    panic!(
+        "mock upstream port was stolen on {HTTP_CRASH_SETUP_ATTEMPTS} consecutive setup attempts"
+    );
+}
+
 #[tokio::test]
 async fn test_stdio_end_to_end_proxy_path() {
     let mut config = Config::default();
