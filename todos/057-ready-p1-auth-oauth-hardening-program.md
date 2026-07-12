@@ -1010,3 +1010,54 @@ Key files expected to change:
 - On macOS, repeated secure-store access becomes much more painful when multiple `plug` binaries
   or restarted daemons are involved, so the runtime should minimize keychain touches once
   credentials have been hydrated successfully in-process.
+
+### 2026-07-12 - Downstream OAuth conformance spike (plan 018)
+
+**By:** Claude Fable 5
+
+**Actions:**
+- Ran the plan-018 gap-analysis spike (`plans/018-downstream-oauth-conformance-spike-claude-fable.md`)
+  against the downstream OAuth surface (`plug-core/src/downstream_oauth/`, `plug-core/src/http/server.rs`
+  discovery/authorize/token endpoints) — the surface that lets remote HTTP MCP clients (e.g. Claude
+  Desktop's remote connector) authorize against `plug serve`.
+- Built a full conformance matrix against RFC 9728 (Protected Resource Metadata), RFC 8414
+  (Authorization Server Metadata), and the MCP Authorization spec (protocol revision 2025-11-25),
+  citing file:line for every row.
+- Stood up an isolated scratch `plug serve` instance (throwaway `HOME`/config dir, loopback-only,
+  dummy credentials — the operator's real config/daemon/keychain were never touched) and live-probed
+  discovery, the full authorization_code+PKCE flow, refresh_token and client_credentials grants,
+  redirect-URI allowlist enforcement, and scope handling.
+- Wrote up findings, a probe transcript appendix (token values redacted), a pre-auth privacy
+  inventory, and a triaged follow-up list.
+
+**Result:** `docs/plans/2026-07-downstream-oauth-conformance-findings-claude-fable.md`
+
+**Headline result:** the metadata/discovery surface (PRM, AS metadata, `WWW-Authenticate` +
+well-known fallback, PKCE S256 enforcement, issuer consistency) is fully conformant — no gaps
+found there. Three real gaps were identified and triaged, all **spec-gap-no-known-impact**
+severity today (no exploitable auth bypass found):
+1. `oauth_redirect_uri_allowlist` entries are accepted with no HTTPS-scheme check — an
+   operator-allowlisted plain-HTTP non-loopback redirect URI is honored and a real authorization
+   code gets redirected to it (live-confirmed). Cheap config-validation-level fix, recommended for
+   next batch.
+2. Neither `/oauth/authorize` nor `/oauth/token` reads or validates an RFC 8707 `resource`
+   parameter — silently ignored if a client sends one. No exploitable impact given plug's
+   single-process AS+RS architecture, but a compatibility risk against increasingly strict MCP
+   clients.
+3. OAuth scopes are accepted verbatim from the client with no validation against configured
+   `http.oauth_scopes`, and `validate_access_token` never checks token scopes when authorizing
+   `/mcp` requests — scopes are issued and stored but functionally cosmetic; `insufficient_scope`
+   is never emitted anywhere in the codebase.
+
+**Note on plan 020 (separate branch, not yet merged as of this spike):** plan 020 reportedly adds
+an eager expiry sweep for the downstream-oauth token store and changes `client_credentials` token
+reuse behavior. This spike's branch does not contain those changes; the scope-enforcement and
+token-issuance findings above describe the code as it exists without plan 020, and are believed to
+persist unchanged under plan 020's described behavior (that plan changes token *lifecycle/reuse*
+timing, not scope *validation*) — this should be re-confirmed once plan 020 merges.
+
+**Verification:** `cargo test --workspace` (confirmed green, tree untouched by this spike —
+findings-doc-and-todo-note-only change).
+
+**Status:** program stays `ready` — this spike produced input for the next planning round, it did
+not close any acceptance criteria itself.
