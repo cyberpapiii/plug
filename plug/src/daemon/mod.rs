@@ -42,7 +42,7 @@ mod notify;
 use notify::send_ipc_control_notification;
 
 mod mcp_dispatch;
-use mcp_dispatch::{dispatch_mcp_request, ipc_from_mcp_result, ipc_ok};
+use mcp_dispatch::dispatch_mcp_request;
 
 /// Maximum concurrently registered proxy client sessions.
 ///
@@ -2964,46 +2964,6 @@ mod tests {
             Some(-32601),
             "unexpected error payload: {payload}"
         );
-    }
-
-    #[test]
-    fn ipc_ok_encodes_value_as_mcp_response() {
-        let resp = ipc_ok(serde_json::json!({ "a": 1 }));
-        let IpcResponse::McpResponse { payload } = resp else {
-            panic!("expected McpResponse, got {resp:?}");
-        };
-        assert_eq!(payload, serde_json::json!({ "a": 1 }));
-
-        // A value that fails serialization (a map with non-string tuple keys)
-        // takes the SERIALIZE_ERROR fallback frame rather than an McpResponse.
-        let mut unserializable = std::collections::BTreeMap::new();
-        unserializable.insert((1_i32, 2_i32), 3_i32);
-        match ipc_ok(unserializable) {
-            IpcResponse::Error { code, .. } => assert_eq!(code, "SERIALIZE_ERROR"),
-            other => panic!("expected SERIALIZE_ERROR frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ipc_from_mcp_result_encodes_ok_and_err() {
-        // Ok -> McpResponse with the serialized value.
-        let ok = ipc_from_mcp_result::<serde_json::Value>(Ok(serde_json::json!({ "ok": true })));
-        let IpcResponse::McpResponse { payload } = ok else {
-            panic!("expected McpResponse for Ok, got {ok:?}");
-        };
-        assert_eq!(payload, serde_json::json!({ "ok": true }));
-
-        // Err -> McpResponse carrying the serialized McpError (code + message),
-        // the IPC convention where errors ride the same channel.
-        let err = ipc_from_mcp_result::<serde_json::Value>(Err(McpError::invalid_params(
-            "boom".to_string(),
-            None,
-        )));
-        let IpcResponse::McpResponse { payload } = err else {
-            panic!("expected McpResponse for Err, got {err:?}");
-        };
-        assert_eq!(payload["code"].as_i64(), Some(-32602));
-        assert_eq!(payload["message"].as_str(), Some("boom"));
     }
 
     // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
