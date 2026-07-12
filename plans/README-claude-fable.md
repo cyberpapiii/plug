@@ -28,7 +28,7 @@ matters.
 
 | # | Plan | Category | Effort | Depends on | Status |
 |---|------|----------|--------|------------|--------|
-| 001 | [Toolchain/CI quick wins](001-toolchain-ci-quick-wins-claude-fable.md) — fix 2 clippy-1.97 failures (gate is currently RED), advisories gate, MSRV job, oauth2 default-features, fs2→fs4, shared 0700-dir helper | tooling | S | — (land FIRST: unblocks every plan's clippy gate) | IN PROGRESS (2026-07-12; step-2 MSRV amendment: declared 1.86 unbuildable, bumped to 1.88 — see plan) |
+| 001 | [Toolchain/CI quick wins](001-toolchain-ci-quick-wins-claude-fable.md) — fix 2 clippy-1.97 failures (gate is currently RED), advisories gate, MSRV job, oauth2 default-features, fs2→fs4, shared 0700-dir helper | tooling | S | — (landed FIRST: clippy gate green) | DONE 2026-07-12 (merged to improve/integration @ 49426d4; 8 commits — incl. MSRV 1.86→1.88 amendment, 1.88-lint fix-up across 19 files, third 0700 site; see plan amendments) |
 | 002 | [Todo/README hygiene](002-todo-readme-hygiene-claude-fable.md) — reconcile 6 contradictory todo statuses, guard script, README staleness | docs | S | — | TODO |
 | 003 | [Correctness small-fix batch](003-correctness-small-fix-batch-claude-fable.md) — eviction metric, daemon busy-spin, pending-cancel-before-attach, idle-select reverse arm | correctness | S/M | — | TODO |
 | 004 | [Catalog perf batch](004-catalog-perf-batch-claude-fable.md) — pagination clones, refresh-loop hoists, gated filtered-catalog builds | perf | M | — | TODO |
