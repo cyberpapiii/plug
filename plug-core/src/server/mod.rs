@@ -282,6 +282,25 @@ pub(crate) struct UpstreamClientHandler {
     router: std::sync::Weak<ToolRouter>,
 }
 
+#[cfg(test)]
+impl UpstreamClientHandler {
+    /// Test-support constructor so tests outside this module (e.g.
+    /// `proxy::tests` driving `refresh_tools` against in-process duplex
+    /// upstreams) can build a connected `UpstreamServer` without making the
+    /// fields themselves crate-visible.
+    pub(crate) fn new_for_tests(
+        server_id: Arc<str>,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        router: std::sync::Weak<ToolRouter>,
+    ) -> Self {
+        Self {
+            server_id,
+            tools,
+            router,
+        }
+    }
+}
+
 impl ClientHandler for UpstreamClientHandler {
     fn get_info(&self) -> ClientInfo {
         let mut info = ClientInfo::new(
