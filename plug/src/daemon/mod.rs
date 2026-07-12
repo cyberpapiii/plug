@@ -1673,7 +1673,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncWriteExt;
 
-    fn temp_config_path(name: &str) -> std::path::PathBuf {
+    pub(super) fn temp_config_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1683,18 +1683,18 @@ mod tests {
         dir.join("config.toml")
     }
 
-    async fn clear_store(server_name: &str) {
+    pub(super) async fn clear_store(server_name: &str) {
         let store = plug_core::oauth::get_or_create_store(server_name);
         store.clear().await.unwrap();
     }
 
-    fn cleanup_temp_config(config_path: &std::path::Path) {
+    pub(super) fn cleanup_temp_config(config_path: &std::path::Path) {
         if let Some(dir) = config_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 
-    fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
+    pub(super) fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
         let mut config = plug_core::config::Config::default();
         for name in servers {
             config.servers.insert(
@@ -1726,7 +1726,7 @@ mod tests {
         std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
     }
 
-    fn seeded_credentials() -> StoredCredentials {
+    pub(super) fn seeded_credentials() -> StoredCredentials {
         let mut token =
             oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
                 AccessToken::new("access-token".to_string()),
@@ -1744,7 +1744,7 @@ mod tests {
         )
     }
 
-    fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
+    pub(super) fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
         let config = plug_core::config::load_config(Some(&config_path)).unwrap();
         let engine = Arc::new(Engine::new(config));
         let (client_registry, _count_rx) = ClientRegistry::new();
@@ -2050,92 +2050,6 @@ mod tests {
         clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
-    }
-
-    #[tokio::test]
-    async fn auth_status_without_credentials_reports_auth_required() {
-        let config_path = temp_config_path("auth-status-missing");
-        let server_name = format!("oauth-missing-{}", std::process::id());
-        write_oauth_config(&config_path, &[server_name.as_str()]);
-
-        clear_store(&server_name).await;
-
-        let ctx = auth_status_test_context(config_path);
-        let response = dispatch_auth_status(&ctx).await;
-        let IpcResponse::AuthStatus { servers } = response else {
-            panic!("expected auth status response");
-        };
-
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, server_name);
-        assert!(!servers[0].authenticated);
-        assert_eq!(
-            servers[0].health,
-            plug_core::types::ServerHealth::AuthRequired
-        );
-        assert!(servers[0].token_expires_in_secs.is_none());
-        assert!(servers[0].warnings.is_empty());
-
-        clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
-    }
-
-    #[tokio::test]
-    async fn auth_status_with_credentials_and_no_runtime_reports_degraded() {
-        let config_path = temp_config_path("auth-status-degraded");
-        let server_name = format!("oauth-degraded-{}", std::process::id());
-        write_oauth_config(&config_path, &[server_name.as_str()]);
-
-        let store = plug_core::oauth::get_or_create_store(&server_name);
-        clear_store(&server_name).await;
-        store.save(seeded_credentials()).await.unwrap();
-
-        let ctx = auth_status_test_context(config_path);
-        let response = dispatch_auth_status(&ctx).await;
-        let IpcResponse::AuthStatus { servers } = response else {
-            panic!("expected auth status response");
-        };
-
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, server_name);
-        assert!(servers[0].authenticated);
-        assert_eq!(servers[0].health, plug_core::types::ServerHealth::Degraded);
-        assert!(servers[0].token_expires_in_secs.is_some());
-        assert!(servers[0].warnings.is_empty());
-
-        clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
-    }
-
-    #[tokio::test]
-    async fn auth_status_prefers_runtime_auth_required_over_cached_credentials() {
-        let config_path = temp_config_path("auth-status-runtime");
-        let server_name = format!("oauth-runtime-{}", std::process::id());
-        write_oauth_config(&config_path, &[server_name.as_str()]);
-
-        let store = plug_core::oauth::get_or_create_store(&server_name);
-        clear_store(&server_name).await;
-        store.save(seeded_credentials()).await.unwrap();
-
-        let ctx = auth_status_test_context(config_path);
-        ctx.server_manager.mark_auth_required(&server_name);
-
-        let response = dispatch_auth_status(&ctx).await;
-        let IpcResponse::AuthStatus { servers } = response else {
-            panic!("expected auth status response");
-        };
-
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, server_name);
-        assert!(servers[0].authenticated);
-        assert_eq!(
-            servers[0].health,
-            plug_core::types::ServerHealth::AuthRequired
-        );
-        assert!(servers[0].warnings.is_empty());
-
-        clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
