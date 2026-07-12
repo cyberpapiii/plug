@@ -241,6 +241,11 @@ impl ServerHandler for ProxyHandler {
                 let router = Arc::clone(&self.router);
                 let mut rx = self.router.subscribe_notifications();
                 let shutdown = self.shutdown.clone();
+                // This connection's own identity, for fanout::resolve()'s
+                // target match — see plug-core/src/notifications.rs::fanout.
+                let identity = NotificationTarget::Stdio {
+                    client_id: Arc::clone(&client_id),
+                };
                 tokio::spawn(async move {
                     loop {
                         let msg = tokio::select! {
@@ -249,86 +254,80 @@ impl ServerHandler for ProxyHandler {
                             msg = rx.recv() => msg,
                         };
                         match msg {
-                            Ok(ProtocolNotification::ToolListChanged) => {
-                                if let Err(error) = peer.notify_tool_list_changed().await {
-                                    tracing::debug!(
-                                        error = %error,
-                                        "stopping stdio notification fan-out after peer send failure"
-                                    );
-                                    break;
-                                }
-                            }
-                            Ok(ProtocolNotification::ToolListChangedFor { target }) => {
-                                if matches!(
-                                    target,
-                                    NotificationTarget::Stdio { client_id: target_id }
-                                        if target_id == client_id
-                                ) && peer.notify_tool_list_changed().await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Ok(ProtocolNotification::ResourceListChanged) => {
-                                if let Err(error) = peer.notify_resource_list_changed().await {
-                                    tracing::debug!(
-                                        error = %error,
-                                        "stopping stdio notification fan-out after peer send failure"
-                                    );
-                                    break;
-                                }
-                            }
-                            Ok(ProtocolNotification::PromptListChanged) => {
-                                if let Err(error) = peer.notify_prompt_list_changed().await {
-                                    tracing::debug!(
-                                        error = %error,
-                                        "stopping stdio notification fan-out after peer send failure"
-                                    );
-                                    break;
-                                }
-                            }
-                            Ok(ProtocolNotification::Progress { target, params }) => {
-                                if matches!(
-                                    target,
-                                    NotificationTarget::Stdio { client_id: target_id }
-                                        if target_id == client_id
-                                ) && peer.notify_progress(params).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Ok(ProtocolNotification::Cancelled { target, params }) => {
-                                if matches!(
-                                    target,
-                                    NotificationTarget::Stdio { client_id: target_id }
-                                        if target_id == client_id
-                                ) && peer.notify_cancelled(params).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
-                                if matches!(
-                                    target,
-                                    NotificationTarget::Stdio { client_id: target_id }
-                                        if target_id == client_id
-                                ) && peer.notify_resource_updated(params).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Ok(
-                                ref notification @ (ProtocolNotification::LoggingMessage { .. }
-                                | ProtocolNotification::TokenRefreshExchanged {
-                                    ..
-                                }
-                                | ProtocolNotification::AuthStateChanged {
-                                    ..
-                                }),
-                            ) => {
-                                if let Some(params) = notification.as_logging_message_params()
-                                    && peer.notify_logging_message(params).await.is_err()
-                                {
-                                    break;
+                            Ok(notification) => {
+                                // classify -> resolve -> (per-notification-kind delivery below).
+                                // deliver_to() collapses the four `matches!(target,
+                                // NotificationTarget::Stdio {..} if ..)` checks this block used
+                                // to repeat into one shared comparison; it's a no-op (always
+                                // true) for broadcast-shaped notifications.
+                                let deliver = crate::notifications::fanout::resolve(
+                                    crate::notifications::fanout::classify(&notification),
+                                )
+                                .deliver_to(&identity);
+                                match notification {
+                                    ProtocolNotification::ToolListChanged => {
+                                        if let Err(error) = peer.notify_tool_list_changed().await {
+                                            tracing::debug!(
+                                                error = %error,
+                                                "stopping stdio notification fan-out after peer send failure"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    ProtocolNotification::ToolListChangedFor { .. } => {
+                                        if deliver && peer.notify_tool_list_changed().await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    ProtocolNotification::ResourceListChanged => {
+                                        if let Err(error) = peer.notify_resource_list_changed().await
+                                        {
+                                            tracing::debug!(
+                                                error = %error,
+                                                "stopping stdio notification fan-out after peer send failure"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    ProtocolNotification::PromptListChanged => {
+                                        if let Err(error) = peer.notify_prompt_list_changed().await {
+                                            tracing::debug!(
+                                                error = %error,
+                                                "stopping stdio notification fan-out after peer send failure"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    ProtocolNotification::Progress { params, .. } => {
+                                        if deliver && peer.notify_progress(params).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    ProtocolNotification::Cancelled { params, .. } => {
+                                        if deliver && peer.notify_cancelled(params).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    ProtocolNotification::ResourceUpdated { params, .. } => {
+                                        if deliver
+                                            && peer.notify_resource_updated(params).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    ref notification @ (ProtocolNotification::LoggingMessage {
+                                        ..
+                                    }
+                                    | ProtocolNotification::TokenRefreshExchanged { .. }
+                                    | ProtocolNotification::AuthStateChanged { .. }) => {
+                                        if let Some(params) =
+                                            notification.as_logging_message_params()
+                                            && peer.notify_logging_message(params).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

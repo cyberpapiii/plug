@@ -184,6 +184,20 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
+                                // classify -> resolve -> per-notification-kind delivery below.
+                                // Unlike stdio/daemon (one fan-out task per client, comparing
+                                // target to "self"), this task is shared by every HTTP session,
+                                // so a `Targeted` resolution is used to look up which session to
+                                // route to rather than to answer "is this me?". See
+                                // plug-core/src/notifications.rs::fanout.
+                                let resolved_target: Option<NotificationTarget> = match crate::notifications::fanout::resolve(
+                                    crate::notifications::fanout::classify(&notification),
+                                ) {
+                                    crate::notifications::fanout::ResolvedDelivery::Broadcast => None,
+                                    crate::notifications::fanout::ResolvedDelivery::ToTarget(target) => {
+                                        Some(target.clone())
+                                    }
+                                };
                                 match notification {
                                     ProtocolNotification::ToolListChanged => {
                                         if let Some(message) = notification_to_sse_message(
@@ -192,8 +206,8 @@ impl HttpState {
                                             state.sessions.broadcast(message);
                                         }
                                     }
-                                    ProtocolNotification::ToolListChangedFor { target } => {
-                                        if let NotificationTarget::Http { session_id } = target {
+                                    ProtocolNotification::ToolListChangedFor { .. } => {
+                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
                                             let session_key = session_id.to_string();
                                             if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::ToolListChangedFor {
@@ -220,8 +234,8 @@ impl HttpState {
                                             state.sessions.broadcast(message);
                                         }
                                     }
-                                    ProtocolNotification::Progress { target, params } => {
-                                        if let NotificationTarget::Http { session_id } = target {
+                                    ProtocolNotification::Progress { params, .. } => {
+                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
                                             let session_key = session_id.to_string();
                                             if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::Progress {
@@ -235,8 +249,8 @@ impl HttpState {
                                             }
                                         }
                                     }
-                                    ProtocolNotification::Cancelled { target, params } => {
-                                        if let NotificationTarget::Http { session_id } = target {
+                                    ProtocolNotification::Cancelled { params, .. } => {
+                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
                                             let session_key = session_id.to_string();
                                             if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::Cancelled {
@@ -250,8 +264,8 @@ impl HttpState {
                                             }
                                         }
                                     }
-                                    ProtocolNotification::ResourceUpdated { target, params } => {
-                                        if let NotificationTarget::Http { session_id } = target {
+                                    ProtocolNotification::ResourceUpdated { params, .. } => {
+                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
                                             let session_key = session_id.to_string();
                                             if let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::ResourceUpdated {
