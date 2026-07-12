@@ -603,15 +603,13 @@ impl super::ToolRouter {
         request: Option<PaginatedRequestParams>,
     ) -> ListResourcesResult {
         let resources = self.list_resources();
-        paginated_result(
-            &resources,
-            request,
-            |resources, next_cursor| ListResourcesResult {
+        paginated_result(&resources, request, |resources, next_cursor| {
+            ListResourcesResult {
                 meta: None,
                 next_cursor,
                 resources,
-            },
-        )
+            }
+        })
     }
 
     pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
@@ -640,14 +638,12 @@ impl super::ToolRouter {
 
     pub fn list_prompts_page(&self, request: Option<PaginatedRequestParams>) -> ListPromptsResult {
         let prompts = self.list_prompts();
-        paginated_result(
-            &prompts,
-            request,
-            |prompts, next_cursor| ListPromptsResult {
+        paginated_result(&prompts, request, |prompts, next_cursor| {
+            ListPromptsResult {
                 meta: None,
                 next_cursor,
                 prompts,
-            },
-        )
+            }
+        })
     }
 }

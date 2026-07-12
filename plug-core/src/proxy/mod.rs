@@ -1354,9 +1354,19 @@ impl ToolRouter {
             "refreshed tool cache"
         );
 
-        // Build pre-cached filtered views
-        let tools_windsurf = Arc::new(tools.iter().take(100).cloned().collect());
-        let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect());
+        // Build pre-cached filtered views — only when tool filtering is
+        // enabled. `list_tools_for_client_session` (catalog.rs) is the only
+        // reader of these two fields, and it always returns early via
+        // `list_tools()` (which serves `tools_all`) when filtering is
+        // disabled, so these views are provably never read in that case.
+        let (tools_windsurf, tools_copilot) = if self.config.tool_filter_enabled {
+            (
+                Arc::new(tools.iter().take(100).cloned().collect()),
+                Arc::new(tools.iter().take(128).cloned().collect()),
+            )
+        } else {
+            (Arc::new(Vec::new()), Arc::new(Vec::new()))
+        };
         let tools_all = Arc::new(tools);
 
         let mut resource_routes = HashMap::new();
