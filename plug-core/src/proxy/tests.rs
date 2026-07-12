@@ -1330,14 +1330,12 @@ fn resource_subscription_registry_lifecycle() {
     };
 
     // Registry starts empty
-    assert!(router.resource_subscriptions.is_empty());
+    assert_eq!(router.resource_subscriptions.len(), 0);
 
     // Insert directly (bypassing upstream check for unit test)
     router
         .resource_subscriptions
-        .entry("file:///test".to_string())
-        .or_default()
-        .insert(target.clone());
+        .insert_active_for_test("file:///test", target.clone());
     assert_eq!(router.resource_subscriptions.len(), 1);
 
     // Route notification should publish to subscriber

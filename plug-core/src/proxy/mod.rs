@@ -171,7 +171,9 @@ pub struct ToolRouter {
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
     artifact_store: ArtifactStore,
     /// Resource subscription registry: upstream URI → set of downstream subscribers.
-    resource_subscriptions: DashMap<String, HashSet<NotificationTarget>>,
+    /// Owns the atomic subscribe/unsubscribe state machine — see
+    /// `subscriptions::SubscriptionRegistry` for the invariants.
+    resource_subscriptions: Arc<subscriptions::SubscriptionRegistry>,
     /// Cached downstream roots per client. Upstream servers see the union via `list_roots_union()`.
     client_roots: DashMap<NotificationTarget, Vec<Root>>,
     /// Per-client bridge for forwarding reverse requests (elicitation, sampling).
@@ -384,7 +386,7 @@ impl ToolRouter {
             pending_prompt_list_changed: AtomicBool::new(false),
             engine: std::sync::RwLock::new(None),
             artifact_store: ArtifactStore::new(),
-            resource_subscriptions: DashMap::new(),
+            resource_subscriptions: subscriptions::SubscriptionRegistry::new(),
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
@@ -1027,6 +1029,7 @@ impl ToolRouter {
 
     /// Set the Engine reference for session recovery.
     pub fn set_engine(&self, engine: Weak<Engine>) {
+        self.resource_subscriptions.set_engine(engine.clone());
         let mut guard = self
             .engine
             .write()
@@ -1462,93 +1465,29 @@ impl ToolRouter {
 
         let tool_count = tools_all.len();
 
-        // Collect new resource URIs before moving resource_routes into the snapshot.
-        let new_resource_uris: HashSet<&String> = resource_routes.keys().collect();
-
-        // Identify stale subscriptions:
-        // 1. URIs removed from the new route cache entirely -> prune + unsubscribe old server
-        // 2. URIs still present but routed to a different server -> unsubscribe old, subscribe new
-        let mut stale_unsubscribes: Vec<(String, String)> = Vec::new();
-        let mut rebind_subscriptions: Vec<(String, String, String, Vec<NotificationTarget>)> =
-            Vec::new();
-        {
+        // Classify every currently-tracked subscription URI against the
+        // old/new route snapshots. Pure decision — no registry mutation, no
+        // upstream calls yet. See `SubscriptionRegistry::classify_route_changes`
+        // for the exact rebind/prune criteria (unchanged from the historical
+        // inline `retain` closure this replaced).
+        let reconciliation = {
             let old_snapshot = self.cache.load();
-            self.resource_subscriptions.retain(|uri, subscribers| {
-                match old_snapshot.resource_routes.get(uri) {
-                    Some(old_server_id) => {
-                        if let Some(new_server_id) = resource_routes.get(uri) {
-                            if old_server_id == new_server_id {
-                                true
-                            } else {
-                                rebind_subscriptions.push((
-                                    uri.clone(),
-                                    old_server_id.clone(),
-                                    new_server_id.clone(),
-                                    subscribers.iter().cloned().collect(),
-                                ));
-                                tracing::debug!(
-                                    uri = %uri,
-                                    old_server = %old_server_id,
-                                    new_server = %new_server_id,
-                                    "rebinding resource subscription after route refresh"
-                                );
-                                true
-                            }
-                        } else {
-                            stale_unsubscribes.push((uri.clone(), old_server_id.clone()));
-                            tracing::debug!(
-                                uri = %uri,
-                                "pruning stale resource subscription after route refresh"
-                            );
-                            false
-                        }
-                    }
-                    None => {
-                        if new_resource_uris.contains(uri) {
-                            true
-                        } else {
-                            tracing::debug!(
-                                uri = %uri,
-                                "pruning orphaned resource subscription with no route mapping"
-                            );
-                            false
-                        }
-                    }
-                }
-            });
-        }
-
-        let make_unsubscribe = |uri: &str| {
-            serde_json::from_value::<UnsubscribeRequestParams>(serde_json::json!({ "uri": uri }))
-                .expect("UnsubscribeRequestParams from known-good JSON")
+            self.resource_subscriptions
+                .classify_route_changes(&old_snapshot.resource_routes, &resource_routes)
         };
 
-        let supports_subscribe = |upstream: &Arc<crate::server::UpstreamServer>| {
-            upstream
-                .capabilities
-                .resources
-                .as_ref()
-                .and_then(|r| r.subscribe)
-                .unwrap_or(false)
-        };
-
-        let mut rebind_failures: Vec<String> = Vec::new();
-
-        // Send upstream unsubscribes for pruned URIs (best-effort).
-        for (uri, server_id) in stale_unsubscribes {
-            if let Some(upstream) = self.server_manager.get_upstream(&server_id)
-                && let Err(error) = upstream
-                    .client
-                    .peer()
-                    .unsubscribe(make_unsubscribe(&uri))
-                    .await
-            {
-                tracing::warn!(
-                    uri = %uri,
-                    server_id = %server_id,
-                    error = %error,
-                    "failed to unsubscribe stale resource during route refresh"
-                );
+        // Execute prunes for URIs that lost their route entirely
+        // (best-effort upstream unsubscribe) before publishing the new
+        // snapshot — same ordering as the historical stale-unsubscribe pass.
+        for item in &reconciliation {
+            if let subscriptions::RouteReconciliation::Prune { uri, old_server_id } = item {
+                let upstream = old_server_id
+                    .as_deref()
+                    .and_then(|server_id| self.server_manager.get_upstream(server_id))
+                    .map(subscriptions::as_upstream_ops);
+                self.resource_subscriptions
+                    .prune(uri, old_server_id.as_deref(), upstream)
+                    .await;
             }
         }
 
@@ -1571,77 +1510,39 @@ impl ToolRouter {
             let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
         }
 
-        // Rebind subscriptions whose URI still exists but ownership changed.
-        for (uri, old_server_id, new_server_id, subscribers) in rebind_subscriptions {
-            let mut old_unsubscribe_failed = false;
-            if let Some(old_upstream) = self.server_manager.get_upstream(&old_server_id)
-                && let Err(error) = old_upstream
-                    .client
-                    .peer()
-                    .unsubscribe(make_unsubscribe(&uri))
-                    .await
+        // Rebind subscriptions whose URI still exists but ownership changed,
+        // after publishing the new snapshot (same ordering as before).
+        for item in &reconciliation {
+            if let subscriptions::RouteReconciliation::Rebind {
+                uri,
+                old_server_id,
+                new_server_id,
+            } = item
             {
-                tracing::warn!(
-                    uri = %uri,
-                    server_id = %old_server_id,
-                    error = %error,
-                    "failed to unsubscribe old resource owner during route refresh; skipping rebind to avoid dual subscription"
-                );
-                old_unsubscribe_failed = true;
+                let old_upstream = self
+                    .server_manager
+                    .get_upstream(old_server_id)
+                    .map(subscriptions::as_upstream_ops);
+                let new_owner = match self.server_manager.get_upstream(new_server_id) {
+                    None => Err(subscriptions::RebindSkipReason::NewOwnerMissing),
+                    Some(upstream) => {
+                        let supports_subscribe = upstream
+                            .capabilities
+                            .resources
+                            .as_ref()
+                            .and_then(|r| r.subscribe)
+                            .unwrap_or(false);
+                        if supports_subscribe {
+                            Ok(subscriptions::as_upstream_ops(upstream))
+                        } else {
+                            Err(subscriptions::RebindSkipReason::NewOwnerNoSubscribeSupport)
+                        }
+                    }
+                };
+                self.resource_subscriptions
+                    .rebind(uri, old_server_id, old_upstream, new_server_id, new_owner)
+                    .await;
             }
-
-            if old_unsubscribe_failed {
-                // Don't subscribe the new owner while the old one may still be
-                // delivering updates — this would cause duplicate notifications.
-                rebind_failures.push(uri);
-                continue;
-            }
-
-            let Some(new_upstream) = self.server_manager.get_upstream(&new_server_id) else {
-                tracing::warn!(
-                    uri = %uri,
-                    server_id = %new_server_id,
-                    "new resource owner missing during route refresh; pruning local subscribers"
-                );
-                rebind_failures.push(uri);
-                continue;
-            };
-
-            if !supports_subscribe(&new_upstream) {
-                tracing::warn!(
-                    uri = %uri,
-                    server_id = %new_server_id,
-                    "new resource owner does not support subscriptions; pruning local subscribers"
-                );
-                rebind_failures.push(uri);
-                continue;
-            }
-
-            if let Err(error) = new_upstream
-                .client
-                .peer()
-                .subscribe(SubscribeRequestParams::new(&uri))
-                .await
-            {
-                tracing::warn!(
-                    uri = %uri,
-                    server_id = %new_server_id,
-                    error = %error,
-                    "failed to resubscribe resource on new owner during route refresh"
-                );
-                rebind_failures.push(uri);
-                continue;
-            }
-
-            // Ensure the local registry still reflects the current subscribers after the rebind.
-            self.resource_subscriptions
-                .insert(uri, subscribers.into_iter().collect());
-        }
-
-        // If a rebind failed, prune the local subscription entry so the registry
-        // does not claim a live subscription that no upstream owns.
-        for uri in rebind_failures {
-            self.resource_subscriptions.remove(&uri);
         }
     }
 
