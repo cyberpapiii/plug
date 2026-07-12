@@ -479,10 +479,9 @@ fn parse_artifact_uri(uri: &str) -> Option<ArtifactRequest> {
     let (id, suffix) = rest.split_once('/')?;
     let kind = if suffix == "manifest" {
         ArtifactRequestKind::Manifest
-    } else if let Some(chunk) = suffix.strip_prefix("chunk/") {
-        ArtifactRequestKind::Chunk(chunk.parse().ok()?)
     } else {
-        return None;
+        let chunk = suffix.strip_prefix("chunk/")?;
+        ArtifactRequestKind::Chunk(chunk.parse().ok()?)
     };
     Some(ArtifactRequest {
         id: id.to_string(),

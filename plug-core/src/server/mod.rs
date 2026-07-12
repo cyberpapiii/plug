@@ -771,7 +771,7 @@ impl ServerManager {
     /// last-known-good cache — is dropped.
     pub(crate) fn update_availability(&self, degraded: &BTreeSet<String>) {
         let servers = self.servers.load();
-        for (name, _) in servers.iter() {
+        for name in servers.keys() {
             let routable = self
                 .health
                 .get(name)
