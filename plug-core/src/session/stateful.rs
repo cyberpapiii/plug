@@ -583,11 +583,12 @@ mod tests {
 
     #[test]
     fn expired_count_does_not_underflow_when_map_grows_during_retain() {
-        // Mirrors the cleanup task's `before - sessions.len()` arithmetic: a
-        // concurrent insert racing `retain()` can leave the post-retain count
-        // greater than the pre-retain count. The fixed formula must saturate
-        // to 0 instead of underflowing (a panic with overflow-checks on, a
-        // huge wrapped value in release builds).
+        // Mirrors the cleanup task's pre-fix subtraction of the post-retain
+        // count from the pre-retain count: a concurrent insert racing
+        // `retain()` can leave the post-retain count greater than the
+        // pre-retain count. The fixed formula must saturate to 0 instead of
+        // underflowing (a panic with overflow-checks on, a huge wrapped
+        // value in release builds).
         let before: usize = 1;
         let after_growth: usize = 4;
         assert_eq!(before.saturating_sub(after_growth), 0);
