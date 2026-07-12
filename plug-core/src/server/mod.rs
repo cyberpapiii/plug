@@ -1583,7 +1583,11 @@ impl ServerManager {
         // old-generation upstream (child process, HTTP connection, OAuth
         // refresh timer) outlives the engine reporting shutdown complete.
         // Bounded: a wedged retirement must not hang shutdown forever.
-        let _ = self.shutdown_signal.send(true);
+        // send_replace (not send): watch's send fails and does NOT store the
+        // value when no receivers exist — the common case, since receivers
+        // only exist while grace tasks are pending. The latch must still be
+        // observable by a grace task spawned by a replace_server racing us.
+        self.shutdown_signal.send_replace(true);
         {
             let mut retire_tasks = self.retire_tasks.lock().await;
             let bounded_join = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3059,6 +3063,23 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(20), mgr.shutdown_all())
             .await
             .expect("shutdown_all must return once its 5s bound elapses, not hang forever");
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_latches_even_with_no_pending_retirements() {
+        let mgr = ServerManager::new();
+
+        // No grace tasks pending, so no watch receivers exist. watch's plain
+        // send() fails and does NOT store the value in that state; the latch
+        // must use send_replace so a grace task spawned by a replace_server
+        // racing shutdown (subscribing after this point) still observes true.
+        mgr.shutdown_all().await;
+
+        assert!(
+            *mgr.shutdown_signal.subscribe().borrow(),
+            "shutdown latch must read true for late subscribers even when no \
+             receivers existed at shutdown time"
+        );
     }
 
     #[test]
