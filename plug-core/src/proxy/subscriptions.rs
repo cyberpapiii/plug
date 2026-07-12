@@ -654,6 +654,20 @@ impl SubscriptionRegistry {
     /// snapshot pair. Pure decision pass — no registry mutation, no
     /// upstream calls. Emits the same debug logs the old inline `retain`
     /// closure did, at the same point in the decision.
+    ///
+    /// When the URI still has a route in the new snapshot, the "old" side
+    /// of the comparison is the entry's recorded `owner_server_id` — the
+    /// server that last *confirmed* holding the upstream subscription — in
+    /// preference to whatever the old route snapshot said. An entry can be
+    /// created inside a refresh pass's classify→publish window (a first
+    /// subscriber resolving the still-published old snapshot) and end up
+    /// owned by a server the new snapshot no longer routes the URI to;
+    /// pure old-vs-new route diffing would compare identical snapshots on
+    /// every later refresh and never reconcile it. Entries whose owner is
+    /// not yet confirmed (`None`, transition in flight) keep the plain
+    /// route-diff behavior — no false rebinds for in-flight subscribes.
+    /// Route-vanished URIs prune exactly as before; the drain resolves the
+    /// recorded owner itself.
     pub(super) fn classify_route_changes(
         &self,
         old_routes: &HashMap<String, String>,
@@ -662,10 +676,15 @@ impl SubscriptionRegistry {
         let mut out = Vec::new();
         for item in self.entries.iter() {
             let uri = item.key();
-            match old_routes.get(uri) {
-                Some(old_server_id) => match new_routes.get(uri) {
-                    Some(new_server_id) if new_server_id == old_server_id => {}
-                    Some(new_server_id) => {
+            match new_routes.get(uri) {
+                Some(new_server_id) => {
+                    let old_side = match &item.value().owner_server_id {
+                        Some(owner) => Some(owner),
+                        None => old_routes.get(uri),
+                    };
+                    if let Some(old_server_id) = old_side
+                        && old_server_id != new_server_id
+                    {
                         tracing::debug!(
                             uri = %uri,
                             old_server = %old_server_id,
@@ -678,7 +697,9 @@ impl SubscriptionRegistry {
                             new_server_id: new_server_id.clone(),
                         });
                     }
-                    None => {
+                }
+                None => match old_routes.get(uri) {
+                    Some(old_server_id) => {
                         tracing::debug!(
                             uri = %uri,
                             "pruning stale resource subscription after route refresh"
@@ -688,9 +709,7 @@ impl SubscriptionRegistry {
                             old_server_id: Some(old_server_id.clone()),
                         });
                     }
-                },
-                None => {
-                    if !new_routes.contains_key(uri) {
+                    None => {
                         tracing::debug!(
                             uri = %uri,
                             "pruning orphaned resource subscription with no route mapping"
@@ -700,7 +719,7 @@ impl SubscriptionRegistry {
                             old_server_id: None,
                         });
                     }
-                }
+                },
             }
         }
         out
