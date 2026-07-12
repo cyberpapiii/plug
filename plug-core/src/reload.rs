@@ -201,7 +201,7 @@ fn note_restart_required(restart_required: &mut Vec<String>, changed: bool, sett
 }
 
 /// Check if a server config has materially changed (requiring restart).
-fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
+pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
     old.command != new.command
         || old.args != new.args
         || old.env != new.env

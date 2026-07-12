@@ -1775,7 +1775,11 @@ impl ServerManager {
     }
 }
 
-async fn retire_upstream_owned(name: String, upstream_arc: Arc<UpstreamServer>, reason: &str) {
+pub(crate) async fn retire_upstream_owned(
+    name: String,
+    upstream_arc: Arc<UpstreamServer>,
+    reason: &str,
+) {
     upstream_arc.client.cancellation_token().cancel();
 
     match Arc::try_unwrap(upstream_arc) {
