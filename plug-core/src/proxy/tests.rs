@@ -1185,6 +1185,24 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
     assert!(second.next_cursor.is_none());
 }
 
+#[test]
+fn paginated_result_returns_mid_cursor_page_from_borrowed_slice() {
+    // `paginated_result` now takes `&[T]` instead of an owned `Vec<T>`; this
+    // pins that a mid-cursor page sliced from a borrowed input still returns
+    // the same items and next_cursor as the old owned-Vec implementation.
+    let items: Vec<i32> = (0..750).collect();
+
+    let mut request = PaginatedRequestParams::default();
+    request.cursor = Some("500".to_string());
+
+    let (page, next_cursor) = paginated_result(&items, Some(request), |page, next_cursor| {
+        (page, next_cursor)
+    });
+
+    assert_eq!(page, items[500..750].to_vec());
+    assert!(next_cursor.is_none());
+}
+
 #[tokio::test]
 async fn route_upstream_progress_publishes_targeted_notification() {
     let sm = Arc::new(ServerManager::new());
