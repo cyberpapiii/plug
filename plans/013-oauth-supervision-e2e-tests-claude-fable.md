@@ -123,6 +123,23 @@ in the test module comment.
 > 014's paused/mocked-time work removes; re-attempt this step only after 014
 > lands. Step 3 was executed and merged separately (see the in-code deferral
 > note atop the new test section in `plug-core/tests/integration_tests.rs`).
+>
+> **Final adjudication (2026-07-12, after plan 014 landed): step 2 is NOT
+> achievable as a tests-only change — do not re-attempt under this plan.**
+> Plan 014's landed scope (paused time for in-memory-only test sleeps) does
+> not unblock it, for two verified reasons: (1) refresh scheduling is
+> SystemTime-based — `token_needs_refresh` / `time_until_refresh_window`
+> take unix-second timestamps (`plug-core/src/oauth.rs:85,105`, consumed by
+> the engine refresh loop at `plug-core/src/engine.rs:907`) — so paused
+> tokio time cannot accelerate it, and the flow crosses real HTTP sockets,
+> where paused time causes spurious timeouts (the exact reason plan 014
+> classified real-I/O sites as non-convertible); (2) `MIN_EXPIRES_IN = 60`
+> (`oauth.rs:35`) plus the 50% short-lived rule puts two observed refresh
+> windows at ≥60s wall clock, past this plan's own ~15s STOP threshold.
+> Prerequisite for any future attempt: a separate, small production-side
+> plan making the refresh scheduler's clock injectable (or the expiry floor
+> test-configurable); only then does a refresh-under-load e2e become
+> writable within budget.
 
 New test `test_oauth_refresh_under_load_no_auth_errors` (take
 `oauth_integration_test_lock`):
