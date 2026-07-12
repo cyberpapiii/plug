@@ -49,6 +49,14 @@ struct TaskRecord {
     abort_handle: Option<JoinHandle<()>>,
     upstream: Option<TaskUpstreamRef>,
     last_touched: Instant,
+    /// Set by `mark_cancelled` when a cancellation arrives before the
+    /// dispatching task has recorded an upstream request/task ref (i.e.
+    /// there's nothing yet to forward a cancel notification to). Consumed by
+    /// `set_upstream_request` once the ref lands, so the cancel is replayed
+    /// upstream instead of silently dropped. Mirrors the foreground
+    /// `pending_cancel_reason` guard in `proxy/mod.rs`'s
+    /// `attach_upstream_request_id`.
+    pending_cancel_reason: Option<String>,
 }
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
@@ -92,6 +100,7 @@ impl TaskStore {
                 abort_handle: None,
                 upstream: None,
                 last_touched: Instant::now(),
+                pending_cancel_reason: None,
             },
         );
 
@@ -105,11 +114,24 @@ impl TaskStore {
         }
     }
 
-    pub fn set_upstream_request(&mut self, task_id: &str, upstream: TaskUpstreamRef) {
+    /// Records the upstream request/task ref for a task once dispatch has it
+    /// in flight. If a cancellation arrived while the ref was still unset
+    /// (see `mark_cancelled`), returns the pending cancel reason so the
+    /// caller can replay `notify_cancelled` upstream now that there's a
+    /// request id to target — otherwise the cancel would be silently
+    /// dropped, and the upstream would run the call to completion for a
+    /// result nobody wants.
+    pub fn set_upstream_request(
+        &mut self,
+        task_id: &str,
+        upstream: TaskUpstreamRef,
+    ) -> Option<String> {
         if let Some(record) = self.tasks.get_mut(task_id) {
             record.upstream = Some(upstream);
             record.last_touched = Instant::now();
+            return record.pending_cancel_reason.take();
         }
+        None
     }
 
     pub fn create_passthrough(
@@ -138,6 +160,7 @@ impl TaskStore {
                 abort_handle: None,
                 upstream: Some(upstream),
                 last_touched: Instant::now(),
+                pending_cancel_reason: None,
             },
         );
 
@@ -202,11 +225,17 @@ impl TaskStore {
             record.result = None;
             record.last_touched = Instant::now();
 
-            (
-                record.task.clone(),
-                record.upstream.take(),
-                record.abort_handle.take(),
-            )
+            let upstream = record.upstream.take();
+            if upstream.is_none() {
+                // Dispatch hasn't recorded an upstream request/task ref yet —
+                // there's nothing to send `notify_cancelled` to right now.
+                // Stash the reason so `set_upstream_request` can replay it
+                // once the ref lands, instead of the upstream call running to
+                // completion for a result nobody wants.
+                record.pending_cancel_reason = Some("task cancelled".to_string());
+            }
+
+            (record.task.clone(), upstream, record.abort_handle.take())
         };
         self.enforce_owner_completed_retention();
         Ok((task, upstream, handle))
@@ -559,5 +588,75 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn set_upstream_request_replays_a_cancel_that_arrived_before_it() {
+        // Regression guard for the task-cancellation window: if a task is
+        // cancelled before dispatch has recorded an upstream request ref,
+        // `mark_cancelled` has no ref to forward `notify_cancelled` to and
+        // used to drop the cancellation on the floor — the upstream would
+        // run the call to completion for a result nobody wants. The fix
+        // stashes a pending-cancel reason on the record and replays it via
+        // `set_upstream_request`'s return value once the ref lands.
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
+        let task = store.create(owner.clone(), "Mock__echo");
+
+        // Cancel arrives first — no upstream ref has been set yet.
+        let (cancelled_task, upstream, _handle) = store
+            .mark_cancelled(&owner, &task.task_id)
+            .expect("cancel task with no upstream ref yet");
+        assert_eq!(cancelled_task.status, TaskStatus::Cancelled);
+        assert!(
+            upstream.is_none(),
+            "no upstream ref should have been recorded yet"
+        );
+
+        // Dispatch now records the upstream ref (as it would right after
+        // `send_cancellable_request` succeeds) — this must report the
+        // pending cancel so the caller can replay `notify_cancelled`.
+        let pending = store.set_upstream_request(
+            &task.task_id,
+            TaskUpstreamRef::Request {
+                server_id: "mock".to_string(),
+                request_id: rmcp::model::RequestId::Number(1),
+            },
+        );
+        assert_eq!(
+            pending,
+            Some("task cancelled".to_string()),
+            "expected the stashed cancel reason to be replayed"
+        );
+
+        // The pending reason is consumed, not sticky — a second call must
+        // not re-report a cancel that was already replayed.
+        let pending_again = store.set_upstream_request(
+            &task.task_id,
+            TaskUpstreamRef::Request {
+                server_id: "mock".to_string(),
+                request_id: rmcp::model::RequestId::Number(2),
+            },
+        );
+        assert_eq!(pending_again, None);
+    }
+
+    #[test]
+    fn set_upstream_request_reports_no_pending_cancel_for_the_ordinary_path() {
+        // Sanity check for the ordinary (non-cancelled) dispatch path: no
+        // cancel arrived, so recording the upstream ref must not fabricate
+        // a pending-cancel reason.
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
+        let task = store.create(owner, "Mock__echo");
+
+        let pending = store.set_upstream_request(
+            &task.task_id,
+            TaskUpstreamRef::Request {
+                server_id: "mock".to_string(),
+                request_id: rmcp::model::RequestId::Number(1),
+            },
+        );
+        assert_eq!(pending, None);
     }
 }
