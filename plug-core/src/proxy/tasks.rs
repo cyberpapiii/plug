@@ -258,8 +258,68 @@ impl super::ToolRouter {
             .await
     }
 
+    /// Tears down every task record owned by `owner` — HTTP session
+    /// `DELETE`, HTTP idle-session expiry, and IPC/daemon client disconnect
+    /// all funnel through this.
+    ///
+    /// This stops execution, not just bookkeeping: any still-running locally
+    /// spawned task future is aborted (dropping a `JoinHandle` only detaches
+    /// it — the future keeps running and holding its server's
+    /// `max_concurrent` semaphore permit), and any outstanding upstream
+    /// task/request is sent a best-effort cancellation so a task-capable
+    /// upstream also stops instead of completing the call for a result
+    /// nobody will ever collect.
+    ///
+    /// Mirrors the cancellation-forwarding branches in `cancel_task_for_owner`,
+    /// minus the store sync-back — the records are already gone by the time
+    /// cancellation is forwarded, so there is nothing left to update. Errors
+    /// notifying any one upstream are ignored and never skip the rest.
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
-        self.task_store.lock().await.cleanup_owner(owner);
+        let drained = self.task_store.lock().await.cleanup_owner(owner);
+
+        for (upstream, handle) in drained {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+
+            let Some(upstream) = upstream else {
+                continue;
+            };
+            match upstream {
+                TaskUpstreamRef::Task {
+                    server_id,
+                    task_id: upstream_task_id,
+                } => {
+                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                        let _ = server
+                            .client
+                            .peer()
+                            .send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+                                CancelTaskParams {
+                                    meta: None,
+                                    task_id: upstream_task_id,
+                                },
+                            )))
+                            .await;
+                    }
+                }
+                TaskUpstreamRef::Request {
+                    server_id,
+                    request_id,
+                } => {
+                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
+                        let _ = server
+                            .client
+                            .peer()
+                            .notify_cancelled(CancelledNotificationParam {
+                                request_id,
+                                reason: Some("task owner disconnected".to_string()),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
     }
 
     /// Count of task records currently stored for `owner`. Tasks are
@@ -272,6 +332,24 @@ impl super::ToolRouter {
             .list_for_owner(owner, None)
             .tasks
             .len()
+    }
+
+    /// Creates a task record for `owner` with `handle` attached as its abort
+    /// handle, without going through a real upstream call. Exists as a test
+    /// probe so cross-module teardown tests (e.g. the HTTP `DELETE /mcp`
+    /// tests in `http::server`) can prove a still-running task is actually
+    /// aborted by teardown, not just that its record disappears.
+    #[cfg(test)]
+    pub(crate) async fn attach_test_task_with_abort_handle(
+        &self,
+        owner: TaskOwner,
+        name: &str,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Task {
+        let mut store = self.task_store.lock().await;
+        let task = store.create(owner, name);
+        store.attach_abort_handle(&task.task_id, handle);
+        task
     }
 
     pub async fn cancel_task_for_owner(
@@ -523,5 +601,136 @@ impl super::ToolRouter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    fn test_router_config() -> RouterConfig {
+        RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            meta_tool_mode: false,
+            lazy_tools: LazyToolsConfig::default(),
+            tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Drop guard that flips a flag when the future holding it stops
+    /// running — this is how the tests below prove an aborted task's future
+    /// actually stopped executing, rather than merely proving its store
+    /// record disappeared.
+    struct AbortObserver(Arc<AtomicBool>);
+
+    impl Drop for AbortObserver {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Polls `flag` for up to two seconds, since `JoinHandle::abort()` only
+    /// requests cancellation — the aborted future is actually dropped the
+    /// next time the runtime polls/schedules it, which is inherently async
+    /// relative to the call to `abort()`.
+    async fn assert_flag_eventually(flag: &Arc<AtomicBool>, what: &str) {
+        for _ in 0..200 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{what} did not stop within the bounded poll window");
+    }
+
+    async fn assert_owner_teardown_aborts_long_running_local_task(owner: TaskOwner) {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observer = AbortObserver(Arc::clone(&dropped));
+        let handle = tokio::spawn(async move {
+            let _observer = observer;
+            // Never resolves on its own — only `abort()` can stop it, just
+            // like a real `execute_tool_task` future parked on
+            // `await_response()` for an upstream that never replies.
+            std::future::pending::<()>().await;
+        });
+
+        {
+            let mut store = router.task_store.lock().await;
+            let task = store.create(owner.clone(), "long_running_tool");
+            store.attach_abort_handle(&task.task_id, handle);
+        }
+
+        assert_eq!(router.task_count_for_owner(&owner).await, 1);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "task must still be running before teardown"
+        );
+
+        router.cleanup_tasks_for_owner(&owner).await;
+
+        assert_eq!(
+            router.task_count_for_owner(&owner).await,
+            0,
+            "teardown must remove the task record"
+        );
+        assert_flag_eventually(&dropped, "aborted local task future").await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_tasks_for_owner_aborts_long_running_local_task_for_http_session() {
+        let owner = ToolRouter::task_owner_for_http_session("session-abort-http");
+        assert_owner_teardown_aborts_long_running_local_task(owner).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_tasks_for_owner_aborts_long_running_local_task_for_ipc_client() {
+        // IPC/daemon disconnect and HTTP session teardown both funnel
+        // through the same `cleanup_tasks_for_owner` — the owner key is the
+        // only thing that differs (`ipc:<client_id>` vs `http:<session_id>`)
+        // — so this is the shared-layer proof for the daemon teardown path.
+        let owner = ToolRouter::task_owner_for_ipc_client("client-abort-ipc");
+        assert_owner_teardown_aborts_long_running_local_task(owner).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_tasks_for_owner_ignores_other_owners_running_tasks() {
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(sm, test_router_config());
+        let owner_a = ToolRouter::task_owner_for_http_session("session-a");
+        let owner_b = ToolRouter::task_owner_for_http_session("session-b");
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observer = AbortObserver(Arc::clone(&dropped));
+        let handle = tokio::spawn(async move {
+            let _observer = observer;
+            std::future::pending::<()>().await;
+        });
+
+        {
+            let mut store = router.task_store.lock().await;
+            let task = store.create(owner_b.clone(), "long_running_tool");
+            store.attach_abort_handle(&task.task_id, handle);
+        }
+
+        router.cleanup_tasks_for_owner(&owner_a).await;
+
+        // Give the runtime a moment to run anything it might (incorrectly)
+        // have scheduled for abort before asserting it never happened.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "teardown for a different owner must not touch this task"
+        );
+        assert_eq!(router.task_count_for_owner(&owner_b).await, 1);
     }
 }

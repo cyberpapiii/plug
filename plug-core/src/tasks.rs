@@ -266,8 +266,33 @@ impl TaskStore {
         Ok(())
     }
 
-    pub fn cleanup_owner(&mut self, owner: &TaskOwner) {
-        self.tasks.retain(|_, record| &record.owner != owner);
+    /// Drains every task record owned by `owner` and returns the live parts
+    /// (`abort_handle`, `upstream`) each one held, so the caller can actually
+    /// stop execution instead of just discarding the bookkeeping record.
+    ///
+    /// A dropped `JoinHandle` detaches its task rather than stopping it, and
+    /// a dropped `TaskUpstreamRef` means no cancellation is ever sent
+    /// upstream — so returning these parts (instead of letting them drop
+    /// here) is what lets the caller abort local execution and forward
+    /// cancellation upstream. Already-terminal records naturally yield
+    /// `(None, None)` since `complete`/`fail`/`mark_cancelled` already clear
+    /// both fields, so they no-op for the caller.
+    pub fn cleanup_owner(
+        &mut self,
+        owner: &TaskOwner,
+    ) -> Vec<(Option<TaskUpstreamRef>, Option<JoinHandle<()>>)> {
+        let owned_ids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, record)| &record.owner == owner)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+
+        owned_ids
+            .into_iter()
+            .filter_map(|task_id| self.tasks.remove(&task_id))
+            .map(|record| (record.upstream, record.abort_handle))
+            .collect()
     }
 
     pub fn list_for_owner(
@@ -553,6 +578,66 @@ mod tests {
 
         assert!(store.get_info_for_owner(&owner_a, &task_a.task_id).is_err());
         assert!(store.get_info_for_owner(&owner_b, &task_b.task_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_owner_returns_live_parts_so_the_caller_can_stop_execution() {
+        // `cleanup_owner` must hand back the abort handle and upstream ref it
+        // is about to drop, not silently discard them — a bare `retain`
+        // would drop a still-running `JoinHandle` (which detaches rather
+        // than stops it) and the upstream ref (so no cancel is ever sent).
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
+
+        let running = store.create(owner.clone(), "Mock__echo");
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        store.attach_abort_handle(&running.task_id, handle);
+        let pending = store.set_upstream_request(
+            &running.task_id,
+            TaskUpstreamRef::Request {
+                server_id: "mock".to_string(),
+                request_id: rmcp::model::RequestId::Number(1),
+            },
+        );
+        assert_eq!(pending, None);
+
+        let completed = store.create(owner.clone(), "Mock__echo");
+        store.complete(&completed.task_id, serde_json::json!({"ok": true}));
+
+        let mut drained = store.cleanup_owner(&owner);
+        assert_eq!(drained.len(), 2);
+
+        // Order isn't part of the contract; sort by whether an upstream ref
+        // is present so the assertions below are deterministic.
+        drained.sort_by_key(|(upstream, _)| upstream.is_none());
+
+        let (running_upstream, running_handle) = drained.remove(0);
+        assert!(
+            matches!(running_upstream, Some(TaskUpstreamRef::Request { .. })),
+            "still-running task's upstream ref must be returned, not dropped"
+        );
+        let running_handle = running_handle.expect("still-running task's handle must be returned");
+        running_handle.abort();
+        assert!(running_handle.await.unwrap_err().is_cancelled());
+
+        let (completed_upstream, completed_handle) = drained.remove(0);
+        assert!(
+            completed_upstream.is_none(),
+            "completed task has no upstream ref left to forward"
+        );
+        assert!(
+            completed_handle.is_none(),
+            "completed task has no abort handle left to abort"
+        );
+
+        assert!(store.get_info_for_owner(&owner, &running.task_id).is_err());
+        assert!(
+            store
+                .get_info_for_owner(&owner, &completed.task_id)
+                .is_err()
+        );
     }
 
     #[test]
