@@ -1069,6 +1069,19 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                     }
+                    reverse = async {
+                        if let Some(ref mut rx) = ctx.reverse_request_rx {
+                            rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        if let Some((reverse_req, resp_tx)) = reverse {
+                            handle_reverse_request(reader, writer, reverse_req, resp_tx).await?;
+                        } else {
+                            ctx.reverse_request_rx = None;
+                        }
+                    }
                     result = reader.next() => break 'select result,
                 }
             }
@@ -4124,6 +4137,131 @@ mod tests {
             text.contains("Called") && text.contains("ipc-hello"),
             "unexpected echo payload: {payload}"
         );
+    }
+
+    /// Bug 4 regression: an elicitation/sampling request arriving on
+    /// `ctx.reverse_request_rx` while a registered connection is idle (no
+    /// request currently being dispatched) must reach the client without the
+    /// client sending another frame first — pre-fix, the registered-idle
+    /// `select!` had no arm for `reverse_request_rx`, so the request would
+    /// hang until the next client-initiated request happened to service it.
+    ///
+    /// This injects directly into a hand-built reverse-request channel
+    /// (mirroring `daemon_bridge_rejects_elicitation_without_capability`)
+    /// rather than driving it through a real task-wrapped tool call: the
+    /// background-task dispatch path (`execute_tool_task` in
+    /// `plug-core/src/proxy/tasks.rs`) doesn't register into `active_calls`,
+    /// so upstream-triggered reverse-request routing for it is a separate
+    /// concern from the idle-select servicing arm this test targets.
+    #[tokio::test]
+    async fn idle_registered_connection_services_reverse_request_without_new_client_frame() {
+        let config = plug_core::config::Config::default();
+        let engine = Arc::new(Engine::new(config));
+        engine.start().await.expect("engine start");
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/plug-ipc-idle-reverse-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
+        let cancel = CancellationToken::new();
+
+        let (client_registry, _count_rx) = ClientRegistry::new();
+        let session_id = "idle-reverse-session".to_string();
+
+        // Pre-seed `session_id` and a hand-built reverse-request channel
+        // directly on the initial context, bypassing a real `Register` call
+        // (whose handler would create its own channel and discard ours).
+        let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
+        let ctx = ConnectionContext {
+            cancel: cancel.clone(),
+            auth_token: Arc::from("test-token"),
+            server_manager: Arc::clone(engine.server_manager()),
+            engine: Arc::clone(&engine),
+            config_path: std::path::PathBuf::from("/tmp/plug-ipc-idle-reverse-config.toml"),
+            started_at: Instant::now(),
+            client_registry: Arc::new(client_registry),
+            http_sessions: None,
+            session_id: Some(session_id.clone()),
+            reverse_request_rx: Some(reverse_rx),
+        };
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((stream, _addr)) = listener.accept().await {
+                let _ = handle_ipc_connection(stream, ctx).await;
+            }
+        });
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("client connect");
+
+        // One throwaway request: `log_rx`/`ctrl_rx` only get subscribed right
+        // after a request completes while `ctx.session_id` is already
+        // `Some`, which is what routes the connection into the labeled
+        // select loop this bug lives in for subsequent idling.
+        write_ipc(&mut stream, &IpcRequest::Status).await;
+        let status = read_ipc_response(&mut stream).await;
+        assert!(
+            matches!(status, IpcResponse::Status { .. }),
+            "expected Status, got {status:?}"
+        );
+
+        // Inject a reverse request directly into the connection's channel.
+        // No further client frame is sent before reading the pushed frame
+        // below — that's the crux of the regression.
+        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
+        let request = plug_core::ipc::IpcClientRequest::CreateElicitation {
+            params: serde_json::from_value(serde_json::json!({
+                "message": "idle test",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }))
+            .unwrap(),
+        };
+        reverse_tx
+            .send((request, resp_tx))
+            .await
+            .expect("send reverse request into idle connection");
+
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            plug_core::ipc::read_frame(&mut stream),
+        )
+        .await
+        .expect("timed out waiting for the idle-time reverse request")
+        .expect("read frame")
+        .expect("unexpected EOF waiting for reverse request");
+
+        let msg: plug_core::ipc::DaemonToProxyMessage =
+            serde_json::from_slice(&frame).expect("decode DaemonToProxyMessage");
+        match msg {
+            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { request, .. } => {
+                assert!(
+                    matches!(
+                        *request,
+                        plug_core::ipc::IpcClientRequest::CreateElicitation { .. }
+                    ),
+                    "expected CreateElicitation, got {request:?}"
+                );
+            }
+            other => panic!("expected ReverseRequest envelope, got {other:?}"),
+        }
+
+        // Unblock `handle_reverse_request`'s wait for a client reply so the
+        // connection loop and server task can wind down cleanly.
+        let reply = IpcClientResponse::Error {
+            message: "test reply".to_string(),
+        };
+        plug_core::ipc::write_frame(&mut stream, &serde_json::to_vec(&reply).unwrap())
+            .await
+            .expect("write reverse-request reply");
+
+        cancel.cancel();
+        drop(stream);
+        let _ = server_task.await;
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     /// Regression test for the frame-reader cancellation-safety fix.
