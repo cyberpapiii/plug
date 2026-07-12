@@ -31,12 +31,11 @@ pub fn sanitize_tool_name(name: &str) -> String {
 
                 if prev.is_lowercase() || prev.is_ascii_digit() {
                     result.push('_');
-                } else if prev.is_uppercase() {
-                    if let Some(&n) = next {
-                        if n.is_lowercase() {
-                            result.push('_');
-                        }
-                    }
+                } else if prev.is_uppercase()
+                    && let Some(&n) = next
+                    && n.is_lowercase()
+                {
+                    result.push('_');
                 }
             }
             result.push(c.to_ascii_lowercase());

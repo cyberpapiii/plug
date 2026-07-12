@@ -35,60 +35,59 @@ impl super::ToolRouter {
             .map(|context| Arc::clone(&context.trace_id))
             .unwrap_or_else(|| Arc::from(new_trace_id()));
 
-        if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
-            if upstream
+        if let Some(upstream) = self.server_manager.get_upstream(&server_id)
+            && upstream
                 .capabilities
                 .tasks
                 .as_ref()
                 .is_some_and(|tasks| tasks.supports_tools_call())
-            {
-                let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-                if let Some(args) = arguments.clone() {
-                    upstream_params = upstream_params.with_arguments(args);
-                }
-                upstream_params.task = Some(serde_json::Map::new());
-                if let Some(token) = progress_token.clone() {
-                    upstream_params.set_progress_token(token);
-                }
-                let response = upstream
-                    .client
-                    .peer()
-                    .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
-                        upstream_params,
-                    )))
-                    .await
-                    .map_err(|error| match error {
-                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
-                    })?;
-
-                if let ServerResult::CreateTaskResult(result) = response {
-                    tracing::info!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        tool = %original_name,
-                        task_id = %result.task.task_id,
-                        "proxy native upstream task created"
-                    );
-                    let task = self.task_store.lock().await.create_passthrough(
-                        owner,
-                        tool_name,
-                        &result.task,
-                        TaskUpstreamRef::Task {
-                            server_id,
-                            task_id: result.task.task_id.clone(),
-                        },
-                    );
-                    return Ok(CreateTaskResult::new(task));
-                }
-
-                return Err(McpError::internal_error(
-                    format!(
-                        "upstream task-capable server returned unexpected response for task-wrapped tool call: {response:?}"
-                    ),
-                    None,
-                ));
+        {
+            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
+            if let Some(args) = arguments.clone() {
+                upstream_params = upstream_params.with_arguments(args);
             }
+            upstream_params.task = Some(serde_json::Map::new());
+            if let Some(token) = progress_token.clone() {
+                upstream_params.set_progress_token(token);
+            }
+            let response = upstream
+                .client
+                .peer()
+                .send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+                    upstream_params,
+                )))
+                .await
+                .map_err(|error| match error {
+                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                    other => McpError::internal_error(other.to_string(), None),
+                })?;
+
+            if let ServerResult::CreateTaskResult(result) = response {
+                tracing::info!(
+                    trace_id = %trace_id,
+                    server = %server_id,
+                    tool = %original_name,
+                    task_id = %result.task.task_id,
+                    "proxy native upstream task created"
+                );
+                let task = self.task_store.lock().await.create_passthrough(
+                    owner,
+                    tool_name,
+                    &result.task,
+                    TaskUpstreamRef::Task {
+                        server_id,
+                        task_id: result.task.task_id.clone(),
+                    },
+                );
+                return Ok(CreateTaskResult::new(task));
+            }
+
+            return Err(McpError::internal_error(
+                format!(
+                    "upstream task-capable server returned unexpected response for task-wrapped tool call: {response:?}"
+                ),
+                None,
+            ));
         }
 
         let task = {
@@ -143,38 +142,37 @@ impl super::ToolRouter {
             server_id,
             task_id: upstream_task_id,
         }) = upstream
+            && let Some(server) = self.server_manager.get_upstream(&server_id)
         {
-            if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                let response = server
-                    .client
-                    .peer()
-                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
-                        GetTaskInfoParams {
-                            meta: None,
-                            task_id: upstream_task_id,
-                        },
-                    )))
-                    .await
-                    .map_err(|error| match error {
-                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
-                    })?;
-                if let ServerResult::GetTaskResult(result) = response {
-                    let synced = self.task_store.lock().await.sync_from_upstream_for_owner(
-                        owner,
-                        task_id,
-                        &result.task,
-                    )?;
-                    return Ok(GetTaskResult {
+            let response = server
+                .client
+                .peer()
+                .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                    GetTaskInfoParams {
                         meta: None,
-                        task: synced,
-                    });
-                }
-                return Err(McpError::internal_error(
-                    "unexpected upstream tasks/get response".to_string(),
-                    None,
-                ));
+                        task_id: upstream_task_id,
+                    },
+                )))
+                .await
+                .map_err(|error| match error {
+                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                    other => McpError::internal_error(other.to_string(), None),
+                })?;
+            if let ServerResult::GetTaskResult(result) = response {
+                let synced = self.task_store.lock().await.sync_from_upstream_for_owner(
+                    owner,
+                    task_id,
+                    &result.task,
+                )?;
+                return Ok(GetTaskResult {
+                    meta: None,
+                    task: synced,
+                });
             }
+            return Err(McpError::internal_error(
+                "unexpected upstream tasks/get response".to_string(),
+                None,
+            ));
         }
         self.task_store
             .lock()
@@ -197,53 +195,52 @@ impl super::ToolRouter {
             server_id,
             task_id: upstream_task_id,
         }) = upstream
+            && let Some(server) = self.server_manager.get_upstream(&server_id)
         {
-            if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                let response = server
-                    .client
-                    .peer()
-                    .send_request(ClientRequest::GetTaskResultRequest(
-                        GetTaskResultRequest::new(GetTaskResultParams {
-                            meta: None,
-                            task_id: upstream_task_id,
-                        }),
-                    ))
-                    .await
-                    .map_err(|error| match error {
-                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
+            let response = server
+                .client
+                .peer()
+                .send_request(ClientRequest::GetTaskResultRequest(
+                    GetTaskResultRequest::new(GetTaskResultParams {
+                        meta: None,
+                        task_id: upstream_task_id,
+                    }),
+                ))
+                .await
+                .map_err(|error| match error {
+                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                    other => McpError::internal_error(other.to_string(), None),
+                })?;
+            return match response {
+                ServerResult::GetTaskPayloadResult(result) => {
+                    self.task_store.lock().await.cache_result_for_owner(
+                        owner,
+                        task_id,
+                        result.0.clone(),
+                    )?;
+                    self.artifact_store
+                        .maybe_spill_task_payload(&format!("task_result:{task_id}"), result.0)
+                }
+                ServerResult::CallToolResult(result) => {
+                    let payload = serde_json::to_value(result).map_err(|e| {
+                        McpError::internal_error(
+                            format!("failed to serialize upstream task payload: {e}"),
+                            None,
+                        )
                     })?;
-                return match response {
-                    ServerResult::GetTaskPayloadResult(result) => {
-                        self.task_store.lock().await.cache_result_for_owner(
-                            owner,
-                            task_id,
-                            result.0.clone(),
-                        )?;
-                        self.artifact_store
-                            .maybe_spill_task_payload(&format!("task_result:{task_id}"), result.0)
-                    }
-                    ServerResult::CallToolResult(result) => {
-                        let payload = serde_json::to_value(result).map_err(|e| {
-                            McpError::internal_error(
-                                format!("failed to serialize upstream task payload: {e}"),
-                                None,
-                            )
-                        })?;
-                        self.task_store.lock().await.cache_result_for_owner(
-                            owner,
-                            task_id,
-                            payload.clone(),
-                        )?;
-                        self.artifact_store
-                            .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
-                    }
-                    _ => Err(McpError::internal_error(
-                        "unexpected upstream tasks/result response".to_string(),
-                        None,
-                    )),
-                };
-            }
+                    self.task_store.lock().await.cache_result_for_owner(
+                        owner,
+                        task_id,
+                        payload.clone(),
+                    )?;
+                    self.artifact_store
+                        .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
+                }
+                _ => Err(McpError::internal_error(
+                    "unexpected upstream tasks/result response".to_string(),
+                    None,
+                )),
+            };
         }
         let payload = self
             .task_store

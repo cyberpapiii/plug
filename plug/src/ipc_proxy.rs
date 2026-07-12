@@ -164,13 +164,12 @@ impl IpcProxyHandler {
                 match daemon_msg {
                     DaemonToProxyMessage::Response { inner } => match inner {
                         IpcResponse::LoggingNotification { params } => {
-                            if let Some(peer) = peer {
-                                if let Ok(notif_params) = serde_json::from_value::<
+                            if let Some(peer) = peer
+                                && let Ok(notif_params) = serde_json::from_value::<
                                     LoggingMessageNotificationParam,
                                 >(params)
-                                {
-                                    let _ = peer.notify_logging_message(notif_params).await;
-                                }
+                            {
+                                let _ = peer.notify_logging_message(notif_params).await;
                             }
                             continue;
                         }
@@ -257,12 +256,11 @@ impl IpcProxyHandler {
 
             match response {
                 IpcResponse::LoggingNotification { params } => {
-                    if let Some(peer) = peer {
-                        if let Ok(notif_params) =
+                    if let Some(peer) = peer
+                        && let Ok(notif_params) =
                             serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                        {
-                            let _ = peer.notify_logging_message(notif_params).await;
-                        }
+                    {
+                        let _ = peer.notify_logging_message(notif_params).await;
                     }
                     continue; // keep reading for the actual response
                 }
@@ -583,10 +581,10 @@ impl ServerHandler for IpcProxyHandler {
                 .await
             {
                 Ok(IpcResponse::Capabilities { capabilities }) => {
-                    if let Ok(parsed) = serde_json::from_value::<ServerCapabilities>(capabilities) {
-                        if let Ok(mut caps) = self.shared.capabilities.write() {
-                            *caps = parsed;
-                        }
+                    if let Ok(parsed) = serde_json::from_value::<ServerCapabilities>(capabilities)
+                        && let Ok(mut caps) = self.shared.capabilities.write()
+                    {
+                        *caps = parsed;
                     }
                 }
                 Ok(other) => {
@@ -748,10 +746,10 @@ impl ServerHandler for IpcProxyHandler {
             {
                 IpcResponse::McpResponse { payload } => {
                     // Check if this is an error response before attempting CallToolResult parse
-                    if payload.get("code").is_some() {
-                        if let Ok(err) = serde_json::from_value::<McpError>(payload.clone()) {
-                            return Err(err);
-                        }
+                    if payload.get("code").is_some()
+                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
+                    {
+                        return Err(err);
                     }
                     serde_json::from_value::<CallToolResult>(payload).map_err(|e| {
                         McpError::internal_error(

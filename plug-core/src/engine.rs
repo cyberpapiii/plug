@@ -1602,7 +1602,7 @@ mod tests {
                     let _tools = eng.tool_list();
                     iterations += 1;
                     // Yield to avoid starving the reload task
-                    if iterations % 100 == 0 {
+                    if iterations.is_multiple_of(100) {
                         tokio::task::yield_now().await;
                     }
                 }

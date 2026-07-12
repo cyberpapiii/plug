@@ -4234,14 +4234,12 @@ async fn test_http_elicitation_reverse_request_round_trip() {
         while let Some(Ok(chunk)) = stream.next().await {
             let text = String::from_utf8_lossy(&chunk).to_string();
             for line in text.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if json.get("method").and_then(|m| m.as_str()) == Some("elicitation/create")
-                        {
-                            elicitation_request_id = json.get("id").cloned();
-                            return;
-                        }
-                    }
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && json.get("method").and_then(|m| m.as_str()) == Some("elicitation/create")
+                {
+                    elicitation_request_id = json.get("id").cloned();
+                    return;
                 }
             }
         }
@@ -4420,15 +4418,12 @@ async fn test_http_sampling_reverse_request_round_trip() {
         while let Some(Ok(chunk)) = stream.next().await {
             let text = String::from_utf8_lossy(&chunk).to_string();
             for line in text.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if json.get("method").and_then(|m| m.as_str())
-                            == Some("sampling/createMessage")
-                        {
-                            sampling_request_id = json.get("id").cloned();
-                            return;
-                        }
-                    }
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && json.get("method").and_then(|m| m.as_str()) == Some("sampling/createMessage")
+                {
+                    sampling_request_id = json.get("id").cloned();
+                    return;
                 }
             }
         }

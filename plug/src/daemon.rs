@@ -917,14 +917,14 @@ async fn handle_ipc_connection(
         ctx.engine
             .tool_router()
             .clear_lazy_session(&lazy_session_key);
-        if let Some(client_id) = removed_client_id {
-            if !ctx.client_registry.client_sessions.contains_key(&client_id) {
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                ctx.engine
-                    .tool_router()
-                    .cleanup_tasks_for_owner(&owner)
-                    .await;
-            }
+        if let Some(client_id) = removed_client_id
+            && !ctx.client_registry.client_sessions.contains_key(&client_id)
+        {
+            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            ctx.engine
+                .tool_router()
+                .cleanup_tasks_for_owner(&owner)
+                .await;
         }
     }
 
@@ -1705,14 +1705,14 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             ctx.engine
                 .tool_router()
                 .clear_lazy_session(&lazy_session_key);
-            if let Some(client_id) = removed_client_id {
-                if !ctx.client_registry.client_sessions.contains_key(&client_id) {
-                    let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                    ctx.engine
-                        .tool_router()
-                        .cleanup_tasks_for_owner(&owner)
-                        .await;
-                }
+            if let Some(client_id) = removed_client_id
+                && !ctx.client_registry.client_sessions.contains_key(&client_id)
+            {
+                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                ctx.engine
+                    .tool_router()
+                    .cleanup_tasks_for_owner(&owner)
+                    .await;
             }
             ctx.session_id = None;
             ctx.reverse_request_rx = None;

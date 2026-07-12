@@ -49,26 +49,25 @@ impl super::ToolRouter {
         entry.insert(target.clone());
         drop(entry);
 
-        if is_first {
-            if let Err(error) = upstream
+        if is_first
+            && let Err(error) = upstream
                 .client
                 .peer()
                 .subscribe(SubscribeRequestParams::new(uri))
                 .await
-            {
-                // Roll back the local subscription on upstream failure
-                if let Some(mut entry) = self.resource_subscriptions.get_mut(uri) {
-                    entry.remove(&target);
-                    if entry.is_empty() {
-                        drop(entry);
-                        self.resource_subscriptions.remove(uri);
-                    }
+        {
+            // Roll back the local subscription on upstream failure
+            if let Some(mut entry) = self.resource_subscriptions.get_mut(uri) {
+                entry.remove(&target);
+                if entry.is_empty() {
+                    drop(entry);
+                    self.resource_subscriptions.remove(uri);
                 }
-                return Err(match error {
-                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                    other => McpError::internal_error(other.to_string(), None),
-                });
             }
+            return Err(match error {
+                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                other => McpError::internal_error(other.to_string(), None),
+            });
         }
 
         Ok(())
@@ -143,8 +142,8 @@ impl super::ToolRouter {
 
         // Send upstream unsubscribe for each URI that lost its last subscriber
         for (uri, server_id) in uris_to_unsubscribe {
-            if let Some(upstream) = self.server_manager.get_upstream(&server_id) {
-                if let Err(error) = upstream
+            if let Some(upstream) = self.server_manager.get_upstream(&server_id)
+                && let Err(error) = upstream
                     .client
                     .peer()
                     .unsubscribe(
@@ -154,13 +153,12 @@ impl super::ToolRouter {
                         .expect("UnsubscribeRequestParams from known-good JSON"),
                     )
                     .await
-                {
-                    tracing::warn!(
-                        uri = %uri,
-                        error = %error,
-                        "failed to unsubscribe upstream during target cleanup"
-                    );
-                }
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    error = %error,
+                    "failed to unsubscribe upstream during target cleanup"
+                );
             }
         }
     }

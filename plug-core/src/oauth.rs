@@ -769,14 +769,13 @@ impl CompositeCredentialStore {
                         .as_ref()
                         .map(|file| !Self::persisted_credentials_match(file, creds))
                         .unwrap_or(true)
+                    && let Err(error) = self.file_save(creds)
                 {
-                    if let Err(error) = self.file_save(creds) {
-                        warn!(
-                            server = %self.server_name,
-                            error = %error,
-                            "token file mirror repair failed after keyring-backed load"
-                        );
-                    }
+                    warn!(
+                        server = %self.server_name,
+                        error = %error,
+                        "token file mirror repair failed after keyring-backed load"
+                    );
                 }
                 self.update_cache(creds);
                 CredentialSnapshot {

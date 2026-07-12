@@ -698,10 +698,9 @@ async fn cmd_auth_status(
                 if let Some(scopes) = live
                     .and_then(|s| s.scopes.clone())
                     .or_else(|| sc.oauth_scopes.clone())
+                    && !scopes.is_empty()
                 {
-                    if !scopes.is_empty() {
-                        println!("    Scopes: {}", scopes.join(", "));
-                    }
+                    println!("    Scopes: {}", scopes.join(", "));
                 }
 
                 if let Some(remaining) = live.and_then(|s| s.token_expires_in_secs) {

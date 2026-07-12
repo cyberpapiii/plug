@@ -30,10 +30,10 @@ pub(crate) fn mirrored_headers_for_message(
     if let Ok(value) = HeaderValue::from_str(&fields.method) {
         headers.insert(HeaderName::from_static("mcp-method"), value);
     }
-    if let Some(name) = fields.name {
-        if let Ok(value) = HeaderValue::from_str(&name) {
-            headers.insert(HeaderName::from_static("mcp-name"), value);
-        }
+    if let Some(name) = fields.name
+        && let Ok(value) = HeaderValue::from_str(&name)
+    {
+        headers.insert(HeaderName::from_static("mcp-name"), value);
     }
 
     headers

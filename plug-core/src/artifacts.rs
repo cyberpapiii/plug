@@ -278,10 +278,11 @@ fn content_is_artifactish(content: &Content) -> bool {
         return true;
     }
 
-    if let Some(text) = content.raw.as_text() {
-        if text.text.len() > 256 * 1024 && looks_like_attachment_json(&text.text) {
-            return true;
-        }
+    if let Some(text) = content.raw.as_text()
+        && text.text.len() > 256 * 1024
+        && looks_like_attachment_json(&text.text)
+    {
+        return true;
     }
 
     false
@@ -305,17 +306,17 @@ fn build_preview(result: &CallToolResult) -> String {
     let mut parts = Vec::new();
 
     for content in &result.content {
-        if let Some(text) = content.raw.as_text() {
-            if !text.text.is_empty() {
-                parts.push(text.text.clone());
-            }
+        if let Some(text) = content.raw.as_text()
+            && !text.text.is_empty()
+        {
+            parts.push(text.text.clone());
         }
     }
 
-    if parts.is_empty() {
-        if let Some(structured) = &result.structured_content {
-            parts.push(structured.to_string());
-        }
+    if parts.is_empty()
+        && let Some(structured) = &result.structured_content
+    {
+        parts.push(structured.to_string());
     }
 
     let mut preview = parts.join("\n\n");

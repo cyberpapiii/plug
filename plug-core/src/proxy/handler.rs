@@ -325,10 +325,10 @@ impl ServerHandler for ProxyHandler {
                                     ..
                                 }),
                             ) => {
-                                if let Some(params) = notification.as_logging_message_params() {
-                                    if peer.notify_logging_message(params).await.is_err() {
-                                        break;
-                                    }
+                                if let Some(params) = notification.as_logging_message_params()
+                                    && peer.notify_logging_message(params).await.is_err()
+                                {
+                                    break;
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
