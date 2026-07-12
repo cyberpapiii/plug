@@ -15,11 +15,36 @@
 ## Status
 
 - **Priority**: P3
-- **Effort**: S
-- **Risk**: LOW
-- **Depends on**: none
+- **Effort**: S → M (re-scoped; see amendment)
+- **Risk**: LOW → MEDIUM (async signature ripple)
+- **Depends on**: plans 004 and 019 merged first (they own `proxy/mod.rs` / `proxy/tasks.rs`)
 - **Category**: perf
 - **Planned at**: commit `e341625`, 2026-07-11
+
+> **Reviewer re-scope amendment (2026-07-12, after execution STOP).** The first
+> execution attempt STOPPED correctly on STOP condition 2: this plan assumed the
+> spill functions were async, and they are not. Verified facts (reviewer re-checked
+> each): `maybe_spill_tool_result` (`plug-core/src/artifacts.rs:76`),
+> `maybe_spill_tool_result_with_limit` (`:84`), and `maybe_spill_task_payload`
+> (`:179`) are all plain sync `fn`; there is NO existing `spawn_blocking` usage
+> anywhere in `plug-core/src` or `plug/src` (the "Commands you will need" claim of
+> an existing idiom is wrong); the four call sites are
+> `plug-core/src/proxy/mod.rs` (`maybe_spill_tool_result`, inside the async block
+> built by `call_tool_inner`) and `plug-core/src/proxy/tasks.rs` (three
+> `maybe_spill_task_payload` calls inside `async fn` bodies). Locate call sites by
+> symbol name, not line number — plans 004 and 019 will have edited these files.
+>
+> **Revised approach (authorized):** make all three spill functions `async fn`;
+> inside `maybe_spill_tool_result_with_limit`, move ONLY the blocking filesystem
+> write section into `tokio::task::spawn_blocking` (clone/move the owned data it
+> needs; `.await` the join handle and map `JoinError` into the existing `McpError`
+> path); `.await` the three public-call sites listed above plus any the compiler
+> then surfaces. **Expanded scope:** `plug-core/src/proxy/mod.rs` and
+> `plug-core/src/proxy/tasks.rs` are now in scope for signature-adaptation edits
+> ONLY (adding `.await`, no logic changes). Everything else in the original Scope
+> section still stands. New STOP condition: if any spill call site turns out to be
+> in a context that cannot become async (e.g. a `Drop` impl or sync trait method),
+> STOP and report.
 
 ## Why this matters
 

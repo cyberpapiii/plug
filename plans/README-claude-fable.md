@@ -32,7 +32,7 @@ matters.
 | 002 | [Todo/README hygiene](002-todo-readme-hygiene-claude-fable.md) — reconcile 6 contradictory todo statuses, guard script, README staleness | docs | S | — | DONE 2026-07-12 (merged to improve/integration @ fa2471d; 2 amendments — 045 residual, 062 had no frontmatter) |
 | 003 | [Correctness small-fix batch](003-correctness-small-fix-batch-claude-fable.md) — eviction metric, daemon busy-spin, pending-cancel-before-attach, idle-select reverse arm | correctness | S/M | — | TODO |
 | 004 | [Catalog perf batch](004-catalog-perf-batch-claude-fable.md) — pagination clones, refresh-loop hoists, gated filtered-catalog builds | perf | M | — | TODO |
-| 005 | [Async artifact write](005-artifact-async-write-claude-fable.md) — spawn_blocking for ≥16MB payload writes (PR #58 residual) | perf | S | — | TODO |
+| 005 | [Async artifact write](005-artifact-async-write-claude-fable.md) — spawn_blocking for ≥16MB payload writes (PR #58 residual) | perf | S | after 004+019 merge | BLOCKED-RESCOPED 2026-07-12 (executor STOP confirmed: spill fns are sync, plan assumed async; re-scoped amendment authorizes async-ifying 3 spill fns + 4 call sites in proxy/mod.rs + proxy/tasks.rs; re-dispatch after 004/019 land) |
 | 006 | [ipc_proxy characterization tests](006-ipc-proxy-characterization-tests-claude-fable.md) — pin reconnect/retry/framing/stall behavior | tests | M | — | TODO |
 | 007 | [IPC reconnect state replay](007-ipc-reconnect-state-replay-claude-fable.md) — replay caps/subscriptions/log level after daemon restart | correctness | M | 006 | TODO |
 | 008 | [SSE replay integrity](008-sse-replay-integrity-claude-fable.md) — replay-queue tail loss + raced-sender enqueue gap | correctness | M | — (003 same file, trivial) | TODO |
@@ -51,7 +51,7 @@ matters.
 | 021 | [rmcp version pin policy](021-rmcp-version-pin-policy-claude-fable.md) — `~1.7` tilde pin + CRATE-STACK policy note (protects unlocked installs and broad `cargo update`) | deps | S | 001 (soft; same Cargo.toml) | TODO |
 | 022 | [PLAN.md dispatcher truth fix](022-plan-doc-dispatcher-truth-fix-claude-fable.md) — remove the "only remaining dispatcher item"/"decomposition also remains" claims contradicted by the ✅ entries two lines below (docs only; the memory-contamination root cause) | docs | S | — | DONE 2026-07-12 (merged to improve/integration @ ed0fc62) |
 | 023 | [Catalog family concurrent fetch](023-catalog-family-concurrent-fetch-claude-fable.md) — `tokio::join!` the three live family getters in `refresh_tools` (sum→max of family latencies; servers were already concurrent within each family) | perf | S/M | — (NOT parallel with 004 or 010: same refresh_tools) | TODO |
-| 024 | [Config-watcher e2e tests](024-config-watcher-e2e-tests-claude-fable.md) — disk change → debounce → reload chain, parse-error recovery, sibling filter, rename-replace; zero production changes | tests | M | — | TODO |
+| 024 | [Config-watcher e2e tests](024-config-watcher-e2e-tests-claude-fable.md) — disk change → debounce → reload chain, parse-error recovery, sibling filter, rename-replace; zero production changes | tests | M | — | DONE 2026-07-12 (merged to improve/integration @ c6307ad) |
 
 ## Dependency notes (the ones that bite)
 
