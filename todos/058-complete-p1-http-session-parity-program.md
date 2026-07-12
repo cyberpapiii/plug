@@ -1,5 +1,5 @@
 ---
-status: done
+status: complete
 priority: p1
 issue_id: "058"
 tags: [http, sessions, parity, topology, daemon, serve, ux, architecture]

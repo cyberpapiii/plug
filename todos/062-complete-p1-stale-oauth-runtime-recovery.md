@@ -1,7 +1,13 @@
+---
+status: complete
+priority: p1
+issue_id: "062"
+tags: [oauth, auth, runtime, recovery]
+dependencies: []
+---
+
 # 062 - stale oauth runtime recovery
 
-Status: complete
-Priority: p1
 Date: 2026-03-17
 
 ## Goal
