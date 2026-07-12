@@ -109,6 +109,23 @@ impl StatefulSessionStore {
         entry.pending_notifications.push_back(event);
     }
 
+    /// Put previously-drained events back at the FRONT of the pending queue,
+    /// in order, ahead of anything already sitting in `pending_notifications`.
+    /// Pairs with `send_replay_events`'s no-`Last-Event-Id` drain: a send
+    /// failure partway through drained-but-unsent events must not silently
+    /// discard the untried tail.
+    ///
+    /// Every caller of this function holds the session's `DashMap` `RefMut`
+    /// for the entire drain-and-send loop (no `.await` in between), so
+    /// nothing else can enqueue into `pending_notifications` concurrently --
+    /// the events passed in are always a subset of what was already bounded
+    /// by `PENDING_LIMIT`, so this never needs to evict.
+    fn requeue_front(entry: &mut SessionState, events: impl IntoIterator<Item = SseEvent>) {
+        let mut requeued: VecDeque<SseEvent> = events.into_iter().collect();
+        requeued.append(&mut entry.pending_notifications);
+        entry.pending_notifications = requeued;
+    }
+
     fn enqueue_replay(entry: &mut SessionState, event: SseEvent) {
         const REPLAY_LIMIT: usize = 128;
         if entry.replay_events.len() >= REPLAY_LIMIT {
@@ -205,9 +222,9 @@ impl StatefulSessionStore {
         if clear_sender {
             self.clear_sender_if_matching(session_id, failed_sender.as_ref(), queue_event);
         } else if let Some(event) = queue_event
-            && let Some(mut entry) = self.sessions.get_mut(session_id)
+            && self.enqueue_or_deliver_racy(session_id, event)
         {
-            Self::enqueue_pending(&mut entry, event);
+            delivered = true;
         }
 
         if delivered {
@@ -216,6 +233,44 @@ impl StatefulSessionStore {
             SessionSendOutcome::Queued
         } else {
             SessionSendOutcome::SessionNotFound
+        }
+    }
+
+    /// Second phase of `try_send_to_session`'s no-live-sender-at-first-check
+    /// path. A reconnecting client may install a fresh sender in the window
+    /// between the initial `None` check (phase 1, where no sender was found)
+    /// and re-acquiring this entry's guard here (phase 2); blindly enqueuing
+    /// would strand the event in `pending_notifications` until the next
+    /// reconnect even though a live sender now exists. Mirrors
+    /// `clear_sender_if_matching`'s raced-new-sender handling: try live
+    /// delivery on the current sender before falling back to the queue.
+    ///
+    /// Returns `true` if the event was delivered live, `false` if it was
+    /// queued (or the session vanished in the interim).
+    ///
+    /// Extracted (mirroring `clear_sender_if_matching`) so the race-guard
+    /// decision can be exercised directly by tests without relying on real
+    /// thread interleaving.
+    fn enqueue_or_deliver_racy(&self, session_id: &str, event: SseEvent) -> bool {
+        let Some(mut entry) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        match entry.sse_sender.clone() {
+            Some(sender) => match sender.try_send(event.clone()) {
+                Ok(()) => {
+                    entry.last_activity = Instant::now();
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(event))
+                | Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    Self::enqueue_pending(&mut entry, event);
+                    false
+                }
+            },
+            None => {
+                Self::enqueue_pending(&mut entry, event);
+                false
+            }
         }
     }
 
@@ -280,7 +335,8 @@ impl StatefulSessionStore {
         };
 
         let mut sent_through = last_event_id;
-        for event in events {
+        let mut iter = events.into_iter();
+        while let Some(event) = iter.next() {
             match sender.try_send(event.clone()) {
                 Ok(()) => {
                     sent_through = Some(event.id);
@@ -288,7 +344,24 @@ impl StatefulSessionStore {
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(event))
                 | Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                    Self::enqueue_pending(entry, event);
+                    if last_event_id.is_none() {
+                        // The source was `pending_notifications`, drained up
+                        // front: the failed event plus everything not yet
+                        // attempted (already drained, not yet sent) must go
+                        // back at the front of the queue, in order, or the
+                        // untried tail is silently lost. No concurrent
+                        // enqueue race is possible here -- the caller holds
+                        // the session's `DashMap` `RefMut` for this entire
+                        // synchronous call.
+                        Self::requeue_front(entry, std::iter::once(event).chain(iter));
+                    } else {
+                        // The source was `replay_events`, which is filtered
+                        // (not drained): untried events remain there for the
+                        // next `Last-Event-Id` reconnect. Only the failed
+                        // event needs a pending-queue fallback so an id-less
+                        // reconnect can still see it.
+                        Self::enqueue_pending(entry, event);
+                    }
                     entry.sse_sender = None;
                     break;
                 }
@@ -906,5 +979,126 @@ mod tests {
         store.set_sse_sender(&id, tx, Some(0)).unwrap();
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_send_failure_preserves_tail() {
+        // Regression guard for the drain-then-break tail loss: the old code
+        // drained `pending_notifications` entirely up front, then on the
+        // first `try_send` failure re-enqueued only that one event and
+        // `break`-ed, silently discarding every already-drained, not-yet-sent
+        // event after it.
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        for seq in 1..=5u64 {
+            store.send_to_session(
+                &id,
+                crate::session::SseMessage::from_json_value(serde_json::json!({"seq": seq}))
+                    .unwrap(),
+            );
+        }
+
+        // Capacity 2, receiver never polled: the first two `try_send` calls
+        // fill the buffer and succeed; the third fails with `Full`,
+        // deterministically exercising the mid-drain failure path.
+        let (tx, _rx) = mpsc::channel(2);
+        store.set_sse_sender(&id, tx, None).unwrap();
+
+        let remaining: Vec<u64> = store
+            .sessions
+            .get(&id)
+            .unwrap()
+            .pending_notifications
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![3, 4, 5],
+            "the untried tail must survive a mid-drain send failure, in order"
+        );
+        assert!(
+            !store.has_live_sse_sender(&id).unwrap(),
+            "the failed sender must still be cleared"
+        );
+    }
+
+    // `replay_requeue_orders_before_concurrent_enqueues` from the plan is
+    // intentionally not implemented: `send_replay_events` is always invoked
+    // while the caller (`set_sse_sender`) holds the session's `DashMap`
+    // `RefMut` for the entire synchronous call (no `.await` inside), and
+    // `DashMap::get_mut` takes an exclusive lock on the shard for the guard's
+    // lifetime. No other call can reach `pending_notifications` for this
+    // session while the drain-and-send loop runs, so "concurrent enqueue
+    // during drain" is not reachable to simulate. Plain re-append (via
+    // `requeue_front`) is therefore order-preserving by construction.
+
+    #[tokio::test]
+    async fn enqueue_recheck_flushes_to_new_sender() {
+        // Reproduces the fix directly: `enqueue_or_deliver_racy` is the exact
+        // second-phase decision `try_send_to_session` makes after releasing
+        // and re-acquiring the session guard when phase 1 found no sender.
+        // Here a live sender is installed AFTER the point where phase 1 would
+        // have observed `None`, simulating a client reconnect racing into the
+        // window between phase 1 and phase 2. The racing event must reach
+        // the new sender live rather than being stranded in the pending
+        // queue until the next reconnect.
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        // No sender yet -- this is what phase 1 of `try_send_to_session`
+        // would have seen.
+        assert!(!store.has_live_sse_sender(&id).unwrap());
+
+        // A reconnecting client installs a live sender before phase 2 runs.
+        let (tx, mut rx) = mpsc::channel(4);
+        store.set_sse_sender(&id, tx, None).unwrap();
+        assert!(store.has_live_sse_sender(&id).unwrap());
+
+        // Now run phase 2 directly with the event phase 1 would have queued.
+        let event = crate::session::SseEvent {
+            id: 1,
+            message: crate::session::SseMessage::from_json_value(
+                serde_json::json!({"type": "raced"}),
+            )
+            .unwrap(),
+        };
+        let delivered = store.enqueue_or_deliver_racy(&id, event);
+
+        assert!(
+            delivered,
+            "the racing event should be delivered live, not queued"
+        );
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("live sender should receive the raced event")
+            .expect("event present");
+        assert_eq!(received.message.to_json_value()["type"], "raced");
+
+        // It must not also be stranded in the pending queue.
+        assert!(
+            store
+                .sessions
+                .get(&id)
+                .unwrap()
+                .pending_notifications
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_empty_queue_is_noop() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        store.set_sse_sender(&id, tx, None).unwrap();
+
+        assert!(rx.try_recv().is_err(), "no events should have been sent");
+        assert!(
+            store.has_live_sse_sender(&id).unwrap(),
+            "an empty replay must not clear the sender"
+        );
     }
 }
