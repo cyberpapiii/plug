@@ -1972,13 +1972,13 @@ mod tests {
     use rmcp::model::{
         AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams,
         CancelTaskResult, ClientJsonRpcMessage, ClientRequest, Content, CreateTaskResult,
-        GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult, Icon,
-        Implementation, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListTasksResult, ListToolsResult, Meta, NumberOrString,
-        ProgressNotificationParam, ProgressToken, Prompt, PromptMessage, PromptMessageContent,
-        PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceResult, ResourceContents,
-        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Task, TaskStatus,
-        TasksCapability, Tool,
+        GetPromptResult, GetTaskInfoParams, GetTaskInfoRequest, GetTaskPayloadResult,
+        GetTaskResult, Icon, Implementation, InitializeResult, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, ListToolsResult, Meta,
+        NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
+        PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
+        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        ServerResult, Task, TaskStatus, TasksCapability, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -3482,6 +3482,102 @@ mod tests {
             .expect("fetch cancelled passthrough task result timed out")
             .is_err(),
             "cancelled passthrough task should not expose a result"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_tasks_for_owner_forwards_cancel_to_task_native_upstream() {
+        // Owner teardown (HTTP DELETE, idle expiry, IPC disconnect) must not
+        // just forget the local record for a passthrough task backed by a
+        // task-capable upstream — it must also tell the upstream to stop, or
+        // the upstream keeps the task running for a result nobody will ever
+        // collect. This proves the forwarded `CancelTaskRequest` lands by
+        // querying the upstream mock directly (bypassing the router, whose
+        // record is gone after cleanup).
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+
+        let (upstream, _task_result_request_count) = tokio::time::timeout(
+            Duration::from_secs(5),
+            make_connected_task_native_upstream("upstream", &router),
+        )
+        .await
+        .expect("connect task-native upstream");
+        server_manager.replace_server("upstream", upstream).await;
+        tokio::time::timeout(Duration::from_secs(5), router.refresh_tools())
+            .await
+            .expect("refresh routed tools");
+
+        let tool_name = router
+            .list_tools()
+            .first()
+            .expect("task-native tool should be exposed")
+            .name
+            .to_string();
+        let owner =
+            crate::tasks::TaskOwner::new(Arc::<str>::from("http:test-teardown-cancel-upstream"));
+
+        let create = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.enqueue_tool_task(
+                &tool_name,
+                Some(
+                    serde_json::json!({"input": "teardown-me"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                None,
+                owner.clone(),
+                None,
+            ),
+        )
+        .await
+        .expect("create passthrough task timed out")
+        .expect("create passthrough task");
+        assert_eq!(create.task.status, TaskStatus::Working);
+        assert_eq!(router.task_count_for_owner(&owner).await, 1);
+
+        router.cleanup_tasks_for_owner(&owner).await;
+        assert_eq!(
+            router.task_count_for_owner(&owner).await,
+            0,
+            "teardown must remove the local task record"
+        );
+
+        // Ask the upstream mock directly for the task it created — the
+        // router's own record is gone, so this is the only way left to
+        // observe whether cleanup actually forwarded the cancel.
+        let upstream_handle = server_manager
+            .get_upstream("upstream")
+            .expect("upstream still registered after teardown");
+        let info = tokio::time::timeout(
+            Duration::from_secs(5),
+            upstream_handle
+                .client
+                .peer()
+                .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+                    GetTaskInfoParams {
+                        meta: None,
+                        task_id: "upstream-task-1".to_string(),
+                    },
+                ))),
+        )
+        .await
+        .expect("query upstream task info timed out")
+        .expect("query upstream task info");
+
+        let ServerResult::GetTaskResult(result) = info else {
+            panic!("unexpected upstream response to tasks/get: {info:?}");
+        };
+        assert_eq!(
+            result.task.status,
+            TaskStatus::Cancelled,
+            "owner teardown must forward CancelTaskRequest to the task-native upstream"
         );
     }
 
