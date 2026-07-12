@@ -50,7 +50,23 @@ pub(super) struct SubscriptionRegistry {
     /// `TaskTracker` so they participate in ordered shutdown. Set once via
     /// `set_engine()`, mirroring `ToolRouter::engine`.
     engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    /// Resolves a server id to its current upstream handle at drain time.
+    /// Set once via `set_owner_resolver()` (production: a
+    /// `ServerManager::get_upstream` lookup). Drains prefer the entry's
+    /// recorded `owner_server_id` through this resolver over whatever
+    /// handle the caller resolved from the live route cache — the route
+    /// cache can point at a different server than the one actually holding
+    /// the upstream subscription on either side of a `refresh_tools`
+    /// snapshot publish.
+    owner_resolver: std::sync::RwLock<Option<OwnerResolver>>,
 }
+
+/// Maps an upstream server id to its current subscription-capable handle.
+/// Entries record only the owning server *id* (never the handle itself, so
+/// a retired upstream connection can't be kept alive by the registry) and
+/// resolve it through this at drain time.
+pub(super) type OwnerResolver =
+    Arc<dyn Fn(&str) -> Option<Arc<dyn UpstreamResourceOps>> + Send + Sync>;
 
 /// Signal broadcast to everyone waiting on a particular transition:
 /// `None` while still in flight, `Some(result)` once it resolves.
@@ -60,6 +76,13 @@ struct Entry {
     generation: u64,
     members: HashSet<NotificationTarget>,
     state: EntryState,
+    /// The upstream server that last *confirmed* holding this entry's
+    /// subscription (set when a subscribe or rebind transition succeeds,
+    /// generation-matched). `None` until the first upstream confirmation.
+    /// Drains resolve this through the registry's `owner_resolver` in
+    /// preference to any route-cache-derived handle, so an unsubscribe
+    /// racing a route refresh can never be sent to the wrong upstream.
+    owner_server_id: Option<String>,
 }
 
 enum EntryState {
@@ -189,6 +212,7 @@ impl SubscriptionRegistry {
             transition_locks: DashMap::new(),
             next_generation: AtomicU64::new(0),
             engine: std::sync::RwLock::new(None),
+            owner_resolver: std::sync::RwLock::new(None),
         })
     }
 
@@ -198,6 +222,41 @@ impl SubscriptionRegistry {
             .write()
             .expect("engine RwLock poisoned — prior panic");
         *guard = Some(engine);
+    }
+
+    pub(super) fn set_owner_resolver(&self, resolver: OwnerResolver) {
+        let mut guard = self
+            .owner_resolver
+            .write()
+            .expect("owner resolver RwLock poisoned — prior panic");
+        *guard = Some(resolver);
+    }
+
+    fn owner_resolver_snapshot(&self) -> Option<OwnerResolver> {
+        self.owner_resolver
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Pick the upstream handle a drain (or a rebind's old-owner
+    /// unsubscribe) should use: the entry's recorded owner resolved through
+    /// `owner_resolver` when both exist, otherwise the caller-supplied
+    /// fallback (historically resolved from the live route cache). A
+    /// recorded owner that no longer resolves means the owning connection
+    /// is gone — there is nothing to unsubscribe, and falling back to a
+    /// route-resolved handle would target the wrong server.
+    fn drain_handle(
+        &self,
+        recorded_owner: Option<&str>,
+        fallback: Option<Arc<dyn UpstreamResourceOps>>,
+    ) -> Option<Arc<dyn UpstreamResourceOps>> {
+        if let Some(owner_id) = recorded_owner
+            && let Some(resolver) = self.owner_resolver_snapshot()
+        {
+            return resolver(owner_id);
+        }
+        fallback
     }
 
     fn upgrade_engine(&self) -> Option<Arc<Engine>> {
@@ -215,6 +274,15 @@ impl SubscriptionRegistry {
 
     pub(super) fn members_snapshot(&self, uri: &str) -> Option<HashSet<NotificationTarget>> {
         self.entries.get(uri).map(|e| e.members.clone())
+    }
+
+    /// Whether any entry (in any state) is tracked for `uri`. Used by the
+    /// downstream unsubscribe path: an entry may outlive its route (the
+    /// route vanished in a refresh while the subscription was still being
+    /// established), and such an entry must still be reachable for a drain
+    /// via its recorded owner instead of erroring "resource not found".
+    pub(super) fn has_entry(&self, uri: &str) -> bool {
+        self.entries.contains_key(uri)
     }
 
     fn transition_lock(&self, uri: &str) -> Arc<Mutex<()>> {
@@ -257,11 +325,15 @@ impl SubscriptionRegistry {
 
     /// Subscribe `target` to `uri`. Resolves once the upstream transition
     /// this call joined (either one it started, or an in-flight one it
-    /// piggy-backed on) has a definite outcome.
+    /// piggy-backed on) has a definite outcome. `owner_server_id` names the
+    /// server `upstream` belongs to; it is recorded on the entry when the
+    /// upstream subscribe succeeds so later drains can resolve the actual
+    /// owner instead of trusting the live route cache.
     pub(super) async fn subscribe(
         self: &Arc<Self>,
         uri: &str,
         target: NotificationTarget,
+        owner_server_id: &str,
         upstream: Arc<dyn UpstreamResourceOps>,
     ) -> Result<(), McpError> {
         enum Action {
@@ -284,6 +356,7 @@ impl SubscriptionRegistry {
                     generation,
                     members,
                     state: EntryState::Pending(rx.clone()),
+                    owner_server_id: None,
                 });
                 Action::Start { generation, tx, rx }
             }
@@ -322,6 +395,7 @@ impl SubscriptionRegistry {
                             generation,
                             members,
                             state: EntryState::Pending(rx.clone()),
+                            owner_server_id: None,
                         };
                         Action::Start { generation, tx, rx }
                     }
@@ -335,9 +409,16 @@ impl SubscriptionRegistry {
             Action::Start { generation, tx, rx } => {
                 let registry = Arc::clone(self);
                 let uri_owned = uri.to_string();
+                let owner_server_id = owner_server_id.to_string();
                 self.spawn_detached(async move {
                     registry
-                        .run_subscribe_transition(uri_owned, generation, upstream, tx)
+                        .run_subscribe_transition(
+                            uri_owned,
+                            generation,
+                            owner_server_id,
+                            upstream,
+                            tx,
+                        )
                         .await;
                 });
                 Self::await_transition(rx).await
@@ -349,6 +430,7 @@ impl SubscriptionRegistry {
         self: Arc<Self>,
         uri: String,
         generation: u64,
+        owner_server_id: String,
         upstream: Arc<dyn UpstreamResourceOps>,
         tx: watch::Sender<TransitionSignal>,
     ) {
@@ -371,12 +453,17 @@ impl SubscriptionRegistry {
                     // queued drain owns this entry's ending, and a transient
                     // Active window here would let a new subscriber
                     // piggyback onto a slot the drain is about to remove out
-                    // from under it.
+                    // from under it. The confirmed owner is recorded even in
+                    // that Draining case — the upstream subscription now
+                    // exists on this server, and the queued drain needs the
+                    // recorded owner to unsubscribe the right one.
                     if let Some(mut entry) = self.entries.get_mut(&uri)
                         && entry.generation == generation
-                        && matches!(entry.state, EntryState::Pending(_))
                     {
-                        entry.state = EntryState::Active;
+                        entry.owner_server_id = Some(owner_server_id);
+                        if matches!(entry.state, EntryState::Pending(_)) {
+                            entry.state = EntryState::Active;
+                        }
                     }
                 }
                 Err(_) => {
@@ -509,13 +596,19 @@ impl SubscriptionRegistry {
         let lock = self.transition_lock(&uri);
         let _guard = lock.lock().await;
 
-        let still_current = self
+        // `Some(owner)` iff the entry still exists on this drain's
+        // generation. The recorded owner is read here — under the
+        // transition lock, at drain time — rather than at spawn time, so a
+        // subscribe transition this drain queued behind (an emptied-Pending
+        // entry) has already recorded which server actually holds the
+        // upstream subscription.
+        let still_current: Option<Option<String>> = self
             .entries
             .get(&uri)
-            .map(|e| e.generation == generation)
-            .unwrap_or(false);
+            .and_then(|e| (e.generation == generation).then(|| e.owner_server_id.clone()));
 
-        if still_current {
+        if let Some(recorded_owner) = still_current {
+            let upstream = self.drain_handle(recorded_owner.as_deref(), upstream);
             let call_result = match &upstream {
                 Some(upstream) => upstream.unsubscribe_resource(&uri).await,
                 None => Ok(()),
@@ -757,19 +850,25 @@ impl SubscriptionRegistry {
         let lock = self.transition_lock(&uri);
         let _guard = lock.lock().await;
 
-        let still_current = self
+        // `Some(owner)` iff the entry still exists on this rebind's
+        // generation. The rebind's synchronous mutation left the recorded
+        // owner untouched, so it still names whichever server last
+        // confirmed holding the subscription — preferred over the
+        // caller-resolved `old_upstream` (derived from the old route
+        // snapshot) when a resolver is wired.
+        let still_current: Option<Option<String>> = self
             .entries
             .get(&uri)
-            .map(|e| e.generation == generation)
-            .unwrap_or(false);
+            .and_then(|e| (e.generation == generation).then(|| e.owner_server_id.clone()));
 
-        if !still_current {
+        let Some(recorded_owner) = still_current else {
             let _ = tx.send(Some(Ok(())));
             return;
-        }
+        };
 
         let mut failed = false;
 
+        let old_upstream = self.drain_handle(recorded_owner.as_deref(), old_upstream);
         if let Some(old_upstream) = &old_upstream
             && let Err(error) = old_upstream.unsubscribe_resource(&uri).await
         {
@@ -825,12 +924,16 @@ impl SubscriptionRegistry {
             // Same rule as `run_subscribe_transition`: only a still-Pending
             // slot may be upgraded — a Draining marker set on this
             // generation mid-flight belongs to a queued drain that owns the
-            // entry's ending.
+            // entry's ending. The new owner is recorded even in that
+            // Draining case so the queued drain unsubscribes the server the
+            // subscription now actually lives on.
             if let Some(mut entry) = self.entries.get_mut(&uri)
                 && entry.generation == generation
-                && matches!(entry.state, EntryState::Pending(_))
             {
-                entry.state = EntryState::Active;
+                entry.owner_server_id = Some(new_server_id.clone());
+                if matches!(entry.state, EntryState::Pending(_)) {
+                    entry.state = EntryState::Active;
+                }
             }
             Ok(())
         };
@@ -852,6 +955,7 @@ impl SubscriptionRegistry {
                 generation,
                 members,
                 state: EntryState::Active,
+                owner_server_id: None,
             },
         );
     }
@@ -904,29 +1008,39 @@ impl super::ToolRouter {
         }
 
         self.resource_subscriptions
-            .subscribe(uri, target, as_upstream_ops(upstream))
+            .subscribe(uri, target, &server_id, as_upstream_ops(upstream))
             .await
     }
 
     /// Unsubscribe a downstream client from resource updates.
     ///
     /// When the last subscriber is removed, forwards the unsubscribe to upstream.
+    ///
+    /// A tracked entry may outlive its route (a refresh dropped the route
+    /// while the subscription was racing it); such an entry is still
+    /// unsubscribable — its drain resolves the recorded owner instead of
+    /// the route cache. Only a URI with neither an entry nor a route is an
+    /// error.
     pub async fn unsubscribe_resource(
         &self,
         uri: &str,
         target: &NotificationTarget,
     ) -> Result<(), McpError> {
-        let snapshot = self.cache.load();
-        let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
-            McpError::from(ProtocolError::InvalidRequest {
-                detail: format!("resource not found: {uri}"),
-            })
-        })?;
-        drop(snapshot);
+        let route_server_id = {
+            let snapshot = self.cache.load();
+            snapshot.resource_routes.get(uri).cloned()
+        };
 
-        let upstream = self
-            .server_manager
-            .get_upstream(&server_id)
+        if route_server_id.is_none() && !self.resource_subscriptions.has_entry(uri) {
+            return Err(McpError::from(ProtocolError::InvalidRequest {
+                detail: format!("resource not found: {uri}"),
+            }));
+        }
+
+        // Route-resolved handle is only a fallback: the registry prefers
+        // the entry's recorded owner at drain time.
+        let upstream = route_server_id
+            .and_then(|server_id| self.server_manager.get_upstream(&server_id))
             .map(as_upstream_ops);
         self.resource_subscriptions
             .unsubscribe(uri, target, upstream)
@@ -940,6 +1054,8 @@ impl super::ToolRouter {
     /// Iterates all subscription entries and removes the target. When a URI
     /// transitions from 1 → 0 subscribers, forwards `unsubscribe` upstream.
     pub async fn cleanup_subscriptions_for_target(&self, target: &NotificationTarget) {
+        // Route-resolved handles are only fallbacks: each drain prefers the
+        // entry's recorded owner at drain time.
         self.resource_subscriptions
             .cleanup_target(target, |uri| {
                 let snapshot = self.cache.load();
@@ -1143,15 +1259,21 @@ mod tests {
         let entered = mock.subscribe_entered.notified();
         let reg_a = Arc::clone(&registry);
         let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let a =
-            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        let a = tokio::spawn(async move {
+            reg_a
+                .subscribe("file:///x", client("a"), "srv", mock_a)
+                .await
+        });
         entered.await;
 
         // B piggybacks on A's in-flight (still pending) transition.
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
         // Give B a chance to reach the piggyback branch before we release.
         tokio::task::yield_now().await;
 
@@ -1174,14 +1296,20 @@ mod tests {
         let entered = mock.subscribe_entered.notified();
         let reg_a = Arc::clone(&registry);
         let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let a =
-            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        let a = tokio::spawn(async move {
+            reg_a
+                .subscribe("file:///x", client("a"), "srv", mock_a)
+                .await
+        });
         entered.await;
 
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
         tokio::task::yield_now().await;
 
         mock.subscribe_gate.open();
@@ -1205,6 +1333,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("a"),
+                "srv",
                 Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1224,8 +1353,11 @@ mod tests {
         // B subscribes while the drain is still in flight upstream.
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
 
         // B must not be able to complete while the drain's unsubscribe call
         // is still parked — give it every opportunity to (incorrectly) race
@@ -1260,6 +1392,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("a"),
+                "srv",
                 Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1296,6 +1429,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("a"),
+                "srv",
                 Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1319,8 +1453,11 @@ mod tests {
         // race it.
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
@@ -1348,6 +1485,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("b"),
+                "srv",
                 Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1363,8 +1501,11 @@ mod tests {
         let entered = mock.subscribe_entered.notified();
         let reg_a = Arc::clone(&registry);
         let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let a =
-            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        let a = tokio::spawn(async move {
+            reg_a
+                .subscribe("file:///x", client("a"), "srv", mock_a)
+                .await
+        });
         entered.await;
 
         // A disconnects while its subscribe transition is still parked
@@ -1407,8 +1548,11 @@ mod tests {
         let entered_sub = mock.subscribe_entered.notified();
         let reg_a = Arc::clone(&registry);
         let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let a =
-            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        let a = tokio::spawn(async move {
+            reg_a
+                .subscribe("file:///x", client("a"), "srv", mock_a)
+                .await
+        });
         entered_sub.await;
 
         // A route refresh prunes the URI while A's subscribe transition is
@@ -1436,8 +1580,11 @@ mod tests {
         // a transient Active slot the drain is about to remove.
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
@@ -1460,6 +1607,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("b"),
+                "srv",
                 Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1475,8 +1623,11 @@ mod tests {
         let entered = mock.subscribe_entered.notified();
         let reg_a = Arc::clone(&registry);
         let mock_a = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let a =
-            tokio::spawn(async move { reg_a.subscribe("file:///x", client("a"), mock_a).await });
+        let a = tokio::spawn(async move {
+            reg_a
+                .subscribe("file:///x", client("a"), "srv", mock_a)
+                .await
+        });
         entered.await;
 
         // Drop A's own call (simulating a cancelled/disconnected caller).
@@ -1487,8 +1638,11 @@ mod tests {
         // detached transition task survived A's cancellation.
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
         tokio::task::yield_now().await;
 
         mock.subscribe_gate.open();
@@ -1507,6 +1661,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("a"),
+                "srv",
                 Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1529,8 +1684,11 @@ mod tests {
 
         let reg_b = Arc::clone(&registry);
         let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
-        let b =
-            tokio::spawn(async move { reg_b.subscribe("file:///x", client("b"), mock_b).await });
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "srv", mock_b)
+                .await
+        });
         tokio::task::yield_now().await;
         assert!(!b.is_finished());
 
@@ -1550,6 +1708,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("a"),
+                "srv",
                 Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1583,8 +1742,11 @@ mod tests {
         // holds the transition lock must not race ahead of it.
         let reg_c = Arc::clone(&registry);
         let mock_c = Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>;
-        let c =
-            tokio::spawn(async move { reg_c.subscribe("file:///x", client("c"), mock_c).await });
+        let c = tokio::spawn(async move {
+            reg_c
+                .subscribe("file:///x", client("c"), "srv", mock_c)
+                .await
+        });
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
@@ -1610,6 +1772,7 @@ mod tests {
             .subscribe(
                 "file:///x",
                 client("a"),
+                "srv",
                 Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>,
             )
             .await
@@ -1664,6 +1827,160 @@ mod tests {
         assert_eq!(new_mock.unsubscribe_call_count(), 0);
     }
 
+    /// Manifestation: a downstream unsubscribe landing after `refresh_tools`
+    /// published its new snapshot resolves the NEW owner from the route
+    /// cache and hands that (wrong) handle to the drain. The drain must
+    /// instead unsubscribe the recorded owner — the server actually holding
+    /// the upstream subscription — and the subsequent rebind must find the
+    /// entry gone and never touch the new owner.
+    #[tokio::test]
+    async fn drain_prefers_recorded_owner_over_route_resolved_fallback() {
+        let registry = SubscriptionRegistry::new();
+        let old_mock = MockUpstream::new();
+        let new_mock = MockUpstream::new();
+
+        let resolver_old = Arc::clone(&old_mock);
+        let resolver_new = Arc::clone(&new_mock);
+        registry.set_owner_resolver(Arc::new(move |server_id: &str| match server_id {
+            "old-server" => Some(Arc::clone(&resolver_old) as Arc<dyn UpstreamResourceOps>),
+            "new-server" => Some(Arc::clone(&resolver_new) as Arc<dyn UpstreamResourceOps>),
+            _ => None,
+        }));
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "old-server",
+                Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_mock.subscribe_call_count(), 1);
+
+        // The last member unsubscribes with a handle resolved from the
+        // already-published new snapshot (the wrong upstream). Recorded
+        // owner must win.
+        registry
+            .unsubscribe(
+                "file:///x",
+                &client("a"),
+                Some(Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await;
+
+        for _ in 0..50 {
+            if registry.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.is_empty());
+        assert_eq!(
+            old_mock.unsubscribe_call_count(),
+            1,
+            "drain must hit the recorded owner"
+        );
+        assert_eq!(
+            new_mock.unsubscribe_call_count(),
+            0,
+            "drain must not hit the route-resolved fallback"
+        );
+
+        // The refresh's rebind then finds no entry and must not resubscribe
+        // anywhere (the invisible-orphan half of the manifestation).
+        registry
+            .rebind(
+                "file:///x",
+                "old-server",
+                Some(Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>),
+                "new-server",
+                Ok(Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await;
+        assert_eq!(new_mock.subscribe_call_count(), 0);
+        assert_eq!(old_mock.unsubscribe_call_count(), 1);
+    }
+
+    /// Manifestation: a downstream subscribe racing a route-refresh prune
+    /// (prunes run BEFORE the new snapshot is published) resolves the OLD
+    /// route and re-creates the entry on the old owner; the published
+    /// snapshot then has no route for the URI. The recorded owner must let
+    /// a later routeless drain (fallback handle `None`) still unsubscribe
+    /// the old owner instead of silently leaking the upstream subscription.
+    #[tokio::test]
+    async fn racing_subscribe_during_prune_records_owner_for_routeless_drain() {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::with_closed_unsubscribe_gate();
+
+        let resolver_mock = Arc::clone(&mock);
+        registry.set_owner_resolver(Arc::new(move |server_id: &str| {
+            (server_id == "old-server")
+                .then(|| Arc::clone(&resolver_mock) as Arc<dyn UpstreamResourceOps>)
+        }));
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "old-server",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+
+        // Route refresh prunes the URI; its drain parks inside the upstream
+        // unsubscribe call.
+        let entered_unsub = mock.unsubscribe_entered.notified();
+        let reg_prune = Arc::clone(&registry);
+        let mock_prune = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let prune = tokio::spawn(async move {
+            reg_prune
+                .prune("file:///x", Some("old-server"), Some(mock_prune))
+                .await;
+        });
+        entered_unsub.await;
+
+        // B subscribes in the window, resolving the old (pre-publish)
+        // route: fresh generation on the old owner, queued behind the
+        // drain.
+        let reg_b = Arc::clone(&registry);
+        let mock_b = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
+        let b = tokio::spawn(async move {
+            reg_b
+                .subscribe("file:///x", client("b"), "old-server", mock_b)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        mock.unsubscribe_gate.open();
+        prune.await.unwrap();
+        assert!(b.await.unwrap().is_ok());
+        assert_eq!(mock.subscribe_call_count(), 2);
+        assert_eq!(mock.unsubscribe_call_count(), 1);
+        assert_eq!(
+            registry.members_snapshot("file:///x").unwrap(),
+            HashSet::from([client("b")])
+        );
+
+        // The published snapshot has no route for the URI, so B's eventual
+        // unsubscribe arrives with no fallback handle at all. The recorded
+        // owner must still drain the old owner.
+        registry.unsubscribe("file:///x", &client("b"), None).await;
+        for _ in 0..50 {
+            if registry.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.is_empty());
+        assert_eq!(
+            mock.unsubscribe_call_count(),
+            2,
+            "routeless drain must unsubscribe via the recorded owner"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_subscribe_unsubscribe_smoke() {
         let registry = SubscriptionRegistry::new();
@@ -1676,7 +1993,9 @@ mod tests {
             let m = Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>;
             let target = client(&format!("client-{i}"));
             tasks.push(tokio::spawn(async move {
-                let _ = reg.subscribe(uri, target.clone(), Arc::clone(&m)).await;
+                let _ = reg
+                    .subscribe(uri, target.clone(), "srv", Arc::clone(&m))
+                    .await;
                 reg.unsubscribe(uri, &target, Some(m)).await;
             }));
         }
