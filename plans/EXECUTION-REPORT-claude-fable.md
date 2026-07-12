@@ -97,15 +97,17 @@ record in the merge body):
   failure exits and the silent corrupt-state-file fallback now emit
   `tracing::warn!` with error/path fields. Note: canonicalization does
   NOT bound hostile minting — scopes are free-form and secret-gated;
-  the eager expiry sweep + 1h TTL remain the actual bound, as 020's
-  review already recorded.
+  the eager expiry sweep + 1h TTL bound retention time, not row
+  cardinality (a hostile secret-holder can still mint arbitrarily many
+  rows inside a TTL window; the sweep only guarantees they die within
+  the hour), as 020's review already recorded.
 
 The counter-review also produced six truth corrections to this report,
 the plans index, plan 020's addendum, the snapshot, and session memory —
 all verified against primary evidence (git, a from-scratch baseline test
 run, wave-gate transcripts) before being applied at `013d209`.
 
-## Open findings / follow-up candidates (none block the merge)
+## Open findings / follow-up candidates
 
 1. **IPC `ping` gap (correctness, new)** — MCP `ping` over the daemon IPC
    proxy returns `UNSUPPORTED_METHOD` (catch-all arm, now in
