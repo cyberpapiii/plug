@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after the 2026-07-12 improve-program integration and its post-merge truth pass.
+Baseline: `main` after the 2026-07-13 RMCP 2.2 stable migration.
 
 This is the canonical current-state doc for the project.
 
@@ -28,7 +28,8 @@ Implemented on `main`:
 - reconnecting IPC proxy sessions with capability, subscription, and log-level replay plus a read-silence watchdog
 - session-store seam / stateless prep
 - downstream protocol-version validation
-- upstream MCP-Protocol-Version send-side (provided by rmcp 1.7.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
+- upstream MCP-Protocol-Version send-side (provided by RMCP 2.2.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
+- RMCP 2.2.0 with spec-aligned `ContentBlock`, resource, prompt, task, elicitation, and cancellation models while continuing to negotiate MCP `2025-11-25`
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation reverse-request forwarding across stdio, HTTP, and daemon IPC
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
@@ -96,15 +97,25 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-The `codex/rmcp-2.2-upgrade` branch upgrades the Rust MCP SDK to RMCP 2.2.0,
-migrates Plug to its spec-aligned models, and keeps the negotiated MCP revision
-at `2025-11-25`. It exists off-main until merged and verified there.
+No unmerged project work is currently present locally or on `origin`. Local
+branch names may remain temporarily while their worktrees are pruned, but
+their reviewed commits are already contained in `main`.
 
 ## Release Status
 
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-07-13, `main` upgraded the Rust MCP SDK from RMCP 1.7.0 to the exact
+stable RMCP 2.2.0 release. Plug migrated to RMCP's spec-aligned model types,
+accepts cancellation notifications without a request id without touching an
+unrelated active call, and keeps its existing stdio, Streamable HTTP, daemon
+IPC, OAuth, Tasks, elicitation, sampling, resources, prompts, completion, and
+notification behavior. The negotiated MCP wire revision remains `2025-11-25`;
+stdio and daemon-IPC clients requesting the announced-but-unimplemented
+`2026-07-28` revision are rejected. See
+[`RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md`](RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md).
 
 On 2026-07-12, `main` absorbed the 24-plan improve program plus four rounds of
 counter-review repairs. The user-visible result is stronger reconnect and SSE

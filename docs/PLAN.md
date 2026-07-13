@@ -25,7 +25,7 @@ forwarding work:
 - daemon continuity recovery (stdio clients via IPC proxy reconnect)
 - session-store abstraction seam and stateless design prep
 - MCP-Protocol-Version header validation on downstream HTTP POST requests
-- MCP-Protocol-Version header on upstream HTTP requests (provided by rmcp 1.7.0 after initialization)
+- MCP-Protocol-Version header on upstream HTTP requests (provided by RMCP 2.2.0 after initialization)
 - subscription pruning and rebind on route refresh (todo 039 resolved)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC (PR #34)

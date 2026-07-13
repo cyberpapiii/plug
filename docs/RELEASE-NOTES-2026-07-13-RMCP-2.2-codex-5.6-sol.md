@@ -1,9 +1,8 @@
 # RMCP 2.2 upgrade - Codex 5.6 sol
 
-This release branch upgrades Plug to RMCP 2.2.0, the latest stable release of
-the official Rust SDK available on July 13, 2026. Until the branch is merged,
-it exists off-main. This is an SDK and compatibility upgrade, not a change to
-the MCP version clients see: Plug still negotiates MCP `2025-11-25`.
+Plug now uses RMCP 2.2.0, the latest stable release of the official Rust SDK
+available on July 13, 2026. This is an SDK and compatibility upgrade, not a
+change to the MCP version clients see: Plug still negotiates MCP `2025-11-25`.
 
 No configuration migration is required. Existing stdio, Streamable HTTP,
 daemon IPC, OAuth, Tasks, resources, prompts, completion, elicitation,

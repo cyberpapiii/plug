@@ -4,7 +4,7 @@ This document captures the MCP protocol details that directly affect Plug's impl
 
 **Current spec version**: 2025-11-25
 **Spec URL**: https://modelcontextprotocol.io/specification/2025-11-25
-**Rust SDK on `main`**: RMCP 1.7.0. The off-main migration branch pins RMCP 2.2.0 exactly.
+**Rust SDK**: RMCP 2.2.0 (exactly pinned)
 
 ---
 
