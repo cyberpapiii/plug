@@ -224,12 +224,25 @@ mod tests {
                 engine.tracker(),
             );
 
-            Self {
+            let mut fixture = Self {
                 _dir: dir,
                 config_path,
                 engine,
                 events,
-            }
+            };
+
+            // The watcher task arms asynchronously. Drive one real config
+            // write through the full debounce/reload path before returning so
+            // negative assertions cannot mistake a late startup event for the
+            // mutation they are testing. The bounded retry also covers a
+            // first write that lands before the OS watcher is registered.
+            let initial_config = Config::default();
+            assert!(
+                fixture.mutate_and_await_reload(&initial_config).await,
+                "config watcher did not become ready within the bounded retry window"
+            );
+
+            fixture
         }
 
         /// Poll (deadline-bounded, never a bare sleep-then-check) until a
