@@ -918,6 +918,7 @@ async fn bridge_session_rejects_unloaded_task_tool_call() {
             None,
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
+            None,
             Some(DownstreamCallContext::stdio_for_client(
                 "client-a",
                 RequestId::Number(1),
@@ -942,6 +943,7 @@ async fn bridge_session_rejects_task_wrapped_search_meta_tool() {
             Some(args),
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
+            None,
             Some(DownstreamCallContext::stdio_for_client(
                 "client-a",
                 RequestId::Number(1),

@@ -65,12 +65,14 @@ pub struct HttpState {
 }
 
 /// HTTP adapter for the shared `tools/call` dispatcher. Carries the per-call
-/// session identity, request id, and trace id the dispatcher needs.
+/// session identity, request id, and trace id the dispatcher needs, plus the
+/// session store so task creation can re-check the session's liveness.
 struct HttpDownstreamContext {
     session_id: Arc<str>,
     request_id: RequestId,
     client_type: crate::types::ClientType,
     trace_id: Arc<str>,
+    sessions: Arc<dyn SessionStore>,
 }
 
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
@@ -87,6 +89,18 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
         Ok(crate::proxy::ToolRouter::task_owner_for_http_session(
             &self.session_id,
         ))
+    }
+
+    /// Session-existence probe for the enqueue path's post-guard liveness
+    /// re-check. HTTP teardown (DELETE / idle expiry) removes the session
+    /// from this store BEFORE running task cleanup, and session ids are
+    /// server-minted UUIDv4 (never reused), so "still in the store" is a
+    /// sound "teardown has not started" signal — see the ordering argument
+    /// at the check site in `proxy::tasks`.
+    fn owner_liveness_probe(&self) -> Option<crate::tasks::OwnerLivenessProbe> {
+        let sessions = Arc::clone(&self.sessions);
+        let session_id = Arc::clone(&self.session_id);
+        Some(Arc::new(move || sessions.validate(&session_id).is_ok()))
     }
 }
 
@@ -1322,6 +1336,7 @@ async fn handle_request(
                 request_id: request_id.clone(),
                 client_type,
                 trace_id: Arc::clone(&trace_id),
+                sessions: Arc::clone(&state.sessions),
             };
             let response_msg =
                 match crate::dispatch::dispatch_tools_call(&state.router, &ctx, call_req.params)
@@ -2035,7 +2050,7 @@ mod tests {
         let owner = ToolRouter::task_owner_for_http_session(&session_id);
         state
             .router
-            .enqueue_tool_task("git__commit", None, None, owner.clone(), None)
+            .enqueue_tool_task("git__commit", None, None, owner.clone(), None, None)
             .await
             .expect("enqueue task for departing session");
         assert_eq!(state.router.task_count_for_owner(&owner).await, 1);

@@ -29,6 +29,11 @@ struct IpcDownstreamContext {
     request_id: RequestId,
     client_type: plug_core::types::ClientType,
     owner: Option<plug_core::tasks::TaskOwner>,
+    /// Pre-built alongside `owner` (both derive from the resolved client id):
+    /// reports whether the client registry still holds a session for that
+    /// client id, mirroring the `client_sessions.contains_key` gate the
+    /// daemon's disconnect teardown uses before task cleanup.
+    owner_liveness: Option<plug_core::tasks::OwnerLivenessProbe>,
 }
 
 impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
@@ -44,6 +49,17 @@ impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
         self.owner.clone().ok_or_else(|| {
             McpError::internal_error("ipc task owner was not resolved".to_string(), None)
         })
+    }
+
+    /// Registry-liveness probe for the enqueue path's post-guard re-check.
+    /// IPC teardown deregisters the client (removing it from
+    /// `client_sessions`) BEFORE running task cleanup, matching the ordering
+    /// the check site in `proxy::tasks` relies on. IPC client ids recur on
+    /// reconnect by design, so a probe observing a re-registered client
+    /// accepts the create — benign, since the same `ipc:<client_id>` owner is
+    /// live again; the tombstone catch-all remains the backstop.
+    fn owner_liveness_probe(&self) -> Option<plug_core::tasks::OwnerLivenessProbe> {
+        self.owner_liveness.clone()
     }
 }
 
@@ -247,18 +263,21 @@ pub(super) async fn dispatch_mcp_request(
             // Pre-resolve the task owner so the transport-specific UNKNOWN_SESSION
             // error frame is preserved for a task-augmented call whose session
             // vanished (the dispatcher only sees an opaque McpError otherwise).
-            let owner = if call_params.task.is_some() {
+            // The liveness probe is built from the same resolved client id.
+            let (owner, owner_liveness) = if call_params.task.is_some() {
                 let Some(client_id) = ctx.client_registry.client_id(session_id) else {
                     return IpcResponse::Error {
                         code: "UNKNOWN_SESSION".to_string(),
                         message: "session not found".to_string(),
                     };
                 };
-                Some(plug_core::proxy::ToolRouter::task_owner_for_ipc_client(
-                    &client_id,
-                ))
+                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                let registry = Arc::clone(&ctx.client_registry);
+                let probe: plug_core::tasks::OwnerLivenessProbe =
+                    Arc::new(move || registry.client_sessions.contains_key(&client_id));
+                (Some(owner), Some(probe))
             } else {
-                None
+                (None, None)
             };
 
             // Synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
@@ -271,6 +290,7 @@ pub(super) async fn dispatch_mcp_request(
                 request_id,
                 client_type,
                 owner,
+                owner_liveness,
             };
 
             match plug_core::dispatch::dispatch_tools_call(

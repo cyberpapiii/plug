@@ -15,6 +15,14 @@ pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_MAX_COMPLETED_TASKS_PER_OWNER: usize = 100;
 const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Transport-supplied probe reporting whether a task owner's downstream
+/// session is still live. Checked by `enqueue_tool_task` immediately after it
+/// registers its [`OwnerCreateGuard`], closing the race where a teardown
+/// completes *entirely* before the enqueue registers anything (so the
+/// tombstone never sees the create). `None` means the transport has no
+/// teardown path that could race task creation (stdio).
+pub type OwnerLivenessProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaskOwner {
     key: Arc<str>,
@@ -60,6 +68,40 @@ struct TaskRecord {
 }
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
+
+/// Outcome of [`TaskStore::set_upstream_request`].
+///
+/// `Missing` and "recorded with no pending cancel" must be distinguishable:
+/// the old `Option<String>` return conflated them, so a record that vanished
+/// between the upstream send and this call (owner teardown draining the
+/// store) could never trigger an upstream cancellation from the dispatch
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamRecordOutcome {
+    /// No record exists for the task id: the owner was torn down (or the
+    /// record pruned) after the upstream request was sent. Teardown drained
+    /// the store before this record held an upstream ref, so the caller is
+    /// the only party that still knows the request id — it must cancel
+    /// upstream itself.
+    Missing,
+    /// The upstream ref was recorded. `pending_cancel` reports a cancellation
+    /// that arrived before the ref landed (see [`TaskStore::mark_cancelled`])
+    /// so the caller can replay `notify_cancelled` upstream.
+    Recorded { pending_cancel: Option<String> },
+}
+
+/// Error returned when a task create is refused because its owner's session
+/// was torn down: either observed via the owner tombstone
+/// ([`TaskStore::cleanup_owner`] during an in-flight create) or via a
+/// transport [`OwnerLivenessProbe`] right after guard registration. One
+/// constructor so both refusal paths surface the identical error.
+pub(crate) fn owner_closed_during_create_error() -> McpError {
+    McpError::new(
+        ErrorCode::INVALID_REQUEST,
+        "session closed during task creation",
+        None,
+    )
+}
 
 /// Per-owner lifecycle state: how many `enqueue_tool_task` calls are
 /// currently in flight for the owner, and whether the owner was torn down
@@ -193,13 +235,18 @@ impl TaskStore {
     /// nothing ever cleans up until the stale-in-flight TTL.
     fn ensure_owner_accepts_creates(&self, owner: &TaskOwner) -> Result<(), McpError> {
         if self.lifecycle.is_tombstoned(owner) {
-            return Err(McpError::new(
-                ErrorCode::INVALID_REQUEST,
-                "session closed during task creation",
-                None,
-            ));
+            return Err(owner_closed_during_create_error());
         }
         Ok(())
+    }
+
+    /// Test probe: whether the lifecycle ledger still holds an entry for
+    /// `owner`. Entries exist only while creates are in flight, so this lets
+    /// tests assert the ledger returned to count zero after an enqueue
+    /// resolved (no per-owner memory leak, tombstone included).
+    #[cfg(test)]
+    pub(crate) fn owner_has_lifecycle_entry(&self, owner: &TaskOwner) -> bool {
+        self.lifecycle.lock_states().contains_key(owner)
     }
 
     pub fn create(&mut self, owner: TaskOwner, name: &str) -> Result<Task, McpError> {
@@ -239,22 +286,29 @@ impl TaskStore {
 
     /// Records the upstream request/task ref for a task once dispatch has it
     /// in flight. If a cancellation arrived while the ref was still unset
-    /// (see `mark_cancelled`), returns the pending cancel reason so the
-    /// caller can replay `notify_cancelled` upstream now that there's a
-    /// request id to target — otherwise the cancel would be silently
-    /// dropped, and the upstream would run the call to completion for a
-    /// result nobody wants.
+    /// (see `mark_cancelled`), the [`UpstreamRecordOutcome::Recorded`] result
+    /// carries the pending cancel reason so the caller can replay
+    /// `notify_cancelled` upstream now that there's a request id to target —
+    /// otherwise the cancel would be silently dropped, and the upstream would
+    /// run the call to completion for a result nobody wants.
+    ///
+    /// Returns [`UpstreamRecordOutcome::Missing`] when no record with this
+    /// task id exists (the owner was torn down between the upstream send and
+    /// this call) — distinct from "recorded, no pending cancel" so the caller
+    /// knows it must cancel the upstream request itself.
     pub fn set_upstream_request(
         &mut self,
         task_id: &str,
         upstream: TaskUpstreamRef,
-    ) -> Option<String> {
+    ) -> UpstreamRecordOutcome {
         if let Some(record) = self.tasks.get_mut(task_id) {
             record.upstream = Some(upstream);
             record.last_touched = Instant::now();
-            return record.pending_cancel_reason.take();
+            return UpstreamRecordOutcome::Recorded {
+                pending_cancel: record.pending_cancel_reason.take(),
+            };
         }
-        None
+        UpstreamRecordOutcome::Missing
     }
 
     pub fn create_passthrough(
@@ -748,7 +802,12 @@ mod tests {
                 request_id: rmcp::model::RequestId::Number(1),
             },
         );
-        assert_eq!(pending, None);
+        assert_eq!(
+            pending,
+            UpstreamRecordOutcome::Recorded {
+                pending_cancel: None
+            }
+        );
 
         let completed = store
             .create(owner.clone(), "Mock__echo")
@@ -863,7 +922,9 @@ mod tests {
         );
         assert_eq!(
             pending,
-            Some("task cancelled".to_string()),
+            UpstreamRecordOutcome::Recorded {
+                pending_cancel: Some("task cancelled".to_string())
+            },
             "expected the stashed cancel reason to be replayed"
         );
 
@@ -876,7 +937,12 @@ mod tests {
                 request_id: rmcp::model::RequestId::Number(2),
             },
         );
-        assert_eq!(pending_again, None);
+        assert_eq!(
+            pending_again,
+            UpstreamRecordOutcome::Recorded {
+                pending_cancel: None
+            }
+        );
     }
 
     #[test]
@@ -895,7 +961,37 @@ mod tests {
                 request_id: rmcp::model::RequestId::Number(1),
             },
         );
-        assert_eq!(pending, None);
+        assert_eq!(
+            pending,
+            UpstreamRecordOutcome::Recorded {
+                pending_cancel: None
+            }
+        );
+    }
+
+    #[test]
+    fn set_upstream_request_reports_missing_for_a_vanished_record() {
+        // Store-level backing for the send-to-record gap fix: if the owner
+        // was torn down (record drained) between the upstream send and the
+        // record call, the outcome must be distinguishable from "recorded,
+        // no pending cancel" so the dispatch path knows it alone still holds
+        // the request id and must cancel upstream itself.
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("http:gone"));
+        let task = store
+            .create(owner.clone(), "Mock__echo")
+            .expect("create task");
+
+        store.cleanup_owner(&owner);
+
+        let outcome = store.set_upstream_request(
+            &task.task_id,
+            TaskUpstreamRef::Request {
+                server_id: "mock".to_string(),
+                request_id: rmcp::model::RequestId::Number(1),
+            },
+        );
+        assert_eq!(outcome, UpstreamRecordOutcome::Missing);
     }
 
     fn upstream_working_task(task_id: &str) -> Task {
