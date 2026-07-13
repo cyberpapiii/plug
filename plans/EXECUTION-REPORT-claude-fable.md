@@ -243,8 +243,8 @@ Wave-3 final gates all passed at `6f8c2b8` (see "Final gates" above):
 ## Codex 5.6 sol final repair wave (2026-07-12)
 
 Codex re-checked the wave-3 tree and found three remaining defects plus one
-unsupported test claim. Commit `4e07fbd` on `codex/wave4-final-repairs` fixes
-the code. The separate handoff is
+unsupported test claim. Commit `4e07fbd`, merged into `improve/integration` by
+`c1b6fef`, fixes the code. The separate handoff is
 `plans/FINAL-REPAIR-REPORT-codex-5.6-sol.md`.
 
 - Plan 010 now coalesces equivalent Pending rebinds by intended owner, so

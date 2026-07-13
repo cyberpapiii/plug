@@ -2,9 +2,9 @@
 
 Date: 2026-07-12
 
-Status: `exists off-main`. Code commit `4e07fbd` sits on
-`codex/wave4-final-repairs`, based on `improve/integration` at `6ecf4b8`.
-This report does not claim any change is done on `main`.
+Status: `exists off-main`. Code commit `4e07fbd` and this report were merged
+into `improve/integration` by `c1b6fef`. This report does not claim any change
+is done on `main`.
 
 ## What this pass fixed
 
@@ -62,4 +62,3 @@ In particular, this commit does not change cross-owner subscription supersede
 semantics or add timeouts to all resource subscribe and unsubscribe calls.
 Those are older, documented design limits and were not required to correct the
 false-success, retention, native-send, or HTTP-proof defects above.
-
