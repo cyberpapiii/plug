@@ -48,6 +48,11 @@ forwarding work:
 - runtime-truth follow-up hardening across `status`, `tools`, `servers`, `clients`, and `doctor`
 - explicit live reverse-request delivery failure handling for downstream HTTP sessions
 - review-hardened task correctness around monotonic state transitions, reconnect-stable IPC ownership, and fail-closed pass-through dispatch
+- owner-scoped task teardown that aborts local execution first and forwards bounded upstream cancellation
+- per-URI atomic resource subscription transitions with recorded-owner drains and same-refresh route healing
+- IPC reconnect state replay, read-silence recovery, and SSE replay-tail preservation
+- downstream OAuth store sweeping, token reuse, scope canonicalization, and owner-only fail-closed persistence
+- concurrent catalog-family refresh and blocking-pool writes for oversized artifacts
 - downstream OAuth authorize-redirect allowlist and exposure-keyed secretless-OAuth guard, plus per-upstream operability metrics in `plug status --output json` (PR #60)
 - first-class upstream catalog availability (`healthy | degraded | absent`) with last-known-good carry-forward for transient listing failures, closing the PR #58 subscription-rebind residual (PR #61)
 
@@ -83,7 +88,6 @@ Optional future scope only:
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
-- move the ≥16MB artifact write off the async worker via `spawn_blocking` (requires making `ArtifactStore` shareable; deferred from PR #58) — `exists off-main` on the `improve/integration` line (improve-program plan 005, re-scoped to `spawn_blocking` for oversized payload writes); becomes `done on main` only when that branch merges
 - end-to-end metrics-recording test plus an RAII recording guard, and an operator-guide note on `degraded_since` vs. health divergence (deferred from PR #60)
 
 ## Designed-But-Deferred Program Phases

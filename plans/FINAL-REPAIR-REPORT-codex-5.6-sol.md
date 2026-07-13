@@ -2,9 +2,8 @@
 
 Date: 2026-07-12
 
-Status: `exists off-main`. Code commit `4e07fbd` and this report were merged
-into `improve/integration` by `c1b6fef`. This report does not claim any change
-is done on `main`.
+Status: `done on main`. Code commit `4e07fbd` and this report reached `main`
+through the reviewed `improve/integration` line on 2026-07-12.
 
 ## What this pass fixed
 

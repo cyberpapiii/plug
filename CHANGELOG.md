@@ -7,6 +7,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+Detailed notes: [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
+
+### Added
+
+- End-to-end config watcher coverage for normal saves, atomic-renames, parse failures, and unrelated file changes.
+- IPC proxy characterization coverage for reconnects, retries, malformed frames, notification ordering, and replayed session state.
+- CI checks for the declared Rust 1.88 minimum version, RustSec advisories, and todo-file status consistency.
+
+### Changed
+
+- Reconnecting daemon clients now restore capabilities, resource subscriptions, client log level, and other session state before resuming work.
+- Catalog refresh fetches resources, templates, and prompts concurrently and avoids repeated server lookups and unnecessary filtered views.
+- Oversized artifact writes run on the blocking pool instead of occupying an async runtime worker.
+- Native task creation and task teardown now use bounded waits derived from each upstream server's call timeout.
+- Split the daemon implementation into focused framing, path, registry, auth, notification, and MCP dispatch modules without changing its public behavior.
+- Source builds now require Rust 1.88. The `rmcp` dependency stays within the compatible 1.7 release line.
+
+### Fixed
+
+- Resource subscriptions now serialize upstream transitions per URI, preserve the correct recorded owner, and heal route changes without false success or zombie registry entries.
+- HTTP and IPC session teardown now aborts local task execution and forwards bounded cancellation to task-capable upstreams.
+- Task creation can no longer recreate records after the owning session has been removed, leak owner guards behind a full request queue, or lose cancellation in the send-to-record window.
+- Reloads and reconnects now commit through the same coordination lock, so stale reconnect attempts cannot overwrite newer configuration.
+- SSE replay preserves the unsent tail after a delivery failure and no longer clears a sender installed by a racing reconnect.
+- Daemon IPC read silence now forces a reconnect instead of holding the session mutex indefinitely.
+- Replacement grace tasks now participate in shutdown and a shutdown signal remains latched even when no receiver is present.
+- Fixed expired-session counter underflow, pending cancellation replay, a daemon reverse-request busy loop, and closed-channel restoration after deregistration.
+
+### Security
+
+- OAuth secret directories are created with owner-only permissions.
+- Downstream OAuth state persistence fails closed on unsafe temporary-file permissions and enforces owner-only permissions after rename.
+- Expired OAuth records are swept, equivalent scope sets reuse tokens, and client-credentials requests reuse live tokens instead of growing the store on every call.
+- Replaced the unmaintained `fs2` lock dependency with `fs4` and removed the duplicate default HTTP stack from `oauth2`.
+
 ## [0.3.0] - 2026-05-17
 
 ### Added

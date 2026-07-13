@@ -263,8 +263,7 @@ unsupported test claim. Commit `4e07fbd`, merged into `improve/integration` by
 The three behavioral regressions failed on the wave-3 code before the fixes.
 All four focused tests passed 3 consecutive runs after the fix. The full gate
 passed at 857 workspace tests, clippy `-D warnings`, fmt, MSRV 1.88, advisories,
-and the todo-status guard. Everything in this section remains `exists
-off-main` until merged to `main`.
+and the todo-status guard. This repair wave is now `done on main`.
 
 ## Open findings / follow-up candidates
 
@@ -322,12 +321,11 @@ off-main` until merged to `main`.
 
 ## Handoff
 
-- `improve/integration` → `main` is the operator's decision; nothing has
-  been pushed anywhere.
-- On merge, run the repo post-merge checklist: promote the snapshot's
-  "What Exists Off-Main" entry into a dated Release Status paragraph,
-  retire `docs/PLAN.md`'s artifact-`spawn_blocking` remaining-work bullet
-  (annotated on this branch), and re-verify the snapshot against `main`.
-- Executor worktrees under `.claude/worktrees/` and the merged plan
-  branches (`fix/...`, `test/...`, `perf/...`, `docs/...`, `refactor/...`)
-  can be pruned after merge.
+- `improve/integration` was fast-forwarded into `main` on 2026-07-12 after
+  the Codex 5.6 sol repair wave and the full merged-tree gate passed.
+- The post-merge truth pass promoted the snapshot entry, removed the stale
+  artifact remaining-work bullet, updated the changelog, and added the
+  user-facing release notes.
+- The executor worktrees and their merged branches were then eligible for
+  pruning. Harness-owned temporary worktrees remain under their owning tool's
+  control.

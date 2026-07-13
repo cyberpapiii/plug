@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #67 (active upstream supervision — restart-on-degradation, item 2b / R10) and its post-merge truth pass. **The 2026-06-10 operability/hardening program is now fully landed** (PRs #60–#67).
+Baseline: `main` after the 2026-07-12 improve-program integration and its post-merge truth pass.
 
 This is the canonical current-state doc for the project.
 
@@ -25,7 +25,7 @@ Implemented on `main`:
 - meta-tool mode
 - lazy tool discovery v2 with client-targeted lazy policy, OpenCode bridge search, bounded session working sets, and legacy `meta_tool_mode` compatibility
 - daemon-backed local sharing
-- reconnecting IPC proxy sessions
+- reconnecting IPC proxy sessions with capability, subscription, and log-level replay plus a read-silence watchdog
 - session-store seam / stateless prep
 - downstream protocol-version validation
 - upstream MCP-Protocol-Version send-side (provided by rmcp 1.7.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
@@ -81,7 +81,11 @@ Implemented on `main`:
 - bounded concurrent reload startup with single-flight engine reloads and safe shared upstream registration
 - coalesced health-triggered tool refreshes and deduplicated proactive recovery task spawning
 - pre-serialized HTTP/SSE notification fanout payloads
-- artifact cache pruning at startup, periodic background maintenance, and oldest-first size eviction
+- artifact cache pruning at startup, periodic background maintenance, oldest-first size eviction, and blocking-pool writes for oversized payloads
+- per-URI atomic resource subscription transitions with recorded-owner drains and same-refresh route healing
+- owner-scoped HTTP and IPC task teardown with abort-first local cleanup and bounded upstream cancellation
+- downstream OAuth entry sweeping, client-credentials token reuse, scope canonicalization, and fail-closed owner-only persistence
+- reload/reconnect installation coordinated through one material-configuration check
 - centralized config env traversal reused by doctor env checks, with broader coverage across config fields
 - stricter runtime-truth handling across `status`, `tools`, `servers`, `clients`, and `doctor` when the daemon is reachable but IPC/runtime inspection fails
 
@@ -92,15 +96,27 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-One off-main line exists locally: `improve/integration` (the 2026-07-11/12 improve-program batch; local only, not on `origin`). It contains 24 individually-executed, reviewed, and merged plan branches — 23 plans completed plus one partial (013: the HTTP crash-restart supervision e2e landed; the OAuth refresh-under-load e2e was adjudicated not achievable as a tests-only change). Contents: correctness fixes (SSE replay tail preservation, IPC read watchdog, subscription-registry atomicity, retire-task tracking with a latched shutdown signal, reconnect/reload interlock, HTTP session-task teardown, a four-bug small-fix batch), downstream-OAuth store hardening, test hardening (IPC-proxy characterization, crash-restart supervision e2e, config-watcher e2e, paused-time de-flake), perf (catalog hot-path batch, concurrent catalog family fetch, artifact `spawn_blocking` writes), toolchain/CI quick wins with an MSRV reality-bump to 1.88, docs/design deliverables (dispatch-unification design, downstream-OAuth conformance spike, rmcp pin policy, plan-doc and todo truth fixes), and a move-only split of `plug/src/daemon.rs` into `plug/src/daemon/` submodules. Per-plan status and review annotations: `plans/README-claude-fable.md` on that branch; full execution report: `plans/EXECUTION-REPORT-claude-fable.md`.
-
-Everything in this section carries the status label `exists off-main` (per `docs/TRUTH-RULES.md`). Off-main work must not be described as current implementation unless live git evidence shows it exists; nothing above is `done on main` until the branch merges. Post-merge checklist for whoever merges it: promote this entry into a dated Release Status paragraph, retire the PLAN.md remaining-work bullet on the artifact `spawn_blocking` write (completed by plan 005), and re-verify this snapshot against `main`.
+No unmerged project work is currently present locally or on `origin`. Local
+executor branch names may remain temporarily while their worktrees are pruned,
+but their reviewed commits are already contained in `main`.
 
 ## Release Status
 
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-07-12, `main` absorbed the 24-plan improve program plus four rounds of
+counter-review repairs. The user-visible result is stronger reconnect and SSE
+replay behavior, atomic resource subscription ownership across route refreshes,
+bounded owner-scoped task teardown, safer downstream OAuth persistence, faster
+catalog refresh, and non-blocking oversized artifact writes. The source-build
+minimum is now Rust 1.88 and `rmcp` stays within the 1.7 release line. The final
+workspace gate passed 857 tests plus clippy, formatting, MSRV compilation,
+RustSec advisories, and todo-status checks. See
+[`RELEASE-NOTES-2026-07-12-codex-5.6-sol.md`](RELEASE-NOTES-2026-07-12-codex-5.6-sol.md)
+for the user-facing summary and `plans/EXECUTION-REPORT-claude-fable.md` for
+the technical record.
 
 On 2026-07-03, `main` absorbed the improve-audit hardening batch (eight reviewed branches, merged directly): (1) daemon IPC frame reads are now cancellation-safe — a dedicated reader task feeds a bounded channel, ending the frame-desync ("frame too large") failure when notification delivery raced a mid-flight frame; the reverse-request read path shares the same ordered channel; (2) the daemon grace-period task re-checks on a bounded interval while held alive by HTTP sessions, so HTTP drain now triggers auto-shutdown instead of stranding the daemon; (3) `ServerManager::shutdown_all` swaps the map under `server_map_write_lock` and always retires + clears even when the map `Arc` is shared (shutdown can no longer silently no-op); (4) `try_send_to_session` only clears the SSE sender that actually failed (`same_channel` gate), so a racing reconnect's fresh sender survives and receives the event; (5) downstream auth guards (`auth_mode = "none"` rejection and `auto`-mode token minting) now key on the `externally_exposed` signal (non-loopback bind **or** non-loopback `public_base_url`) — **breaking** for tunneled no-auth configs; the TLS guard stays bind-only by design; (6) `config.toml` is written/tightened to 0600 and `SecretString`'s plaintext-`Serialize` asymmetry is documented + pinned by test; (7) supervision decision seams (healthy-blip non-reset, stable-recovery reset, backoff accumulation, disabled-mode) gained direct tests; (8) quick wins — macOS/cross/size CI jobs run on pushes to `main`, `install.sh` points at `cyberpapiii/plug`, todo 068 closed (rmcp already 1.7.0), anyhow → 1.0.103 clearing RUSTSEC-2026-0190. Workspace suite after merge: 511 + 43 + 176, clippy/fmt/advisories clean.
 

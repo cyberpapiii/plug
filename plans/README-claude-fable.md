@@ -1,5 +1,9 @@
 # Improvement Plans — Claude Fable run, 2026-07-11
 
+Program status: merged to `main` on 2026-07-12 after the final Codex 5.6 sol
+repair wave and full post-merge verification. The plan rows below retain their
+integration commit ids as execution provenance.
+
 Plans 001-018 were produced by the Claude Fable `/improve` run on
 2026-07-11; plans 019-024 by the agreed follow-up pass on 2026-07-12 (the
 prioritized "019+" batch from the cross-agent review). All are planned
