@@ -1107,18 +1107,12 @@ mod tests {
         config.servers.insert(
             "oauth-mock".to_string(),
             crate::config::ServerConfig {
-                command: Some("cargo".to_string()),
-                args: vec![
-                    "run".to_string(),
-                    "--quiet".to_string(),
-                    "-p".to_string(),
-                    "plug-test-harness".to_string(),
-                    "--bin".to_string(),
-                    "mock-mcp-server".to_string(),
-                    "--".to_string(),
-                    "--tools".to_string(),
-                    "echo".to_string(),
-                ],
+                command: Some(
+                    plug_test_harness::mock_server_bin()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                args: vec!["--tools".to_string(), "echo".to_string()],
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
@@ -1150,18 +1144,12 @@ mod tests {
     /// non-materially different (`max_concurrent`, which it omits).
     fn mock_stdio_server_config(tools: &str, max_concurrent: usize) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
-            command: Some("cargo".to_string()),
-            args: vec![
-                "run".to_string(),
-                "--quiet".to_string(),
-                "-p".to_string(),
-                "plug-test-harness".to_string(),
-                "--bin".to_string(),
-                "mock-mcp-server".to_string(),
-                "--".to_string(),
-                "--tools".to_string(),
-                tools.to_string(),
-            ],
+            command: Some(
+                plug_test_harness::mock_server_bin()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            args: vec!["--tools".to_string(), tools.to_string()],
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,

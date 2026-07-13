@@ -44,6 +44,7 @@ Detailed notes: [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-
 - Made Plug's documented 4 MiB HTTP request limit authoritative instead of Axum's hidden 2 MiB default.
 - Local macOS reinstalls now sign and verify a staged binary before atomically replacing the live executable, eliminating the unsigned execution window that could retrigger Keychain prompts.
 - Daemon auth-status queries no longer fall back to a missing token mirror's Keychain entry, preventing a read-only diagnostic from freezing IPC and HTTP behind a macOS authorization dialog.
+- Engine concurrency tests now launch the prebuilt mock server directly, avoiding parallel `cargo run` lock contention that could exhaust their startup timeout on macOS CI.
 
 ### Security
 

@@ -45,6 +45,12 @@ HTTP traffic from freezing behind a hidden macOS authorization dialog. Explicit
 credential recovery and token-injection operations still retain the deliberate
 Keychain fallback they need.
 
+The release suite is also reliable on cold macOS runners again. Engine race
+tests now launch the shared prebuilt MCP fixture directly instead of starting
+several competing `cargo run` processes inside 30-second connection windows.
+This removes build-lock timing from the concurrency assertions without relaxing
+their timeouts or behavior checks.
+
 ## Dependency refresh
 
 The rest of Plug's direct Rust dependencies were brought to their latest
