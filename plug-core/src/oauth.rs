@@ -19,6 +19,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+#[cfg(not(target_os = "linux"))]
+use keyring as platform_keyring;
+#[cfg(target_os = "linux")]
+use keyring_core as platform_keyring;
+
 use crate::config;
 
 // ---------------------------------------------------------------------------
@@ -39,6 +44,33 @@ const MAX_EXPIRES_IN: u64 = 86400;
 
 /// Short-lived threshold: if `expires_in < 600`, use the 50% rule.
 const SHORT_LIVED_THRESHOLD: u64 = 600;
+
+#[cfg(target_os = "linux")]
+const LINUX_KEYRING_PREFIX: &str = "keyring-rs:";
+
+#[cfg(target_os = "linux")]
+fn linux_keyring_store() -> platform_keyring::Result<Arc<linux_keyutils_keyring_store::Store>> {
+    linux_keyutils_keyring_store::Store::new_with_configuration(&std::collections::HashMap::from([
+        ("prefix", LINUX_KEYRING_PREFIX),
+    ]))
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_platform_keyring() -> Result<(), String> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    INIT.get_or_init(|| {
+        let store = linux_keyring_store().map_err(|error| error.to_string())?;
+        platform_keyring::set_default_store(store);
+        Ok(())
+    })
+    .clone()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn initialize_platform_keyring() -> Result<(), String> {
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Global store registry
@@ -316,9 +348,14 @@ impl CompositeCredentialStore {
 
     // -- keyring helpers --------------------------------------------------
 
-    fn keyring_entry(&self) -> Option<keyring::Entry> {
+    fn keyring_entry(&self) -> Option<platform_keyring::Entry> {
+        if let Err(error) = initialize_platform_keyring() {
+            debug!(server = %self.server_name, %error, "keyring initialization failed");
+            return None;
+        }
+
         let user = format!("oauth:{}", self.server_name);
-        match keyring::Entry::new("plug", &user) {
+        match platform_keyring::Entry::new("plug", &user) {
             Ok(entry) => Some(entry),
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring entry creation failed");
@@ -353,7 +390,7 @@ impl CompositeCredentialStore {
                     None
                 }
             },
-            Err(keyring::Error::NoEntry) => None,
+            Err(platform_keyring::Error::NoEntry) => None,
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring: load failed");
                 None
@@ -414,7 +451,7 @@ impl CompositeCredentialStore {
         if let Some(entry) = self.keyring_entry() {
             match entry.delete_credential() {
                 Ok(()) => debug!(server = %self.server_name, "keyring: credential deleted"),
-                Err(keyring::Error::NoEntry) => {}
+                Err(platform_keyring::Error::NoEntry) => {}
                 Err(e) => {
                     debug!(server = %self.server_name, error = %e, "keyring: delete failed");
                 }
@@ -1328,6 +1365,15 @@ pub async fn refresh_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keyring_store_preserves_v3_description_prefix() {
+        let store = linux_keyring_store().expect("linux keyutils store");
+        assert_eq!(store.delimiters[0], LINUX_KEYRING_PREFIX);
+        assert_eq!(store.delimiters[1], "@");
+        assert_eq!(store.delimiters[2], "");
+    }
 
     /// Token just received — should not need refresh.
     #[test]

@@ -102,7 +102,7 @@ fn linked_client_config_from_content(
 
     match ext {
         Some("toml") => {
-            let value = content.parse::<toml::Value>().ok()?;
+            let value = toml::from_str::<toml::Value>(content).ok()?;
             let table = value.get("mcp_servers")?.get("plug")?;
             if let Some(url) = table.get("url").and_then(|value| value.as_str()) {
                 Some(LinkedClientConfig {

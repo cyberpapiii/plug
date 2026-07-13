@@ -7,6 +7,7 @@ CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 LOCAL_BIN_DIR="$HOME/.local/bin"
 CARGO_PLUG="$CARGO_BIN_DIR/plug"
 LOCAL_PLUG="$LOCAL_BIN_DIR/plug"
+STAGE_DIR=""
 
 RUN_TESTS=1
 CLEAN_AFTER=0
@@ -55,6 +56,13 @@ done
 
 cd "$ROOT_DIR"
 
+cleanup() {
+  if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
+    rm -rf "$STAGE_DIR"
+  fi
+}
+trap cleanup EXIT
+
 echo "==> Checking workspace"
 cargo check --workspace
 
@@ -63,8 +71,12 @@ if [[ "$RUN_TESTS" -eq 1 ]]; then
   cargo test -p plug-core
 fi
 
-echo "==> Installing plug to $CARGO_BIN_DIR"
-cargo install --path plug --force --locked
+mkdir -p "$CARGO_BIN_DIR"
+STAGE_DIR="$(mktemp -d "$CARGO_BIN_DIR/.plug-install.XXXXXX")"
+STAGED_PLUG="$STAGE_DIR/bin/plug"
+
+echo "==> Building plug in a staging directory"
+cargo install --path plug --root "$STAGE_DIR" --force --locked
 
 # On macOS, re-sign with the stable self-signed identity so the Keychain
 # "Always Allow" ACL persists across rebuilds (a bare install is ad-hoc signed,
@@ -74,14 +86,22 @@ cargo install --path plug --force --locked
 if [[ "$(uname -s)" == "Darwin" ]]; then
   SIGN_IDENTITY="Plug Local Signing"
   if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
-    echo "==> Code-signing plug with '$SIGN_IDENTITY'"
-    codesign --force -s "$SIGN_IDENTITY" "$CARGO_PLUG"
-    codesign -dv --verbose=2 "$CARGO_PLUG" 2>&1 | grep -E 'Authority' || true
+    echo "==> Code-signing staged plug with '$SIGN_IDENTITY'"
+    codesign --force -s "$SIGN_IDENTITY" "$STAGED_PLUG"
+    codesign --verify --deep --strict "$STAGED_PLUG"
+    codesign -dv --verbose=2 "$STAGED_PLUG" 2>&1 | grep -E 'Authority' || true
   else
-    echo "==> Note: '$SIGN_IDENTITY' identity not found — binary stays ad-hoc signed."
-    echo "    Run ./scripts/setup-codesigning.sh once to stop repeated macOS Keychain prompts."
+    echo "error: '$SIGN_IDENTITY' identity not found; refusing to replace the signed binary." >&2
+    echo "       Run ./scripts/setup-codesigning.sh, then retry this install." >&2
+    exit 1
   fi
 fi
+
+echo "==> Smoke testing staged binary"
+"$STAGED_PLUG" --help >/dev/null
+
+echo "==> Atomically installing verified plug to $CARGO_PLUG"
+mv -f "$STAGED_PLUG" "$CARGO_PLUG"
 
 mkdir -p "$LOCAL_BIN_DIR"
 

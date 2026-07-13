@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable as _};
-use rand::Rng as _;
 use tokio::sync::broadcast;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -71,7 +70,7 @@ pub fn spawn_health_check(
     let tracker_clone = tracker.clone();
 
     tracker.spawn(async move {
-        let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..10_000));
+        let jitter = Duration::from_millis(rand::random_range(0..10_000));
         tokio::time::sleep(jitter).await;
 
         let mut tick = tokio::time::interval(interval);

@@ -681,9 +681,8 @@ fn parse_toml_mcp_servers(
     source: ClientSource,
     key: &str,
 ) -> Result<Vec<DiscoveredServer>, String> {
-    let value: toml::Value = content
-        .parse::<toml::Value>()
-        .map_err(|e| format!("TOML parse error: {e}"))?;
+    let value: toml::Value =
+        toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
 
     let servers_table = match value.get(key).and_then(|v| v.as_table()) {
         Some(t) => t,

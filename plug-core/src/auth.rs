@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 
 /// Generate a 256-bit (32-byte) cryptographic random auth token, hex-encoded.
 pub fn generate_auth_token() -> String {
-    use rand::RngCore;
+    use rand::TryRng as _;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system random source unavailable");
     hex::encode(bytes)
 }
 

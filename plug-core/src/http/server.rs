@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Router, extract::Request};
+use axum::{Router, extract::DefaultBodyLimit, extract::Request};
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
@@ -413,6 +413,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             state.clone(),
             validate_bearer_auth,
         ))
+        .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
         .with_state(state);
 
@@ -1939,6 +1940,59 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_accepts_exactly_four_mebibytes() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let app = build_router(test_state());
+        let mut body = b"{}".to_vec();
+        body.resize(LIMIT, b' ');
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("content-length", LIMIT)
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_rejects_content_length_over_four_mebibytes() {
+        const OVER_LIMIT: usize = 4 * 1024 * 1024 + 1;
+        let app = build_router(test_state());
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("content-length", OVER_LIMIT)
+            .body(Body::from(vec![b' '; OVER_LIMIT]))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_rejects_chunked_body_over_four_mebibytes() {
+        let app = build_router(test_state());
+        let chunks = vec![
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{}")),
+            Ok(bytes::Bytes::from(vec![b' '; 2 * 1024 * 1024])),
+            Ok(bytes::Bytes::from(vec![b' '; 2 * 1024 * 1024])),
+        ];
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures::stream::iter(chunks)))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

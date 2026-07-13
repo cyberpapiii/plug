@@ -776,7 +776,7 @@ async fn check_client_configs() -> CheckResult {
                     ));
                 }
                 // Also check if it's even valid TOML
-                if let Err(e) = content.parse::<toml::Value>() {
+                if let Err(e) = validate_toml_document(&content) {
                     issues.push(format!(
                         "{} (invalid TOML in {}: {})",
                         target,
@@ -865,6 +865,10 @@ async fn check_client_configs() -> CheckResult {
             ),
         }
     }
+}
+
+fn validate_toml_document(content: &str) -> Result<(), toml::de::Error> {
+    toml::from_str::<toml::Value>(content).map(|_| ())
 }
 
 /// Check 11: Downstream HTTP auth configuration and token state.
@@ -1241,6 +1245,20 @@ mod tests {
         assert!(result.message.contains("invalid TOML"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_config_validation_parses_complete_toml_documents() {
+        let document = r#"
+[mcp_servers.plug]
+url = "http://127.0.0.1:3282/mcp"
+
+[mcp_servers.example]
+command = "example-server"
+"#;
+
+        assert!(validate_toml_document(document).is_ok());
+        assert!(validate_toml_document("[broken").is_err());
     }
 
     // -- check_config_permissions --
