@@ -21,7 +21,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolRequestParams, CallToolResult, CreateTaskResult, RequestParamsMeta};
 
 use crate::proxy::{DownstreamCallContext, ToolRouter};
-use crate::tasks::TaskOwner;
+use crate::tasks::{OwnerLivenessProbe, TaskOwner};
 
 /// Outcome of dispatching a `tools/call`.
 ///
@@ -65,6 +65,19 @@ pub trait DownstreamContext: Send + Sync {
     /// request carries a task. May fail when the transport cannot resolve the
     /// owning client (e.g. an IPC session that vanished mid-call).
     fn task_owner(&self) -> Result<TaskOwner, McpError>;
+
+    /// Liveness probe for the task owner's downstream session, re-checked by
+    /// `enqueue_tool_task` right after it registers its owner-create guard.
+    /// Closes the race where a session teardown completes *entirely* before
+    /// the enqueue registers anything, so the teardown's tombstone never sees
+    /// the create (see the ordering argument at the check site in
+    /// `proxy::tasks`).
+    ///
+    /// Default `None`: the transport has no teardown path that could race
+    /// task creation (stdio), so there is nothing to probe.
+    fn owner_liveness_probe(&self) -> Option<OwnerLivenessProbe> {
+        None
+    }
 }
 
 /// Shared `tools/call` adapter.
@@ -91,6 +104,7 @@ pub async fn dispatch_tools_call(
                 params.arguments,
                 progress_token,
                 owner,
+                ctx.owner_liveness_probe(),
                 Some(downstream),
             )
             .await?;

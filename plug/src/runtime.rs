@@ -1718,7 +1718,7 @@ mod tests {
         assert_eq!(tool_router.log_level(), rmcp::model::LoggingLevel::Debug);
 
         tool_router
-            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None)
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
             .await
             .expect("enqueue task for expiring session");
         assert_eq!(tool_router.task_count_for_owner(&owner).await, 1);

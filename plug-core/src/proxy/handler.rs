@@ -197,6 +197,9 @@ impl ServerHandler for ProxyHandler {
                     arguments,
                     progress_token,
                     owner,
+                    // stdio has no teardown path that calls task cleanup, so
+                    // the owner is always live — nothing to probe.
+                    None,
                     Some(downstream),
                 )
                 .await
