@@ -4,7 +4,7 @@
 local `main` @ `a2d8fd6` (a plans-only docs commit); implementation
 baseline: `e341625` (the commit all plans were written against, equal to
 `origin/main`'s runtime code). This report was written at the end of the
-execution run and updated on 2026-07-12 after two cross-agent (Codex)
+execution run and updated on 2026-07-12 after three cross-agent (Codex)
 counter-review waves; the final code state is the commit this file
 lands on.
 
@@ -16,18 +16,18 @@ Per-plan status with review annotations: `plans/README-claude-fable.md`.
 Each `merge:` commit body on this branch is the detailed review record for
 its plan.
 
-**Final gates** (most recently run at `6d3e59a`, the last code commit —
-after the three wave-2 counter-review repairs; see the two
+**Final gates** (most recently run at `6f8c2b8`, the last code commit —
+after the two wave-3 counter-review repairs; see the three
 "Counter-review repairs" sections below. Every wave gate passed before
 the next wave was dispatched — note the wave-1 execution gate initially
 failed four `watcher::tests::*` config-watcher tests and was closed only
 after they went green; the program's pre-repair gate at `c1de241` was
-fully green at 812 tests and the wave-1 repair gate at `00364c8` at
-828):
+fully green at 812 tests, the wave-1 repair gate at `00364c8` at 828,
+and the wave-2 repair gate at `6d3e59a` at 843):
 
-- `cargo test --workspace`: 843 tests green (606 plug-core lib + 45
+- `cargo test --workspace`: 853 tests green (616 plug-core lib + 45
   integration + 192 plug bin), up from 730 at the implementation baseline
-  `e341625` (511 + 43 + 176; net +113 — an earlier revision of this report
+  `e341625` (511 + 43 + 176; net +123 — an earlier revision of this report
   wrongly said "802 at program start"; 802 was a mid-program measurement)
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
@@ -141,8 +141,11 @@ record in the merge body:
   cover both interleavings; the executor proved all six pinning tests
   fail with the fix reverted. (Codex's route-epoch/commit-coordination
   remedy was again judged over-scoped; this is the "equivalent
-  authoritative revalidation" its report allowed for.) Remaining skew
-  windows are bounded to one refresh period, no longer permanent.
+  authoritative revalidation" its report allowed for.) This report
+  originally claimed the remaining windows were "bounded to one refresh
+  period" — Codex's wave-3 review falsified that: refreshes are purely
+  event-driven, so no next refresh is guaranteed. Repair G (wave 3)
+  made the heal same-refresh.
 - **Repair E (plan 019 follow-up)** — merged `6d3e59a`. Teardown was
   serial and unbounded (rmcp's plain `send_request` has no timeout, so
   one silent upstream blocked later handles' aborts and could hang
@@ -170,8 +173,71 @@ record in the merge body:
   and post-rename 0600 enforcement mirrors `oauth.rs`. Unix-gated
   tests pin the stale-loose-temp and fresh-persist cases.
 
-Wave-2 final gates all passed at `6d3e59a` (see "Final gates" above):
-843 workspace tests, clippy `-D warnings`, fmt, MSRV 1.88 check,
+Wave-2 final gates all passed at `6d3e59a`: 843 workspace tests, clippy
+`-D warnings`, fmt, MSRV 1.88 check, `cargo deny check advisories`, and
+the todo-status guard.
+
+## Counter-review repairs, wave 3 (2026-07-12)
+
+Codex's third counter-review (against `3763ad4`) approved repair F and
+the truth pass outright, verified the branch clean/unpushed/
+fast-forwardable, and re-ran the full suite — noting one pre-existing
+TLS-test startup flake (a single connection refusal on its first run;
+3/3 green in isolation; recorded here report-only, no repair). It then
+returned exactly plans 010 and 019 for "one bounded revision" with four
+claims. All four were adjudicated against the code and confirmed; two
+were worse than stated (the silent-success self-check was a regression
+introduced by repair D itself, and the unbounded native round trip
+could hold an owner-create guard forever). Before dispatch, both remedy
+designs were subjected to a four-verifier adversarial refutation
+workflow; every verifier found real holes (two blocking), and the
+designs were revised before any executor ran. Same per-repair protocol
+as waves 1–2:
+
+- **Repair G (plan 010, second follow-up)** — merged `7411fc2`
+  (executor branch @ `3fae883`). Claims closed: repair D's heal
+  depended on a *next* event-driven refresh that may never fire, and
+  its post-subscribe self-check discarded the rebind outcome (silent
+  Ok with no live subscription). Fix, five parts: a reconcile-phase
+  mutex serializes classify→prune→publish→rebind across overlapping
+  refreshes; a DETACHED post-publish sweep re-classifies recorded
+  owners against the just-published snapshot inside the triggering
+  refresh (immune to the 600s notification-loop backstop dropping the
+  refresh future); `rebind` propagates its transition outcome; a
+  post-confirm hook fires the heal from the uncancellable transition
+  task (a downstream disconnect can no longer kill it); and the
+  self-check compares the entry's RECORDED owner (so retries heal) and
+  answers from a final membership verify (a superseded transition's
+  laundered Ok can no longer mask a failed migration — the client gets
+  an explicit retry error). Four deterministic tests: same-refresh
+  heal, caller-aborted heal, retry heal, failed-migration propagation.
+  Approved deviation: the sweep executes rebinds only — sweep-side
+  prunes would break the pre-existing grace window for routeless
+  racing subscribers.
+- **Repair H (plan 019, second follow-up)** — merged `6f8c2b8`
+  (executor branch @ `17e3aaa`). Claims closed: a teardown completing
+  entirely before enqueue registered its guard left the create
+  invisible to the tombstone (with no hard TTL bound — `prune_expired`
+  is opportunistic only), and upstream work sent before its reference
+  was published locally (native create, wrapper send-to-record gap)
+  had no cancellation path. Fix, three parts: an owner-liveness probe
+  re-checked immediately AFTER guard registration (HTTP:
+  session-store validate; IPC: client-registry membership; stdio:
+  none — no teardown path), sound via the documented happens-before
+  argument (guard before probe, session removal before cleanup,
+  cleanup tombstones in-flight creates); the native round trip is now
+  detached (a spawned task owns the create guard — a dropped POST
+  future can neither release it early nor orphan the upstream task),
+  bounded by `call_timeout_secs` with an explicit bounded
+  request-level cancel on timeout, and backed by a reaper that cancels
+  a late-created task by id; the wrapper gap is covered by an RAII
+  abort-cancel guard plus a three-state `set_upstream_request` whose
+  `Missing` outcome sends its own bounded cancel. Seven deterministic
+  tests, including the full POST-vs-DELETE interleaving and
+  held-store-lock parking for the send-to-record gap.
+
+Wave-3 final gates all passed at `6f8c2b8` (see "Final gates" above):
+853 workspace tests, clippy `-D warnings`, fmt, MSRV 1.88 check,
 `cargo deny check advisories`, and the todo-status guard.
 
 ## Open findings / follow-up candidates
@@ -204,16 +270,23 @@ Wave-2 final gates all passed at `6d3e59a` (see "Final gates" above):
 6. **010 residuals** — two acknowledged residual races were recorded in
    its merge body; the counter-reviews then confirmed a third window
    (publish-before-rebind), fixed on this branch by repair B
-   (`00364c8`), and a fourth (first-subscribe-during-refresh permanent
-   skew), fixed by repair D (`89bcb78`). What remains is recorded, not
-   fixed: the pre-existing cross-owner supersede case (a new subscriber
-   superseding any drain before its upstream call can leave the old
-   owner's subscription unreleased if the subscriber lands on a
-   different owner), and repair D's bounded windows — its self-check is
-   one-shot (a second mid-subscribe route move waits one refresh) and
-   classify reads the recorded owner outside the transition lock (stale
-   decisions become generation-stamped no-ops). All post-D windows
-   self-heal within one refresh period; none is permanent.
+   (`00364c8`), a fourth (first-subscribe-during-refresh permanent
+   skew), fixed by repair D (`89bcb78`), and a fifth wave (heal
+   depended on a next refresh that event-driven scheduling never
+   guarantees, plus a repair-D-introduced silent-success self-check),
+   fixed by repair G (`7411fc2` — same-refresh sweep, uncancellable
+   post-confirm heal, recorded-owner retry heal, failure propagation).
+   What remains is recorded, not fixed: the pre-existing cross-owner
+   supersede case (a new subscriber superseding any drain before its
+   upstream call can leave the old owner's subscription unreleased if
+   the subscriber lands on a different owner); upstream
+   subscribe/unsubscribe calls inside transitions are unbounded
+   (pre-existing — a wedged upstream can stall that URI's per-URI
+   transition queue); superseded transitions still report Ok to their
+   own waiter (neutralized at the subscribe caller by repair G's
+   membership verify; refresh-path callers log only); and a sweep from
+   an older pass can overlap a newer pass's reconcile phase
+   (generation supersede plus the newer pass's own sweep converge it).
 7. **003 bug-3 residual race (report-only, recorded in its merge body)**.
 8. **015 drift observations** — daemon pushes `AuthStateChanged` as a
    native unfiltered `IpcResponse` where stdio/HTTP flatten to a logging
