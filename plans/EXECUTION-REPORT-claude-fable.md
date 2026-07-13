@@ -240,6 +240,32 @@ Wave-3 final gates all passed at `6f8c2b8` (see "Final gates" above):
 853 workspace tests, clippy `-D warnings`, fmt, MSRV 1.88 check,
 `cargo deny check advisories`, and the todo-status guard.
 
+## Codex 5.6 sol final repair wave (2026-07-12)
+
+Codex re-checked the wave-3 tree and found three remaining defects plus one
+unsupported test claim. Commit `4e07fbd` on `codex/wave4-final-repairs` fixes
+the code. The separate handoff is
+`plans/FINAL-REPAIR-REPORT-codex-5.6-sol.md`.
+
+- Plan 010 now coalesces equivalent Pending rebinds by intended owner, so
+  every waiter receives the authoritative migration result. The downstream
+  subscribe path requires a confirmed Active entry on the published owner,
+  while preserving the established routeless grace behavior. The
+  post-confirm hook captures the registry through `Weak`, which removes the
+  registry-to-hook-to-registry retention cycle.
+- Plan 019 now uses one deadline for native request-handle acquisition and
+  response receipt. This closes the full-rmcp-peer-queue case that could keep
+  an owner-create guard alive forever before a request id existed.
+- The wave-3 sentence claiming a full POST-versus-DELETE test was inaccurate.
+  This repair adds the missing Axum handler test and drives the actual `/mcp`
+  POST and DELETE paths through the post-guard liveness check.
+
+The three behavioral regressions failed on the wave-3 code before the fixes.
+All four focused tests passed 3 consecutive runs after the fix. The full gate
+passed at 857 workspace tests, clippy `-D warnings`, fmt, MSRV 1.88, advisories,
+and the todo-status guard. Everything in this section remains `exists
+off-main` until merged to `main`.
+
 ## Open findings / follow-up candidates
 
 1. **IPC `ping` gap (correctness, new)** — MCP `ping` over the daemon IPC
@@ -282,10 +308,10 @@ Wave-3 final gates all passed at `6f8c2b8` (see "Final gates" above):
    the subscriber lands on a different owner); upstream
    subscribe/unsubscribe calls inside transitions are unbounded
    (pre-existing — a wedged upstream can stall that URI's per-URI
-   transition queue); superseded transitions still report Ok to their
-   own waiter (neutralized at the subscribe caller by repair G's
-   membership verify; refresh-path callers log only); and a sweep from
-   an older pass can overlap a newer pass's reconcile phase
+   transition queue); different-destination supersession can still report
+   Ok to its displaced waiter, while equivalent same-destination rebinds now
+   share one authoritative result via the Codex 5.6 sol repair (`4e07fbd`);
+   and a sweep from an older pass can overlap a newer pass's reconcile phase
    (generation supersede plus the newer pass's own sweep converge it).
 7. **003 bug-3 residual race (report-only, recorded in its merge body)**.
 8. **015 drift observations** — daemon pushes `AuthStateChanged` as a
