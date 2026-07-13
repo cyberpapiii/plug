@@ -19,25 +19,29 @@ const DEBOUNCE_MS: u64 = 500;
 
 /// Spawn a background task that watches `config.toml` for changes.
 ///
-/// Returns the join handle for the watcher task. The task runs until the
-/// cancellation token is triggered.
+/// Returns a one-shot receiver that resolves after the OS directory watch is
+/// registered. It closes without a value if the watcher cannot be armed. The
+/// watcher task itself runs until the cancellation token is triggered.
 pub fn spawn_config_watcher(
     engine: Arc<Engine>,
     config_path: PathBuf,
     cancel: CancellationToken,
     tracker: &tokio_util::task::TaskTracker,
-) {
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tracker.spawn(async move {
-        if let Err(e) = run_watcher(engine, config_path, cancel).await {
+        if let Err(e) = run_watcher(engine, config_path, cancel, ready_tx).await {
             tracing::error!(error = %e, "config watcher failed");
         }
     });
+    ready_rx
 }
 
 async fn run_watcher(
     engine: Arc<Engine>,
     config_path: PathBuf,
     cancel: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
     let watch_dir = config_path
         .parent()
@@ -50,6 +54,7 @@ async fn run_watcher(
             path = %watch_dir.display(),
             "config directory does not exist — skipping file watcher"
         );
+        drop(ready);
         cancel.cancelled().await;
         return Ok(());
     }
@@ -75,6 +80,7 @@ async fn run_watcher(
         .watcher()
         .watch(&watch_dir, notify::RecursiveMode::NonRecursive)
         .map_err(|e| anyhow::anyhow!("failed to watch {}: {e}", watch_dir.display()))?;
+    let _ = ready.send(());
 
     let config_filename = config_path
         .file_name()
@@ -217,12 +223,16 @@ mod tests {
             engine.start().await.expect("engine start");
             let events = engine.event_sender().subscribe();
 
-            spawn_config_watcher(
+            let ready = spawn_config_watcher(
                 engine.clone(),
                 config_path.clone(),
                 engine.cancel_token().clone(),
                 engine.tracker(),
             );
+            tokio::time::timeout(Duration::from_secs(5), ready)
+                .await
+                .expect("config watcher readiness timed out")
+                .expect("config watcher exited before registering the directory watch");
 
             let mut fixture = Self {
                 _dir: dir,

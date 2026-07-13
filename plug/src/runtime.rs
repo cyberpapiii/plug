@@ -763,12 +763,12 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     engine.start().await?;
     let http_runtime = build_configured_http_runtime(&engine.config(), &engine)?;
     let cancel = engine.cancel_token().clone();
-    plug_core::watcher::spawn_config_watcher(
+    drop(plug_core::watcher::spawn_config_watcher(
         engine.clone(),
         config_path.clone(),
         cancel.clone(),
         engine.tracker(),
-    );
+    ));
     let http_config = engine.config().http.clone();
     let http_future = serve_router(
         http_runtime.router,
