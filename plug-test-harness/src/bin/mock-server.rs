@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Exercise the complete MCP 2025-11-25 surface even where RMCP 2.2 marks
+// features deprecated toward future SEP-2577.
+#![allow(deprecated)]
 
 //! Mock MCP server for integration testing.
 //!
@@ -110,19 +113,19 @@ impl MockServer {
 impl ServerHandler for MockServer {
     fn get_info(&self) -> ServerInfo {
         let mut capabilities = ServerCapabilities::default();
-        capabilities.tools = Some(ToolsCapability {
-            list_changed: Some(false),
-        });
+        let mut tools = ToolsCapability::default();
+        tools.list_changed = Some(false);
+        capabilities.tools = Some(tools);
         if self.resources {
-            capabilities.resources = Some(ResourcesCapability {
-                subscribe: Some(true),
-                list_changed: Some(true),
-            });
+            let mut resources = ResourcesCapability::default();
+            resources.subscribe = Some(true);
+            resources.list_changed = Some(true);
+            capabilities.resources = Some(resources);
         }
         if self.prompts {
-            capabilities.prompts = Some(PromptsCapability {
-                list_changed: Some(false),
-            });
+            let mut prompts = PromptsCapability::default();
+            prompts.list_changed = Some(false);
+            capabilities.prompts = Some(prompts);
         }
         if self.completions {
             capabilities.completions = Some(serde_json::Map::new());
@@ -183,28 +186,23 @@ impl ServerHandler for MockServer {
             }
 
             if request.name == "resource_link" {
-                return Ok(CallToolResult::success(vec![Content::resource_link(
-                    RawResource {
-                        uri: "file:///tmp/mock-resource.txt".to_string(),
-                        name: "mock-resource.txt".to_string(),
-                        title: Some("Mock Resource".to_string()),
-                        description: Some("Structured resource link test fixture".to_string()),
-                        mime_type: Some("text/plain".to_string()),
-                        size: Some(17),
-                        icons: None,
-                        meta: None,
-                    },
+                return Ok(CallToolResult::success(vec![ContentBlock::resource_link(
+                    Resource::new("file:///tmp/mock-resource.txt", "mock-resource.txt")
+                        .with_title("Mock Resource")
+                        .with_description("Structured resource link test fixture")
+                        .with_mime_type("text/plain")
+                        .with_size(17),
                 )]));
             }
 
             if request.name == "artifact_text" {
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     "A".repeat(18 * 1024 * 1024),
                 )]));
             }
 
             if request.name == "chunked_text" {
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     "B".repeat(6 * 1024 * 1024),
                 )]));
             }
@@ -220,7 +218,7 @@ impl ServerHandler for MockServer {
                     "encoding": "base64",
                     "content": content,
                 });
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     payload.to_string(),
                 )]));
             }
@@ -237,7 +235,7 @@ impl ServerHandler for MockServer {
                 "elicitation" => {
                     eprintln!("mock-mcp-server: sending elicitation reverse request");
                     let schema = ElicitationSchema::new(BTreeMap::new());
-                    let params = CreateElicitationRequestParams::FormElicitationParams {
+                    let params = ElicitRequestParams::FormElicitationParams {
                         meta: None,
                         message: "mock elicitation request".to_string(),
                         requested_schema: schema,
@@ -271,7 +269,9 @@ impl ServerHandler for MockServer {
                 _ => {}
             }
 
-            Ok(CallToolResult::success(vec![Content::text(response_text)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                response_text,
+            )]))
         }
     }
 
@@ -311,13 +311,12 @@ impl ServerHandler for MockServer {
             if !self.resources {
                 return Ok(ListResourcesResult::with_all_items(vec![]));
             }
-            Ok(ListResourcesResult::with_all_items(vec![Resource::new(
-                RawResource::new("file:///tmp/mock-resource.txt", "mock-resource.txt")
+            Ok(ListResourcesResult::with_all_items(vec![
+                Resource::new("file:///tmp/mock-resource.txt", "mock-resource.txt")
                     .with_title("Mock Resource")
                     .with_description("Subscribable mock resource")
                     .with_mime_type("text/plain"),
-                None,
-            )]))
+            ]))
         }
     }
 
@@ -384,11 +383,10 @@ impl ServerHandler for MockServer {
                 return Ok(ListResourceTemplatesResult::with_all_items(vec![]));
             }
             Ok(ListResourceTemplatesResult::with_all_items(vec![
-                RawResourceTemplate::new("file:///tmp/mock-templates/{id}.txt", "mock_template")
+                ResourceTemplate::new("file:///tmp/mock-templates/{id}.txt", "mock_template")
                     .with_title("Mock Template")
                     .with_description("Mock resource template")
-                    .with_mime_type("text/plain")
-                    .no_annotation(),
+                    .with_mime_type("text/plain"),
             ]))
         }
     }
@@ -427,9 +425,9 @@ impl ServerHandler for MockServer {
                     None,
                 ));
             }
-            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                PromptMessageRole::User,
-                "mock prompt body",
+            Ok(GetPromptResult::new(vec![PromptMessage::new(
+                Role::User,
+                ContentBlock::text("mock prompt body"),
             )])
             .with_description("Mock prompt fixture"))
         }

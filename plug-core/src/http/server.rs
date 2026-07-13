@@ -115,8 +115,8 @@ struct HttpBridge {
 impl DownstreamBridge for HttpBridge {
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
-    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        request: ElicitRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
         if self.capabilities.elicitation.is_none() {
             return Box::pin(async {
                 Err(McpError::internal_error(
@@ -131,12 +131,12 @@ impl DownstreamBridge for HttpBridge {
             let result = send_http_client_request(
                 &state,
                 &session_id,
-                ServerRequest::CreateElicitationRequest(CreateElicitationRequest::new(request)),
+                ServerRequest::ElicitRequest(ElicitRequest::new(request)),
                 Some(Duration::from_secs(600)), // 10-minute upper bound prevents resource leaks
             )
             .await?;
             match result {
-                ClientResult::CreateElicitationResult(r) => Ok(r),
+                ClientResult::ElicitResult(r) => Ok(r),
                 other => Err(McpError::internal_error(
                     format!("unexpected elicitation response: {other:?}"),
                     None,
@@ -347,13 +347,13 @@ impl HttpState {
                                 tracing::warn!(skipped, "HTTP logging fan-out lagged");
                                 // Emit synthetic warning to all connected clients
                                 let synthetic = ProtocolNotification::LoggingMessage {
-                                    params: rmcp::model::LoggingMessageNotificationParam {
-                                        level: rmcp::model::LoggingLevel::Warning,
-                                        logger: Some("plug".to_string()),
-                                        data: serde_json::json!(format!(
+                                    params: rmcp::model::LoggingMessageNotificationParam::new(
+                                        rmcp::model::LoggingLevel::Warning,
+                                        serde_json::json!(format!(
                                             "skipped {skipped} log messages"
                                         )),
-                                    },
+                                    )
+                                    .with_logger("plug"),
                                 };
                                 if let Some(message) = notification_to_sse_message(synthetic) {
                                     log_state.sessions.broadcast(message);
@@ -609,15 +609,17 @@ async fn post_mcp(
             validate_session_header(&headers, state.sessions.as_ref())?;
             match notification.notification {
                 ClientNotification::CancelledNotification(cancelled) => {
-                    state.router.forward_cancel_from_downstream(
-                        &DownstreamCallContext::http_for_client_with_trace(
-                            Arc::<str>::from(session_id.as_str()),
-                            cancelled.params.request_id.clone(),
-                            crate::types::ClientType::Unknown,
-                            Arc::clone(&trace_id),
-                        ),
-                        cancelled.params.reason,
-                    );
+                    if let Some(request_id) = cancelled.params.request_id.clone() {
+                        state.router.forward_cancel_from_downstream(
+                            &DownstreamCallContext::http_for_client_with_trace(
+                                Arc::<str>::from(session_id.as_str()),
+                                request_id,
+                                crate::types::ClientType::Unknown,
+                                Arc::clone(&trace_id),
+                            ),
+                            cancelled.params.reason,
+                        );
+                    }
                 }
                 ClientNotification::InitializedNotification(_) => {
                     maybe_request_http_roots(Arc::clone(&state), session_id.clone());
@@ -1382,7 +1384,7 @@ async fn handle_request(
             }
         }
 
-        ClientRequest::GetTaskInfoRequest(task_req) => {
+        ClientRequest::GetTaskRequest(task_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
@@ -1405,7 +1407,7 @@ async fn handle_request(
             }
         }
 
-        ClientRequest::GetTaskResultRequest(task_req) => {
+        ClientRequest::GetTaskPayloadRequest(task_req) => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);

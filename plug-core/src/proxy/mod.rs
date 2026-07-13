@@ -346,8 +346,8 @@ struct ActiveCallRecord {
 pub trait DownstreamBridge: Send + Sync {
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
-    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>>;
+        request: ElicitRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>>;
 
     fn create_message(
         &self,
@@ -737,8 +737,8 @@ impl ToolRouter {
         &self,
         server_id: &str,
         upstream_request_id: RequestId,
-        request: CreateElicitationRequestParams,
-    ) -> Result<CreateElicitationResult, McpError> {
+        request: ElicitRequestParams,
+    ) -> Result<ElicitResult, McpError> {
         let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
             Ok(record) => record.downstream.notification_target(),
             Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
@@ -966,7 +966,7 @@ impl ToolRouter {
             let request_id = request_id.clone();
             tokio::spawn(async move {
                 if let Err(error) = peer
-                    .notify_cancelled(CancelledNotificationParam { request_id, reason })
+                    .notify_cancelled(CancelledNotificationParam::new(Some(request_id), reason))
                     .await
                 {
                     tracing::warn!(error = %error, "failed to forward pending downstream cancellation upstream");
@@ -1037,7 +1037,7 @@ impl ToolRouter {
         let peer = upstream.client.peer().clone();
         tokio::spawn(async move {
             if let Err(error) = peer
-                .notify_cancelled(CancelledNotificationParam { request_id, reason })
+                .notify_cancelled(CancelledNotificationParam::new(Some(request_id), reason))
                 .await
             {
                 tracing::warn!(error = %error, "failed to forward downstream cancellation upstream");
@@ -1083,9 +1083,17 @@ impl ToolRouter {
         server_id: &str,
         params: CancelledNotificationParam,
     ) {
+        let Some(request_id) = params.request_id.clone() else {
+            tracing::debug!(
+                server = %server_id,
+                reason = ?params.reason,
+                "ignoring anonymous upstream cancellation"
+            );
+            return;
+        };
         let key = UpstreamRequestKey {
             server_id: server_id.to_string(),
-            request_id: params.request_id.clone(),
+            request_id,
         };
         let Some(call_id) = self.upstream_request_lookup.get(&key).map(|entry| *entry) else {
             tracing::debug!(
@@ -2248,7 +2256,9 @@ impl ToolRouter {
 
         let statuses = self.server_manager.server_statuses();
         if statuses.is_empty() {
-            return CallToolResult::success(vec![Content::text("No upstream servers configured.")]);
+            return CallToolResult::success(vec![ContentBlock::text(
+                "No upstream servers configured.",
+            )]);
         }
 
         let mut lines = vec![format!("Servers ({})", statuses.len())];
@@ -2263,7 +2273,7 @@ impl ToolRouter {
             ));
         }
 
-        CallToolResult::success(vec![Content::text(lines.join("\n"))])
+        CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))])
     }
 
     fn handle_list_tools(
@@ -2315,7 +2325,7 @@ impl ToolRouter {
         }
 
         if matches.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No tools matched the requested filters.",
             )]));
         }
@@ -2328,7 +2338,7 @@ impl ToolRouter {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             lines.join("\n"),
         )]))
     }
@@ -2515,7 +2525,7 @@ impl ToolRouter {
     fn json_tool_result(&self, value: serde_json::Value) -> Result<CallToolResult, McpError> {
         let text = serde_json::to_string_pretty(&value)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     fn ensure_lazy_tool_loaded_for_direct_call(

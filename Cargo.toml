@@ -12,7 +12,7 @@ homepage = "https://github.com/cyberpapiii/plug"
 
 [workspace.dependencies]
 # MCP SDK
-rmcp = { version = "~1.7", features = [
+rmcp = { version = "=2.2.0", features = [
     "client",
     "server",
     "macros",
@@ -93,7 +93,7 @@ hex = "0.4"
 
 # Legacy SSE upstream transport
 reqwest = { version = "0.13", default-features = false }
-sse-stream = "0.2"
+sse-stream = "=0.2.4"
 
 # OAuth token storage
 keyring = { version = "3", features = ["apple-native", "linux-native"] }

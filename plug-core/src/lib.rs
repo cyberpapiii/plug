@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// RMCP 2.2 deprecates these APIs toward future SEP-2577. Plug intentionally
+// retains them while MCP 2025-11-25 remains the negotiated stable revision.
+#![allow(deprecated)]
 
 pub mod artifacts;
 pub mod auth;
@@ -23,6 +26,7 @@ pub mod ipc;
 pub(crate) mod mcp_http_headers;
 pub mod notifications;
 pub mod oauth;
+pub mod protocol;
 pub mod proxy;
 pub mod reload;
 pub mod server;

@@ -16,10 +16,10 @@ use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
-    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
-    ElicitationCapability, FormElicitationCapability, Implementation, InitializedNotification,
-    LoggingMessageNotificationParam, ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
+    CancelledNotificationParam, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
+    ElicitRequestParams, ElicitResult, ElicitationCapability, FormElicitationCapability,
+    Implementation, InitializedNotification, LoggingMessageNotificationParam,
+    ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
     SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
 };
@@ -307,15 +307,16 @@ impl ClientHandler for UpstreamClientHandler {
             rmcp::model::ClientCapabilities::default(),
             rmcp::model::Implementation::new("plug", env!("CARGO_PKG_VERSION")),
         );
-        info.capabilities.roots = Some(RootsCapabilities {
-            list_changed: Some(true),
-        });
+        let mut roots = RootsCapabilities::default();
+        roots.list_changed = Some(true);
+        info.capabilities.roots = Some(roots);
         info.capabilities.tasks = Some(TasksCapability::client_default());
         info.capabilities.sampling = Some(SamplingCapability::default());
-        info.capabilities.elicitation = Some(ElicitationCapability {
-            form: Some(FormElicitationCapability::default()),
-            url: Some(UrlElicitationCapability::default()),
-        });
+        info.capabilities.elicitation = Some(
+            ElicitationCapability::new()
+                .with_form(FormElicitationCapability::default())
+                .with_url(UrlElicitationCapability::default()),
+        );
         info = info.with_protocol_version(
             serde_json::from_value(serde_json::Value::String(
                 LATEST_PROTOCOL_VERSION.to_string(),
@@ -342,9 +343,9 @@ impl ClientHandler for UpstreamClientHandler {
 
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         context: RequestContext<rmcp::RoleClient>,
-    ) -> impl Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
         let router = self.router.clone();
         let server_id = Arc::clone(&self.server_id);
         let request_id = context.id.clone();
@@ -1989,15 +1990,14 @@ mod tests {
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
-        AnnotateAble, CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams,
-        CancelTaskResult, ClientJsonRpcMessage, ClientRequest, Content, CreateTaskResult,
-        GetPromptResult, GetTaskInfoParams, GetTaskInfoRequest, GetTaskPayloadResult,
-        GetTaskResult, Icon, Implementation, InitializeResult, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, ListToolsResult, Meta,
-        NumberOrString, ProgressNotificationParam, ProgressToken, Prompt, PromptMessage,
-        PromptMessageContent, PromptMessageRole, RawResource, RawResourceTemplate,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
-        ServerResult, Task, TaskStatus, TasksCapability, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
+        ClientJsonRpcMessage, ClientRequest, ContentBlock, CreateTaskResult, GetPromptResult,
+        GetTaskParams, GetTaskPayloadResult, GetTaskRequest, GetTaskResult, Icon, Implementation,
+        InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        ListTasksResult, ListToolsResult, Meta, NumberOrString, ProgressNotificationParam,
+        ProgressToken, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContents,
+        ResourceTemplate, Role, ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult,
+        Task, TaskStatus, TasksCapability, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -2240,9 +2240,9 @@ mod tests {
     impl ServerHandler for MutableToolServerHandler {
         fn get_info(&self) -> ServerInfo {
             let mut capabilities = ServerCapabilities::default();
-            capabilities.tools = Some(rmcp::model::ToolsCapability {
-                list_changed: Some(true),
-            });
+            let mut tools = rmcp::model::ToolsCapability::default();
+            tools.list_changed = Some(true);
+            capabilities.tools = Some(tools);
             ServerInfo::new(capabilities)
         }
 
@@ -2265,7 +2265,9 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
             let content = format!("called {}", request.name);
-            std::future::ready(Ok(CallToolResult::success(vec![Content::text(content)])))
+            std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
+                content,
+            )])))
         }
     }
 
@@ -2302,9 +2304,9 @@ mod tests {
     impl ServerHandler for ProgressCancelServer {
         fn get_info(&self) -> ServerInfo {
             let mut capabilities = ServerCapabilities::default();
-            capabilities.tools = Some(rmcp::model::ToolsCapability {
-                list_changed: Some(true),
-            });
+            let mut tools = rmcp::model::ToolsCapability::default();
+            tools.list_changed = Some(true);
+            capabilities.tools = Some(tools);
             ServerInfo::new(capabilities)
         }
 
@@ -2325,7 +2327,7 @@ mod tests {
             async move {
                 let _ = request.progress_token();
                 cancel_signal.notified().await;
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     "cancelled upstream",
                 )]))
             }
@@ -2339,8 +2341,10 @@ mod tests {
             let cancel_signal = Arc::clone(&self.cancel_signal);
             let cancelled_request = Arc::clone(&self.cancelled_request);
             async move {
-                *cancelled_request.lock().unwrap() = Some(notification.request_id);
-                cancel_signal.notify_one();
+                if let Some(request_id) = notification.request_id {
+                    *cancelled_request.lock().unwrap() = Some(request_id);
+                    cancel_signal.notify_one();
+                }
             }
         }
     }
@@ -2355,9 +2359,9 @@ mod tests {
     impl ServerHandler for TaskNativeUpstreamHandler {
         fn get_info(&self) -> ServerInfo {
             let mut capabilities = ServerCapabilities::default();
-            capabilities.tools = Some(rmcp::model::ToolsCapability {
-                list_changed: Some(false),
-            });
+            let mut tools = rmcp::model::ToolsCapability::default();
+            tools.list_changed = Some(false);
+            capabilities.tools = Some(tools);
             capabilities.tasks = Some(TasksCapability::server_default());
             ServerInfo::new(capabilities)
         }
@@ -2430,7 +2434,7 @@ mod tests {
 
         fn get_task_info(
             &self,
-            request: GetTaskInfoParams,
+            request: GetTaskParams,
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
             let mut tasks = self.tasks.lock().unwrap();
@@ -2445,12 +2449,12 @@ mod tests {
                     }
                     entry.0.clone()
                 });
-            std::future::ready(task.map(|task| GetTaskResult { meta: None, task }))
+            std::future::ready(task.map(GetTaskResult::new))
         }
 
         fn get_task_result(
             &self,
-            request: rmcp::model::GetTaskResultParams,
+            request: rmcp::model::GetTaskPayloadParams,
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
             let call_count = self.task_result_requests.fetch_add(1, Ordering::SeqCst);
@@ -2486,7 +2490,7 @@ mod tests {
                     entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
                     entry.0.clone()
                 });
-            std::future::ready(task.map(|task| CancelTaskResult { meta: None, task }))
+            std::future::ready(task.map(CancelTaskResult::new))
         }
     }
 
@@ -2563,9 +2567,9 @@ mod tests {
         tools.store(Arc::new(initial_tools));
 
         let mut capabilities = ServerCapabilities::default();
-        capabilities.tools = Some(rmcp::model::ToolsCapability {
-            list_changed: Some(false),
-        });
+        let mut tools_capability = rmcp::model::ToolsCapability::default();
+        tools_capability.list_changed = Some(false);
+        capabilities.tools = Some(tools_capability);
         capabilities.tasks = Some(TasksCapability::server_default());
 
         (
@@ -2603,16 +2607,15 @@ mod tests {
     impl ServerHandler for CatalogServer {
         fn get_info(&self) -> ServerInfo {
             let mut capabilities = ServerCapabilities::default();
-            capabilities.resources = Some(rmcp::model::ResourcesCapability {
-                subscribe: None,
-                list_changed: Some(false),
-            });
-            capabilities.prompts = Some(rmcp::model::PromptsCapability {
-                list_changed: Some(false),
-            });
-            capabilities.tools = Some(rmcp::model::ToolsCapability {
-                list_changed: Some(true),
-            });
+            let mut resources = rmcp::model::ResourcesCapability::default();
+            resources.list_changed = Some(false);
+            capabilities.resources = Some(resources);
+            let mut prompts = rmcp::model::PromptsCapability::default();
+            prompts.list_changed = Some(false);
+            capabilities.prompts = Some(prompts);
+            let mut tools = rmcp::model::ToolsCapability::default();
+            tools.list_changed = Some(true);
+            capabilities.tools = Some(tools);
             ServerInfo::new(capabilities)
         }
 
@@ -2631,7 +2634,7 @@ mod tests {
         ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
         {
             std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
-                RawResource::new("memory://notes", "notes").no_annotation(),
+                Resource::new("memory://notes", "notes"),
             ])))
         }
 
@@ -2642,7 +2645,7 @@ mod tests {
         ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + Send + '_
         {
             std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
-                RawResourceTemplate::new("memory://notes/{id}", "notes_template").no_annotation(),
+                ResourceTemplate::new("memory://notes/{id}", "notes_template"),
             ])))
         }
 
@@ -2675,8 +2678,8 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<GetPromptResult, rmcp::ErrorData>> + Send + '_ {
             std::future::ready(Ok(GetPromptResult::new(vec![PromptMessage::new(
-                PromptMessageRole::User,
-                PromptMessageContent::text(format!("prompt: {}", request.name)),
+                Role::User,
+                ContentBlock::text(format!("prompt: {}", request.name)),
             )])))
         }
     }
@@ -3582,11 +3585,8 @@ mod tests {
             upstream_handle
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
-                    GetTaskInfoParams {
-                        meta: None,
-                        task_id: "upstream-task-1".to_string(),
-                    },
+                .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
+                    GetTaskParams::new("upstream-task-1"),
                 ))),
         )
         .await
@@ -3840,10 +3840,10 @@ mod tests {
         assert_eq!(received[0].message.as_deref(), Some("halfway"));
 
         downstream_client
-            .notify_cancelled(rmcp::model::CancelledNotificationParam {
-                request_id: downstream_request_id,
-                reason: Some("user cancelled".to_string()),
-            })
+            .notify_cancelled(rmcp::model::CancelledNotificationParam::new(
+                Some(downstream_request_id),
+                Some("user cancelled".to_string()),
+            ))
             .await
             .expect("send downstream cancellation");
 
@@ -4078,9 +4078,9 @@ mod tests {
             ClientJsonRpcMessage::Request(request) => match request.request {
                 ClientRequest::InitializeRequest(_) => {
                     let mut caps = ServerCapabilities::default();
-                    caps.tools = Some(rmcp::model::ToolsCapability {
-                        list_changed: Some(true),
-                    });
+                    let mut tools = rmcp::model::ToolsCapability::default();
+                    tools.list_changed = Some(true);
+                    caps.tools = Some(tools);
                     let response = ServerJsonRpcMessage::response(
                         ServerResult::InitializeResult(
                             InitializeResult::new(caps)
@@ -4106,9 +4106,9 @@ mod tests {
                 }
                 ClientRequest::CallToolRequest(call) => {
                     let response = ServerJsonRpcMessage::response(
-                        ServerResult::CallToolResult(CallToolResult::success(vec![Content::text(
-                            format!("legacy sse called {}", call.params.name),
-                        )])),
+                        ServerResult::CallToolResult(CallToolResult::success(vec![
+                            ContentBlock::text(format!("legacy sse called {}", call.params.name)),
+                        ])),
                         request.id,
                     );
                     let _ = state.tx.send(sse_stream::Sse::default().data(

@@ -59,45 +59,49 @@ impl ProtocolNotification {
         skipped: u64,
         transport: &'static str,
     ) -> LoggingMessageNotificationParam {
-        LoggingMessageNotificationParam {
-            level: rmcp::model::LoggingLevel::Warning,
-            logger: Some("plug.control".into()),
-            data: serde_json::json!({
+        LoggingMessageNotificationParam::new(
+            rmcp::model::LoggingLevel::Warning,
+            serde_json::json!({
                 "event": "control_notification_lagged",
                 "transport": transport,
                 "skipped": skipped,
             }),
-        }
+        )
+        .with_logger("plug.control")
     }
 
     pub fn as_logging_message_params(&self) -> Option<LoggingMessageNotificationParam> {
         match self {
             ProtocolNotification::LoggingMessage { params } => Some(params.clone()),
-            ProtocolNotification::TokenRefreshExchanged { server_id } => {
-                Some(LoggingMessageNotificationParam {
-                    level: rmcp::model::LoggingLevel::Info,
-                    logger: Some("plug.auth".into()),
-                    data: serde_json::json!({
+            ProtocolNotification::TokenRefreshExchanged { server_id } => Some(
+                LoggingMessageNotificationParam::new(
+                    rmcp::model::LoggingLevel::Info,
+                    serde_json::json!({
                         "event": "token_refresh_exchanged",
                         "server_id": server_id,
                     }),
-                })
-            }
+                )
+                .with_logger("plug.auth"),
+            ),
             ProtocolNotification::AuthStateChanged {
                 server_id,
                 new_state,
-            } => Some(LoggingMessageNotificationParam {
-                level: match new_state {
-                    crate::types::ServerHealth::AuthRequired => rmcp::model::LoggingLevel::Warning,
-                    _ => rmcp::model::LoggingLevel::Info,
-                },
-                logger: Some("plug.auth".into()),
-                data: serde_json::json!({
-                    "event": "auth_state_changed",
-                    "server_id": server_id,
-                    "new_state": new_state,
-                }),
-            }),
+            } => Some(
+                LoggingMessageNotificationParam::new(
+                    match new_state {
+                        crate::types::ServerHealth::AuthRequired => {
+                            rmcp::model::LoggingLevel::Warning
+                        }
+                        _ => rmcp::model::LoggingLevel::Info,
+                    },
+                    serde_json::json!({
+                        "event": "auth_state_changed",
+                        "server_id": server_id,
+                        "new_state": new_state,
+                    }),
+                )
+                .with_logger("plug.auth"),
+            ),
             _ => None,
         }
     }
@@ -314,14 +318,34 @@ pub mod fanout {
         }
 
         fn cancelled_params() -> rmcp::model::CancelledNotificationParam {
-            rmcp::model::CancelledNotificationParam {
-                request_id: rmcp::model::RequestId::Number(1),
-                reason: None,
-            }
+            rmcp::model::CancelledNotificationParam::new(
+                Some(rmcp::model::RequestId::Number(1)),
+                None,
+            )
         }
 
         fn resource_updated_params() -> rmcp::model::ResourceUpdatedNotificationParam {
             rmcp::model::ResourceUpdatedNotificationParam::new("file:///a".to_string())
+        }
+
+        #[test]
+        fn rmcp_2_2_wire_shapes_preserve_resource_links_and_anonymous_cancellation() {
+            let content = rmcp::model::ContentBlock::resource_link(rmcp::model::Resource::new(
+                "memory://item",
+                "item",
+            ));
+            let json = serde_json::to_value(content).expect("serialize resource link");
+            assert_eq!(json["type"], "resource_link");
+            assert_eq!(json["uri"], "memory://item");
+            assert_eq!(json["name"], "item");
+
+            let cancelled = rmcp::model::CancelledNotificationParam::new(
+                None,
+                Some("owner teardown".to_string()),
+            );
+            let json = serde_json::to_value(cancelled).expect("serialize cancellation");
+            assert!(json.get("requestId").is_none());
+            assert_eq!(json["reason"], "owner teardown");
         }
 
         // ── classify: one test per NotificationClass arm ───────────────
@@ -405,11 +429,10 @@ pub mod fanout {
         fn classify_logging_message_is_logging() {
             assert_eq!(
                 classify(&ProtocolNotification::LoggingMessage {
-                    params: rmcp::model::LoggingMessageNotificationParam {
-                        level: rmcp::model::LoggingLevel::Info,
-                        logger: None,
-                        data: serde_json::json!("hi"),
-                    },
+                    params: rmcp::model::LoggingMessageNotificationParam::new(
+                        rmcp::model::LoggingLevel::Info,
+                        serde_json::json!("hi"),
+                    ),
                 }),
                 NotificationClass::Logging
             );

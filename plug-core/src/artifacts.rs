@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use directories::ProjectDirs;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolResult, Content, GetTaskPayloadResult, Meta, RawResource, ReadResourceResult,
+    CallToolResult, ContentBlock, GetTaskPayloadResult, Meta, ReadResourceResult, Resource,
     ResourceContents,
 };
 use serde::{Deserialize, Serialize};
@@ -119,7 +119,7 @@ impl ArtifactStore {
         let attachment_source = result
             .content
             .iter()
-            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()));
+            .find_map(|content| content.as_text().map(|text| text.text.clone()));
         let write_dir = artifact_dir.clone();
         let write_payload_path = payload_path.clone();
         let materialized_path = tokio::task::spawn_blocking(move || {
@@ -288,12 +288,12 @@ fn should_artifactize(source_tool: &str, result: &CallToolResult, size: usize) -
     result.content.iter().any(content_is_artifactish)
 }
 
-fn content_is_artifactish(content: &Content) -> bool {
-    if content.raw.as_image().is_some() || content.raw.as_resource().is_some() {
+fn content_is_artifactish(content: &ContentBlock) -> bool {
+    if content.as_image().is_some() || content.as_resource().is_some() {
         return true;
     }
 
-    if let Some(text) = content.raw.as_text()
+    if let Some(text) = content.as_text()
         && text.text.len() > 256 * 1024
         && looks_like_attachment_json(&text.text)
     {
@@ -321,7 +321,7 @@ fn build_preview(result: &CallToolResult) -> String {
     let mut parts = Vec::new();
 
     for content in &result.content {
-        if let Some(text) = content.raw.as_text()
+        if let Some(text) = content.as_text()
             && !text.text.is_empty()
         {
             parts.push(text.text.clone());
@@ -348,14 +348,14 @@ fn build_artifact_result(is_error: bool, record: &ArtifactRecord) -> CallToolRes
         record.source_tool, manifest_uri
     );
 
-    let resource = RawResource::new(
+    let resource = Resource::new(
         manifest_uri.clone(),
         format!("{} oversized result", record.source_tool),
     )
     .with_title(format!("{} oversized result", record.source_tool))
     .with_description("Artifact manifest for an oversized tool result")
     .with_mime_type("text/markdown")
-    .with_size(record.original_size_bytes.min(u32::MAX as usize) as u32);
+    .with_size(record.original_size_bytes as u64);
 
     let mut meta = Meta::new();
     meta.0.insert(
@@ -386,9 +386,12 @@ fn build_artifact_result(is_error: bool, record: &ArtifactRecord) -> CallToolRes
         )),
     );
 
-    let mut content = vec![Content::text(summary), Content::resource_link(resource)];
+    let mut content = vec![
+        ContentBlock::text(summary),
+        ContentBlock::resource_link(resource),
+    ];
     if !record.preview.is_empty() {
-        content.push(Content::text(format!("Preview:\n{}", record.preview)));
+        content.push(ContentBlock::text(format!("Preview:\n{}", record.preview)));
     }
 
     let mut result = if is_error {
@@ -436,9 +439,9 @@ fn build_unpersistable_result(
         serde_json::json!(false),
     );
 
-    let mut content = vec![Content::text(summary)];
+    let mut content = vec![ContentBlock::text(summary)];
     if !preview.is_empty() {
-        content.push(Content::text(format!("Preview:\n{}", preview)));
+        content.push(ContentBlock::text(format!("Preview:\n{}", preview)));
     }
 
     let mut result = if is_error {
@@ -878,7 +881,7 @@ mod tests {
     async fn rehydrate_loads_metadata_back_into_index() {
         let base_dir = temp_dir("rehydrate");
         let store = test_store(base_dir.clone());
-        let result = CallToolResult::success(vec![Content::text(
+        let result = CallToolResult::success(vec![ContentBlock::text(
             "R".repeat(ARTIFACT_RESULT_MIN_BYTES + 1),
         )]);
         let spilled = store
@@ -888,7 +891,7 @@ mod tests {
         let uri = spilled
             .content
             .iter()
-            .find_map(|content| content.raw.as_resource_link())
+            .find_map(ContentBlock::as_resource_link)
             .expect("artifact resource_link")
             .uri
             .clone();
@@ -905,7 +908,7 @@ mod tests {
     async fn oversized_single_result_returns_clear_non_artifact_fallback() {
         let base_dir = temp_dir("oversized-single");
         let store = test_store(base_dir.clone());
-        let result = CallToolResult::success(vec![Content::text("X".repeat(2_000_000))]);
+        let result = CallToolResult::success(vec![ContentBlock::text("X".repeat(2_000_000))]);
 
         let spilled = store
             .maybe_spill_tool_result_with_limit("Mock__attachment_get_data", result, 1_024)
@@ -914,7 +917,6 @@ mod tests {
 
         assert_eq!(spilled.is_error, Some(false));
         let text = spilled.content[0]
-            .raw
             .as_text()
             .expect("text content")
             .text
@@ -945,7 +947,7 @@ mod tests {
             "content": attachment_body,
         })
         .to_string();
-        let result = CallToolResult::success(vec![Content::text(text)]);
+        let result = CallToolResult::success(vec![ContentBlock::text(text)]);
 
         let spilled = store
             .maybe_spill_tool_result("Mock__attachment_get_data", result)
@@ -956,7 +958,7 @@ mod tests {
             spilled
                 .content
                 .iter()
-                .any(|content| content.raw.as_resource_link().is_some()),
+                .any(|content| content.as_resource_link().is_some()),
             "spilled result must link to the artifact"
         );
         let record = store

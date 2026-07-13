@@ -481,9 +481,9 @@ impl super::ToolRouter {
         ) || !self.list_tools_for_client(client_type).is_empty()
             || upstream_caps.iter().any(|caps| caps.tools.is_some())
         {
-            capabilities.tools = Some(ToolsCapability {
-                list_changed: Some(true),
-            });
+            let mut tools = ToolsCapability::default();
+            tools.list_changed = Some(true);
+            capabilities.tools = Some(tools);
         }
         if upstream_caps.iter().any(|caps| caps.resources.is_some()) {
             let any_subscribe = upstream_caps.iter().any(|caps| {
@@ -492,15 +492,15 @@ impl super::ToolRouter {
                     .and_then(|r| r.subscribe)
                     .unwrap_or(false)
             });
-            capabilities.resources = Some(ResourcesCapability {
-                subscribe: if any_subscribe { Some(true) } else { None },
-                list_changed: Some(true),
-            });
+            let mut resources = ResourcesCapability::default();
+            resources.subscribe = if any_subscribe { Some(true) } else { None };
+            resources.list_changed = Some(true);
+            capabilities.resources = Some(resources);
         }
         if upstream_caps.iter().any(|caps| caps.prompts.is_some()) {
-            capabilities.prompts = Some(PromptsCapability {
-                list_changed: Some(true),
-            });
+            let mut prompts = PromptsCapability::default();
+            prompts.list_changed = Some(true);
+            capabilities.prompts = Some(prompts);
         }
         if upstream_caps.iter().any(|caps| caps.completions.is_some()) {
             capabilities.completions = Some(serde_json::Map::new());

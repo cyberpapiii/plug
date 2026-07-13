@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-    CreateMessageResult,
+    CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
 };
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
@@ -426,8 +425,8 @@ impl DaemonBridge {
 impl DownstreamBridge for DaemonBridge {
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
-    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        request: ElicitRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
         let caps = self.client_registry.capabilities(&self.session_id);
         if caps.as_ref().and_then(|c| c.elicitation.as_ref()).is_none() {
             return Box::pin(async {
@@ -2145,7 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_bridge_rejects_elicitation_without_capability() {
         use plug_core::proxy::DownstreamBridge;
-        use rmcp::model::{ClientCapabilities, CreateElicitationRequestParams};
+        use rmcp::model::{ClientCapabilities, ElicitRequestParams};
 
         let (registry, _count_rx) = ClientRegistry::new();
         let registry = Arc::new(registry);
@@ -2166,7 +2165,7 @@ mod tests {
         };
 
         // Build a minimal elicitation request via JSON deserialization
-        let request: CreateElicitationRequestParams = serde_json::from_value(serde_json::json!({
+        let request: ElicitRequestParams = serde_json::from_value(serde_json::json!({
             "message": "test",
             "requestedSchema": {
                 "type": "object",
@@ -2189,7 +2188,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "elicitation": {} })).unwrap();
         registry.update_capabilities(&reg_result.session_id, caps_with_elicitation);
 
-        let request2: CreateElicitationRequestParams = serde_json::from_value(serde_json::json!({
+        let request2: ElicitRequestParams = serde_json::from_value(serde_json::json!({
             "message": "test",
             "requestedSchema": {
                 "type": "object",
@@ -3434,7 +3433,7 @@ mod tests {
                 .expect("stdio client serve");
             let mut params = rmcp::model::CallToolRequestParams::new("Mock__echo".to_string());
             params = params.with_arguments(serde_json::Map::new());
-            params.task = Some(serde_json::Map::new());
+            params.task = Some(rmcp::model::TaskMetadata::new());
             let err = client
                 .call_tool(params)
                 .await

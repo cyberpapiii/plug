@@ -7,8 +7,8 @@ use base64::Engine as _;
 use std::fmt;
 
 use rmcp::model::{
-    ClientCapabilities, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult, Icon, ToolAnnotations,
+    ClientCapabilities, CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams,
+    ElicitResult, Icon, ToolAnnotations,
 };
 use serde::{Deserialize, Serialize};
 
@@ -504,19 +504,15 @@ pub enum IpcResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcClientRequest {
-    CreateElicitation {
-        params: CreateElicitationRequestParams,
-    },
-    CreateMessage {
-        params: CreateMessageRequestParams,
-    },
+    CreateElicitation { params: ElicitRequestParams },
+    CreateMessage { params: CreateMessageRequestParams },
 }
 
 /// Proxy-to-daemon response for a reverse request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcClientResponse {
-    CreateElicitation { result: CreateElicitationResult },
+    CreateElicitation { result: ElicitResult },
     CreateMessage { result: CreateMessageResult },
     Error { message: String },
 }

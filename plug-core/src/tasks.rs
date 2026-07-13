@@ -508,10 +508,7 @@ impl TaskStore {
             .get(task_id)
             .ok_or_else(|| task_not_found(task_id))?;
         ensure_owner(owner, record)?;
-        Ok(GetTaskResult {
-            meta: None,
-            task: record.task.clone(),
-        })
+        Ok(GetTaskResult::new(record.task.clone()))
     }
 
     pub fn sync_from_upstream_for_owner(
@@ -585,6 +582,11 @@ impl TaskStore {
                 format!("task {task_id} is not in a completed state"),
                 None,
             )),
+            _ => Err(McpError::new(
+                ErrorCode::INVALID_REQUEST,
+                format!("task {task_id} has an unsupported status"),
+                None,
+            )),
         }
     }
 
@@ -599,10 +601,7 @@ impl TaskStore {
             .get(task_id)
             .ok_or_else(|| task_not_found(task_id))?;
         ensure_owner(owner, record)?;
-        Ok(CancelTaskResult {
-            meta: None,
-            task: record.task.clone(),
-        })
+        Ok(CancelTaskResult::new(record.task.clone()))
     }
 
     fn prune_expired(&mut self) {
@@ -615,6 +614,10 @@ impl TaskStore {
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
                 let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
                 now.duration_since(record.last_touched) < Duration::from_millis(ttl_ms)
+            }
+            _ => {
+                now.duration_since(record.last_touched)
+                    < Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
             }
         });
     }
@@ -675,7 +678,6 @@ fn paginate_tasks(
     request: Option<rmcp::model::PaginatedRequestParams>,
 ) -> ListTasksResult {
     const PAGE_SIZE: usize = 500;
-    let total = tasks.len() as u64;
     let start = request
         .as_ref()
         .and_then(|params| params.cursor.as_ref())
@@ -687,7 +689,6 @@ fn paginate_tasks(
 
     let mut result = ListTasksResult::new(tasks[start..end].to_vec());
     result.next_cursor = next_cursor;
-    result.total = Some(total);
     result
 }
 

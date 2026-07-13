@@ -1,4 +1,7 @@
 #![deny(unsafe_code)]
+// RMCP 2.2 deprecates these APIs toward future SEP-2577. Plug intentionally
+// retains them while MCP 2025-11-25 remains the negotiated stable revision.
+#![allow(deprecated)]
 #![allow(
     clippy::items_after_test_module,
     clippy::large_enum_variant,

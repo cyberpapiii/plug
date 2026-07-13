@@ -454,7 +454,7 @@ async fn open_sse_stream(
         return Err(LegacySseError::UnexpectedContentType(content_type));
     }
 
-    Ok(SseStream::from_byte_stream(response.bytes_stream()).boxed())
+    Ok(SseStream::from_bytes_stream(response.bytes_stream()).boxed())
 }
 
 async fn post_message(
@@ -547,7 +547,7 @@ mod tests {
     use rmcp::ServiceExt as _;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
-        CallToolRequestParams, ClientRequest, Content, Implementation, InitializeResult,
+        CallToolRequestParams, ClientRequest, ContentBlock, Implementation, InitializeResult,
         ListToolsResult, LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam,
         ServerCapabilities, ServerNotification, ServerResult, Tool, ToolsCapability,
     };
@@ -827,9 +827,9 @@ mod tests {
             match request.request {
                 ClientRequest::InitializeRequest(_) => {
                     let mut capabilities = ServerCapabilities::default();
-                    capabilities.tools = Some(ToolsCapability {
-                        list_changed: Some(false),
-                    });
+                    let mut tools = ToolsCapability::default();
+                    tools.list_changed = Some(false);
+                    capabilities.tools = Some(tools);
                     let logging = ServerJsonRpcMessage::notification(
                         ServerNotification::LoggingMessageNotification(
                             LoggingMessageNotification::new(LoggingMessageNotificationParam::new(
@@ -877,9 +877,9 @@ mod tests {
             match request.request {
                 ClientRequest::InitializeRequest(_) => {
                     let mut capabilities = ServerCapabilities::default();
-                    capabilities.tools = Some(ToolsCapability {
-                        list_changed: Some(false),
-                    });
+                    let mut tools = ToolsCapability::default();
+                    tools.list_changed = Some(false);
+                    capabilities.tools = Some(tools);
                     let response = ServerJsonRpcMessage::response(
                         ServerResult::InitializeResult(
                             InitializeResult::new(capabilities)
@@ -925,7 +925,7 @@ mod tests {
                     }
                     let response = ServerJsonRpcMessage::response(
                         ServerResult::CallToolResult(rmcp::model::CallToolResult::success(vec![
-                            Content::text("noisy call completed"),
+                            ContentBlock::text("noisy call completed"),
                         ])),
                         request.id,
                     );

@@ -104,6 +104,12 @@ impl super::ToolRouter {
                         detail: format!("resource not found: {}", resource_ref.uri),
                     })
                 })?,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "unsupported completion reference type",
+                    None,
+                ));
+            }
         };
         drop(snapshot);
 

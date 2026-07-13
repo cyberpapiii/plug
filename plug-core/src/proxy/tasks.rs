@@ -50,10 +50,10 @@ impl Drop for UpstreamRequestCancelGuard {
         // worth cancelling either — skip instead of panicking.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let send = peer.notify_cancelled(CancelledNotificationParam {
-                    request_id,
-                    reason: Some("task aborted before upstream request was recorded".to_string()),
-                });
+                let send = peer.notify_cancelled(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some("task aborted before upstream request was recorded".to_string()),
+                ));
                 if tokio::time::timeout(bound, send).await.is_err() {
                     tracing::warn!(
                         timeout_secs = bound.as_secs(),
@@ -159,7 +159,7 @@ impl super::ToolRouter {
             if let Some(args) = arguments.clone() {
                 upstream_params = upstream_params.with_arguments(args);
             }
-            upstream_params.task = Some(serde_json::Map::new());
+            upstream_params.task = Some(TaskMetadata::new());
             if let Some(token) = progress_token.clone() {
                 upstream_params.set_progress_token(token);
             }
@@ -239,10 +239,11 @@ impl super::ToolRouter {
                         // Best-effort request-level cancel, bounded on its
                         // own: a wedged transport sink must not hang this
                         // detached task.
-                        let cancel = request_peer.notify_cancelled(CancelledNotificationParam {
-                            request_id: upstream_request_id.clone(),
-                            reason: Some("task creation timed out".to_string()),
-                        });
+                        let cancel =
+                            request_peer.notify_cancelled(CancelledNotificationParam::new(
+                                Some(upstream_request_id.clone()),
+                                Some("task creation timed out".to_string()),
+                            ));
                         if tokio::time::timeout(call_timeout, cancel).await.is_err() {
                             tracing::warn!(
                                 trace_id = %trace_id,
@@ -413,11 +414,8 @@ impl super::ToolRouter {
             let response = server
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
-                    GetTaskInfoParams {
-                        meta: None,
-                        task_id: upstream_task_id,
-                    },
+                .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
+                    GetTaskParams::new(upstream_task_id),
                 )))
                 .await
                 .map_err(|error| match error {
@@ -430,10 +428,7 @@ impl super::ToolRouter {
                     task_id,
                     &result.task,
                 )?;
-                return Ok(GetTaskResult {
-                    meta: None,
-                    task: synced,
-                });
+                return Ok(GetTaskResult::new(synced));
             }
             return Err(McpError::internal_error(
                 "unexpected upstream tasks/get response".to_string(),
@@ -466,11 +461,8 @@ impl super::ToolRouter {
             let response = server
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskResultRequest(
-                    GetTaskResultRequest::new(GetTaskResultParams {
-                        meta: None,
-                        task_id: upstream_task_id,
-                    }),
+                .send_request(ClientRequest::GetTaskPayloadRequest(
+                    GetTaskPayloadRequest::new(GetTaskPayloadParams::new(upstream_task_id)),
                 ))
                 .await
                 .map_err(|error| match error {
@@ -601,10 +593,7 @@ impl super::ToolRouter {
                     task_id: upstream_task_id,
                 } => {
                     let send = peer.send_request(ClientRequest::CancelTaskRequest(
-                        CancelTaskRequest::new(CancelTaskParams {
-                            meta: None,
-                            task_id: upstream_task_id.clone(),
-                        }),
+                        CancelTaskRequest::new(CancelTaskParams::new(upstream_task_id.clone())),
                     ));
                     match tokio::time::timeout(bound, send).await {
                         Err(_) => tracing::warn!(
@@ -626,10 +615,10 @@ impl super::ToolRouter {
                     server_id,
                     request_id,
                 } => {
-                    let send = peer.notify_cancelled(CancelledNotificationParam {
-                        request_id,
-                        reason: Some("task owner disconnected".to_string()),
-                    });
+                    let send = peer.notify_cancelled(CancelledNotificationParam::new(
+                        Some(request_id),
+                        Some("task owner disconnected".to_string()),
+                    ));
                     match tokio::time::timeout(bound, send).await {
                         Err(_) => tracing::warn!(
                             server = %server_id,
@@ -771,10 +760,7 @@ impl super::ToolRouter {
                                 .client
                                 .peer()
                                 .send_request(ClientRequest::CancelTaskRequest(
-                                    CancelTaskRequest::new(CancelTaskParams {
-                                        meta: None,
-                                        task_id: upstream_task_id,
-                                    }),
+                                    CancelTaskRequest::new(CancelTaskParams::new(upstream_task_id)),
                                 )),
                         )
                         .await;
@@ -785,10 +771,7 @@ impl super::ToolRouter {
                                     .lock()
                                     .await
                                     .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
-                                return Ok(CancelTaskResult {
-                                    meta: None,
-                                    task: synced,
-                                });
+                                return Ok(CancelTaskResult::new(synced));
                             }
                             Err(_) => tracing::debug!(
                                 server = %server_id,
@@ -810,10 +793,10 @@ impl super::ToolRouter {
                             server
                                 .client
                                 .peer()
-                                .notify_cancelled(CancelledNotificationParam {
-                                    request_id,
-                                    reason: Some("task cancelled".to_string()),
-                                });
+                                .notify_cancelled(CancelledNotificationParam::new(
+                                    Some(request_id),
+                                    Some("task cancelled".to_string()),
+                                ));
                         if tokio::time::timeout(bound, notify).await.is_err() {
                             tracing::debug!(
                                 server = %server_id,
@@ -829,7 +812,7 @@ impl super::ToolRouter {
         if let Some(handle) = handle {
             handle.abort();
         }
-        Ok(CancelTaskResult { meta: None, task })
+        Ok(CancelTaskResult::new(task))
     }
 
     async fn execute_tool_task(
@@ -987,10 +970,10 @@ impl super::ToolRouter {
                     // completing it for a result nobody wants.
                     if let Some(reason) = pending_cancel {
                         let _ = request_peer
-                            .notify_cancelled(CancelledNotificationParam {
-                                request_id: upstream_request_id.clone(),
-                                reason: Some(reason),
-                            })
+                            .notify_cancelled(CancelledNotificationParam::new(
+                                Some(upstream_request_id.clone()),
+                                Some(reason),
+                            ))
                             .await;
                     }
                 }
@@ -1010,10 +993,10 @@ impl super::ToolRouter {
                         server = %server_id,
                         "task record gone before upstream request was recorded; cancelling upstream request"
                     );
-                    let cancel = request_peer.notify_cancelled(CancelledNotificationParam {
-                        request_id: upstream_request_id.clone(),
-                        reason: Some("task owner disconnected".to_string()),
-                    });
+                    let cancel = request_peer.notify_cancelled(CancelledNotificationParam::new(
+                        Some(upstream_request_id.clone()),
+                        Some("task owner disconnected".to_string()),
+                    ));
                     if tokio::time::timeout(timeout_duration, cancel)
                         .await
                         .is_err()
@@ -1041,12 +1024,10 @@ impl super::ToolRouter {
                 Ok(Ok(inner)) => inner,
                 Ok(Err(_recv_error)) => Err(ServiceError::TransportClosed),
                 Err(_elapsed) => {
-                    let cancel = request_peer.notify_cancelled(CancelledNotificationParam {
-                        request_id: upstream_request_id.clone(),
-                        reason: Some(
-                            RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON.to_string(),
-                        ),
-                    });
+                    let cancel = request_peer.notify_cancelled(CancelledNotificationParam::new(
+                        Some(upstream_request_id.clone()),
+                        Some(RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON.to_string()),
+                    ));
                     if tokio::time::timeout(timeout_duration, cancel)
                         .await
                         .is_err()
@@ -1401,10 +1382,12 @@ mod tests {
                     std::future::pending::<()>().await;
                 }
                 let now = rmcp::task_manager::current_timestamp();
-                Ok(CancelTaskResult {
-                    meta: None,
-                    task: Task::new(request.task_id, TaskStatus::Cancelled, now.clone(), now),
-                })
+                Ok(CancelTaskResult::new(Task::new(
+                    request.task_id,
+                    TaskStatus::Cancelled,
+                    now.clone(),
+                    now,
+                )))
             }
         }
     }
@@ -2121,7 +2104,7 @@ mod tests {
                         Err(McpError::internal_error("call cancelled by client", None))
                     }
                     _ = state.call_gate.wait() => {
-                        Ok(CallToolResult::success(vec![Content::text("done")]))
+                        Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
                     }
                 }
             }

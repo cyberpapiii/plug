@@ -40,8 +40,8 @@ struct StdioBridge {
 impl DownstreamBridge for StdioBridge {
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
-    ) -> Pin<Box<dyn Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_>> {
+        request: ElicitRequestParams,
+    ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
         if self.capabilities.elicitation.is_none() {
             return Box::pin(async {
                 Err(McpError::internal_error(
@@ -212,6 +212,8 @@ impl ServerHandler for ProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
+            crate::protocol::ensure_supported_downstream_protocol(&request.protocol_version)?;
+
             let client_type = detect_client(&request.client_info.name);
             tracing::info!(
                 client = %request.client_info.name,
@@ -376,13 +378,15 @@ impl ServerHandler for ProxyHandler {
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "stdio logging fan-out lagged");
                                 let _ = log_peer
-                                    .notify_logging_message(LoggingMessageNotificationParam {
-                                        level: LoggingLevel::Warning,
-                                        logger: Some("plug".to_string()),
-                                        data: serde_json::json!(format!(
-                                            "skipped {skipped} log messages"
-                                        )),
-                                    })
+                                    .notify_logging_message(
+                                        LoggingMessageNotificationParam::new(
+                                            LoggingLevel::Warning,
+                                            serde_json::json!(format!(
+                                                "skipped {skipped} log messages"
+                                            )),
+                                        )
+                                        .with_logger("plug"),
+                                    )
                                     .await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -548,7 +552,7 @@ impl ServerHandler for ProxyHandler {
 
     fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
         let router = Arc::clone(&self.router);
@@ -562,7 +566,7 @@ impl ServerHandler for ProxyHandler {
 
     fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
         let router = Arc::clone(&self.router);
@@ -590,13 +594,12 @@ impl ServerHandler for ProxyHandler {
         _context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + Send + '_ {
         async move {
-            self.router.forward_cancel_from_downstream(
-                &DownstreamCallContext::stdio(
-                    Arc::clone(&self.client_id),
-                    notification.request_id.clone(),
-                ),
-                notification.reason,
-            );
+            if let Some(request_id) = notification.request_id {
+                self.router.forward_cancel_from_downstream(
+                    &DownstreamCallContext::stdio(Arc::clone(&self.client_id), request_id),
+                    notification.reason,
+                );
+            }
         }
     }
 

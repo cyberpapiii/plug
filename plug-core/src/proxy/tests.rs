@@ -1371,10 +1371,7 @@ fn synthesized_capabilities_no_completions_without_upstream() {
 fn complete_request_params_serde_roundtrip() {
     let params = CompleteRequestParams::new(
         Reference::for_prompt("test-prompt"),
-        ArgumentInfo {
-            name: "arg1".to_string(),
-            value: "partial".to_string(),
-        },
+        ArgumentInfo::new("arg1", "partial"),
     );
 
     let json = serde_json::to_value(&params).unwrap();
@@ -1396,11 +1393,11 @@ fn route_upstream_logging_message_publishes_with_server_prefix() {
 
     router.route_upstream_logging_message(
         "github",
-        LoggingMessageNotificationParam {
-            level: LoggingLevel::Warning,
-            logger: Some("default".to_string()),
-            data: serde_json::json!("something happened"),
-        },
+        LoggingMessageNotificationParam::new(
+            LoggingLevel::Warning,
+            serde_json::json!("something happened"),
+        )
+        .with_logger("default"),
     );
 
     match rx.try_recv() {
@@ -1421,11 +1418,7 @@ fn route_upstream_logging_message_filters_below_threshold() {
     // Default level is Warning — debug should be filtered
     router.route_upstream_logging_message(
         "github",
-        LoggingMessageNotificationParam {
-            level: LoggingLevel::Debug,
-            logger: None,
-            data: serde_json::json!("debug noise"),
-        },
+        LoggingMessageNotificationParam::new(LoggingLevel::Debug, serde_json::json!("debug noise")),
     );
 
     assert!(rx.try_recv().is_err(), "debug message should be filtered");
@@ -1468,11 +1461,7 @@ fn route_upstream_logging_respects_changed_level() {
     // Now debug messages should pass through
     router.route_upstream_logging_message(
         "server1",
-        LoggingMessageNotificationParam {
-            level: LoggingLevel::Debug,
-            logger: None,
-            data: serde_json::json!("debug info"),
-        },
+        LoggingMessageNotificationParam::new(LoggingLevel::Debug, serde_json::json!("debug info")),
     );
 
     match rx.try_recv() {
@@ -1494,11 +1483,7 @@ fn logging_channel_is_separate_from_control_channel() {
     // Send a logging message
     router.route_upstream_logging_message(
         "server1",
-        LoggingMessageNotificationParam {
-            level: LoggingLevel::Warning,
-            logger: None,
-            data: serde_json::json!("log msg"),
-        },
+        LoggingMessageNotificationParam::new(LoggingLevel::Warning, serde_json::json!("log msg")),
     );
 
     // Control channel should NOT receive it
@@ -1811,12 +1796,11 @@ fn test_route_upstream_progress_restores_downstream_token() {
 
     router.route_upstream_progress(
         "s1",
-        ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(Arc::from("upstream-token"))),
-            progress: 0.5,
-            total: Some(1.0),
-            message: None,
-        },
+        ProgressNotificationParam::new(
+            ProgressToken(NumberOrString::String(Arc::from("upstream-token"))),
+            0.5,
+        )
+        .with_total(1.0),
     );
 
     let notification = rx.try_recv().expect("progress notification");
@@ -1835,6 +1819,35 @@ fn test_route_upstream_progress_restores_downstream_token() {
         }
         other => panic!("expected progress notification, got {other:?}"),
     }
+}
+
+#[test]
+fn test_anonymous_upstream_cancellation_preserves_active_call() {
+    let sm = Arc::new(ServerManager::new());
+    let router = ToolRouter::new(sm, test_router_config());
+
+    router.register_active_call(
+        1,
+        ActiveCallRecord {
+            downstream: DownstreamCallContext::stdio(
+                Arc::from("client-a"),
+                RequestId::from(NumberOrString::Number(1)),
+            ),
+            upstream_server_id: "s1".to_string(),
+            upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
+            downstream_progress_token: None,
+            upstream_progress_token: None,
+            pending_cancel_reason: None,
+        },
+    );
+
+    router.route_upstream_cancelled(
+        "s1",
+        CancelledNotificationParam::new(None, Some("session closed".to_string())),
+    );
+
+    assert_eq!(router.active_call_count(), 1);
+    assert!(router.active_calls.contains_key(&1));
 }
 
 #[test]
@@ -2044,7 +2057,7 @@ async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
         supports_tasks: true,
     };
     let mut params = CallToolRequestParams::new("Mock__tool");
-    params.task = Some(serde_json::Map::new());
+    params.task = Some(TaskMetadata::new());
 
     let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
         .await
@@ -2065,7 +2078,7 @@ async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
         supports_tasks: false,
     };
     let mut params = CallToolRequestParams::new("Mock__tool");
-    params.task = Some(serde_json::Map::new());
+    params.task = Some(TaskMetadata::new());
 
     // expect_err is itself the branch-distinction proof: the task path returns
     // Ok(TaskCreated) (see the sibling test), so an Err means the sync path ran.
@@ -2219,10 +2232,10 @@ struct SubscribableUpstreamHandler {
 impl ServerHandler for SubscribableUpstreamHandler {
     fn get_info(&self) -> ServerInfo {
         let mut capabilities = ServerCapabilities::default();
-        capabilities.resources = Some(rmcp::model::ResourcesCapability {
-            subscribe: Some(true),
-            list_changed: Some(false),
-        });
+        let mut resources = rmcp::model::ResourcesCapability::default();
+        resources.subscribe = Some(true);
+        resources.list_changed = Some(false);
+        capabilities.resources = Some(resources);
         ServerInfo::new(capabilities)
     }
 
@@ -2234,7 +2247,7 @@ impl ServerHandler for SubscribableUpstreamHandler {
         let uris = self.state.resources.lock().unwrap().clone();
         std::future::ready(Ok(ListResourcesResult::with_all_items(
             uris.iter()
-                .map(|uri| RawResource::new(uri.as_str(), uri.as_str()).no_annotation())
+                .map(|uri| Resource::new(uri.as_str(), uri.as_str()))
                 .collect(),
         )))
     }
@@ -2330,10 +2343,10 @@ async fn connect_subscribable_upstream(
         .expect("connect subscribable upstream test client");
 
     let mut capabilities = ServerCapabilities::default();
-    capabilities.resources = Some(rmcp::model::ResourcesCapability {
-        subscribe: Some(true),
-        list_changed: Some(false),
-    });
+    let mut resources = rmcp::model::ResourcesCapability::default();
+    resources.subscribe = Some(true);
+    resources.list_changed = Some(false);
+    capabilities.resources = Some(resources);
 
     UpstreamServer {
         name: name.to_string(),

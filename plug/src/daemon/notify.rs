@@ -271,12 +271,9 @@ mod tests {
         use rmcp::model::{NumberOrString, ProgressNotificationParam, ProgressToken};
 
         let progress_token = ProgressToken(NumberOrString::String(Arc::from("tok-1")));
-        let params = ProgressNotificationParam {
-            progress_token: progress_token.clone(),
-            progress: 50.0,
-            total: Some(100.0),
-            message: Some("halfway".to_string()),
-        };
+        let params = ProgressNotificationParam::new(progress_token.clone(), 50.0)
+            .with_total(100.0)
+            .with_message("halfway");
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Progress {
@@ -305,12 +302,7 @@ mod tests {
         use rmcp::model::{NumberOrString, ProgressNotificationParam, ProgressToken};
 
         let progress_token = ProgressToken(NumberOrString::String(Arc::from("tok-1")));
-        let params = ProgressNotificationParam {
-            progress_token,
-            progress: 50.0,
-            total: Some(100.0),
-            message: None,
-        };
+        let params = ProgressNotificationParam::new(progress_token, 50.0).with_total(100.0);
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Progress {
@@ -333,10 +325,10 @@ mod tests {
     async fn control_notification_forwards_cancelled_for_matching_session() {
         use rmcp::model::{CancelledNotificationParam, NumberOrString, RequestId};
 
-        let params = CancelledNotificationParam {
-            request_id: RequestId::from(NumberOrString::Number(99)),
-            reason: Some("user cancelled".to_string()),
-        };
+        let params = CancelledNotificationParam::new(
+            Some(RequestId::from(NumberOrString::Number(99))),
+            Some("user cancelled".to_string()),
+        );
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Cancelled {
@@ -361,10 +353,10 @@ mod tests {
     async fn control_notification_filters_cancelled_for_different_session() {
         use rmcp::model::{CancelledNotificationParam, NumberOrString, RequestId};
 
-        let params = CancelledNotificationParam {
-            request_id: RequestId::from(NumberOrString::Number(99)),
-            reason: None,
-        };
+        let params = CancelledNotificationParam::new(
+            Some(RequestId::from(NumberOrString::Number(99))),
+            None,
+        );
 
         let resp = send_and_read_control_notification(
             plug_core::notifications::ProtocolNotification::Cancelled {

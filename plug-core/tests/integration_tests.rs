@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Preserve integration coverage for MCP 2025-11-25 features that RMCP 2.2
+// deprecates only in anticipation of future SEP-2577.
+#![allow(deprecated)]
 
 //! Integration tests for plug-core.
 //!
@@ -34,8 +37,8 @@ use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
-    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
+    CallToolRequestParams, ClientCapabilities, ClientInfo, CreateMessageRequestParams,
+    CreateMessageResult, ElicitRequestParams, ElicitResult, ElicitationAction,
     ElicitationCapability, FormElicitationCapability, Implementation, ReadResourceRequestParams,
     ResourceContents, SamplingCapability, SamplingMessage, UrlElicitationCapability,
 };
@@ -2517,7 +2520,7 @@ async fn test_stdio_resource_link_passes_through_end_to_end() {
     let resource = result
         .content
         .first()
-        .and_then(|content| content.raw.as_resource_link())
+        .and_then(|content| content.as_resource_link())
         .expect("resource_link content");
     assert_eq!(resource.uri, "file:///tmp/mock-resource.txt");
     assert_eq!(resource.name, "mock-resource.txt");
@@ -2559,7 +2562,7 @@ async fn test_stdio_oversized_tool_result_spills_to_artifact_link() {
     let resource = result
         .content
         .iter()
-        .find_map(|content| content.raw.as_resource_link())
+        .find_map(|content| content.as_resource_link())
         .expect("artifact resource_link content");
     assert!(
         resource.uri.starts_with("plug://artifact/"),
@@ -2603,7 +2606,7 @@ async fn test_stdio_artifact_manifest_is_readable() {
     let manifest_uri = result
         .content
         .iter()
-        .find_map(|content| content.raw.as_resource_link())
+        .find_map(|content| content.as_resource_link())
         .map(|resource| resource.uri.clone())
         .expect("artifact resource_link content");
 
@@ -2658,7 +2661,7 @@ async fn test_stdio_artifact_chunk_is_readable() {
     let manifest_uri = result
         .content
         .iter()
-        .find_map(|content| content.raw.as_resource_link())
+        .find_map(|content| content.as_resource_link())
         .map(|resource| resource.uri.clone())
         .expect("artifact resource_link content");
     let chunk_uri = manifest_uri.replace("/manifest", "/chunk/0");
@@ -2712,7 +2715,7 @@ async fn test_stdio_attachment_like_tool_result_spills_to_artifact_link() {
     let resource = result
         .content
         .iter()
-        .find_map(|content| content.raw.as_resource_link())
+        .find_map(|content| content.as_resource_link())
         .expect("artifact resource_link content");
     assert!(resource.uri.starts_with("plug://artifact/"));
     assert_eq!(result.is_error, Some(false));
@@ -4340,20 +4343,21 @@ impl ClientHandler for ReverseRequestTestClient {
     fn get_info(&self) -> ClientInfo {
         let mut caps = ClientCapabilities::default();
         caps.sampling = Some(SamplingCapability::default());
-        caps.elicitation = Some(ElicitationCapability {
-            form: Some(FormElicitationCapability::default()),
-            url: Some(UrlElicitationCapability {}),
-        });
+        caps.elicitation = Some(
+            ElicitationCapability::new()
+                .with_form(FormElicitationCapability::default())
+                .with_url(UrlElicitationCapability::default()),
+        );
         ClientInfo::new(caps, Implementation::new("reverse-test-client", "1.0"))
     }
 
     fn create_elicitation(
         &self,
-        _request: CreateElicitationRequestParams,
+        _request: ElicitRequestParams,
         _context: RequestContext<rmcp::RoleClient>,
-    ) -> impl Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
         async {
-            Ok(CreateElicitationResult::new(ElicitationAction::Accept)
+            Ok(ElicitResult::new(ElicitationAction::Accept)
                 .with_content(serde_json::json!({"answer": "test-elicitation-response"})))
         }
     }

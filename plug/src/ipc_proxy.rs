@@ -697,6 +697,8 @@ impl ServerHandler for IpcProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
+            plug_core::protocol::ensure_supported_downstream_protocol(&request.protocol_version)?;
+
             let client_name = request.client_info.name.to_string();
             tracing::info!(
                 client = %client_name,
@@ -988,7 +990,7 @@ impl ServerHandler for IpcProxyHandler {
 
     fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
         async move {
@@ -1022,7 +1024,7 @@ impl ServerHandler for IpcProxyHandler {
 
     fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
         async move {
@@ -1534,8 +1536,8 @@ mod tests {
     use rmcp::ServiceExt as _;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
-        CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskInfoParams,
-        GetTaskInfoRequest, GetTaskResultParams, GetTaskResultRequest, ServerResult, TaskStatus,
+        CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskParams, GetTaskPayloadParams,
+        GetTaskPayloadRequest, GetTaskRequest, ServerResult, TaskMetadata, TaskStatus,
     };
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1938,7 +1940,7 @@ mod tests {
                     .unwrap()
                     .clone(),
             )
-            .with_task(serde_json::Map::new());
+            .with_task(TaskMetadata::new());
 
         let create_response = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1964,11 +1966,8 @@ mod tests {
             loop {
                 let response = client
                     .peer()
-                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
-                        GetTaskInfoParams {
-                            meta: None,
-                            task_id: task_id.clone(),
-                        },
+                    .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
+                        GetTaskParams::new(task_id.clone()),
                     )))
                     .await
                     .expect("task info response");
@@ -1989,11 +1988,8 @@ mod tests {
 
         let payload_response = client
             .peer()
-            .send_request(ClientRequest::GetTaskResultRequest(
-                GetTaskResultRequest::new(GetTaskResultParams {
-                    meta: None,
-                    task_id: task_id.clone(),
-                }),
+            .send_request(ClientRequest::GetTaskPayloadRequest(
+                GetTaskPayloadRequest::new(GetTaskPayloadParams::new(task_id.clone())),
             ))
             .await
             .expect("task result response");
@@ -2187,7 +2183,7 @@ mod tests {
                     .unwrap()
                     .clone(),
             )
-            .with_task(serde_json::Map::new());
+            .with_task(TaskMetadata::new());
 
         let create_response = client_a
             .peer()
@@ -2225,11 +2221,8 @@ mod tests {
             loop {
                 let response = client_b
                     .peer()
-                    .send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
-                        GetTaskInfoParams {
-                            meta: None,
-                            task_id: task_id.clone(),
-                        },
+                    .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
+                        GetTaskParams::new(task_id.clone()),
                     )))
                     .await
                     .expect("replacement task info response");
@@ -2251,11 +2244,8 @@ mod tests {
 
         let payload_response = client_b
             .peer()
-            .send_request(ClientRequest::GetTaskResultRequest(
-                GetTaskResultRequest::new(GetTaskResultParams {
-                    meta: None,
-                    task_id: task_id.clone(),
-                }),
+            .send_request(ClientRequest::GetTaskPayloadRequest(
+                GetTaskPayloadRequest::new(GetTaskPayloadParams::new(task_id.clone())),
             ))
             .await
             .expect("replacement task result response");
@@ -2436,7 +2426,7 @@ mod tests {
         .expect("chunked tool call");
 
         let first = result.content.first().expect("content");
-        let text = first.raw.as_text().expect("text content");
+        let text = first.as_text().expect("text content");
         assert_eq!(text.text.len(), 6 * 1024 * 1024);
         assert_eq!(result.is_error, Some(false));
 
@@ -2512,7 +2502,7 @@ mod tests {
         let resource = result
             .content
             .iter()
-            .find_map(|content| content.raw.as_resource_link())
+            .find_map(ContentBlock::as_resource_link)
             .expect("artifact resource_link content");
         assert!(resource.uri.starts_with("plug://artifact/"));
         assert_eq!(result.is_error, Some(false));
@@ -2579,7 +2569,7 @@ mod tests {
             .expect("connect downstream client");
 
         let task_request =
-            CallToolRequestParams::new("Mock__artifact_text").with_task(serde_json::Map::new());
+            CallToolRequestParams::new("Mock__artifact_text").with_task(TaskMetadata::new());
 
         let create_response = client
             .peer()
@@ -2597,11 +2587,8 @@ mod tests {
             loop {
                 let response = client
                     .peer()
-                    .send_request(ClientRequest::GetTaskResultRequest(
-                        GetTaskResultRequest::new(GetTaskResultParams {
-                            meta: None,
-                            task_id: task_id.clone(),
-                        }),
+                    .send_request(ClientRequest::GetTaskPayloadRequest(
+                        GetTaskPayloadRequest::new(GetTaskPayloadParams::new(task_id.clone())),
                     ))
                     .await
                     .expect("task result response");
@@ -2697,7 +2684,7 @@ mod tests {
         let manifest_uri = result
             .content
             .iter()
-            .find_map(|content| content.raw.as_resource_link())
+            .find_map(ContentBlock::as_resource_link)
             .expect("artifact resource_link")
             .uri
             .clone();
@@ -3541,7 +3528,7 @@ mod tests {
             .expect("send interleaved notification");
 
             let call_result =
-                serde_json::to_value(CallToolResult::success(vec![Content::text("ok")]))
+                serde_json::to_value(CallToolResult::success(vec![ContentBlock::text("ok")]))
                     .expect("serialize call result");
             ipc::send_response(
                 &mut writer,
@@ -3632,7 +3619,7 @@ mod tests {
             // reassemble.
             let big_text = "x".repeat(6 * 1024 * 1024);
             let call_result =
-                serde_json::to_value(CallToolResult::success(vec![Content::text(big_text)]))
+                serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(big_text)]))
                     .expect("serialize call result");
             ipc::send_chunked_response(
                 &mut writer,
@@ -3678,7 +3665,7 @@ mod tests {
         let text = result
             .content
             .first()
-            .and_then(|c| c.raw.as_text())
+            .and_then(ContentBlock::as_text)
             .expect("text content");
         assert_eq!(text.text.len(), 6 * 1024 * 1024);
 
@@ -3766,8 +3753,10 @@ mod tests {
                 "expected retried tools/call, got {req2:?}"
             );
             let call_result =
-                serde_json::to_value(CallToolResult::success(vec![Content::text("recovered")]))
-                    .expect("serialize call result");
+                serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+                    "recovered",
+                )]))
+                .expect("serialize call result");
             ipc::send_response(
                 &mut writer2,
                 &IpcResponse::McpResponse {
@@ -3829,7 +3818,7 @@ mod tests {
             second_attempt
                 .content
                 .first()
-                .and_then(|c| c.raw.as_text())
+                .and_then(ContentBlock::as_text)
                 .map(|t| t.text.as_str()),
             Some("recovered")
         );
@@ -3908,8 +3897,10 @@ mod tests {
                 "expected retried tools/call, got {req2:?}"
             );
             let call_result =
-                serde_json::to_value(CallToolResult::success(vec![Content::text("recovered")]))
-                    .expect("serialize call result");
+                serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+                    "recovered",
+                )]))
+                .expect("serialize call result");
             ipc::send_response(
                 &mut writer2,
                 &IpcResponse::McpResponse {
@@ -3976,7 +3967,7 @@ mod tests {
             second_attempt
                 .content
                 .first()
-                .and_then(|c| c.raw.as_text())
+                .and_then(ContentBlock::as_text)
                 .map(|t| t.text.as_str()),
             Some("recovered")
         );
@@ -4025,8 +4016,10 @@ mod tests {
             }
 
             let call_result =
-                serde_json::to_value(CallToolResult::success(vec![Content::text("survived")]))
-                    .expect("serialize call result");
+                serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+                    "survived",
+                )]))
+                .expect("serialize call result");
             ipc::send_response(
                 &mut writer,
                 &IpcResponse::McpResponse {
@@ -4079,7 +4072,7 @@ mod tests {
             result
                 .content
                 .first()
-                .and_then(|c| c.raw.as_text())
+                .and_then(ContentBlock::as_text)
                 .map(|t| t.text.as_str()),
             Some("survived")
         );
