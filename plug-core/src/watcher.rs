@@ -241,16 +241,18 @@ mod tests {
                 events,
             };
 
-            // The watcher task arms asynchronously. Drive one real config
-            // write through the full debounce/reload path before returning so
-            // negative assertions cannot mistake a late startup event for the
-            // mutation they are testing. The bounded retry also covers a
-            // first write that lands before the OS watcher is registered.
-            let initial_config = Config::default();
-            assert!(
-                fixture.mutate_and_await_reload(&initial_config).await,
-                "config watcher did not become ready within the bounded retry window"
-            );
+            // FSEvents can report a file event that predates registration.
+            // Drain those startup notifications until one full two-debounce
+            // window is quiet, without creating another config write that can
+            // itself leak into a later negative assertion.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while fixture
+                    .wait_for_reload(Duration::from_millis(DEBOUNCE_MS * 2))
+                    .await
+                {}
+            })
+            .await
+            .expect("config watcher startup events did not settle");
 
             fixture
         }
