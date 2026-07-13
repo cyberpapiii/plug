@@ -398,12 +398,17 @@ impl ToolRouter {
         {
             let server_manager = Arc::clone(&server_manager);
             let cache = Arc::clone(&cache);
-            let registry = Arc::clone(&resource_subscriptions);
+            // The registry stores this hook, so it must capture the registry
+            // weakly. A strong capture forms registry -> hook -> registry and
+            // retains the router's subscription/cache/server graph forever.
+            let registry = Arc::downgrade(&resource_subscriptions);
             resource_subscriptions.set_post_confirm_hook(Arc::new(
                 move |uri: String, confirmed_owner: String| {
                     let server_manager = Arc::clone(&server_manager);
                     let cache = Arc::clone(&cache);
-                    let registry = Arc::clone(&registry);
+                    let Some(registry) = registry.upgrade() else {
+                        return;
+                    };
                     tokio::spawn(async move {
                         let published_route = cache.load().resource_routes.get(&uri).cloned();
                         let Some(new_server_id) = published_route else {

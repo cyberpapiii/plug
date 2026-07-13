@@ -176,6 +176,7 @@ impl super::ToolRouter {
             let tool_name = tool_name.to_string();
             let round_trip = tokio::spawn(async move {
                 let _create_guard = create_guard;
+                let deadline = tokio::time::Instant::now() + call_timeout;
 
                 let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
                 // DEFAULT options on purpose: setting rmcp's own
@@ -183,14 +184,41 @@ impl super::ToolRouter {
                 // `await_response`, whose auto-cancel awaits an UNBOUNDED
                 // `send_notification` — a wedged sink would hang this task
                 // forever. The bound lives in our own `tokio::time::timeout`
-                // below, paired with a bounded explicit cancel.
-                let handle = peer
-                    .send_cancellable_request(request, PeerRequestOptions::default())
-                    .await
-                    .map_err(|error| match error {
-                        ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
-                    })?;
+                // below, paired with a bounded explicit cancel. The same
+                // deadline covers BOTH queueing the request and receiving
+                // its response: rmcp's peer channel is bounded, so acquiring
+                // a RequestHandle can itself backpressure before a request id
+                // exists to cancel.
+                let handle = match tokio::time::timeout_at(
+                    deadline,
+                    peer.send_cancellable_request(request, PeerRequestOptions::default()),
+                )
+                .await
+                {
+                    Ok(Ok(handle)) => handle,
+                    Ok(Err(error)) => {
+                        return Err(match error {
+                            ServiceError::McpError(mcp_err) => mcp_err,
+                            other => McpError::internal_error(other.to_string(), None),
+                        });
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            trace_id = %trace_id,
+                            server = %server_id,
+                            tool = %original_name,
+                            timeout_secs = call_timeout.as_secs(),
+                            "native task creation timed out while queueing upstream request"
+                        );
+                        return Err(McpError::internal_error(
+                            ServiceError::Timeout {
+                                timeout: call_timeout,
+                            }
+                            .to_string(),
+                            None,
+                        ));
+                    }
+                };
                 let RequestHandle {
                     mut rx,
                     id: upstream_request_id,
@@ -198,7 +226,7 @@ impl super::ToolRouter {
                     ..
                 } = handle;
 
-                let recv = match tokio::time::timeout(call_timeout, &mut rx).await {
+                let recv = match tokio::time::timeout_at(deadline, &mut rx).await {
                     Ok(recv) => recv,
                     Err(_elapsed) => {
                         tracing::warn!(
@@ -1097,6 +1125,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use rmcp::model::PingRequest;
 
     fn test_router_config() -> RouterConfig {
         RouterConfig {
@@ -1445,6 +1474,56 @@ mod tests {
         }
     }
 
+    /// Owns the parked runtime used by `connect_frozen_task_upstream` and
+    /// guarantees it is released even when a regression assertion panics.
+    struct FrozenUpstreamRuntime {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for FrozenUpstreamRuntime {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Connect a real rmcp client/server pair, then stop polling the runtime
+    /// that owns their service loops. The returned client's private
+    /// 1,024-message peer queue can therefore be filled deterministically to
+    /// exercise request-handle acquisition backpressure.
+    fn connect_frozen_task_upstream(
+        name: &str,
+        state: Arc<GatedTaskUpstreamState>,
+        call_timeout_secs: u64,
+    ) -> (UpstreamServer, FrozenUpstreamRuntime) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let name = name.to_string();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build frozen upstream runtime");
+            let upstream =
+                runtime.block_on(connect_gated_task_upstream(&name, state, call_timeout_secs));
+            ready_tx.send(upstream).expect("publish frozen upstream");
+            let _ = release_rx.recv();
+        });
+        let upstream = ready_rx.recv().expect("receive frozen upstream");
+        (
+            upstream,
+            FrozenUpstreamRuntime {
+                release: Some(release_tx),
+                thread: Some(thread),
+            },
+        )
+    }
+
     fn upstream_working_task(task_id: &str) -> Task {
         Task::new(
             task_id.to_string(),
@@ -1679,6 +1758,69 @@ mod tests {
             .create(owner.clone(), "fresh_tool")
             .expect("fresh create after the tombstone cleared");
         assert_eq!(router.task_count_for_owner(&owner).await, 1);
+    }
+
+    /// Request creation itself is backpressured by rmcp's bounded peer
+    /// channel. The configured call timeout must cover that acquisition as
+    /// well as the response; otherwise the detached owner-create guard can
+    /// remain live forever before a request id even exists to cancel.
+    #[tokio::test(start_paused = true)]
+    async fn native_enqueue_bounds_request_handle_acquisition() {
+        let state = GatedTaskUpstreamState::new(false, true);
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let (upstream, _frozen_runtime) =
+            connect_frozen_task_upstream("mock", Arc::clone(&state), 2);
+        let peer = upstream.client.peer().clone();
+        sm.replace_server("mock", upstream).await;
+
+        // The service runtime is parked, so nothing drains rmcp's private
+        // peer channel. Fill its documented 1,024 slots with requests whose
+        // handles are intentionally dropped; the next send must backpressure.
+        for index in 0..1024 {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                peer.send_cancellable_request(
+                    ClientRequest::PingRequest(PingRequest::default()),
+                    PeerRequestOptions::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("peer queue filled before slot {index}"))
+            .expect("queue ping request");
+        }
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "Mock__echo".to_string(),
+            ("mock".to_string(), "echo".to_string()),
+        );
+        router.replace_snapshot(RouterSnapshot {
+            routes,
+            tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        });
+
+        let owner = ToolRouter::task_owner_for_http_session("session-full-peer-queue");
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None),
+        )
+        .await
+        .expect("request-handle acquisition must respect the configured timeout");
+
+        let error = result.expect_err("a full peer queue must time out task creation");
+        assert!(error.message.to_lowercase().contains("timeout"));
+        assert_eq!(router.task_count_for_owner(&owner).await, 0);
     }
 
     /// Installs a snapshot exposing exactly one routed tool, so enqueue

@@ -1714,6 +1714,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http::Request as HttpRequest;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -1804,6 +1805,125 @@ mod tests {
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         })
+    }
+
+    /// Session-store wrapper that parks the owner-liveness validation (the
+    /// second validation in a task-wrapped POST) until a concurrent DELETE
+    /// has removed the session. It delegates every other operation to the
+    /// production store, so the regression drives the real HTTP handlers.
+    struct GateSecondValidateSessionStore {
+        inner: crate::session::StatefulSessionStore,
+        validate_calls: AtomicUsize,
+        second_validate_notify: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        release_cv: std::sync::Condvar,
+    }
+
+    impl GateSecondValidateSessionStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: crate::session::StatefulSessionStore::new(1800, 100),
+                validate_calls: AtomicUsize::new(0),
+                second_validate_notify: tokio::sync::Notify::new(),
+                released: std::sync::Mutex::new(false),
+                release_cv: std::sync::Condvar::new(),
+            })
+        }
+
+        fn release_second_validate(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release_cv.notify_all();
+        }
+    }
+
+    struct SecondValidateReleaseGuard(Arc<GateSecondValidateSessionStore>);
+
+    impl Drop for SecondValidateReleaseGuard {
+        fn drop(&mut self) {
+            self.0.release_second_validate();
+        }
+    }
+
+    impl SessionStore for GateSecondValidateSessionStore {
+        fn create_session(&self) -> Result<String, HttpError> {
+            self.inner.create_session()
+        }
+
+        fn validate(&self, session_id: &str) -> Result<(), HttpError> {
+            if self.validate_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.second_validate_notify.notify_one();
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    released = self.release_cv.wait(released).unwrap();
+                }
+            }
+            self.inner.validate(session_id)
+        }
+
+        fn touch(&self, session_id: &str) -> Result<(), HttpError> {
+            self.inner.touch(session_id)
+        }
+
+        fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
+            self.inner.has_live_sse_sender(session_id)
+        }
+
+        fn set_sse_sender(
+            &self,
+            session_id: &str,
+            sender: mpsc::Sender<crate::session::SseEvent>,
+            last_event_id: Option<u64>,
+        ) -> Result<(), HttpError> {
+            self.inner.set_sse_sender(session_id, sender, last_event_id)
+        }
+
+        fn set_client_type(
+            &self,
+            session_id: &str,
+            client_type: crate::types::ClientType,
+        ) -> Result<(), HttpError> {
+            self.inner.set_client_type(session_id, client_type)
+        }
+
+        fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
+            self.inner.get_client_type(session_id)
+        }
+
+        fn remove(&self, session_id: &str) -> bool {
+            self.inner.remove(session_id)
+        }
+
+        fn broadcast(&self, message: SseMessage) {
+            self.inner.broadcast(message);
+        }
+
+        fn send_to_session(&self, session_id: &str, message: SseMessage) {
+            self.inner.send_to_session(session_id, message);
+        }
+
+        fn send_to_live_session(
+            &self,
+            session_id: &str,
+            message: SseMessage,
+        ) -> SessionSendOutcome {
+            self.inner.send_to_live_session(session_id, message)
+        }
+
+        fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
+            self.inner.remove_replay_events_by_key(session_id, key);
+        }
+
+        fn spawn_cleanup_task(&self, cancel: CancellationToken) {
+            self.inner.spawn_cleanup_task(cancel);
+        }
+
+        fn session_count(&self) -> usize {
+            self.inner.session_count()
+        }
+
+        fn session_snapshots(&self) -> Vec<crate::session::DownstreamSessionSnapshot> {
+            self.inner.session_snapshots()
+        }
     }
 
     #[tokio::test]
@@ -2016,6 +2136,114 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// End-to-end transport regression for the create-vs-teardown boundary:
+    /// the POST passes its initial session validation, registers the task
+    /// owner guard, then DELETE removes that same session before the enqueue
+    /// path's liveness re-check. The real handler must refuse the create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_wrapped_post_racing_delete_refuses_late_create() {
+        let sessions = GateSecondValidateSessionStore::new();
+        let session_id = sessions.create_session().unwrap();
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(
+            sm,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        let state = Arc::new(HttpState {
+            router: Arc::clone(&router),
+            sessions: Arc::clone(&sessions) as Arc<dyn SessionStore>,
+            cancel: CancellationToken::new(),
+            auth_mode: crate::config::DownstreamAuthMode::Auto,
+            downstream_oauth: None,
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let post_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "missing__tool",
+                "arguments": {},
+                "task": {}
+            }
+        });
+        let post_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .body(Body::from(serde_json::to_vec(&post_body).unwrap()))
+            .unwrap();
+        let post_app = app.clone();
+        let post = tokio::spawn(async move { post_app.oneshot(post_request).await.unwrap() });
+
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            sessions.second_validate_notify.notified(),
+        )
+        .await
+        .is_err()
+        {
+            let validate_calls = sessions.validate_calls.load(Ordering::SeqCst);
+            sessions.release_second_validate();
+            let response = post.await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            panic!(
+                "task POST never reached its post-guard owner-liveness validation; validate_calls={validate_calls}, status={status}, body={}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let release_guard = SecondValidateReleaseGuard(Arc::clone(&sessions));
+
+        let delete_request = HttpRequest::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .body(Body::empty())
+            .unwrap();
+        let delete_response = app.oneshot(delete_request).await.unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        sessions.release_second_validate();
+        drop(release_guard);
+        let post_response = post.await.unwrap();
+        assert_eq!(post_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(post_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], ErrorCode::INVALID_REQUEST.0);
+        assert_eq!(
+            value["error"]["message"],
+            "session closed during task creation"
+        );
+        let owner = ToolRouter::task_owner_for_http_session(&session_id);
+        assert_eq!(router.task_count_for_owner(&owner).await, 0);
     }
 
     #[tokio::test]

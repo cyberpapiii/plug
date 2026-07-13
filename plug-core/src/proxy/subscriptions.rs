@@ -103,7 +103,13 @@ struct Entry {
 
 enum EntryState {
     /// An upstream `subscribe` transition is in flight for this generation.
-    Pending(watch::Receiver<TransitionSignal>),
+    /// The intended owner is part of the state so equivalent concurrent
+    /// rebinds can share one authoritative transition result instead of
+    /// superseding each other and laundering the first waiter's failure.
+    Pending {
+        rx: watch::Receiver<TransitionSignal>,
+        intended_owner_server_id: String,
+    },
     /// The upstream is confirmed subscribed for the current generation.
     Active,
     /// An upstream `unsubscribe` transition is in flight for this
@@ -337,6 +343,38 @@ impl SubscriptionRegistry {
             .unwrap_or(false)
     }
 
+    /// Whether `target` is backed by a confirmed subscription on the
+    /// currently published owner. Membership in a `Pending` generation is
+    /// not success: that transition may still fail and remove the entry.
+    pub(super) fn member_active_on_owner(
+        &self,
+        uri: &str,
+        target: &NotificationTarget,
+        owner_server_id: &str,
+    ) -> bool {
+        self.entries
+            .get(uri)
+            .map(|entry| {
+                entry.members.contains(target)
+                    && matches!(entry.state, EntryState::Active)
+                    && entry.owner_server_id.as_deref() == Some(owner_server_id)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether `target` has any confirmed Active subscription. Used only
+    /// for the established routeless grace window: a subscriber that races
+    /// a route prune remains usable on its recorded owner until its own
+    /// unsubscribe or the next refresh drains it.
+    pub(super) fn member_is_active(&self, uri: &str, target: &NotificationTarget) -> bool {
+        self.entries
+            .get(uri)
+            .map(|entry| {
+                entry.members.contains(target) && matches!(entry.state, EntryState::Active)
+            })
+            .unwrap_or(false)
+    }
+
     fn transition_lock(&self, uri: &str) -> Arc<Mutex<()>> {
         self.transition_locks
             .entry(uri.to_string())
@@ -407,7 +445,10 @@ impl SubscriptionRegistry {
                 v.insert(Entry {
                     generation,
                     members,
-                    state: EntryState::Pending(rx.clone()),
+                    state: EntryState::Pending {
+                        rx: rx.clone(),
+                        intended_owner_server_id: owner_server_id.to_string(),
+                    },
                     owner_server_id: None,
                 });
                 Action::Start { generation, tx, rx }
@@ -425,7 +466,7 @@ impl SubscriptionRegistry {
                 }
                 let current = match &entry.state {
                     EntryState::Active => Current::Active,
-                    EntryState::Pending(rx) => Current::Pending(rx.clone()),
+                    EntryState::Pending { rx, .. } => Current::Pending(rx.clone()),
                     EntryState::Draining => Current::Draining,
                 };
                 match current {
@@ -446,7 +487,10 @@ impl SubscriptionRegistry {
                         *entry = Entry {
                             generation,
                             members,
-                            state: EntryState::Pending(rx.clone()),
+                            state: EntryState::Pending {
+                                rx: rx.clone(),
+                                intended_owner_server_id: owner_server_id.to_string(),
+                            },
                             owner_server_id: None,
                         };
                         Action::Start { generation, tx, rx }
@@ -514,7 +558,7 @@ impl SubscriptionRegistry {
                         && entry.generation == generation
                     {
                         entry.owner_server_id = Some(owner_server_id.clone());
-                        if matches!(entry.state, EntryState::Pending(_)) {
+                        if matches!(entry.state, EntryState::Pending { .. }) {
                             entry.state = EntryState::Active;
                         }
                         owner_recorded = true;
@@ -572,7 +616,7 @@ impl SubscriptionRegistry {
                 // Active and the upstream subscription would leak forever.
                 // Never a Draining entry: that drain is already running.
                 let now_empty = entry.members.is_empty()
-                    && matches!(entry.state, EntryState::Active | EntryState::Pending(_));
+                    && matches!(entry.state, EntryState::Active | EntryState::Pending { .. });
                 if now_empty {
                     let generation = entry.generation;
                     let (tx, _rx) = watch::channel(None);
@@ -616,7 +660,7 @@ impl SubscriptionRegistry {
             // racing the subscribe window can't leak the upstream
             // subscription); never a Draining one.
             let now_empty = entry.members.is_empty()
-                && matches!(entry.state, EntryState::Active | EntryState::Pending(_));
+                && matches!(entry.state, EntryState::Active | EntryState::Pending { .. });
             if now_empty {
                 let generation = entry.generation;
                 let (tx, _rx) = watch::channel(None);
@@ -842,10 +886,11 @@ impl SubscriptionRegistry {
     /// Awaits completion so `refresh_tools`'s own await reflects final
     /// state, matching historical synchronous-return semantics, and
     /// returns the transition's outcome: `Err` when the migration failed
-    /// and pruned the entry's local subscribers. A rebind superseded by a
-    /// newer transition still reports `Ok` (its watch does) — callers that
-    /// need a laundering-proof answer must consult the registry's final
-    /// state (see `subscribe_resource`'s final verify).
+    /// and pruned the entry's local subscribers. Equivalent concurrent
+    /// rebinds to the same destination piggyback on one generation and
+    /// therefore receive the same authoritative outcome. A genuinely newer
+    /// transition to a different destination may still supersede this one;
+    /// downstream callers additionally verify the registry's final state.
     pub(super) async fn rebind(
         self: &Arc<Self>,
         uri: &str,
@@ -855,6 +900,7 @@ impl SubscriptionRegistry {
         new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
     ) -> Result<(), McpError> {
         enum Decision {
+            Piggyback(watch::Receiver<TransitionSignal>),
             Migrate {
                 generation: u64,
                 tx: watch::Sender<TransitionSignal>,
@@ -873,20 +919,39 @@ impl SubscriptionRegistry {
                 return Ok(());
             }
             Some(mut entry) => {
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let (tx, rx) = watch::channel(None);
-                entry.generation = generation;
-                if entry.members.is_empty() {
-                    entry.state = EntryState::Draining;
-                    Decision::DrainEmpty { generation, tx, rx }
+                let equivalent_pending = if !entry.members.is_empty()
+                    && let EntryState::Pending {
+                        rx,
+                        intended_owner_server_id,
+                    } = &entry.state
+                    && intended_owner_server_id == new_server_id
+                {
+                    Some(rx.clone())
                 } else {
-                    entry.state = EntryState::Pending(rx.clone());
-                    Decision::Migrate { generation, tx, rx }
+                    None
+                };
+                if let Some(rx) = equivalent_pending {
+                    Decision::Piggyback(rx)
+                } else {
+                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                    let (tx, rx) = watch::channel(None);
+                    entry.generation = generation;
+                    if entry.members.is_empty() {
+                        entry.state = EntryState::Draining;
+                        Decision::DrainEmpty { generation, tx, rx }
+                    } else {
+                        entry.state = EntryState::Pending {
+                            rx: rx.clone(),
+                            intended_owner_server_id: new_server_id.to_string(),
+                        };
+                        Decision::Migrate { generation, tx, rx }
+                    }
                 }
             }
         };
 
         match decision {
+            Decision::Piggyback(rx) => Self::await_transition(rx).await,
             Decision::DrainEmpty { generation, tx, rx } => {
                 self.spawn_drain_transition(
                     uri.to_string(),
@@ -1017,7 +1082,7 @@ impl SubscriptionRegistry {
                 && entry.generation == generation
             {
                 entry.owner_server_id = Some(new_server_id.clone());
-                if matches!(entry.state, EntryState::Pending(_)) {
+                if matches!(entry.state, EntryState::Pending { .. }) {
                     entry.state = EntryState::Active;
                 }
             }
@@ -1128,16 +1193,24 @@ impl super::ToolRouter {
             _ => None,
         };
 
-        // Final verify: the subscribe outcome observed above may have come
-        // from a transition that was superseded (its watch reports Ok even
-        // though the surviving transition did the actual work — and may
-        // have failed and removed the entry), and the heal above prunes the
-        // entry itself when the migration fails. Answer from the registry's
-        // current state instead of trusting the watch result.
-        if self.resource_subscriptions.tracks_member(uri, &target) {
+        // Final verify: membership alone is not success. A superseding
+        // transition can preserve the member in a fresh Pending generation
+        // and fail after this caller returns. Only a confirmed Active entry
+        // on the currently published owner may acknowledge the subscribe,
+        // except for the established routeless grace case (route vanished
+        // mid-subscribe), which still requires a confirmed Active entry.
+        let tracks_member = self.resource_subscriptions.tracks_member(uri, &target);
+        let confirmed = match published_route.as_deref() {
+            Some(route) => self
+                .resource_subscriptions
+                .member_active_on_owner(uri, &target, route),
+            None => self.resource_subscriptions.member_is_active(uri, &target),
+        };
+        if confirmed {
             return Ok(());
         }
-        if heal_outcome.is_some_and(|outcome| outcome.is_err())
+        if tracks_member
+            || heal_outcome.is_some_and(|outcome| outcome.is_err())
             || !self.resource_subscriptions.has_entry(uri)
         {
             return Err(McpError::internal_error(
@@ -1902,6 +1975,78 @@ mod tests {
         rebind_task.await.unwrap();
         assert!(c.await.unwrap().is_ok());
         assert_eq!(registry.len(), 1);
+    }
+
+    /// Equivalent rebinds queued behind the URI transition lock must share
+    /// one authoritative outcome. Generation-bumping the second used to
+    /// supersede the first, whose waiter returned `Ok` before the winning
+    /// migration failed and removed the entry.
+    #[tokio::test]
+    async fn equivalent_concurrent_rebinds_share_authoritative_failure() {
+        let registry = SubscriptionRegistry::new();
+        let old_mock = MockUpstream::new();
+        let new_mock = MockUpstream::new();
+        new_mock.set_subscribe_result(Err(some_error()));
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "old-server",
+                Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+
+        // Park all transition tasks, then poll each rebind future once. Each
+        // poll completes the synchronous classification before waiting on
+        // its transition result. Equivalent migrations must share that
+        // authoritative result rather than generation-bumping each other.
+        let transition_lock = registry.transition_lock("file:///x");
+        let guard = transition_lock.lock().await;
+        let first_old = Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>;
+        let first_new = Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>;
+        let first = registry.rebind(
+            "file:///x",
+            "old-server",
+            Some(first_old),
+            "new-server",
+            Ok(first_new),
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            biased;
+            result = &mut first => panic!("parked first rebind resolved early: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        let second_old = Arc::clone(&old_mock) as Arc<dyn UpstreamResourceOps>;
+        let second_new = Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>;
+        let second = registry.rebind(
+            "file:///x",
+            "old-server",
+            Some(second_old),
+            "new-server",
+            Ok(second_new),
+        );
+        tokio::pin!(second);
+        tokio::select! {
+            biased;
+            result = &mut second => panic!("parked second rebind resolved early: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        drop(guard);
+
+        let first_result = first.await;
+        let second_result = second.await;
+        assert!(
+            first_result.is_err(),
+            "the superseded waiter must receive the winning migration's failure"
+        );
+        assert!(second_result.is_err());
+        assert_eq!(new_mock.subscribe_call_count(), 1);
+        assert!(registry.is_empty());
     }
 
     #[tokio::test]
