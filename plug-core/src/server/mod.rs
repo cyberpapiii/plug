@@ -1111,8 +1111,8 @@ impl ServerManager {
                     let mut transport_config =
                         StreamableHttpClientTransportConfig::with_uri(url);
 
-                    // Resolve auth header: OAuth token from cache, or static bearer token
-                    let auth_header = if config.auth.as_deref() == Some("oauth") {
+                    // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
+                    let auth_token = if config.auth.as_deref() == Some("oauth") {
                         match crate::oauth::current_or_stored_access_token(name).await {
                             Some(token) => Some(token),
                             None => {
@@ -1124,11 +1124,11 @@ impl ServerManager {
                             }
                         }
                     } else {
-                        config.auth_token.as_ref().map(|t| format!("Bearer {}", t.as_str()))
+                        config.auth_token.as_ref().map(|t| t.as_str().to_string())
                     };
 
-                    if let Some(header) = auth_header {
-                        transport_config = transport_config.auth_header(header);
+                    if let Some(token) = auth_token {
+                        transport_config = transport_config.auth_header(token);
                     }
 
                     tracing::info!(
@@ -1937,6 +1937,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::sse::{Event, Sse};
+    use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use axum::{Json, Router};
 
@@ -2132,6 +2133,91 @@ mod tests {
             tool_groups: Vec::new(),
             sandbox: None,
         }
+    }
+
+    #[derive(Clone)]
+    struct StreamableHttpAuthTestState {
+        authorization_headers: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn streamable_http_auth_handler(
+        State(state): State<StreamableHttpAuthTestState>,
+        headers: HeaderMap,
+        Json(message): Json<serde_json::Value>,
+    ) -> Response {
+        let authorization = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        state
+            .authorization_headers
+            .lock()
+            .expect("authorization header lock")
+            .push(authorization.clone());
+
+        if authorization != "Bearer static-token" {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        match message.get("method").and_then(serde_json::Value::as_str) {
+            Some("initialize") => Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "auth-test", "version": "1.0.0" }
+                }
+            }))
+            .into_response(),
+            Some("tools/list") => Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": { "tools": [] }
+            }))
+            .into_response(),
+            Some("notifications/initialized") => StatusCode::ACCEPTED.into_response(),
+            _ => StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn streamable_http_static_bearer_token_has_one_prefix() {
+        let authorization_headers = Arc::new(Mutex::new(Vec::new()));
+        let state = StreamableHttpAuthTestState {
+            authorization_headers: Arc::clone(&authorization_headers),
+        };
+        let app = Router::new()
+            .route("/mcp", post(streamable_http_auth_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streamable HTTP auth test server");
+        let addr = listener.local_addr().expect("streamable HTTP auth address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve streamable HTTP auth test server");
+        });
+
+        let mut config = test_server_config();
+        config.transport = TransportType::Http;
+        config.command = None;
+        config.url = Some(format!("http://{addr}/mcp"));
+        config.auth_token = Some(crate::types::SecretString::from("static-token".to_string()));
+
+        let result = ServerManager::new()
+            .start_server("auth-test", &config)
+            .await;
+        let headers = authorization_headers
+            .lock()
+            .expect("authorization header lock");
+        assert_eq!(
+            headers.first().map(String::as_str),
+            Some("Bearer static-token")
+        );
+        result.expect("streamable HTTP upstream should accept static bearer token");
     }
 
     #[cfg(target_os = "macos")]
