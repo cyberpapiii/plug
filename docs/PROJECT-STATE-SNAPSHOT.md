@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after the 2026-07-13 RMCP 2.2 stable migration.
+Baseline: `main` after the 2026-07-13 RMCP 2.2 migration and stable dependency refresh.
 
 This is the canonical current-state doc for the project.
 
@@ -116,6 +116,13 @@ notification behavior. The negotiated MCP wire revision remains `2025-11-25`;
 stdio and daemon-IPC clients requesting the announced-but-unimplemented
 `2026-07-28` revision are rejected. See
 [`RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md`](RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md).
+
+The same release refreshed all direct Rust dependencies to their latest
+compatible stable versions. Keyring 4.1.4 preserves the existing macOS and
+Linux credential identities; TOML 1.1.2 keeps whole-document client/import
+parsing through explicit regressions; Tower HTTP 0.7.0 now enforces Plug's
+intended 4 MiB request ceiling; and local macOS reinstalls publish only a
+fully signed and verified binary through an atomic replacement.
 
 On 2026-07-12, `main` absorbed the 24-plan improve program plus four rounds of
 counter-review repairs. The user-visible result is stronger reconnect and SSE

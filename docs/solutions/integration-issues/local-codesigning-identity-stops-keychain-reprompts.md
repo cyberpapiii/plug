@@ -109,14 +109,20 @@ security add-trusted-cert -r trustRoot -p codeSign cert.pem
 security find-identity -v -p codesigning
 ```
 
-Then sign on every install (now wired into `scripts/dev-reinstall.sh`):
+Then use the staged installer for every local rebuild:
 
 ```sh
-cargo install --path plug --force
-codesign --force -s "Plug Local Signing" ~/.cargo/bin/plug
+./scripts/dev-reinstall.sh --quick
+codesign --verify --deep --strict ~/.cargo/bin/plug
 codesign -dv --verbose=2 ~/.cargo/bin/plug 2>&1 | grep Authority
 # → Authority=Plug Local Signing   (no longer Signature=adhoc)
 ```
+
+The script installs into a private same-filesystem staging directory, signs and
+verifies the candidate, smoke-tests it, and only then atomically renames it over
+the live binary. Do not replace the live binary first and sign it afterward:
+an auto-respawning client could execute that unsigned intermediate build and
+reopen the Keychain authorization flood.
 
 After the first signed restart, macOS prompts **once more** per OAuth upstream
 (the identity just changed from ad-hoc to the stable cert). Click **Always

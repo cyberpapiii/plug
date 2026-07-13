@@ -27,9 +27,39 @@ on-disk token mirror.
   the recovery source when the mirror is missing and is still checked by
   explicit credential diagnostics.
 
-No credentials or server configuration need to be recreated. The complete
-868-test workspace suite was run while hashing the production token directory
-before and after; its file count and content manifest remained unchanged.
+No credentials or server configuration need to be recreated. The 868-test
+keychain-hotfix suite was run while hashing the production token directory
+before and after; its file count and content manifest remained unchanged. The
+four dependency-refresh regressions bring the final release suite to 872 tests.
+
+Local reinstalls are safer too. The installer now builds into a private staging
+directory, signs the candidate with the stable `Plug Local Signing` identity,
+strictly verifies that signature, smoke-tests the binary, and only then swaps it
+into place atomically. A running client can therefore see either the previous
+signed build or the new signed build, never an unsigned in-between build.
+
+## Dependency refresh
+
+The rest of Plug's direct Rust dependencies were brought to their latest
+compatible stable releases. The most important upgrades are Keyring 4.1.4,
+Rand 0.10.2, TOML 1.1.2, and Tower HTTP 0.7.0; the refreshed lockfile updates
+141 packages in total. No Plug configuration changes are required.
+
+- macOS credentials retain the same login-Keychain service (`plug`) and account
+  names, so the Keyring upgrade does not move or recreate saved OAuth tokens.
+- Linux keeps the previous kernel-keyring naming scheme, so existing saved
+  credentials remain discoverable there as well.
+- Client discovery, config import, and `plug doctor` continue to parse complete
+  TOML documents correctly under TOML 1.x.
+- The HTTP request ceiling is now truly 4 MiB for both declared-length and
+  streamed requests. Previously Axum's implicit 2 MiB limit could reject an
+  otherwise valid request before Plug's configured limit was reached.
+- The secure token generator and health-check jitter now use Rand 0.10's current
+  APIs without weakening operating-system entropy or changing behavior.
+
+All direct dependencies are current. Two older transitive crates remain because
+their upstream dependents require those exact major versions; they are not
+separately selectable by Plug and have no known advisory in the release gate.
 
 ## What improves
 
@@ -69,6 +99,8 @@ older 0.2.2 API.
 The migration adds direct regression coverage for RMCP 2.2 resource-link JSON
 and cancellation without a request id. Existing protocol-version, Tasks,
 elicitation, sampling, and daemon IPC suites continue to exercise MCP
-`2025-11-25` behavior. The release gate covers the complete workspace tests,
-Clippy with warnings denied, formatting, Rust 1.88 compilation, RustSec
-advisories, todo-status consistency, and clean diffs.
+`2025-11-25` behavior. Additional regressions cover TOML 1.x document parsing,
+Linux keyring compatibility, and the exact/streamed HTTP body limits. The
+release gate covers all 872 workspace tests, Clippy with warnings denied,
+formatting, Rust 1.88 compilation, RustSec advisories, dependency licensing and
+sources, todo-status consistency, and clean diffs.

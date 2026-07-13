@@ -25,6 +25,7 @@ Detailed notes: [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-
 - Source builds now require Rust 1.88.
 - Upgraded the Rust MCP SDK from RMCP 1.7.0 to exactly RMCP 2.2.0 while preserving MCP `2025-11-25` negotiation and the existing transport/method surface.
 - Migrated to RMCP's spec-aligned content, resource, prompt, task, elicitation, and cancellation APIs.
+- Refreshed every direct Rust dependency to its latest compatible stable release, including Keyring 4.1.4, Rand 0.10.2, TOML 1.1.2, and Tower HTTP 0.7.0.
 
 ### Fixed
 
@@ -39,6 +40,9 @@ Detailed notes: [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-
 - Cancellation notifications without `requestId` are accepted and ignored safely instead of being mapped onto an unrelated active call.
 - Downstream stdio and daemon-IPC initialization reject RMCP's announced-but-unimplemented MCP `2026-07-28` revision instead of accidentally negotiating it.
 - Pinned `sse-stream` 0.2.4 to match the API required by RMCP 2.2.0 and keep fresh locked builds reproducible.
+- Preserved complete TOML document parsing after the TOML 1.x upgrade for client discovery, imports, and doctor checks.
+- Made Plug's documented 4 MiB HTTP request limit authoritative instead of Axum's hidden 2 MiB default.
+- Local macOS reinstalls now sign and verify a staged binary before atomically replacing the live executable, eliminating the unsigned execution window that could retrigger Keychain prompts.
 
 ### Security
 
