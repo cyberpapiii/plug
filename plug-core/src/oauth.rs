@@ -5,7 +5,7 @@
 //! `CredentialStore` and `StateStore` traits respectively.
 
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -47,11 +47,57 @@ const SHORT_LIVED_THRESHOLD: u64 = 600;
 static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
     LazyLock::new(DashMap::new);
 
+/// Process-local credential backend used by tests.
+///
+/// OAuth tests must never touch the operator's login Keychain or production
+/// token directory. Integration-test binaries opt in explicitly; this crate's
+/// unit tests install it lazily on first credential access.
+struct TestCredentialEnvironment {
+    tokens_dir: PathBuf,
+    keyring: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+static TEST_CREDENTIAL_ENVIRONMENT: OnceLock<TestCredentialEnvironment> = OnceLock::new();
+
+/// Isolate OAuth credentials for the current test process.
+///
+/// This is public only so workspace integration-test binaries can install the
+/// isolated backend before exercising production credential-store code.
+#[doc(hidden)]
+pub fn install_test_credential_environment(tokens_dir: PathBuf) {
+    let environment = TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
+        tokens_dir: tokens_dir.clone(),
+        keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    assert_eq!(
+        environment.tokens_dir, tokens_dir,
+        "test credential environment was already installed with a different token directory"
+    );
+}
+
+#[cfg(test)]
+fn ensure_unit_test_credential_environment() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        install_test_credential_environment(
+            std::env::temp_dir().join(format!("plug-oauth-unit-tests-{}", std::process::id())),
+        );
+    });
+}
+
+fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
+    #[cfg(test)]
+    ensure_unit_test_credential_environment();
+    TEST_CREDENTIAL_ENVIRONMENT.get()
+}
+
 /// Get or create a per-server [`CompositeCredentialStore`].
 ///
 /// Callers may share the returned `Arc` freely; stores are lazily
 /// created and live for the process lifetime.
 pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
+    #[cfg(test)]
+    ensure_unit_test_credential_environment();
     STORES
         .entry(server_name.to_string())
         .or_insert_with(|| Arc::new(CompositeCredentialStore::new(server_name.to_string())))
@@ -64,6 +110,9 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
 
 /// Return the `~/.config/plug/tokens/` directory path.
 pub fn tokens_dir() -> PathBuf {
+    if let Some(environment) = test_credential_environment() {
+        return environment.tokens_dir.clone();
+    }
     config::config_dir().join("tokens")
 }
 
@@ -279,6 +328,22 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_load(&self) -> Option<StoredCredentials> {
+        if let Some(environment) = test_credential_environment() {
+            let json = environment
+                .keyring
+                .lock()
+                .expect("test keyring mutex poisoned")
+                .get(&self.server_name)
+                .cloned()?;
+            return match serde_json::from_str::<StoredCredentials>(&json) {
+                Ok(creds) => Some(creds),
+                Err(error) => {
+                    warn!(server = %self.server_name, %error, "test keyring: invalid JSON");
+                    None
+                }
+            };
+        }
+
         let entry = self.keyring_entry()?;
         match entry.get_password() {
             Ok(json) => match serde_json::from_str::<StoredCredentials>(&json) {
@@ -297,6 +362,22 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_save(&self, creds: &StoredCredentials) -> bool {
+        if let Some(environment) = test_credential_environment() {
+            let json = match serde_json::to_string(creds) {
+                Ok(json) => json,
+                Err(error) => {
+                    warn!(server = %self.server_name, %error, "test keyring: serialization failed");
+                    return false;
+                }
+            };
+            environment
+                .keyring
+                .lock()
+                .expect("test keyring mutex poisoned")
+                .insert(self.server_name.clone(), json);
+            return true;
+        }
+
         let entry = match self.keyring_entry() {
             Some(e) => e,
             None => return false,
@@ -321,6 +402,15 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_clear(&self) {
+        if let Some(environment) = test_credential_environment() {
+            environment
+                .keyring
+                .lock()
+                .expect("test keyring mutex poisoned")
+                .remove(&self.server_name);
+            return;
+        }
+
         if let Some(entry) = self.keyring_entry() {
             match entry.delete_credential() {
                 Ok(()) => debug!(server = %self.server_name, "keyring: credential deleted"),
@@ -807,7 +897,14 @@ impl CompositeCredentialStore {
     }
 
     pub fn credential_debug_snapshot(&self) -> CredentialDebugSnapshot {
-        let snapshot = self.credential_snapshot_inner();
+        Self::debug_snapshot(self.credential_snapshot_inner())
+    }
+
+    fn fallback_auth_debug_snapshot(&self) -> CredentialDebugSnapshot {
+        Self::debug_snapshot(self.fallback_auth_snapshot_inner())
+    }
+
+    fn debug_snapshot(snapshot: CredentialSnapshot) -> CredentialDebugSnapshot {
         let (token_received_at, client_id, has_refresh_token) = snapshot
             .credentials
             .as_ref()
@@ -842,36 +939,43 @@ impl CompositeCredentialStore {
     /// fresher persisted credentials written by another process without
     /// requiring a full restart to clear cache state.
     async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
-        self.credential_snapshot_inner().credentials
+        self.fallback_auth_snapshot_inner().credentials
     }
 }
 
 #[async_trait]
 impl CredentialStore for CompositeCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        Ok(self.credential_snapshot_inner().credentials)
+        // The normal runtime hot path must not wake the OS credential UI when
+        // a protected token mirror is already available. Explicit diagnostics
+        // still use `credential_snapshot_inner` to compare both backends.
+        let snapshot = self.fallback_auth_snapshot_inner();
+        if snapshot.source == Some("keyring")
+            && let Some(credentials) = snapshot.credentials.as_ref()
+            && let Err(error) = self.file_save(credentials)
+        {
+            warn!(
+                server = %self.server_name,
+                %error,
+                "token file mirror repair failed after keyring-backed load"
+            );
+        }
+        Ok(snapshot.credentials)
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        // Try keyring first.
-        let keyring_ok = self.keyring_save(&credentials);
+        // Normal loads treat the protected file mirror as authoritative so
+        // writing it is part of the save contract. Persist it before touching
+        // Keychain to avoid acknowledging a newer Keychain-only credential
+        // that a cold restart would mask with an older file.
+        self.file_save(&credentials)?;
 
-        // Always try file as well (independent of keyring result).
-        let file_result = self.file_save(&credentials);
+        // Keychain remains the recovery backend. A failure here does not make
+        // the credential unusable because the authoritative mirror is durable.
+        let _keyring_ok = self.keyring_save(&credentials);
 
-        // Update in-memory cache regardless of backing-store outcome.
+        // Publish to the in-memory cache only after durable mirror success.
         self.update_cache(&credentials);
-
-        // If both backends failed, propagate the file error.
-        if !keyring_ok {
-            file_result?;
-        } else if let Err(error) = file_result {
-            warn!(
-                server = %self.server_name,
-                error = %error,
-                "token file mirror save failed after keyring save; continuing with keyring-backed credentials"
-            );
-        }
 
         Ok(())
     }
@@ -1103,7 +1207,7 @@ pub async fn refresh_access_token(
         Ok(None) => return RefreshResult::NoCredentials,
         Err(e) => return RefreshResult::TransientError(format!("failed to load credentials: {e}")),
     };
-    let load_snapshot = store.credential_debug_snapshot();
+    let load_snapshot = store.fallback_auth_debug_snapshot();
     debug!(
         server = %server_name,
         credential_source = ?load_snapshot.source,
@@ -1193,7 +1297,7 @@ pub async fn refresh_access_token(
                 }
             };
             store.hydrate_credentials(&refreshed);
-            let refreshed_snapshot = refresh_store.credential_debug_snapshot();
+            let refreshed_snapshot = refresh_store.fallback_auth_debug_snapshot();
             debug!(
                 server = %server_name,
                 credential_source = ?refreshed_snapshot.source,
@@ -1688,35 +1792,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_prefers_file_mirror_before_keyring_probe() {
+    async fn startup_token_lookup_prefers_file_mirror_before_keyring_probe() {
         let name = format!("oauth-file-first-{}", std::process::id());
         let store = get_or_create_store(&name);
         store.clear().await.unwrap();
 
-        let mut stale_keyring =
+        let mut fresher_keyring =
             make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
-        stale_keyring.token_received_at = Some(100);
-        assert!(store.keyring_save(&stale_keyring));
+        fresher_keyring.token_received_at = Some(200);
+        assert!(store.keyring_save(&fresher_keyring));
 
-        let mut fresh_file = make_test_token("file-access", Some("file-refresh"), Some(3600));
-        fresh_file.token_received_at = Some(200);
-        store.file_save(&fresh_file).unwrap();
+        let mut mirrored_file = make_test_token("file-access", Some("file-refresh"), Some(3600));
+        mirrored_file.token_received_at = Some(100);
+        store.file_save(&mirrored_file).unwrap();
         store.clear_cache();
 
-        let loaded = store
-            .load()
-            .await
-            .unwrap()
-            .expect("expected credentials from file mirror");
-        use oauth2::TokenResponse;
-        let token = loaded
-            .token_response
-            .as_ref()
-            .map(|tr| tr.access_token().secret().to_string());
+        let debug_snapshot = store.fallback_auth_debug_snapshot();
+        assert_eq!(debug_snapshot.source, Some("file"));
+        store.clear_cache();
+
+        let token = current_or_stored_access_token(&name).await;
         assert_eq!(token.as_deref(), Some("file-access"));
         assert_eq!(current_access_token(&name).as_deref(), Some("file-access"));
 
         store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_fails_before_keyring_when_authoritative_file_mirror_cannot_persist() {
+        let name = format!("oauth-file-save-failure-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let token_path = store.token_file_path().expect("token file path");
+        std::fs::create_dir_all(&token_path).expect("replace token file with a directory");
+        let credentials = make_test_token("new-access", Some("new-refresh"), Some(3600));
+
+        let error = store
+            .save(credentials)
+            .await
+            .expect_err("an unavailable authoritative mirror must fail the save");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to rename temp token file")
+        );
+        assert!(
+            store.keyring_load().is_none(),
+            "failed mirror persistence must not publish a newer Keychain-only credential"
+        );
+        assert!(
+            store.cached_credentials().is_none(),
+            "failed mirror persistence must not publish credentials to cache"
+        );
+
+        std::fs::remove_dir_all(token_path).expect("remove token-path test directory");
     }
 
     #[test]
@@ -1734,6 +1864,22 @@ mod tests {
 
         assert_eq!(chosen.0.token_received_at, Some(200));
         assert_eq!(chosen.1, CredentialSource::Keyring);
+    }
+
+    #[test]
+    fn unit_tests_do_not_use_the_real_plug_token_directory() {
+        let production = config::config_dir().join("tokens");
+        let actual = tokens_dir();
+
+        assert_ne!(
+            actual, production,
+            "tests must not write production OAuth files"
+        );
+        assert!(
+            actual.starts_with(std::env::temp_dir()),
+            "test OAuth files must stay under the system temp directory: {}",
+            actual.display()
+        );
     }
 
     #[test]

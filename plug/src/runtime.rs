@@ -661,21 +661,70 @@ pub(crate) fn auto_start_daemon(
 }
 
 pub(crate) async fn wait_for_daemon_ready(
+    child: Option<&mut std::process::Child>,
+) -> anyhow::Result<tokio::net::UnixStream> {
+    wait_for_daemon_ready_with_timeouts(
+        child,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(300),
+    )
+    .await
+}
+
+#[derive(Debug)]
+struct DaemonStartupContention;
+
+impl std::fmt::Display for DaemonStartupContention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("another Plug daemon still owns startup but is not ready")
+    }
+}
+
+impl std::error::Error for DaemonStartupContention {}
+
+fn allows_standalone_fallback(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DaemonStartupContention>().is_none()
+}
+
+async fn wait_for_daemon_ready_with_timeouts(
     mut child: Option<&mut std::process::Child>,
+    initial_timeout: std::time::Duration,
+    contention_timeout: std::time::Duration,
 ) -> anyhow::Result<tokio::net::UnixStream> {
     let mut delay = std::time::Duration::from_millis(10);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started_at = std::time::Instant::now();
+    let mut deadline = started_at + initial_timeout;
+    let mut child_exit = None;
     while std::time::Instant::now() < deadline {
         if let Some(stream) = daemon::connect_to_daemon().await {
             return Ok(stream);
         }
-        if let Some(child) = child.as_mut()
+        if child_exit.is_none()
+            && let Some(child) = child.as_mut()
             && let Some(status) = child.try_wait()?
         {
-            anyhow::bail!("daemon exited before becoming ready (status: {status})");
+            if daemon::runtime_lock_is_held() {
+                // This child correctly lost a concurrent auto-start race. Keep
+                // waiting for the lock owner instead of falling back to a
+                // standalone Engine that would duplicate upstream startup.
+                child_exit = Some(status);
+                deadline = started_at + contention_timeout;
+            } else {
+                anyhow::bail!("daemon exited before becoming ready (status: {status})");
+            }
+        }
+        if let Some(status) = child_exit
+            && !daemon::runtime_lock_is_held()
+        {
+            anyhow::bail!(
+                "concurrent daemon exited before becoming ready (losing child status: {status})"
+            );
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(500));
+    }
+    if child_exit.is_some() && daemon::runtime_lock_is_held() {
+        return Err(DaemonStartupContention.into());
     }
     anyhow::bail!("daemon failed to start")
 }
@@ -719,6 +768,13 @@ pub(crate) async fn daemon_query<T>(
 pub(crate) async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     match connect_via_daemon(config_path).await {
         Ok(()) => return Ok(()),
+        Err(error) if !allows_standalone_fallback(&error) => {
+            tracing::error!(
+                error = %error,
+                "daemon startup is still owned by another process; refusing duplicate standalone startup"
+            );
+            return Err(error);
+        }
         Err(e) => {
             tracing::error!(error = %e, "daemon proxy failed — falling back to standalone mode");
         }
@@ -754,6 +810,10 @@ pub(crate) async fn cmd_start(
 }
 
 pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    // Claim daemon ownership before Engine::start() can read Keychain entries
+    // or spawn upstream processes. Concurrent `plug connect` auto-starts lose
+    // here and simply retry the winning daemon's socket.
+    let runtime_lock = daemon::acquire_runtime_lock()?;
     let config_path = config_path
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
@@ -776,11 +836,12 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         engine.cancel_token().clone(),
     );
     tokio::pin!(http_future);
-    let daemon_future = daemon::run_daemon(
+    let daemon_future = daemon::run_daemon_with_lock(
         engine.clone(),
         config_path,
         engine.config().daemon_grace_period_secs,
         Some(http_runtime.sessions),
+        runtime_lock,
     );
     tokio::pin!(daemon_future);
     tokio::select! {
@@ -1440,6 +1501,86 @@ mod tests {
             "unexpected readiness failure: {error}"
         );
 
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_ready_follows_the_concurrent_lock_winner() {
+        let _guard = runtime_path_test_lock().lock().await;
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let runtime_root = std::path::PathBuf::from(format!("/tmp/plug-dr-{suffix}"));
+        let state_root = std::path::PathBuf::from(format!("/tmp/plug-ds-{suffix}"));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let winning_lock = daemon::acquire_runtime_lock().expect("winning daemon lock");
+        let mut losing_child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.02; exit 1")
+            .spawn()
+            .expect("spawn losing daemon stand-in");
+
+        let listener_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let socket = daemon::socket_path();
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind winner socket");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            listener
+        });
+
+        let stream = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_daemon_ready(Some(&mut losing_child)),
+        )
+        .await
+        .expect("readiness wait timed out")
+        .expect("losing auto-start should wait for the lock winner");
+        drop(stream);
+
+        listener_task.abort();
+        drop(winning_lock);
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn held_winner_lock_times_out_without_allowing_standalone_fallback() {
+        let _guard = runtime_path_test_lock().lock().await;
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let runtime_root = std::path::PathBuf::from(format!("/tmp/plug-cr-{suffix}"));
+        let state_root = std::path::PathBuf::from(format!("/tmp/plug-cs-{suffix}"));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        let winning_lock = daemon::acquire_runtime_lock().expect("winning daemon lock");
+        let mut losing_child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 1")
+            .spawn()
+            .expect("spawn losing daemon stand-in");
+
+        let error = wait_for_daemon_ready_with_timeouts(
+            Some(&mut losing_child),
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("held winner without a socket must fail closed");
+        assert!(error.downcast_ref::<DaemonStartupContention>().is_some());
+        assert!(
+            !allows_standalone_fallback(&error),
+            "lock contention must never reopen duplicate standalone startup"
+        );
+        assert!(allows_standalone_fallback(&anyhow::anyhow!(
+            "ordinary daemon failure"
+        )));
+
+        drop(winning_lock);
         clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");

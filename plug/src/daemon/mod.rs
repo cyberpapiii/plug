@@ -117,6 +117,50 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
+pub(crate) struct DaemonRuntimeLock {
+    file: std::fs::File,
+    pid_file_path: PathBuf,
+}
+
+/// Claim singleton daemon ownership before any upstream initialization.
+///
+/// `plug connect` clients can all notice a missing socket at once. The winner
+/// must own this lock before loading OAuth credentials or spawning upstreams;
+/// every loser exits without touching either.
+pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
+    ensure_dir(&runtime_dir())?;
+    let pid_file_path = pid_path();
+    let file = acquire_pid_lock(&pid_file_path)?;
+    Ok(DaemonRuntimeLock {
+        file,
+        pid_file_path,
+    })
+}
+
+/// Return whether another process currently owns the daemon singleton lock.
+///
+/// This probe never creates or rewrites the PID file. Auto-start callers use it
+/// to distinguish a failed child from a child that correctly lost to another
+/// daemon which is still booting.
+pub(crate) fn runtime_lock_is_held() -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pid_path())
+    else {
+        return false;
+    };
+
+    match fs4::FileExt::try_lock(&file) {
+        Err(fs4::TryLockError::WouldBlock) => true,
+        Ok(()) => {
+            let _ = fs4::FileExt::unlock(&file);
+            false
+        }
+        Err(fs4::TryLockError::Error(_)) => false,
+    }
+}
+
 // ───────────────────────── Grace-period auto-shutdown ─────────────────────────
 
 /// Spawn the grace-period auto-shutdown task.
@@ -232,11 +276,30 @@ fn spawn_grace_period_task(
 ///
 /// Returns the tracing-appender guard that MUST be held for the daemon's lifetime
 /// (dropping it flushes and closes the log file).
+#[cfg(test)]
 pub async fn run_daemon(
     engine: Arc<Engine>,
     config_path: PathBuf,
     grace_period_secs: u64,
     http_sessions: Option<Arc<dyn SessionStore>>,
+) -> anyhow::Result<()> {
+    let runtime_lock = acquire_runtime_lock()?;
+    run_daemon_with_lock(
+        engine,
+        config_path,
+        grace_period_secs,
+        http_sessions,
+        runtime_lock,
+    )
+    .await
+}
+
+pub(crate) async fn run_daemon_with_lock(
+    engine: Arc<Engine>,
+    config_path: PathBuf,
+    grace_period_secs: u64,
+    http_sessions: Option<Arc<dyn SessionStore>>,
+    runtime_lock: DaemonRuntimeLock,
 ) -> anyhow::Result<()> {
     let rt_dir = runtime_dir();
     let log_directory = log_dir();
@@ -245,10 +308,10 @@ pub async fn run_daemon(
     ensure_dir(&rt_dir)?;
     ensure_dir(&log_directory)?;
 
-    // Acquire PID file lock BEFORE socket operations to prevent TOCTOU races.
-    // Two concurrent auto_start_daemon calls: the loser fails here, retries connecting.
-    let pid_file_path = pid_path();
-    let _pid_lock = acquire_pid_lock(&pid_file_path)?;
+    let DaemonRuntimeLock {
+        file: _pid_lock,
+        pid_file_path,
+    } = runtime_lock;
 
     // Generate auth token only after we own the daemon runtime lock so a
     // losing concurrent startup cannot overwrite the live daemon's control token.
@@ -1672,6 +1735,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     pub(super) fn temp_config_path(name: &str) -> std::path::PathBuf {
+        crate::install_test_credential_environment();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1690,6 +1754,17 @@ mod tests {
         if let Some(dir) = config_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn daemon_tests_do_not_use_the_real_plug_token_directory() {
+        let config_path = temp_config_path("credential-isolation");
+        let production = plug_core::config::config_dir().join("tokens");
+        let actual = plug_core::oauth::tokens_dir();
+
+        assert_ne!(actual, production);
+        assert!(actual.starts_with(std::env::temp_dir()));
+        cleanup_temp_config(&config_path);
     }
 
     pub(super) fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
@@ -1962,6 +2037,79 @@ mod tests {
 
         drop(first_lock);
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn losing_daemon_start_does_not_boot_upstream_servers() {
+        let _guard = runtime_paths_test_lock().lock().await;
+        let runtime_root = std::env::temp_dir().join(format!(
+            "plug-daemon-early-lock-runtime-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_root = std::env::temp_dir().join(format!(
+            "plug-daemon-early-lock-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        std::fs::create_dir_all(runtime_dir()).expect("create daemon runtime dir");
+        let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
+
+        let marker = state_root.join("upstream-started");
+        let config_path = state_root.join("config.toml");
+        let mut config = plug_core::config::Config::default();
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
+        config.http.port = probe.local_addr().expect("HTTP address").port();
+        drop(probe);
+        config.servers.insert(
+            "marker".to_string(),
+            plug_core::config::ServerConfig {
+                command: Some("/bin/sh".to_string()),
+                args: vec!["-c".to_string(), "touch \"$MARKER\"".to_string()],
+                env: HashMap::from([("MARKER".to_string(), marker.display().to_string())]),
+                enabled: true,
+                transport: plug_core::config::TransportType::Stdio,
+                url: None,
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 1,
+                call_timeout_secs: 1,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+                sandbox: None,
+            },
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let result = crate::runtime::cmd_daemon(Some(&config_path)).await;
+        let error = result.expect_err("losing daemon should exit immediately");
+        assert!(
+            error.to_string().contains("PID file locked"),
+            "startup should reach the singleton lock: {error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "a daemon that loses the singleton lock must not start upstream servers"
+        );
+
+        drop(winning_lock);
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
+        std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
     #[tokio::test]

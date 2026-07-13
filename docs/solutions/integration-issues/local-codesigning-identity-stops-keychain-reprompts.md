@@ -123,6 +123,23 @@ After the first signed restart, macOS prompts **once more** per OAuth upstream
 Allow** — those approvals now bind to the stable identity and do not return on
 future rebuilds.
 
+### July 2026 follow-up: signing was necessary but not sufficient
+
+A later 50-plus-dialog burst exposed two independent amplifiers that stable
+signing could not solve by itself:
+
+- OAuth tests were using the production token directory and login Keychain.
+  Each short-lived test binary could therefore request real credential access.
+- Daemon contenders acquired the singleton lock only after starting upstreams.
+  Several simultaneous clients could all reach Keychain before one process won.
+
+Plug now isolates test credentials, takes the daemon lock before upstream
+initialization, makes losing auto-start attempts follow the winning daemon, and
+uses the protected token-file mirror before probing Keychain during normal
+startup. Stable signing still matters for genuine Keychain recovery and
+diagnostic access, but it is no longer asked to paper over process and test
+isolation bugs.
+
 ## Why This Works
 
 A macOS Keychain "Always Allow" ACL entry is keyed to the requesting
@@ -152,6 +169,11 @@ Digital Signature** extension (not just Extended Key Usage). Miss either and
 - **Always re-sign after installing.** Use `scripts/dev-reinstall.sh` (which
   signs automatically when the identity exists) instead of a bare
   `cargo install`. A bare install drops back to ad-hoc and the prompts return.
+- **Never let tests use production credential paths.** Workspace OAuth tests
+  install an isolated temporary token directory and in-memory keyring before
+  the first credential operation; keep regression coverage for that boundary.
+- **Acquire singleton ownership before external initialization.** A daemon that
+  cannot own the runtime lock must not start upstreams or read credentials.
 - **Run `plug codesign-setup` (or `scripts/setup-codesigning.sh`) once per
   machine.** Both are idempotent: they no-op on non-macOS and skip creation when
   a valid `Plug Local Signing` identity already exists.

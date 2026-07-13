@@ -8,6 +8,29 @@ No configuration migration is required. Existing stdio, Streamable HTTP,
 daemon IPC, OAuth, Tasks, resources, prompts, completion, elicitation,
 sampling, logging, and notification behavior remains available.
 
+## Keychain prompt flood hotfix
+
+This release also fixes the burst of macOS dialogs saying that Plug wants to
+access the `plug` key in your login Keychain. The flood had three compounding
+causes: OAuth tests were touching the real user credential stores, competing
+daemon starts could initialize upstreams before discovering another daemon had
+won, and routine credential loading checked Keychain before using the protected
+on-disk token mirror.
+
+- OAuth tests now use an isolated temporary token directory and in-memory
+  credential store. Running the test suite cannot read or write your login
+  Keychain or production token files.
+- A daemon now claims the singleton lock before it starts any upstream server.
+  Losing startup attempts wait for the winner instead of opening their own
+  upstream connections or falling back to a duplicate standalone process.
+- Normal OAuth startup uses the protected token mirror first. Keychain remains
+  the recovery source when the mirror is missing and is still checked by
+  explicit credential diagnostics.
+
+No credentials or server configuration need to be recreated. The complete
+868-test workspace suite was run while hashing the production token directory
+before and after; its file count and content manifest remained unchanged.
+
 ## What improves
 
 RMCP 2.2 includes the SDK's latest `2025-11-25` conformance fixes, stricter

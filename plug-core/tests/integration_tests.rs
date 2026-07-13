@@ -54,8 +54,26 @@ const HTTP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 fn oauth_integration_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static ENVIRONMENT: OnceLock<()> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
+        oauth::install_test_credential_environment(std::env::temp_dir().join(format!(
+            "plug-oauth-integration-tests-{}",
+            std::process::id()
+        )));
+    });
+
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[test]
+fn oauth_integration_credentials_are_isolated_from_the_user_profile() {
+    let _ = oauth_integration_test_lock();
+    let production = plug_core::config::config_dir().join("tokens");
+    let actual = oauth::tokens_dir();
+
+    assert_ne!(actual, production);
+    assert!(actual.starts_with(std::env::temp_dir()));
 }
 
 fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
@@ -3064,6 +3082,7 @@ async fn test_multi_client_shared_engine_isolation() {
 
 #[tokio::test]
 async fn test_upstream_http_sends_protocol_version_header() {
+    let _guard = oauth_integration_test_lock().lock().await;
     /// Captured method name + optional MCP-Protocol-Version + Authorization header value.
     type CapturedHeaders = Vec<(String, Option<String>, Option<String>)>;
 
@@ -3496,6 +3515,7 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
 
 #[tokio::test]
 async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
+    let _guard = oauth_integration_test_lock().lock().await;
     let provider = MockOAuthProvider::start().await;
     let oauth_healthy = format!("oauth-healthy-{}", std::process::id());
     let oauth_auth_required = format!("oauth-required-{}", std::process::id());

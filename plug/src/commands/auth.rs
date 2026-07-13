@@ -977,6 +977,7 @@ mod tests {
 
     #[test]
     fn reusable_dynamic_registration_skips_configured_clients() {
+        crate::install_test_credential_environment();
         let server = plug_core::config::ServerConfig {
             command: None,
             args: Vec::new(),
@@ -1009,6 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn reusable_dynamic_registration_loads_persisted_registration() {
+        crate::install_test_credential_environment();
         let server_name = format!("auth-registration-{}", std::process::id());
         let server = plug_core::config::ServerConfig {
             command: None,
