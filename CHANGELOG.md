@@ -7,7 +7,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-Detailed notes: [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
+Detailed notes: [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md) and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
 
 ### Added
 
@@ -22,7 +22,9 @@ Detailed notes: [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-cod
 - Oversized artifact writes run on the blocking pool instead of occupying an async runtime worker.
 - Native task creation and task teardown now use bounded waits derived from each upstream server's call timeout.
 - Split the daemon implementation into focused framing, path, registry, auth, notification, and MCP dispatch modules without changing its public behavior.
-- Source builds now require Rust 1.88. The `rmcp` dependency stays within the compatible 1.7 release line.
+- Source builds now require Rust 1.88.
+- Upgraded the Rust MCP SDK from RMCP 1.7.0 to exactly RMCP 2.2.0 while preserving MCP `2025-11-25` negotiation and the existing transport/method surface.
+- Migrated to RMCP's spec-aligned content, resource, prompt, task, elicitation, and cancellation APIs.
 
 ### Fixed
 
@@ -34,6 +36,9 @@ Detailed notes: [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-cod
 - Daemon IPC read silence now forces a reconnect instead of holding the session mutex indefinitely.
 - Replacement grace tasks now participate in shutdown and a shutdown signal remains latched even when no receiver is present.
 - Fixed expired-session counter underflow, pending cancellation replay, a daemon reverse-request busy loop, and closed-channel restoration after deregistration.
+- Cancellation notifications without `requestId` are accepted and ignored safely instead of being mapped onto an unrelated active call.
+- Downstream stdio and daemon-IPC initialization reject RMCP's announced-but-unimplemented MCP `2026-07-28` revision instead of accidentally negotiating it.
+- Pinned `sse-stream` 0.2.4 to match the API required by RMCP 2.2.0 and keep fresh locked builds reproducible.
 
 ### Security
 

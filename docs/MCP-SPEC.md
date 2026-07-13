@@ -4,6 +4,7 @@ This document captures the MCP protocol details that directly affect Plug's impl
 
 **Current spec version**: 2025-11-25
 **Spec URL**: https://modelcontextprotocol.io/specification/2025-11-25
+**Rust SDK on `main`**: RMCP 1.7.0. The off-main migration branch pins RMCP 2.2.0 exactly.
 
 ---
 
@@ -16,7 +17,7 @@ This document captures the MCP protocol details that directly affect Plug's impl
 | 2025-06-18 | Jun 2025 | Structured Output. Resource Links in tool results. JSON-RPC batching REMOVED. `MCP-Protocol-Version` header required. |
 | 2025-11-25 | Nov 2025 | Tasks (experimental). OAuth 2.1 + PKCE. OIDC Discovery. CIMD. Icons metadata. Elicitation URL mode. Sampling with tool calling. M2M client-credentials. |
 
-**Next anticipated**: June 2026 — likely stateless mode, Server Cards, session elevation.
+**Next announced revision**: 2026-07-28. It is not stable or implemented here yet; upgrading the SDK does not opt Plug into that revision.
 
 ---
 
@@ -176,7 +177,7 @@ Client confirms:
 - Server responds with same version (if supported) or its own latest
 - If incompatible: client SHOULD disconnect
 
-**Plug**: Advertise `2025-11-25`. The current downstream HTTP policy is strict after initialization: non-initialize HTTP requests must include `MCP-Protocol-Version: 2025-11-25`. The HTTP initialize response body is set through typed `InitializeResult` construction, not JSON body mutation. Revisit this only when the accepted stateless/per-request protocol work is implemented.
+**Plug**: Advertise `2025-11-25`. RMCP 2.2.0 supplies the Rust protocol models and transport implementation, but does not change Plug's negotiated wire revision. The current downstream HTTP policy is strict after initialization: non-initialize HTTP requests must include `MCP-Protocol-Version: 2025-11-25`. The HTTP initialize response body is set through typed `InitializeResult` construction, not JSON body mutation. Revisit this only when the 2026-07-28 stateless/per-request protocol work is stable and deliberately implemented.
 
 ### Phase 2: Operation
 

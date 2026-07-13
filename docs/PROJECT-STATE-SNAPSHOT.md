@@ -96,9 +96,9 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-No unmerged project work is currently present locally or on `origin`. Local
-executor branch names may remain temporarily while their worktrees are pruned,
-but their reviewed commits are already contained in `main`.
+The `codex/rmcp-2.2-upgrade` branch upgrades the Rust MCP SDK to RMCP 2.2.0,
+migrates Plug to its spec-aligned models, and keeps the negotiated MCP revision
+at `2025-11-25`. It exists off-main until merged and verified there.
 
 ## Release Status
 
