@@ -122,7 +122,9 @@ compatible stable versions. Keyring 4.1.4 preserves the existing macOS and
 Linux credential identities; TOML 1.1.2 keeps whole-document client/import
 parsing through explicit regressions; Tower HTTP 0.7.0 now enforces Plug's
 intended 4 MiB request ceiling; and local macOS reinstalls publish only a
-fully signed and verified binary through an atomic replacement.
+fully signed and verified binary through an atomic replacement. Read-only
+daemon auth status also stays on memory and the protected mirror, so a missing
+mirror cannot freeze IPC or HTTP behind a Keychain authorization dialog.
 
 On 2026-07-12, `main` absorbed the 24-plan improve program plus four rounds of
 counter-review repairs. The user-visible result is stronger reconnect and SSE

@@ -30,13 +30,20 @@ on-disk token mirror.
 No credentials or server configuration need to be recreated. The 868-test
 keychain-hotfix suite was run while hashing the production token directory
 before and after; its file count and content manifest remained unchanged. The
-four dependency-refresh regressions bring the final release suite to 872 tests.
+six dependency and runtime regressions bring the final release suite to 874 tests.
 
 Local reinstalls are safer too. The installer now builds into a private staging
 directory, signs the candidate with the stable `Plug Local Signing` identity,
 strictly verifies that signature, smoke-tests the binary, and only then swaps it
 into place atomically. A running client can therefore see either the previous
 signed build or the new signed build, never an unsigned in-between build.
+
+Read-only daemon auth status is now Keychain-safe as well. It reports from the
+daemon's memory and protected token mirror instead of probing a mirrorless
+Keychain entry. This prevents `plug auth status`, `plug status`, and unrelated
+HTTP traffic from freezing behind a hidden macOS authorization dialog. Explicit
+credential recovery and token-injection operations still retain the deliberate
+Keychain fallback they need.
 
 ## Dependency refresh
 
@@ -101,6 +108,6 @@ and cancellation without a request id. Existing protocol-version, Tasks,
 elicitation, sampling, and daemon IPC suites continue to exercise MCP
 `2025-11-25` behavior. Additional regressions cover TOML 1.x document parsing,
 Linux keyring compatibility, and the exact/streamed HTTP body limits. The
-release gate covers all 872 workspace tests, Clippy with warnings denied,
+release gate covers all 874 workspace tests, Clippy with warnings denied,
 formatting, Rust 1.88 compilation, RustSec advisories, dependency licensing and
 sources, todo-status consistency, and clean diffs.

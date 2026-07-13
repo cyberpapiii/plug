@@ -124,6 +124,13 @@ the live binary. Do not replace the live binary first and sign it afterward:
 an auto-respawning client could execute that unsigned intermediate build and
 reopen the Keychain authorization flood.
 
+Daemon operator queries must also stay off the synchronous Keychain path.
+`AuthStatus` reads the in-memory credential cache and protected file mirror
+only; a keyring-only credential is reported as unavailable at runtime and can
+still be recovered by the explicit credential-loading paths. This keeps a
+read-only status request from parking Tokio's I/O driver in
+`SecKeychainFindGenericPassword` and freezing both IPC and HTTP.
+
 After the first signed restart, macOS prompts **once more** per OAuth upstream
 (the identity just changed from ad-hoc to the stable cert). Click **Always
 Allow** — those approvals now bind to the stable identity and do not return on

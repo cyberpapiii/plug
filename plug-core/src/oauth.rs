@@ -107,6 +107,24 @@ pub fn install_test_credential_environment(tokens_dir: PathBuf) {
     );
 }
 
+/// Seed only the isolated test keyring, without creating a token-file mirror.
+///
+/// This is public only for workspace integration tests that verify runtime
+/// paths do not probe the operator Keychain. It panics outside an explicitly
+/// installed test credential environment.
+#[doc(hidden)]
+pub fn seed_test_keyring_credentials(server_name: &str, credentials: &StoredCredentials) {
+    let environment = TEST_CREDENTIAL_ENVIRONMENT
+        .get()
+        .expect("test credential environment must be installed before seeding its keyring");
+    let json = serde_json::to_string(credentials).expect("serialize test credentials");
+    environment
+        .keyring
+        .lock()
+        .expect("test keyring mutex poisoned")
+        .insert(server_name.to_string(), json);
+}
+
 #[cfg(test)]
 fn ensure_unit_test_credential_environment() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -801,7 +819,7 @@ impl CompositeCredentialStore {
         Self::compute_backing_store_warnings(file.as_ref(), keyring.as_ref())
     }
 
-    fn fallback_auth_snapshot_inner(&self) -> CredentialSnapshot {
+    fn runtime_auth_snapshot_inner(&self) -> CredentialSnapshot {
         let cached = self.cached_credentials();
         let persisted_file = self.file_load();
 
@@ -831,31 +849,40 @@ impl CompositeCredentialStore {
                 }
             }
             Some((_, CredentialSource::Keyring)) => unreachable!("keyring is not considered here"),
-            None => {
-                let persisted_keyring = self.keyring_load();
-                let warnings = Self::compute_backing_store_warnings(
-                    persisted_file.as_ref(),
-                    persisted_keyring.as_ref(),
-                );
+            None => CredentialSnapshot {
+                credentials: None,
+                source: None,
+                token_expires_in_secs: None,
+                warnings: Vec::new(),
+            },
+        }
+    }
 
-                match persisted_keyring.as_ref() {
-                    Some(creds) => {
-                        self.update_cache(creds);
-                        CredentialSnapshot {
-                            credentials: Some(creds.clone()),
-                            source: Some("keyring"),
-                            token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
-                            warnings,
-                        }
-                    }
-                    None => CredentialSnapshot {
-                        credentials: None,
-                        source: None,
-                        token_expires_in_secs: None,
-                        warnings,
-                    },
+    fn fallback_auth_snapshot_inner(&self) -> CredentialSnapshot {
+        let runtime = self.runtime_auth_snapshot_inner();
+        if runtime.credentials.is_some() {
+            return runtime;
+        }
+
+        let persisted_keyring = self.keyring_load();
+        let warnings = Self::compute_backing_store_warnings(None, persisted_keyring.as_ref());
+
+        match persisted_keyring.as_ref() {
+            Some(creds) => {
+                self.update_cache(creds);
+                CredentialSnapshot {
+                    credentials: Some(creds.clone()),
+                    source: Some("keyring"),
+                    token_expires_in_secs: Self::remaining_token_lifetime_secs(creds),
+                    warnings,
                 }
             }
+            None => CredentialSnapshot {
+                credentials: None,
+                source: None,
+                token_expires_in_secs: None,
+                warnings,
+            },
         }
     }
 
@@ -931,6 +958,15 @@ impl CompositeCredentialStore {
 
     pub fn fallback_auth_snapshot(&self) -> CredentialSnapshot {
         self.fallback_auth_snapshot_inner()
+    }
+
+    /// Read only the in-memory cache and protected file mirror.
+    ///
+    /// Daemon request handlers use this path so an operator query cannot block
+    /// the async runtime behind a macOS Keychain authorization dialog. Normal
+    /// startup and explicit local diagnostics retain the keyring recovery path.
+    pub fn runtime_auth_snapshot(&self) -> CredentialSnapshot {
+        self.runtime_auth_snapshot_inner()
     }
 
     pub fn credential_debug_snapshot(&self) -> CredentialDebugSnapshot {
@@ -2041,6 +2077,32 @@ mod tests {
             store.file_load().is_none(),
             "fallback auth snapshot should not repair the token-file mirror"
         );
+
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_auth_snapshot_does_not_probe_keyring_without_mirror() {
+        let name = format!("oauth-runtime-no-keyring-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let credentials = make_test_token(
+            "keyring-only-access",
+            Some("keyring-only-refresh"),
+            Some(3600),
+        );
+        assert!(store.keyring_save(&credentials));
+        store.file_clear();
+        store.clear_cache();
+
+        let runtime = store.runtime_auth_snapshot();
+        assert!(runtime.credentials.is_none());
+        assert!(runtime.warnings.is_empty());
+
+        let fallback = store.fallback_auth_snapshot();
+        assert!(fallback.credentials.is_some());
+        assert_eq!(fallback.source, Some("keyring"));
 
         store.clear().await.unwrap();
     }

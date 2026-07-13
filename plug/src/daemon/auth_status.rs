@@ -34,7 +34,7 @@ pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse
     let mut servers = Vec::new();
     for (name, sc) in &oauth_servers {
         let store = oauth::get_or_create_store(name);
-        let snapshot = store.fallback_auth_snapshot();
+        let snapshot = store.runtime_auth_snapshot();
         let has_creds = snapshot.credentials.is_some();
 
         let health = status_map
@@ -121,6 +121,38 @@ mod tests {
         assert_eq!(servers[0].health, plug_core::types::ServerHealth::Degraded);
         assert!(servers[0].token_expires_in_secs.is_some());
         assert!(servers[0].warnings.is_empty());
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&ctx.config_path);
+    }
+
+    #[tokio::test]
+    async fn auth_status_does_not_probe_keyring_only_credentials() {
+        let config_path = temp_config_path("auth-status-keyring-only");
+        let server_name = format!("oauth-keyring-only-{}", std::process::id());
+        write_oauth_config(&config_path, &[server_name.as_str()]);
+
+        clear_store(&server_name).await;
+        plug_core::oauth::seed_test_keyring_credentials(&server_name, &seeded_credentials());
+
+        let ctx = auth_status_test_context(config_path);
+        let response = dispatch_auth_status(&ctx).await;
+        let IpcResponse::AuthStatus { servers } = response else {
+            panic!("expected auth status response");
+        };
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, server_name);
+        assert!(!servers[0].authenticated);
+        assert_eq!(
+            servers[0].health,
+            plug_core::types::ServerHealth::AuthRequired
+        );
+        assert!(servers[0].token_expires_in_secs.is_none());
+        assert!(servers[0].warnings.is_empty());
+
+        let recovery = plug_core::oauth::get_or_create_store(&server_name).fallback_auth_snapshot();
+        assert_eq!(recovery.source, Some("keyring"));
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);
