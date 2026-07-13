@@ -136,7 +136,7 @@ Every roadmap-affecting PR should complete this checklist after merge:
 ## Tech Stack
 
 - Rust 2024 edition
-- `rmcp` 1.7.0
+- `rmcp` 2.2.0 (exact workspace pin)
 - Tokio
 - Axum
 - DashMap
@@ -146,6 +146,13 @@ Every roadmap-affecting PR should complete this checklist after merge:
 - `backon`
 - `notify` + `notify-debouncer-mini`
 - `tracing` + `tracing-subscriber` + `tracing-appender`
+
+Engineering guardrails:
+
+- workspace crate roots deny or forbid unsafe code
+- daemon IPC is length-prefixed JSON over Unix sockets
+- bearer-token comparisons use constant-time equality
+- broadcast-event string fields use `Arc<str>` for cheap fan-out clones
 
 ## Development Commands
 

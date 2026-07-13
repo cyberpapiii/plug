@@ -615,7 +615,7 @@ Stream A phases are independent and can be done by one developer sequentially. S
 
 - `docs/solutions/integration-issues/rmcp-sdk-integration-patterns-plug-20260303.md` -- Non-exhaustive structs, ArcSwap atomic consistency, lock guards across async
 - `docs/solutions/integration-issues/phase2a-notification-infrastructure-tools-list-changed-20260307.md` -- Notification bus patterns, coalescing, channel sizing
-- `docs/solutions/integration-issues/phase2a-notification-fanout-tools-list-changed-20260307.md` -- Non-blocking fan-out (`try_send`), session liveness
+- `docs/solutions/integration-issues/phase2a-notification-infrastructure-tools-list-changed-20260307.md` -- Non-blocking fan-out (`try_send`), session liveness, and correlation substrate
 - `docs/solutions/integration-issues/mcp-multiplexer-http-transport-phase2.md` -- SSE priming event, keep-alive, CancellationToken
 - `docs/solutions/integration-issues/downstream-https-serving-20260307.md` -- TLS config, origin validation, SSRF protection
 

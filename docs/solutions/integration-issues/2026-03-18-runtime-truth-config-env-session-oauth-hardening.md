@@ -57,12 +57,9 @@ The remediation review surfaced four related reliability gaps:
 - invalid PKCE does not consume the downstream OAuth auth code
 - downstream OAuth persistence is isolated per public base URL
 
-## Follow-up
+## Later work
 
-This tranche intentionally does not yet address:
-
-- IPC response/notification interleaving during daemon proxy handshakes
-- per-call reverse-request ownership and cancellation/progress correlation
-- reload task-topology rebuilding and legacy SSE transport fixes
-
-Those remain the next implementation waves from the remediation plan.
+The follow-up areas recorded by this tranche subsequently landed on `main`: IPC handshake
+interleaving, per-call reverse-request correlation, reload task-topology rebuilding, and legacy SSE
+hardening. The focused learnings for those mechanisms remain the better source for their current
+behavior; this document stays scoped to the runtime-truth and state-hardening tranche above.

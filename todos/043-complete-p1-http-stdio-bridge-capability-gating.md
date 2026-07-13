@@ -76,4 +76,4 @@ _To be filled during triage_
 ## Resources
 
 - DaemonBridge gating pattern: `plug/src/daemon.rs:548-558`
-- Institutional learning: `docs/solutions/integration-issues/resource-subscribe-forwarding-lifecycle-20260307.md` (three-transport parity checklist)
+- Institutional learning: `docs/solutions/architecture-patterns/resource-subscription-transitions-and-owner-reconciliation.md` (current transition and ownership invariants)

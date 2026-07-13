@@ -180,10 +180,10 @@ cargo check
 - [mcp-multiplexer-http-transport-phase2.md](./mcp-multiplexer-http-transport-phase2.md)
   Reinforces the transport-agnostic router boundary.
 
-- [2026-03-04-feat-http-upstream-session-recovery-plan.md](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-v0-1-stabilization/docs/plans/2026-03-04-feat-http-upstream-session-recovery-plan.md)
+- [2026-03-04 feat HTTP upstream session recovery plan](../../plans/2026-03-04-feat-http-upstream-session-recovery-plan.md)
   Prior reconnect architecture that established the single reconnect codepath.
 
-- [2026-03-06-feat-proactive-transport-recovery-plan.md](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-v0-1-stabilization/docs/plans/2026-03-06-feat-proactive-transport-recovery-plan.md)
+- [2026-03-06 proactive transport recovery plan](../../plans/2026-03-06-feat-proactive-transport-recovery-plan.md)
   Broader continuity strategy that this fix fits under.
 
 ## Prevention

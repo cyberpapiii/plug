@@ -5,7 +5,7 @@ tags: [mcp, logging, notifications, broadcast-channel, bulkhead, fan-out, rmcp, 
 module: plug-core
 symptom: "Upstream MCP server log messages silently dropped; logging/setLevel requests from clients fail silently"
 root_cause: "UpstreamClientHandler did not implement on_logging_message(); no logging broadcast channel existed; logging capability not advertised"
-date_solved: 2026-03-07
+date: 2026-03-07
 severity: high
 complexity: medium
 reuse_potential: high
@@ -27,7 +27,7 @@ This was the single most impactful protocol correctness gap — logging has the 
 
 1. Confirmed `UpstreamClientHandler` in `plug-core/src/server/mod.rs` had `on_progress` and `on_cancelled` handlers but no `on_logging_message`
 2. Identified that mixing logging into the existing control notification channel (capacity 128) would cause `Lagged` errors under log-heavy upstream servers, dropping delivery-critical Progress/Cancelled notifications
-3. Verified rmcp 1.1.0 types: `LoggingMessageNotificationParam { level, logger, data }`, `LoggingLevel` enum (no `PartialOrd`), `SetLevelRequestParams`, `peer.notify_logging_message()`, `peer.set_level()`
+3. Verified the then-current rmcp 1.1.0 logging types. Treat those exact shapes as historical; current code and the pinned SDK are authoritative.
 4. Confirmed `ServerCapabilities.logging` is `Option<JsonObject>` (empty `{}` to advertise)
 
 ## Root Cause
@@ -90,7 +90,7 @@ pub enum ProtocolNotification {
 
 No `target` field — logging broadcasts to ALL clients, unlike Progress/Cancelled which are request-scoped.
 
-#### 2. Separate Broadcast Channel (`proxy/mod.rs`)
+#### 2. Separate Broadcast Channel (the plug-core proxy module)
 
 ```rust
 // In ToolRouter::new()
@@ -102,7 +102,7 @@ client_log_levels: DashMap<Arc<str>, LoggingLevel>,
 effective_log_level: ArcSwap<LoggingLevel>,  // default: Warning
 ```
 
-#### 3. Level Severity Mapping (`proxy/mod.rs`)
+#### 3. Level Severity Mapping (the `plug-core` proxy module)
 
 rmcp's `LoggingLevel` doesn't implement `PartialOrd`. Manual mapping:
 
@@ -121,7 +121,7 @@ fn level_severity(level: &LoggingLevel) -> u8 {
 }
 ```
 
-#### 4. Upstream Log Routing with Server Prefix (`proxy/mod.rs`)
+#### 4. Upstream Log Routing with Server Prefix
 
 ```rust
 pub fn route_upstream_logging_message(
@@ -138,7 +138,7 @@ pub fn route_upstream_logging_message(
 }
 ```
 
-#### 5. Concurrent setLevel Forwarding (`proxy/mod.rs`)
+#### 5. Concurrent setLevel Forwarding
 
 ```rust
 pub async fn forward_set_level_to_upstreams(&self) {
@@ -160,7 +160,7 @@ pub async fn forward_set_level_to_upstreams(&self) {
 }
 ```
 
-#### 6. Stdio Fan-Out with Lagged Recovery (`proxy/mod.rs`)
+#### 6. Stdio Fan-Out with Lagged Recovery
 
 ```rust
 // Separate task for logging (alongside existing control notification task)
@@ -186,7 +186,7 @@ tokio::spawn(async move {
 });
 ```
 
-#### 7. Capability Advertisement (`proxy/mod.rs`)
+#### 7. Capability Advertisement
 
 ```rust
 // In synthesized_capabilities()
@@ -260,13 +260,13 @@ When forwarding requests to upstream servers:
 | `plug-core/src/http/server.rs` | HTTP logging fan-out task, setLevel request handling, session cleanup, synthetic lag warning |
 | `plug-core/src/ipc.rs` | Added `LoggingNotification` variant to `IpcResponse` |
 | `plug-core/src/session/stateful.rs` | Expiry callback on all session removal paths |
-| `plug/src/daemon.rs` | IPC logging push (subscribe + select + drain), `logging/setLevel` dispatch, log level cleanup on deregister/disconnect |
+| `plug/src/daemon/` | IPC logging push (subscribe + select + drain), `logging/setLevel` dispatch, log level cleanup on deregister/disconnect |
 | `plug/src/ipc_proxy.rs` | Peer storage for notification forwarding, interleaved frame handling in `try_round_trip_locked`, `set_level` handler |
 | `plug/src/runtime.rs` | Expiry callback wiring for log level cleanup |
 
 ## Related
 
 - [Phase 2a notification infrastructure](phase2a-notification-infrastructure-tools-list-changed-20260307.md) — `try_send` fan-out pattern, separate channels concept
-- [Phase 4 TUI daemon patterns](../integration-issues/phase4-tui-dashboard-daemon-patterns.md) — `Arc<str>` for broadcast types, Lagged handling
+- [Phase 2a notification infrastructure](phase2a-notification-infrastructure-tools-list-changed-20260307.md) — shared broadcast and lag-handling foundation
 - [MCP spec compliance roadmap](../../plans/2026-03-07-feat-mcp-spec-compliance-roadmap-plan.md) — Phase A1
 - [Phase A1 plan](../../plans/2026-03-07-feat-logging-notification-forwarding-plan.md) — Detailed implementation plan

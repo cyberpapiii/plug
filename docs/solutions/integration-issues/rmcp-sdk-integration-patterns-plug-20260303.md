@@ -1,26 +1,28 @@
 ---
-module: plug-core
+title: "Historical RMCP SDK integration patterns"
 date: 2026-03-03
-problem_type: integration_issues
-component: rust_crate
+category: integration-issues
+module: plug-core
+problem_type: integration_issue
+component: tooling
 symptoms:
   - "E0639: cannot construct non-exhaustive struct with struct literal syntax"
   - "rmcp::error::ErrorData — private module path compilation failure"
   - "Torn reads between list_tools and call_tool due to non-atomic cache swap"
   - "RwLock held across async .await blocking concurrent tasks"
   - "Figment env var PLUG_LOG_LEVEL parsed as nested 'log.level' instead of 'log_level'"
-root_cause: unfamiliar_sdk_api
+root_cause: wrong_api
+resolution_type: code_fix
 severity: high
 tags:
   - rmcp
   - mcp
-
-note: "Historical integration report from the early rmcp 1.0.0 adoption phase. Useful as implementation archaeology, not as current-state truth."
   - arc-swap
   - figment
   - async-rust
   - non-exhaustive
   - proxy-architecture
+note: "Historical integration report from the early rmcp 1.0.0 adoption phase. Useful as implementation archaeology, not as current-state truth."
 ---
 
 # rmcp SDK Integration Patterns for MCP Proxy Development
@@ -176,10 +178,11 @@ let result: CallToolResult = peer
 
 ## Related Documentation
 
-- [docs/research/rmcp-feasibility.md](../research/rmcp-feasibility.md) — Initial rmcp SDK research
-- [docs/research/crate-validation.md](../research/crate-validation.md) — Crate version validation
-- [docs/ARCHITECTURE.md](../ARCHITECTURE.md) — System architecture
-- [docs/CRATE-STACK.md](../CRATE-STACK.md) — Dependency decisions
+- [docs/research/rmcp-feasibility.md](../../research/rmcp-feasibility.md) — Initial rmcp SDK research
+- [docs/research/crate-validation.md](../../research/crate-validation.md) — Crate version validation
+- [docs/ARCHITECTURE.md](../../ARCHITECTURE.md) — System architecture
+- [docs/CRATE-STACK.md](../../CRATE-STACK.md) — Dependency decisions
+- [RMCP Streamable HTTP authentication requires raw bearer tokens](rmcp-streamable-http-auth-requires-raw-bearer-tokens.md) — current RMCP 2.2 credential-boundary example
 - PR: https://github.com/cyberpapiii/plug/pull/1
 
 ## Environment

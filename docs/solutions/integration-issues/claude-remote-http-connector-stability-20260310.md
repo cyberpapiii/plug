@@ -152,16 +152,12 @@ After updating the connector URL to the full `/mcp` endpoint and using the fresh
 - When debugging Desktop connector failures, do not trust `mcp.log` alone. Claude may only show built-in connector churn there while the custom connector never reaches the server.
 - Debounce downstream `listChanged` fan-out for bursty upstream startup waves so client instability does not mask deeper issues.
 
-## Follow-up gap
+## Current operator visibility
 
-The terminal/menu UX still appears incomplete for remote HTTP sessions. During this incident, active Claude Desktop HTTP usage was not clearly surfaced in the plug client/menu system, and the UX did not make it obvious which live session or transport a user was inspecting.
-
-That gap should be treated as separate follow-up work:
-
-- confirm whether HTTP sessions are absent from the current menu/session inventory or merely not labeled clearly
-- make transport type explicit in session views
-- ensure operators can distinguish Desktop/Mobile HTTP sessions from local stdio clients
-- review whether any newer HTTP features landed without corresponding UX parity
+The incident originally exposed a live-session visibility gap. Current `main` now provides
+transport-aware session inventory with explicit scope and availability semantics, so operators can
+distinguish daemon-proxy and downstream HTTP sessions. The connector checks below remain useful,
+but the old session-inventory follow-up is resolved.
 
 ## Smoke test recipe
 

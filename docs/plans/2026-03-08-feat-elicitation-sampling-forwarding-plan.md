@@ -874,5 +874,5 @@ The following findings were identified during code review and explicitly deferre
 
 ### Institutional learnings
 
-- `docs/solutions/integration-issues/resource-subscribe-forwarding-lifecycle-20260307.md` — three-transport parity checklist, rollback patterns
+- `docs/solutions/architecture-patterns/resource-subscription-transitions-and-owner-reconciliation.md` — current subscription transition, ownership, and reconciliation invariants
 - `docs/solutions/integration-issues/mcp-logging-notification-forwarding-20260307.md` — bulkhead pattern for broadcast channels, session cleanup

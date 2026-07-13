@@ -9,7 +9,7 @@ tags:
   - workspace
 module: Cargo.toml (workspace root)
 symptom: "Workspace Cargo.toml declares ratatui, crossterm, and color-eyre with zero consumers"
-root_cause: "TUI was planned (Phase 4) but never built; dependencies were declared speculatively and never removed"
+root_cause: "The former TUI was removed, but its workspace dependencies remained after the product returned to a CLI-first surface"
 date: 2026-03-07
 pr: "#29"
 phase: "Roadmap Tail Closeout"
@@ -24,7 +24,7 @@ The workspace root `Cargo.toml` declared three dependencies under a `# TUI (Phas
 - `crossterm = { version = "0.29", features = ["event-stream"] }`
 - `color-eyre = "0.6"`
 
-No crate `Cargo.toml` referenced them. No `.rs` source file imported them. They were speculative declarations for a TUI that was never built.
+No active crate `Cargo.toml` referenced them and no remaining `.rs` source imported them. The TUI had existed earlier, but its implementation was removed before these now-dead workspace dependencies were cleaned up.
 
 ## Investigation Steps
 
@@ -37,7 +37,7 @@ No crate `Cargo.toml` referenced them. No `.rs` source file imported them. They 
 
 ### Root Cause Analysis
 
-Dependencies were added during early planning when a TUI was envisioned as Phase 4. The product direction shifted to "CLI-first, not TUI-first" but the manifest was never cleaned up.
+The dependencies supported the former TUI. When that product surface was removed and the project returned to "CLI-first, not TUI-first," the workspace manifest was not cleaned up in the same change.
 
 ### Working Solution
 

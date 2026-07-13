@@ -51,7 +51,7 @@ control-plane work.
 
 ## Related
 
-- `design-patterns/backoff-reset-requires-sustained-recovery.md` — a companion
+- [Backoff reset requires sustained recovery](../design-patterns/backoff-reset-requires-sustained-recovery.md) — a companion
   health-loop-recovery principle from the later active-supervision work: a
   restart/backoff governor's reset must be gated on *sustained* recovery, because
   the restart action itself transiently restores the healthy signal. Same domain

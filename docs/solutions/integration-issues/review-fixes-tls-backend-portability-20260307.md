@@ -134,6 +134,6 @@ When changing rmcp/reqwest TLS features in this repo:
 ## Related Lessons
 
 This fix pairs with the broader PR 21 review-fix work:
-- authenticated HTTP upstream bearer-header construction must use `SecretString::as_str()`
+- authenticated HTTP upstream construction extracts raw secret material with `SecretString::as_str()`, passes that raw token to RMCP 2.2's `auth_header`, and lets RMCP construct the single Bearer prefix; see [the current credential-boundary learning](rmcp-streamable-http-auth-requires-raw-bearer-tokens.md)
 - daemon IPC parity fixes should not regress portability work
 - CI portability issues are often dependency-policy issues, not only workflow config issues

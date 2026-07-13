@@ -50,9 +50,20 @@ Why:
 - keeping them together avoids another layer of repeated file/keyring reads
 - it preserves current operator semantics while removing duplicated read logic
 
+## Freshness and tie-breaking rules
+
+The snapshot compares cache, file mirror, and keyring together. `token_received_at` is the primary
+freshness signal. When timestamps tie but token identities differ, source priority provides a
+deterministic result rather than whichever branch happened to run last. A newer persisted winner
+rehydrates the in-memory cache regardless of whether it came from the file mirror or keyring, and a
+file-mirror save failure is surfaced when the keyring save succeeded so persistence drift is not
+silent.
+
 ## Tests added
 
 - fresher persisted credentials still replace stale cached credentials
 - daemon auth-status fallback still reports degraded runtime state correctly
 - auth-status JSON keeps its stable envelope and warning fields
 - full workspace tests pass with the unified snapshot path
+- equal-timestamp credentials use deterministic persisted-source tie-breaking
+- a fresher persisted credential rehydrates stale cache state

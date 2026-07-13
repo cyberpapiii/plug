@@ -27,7 +27,7 @@ In practice this showed up as:
 
 ### 1. Daemon startup could overwrite control files before it actually owned the daemon
 
-In `plug/src/daemon.rs`, daemon startup:
+In the `plug/src/daemon/` module, daemon startup:
 
 - wrote `plug.token` before it had exclusive daemon ownership
 - opened `plug.pid` with truncation before acquiring the PID-file lock
@@ -64,7 +64,7 @@ at different points during investigation.
 
 ### Daemon control path hardening
 
-Startup ordering in `plug/src/daemon.rs` was changed so that:
+Startup ordering in `plug/src/daemon/` was changed so that:
 
 - daemon ownership is claimed via PID-file locking before writing a fresh control token
 - PID contents are only truncated after the lock is successfully acquired
@@ -78,15 +78,15 @@ Regression coverage:
 
 ### General HTTP compatibility for initialized-notification failure
 
-Plug now wraps the upstream HTTP client path with a compatibility-aware client that:
+Plug wraps the upstream HTTP client path with a compatibility-aware client that:
 
 - preserves normal behavior for all ordinary requests
-- treats `notifications/initialized` failure as compatibility noise for HTTP upstream startup
+- treats an `UnexpectedServerResponse` beginning with HTTP 400 for `notifications/initialized` as compatibility noise for HTTP upstream startup
 - still requires the connection to prove usefulness via later calls such as `tools/list`
 
 This is intentionally general rather than server-specific:
 
-- it is keyed to the MCP handshake boundary (`notifications/initialized`)
+- it is keyed to the MCP handshake boundary (`notifications/initialized`) and the narrow HTTP 400 response shape
 - it applies to HTTP upstreams that otherwise establish a working session
 - it does not special-case Krisp, Todoist, or any specific hostname
 

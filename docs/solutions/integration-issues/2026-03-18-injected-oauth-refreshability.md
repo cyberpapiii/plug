@@ -24,14 +24,16 @@ That had two bad effects:
 - when the target server is configured for OAuth and has a concrete
   `oauth_client_id`, injected credentials are stored under that client id
 - those injected credentials then participate in the normal refresh path
-- when the server config does not provide a usable OAuth client identity,
-  `plug` keeps the synthetic `injected` marker and tells the operator that
-  auto-refresh is unavailable
+- when config does not provide an OAuth client identity, `plug` reuses a valid
+  persisted client identity when one is available and the injected credential
+  includes a refresh token
+- only when no usable configured or persisted identity exists does `plug` keep
+  the synthetic `injected` marker and report auto-refresh as unavailable
 
 ## Key decision
 
-Refreshability is derived from the configured server identity, not from whether
-the injected token payload happened to include a refresh token.
+Refreshability requires both a refresh token and a usable OAuth client identity,
+preferring configured identity and then a valid persisted identity.
 
 Why:
 

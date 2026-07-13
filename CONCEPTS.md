@@ -2,6 +2,33 @@
 
 Shared domain vocabulary for this project — entities, named processes, and status concepts with project-specific meaning. Seeded with core domain vocabulary, then accretes as ce-compound and ce-compound-refresh process learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 
+## Routing and downstreams
+
+### Downstream
+A client that connects to Plug and consumes the aggregated MCP surface, distinct from an Upstream that Plug connects to on the client's behalf.
+
+Downstreams may use different transports, capabilities, and visibility policies while sharing the same upstream runtime. Their identity is also the ownership boundary for targeted notifications, active calls, tasks, and resource subscriptions.
+
+### Route
+The authoritative mapping from a downstream-visible MCP item to the Upstream and original identity that own it.
+
+Routes are published as coherent snapshots so listing and invocation see the same ownership view. When a route changes, persistent state tied to the old owner, such as a resource subscription, must be reconciled rather than inferred only from the new snapshot.
+
+### Resource subscription
+A downstream request for change notifications on a resource URI, represented in Plug as shared membership backed by one confirmed upstream subscription.
+
+The first member creates remote state and the last member drains it. Acknowledged membership must remain tied to the Upstream that confirmed it, including across caller cancellation and route changes.
+
+### Shared daemon runtime
+The Plug service runtime that owns reusable upstream connections and serves local downstream sessions, allowing multiple clients to share one configured MCP runtime.
+
+It normally runs in the background, but the same shared runtime can run interactively. It is distinct from the per-client standalone fallback created when a downstream cannot connect to the shared service; operator status should identify which runtime supplied each observation.
+
+### Runtime truth
+An observation obtained from the live runtime that owns the relevant state, including explicit scope or unavailability when the complete runtime cannot be queried.
+
+Runtime truth takes precedence over configuration inference for health, sessions, auth state, and routed capabilities; failure to inspect it is reported as unknown or unavailable, not converted into a healthy default.
+
 ## Upstream lifecycle and health
 
 ### Upstream

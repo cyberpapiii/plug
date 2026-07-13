@@ -11,6 +11,9 @@ tags:
   - test-stability
 module: docs + plug
 date: 2026-03-07
+status: stale
+stale_date: 2026-07-13
+stale_reason: "Historical v0.2 closeout evidence; current project truth is docs/PROJECT-STATE-SNAPSHOT.md plus code on main."
 symptom: |
   After the merged Phase 1-3 work, the top-level tracked docs still described the old `v0.1`
   checkpoint and multiple already-completed gaps as if they were future work. During the closeout

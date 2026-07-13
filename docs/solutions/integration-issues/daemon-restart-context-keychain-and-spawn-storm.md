@@ -54,7 +54,7 @@ Two compounding issues, neither of which is a code regression:
 
 **Start (or restart) the daemon in the user's login session, and never kill it out from under live connect clients.**
 
-- To activate a newly-installed binary: run `cargo install --path plug --force`, then let the **MCP host apps** respawn their `plug connect` clients (they run in the login session and auto-spawn a daemon with Keychain access), **or** run `plug start` in the user's own Terminal. Do not `kill` the daemon from an automation/sandboxed shell.
+- To activate a local build, use `scripts/dev-reinstall.sh` so the staged binary is signed and verified before atomic replacement, then run `plug stop && plug start` in the user's login session. Let MCP host apps reconnect normally; do not `kill` the daemon from an automation/sandboxed shell.
 - If a clean restart is needed, prefer restarting the host apps (Claude Desktop, the Claude Code session) over killing the daemon directly — that avoids the per-client respawn storm and guarantees login-session Keychain access.
 
 ## Why This Works
@@ -63,7 +63,7 @@ A login-session process inherits the approved Keychain ACL for `plug`, so the OA
 
 ## Prevention
 
-- **The merge is not the install.** Landing code on `main` does nothing to the running binary — `cargo install --path plug --force` replaces `~/.cargo/bin/plug`, and the services must restart to pick it up. Answer "is the latest installed?" with that, and stop.
+- **The merge is not the install.** Landing code on `main` does nothing to the running binary. The signed local reinstall and a login-session `plug stop && plug start` are separate deployment steps.
 - **Never restart the plug daemon from a non-login-session context** (agent shells, `nohup`, launchd jobs that aren't in the GUI session). Keychain-backed OAuth will hang the whole startup.
 - **Never `kill` the daemon while `plug connect` clients are live** — it triggers a competing-daemon storm. Restart the host apps instead, or accept that the connects must re-converge.
 - **Concurrent daemon starts also race OAuth `refresh_token` exchanges** (refresh tokens are single-use/rotating), which can invalidate stored tokens and force a re-auth. One more reason to keep daemon startup single-instance and session-scoped.

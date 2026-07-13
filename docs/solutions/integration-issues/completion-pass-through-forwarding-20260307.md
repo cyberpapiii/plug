@@ -79,7 +79,7 @@ fn complete(&self, request: CompleteRequestParams, _context: ...) -> ... {
 }
 ```
 
-**Step 3: Add IPC dispatch** (`plug/src/daemon.rs`)
+**Step 3: Add IPC dispatch** (`plug/src/daemon/mcp_dispatch.rs`)
 
 Added `"completion/complete"` arm that deserializes `CompleteRequestParams` from JSON params and forwards to `tool_router.complete_request()`.
 
@@ -103,9 +103,7 @@ The fix: extract the original name from `prompt_routes` (which stores `(server_i
 
 ## Related Documentation
 
-- `docs/solutions/integration-issues/output-schema-stripped-from-tool-definitions-20260307.md` — Phase A2
 - `docs/plans/2026-03-07-feat-completion-pass-through-plan.md` — Phase A3 plan
-- `docs/research/2026-03-07-mcp-feature-adoption-analysis.md` — P2-MEDIUM priority
 
 ### PRs
 

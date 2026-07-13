@@ -33,7 +33,7 @@ The codebase also had no explicit operator configuration for certificates or key
 
 ### 1. Add downstream TLS config to `HttpConfig`
 
-In [plug-core/src/config/mod.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-downstream-https-serving/plug-core/src/config/mod.rs), add:
+In [`plug-core/src/config/mod.rs`](../../../plug-core/src/config/mod.rs), add:
 - `tls_cert_path: Option<PathBuf>`
 - `tls_key_path: Option<PathBuf>`
 
@@ -48,7 +48,7 @@ That last rule is important: the feature should not allow accidental `0.0.0.0` c
 
 ### 2. Add a shared rustls provider helper
 
-A new helper lives in [plug-core/src/tls.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-downstream-https-serving/plug-core/src/tls.rs):
+A shared helper lives in [`plug-core/src/tls.rs`](../../../plug-core/src/tls.rs):
 
 ```rust
 pub fn ensure_rustls_provider_installed() {
@@ -63,9 +63,9 @@ This gives the process a single ring-backed rustls bootstrap convention instead 
 
 ### 3. Install the provider at process startup and use HTTPS only at the serve edge
 
-In [plug/src/main.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-downstream-https-serving/plug/src/main.rs), `plug_core::tls::ensure_rustls_provider_installed()` now runs at startup.
+In [`plug/src/main.rs`](../../../plug/src/main.rs), `plug_core::tls::ensure_rustls_provider_installed()` runs at startup.
 
-In [plug/src/runtime.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-downstream-https-serving/plug/src/runtime.rs), `cmd_serve()` was refactored so the transport-edge helper decides between:
+In [`plug/src/runtime.rs`](../../../plug/src/runtime.rs), the transport-edge helper decides between:
 - plain HTTP via `axum_server::bind(...)`
 - HTTPS via `axum_server::bind_rustls(...)`
 

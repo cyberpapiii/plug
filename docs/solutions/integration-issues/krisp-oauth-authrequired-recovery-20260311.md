@@ -7,6 +7,9 @@ symptom: "`plug auth login --server krisp` succeeds and `plug auth status` shows
 root_cause: "The runtime startup path resolves OAuth headers from `current_access_token()` cache only. Persisted credentials on disk are not enough if the in-memory cache is empty, so the daemon can remain stuck in `AuthRequired` after a successful login."
 date: 2026-03-11
 branch: fix/claude-remote-protocol-version
+status: stale
+stale_date: 2026-07-13
+stale_reason: "Incident archaeology only; current OAuth recovery uses unified credential snapshots, refresh exchange, reconnect, and daemon auth-state signaling that this document does not cover."
 ---
 
 # Krisp OAuth AuthRequired Recovery Gap

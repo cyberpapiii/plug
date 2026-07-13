@@ -142,8 +142,7 @@ TransportType::Http => {
         StreamableHttpClientTransportConfig::with_uri(url);
 
     if let Some(ref token) = config.auth_token {
-        transport_config =
-            transport_config.auth_header(format!("Bearer {token}"));
+        transport_config = transport_config.auth_header(token.as_str().to_string());
     }
 
     let transport =
@@ -157,7 +156,7 @@ TransportType::Http => {
 
 **Key API patterns**:
 - `StreamableHttpClientTransportConfig::with_uri(url)` — constructor takes `&str`
-- `.auth_header(format!("Bearer {token}"))` — builder method for auth
+- `.auth_header(token)` — RMCP expects raw token material and constructs the Bearer header
 - `StreamableHttpClientTransport::from_config(config)` — creates transport from config
 - Same `().serve(transport).await` pattern as stdio transport
 
@@ -402,3 +401,4 @@ pub async fn shutdown_all(&self) {
 - [docs/PLAN.md](../../PLAN.md) — Full project plan with Phase 2 requirements
 - [docs/ARCHITECTURE.md](../../ARCHITECTURE.md) — Component design and data flows
 - [PR #2](https://github.com/cyberpapiii/plug/pull/2) — Phase 2 implementation
+- [RMCP Streamable HTTP authentication requires raw bearer tokens](rmcp-streamable-http-auth-requires-raw-bearer-tokens.md) — current credential-boundary contract and wire-level regression

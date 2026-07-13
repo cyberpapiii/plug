@@ -1,5 +1,7 @@
 ---
-module: System
+title: "Management action menu repaint jitter in the CLI"
+category: ui-bugs
+module: plug/views
 date: 2026-03-05
 problem_type: ui_bug
 component: tooling
@@ -117,5 +119,5 @@ Simplifying the options back to plain labels reduced the redraw surface to the c
 
 ## Related Issues
 
-- See also: [phase4-tui-dashboard-daemon-patterns.md](../integration-issues/phase4-tui-dashboard-daemon-patterns.md)
+- This guidance applies to the current `dialoguer`-based CLI. The retired full-screen TUI used a different rendering model.
 - See also: [rmcp-sdk-integration-patterns-plug-20260303.md](../integration-issues/rmcp-sdk-integration-patterns-plug-20260303.md)

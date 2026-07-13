@@ -191,3 +191,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 - Never let one slow SSE client stall global notification delivery.
 - Re-check session liveness when delivering notifications, not only when handling requests.
 - Preserve downstream request identity early so later progress/cancellation work has something real to attach to.
+- If a change claims to add correlation, require both forward tracking and a reverse lookup from protocol-visible identity to active work.

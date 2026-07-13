@@ -192,7 +192,7 @@ impl fmt::Display for SecretString {
 }
 ```
 
-`#[serde(transparent)]` means config files work without changes. `Display` is used for `format!("Bearer {token}")` in HTTP auth headers.
+`#[serde(transparent)]` means config files work without changes. This was the original implementation context; current `SecretString` redacts both `Debug` and `Display`. Plaintext is exposed only with `as_str()` at the narrow request-construction boundary, and RMCP receives the raw token so it can construct the Bearer header exactly once.
 
 ### 6. UTF-8 Safe Env Var Expansion
 
@@ -281,9 +281,10 @@ Input: prefixed_tool_name, arguments
 
 - [Phase 2 HTTP Transport Learnings](mcp-multiplexer-http-transport-phase2.md) — ArcSwap, ToolRouter extraction, CancellationToken patterns
 - [rmcp SDK Integration Patterns](rmcp-sdk-integration-patterns-plug-20260303.md) — Non-exhaustive structs, RwLock vs OnceLock, Figment config
+- [RMCP Streamable HTTP authentication requires raw bearer tokens](rmcp-streamable-http-auth-requires-raw-bearer-tokens.md) — current outgoing HTTP credential contract
 - [Phase 3 Plan](../../plans/2026-03-03-feat-phase-3-resilience-token-efficiency-plan.md) — Full technical spec
-- [Architecture Decisions](../DECISIONS.md) — ADR-005 (client limits), ADR-006 (crate choices)
-- [Risk Register](../RISKS.md) — R4 (server compatibility), R7 (Gemini timeout)
+- [Architecture Decisions](../../DECISIONS.md) — ADR-005 (client limits), ADR-006 (crate choices)
+- [Risk Register](../../RISKS.md) — R4 (server compatibility), R7 (Gemini timeout)
 
 ## Test Coverage
 

@@ -35,6 +35,7 @@ Implemented on `main`:
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
 - OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, doctor checks, and correct HTTP auth header construction (PR #36, PR #47)
+- static-token Streamable HTTP auth passes raw token material to RMCP 2.2 so the transport emits exactly one Bearer prefix, protected by a wire-level regression
 - mock OAuth provider integration coverage for metadata discovery, auth-code exchange persistence with state cleanup, token refresh persistence, and reconnect using refreshed credentials (PR #51)
 - daemon IPC notification parity: progress, cancelled, list_changed, resource subscribe/unsubscribe, and targeted resource update forwarding
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)
@@ -130,8 +131,9 @@ On 2026-07-12, `main` absorbed the 24-plan improve program plus four rounds of
 counter-review repairs. The user-visible result is stronger reconnect and SSE
 replay behavior, atomic resource subscription ownership across route refreshes,
 bounded owner-scoped task teardown, safer downstream OAuth persistence, faster
-catalog refresh, and non-blocking oversized artifact writes. The source-build
-minimum is now Rust 1.88 and `rmcp` stays within the 1.7 release line. The final
+catalog refresh, and non-blocking oversized artifact writes. At that point the source-build
+minimum became Rust 1.88 and `rmcp` was constrained to the 1.7 release line; the
+RMCP 2.2 upgrade on 2026-07-13 superseded that dependency constraint. The final
 workspace gate passed 857 tests plus clippy, formatting, MSRV compilation,
 RustSec advisories, and todo-status checks. See
 [`RELEASE-NOTES-2026-07-12-codex-5.6-sol.md`](RELEASE-NOTES-2026-07-12-codex-5.6-sol.md)

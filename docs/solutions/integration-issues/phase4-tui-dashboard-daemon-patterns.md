@@ -6,6 +6,9 @@ module: TUI/Daemon
 symptom: "Multiple patterns and learnings from Phase 4 implementation"
 root_cause: "Architectural decisions and implementation patterns for TUI rendering, daemon IPC, security, and event-driven state management"
 date: 2026-03-04
+status: stale
+stale_date: 2026-07-13
+stale_reason: "The full-screen TUI was removed; only selected daemon and broadcast principles remain current, so this composite must not be used as present architecture guidance."
 ---
 
 # Phase 4 TUI Dashboard and Daemon Mode Patterns

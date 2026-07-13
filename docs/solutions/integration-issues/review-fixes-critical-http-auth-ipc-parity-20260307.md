@@ -26,7 +26,7 @@ related:
   - docs/brainstorms/2026-03-07-review-fixes-critical-brainstorm.md
   - docs/plans/2026-03-07-fix-review-fixes-critical-plan.md
   - plug-core/src/server/mod.rs
-  - plug/src/daemon.rs
+  - plug/src/daemon/mod.rs
   - plug/src/ipc_proxy.rs
   - plug-core/src/proxy/mod.rs
   - plug-core/src/notifications.rs
@@ -50,6 +50,11 @@ real and severe enough to fix immediately:
 
 The HTTP upstream path now uses `token.as_str()` instead of `Display`, so auth headers use the real
 secret while logs remain redacted.
+
+That historical fix controls secret extraction, not scheme formatting. With RMCP 2.2, Plug passes
+the extracted value as a raw token to `StreamableHttpClientTransportConfig::auth_header`; RMCP owns
+the single `Bearer` prefix. See
+[RMCP Streamable HTTP authentication requires raw bearer tokens](rmcp-streamable-http-auth-requires-raw-bearer-tokens.md).
 
 ### 2. Add daemon IPC capabilities and broader MCP dispatch
 

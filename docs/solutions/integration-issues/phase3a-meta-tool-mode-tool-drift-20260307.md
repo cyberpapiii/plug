@@ -62,6 +62,9 @@ shared router so stdio and HTTP inherited the same behavior automatically.
 That keeps canonical routing intact while allowing `tools/list` to expose a different surface when
 `meta_tool_mode` is enabled.
 
+Current configuration uses client-aware `lazy_tools` modes. `meta_tool_mode` remains only as a
+deprecated compatibility input and should not be used for new configuration.
+
 ### 2. Add an opt-in `meta_tool_mode` config flag
 
 `Config` and `RouterConfig` now carry `meta_tool_mode: bool`, defaulting to `false`.

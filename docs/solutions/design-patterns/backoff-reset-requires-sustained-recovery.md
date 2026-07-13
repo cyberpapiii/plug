@@ -131,6 +131,6 @@ In every case the fix is the same shape: replace "reset on the success the actio
 
 ## Related
 
-- `integration-issues/2026-03-18-reload-health-refresh-coalescing.md` — adjacent: a per-server recovery-task claim flag so the health loop launches only one recovery task at a time. Same domain (health-loop ticks over-triggering recovery during flapping), different primitive (debounce + claim flag, not a backoff-counter reset gate). Moderate overlap — consolidation review candidate if a "health-loop recovery discipline" doc emerges.
-- `integration-issues/phase3-resilience-token-efficiency.md` — prior art on circuit-breaker `Open → HalfOpen` cycling and "counter reset on recovery" hazards (already labeled historical / rmcp-1.0.0-era).
+- [Reload startup batching and health-refresh coalescing](../integration-issues/2026-03-18-reload-health-refresh-coalescing.md) — adjacent per-server recovery-task claiming and refresh debouncing; the primitive is distinct from a backoff reset gate.
+- [Phase 3 resilience and token efficiency](../integration-issues/phase3-resilience-token-efficiency.md) — prior art on circuit-breaker `Open → HalfOpen` cycling and "counter reset on recovery" hazards (already labeled historical / RMCP-1.0.0-era).
 - Landed on `main` via PR #67 (active upstream supervision); built on the first-class `degraded` state (PR #61) and per-upstream metrics (PR #60).

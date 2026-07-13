@@ -7,6 +7,9 @@ severity: p3
 component: tui, proxy, daemon
 pr: 5
 branch: fix/p3-polish-018-020
+status: stale
+stale_date: 2026-07-13
+stale_reason: "Mixed historical record: the TUI surface was removed and the RouterConfig and tracing implementations have since changed; no single current successor preserves all three topics."
 symptoms: |
   1. TUI redraws unnecessarily on ConfigReloaded/CircuitBreakerTripped events
   2. Navigation keys set dirty flag even when selection doesn't change
@@ -87,7 +90,7 @@ The dirty flag is a contract with the render loop. Only visual state changes war
 Single `From<&Config>` impl alongside the `RouterConfig` definition:
 
 ```rust
-// proxy/mod.rs — single source of truth
+// historical location: the plug-core proxy module
 impl From<&Config> for RouterConfig {
     fn from(config: &Config) -> Self {
         Self {
@@ -106,7 +109,7 @@ let router_config = RouterConfig::from(&config);
 
 ### Why This Works
 
-The `From` trait is idiomatic Rust for struct-to-struct conversion. Placing the impl next to `RouterConfig` in `proxy/mod.rs` centralizes the mapping. The dependency direction (`proxy` → `config`) matches the existing module graph — no circular dependencies introduced.
+The `From` trait is idiomatic Rust for struct-to-struct conversion. Placing the impl next to `RouterConfig` in the `plug-core` proxy module centralizes the mapping. The dependency direction (`proxy` → `config`) matches the existing module graph — no circular dependencies introduced.
 
 ---
 

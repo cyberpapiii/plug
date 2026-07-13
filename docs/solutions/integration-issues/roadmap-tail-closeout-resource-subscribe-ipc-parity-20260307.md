@@ -7,7 +7,7 @@ components:
   - plug-core/src/http/server.rs
   - plug-core/src/session/stateful.rs
   - plug-core/src/ipc.rs
-  - plug/src/daemon.rs
+  - plug/src/daemon/mod.rs
   - plug/src/ipc_proxy.rs
   - plug/src/runtime.rs
 problem_type: protocol-parity-closeout
@@ -45,7 +45,7 @@ At the same time, the repo still carried dead TUI dependencies (`ratatui`, `cros
 
 ### 1. Add subscription bookkeeping to `ToolRouter`
 
-In [plug-core/src/proxy/mod.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-roadmap-tail-closeout/plug-core/src/proxy/mod.rs), `ToolRouter` now tracks:
+Historically, [`plug-core/src/proxy/mod.rs`](../../../plug-core/src/proxy/mod.rs) introduced subscription bookkeeping. Its current concurrency and ownership model is documented in [Resource subscription transitions and owner reconciliation](../architecture-patterns/resource-subscription-transitions-and-owner-reconciliation.md).
 
 - canonical resource URI -> downstream subscriber targets
 - downstream target -> subscribed resource URIs
@@ -78,13 +78,13 @@ Daemon-backed `plug connect` needed real push delivery, not capability masking.
 
 The fix was:
 
-- extend [plug-core/src/ipc.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-roadmap-tail-closeout/plug-core/src/ipc.rs) with:
+- extend [`plug-core/src/ipc.rs`](../../../plug-core/src/ipc.rs) with:
   - `AttachNotifications`
   - `McpNotification`
   - protocol version bump to `3`
-- add a daemon-side notification hub in [plug/src/daemon.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-roadmap-tail-closeout/plug/src/daemon.rs)
-- allow `IpcProxyHandler` to attach a dedicated daemon notification stream in [plug/src/runtime.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-roadmap-tail-closeout/plug/src/runtime.rs)
-- run a self-healing notification supervisor in [plug/src/ipc_proxy.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-roadmap-tail-closeout/plug/src/ipc_proxy.rs) that forwards MCP notifications back to the downstream stdio client
+- add a daemon-side notification hub in [`plug/src/daemon/`](../../../plug/src/daemon/)
+- allow `IpcProxyHandler` to attach a dedicated daemon notification stream in [`plug/src/runtime.rs`](../../../plug/src/runtime.rs)
+- run a self-healing notification supervisor in [`plug/src/ipc_proxy.rs`](../../../plug/src/ipc_proxy.rs) that forwards MCP notifications back to the downstream stdio client
 
 This preserved product parity without rewriting the primary IPC request path.
 
@@ -112,7 +112,7 @@ The original HTTP teardown only handled:
 
 That still leaked subscriptions for naturally expired sessions.
 
-[plug-core/src/session/stateful.rs](/Users/robdezendorf/.config/superpowers/worktrees/plug/feat-roadmap-tail-closeout/plug-core/src/session/stateful.rs) now supports a removal hook, and the HTTP runtime registers router cleanup once when it constructs the session store. That means:
+[`plug-core/src/session/stateful.rs`](../../../plug-core/src/session/stateful.rs) supports a removal hook, and the HTTP runtime registers router cleanup once when it constructs the session store. That means:
 
 - explicit delete
 - validation-time expiry

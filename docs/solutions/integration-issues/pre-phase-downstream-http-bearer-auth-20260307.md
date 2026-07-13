@@ -79,7 +79,7 @@ Auth middleware is the outermost application layer (but inside body limit for Do
 - `plug-core/src/http/server.rs` — Auth middleware, AuthStatus enum, check_bearer_token helper, auth-aware discovery
 - `plug-core/src/http/error.rs` — HttpError::Unauthorized variant with JSON-RPC error + WWW-Authenticate header
 - `plug-core/src/doctor.rs` — check_http_auth diagnostic (Warn for missing, Warn for wrong perms, Pass otherwise)
-- `plug/src/daemon.rs` — Uses shared write_token_file instead of inline file-writing
+- `plug/src/daemon/` — Uses shared write_token_file instead of inline file-writing
 - `plug/src/runtime.rs` — Loads/generates token at serve startup for non-loopback binds
 - `plug/src/views/overview.rs` — Surfaces auth status in `plug status`, `--show-token` flag
 - `plug/src/main.rs` — `--show-token` CLI arg

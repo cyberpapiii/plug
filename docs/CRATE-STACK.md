@@ -7,12 +7,12 @@ about dependency shape, not roadmap status.
 
 ## Core Runtime
 
-- `rmcp` `~1.7` (resolved: 1.7.0)
+- `rmcp` `=2.2.0`
   MCP protocol implementation for both downstream server handlers and upstream client sessions.
-  Version policy: tilde-pinned. Patch releases flow; a minor bump (1.8+) is a
-  deliberate manifest edit that must go through review and the full workspace
-  suite, because rmcp minors can change negotiated protocol behavior. The
-  1.7.0 adoption itself was such a reviewed bump (todo 068).
+  Version policy: exact pin. RMCP releases can change model types, negotiated
+  protocol behavior, and transport helper contracts, so every upgrade is a
+  deliberate manifest edit with focused compatibility tests and the full
+  workspace suite.
 
 - `tokio`
   Shared async runtime across daemon, stdio proxying, and HTTP serving.
@@ -75,7 +75,7 @@ about dependency shape, not roadmap status.
 - `tracing`, `tracing-subscriber`, `tracing-appender`
   Structured logging and daemon log files.
 
-- `fs2`
+- `fs4`
   PID file locking.
 
 - `subtle`, `hex`

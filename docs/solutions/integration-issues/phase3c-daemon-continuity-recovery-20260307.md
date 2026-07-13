@@ -28,8 +28,8 @@ severity: high
 related:
   - docs/brainstorms/2026-03-07-phase3c-daemon-continuity-recovery-brainstorm.md
   - docs/plans/2026-03-07-feat-phase3c-daemon-continuity-recovery-plan.md
-  - /Users/robdezendorf/Documents/GitHub/plug/docs/plans/2026-03-05-feat-daemon-client-session-continuity-plan.md
-  - plug/src/daemon.rs
+  - docs/plans/2026-03-05-feat-daemon-client-session-continuity-plan.md
+  - plug/src/daemon/mod.rs
   - plug/src/ipc_proxy.rs
   - plug/src/runtime.rs
 ---
@@ -94,7 +94,7 @@ After:
 The continuity test needed isolated socket, PID, and token paths without mutating process
 environment unsafely in Rust 2024.
 
-The fix was a `#[cfg(test)]` runtime/log path override inside `plug/src/daemon.rs`, used only by
+The fix was a `#[cfg(test)]` runtime/log path override inside the `plug/src/daemon/` module, used only by
 tests. That keeps the continuity test isolated from any real local daemon.
 
 ### 3. Prove continuity end to end
