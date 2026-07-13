@@ -59,6 +59,17 @@ pub(super) struct SubscriptionRegistry {
     /// the upstream subscription on either side of a `refresh_tools`
     /// snapshot publish.
     owner_resolver: std::sync::RwLock<Option<OwnerResolver>>,
+    /// Invoked from the detached transition task whenever a subscribe
+    /// transition confirms (owner recorded, entry upgraded), with the URI
+    /// and the confirmed owner's server id. Set once via
+    /// `set_post_confirm_hook()` (production: `ToolRouter::new` wires a
+    /// closure that `tokio::spawn`s an owner-vs-published-route check and
+    /// rebinds on drift), so a subscribe that confirms against a stale
+    /// owner gets a heal no downstream cancellation can kill. The hook
+    /// runs while the per-URI transition lock is held, so it must only
+    /// spawn — it must never do async work inline or re-enter the registry
+    /// synchronously.
+    post_confirm_hook: std::sync::RwLock<Option<PostConfirmHook>>,
 }
 
 /// Maps an upstream server id to its current subscription-capable handle.
@@ -67,6 +78,11 @@ pub(super) struct SubscriptionRegistry {
 /// resolve it through this at drain time.
 pub(super) type OwnerResolver =
     Arc<dyn Fn(&str) -> Option<Arc<dyn UpstreamResourceOps>> + Send + Sync>;
+
+/// Post-confirm callback: `(uri, confirmed_owner_server_id)`. See the
+/// `post_confirm_hook` field for the contract (spawn-only, no synchronous
+/// registry re-entry).
+pub(super) type PostConfirmHook = Arc<dyn Fn(String, String) + Send + Sync>;
 
 /// Signal broadcast to everyone waiting on a particular transition:
 /// `None` while still in flight, `Some(result)` once it resolves.
@@ -213,6 +229,7 @@ impl SubscriptionRegistry {
             next_generation: AtomicU64::new(0),
             engine: std::sync::RwLock::new(None),
             owner_resolver: std::sync::RwLock::new(None),
+            post_confirm_hook: std::sync::RwLock::new(None),
         })
     }
 
@@ -234,6 +251,21 @@ impl SubscriptionRegistry {
 
     fn owner_resolver_snapshot(&self) -> Option<OwnerResolver> {
         self.owner_resolver
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub(super) fn set_post_confirm_hook(&self, hook: PostConfirmHook) {
+        let mut guard = self
+            .post_confirm_hook
+            .write()
+            .expect("post-confirm hook RwLock poisoned — prior panic");
+        *guard = Some(hook);
+    }
+
+    fn post_confirm_hook_snapshot(&self) -> Option<PostConfirmHook> {
+        self.post_confirm_hook
             .read()
             .ok()
             .and_then(|guard| guard.clone())
@@ -283,6 +315,26 @@ impl SubscriptionRegistry {
     /// via its recorded owner instead of erroring "resource not found".
     pub(super) fn has_entry(&self, uri: &str) -> bool {
         self.entries.contains_key(uri)
+    }
+
+    /// Recorded owner for `uri`: outer `None` = no entry tracked at all,
+    /// inner `None` = entry exists but no upstream confirmation yet
+    /// (transition in flight). Used by the post-subscribe self-check to
+    /// compare the server actually holding the subscription against the
+    /// published route.
+    pub(super) fn owner_snapshot(&self, uri: &str) -> Option<Option<String>> {
+        self.entries.get(uri).map(|e| e.owner_server_id.clone())
+    }
+
+    /// Whether the entry for `uri` (in any state) still tracks `target` as
+    /// a member. Used by the post-subscribe final verify: a watch outcome
+    /// can come from a superseded transition, so the honest answer is the
+    /// registry's current state, not the watch result.
+    pub(super) fn tracks_member(&self, uri: &str, target: &NotificationTarget) -> bool {
+        self.entries
+            .get(uri)
+            .map(|e| e.members.contains(target))
+            .unwrap_or(false)
     }
 
     fn transition_lock(&self, uri: &str) -> Arc<Mutex<()>> {
@@ -457,13 +509,23 @@ impl SubscriptionRegistry {
                     // that Draining case — the upstream subscription now
                     // exists on this server, and the queued drain needs the
                     // recorded owner to unsubscribe the right one.
+                    let mut owner_recorded = false;
                     if let Some(mut entry) = self.entries.get_mut(&uri)
                         && entry.generation == generation
                     {
-                        entry.owner_server_id = Some(owner_server_id);
+                        entry.owner_server_id = Some(owner_server_id.clone());
                         if matches!(entry.state, EntryState::Pending(_)) {
                             entry.state = EntryState::Active;
                         }
+                        owner_recorded = true;
+                    }
+                    // Post-confirm heal hook: fires only when the owner was
+                    // actually recorded (a superseded generation must not
+                    // trigger heals from stale ownership info). The hook
+                    // only spawns — see the field's contract — so invoking
+                    // it under the held transition lock cannot deadlock.
+                    if owner_recorded && let Some(hook) = self.post_confirm_hook_snapshot() {
+                        hook(uri.clone(), owner_server_id.clone());
                     }
                 }
                 Err(_) => {
@@ -778,7 +840,12 @@ impl SubscriptionRegistry {
     /// subscribed.
     ///
     /// Awaits completion so `refresh_tools`'s own await reflects final
-    /// state, matching historical synchronous-return semantics.
+    /// state, matching historical synchronous-return semantics, and
+    /// returns the transition's outcome: `Err` when the migration failed
+    /// and pruned the entry's local subscribers. A rebind superseded by a
+    /// newer transition still reports `Ok` (its watch does) — callers that
+    /// need a laundering-proof answer must consult the registry's final
+    /// state (see `subscribe_resource`'s final verify).
     pub(super) async fn rebind(
         self: &Arc<Self>,
         uri: &str,
@@ -786,7 +853,7 @@ impl SubscriptionRegistry {
         old_upstream: Option<Arc<dyn UpstreamResourceOps>>,
         new_server_id: &str,
         new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
-    ) {
+    ) -> Result<(), McpError> {
         enum Decision {
             Migrate {
                 generation: u64,
@@ -803,7 +870,7 @@ impl SubscriptionRegistry {
         let decision = match self.entries.get_mut(uri) {
             None => {
                 // No active subscribers left to migrate.
-                return;
+                return Ok(());
             }
             Some(mut entry) => {
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -830,7 +897,7 @@ impl SubscriptionRegistry {
                     },
                     tx,
                 );
-                let _ = Self::await_transition(rx).await;
+                Self::await_transition(rx).await
             }
             Decision::Migrate { generation, tx, rx } => {
                 let registry = Arc::clone(self);
@@ -850,7 +917,7 @@ impl SubscriptionRegistry {
                         )
                         .await;
                 });
-                let _ = Self::await_transition(rx).await;
+                Self::await_transition(rx).await
             }
         }
     }
@@ -1027,41 +1094,62 @@ impl super::ToolRouter {
         }
 
         self.resource_subscriptions
-            .subscribe(uri, target, &server_id, as_upstream_ops(upstream))
+            .subscribe(uri, target.clone(), &server_id, as_upstream_ops(upstream))
             .await?;
 
         // One-shot post-subscribe self-check. The route was resolved from a
         // snapshot loaded before the upstream transition ran; a
         // `refresh_tools` publish landing in between can move the URI to a
         // different server, and if the entry was created inside that pass's
-        // classify→publish window the running pass never saw it. Re-load
-        // the snapshot and heal the drift now instead of waiting for the
-        // next refresh. Runs outside any transition lock (the transition
-        // task released it before reporting its outcome); the rebind's own
-        // transition serializes on the per-URI lock as usual. No loop: if
-        // the route moves again, the next refresh's classify pass (which
-        // compares recorded owner against the new snapshot) reconciles it.
-        // A route that vanished entirely is left alone — the next refresh's
-        // prune plus the entry's recorded owner already drain routeless
-        // entries.
-        let moved_to = {
-            let snapshot = self.cache.load();
-            snapshot
-                .resource_routes
-                .get(uri)
-                .filter(|current| current.as_str() != server_id)
-                .cloned()
+        // classify→publish window the running pass never saw it. Compare
+        // the entry's RECORDED owner — not the server this call resolved: a
+        // retry against an already-skewed entry resolves the NEW route and
+        // would see nothing wrong — against the re-loaded snapshot and heal
+        // the drift now, capturing the outcome. Runs outside any transition
+        // lock (the transition task released it before reporting its
+        // outcome); the rebind's own transition serializes on the per-URI
+        // lock as usual. No loop: if the route moves again, the registry's
+        // post-confirm hook and the next refresh's classify pass reconcile
+        // it. A route that vanished entirely is left alone — the next
+        // refresh's prune plus the entry's recorded owner already drain
+        // routeless entries.
+        let recorded_owner = self.resource_subscriptions.owner_snapshot(uri).flatten();
+        let published_route = self.cache.load().resource_routes.get(uri).cloned();
+        let heal_outcome = match (&recorded_owner, &published_route) {
+            (Some(owner), Some(route)) if owner != route => {
+                tracing::debug!(
+                    uri = %uri,
+                    old_server = %owner,
+                    new_server = %route,
+                    "route moved during subscribe; rebinding to current owner"
+                );
+                Some(self.rebind_subscription_route(uri, owner, route).await)
+            }
+            _ => None,
         };
-        if let Some(new_server_id) = moved_to {
-            tracing::debug!(
-                uri = %uri,
-                old_server = %server_id,
-                new_server = %new_server_id,
-                "route moved during subscribe; rebinding to current owner"
-            );
-            self.rebind_subscription_route(uri, &server_id, &new_server_id)
-                .await;
+
+        // Final verify: the subscribe outcome observed above may have come
+        // from a transition that was superseded (its watch reports Ok even
+        // though the surviving transition did the actual work — and may
+        // have failed and removed the entry), and the heal above prunes the
+        // entry itself when the migration fails. Answer from the registry's
+        // current state instead of trusting the watch result.
+        if self.resource_subscriptions.tracks_member(uri, &target) {
+            return Ok(());
         }
+        if heal_outcome.is_some_and(|outcome| outcome.is_err())
+            || !self.resource_subscriptions.has_entry(uri)
+        {
+            return Err(McpError::internal_error(
+                format!(
+                    "resource subscription lost during route reconciliation for {uri}; retry subscribe"
+                ),
+                None,
+            ));
+        }
+        // The entry survived with other members but this caller is no
+        // longer among them — it unsubscribed (or disconnected) itself
+        // concurrently. Not an error.
         Ok(())
     }
 
@@ -1779,7 +1867,8 @@ mod tests {
                     "new-server",
                     Ok(new_for_rebind),
                 )
-                .await;
+                .await
+                .unwrap();
         });
 
         // Wait until the rebind has at least started (old unsubscribe issued).
@@ -1855,7 +1944,8 @@ mod tests {
                 "new-server",
                 Ok(Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>),
             )
-            .await;
+            .await
+            .unwrap();
 
         // The superseded original drain is a total no-op; give it a chance
         // to (incorrectly) do anything before asserting.
@@ -1950,7 +2040,8 @@ mod tests {
                 "new-server",
                 Ok(Arc::clone(&new_mock) as Arc<dyn UpstreamResourceOps>),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(new_mock.subscribe_call_count(), 0);
         assert_eq!(old_mock.unsubscribe_call_count(), 1);
     }

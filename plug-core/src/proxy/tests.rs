@@ -2133,6 +2133,7 @@ struct SubscribableUpstreamState {
     unsubscribe_log: std::sync::Mutex<Vec<String>>,
     subscribe_gates: std::sync::Mutex<HashMap<String, Arc<SubGate>>>,
     unsubscribe_gates: std::sync::Mutex<HashMap<String, Arc<SubGate>>>,
+    subscribe_errors: std::sync::Mutex<HashSet<String>>,
     subscribe_entered: tokio::sync::Notify,
     unsubscribe_entered: tokio::sync::Notify,
 }
@@ -2145,6 +2146,7 @@ impl SubscribableUpstreamState {
             unsubscribe_log: std::sync::Mutex::new(Vec::new()),
             subscribe_gates: std::sync::Mutex::new(HashMap::new()),
             unsubscribe_gates: std::sync::Mutex::new(HashMap::new()),
+            subscribe_errors: std::sync::Mutex::new(HashSet::new()),
             subscribe_entered: tokio::sync::Notify::new(),
             unsubscribe_entered: tokio::sync::Notify::new(),
         })
@@ -2174,6 +2176,19 @@ impl SubscribableUpstreamState {
             .unwrap()
             .insert(uri.to_string(), Arc::clone(&gate));
         gate
+    }
+
+    /// All subsequent `resources/subscribe` calls for `uri` fail (after
+    /// still being logged/counted) until `clear_subscribe_failure`.
+    fn fail_subscribe(&self, uri: &str) {
+        self.subscribe_errors
+            .lock()
+            .unwrap()
+            .insert(uri.to_string());
+    }
+
+    fn clear_subscribe_failure(&self, uri: &str) {
+        self.subscribe_errors.lock().unwrap().remove(uri);
     }
 
     fn subscribe_count(&self, uri: &str) -> usize {
@@ -2243,6 +2258,17 @@ impl ServerHandler for SubscribableUpstreamHandler {
             state.subscribe_entered.notify_waiters();
             if let Some(gate) = gate {
                 gate.wait().await;
+            }
+            if state
+                .subscribe_errors
+                .lock()
+                .unwrap()
+                .contains(&request.uri)
+            {
+                return Err(McpError::internal_error(
+                    "test-injected subscribe failure".to_string(),
+                    None,
+                ));
             }
             Ok(())
         }
@@ -2346,6 +2372,26 @@ fn sub_target(id: &str) -> NotificationTarget {
     NotificationTarget::Stdio {
         client_id: Arc::from(id),
     }
+}
+
+/// Publish a snapshot whose `resource_routes` maps exactly `uri -> server`,
+/// simulating a `refresh_tools` publish landing without running a pass (so
+/// none of the pass's own reconciliation — classify, rebind, sweep — runs).
+fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
+    router.replace_snapshot(RouterSnapshot {
+        routes: HashMap::new(),
+        tools_all: Arc::new(Vec::new()),
+        meta_tools_all: Arc::new(build_meta_tools()),
+        tools_windsurf: Arc::new(Vec::new()),
+        tools_copilot: Arc::new(Vec::new()),
+        resources_all: Arc::new(Vec::new()),
+        resource_templates_all: Arc::new(Vec::new()),
+        prompts_all: Arc::new(Vec::new()),
+        resource_routes: HashMap::from([(uri.to_string(), server_id.to_string())]),
+        prompt_routes: HashMap::new(),
+        tool_definition_fingerprints: HashMap::new(),
+        tool_risk_inventory: HashMap::new(),
+    });
 }
 
 /// Race manifestation 1 (rebind side): a last-member unsubscribe lands
@@ -2633,14 +2679,15 @@ async fn setup_refresh_parked_pre_publish() -> (
 /// Defect arm 1 (classify owner/route drift): a FIRST subscriber for x
 /// lands entirely inside the parked pass's pre-publish window, resolves
 /// the OLD snapshot, and binds to the old owner. The pass classified
-/// before the entry existed, so the completed refresh leaves the entry
-/// owned by "old" while the published snapshot routes x to "new" — and a
-/// pure old-vs-new route diff would compare new==new forever after. The
-/// next refresh must heal via the recorded owner: rebound onto "new",
-/// old owner unsubscribed, members (and their notification fan-out)
-/// intact, no zero-member entry left anywhere.
+/// before the entry existed, so pure old-vs-new route diffing would
+/// compare new==new forever after — and with refreshes being purely
+/// event-driven, "the next refresh heals it" is a guarantee that may
+/// never fire. The TRIGGERING pass's own post-publish sweep must heal the
+/// skew before `refresh_tools` returns: rebound onto "new", old owner
+/// unsubscribed, members (and their notification fan-out) intact, no
+/// zero-member entry left anywhere. No second refresh is invoked.
 #[tokio::test]
-async fn first_subscribe_during_refresh_window_heals_on_next_refresh() {
+async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     let (_sm, router, old_state, new_state, gate_y, refresh) =
         setup_refresh_parked_pre_publish().await;
 
@@ -2653,23 +2700,23 @@ async fn first_subscribe_during_refresh_window_heals_on_next_refresh() {
     assert_eq!(old_state.subscribe_count("memory://x"), 1);
     assert_eq!(new_state.subscribe_count("memory://x"), 0);
 
+    // Drain the entry's post-confirm hook task against the still-published
+    // OLD snapshot (owner == route, so it no-ops) before releasing the
+    // pass, so the heal below is attributable to the pass's own sweep.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+
     gate_y.open();
     refresh.await.unwrap();
 
-    // The completed pass never saw the entry: route says "new", the
-    // subscription still lives on "old".
+    // The pass classified before the entry existed, but its post-publish
+    // sweep re-classified the recorded owner ("old") against the published
+    // snapshot ("new") and healed the skew before refresh_tools returned.
     assert_eq!(
         router.cache.load().resource_routes.get("memory://x"),
         Some(&"new".to_string())
     );
-    assert_eq!(new_state.subscribe_count("memory://x"), 0);
-    assert_eq!(old_state.unsubscribe_count("memory://x"), 0);
-
-    // The NEXT refresh compares the entry's recorded owner ("old") against
-    // the new snapshot's route ("new") and must emit the healing rebind
-    // even though the old and new route snapshots agree.
-    router.refresh_tools().await;
-
     assert_eq!(
         new_state.subscribe_count("memory://x"),
         1,
@@ -2812,4 +2859,223 @@ async fn routeless_entry_gaining_route_elsewhere_is_rebound() {
         "members must survive the rebind"
     );
     assert_eq!(router.resource_subscriptions.len(), 1);
+}
+
+/// Shared setup for the post-confirm-hook and self-check heal tests: two
+/// subscribable upstreams, routes published with x -> "old".
+async fn setup_two_owner_router() -> (
+    Arc<ServerManager>,
+    Arc<ToolRouter>,
+    Arc<SubscribableUpstreamState>,
+    Arc<SubscribableUpstreamState>,
+) {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+
+    let old_state = SubscribableUpstreamState::new(&["memory://x"]);
+    let new_state = SubscribableUpstreamState::new(&[]);
+    sm.replace_server(
+        "old",
+        connect_subscribable_upstream("old", Arc::clone(&old_state)).await,
+    )
+    .await;
+    sm.replace_server(
+        "new",
+        connect_subscribable_upstream("new", Arc::clone(&new_state)).await,
+    )
+    .await;
+
+    router.refresh_tools().await;
+    assert_eq!(
+        router.cache.load().resource_routes.get("memory://x"),
+        Some(&"old".to_string())
+    );
+
+    (sm, router, old_state, new_state)
+}
+
+/// Defect arm (caller cancellation): the heal must not ride the caller's
+/// cancellable request future. A subscribe whose upstream confirmation is
+/// still parked when a refresh publish moves the URI — and whose
+/// downstream caller is then aborted — has no self-check left to run. The
+/// registry's post-confirm hook fires from the detached transition task
+/// and must heal the skew anyway: new owner subscribed, old owner
+/// unsubscribed, recorded owner updated to the published route.
+#[tokio::test]
+async fn caller_cancelled_subscribe_still_heals_via_post_confirm_hook() {
+    let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
+
+    // The subscriber's upstream subscribe(x) parks on the old server.
+    let gate_sub_x = old_state.close_subscribe_gate("memory://x");
+    let entered_sub_x = old_state.subscribe_entered.notified();
+    let subscribe_router = Arc::clone(&router);
+    let a = tokio::spawn(async move {
+        subscribe_router
+            .subscribe_resource("memory://x", sub_target("a"))
+            .await
+    });
+    entered_sub_x.await;
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+
+    // A refresh publish lands mid-subscribe: x now routes to "new".
+    publish_route_snapshot(&router, "memory://x", "new");
+
+    // The downstream caller disconnects; its request future is dropped
+    // before the transition confirms, so no post-subscribe self-check will
+    // ever run for this call.
+    a.abort();
+    let _ = a.await;
+
+    // The detached transition confirms against the stale owner. The
+    // post-confirm hook must spawn the heal with no caller left alive.
+    gate_sub_x.open();
+
+    for _ in 0..500 {
+        if new_state.subscribe_count("memory://x") == 1
+            && old_state.unsubscribe_count("memory://x") == 1
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        new_state.subscribe_count("memory://x"),
+        1,
+        "the hook must resubscribe on the published owner"
+    );
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        1,
+        "the stale owner must end unsubscribed"
+    );
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert_eq!(new_state.unsubscribe_count("memory://x"), 0);
+    assert_eq!(
+        router.resource_subscriptions.owner_snapshot("memory://x"),
+        Some(Some("new".to_string())),
+        "recorded owner must be the published route"
+    );
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("a")]),
+        "the (disconnected but never unsubscribed) member survives the heal"
+    );
+}
+
+/// Defect arm (retry doesn't heal): a retry/second subscriber against an
+/// already-skewed entry resolves the NEW route, so a self-check comparing
+/// the caller-resolved server against the published route sees nothing
+/// wrong. The self-check must compare the entry's RECORDED owner instead
+/// and heal the skew before returning Ok.
+#[tokio::test]
+async fn retry_subscribe_heals_stale_recorded_owner() {
+    let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
+
+    router
+        .subscribe_resource("memory://x", sub_target("a"))
+        .await
+        .unwrap();
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert_eq!(
+        router.resource_subscriptions.owner_snapshot("memory://x"),
+        Some(Some("old".to_string()))
+    );
+
+    // A refresh publish moved x to "new" while nothing reconciled the
+    // entry (simulated skew: recorded owner "old", published route "new").
+    publish_route_snapshot(&router, "memory://x", "new");
+
+    // A second subscriber piggybacks on the Active entry (no upstream
+    // transition, so no post-confirm hook fires). Its self-check must
+    // detect owner != route via the RECORDED owner and heal before Ok.
+    router
+        .subscribe_resource("memory://x", sub_target("b"))
+        .await
+        .expect("retry against a skewed entry must succeed after healing");
+
+    assert_eq!(
+        new_state.subscribe_count("memory://x"),
+        1,
+        "the heal must resubscribe on the published owner"
+    );
+    assert_eq!(
+        old_state.unsubscribe_count("memory://x"),
+        1,
+        "the stale owner must end unsubscribed"
+    );
+    assert_eq!(old_state.subscribe_count("memory://x"), 1);
+    assert_eq!(
+        router.resource_subscriptions.owner_snapshot("memory://x"),
+        Some(Some("new".to_string()))
+    );
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("a"), sub_target("b")]),
+        "both members must survive the heal"
+    );
+}
+
+/// Defect arm (silent success on failed migration): the self-check heal
+/// unsubscribes the stale owner and, when the new owner's subscribe fails,
+/// the transition prunes the entry — the old contract returned Ok with no
+/// live subscription anywhere. The caller must now get an error, and a
+/// fresh subscribe afterwards must succeed cleanly against the new owner.
+#[tokio::test]
+async fn failed_heal_migration_propagates_error_to_subscriber() {
+    let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
+
+    router
+        .subscribe_resource("memory://x", sub_target("a"))
+        .await
+        .unwrap();
+
+    // Skew the entry (recorded owner "old", published route "new") and
+    // make the new owner reject the migration's subscribe.
+    publish_route_snapshot(&router, "memory://x", "new");
+    new_state.fail_subscribe("memory://x");
+
+    let err = router
+        .subscribe_resource("memory://x", sub_target("b"))
+        .await
+        .expect_err("a failed migration must not be reported as success");
+    assert!(
+        err.message.contains("retry subscribe"),
+        "error must tell the client to retry, got: {}",
+        err.message
+    );
+    assert_eq!(old_state.unsubscribe_count("memory://x"), 1);
+    assert_eq!(
+        new_state.subscribe_count("memory://x"),
+        1,
+        "the failed migration attempt was made"
+    );
+    assert!(
+        !router.resource_subscriptions.has_entry("memory://x"),
+        "the failed migration must prune the entry"
+    );
+
+    // A retry after the failure heals cleanly against the current owner.
+    new_state.clear_subscribe_failure("memory://x");
+    router
+        .subscribe_resource("memory://x", sub_target("b"))
+        .await
+        .expect("a fresh subscribe after the failed migration must succeed");
+    assert_eq!(new_state.subscribe_count("memory://x"), 2);
+    assert_eq!(
+        router.resource_subscriptions.owner_snapshot("memory://x"),
+        Some(Some("new".to_string()))
+    );
+    assert_eq!(
+        router
+            .resource_subscriptions
+            .members_snapshot("memory://x")
+            .unwrap(),
+        HashSet::from([sub_target("b")])
+    );
 }

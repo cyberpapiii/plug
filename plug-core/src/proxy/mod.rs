@@ -182,6 +182,12 @@ pub struct ToolRouter {
     lazy_working_sets: DashMap<String, VecDeque<String>>,
     /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
     task_store: Mutex<TaskStore>,
+    /// Serializes `refresh_tools`' decide-and-mutate phase (subscription
+    /// classify → prune → snapshot publish → rebind) across concurrent
+    /// refresh passes, so one pass cannot interleave reconciliation
+    /// decisions made against a pre-publish snapshot with another pass's
+    /// publish. Per-server listing/fetch work stays outside it.
+    refresh_reconcile_lock: Mutex<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -353,6 +359,20 @@ impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
+        let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
+            routes: HashMap::new(),
+            tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        }));
         let resource_subscriptions = subscriptions::SubscriptionRegistry::new();
         // Drains resolve an entry's recorded owning server to a live handle
         // at drain time — never trusting a handle resolved earlier from the
@@ -366,22 +386,62 @@ impl ToolRouter {
                     .map(subscriptions::as_upstream_ops)
             }));
         }
+        // Post-confirm heal: a subscribe transition can confirm against an
+        // owner the published snapshot no longer routes the URI to (the
+        // publish landed mid-transition, and that pass classified before
+        // the entry existed). The registry invokes this hook from the
+        // detached transition task, so the heal fires even when the
+        // downstream caller's request future was cancelled. The hook body
+        // only spawns: the rebind acquires the same per-URI transition lock
+        // the confirming transition still holds, so it must never run
+        // inline here.
+        {
+            let server_manager = Arc::clone(&server_manager);
+            let cache = Arc::clone(&cache);
+            let registry = Arc::clone(&resource_subscriptions);
+            resource_subscriptions.set_post_confirm_hook(Arc::new(
+                move |uri: String, confirmed_owner: String| {
+                    let server_manager = Arc::clone(&server_manager);
+                    let cache = Arc::clone(&cache);
+                    let registry = Arc::clone(&registry);
+                    tokio::spawn(async move {
+                        let published_route = cache.load().resource_routes.get(&uri).cloned();
+                        let Some(new_server_id) = published_route else {
+                            // Route vanished entirely: the next refresh's
+                            // prune plus the recorded owner drain it.
+                            return;
+                        };
+                        if new_server_id == confirmed_owner {
+                            return;
+                        }
+                        tracing::debug!(
+                            uri = %uri,
+                            old_server = %confirmed_owner,
+                            new_server = %new_server_id,
+                            "subscribe confirmed against stale owner; rebinding to current owner"
+                        );
+                        if let Err(error) = Self::rebind_subscription_route_with(
+                            &server_manager,
+                            &registry,
+                            &uri,
+                            &confirmed_owner,
+                            &new_server_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                uri = %uri,
+                                error = %error,
+                                "post-confirm subscription heal failed to rebind"
+                            );
+                        }
+                    });
+                },
+            ));
+        }
         Self {
             server_manager,
-            cache: Arc::new(ArcSwap::from_pointee(RouterSnapshot {
-                routes: HashMap::new(),
-                tools_all: Arc::new(Vec::new()),
-                meta_tools_all: Arc::new(build_meta_tools()),
-                tools_windsurf: Arc::new(Vec::new()),
-                tools_copilot: Arc::new(Vec::new()),
-                resources_all: Arc::new(Vec::new()),
-                resource_templates_all: Arc::new(Vec::new()),
-                prompts_all: Arc::new(Vec::new()),
-                resource_routes: HashMap::new(),
-                prompt_routes: HashMap::new(),
-                tool_definition_fingerprints: HashMap::new(),
-                tool_risk_inventory: HashMap::new(),
-            })),
+            cache,
             config,
             event_tx: None,
             protocol_notification_tx,
@@ -404,6 +464,7 @@ impl ToolRouter {
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
             task_store: Mutex::new(TaskStore::new()),
+            refresh_reconcile_lock: Mutex::new(()),
         }
     }
 
@@ -1484,6 +1545,17 @@ impl ToolRouter {
 
         let tool_count = tools_all.len();
 
+        // Serialize the decide-and-mutate phase across concurrent refresh
+        // passes: everything from here through the rebind loop (classify →
+        // prune execution → snapshot publish → rebind execution) runs under
+        // this guard, so a second pass cannot classify against a
+        // pre-publish snapshot and then apply those stale decisions around
+        // this pass's publish. The per-server listing above stays
+        // concurrent. If the notification loop's refresh backstop drops
+        // this future mid-phase, the guard is released on drop — tokio's
+        // Mutex does not poison.
+        let reconcile_guard = self.refresh_reconcile_lock.lock().await;
+
         // Classify every currently-tracked subscription URI against the
         // old/new route snapshots. Pure decision — no registry mutation, no
         // upstream calls yet. See `SubscriptionRegistry::classify_route_changes`
@@ -1530,33 +1602,129 @@ impl ToolRouter {
         }
 
         // Rebind subscriptions whose URI still exists but ownership changed,
-        // after publishing the new snapshot (same ordering as before).
+        // after publishing the new snapshot (same ordering as before). A
+        // failed migration already pruned the entry's local subscribers
+        // inside the transition; log and continue.
         for item in &reconciliation {
             if let subscriptions::RouteReconciliation::Rebind {
                 uri,
                 old_server_id,
                 new_server_id,
             } = item
+                && let Err(error) = self
+                    .rebind_subscription_route(uri, old_server_id, new_server_id)
+                    .await
             {
-                self.rebind_subscription_route(uri, old_server_id, new_server_id)
-                    .await;
+                tracing::warn!(
+                    uri = %uri,
+                    error = %error,
+                    "resource subscription rebind failed during route refresh"
+                );
+            }
+        }
+
+        // Release the reconcile guard before the post-publish sweep: the
+        // sweep classifies against the just-published snapshot only, and
+        // must not extend the serialized window it exists to double-check.
+        drop(reconcile_guard);
+
+        // Post-publish sweep. Entries whose subscribe transition confirmed
+        // inside this pass's classify→publish window were invisible to the
+        // classification above, leaving their recorded owner pointing at a
+        // server the published snapshot no longer routes the URI to — and
+        // with refreshes being purely event-driven, nothing else guarantees
+        // a healing pass ever runs. Re-run the classification against the
+        // published snapshot in a DETACHED task (the notification loop's
+        // refresh backstop drops this future on timeout and must not kill a
+        // heal already in flight) and await it, so normal callers — and
+        // tests — observe a fully-reconciled registry before returning.
+        let sweep = tokio::spawn(Self::sweep_subscription_routes(
+            Arc::clone(&self.cache),
+            Arc::clone(&self.resource_subscriptions),
+            Arc::clone(&self.server_manager),
+        ));
+        if sweep.await.is_err() {
+            tracing::warn!("post-publish subscription sweep task failed to complete");
+        }
+    }
+
+    /// Post-publish sweep body: classify every registry entry's recorded
+    /// owner against the CURRENT published snapshot and execute the
+    /// resulting rebinds through the same machinery `refresh_tools` uses.
+    /// Route-vanished entries are intentionally left to the existing
+    /// paths (recorded-owner drains and the next refresh's prune) so a
+    /// subscriber racing a prune keeps its grace window. Takes the Arc'd
+    /// fields it needs instead of `&self` so it can run detached from the
+    /// (cancellable) refresh future.
+    async fn sweep_subscription_routes(
+        cache: Arc<ArcSwap<RouterSnapshot>>,
+        registry: Arc<subscriptions::SubscriptionRegistry>,
+        server_manager: Arc<ServerManager>,
+    ) {
+        let snapshot = cache.load_full();
+        let reconciliation =
+            registry.classify_route_changes(&snapshot.resource_routes, &snapshot.resource_routes);
+        for item in reconciliation {
+            if let subscriptions::RouteReconciliation::Rebind {
+                uri,
+                old_server_id,
+                new_server_id,
+            } = item
+                && let Err(error) = Self::rebind_subscription_route_with(
+                    &server_manager,
+                    &registry,
+                    &uri,
+                    &old_server_id,
+                    &new_server_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    error = %error,
+                    "post-publish sweep failed to rebind resource subscription"
+                );
             }
         }
     }
 
     /// Resolve the upstream handles/capabilities for a subscription rebind
-    /// and execute it, awaiting completion. Shared by `refresh_tools`'
-    /// rebind arm and the post-subscribe owner/route self-check in
-    /// `subscribe_resource` (subscriptions.rs): both resolve the old owner
-    /// as a route-derived fallback (the registry prefers the entry's
-    /// recorded owner at drain time) and gate the new owner on subscribe
-    /// support.
-    async fn rebind_subscription_route(&self, uri: &str, old_server_id: &str, new_server_id: &str) {
-        let old_upstream = self
-            .server_manager
+    /// and execute it, awaiting completion and returning the transition's
+    /// outcome. Shared by `refresh_tools`' rebind arm and the
+    /// post-subscribe owner/route self-check in `subscribe_resource`
+    /// (subscriptions.rs): both resolve the old owner as a route-derived
+    /// fallback (the registry prefers the entry's recorded owner at drain
+    /// time) and gate the new owner on subscribe support.
+    async fn rebind_subscription_route(
+        &self,
+        uri: &str,
+        old_server_id: &str,
+        new_server_id: &str,
+    ) -> Result<(), McpError> {
+        Self::rebind_subscription_route_with(
+            &self.server_manager,
+            &self.resource_subscriptions,
+            uri,
+            old_server_id,
+            new_server_id,
+        )
+        .await
+    }
+
+    /// `rebind_subscription_route` without `&self`, for callers that only
+    /// hold the Arc'd fields: the detached post-publish sweep and the
+    /// registry's post-confirm heal hook (both wired in `new()`).
+    async fn rebind_subscription_route_with(
+        server_manager: &Arc<ServerManager>,
+        registry: &Arc<subscriptions::SubscriptionRegistry>,
+        uri: &str,
+        old_server_id: &str,
+        new_server_id: &str,
+    ) -> Result<(), McpError> {
+        let old_upstream = server_manager
             .get_upstream(old_server_id)
             .map(subscriptions::as_upstream_ops);
-        let new_owner = match self.server_manager.get_upstream(new_server_id) {
+        let new_owner = match server_manager.get_upstream(new_server_id) {
             None => Err(subscriptions::RebindSkipReason::NewOwnerMissing),
             Some(upstream) => {
                 let supports_subscribe = upstream
@@ -1572,9 +1740,9 @@ impl ToolRouter {
                 }
             }
         };
-        self.resource_subscriptions
+        registry
             .rebind(uri, old_server_id, old_upstream, new_server_id, new_owner)
-            .await;
+            .await
     }
 
     /// Call a tool by its prefixed name, routing to the correct upstream server.
