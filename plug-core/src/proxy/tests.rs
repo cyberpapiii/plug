@@ -3081,3 +3081,17 @@ async fn failed_heal_migration_propagates_error_to_subscriber() {
         HashSet::from([sub_target("b")])
     );
 }
+
+#[test]
+fn dropping_router_releases_subscription_registry() {
+    let server_manager = Arc::new(ServerManager::new());
+    let router = ToolRouter::new(server_manager, test_router_config());
+    let registry = Arc::downgrade(&router.resource_subscriptions);
+
+    drop(router);
+
+    assert!(
+        registry.upgrade().is_none(),
+        "the registry-owned post-confirm hook must not retain the registry itself"
+    );
+}
