@@ -24,7 +24,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
-use crate::downstream_oauth::resource_scopes;
+use crate::downstream_oauth::{
+    AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
+    resource_scopes,
+};
 use crate::mcp_http_headers::{HEADER_MISMATCH_CODE, HeaderMismatch, validate_mirrored_headers};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
@@ -396,8 +399,11 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             "/.well-known/oauth-protected-resource/mcp",
             get(get_oauth_protected_resource_metadata),
         )
-        .route("/oauth/authorize", get(oauth_authorize_not_implemented))
-        .route("/oauth/token", post(oauth_token_not_implemented))
+        .route("/oauth/register", post(oauth_register))
+        .route("/oauth/authorize", get(oauth_authorize))
+        .route("/_plug/oauth/authorize", post(oauth_authorize_decision))
+        .route("/oauth/token", post(oauth_token))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state.clone());
 
     // MCP protocol routes — protected by auth + origin validation middleware
@@ -451,6 +457,13 @@ struct OAuthAuthorizeParams {
     code_challenge: String,
     code_challenge_method: String,
     scope: Option<String>,
+    resource: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OAuthConsentDecision {
+    consent_id: String,
+    decision: String,
 }
 
 /// Validate bearer token for non-loopback HTTP servers.
@@ -468,8 +481,9 @@ async fn validate_bearer_auth(
             .as_ref()
             .ok_or_else(|| HttpError::Internal("missing downstream OAuth manager".to_string()))?;
         let metadata_url = protected_resource_metadata_url(manager.base_url());
-        let scopes = resource_scopes(&manager.config.oauth_scopes);
-        let scope = (!scopes.is_empty()).then(|| scopes.join(" "));
+        let advertised_scopes = resource_scopes(&manager.config.oauth_scopes);
+        let scope = (!advertised_scopes.is_empty()).then(|| advertised_scopes.join(" "));
+        let required_scopes = vec!["tools:read".to_string()];
 
         let auth_status = if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
             let auth = auth_header
@@ -483,13 +497,23 @@ async fn validate_bearer_auth(
                     metadata_url: metadata_url.clone(),
                     scope: scope.clone(),
                 })?;
-            if manager.validate_access_token(auth).await {
-                AuthStatus::Authenticated
-            } else {
-                return Err(HttpError::UnauthorizedWithMetadata {
-                    metadata_url,
-                    scope,
-                });
+            match manager
+                .validate_access_token_for(auth, &required_scopes, &manager.resource())
+                .await
+            {
+                AccessTokenValidation::Valid(_) => AuthStatus::Authenticated,
+                AccessTokenValidation::InsufficientScope => {
+                    return Err(HttpError::InsufficientScopeWithMetadata {
+                        metadata_url,
+                        scope: scope.unwrap_or_else(|| "tools:read".to_string()),
+                    });
+                }
+                AccessTokenValidation::Invalid => {
+                    return Err(HttpError::UnauthorizedWithMetadata {
+                        metadata_url,
+                        scope,
+                    });
+                }
             }
         } else {
             return Err(HttpError::UnauthorizedWithMetadata {
@@ -1064,24 +1088,18 @@ async fn get_oauth_authorization_server_metadata(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let base = manager.config.public_base_url.trim_end_matches('/');
-    let token_endpoint_auth_methods_supported = match manager.config.oauth_client_secret {
-        Some(_) => vec!["client_secret_basic", "client_secret_post"],
-        None => vec!["none"],
-    };
-    let mut grant_types_supported = vec!["authorization_code", "refresh_token"];
-    if manager.config.oauth_client_secret.is_some() {
-        grant_types_supported.push("client_credentials");
-    }
+    let base = manager.base_url();
     let response = Json(json!({
         "issuer": base,
-        "authorization_endpoint": format!("{base}/oauth/authorize"),
-        "token_endpoint": format!("{base}/oauth/token"),
+        "authorization_endpoint": manager.authorization_endpoint(),
+        "token_endpoint": manager.token_endpoint(),
+        "registration_endpoint": manager.registration_endpoint(),
         "response_types_supported": ["code"],
-        "grant_types_supported": grant_types_supported,
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": token_endpoint_auth_methods_supported,
+        "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": manager.config.oauth_scopes,
+        "client_id_metadata_document_supported": true,
     }));
     (StatusCode::OK, response).into_response()
 }
@@ -1103,122 +1121,170 @@ async fn get_oauth_protected_resource_metadata(
     (StatusCode::OK, response).into_response()
 }
 
-async fn oauth_authorize_not_implemented(
+async fn oauth_register(
     State(state): State<Arc<HttpState>>,
-    Query(params): Query<OAuthAuthorizeParams>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+    Json(request): Json<ClientRegistrationRequest>,
+) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-
-    if params.response_type != "code" {
-        return (StatusCode::BAD_REQUEST, "unsupported response_type").into_response();
-    }
-
-    match manager
-        .build_authorize_redirect(
-            &params.client_id,
-            &params.redirect_uri,
-            &params.state,
-            &params.code_challenge,
-            &params.code_challenge_method,
-            params.scope.as_deref(),
-        )
-        .await
-    {
-        Ok(location) => {
-            let mut response = StatusCode::FOUND.into_response();
-            if let Ok(value) = HeaderValue::from_str(&location) {
-                response.headers_mut().insert(header::LOCATION, value);
-                response
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "invalid redirect location generated",
-                )
-                    .into_response()
-            }
-        }
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            format!("authorization request rejected: {error}"),
-        )
-            .into_response(),
+    let rate_key = registration_rate_key(&headers);
+    match manager.register_client(request, &rate_key).await {
+        Ok(registration) => (StatusCode::CREATED, Json(registration)).into_response(),
+        Err(error) => oauth_error_response(&error),
     }
 }
 
-async fn oauth_token_not_implemented(
+async fn oauth_authorize(
     State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    Form(params): Form<HashMap<String, String>>,
-) -> impl IntoResponse {
+    Query(params): Query<OAuthAuthorizeParams>,
+) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-
-    let grant_type = match params.get("grant_type").map(String::as_str) {
-        Some(value) => value,
-        None => return (StatusCode::BAD_REQUEST, "missing grant_type").into_response(),
-    };
-
-    let (client_id, client_secret) = match manager.client_credentials_from_headers_or_form(
-        &headers,
-        params.get("client_id").map(String::as_str),
-        params.get("client_secret").map(String::as_str),
-    ) {
-        Ok(credentials) => credentials,
-        Err(error) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                format!("client authentication failed: {error}"),
+    match manager
+        .begin_authorization(AuthorizationRequest {
+            response_type: &params.response_type,
+            client_id: &params.client_id,
+            redirect_uri: &params.redirect_uri,
+            state: &params.state,
+            code_challenge: &params.code_challenge,
+            code_challenge_method: &params.code_challenge_method,
+            scope: params.scope.as_deref(),
+            resource: &params.resource,
+        })
+        .await
+    {
+        Ok(consent) => {
+            let scopes = html_escape(&consent.scopes.join(" "));
+            let local_consent_endpoint = manager.local_consent_endpoint();
+            let html = format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Authorize Plug</title></head><body><main><h1>Authorize {}</h1><p><strong>{}</strong> wants access to Plug tools at <strong>{}</strong>.</p><p>Scope: <code>{}</code></p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"consent_id\" value=\"{}\"><button type=\"submit\" name=\"decision\" value=\"approve\">Allow</button><button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form><p><small>Approval is submitted directly to Plug on this Mac. Remote requests cannot approve access.</small></p></main></body></html>",
+                html_escape(&consent.client_name),
+                html_escape(&consent.client_name),
+                html_escape(&consent.redirect_host),
+                scopes,
+                html_escape(&local_consent_endpoint),
+                html_escape(&consent.consent_id),
+            );
+            let mut response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                html,
             )
                 .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().insert(
+                "X-Content-Type-Options",
+                HeaderValue::from_static("nosniff"),
+            );
+            if let Ok(csp) = HeaderValue::from_str(&format!(
+                "default-src 'none'; form-action {}; base-uri 'none'; frame-ancestors 'none'",
+                local_consent_endpoint
+            )) {
+                response
+                    .headers_mut()
+                    .insert("Content-Security-Policy", csp);
+            }
+            response
         }
-    };
+        Err(error) => {
+            if !matches!(
+                error,
+                DownstreamOauthError::InvalidClient
+                    | DownstreamOauthError::InvalidClientMetadata
+                    | DownstreamOauthError::InvalidRedirectUri
+                    | DownstreamOauthError::MetadataFetch
+            ) && manager
+                .client_redirect_allowed(&params.client_id, &params.redirect_uri)
+                .await
+            {
+                let location =
+                    oauth_authorization_error_redirect(&params.redirect_uri, &params.state, &error);
+                if let Ok(location) = HeaderValue::from_str(&location) {
+                    let mut response = StatusCode::FOUND.into_response();
+                    response.headers_mut().insert(header::LOCATION, location);
+                    return response;
+                }
+            }
+            oauth_error_response(&error)
+        }
+    }
+}
 
-    let result = match grant_type {
-        "authorization_code" => {
-            let code = match params.get("code") {
-                Some(value) => value,
-                None => return (StatusCode::BAD_REQUEST, "missing code").into_response(),
-            };
-            let redirect_uri = match params.get("redirect_uri") {
-                Some(value) => value,
-                None => return (StatusCode::BAD_REQUEST, "missing redirect_uri").into_response(),
-            };
-            let code_verifier = match params.get("code_verifier") {
-                Some(value) => value,
-                None => return (StatusCode::BAD_REQUEST, "missing code_verifier").into_response(),
+async fn oauth_authorize_decision(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    Form(decision): Form<OAuthConsentDecision>,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !manager.local_approval_request_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let approved = match decision.decision.as_str() {
+        "approve" => true,
+        "deny" => false,
+        _ => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
+    };
+    match manager.decide_consent(&decision.consent_id, approved).await {
+        Ok(redirect) => match HeaderValue::from_str(&redirect.location) {
+            Ok(location) => {
+                let mut response = StatusCode::FOUND.into_response();
+                response.headers_mut().insert(header::LOCATION, location);
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(error) => oauth_error_response(&error),
+    }
+}
+
+async fn oauth_token(
+    State(state): State<Arc<HttpState>>,
+    Form(params): Form<HashMap<String, String>>,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if params.contains_key("client_secret") {
+        return oauth_error_response(&DownstreamOauthError::UnsupportedClientAuthMethod);
+    }
+    let Some(client_id) = params.get("client_id") else {
+        return oauth_error_response(&DownstreamOauthError::InvalidClient);
+    };
+    let Some(resource) = params.get("resource") else {
+        return oauth_error_response(&DownstreamOauthError::InvalidResource);
+    };
+    let result = match params.get("grant_type").map(String::as_str) {
+        Some("authorization_code") => {
+            let (Some(code), Some(redirect_uri), Some(code_verifier)) = (
+                params.get("code"),
+                params.get("redirect_uri"),
+                params.get("code_verifier"),
+            ) else {
+                return oauth_error_response(&DownstreamOauthError::InvalidGrant);
             };
             manager
-                .exchange_authorization_code(
-                    &client_id,
-                    client_secret.as_deref(),
-                    code,
-                    redirect_uri,
-                    code_verifier,
-                )
+                .exchange_authorization_code(client_id, code, redirect_uri, code_verifier, resource)
                 .await
         }
-        "refresh_token" => {
-            let refresh_token = match params.get("refresh_token") {
-                Some(value) => value,
-                None => return (StatusCode::BAD_REQUEST, "missing refresh_token").into_response(),
+        Some("refresh_token") => {
+            let Some(refresh_token) = params.get("refresh_token") else {
+                return oauth_error_response(&DownstreamOauthError::InvalidGrant);
             };
             manager
-                .exchange_refresh_token(&client_id, client_secret.as_deref(), refresh_token)
+                .exchange_refresh_token(client_id, refresh_token, resource)
                 .await
         }
-        "client_credentials" => {
-            manager
-                .exchange_client_credentials(
-                    &client_id,
-                    client_secret.as_deref(),
-                    params.get("scope").map(String::as_str),
-                )
-                .await
-        }
-        _ => return (StatusCode::BAD_REQUEST, "unsupported grant_type").into_response(),
+        _ => Err(DownstreamOauthError::UnsupportedGrantType),
     };
 
     match result {
@@ -1234,12 +1300,85 @@ async fn oauth_token_not_implemented(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            format!("token exchange failed: {error}"),
-        )
-            .into_response(),
+        Err(error) => oauth_error_response(&error),
     }
+}
+
+fn oauth_error_response(error: &DownstreamOauthError) -> Response {
+    let (status, code) = match error {
+        DownstreamOauthError::InvalidClient => (StatusCode::UNAUTHORIZED, "invalid_client"),
+        DownstreamOauthError::InvalidClientMetadata | DownstreamOauthError::InvalidRedirectUri => {
+            (StatusCode::BAD_REQUEST, "invalid_client_metadata")
+        }
+        DownstreamOauthError::InvalidScope => (StatusCode::BAD_REQUEST, "invalid_scope"),
+        DownstreamOauthError::AccessDenied => (StatusCode::BAD_REQUEST, "access_denied"),
+        DownstreamOauthError::InvalidGrant | DownstreamOauthError::PkceVerificationFailed => {
+            (StatusCode::BAD_REQUEST, "invalid_grant")
+        }
+        DownstreamOauthError::UnsupportedGrantType => {
+            (StatusCode::BAD_REQUEST, "unsupported_grant_type")
+        }
+        DownstreamOauthError::UnsupportedClientAuthMethod => {
+            (StatusCode::BAD_REQUEST, "invalid_client")
+        }
+        DownstreamOauthError::RateLimited => {
+            (StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable")
+        }
+        DownstreamOauthError::RegistrationQuotaExceeded => {
+            (StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable")
+        }
+        DownstreamOauthError::InvalidResource
+        | DownstreamOauthError::InvalidAuthorizationRequest
+        | DownstreamOauthError::MetadataFetch => (StatusCode::BAD_REQUEST, "invalid_request"),
+        DownstreamOauthError::Persistence(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+    };
+    let mut response = (status, Json(json!({ "error": code }))).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn registration_rate_key(headers: &HeaderMap) -> String {
+    headers
+        .get("cf-connecting-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|address| address.to_string())
+        .unwrap_or_else(|| "local-or-unknown".to_string())
+}
+
+fn oauth_authorization_error_redirect(
+    redirect_uri: &str,
+    state: &str,
+    error: &DownstreamOauthError,
+) -> String {
+    let code = match error {
+        DownstreamOauthError::InvalidScope => "invalid_scope",
+        DownstreamOauthError::AccessDenied => "access_denied",
+        DownstreamOauthError::RateLimited => "temporarily_unavailable",
+        _ => "invalid_request",
+    };
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("error", code)
+        .append_pair("state", state)
+        .finish();
+    format!(
+        "{redirect_uri}{}{query}",
+        if redirect_uri.contains('?') { '&' } else { '?' }
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn protected_resource_metadata_url(base_url: &str) -> String {
@@ -1720,6 +1859,24 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    fn isolated_oauth_manager(
+        scopes: Vec<String>,
+    ) -> crate::downstream_oauth::DownstreamOauthManager {
+        let path = std::env::temp_dir().join(format!(
+            "plug-oauth-http-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            crate::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: scopes,
+                local_port: 3282,
+            },
+            path,
+        )
+        .expect("isolated OAuth manager")
+    }
 
     #[test]
     fn trace_id_prefers_valid_w3c_traceparent() {
@@ -3619,15 +3776,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: None,
-                    oauth_scopes: vec!["tools:read".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3667,7 +3816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_mode_metadata_endpoint_limits_auth_methods_for_confidential_client() {
+    async fn oauth_mode_metadata_advertises_public_clients_only() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(
             sm,
@@ -3688,15 +3837,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: Some("secret-123".to_string().into()),
-                    oauth_scopes: vec!["tools:read".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3722,12 +3863,17 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(
             value["token_endpoint_auth_methods_supported"],
-            json!(["client_secret_basic", "client_secret_post"])
+            json!(["none"])
         );
         assert_eq!(
             value["grant_types_supported"],
-            json!(["authorization_code", "refresh_token", "client_credentials"])
+            json!(["authorization_code", "refresh_token"])
         );
+        assert_eq!(
+            value["registration_endpoint"],
+            "https://plug.example.com/oauth/register"
+        );
+        assert_eq!(value["client_id_metadata_document_supported"], true);
     }
 
     #[tokio::test]
@@ -3752,15 +3898,10 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: Some("secret-123".to_string().into()),
-                    oauth_scopes: vec!["tools:read".to_string(), "offline_access".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec![
+                "tools:read".to_string(),
+                "offline_access".to_string(),
+            ])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3794,7 +3935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_client_credentials_flow_issues_bearer_without_refresh_token() {
+    async fn oauth_client_credentials_flow_is_rejected() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(
             sm,
@@ -3815,15 +3956,10 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: Some("secret-123".to_string().into()),
-                    oauth_scopes: vec!["tools:read".to_string(), "offline_access".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec![
+                "tools:read".to_string(),
+                "offline_access".to_string(),
+            ])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3846,26 +3982,12 @@ mod tests {
             .unwrap();
 
         let token_resp = app.clone().oneshot(token_req).await.unwrap();
-        assert_eq!(token_resp.status(), StatusCode::OK);
+        assert_eq!(token_resp.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(token_resp.into_body(), 10_000)
             .await
             .expect("body bytes");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
-        assert!(value["access_token"].as_str().is_some());
-        assert!(value.get("refresh_token").is_none());
-        assert_eq!(value["scope"], "tools:read");
-
-        let mcp_req = HttpRequest::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", value["access_token"].as_str().unwrap()),
-            )
-            .body(Body::from("{}"))
-            .unwrap();
-        let mcp_resp = app.oneshot(mcp_req).await.unwrap();
-        assert_eq!(mcp_resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(value["error"], "invalid_client");
     }
 
     #[tokio::test]
@@ -3890,15 +4012,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: None,
-                    oauth_scopes: vec!["tools:read".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3950,15 +4064,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: Some("secret-123".to_string().into()),
-                    oauth_scopes: vec!["tools:read".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3970,14 +4076,63 @@ mod tests {
         });
         let app = build_router(state);
 
+        let registration_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"client_name":"Cursor","redirect_uris":["https://client.example.com/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"]}"#,
+            ))
+            .unwrap();
+        let registration_resp = app.clone().oneshot(registration_req).await.unwrap();
+        assert_eq!(registration_resp.status(), StatusCode::CREATED);
+        let registration_body = axum::body::to_bytes(registration_resp.into_body(), 10_000)
+            .await
+            .expect("registration body");
+        let registration: serde_json::Value =
+            serde_json::from_slice(&registration_body).expect("registration json");
+        let client_id = registration["client_id"].as_str().expect("client id");
+
         let authorize_req = HttpRequest::builder()
             .method("GET")
-            .uri("/oauth/authorize?response_type=code&client_id=client-123&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=abc123&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools:read")
+            .uri(format!("/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=abc123&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp"))
             .body(Body::empty())
             .unwrap();
         let authorize_resp = app.clone().oneshot(authorize_req).await.unwrap();
-        assert_eq!(authorize_resp.status(), StatusCode::FOUND);
-        let location = authorize_resp
+        assert_eq!(authorize_resp.status(), StatusCode::OK);
+        let consent_body = axum::body::to_bytes(authorize_resp.into_body(), 20_000)
+            .await
+            .expect("consent body");
+        let consent_html = String::from_utf8(consent_body.to_vec()).expect("consent html");
+        let consent_id = consent_html
+            .split("name=\"consent_id\" value=\"")
+            .nth(1)
+            .and_then(|value| value.split('\"').next())
+            .expect("consent id");
+        let remote_approval = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "plug.example.com")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "consent_id={consent_id}&decision=approve"
+            )))
+            .unwrap();
+        let remote_response = app.clone().oneshot(remote_approval).await.unwrap();
+        assert_eq!(remote_response.status(), StatusCode::FORBIDDEN);
+        let consent_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "127.0.0.1:3282")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "consent_id={consent_id}&decision=approve"
+            )))
+            .unwrap();
+        let consent_resp = app.clone().oneshot(consent_req).await.unwrap();
+        assert_eq!(consent_resp.status(), StatusCode::FOUND);
+        let location = consent_resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
@@ -3992,12 +4147,8 @@ mod tests {
             .method("POST")
             .uri("/oauth/token")
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header(
-                header::AUTHORIZATION,
-                "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz",
-            )
             .body(Body::from(format!(
-                "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+                "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
             )))
             .unwrap();
         let token_resp = app.clone().oneshot(token_req).await.unwrap();
@@ -4031,9 +4182,8 @@ mod tests {
             .method("POST")
             .uri("/oauth/token")
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header(header::AUTHORIZATION, "Basic Y2xpZW50LTEyMzpzZWNyZXQtMTIz")
             .body(Body::from(format!(
-                "grant_type=refresh_token&refresh_token={refresh_token}"
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
             )))
             .unwrap();
         let refresh_resp = app.oneshot(refresh_req).await.unwrap();
@@ -4088,15 +4238,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(crate::downstream_oauth::DownstreamOauthManager::new(
-                crate::downstream_oauth::DownstreamOauthConfig {
-                    public_base_url: "https://plug.example.com".to_string(),
-                    oauth_client_id: Some("client-123".to_string()),
-                    oauth_client_secret: None,
-                    oauth_scopes: vec!["tools:read".to_string()],
-                    redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
-                },
-            )),
+            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),

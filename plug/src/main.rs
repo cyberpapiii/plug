@@ -365,6 +365,25 @@ pub(crate) enum AuthCommands {
         #[arg(long)]
         server: String,
     },
+    /// List or revoke downstream OAuth client registrations
+    Clients {
+        #[command(subcommand)]
+        command: DownstreamOauthClientCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DownstreamOauthClientCommands {
+    /// List registered downstream OAuth clients without exposing credentials
+    List,
+    /// Revoke a client and every code or token issued to it
+    Revoke {
+        /// Registered client ID
+        client_id: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]

@@ -2067,6 +2067,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "sha2",
  "sse-stream",
  "subtle",
  "tempfile",

@@ -48,7 +48,7 @@ pub(crate) fn save_config(
         // of umask), falling back to truncate-and-tighten if it already
         // exists so a previously world-readable config gets locked down on
         // the next save too. config.toml can hold plaintext secrets
-        // (`http.oauth_client_secret`, per-server `auth_token`), matching the
+        // (for example per-server `auth_token`), matching the
         // 0600 convention used by auth.rs/oauth.rs/downstream_oauth.
         let file = std::fs::OpenOptions::new()
             .write(true)

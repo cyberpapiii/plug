@@ -85,16 +85,42 @@ OAuth mode:
 [http]
 auth_mode = "oauth"
 public_base_url = "https://plug.example.com"
-oauth_client_id = "plug-client"
-oauth_client_secret = "$PLUG_DOWNSTREAM_CLIENT_SECRET"
-oauth_scopes = ["mcp:read", "mcp:write"]
+oauth_scopes = ["tools:read"]
 ```
+
+Clients connect with only the MCP URL, for example
+`https://plug.example.com/mcp`. Plug supports public-client Dynamic Client
+Registration and OAuth Client ID Metadata Documents; it does not require a
+shared client secret or a per-client TOML entry. Each client must use PKCE
+S256, an exact registered HTTPS or loopback redirect (or Cursor's exact
+application-claimed native callback), the MCP `resource` parameter, and
+explicit approval on Plug's consent page.
 
 OAuth discovery endpoints:
 
 - `/.well-known/oauth-authorization-server`
 - `/.well-known/oauth-protected-resource`
 - `/.well-known/oauth-protected-resource/mcp`
+- `/oauth/register`
+
+Registrations that are never approved expire after one hour; active clients
+expire after 90 idle days. Plug retains at most 100 registrations and limits
+each source address to 10 new registrations per hour. Access
+tokens last one hour; refresh tokens last 30 days and rotate every time they
+are used. Registrations and tokens live in an issuer-specific owner-only state
+file and survive normal restarts.
+
+List or revoke registered clients without revealing tokens:
+
+```sh
+plug auth clients list
+plug auth clients revoke <client-id>
+```
+
+Revoking a client immediately invalidates all of its codes, access tokens, and
+refresh tokens. The former single-client `oauth_client_id`,
+`oauth_client_secret`, and shared redirect allowlist settings are intentionally
+unsupported; remove them and authorize each remote client again after upgrade.
 
 Operator endpoints use a separate `x-plug-operator-token` and are not protected by downstream MCP bearer/OAuth tokens. Treat the operator token as an administrative secret.
 

@@ -83,6 +83,13 @@ The current product shape is:
 All major roadmap features are now implemented on `main`.
 No required roadmap work remains for the current production-ready bar.
 
+The July 17 downstream OAuth cutover supersedes the older single-client
+allowlist and secretless-client guard described in the historical entries
+below. Current behavior is dynamic multi-client registration plus Client ID
+Metadata Documents, per-client exact redirects, explicit consent, PKCE S256,
+resource/scope enforcement, rotation, expiry, and operator revocation. There
+is no legacy singular-client configuration path.
+
 Optional future scope only:
 
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope

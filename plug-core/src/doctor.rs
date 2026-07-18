@@ -1389,7 +1389,7 @@ command = "example-server"
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
-        config.http.oauth_client_id = Some("client-123".to_string());
+        config.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
         config.http.port = 62003;
 
         let result = check_http_auth(&config).await;

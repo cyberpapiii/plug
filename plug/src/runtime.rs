@@ -5,13 +5,14 @@ use std::sync::Arc;
 use crate::OutputFormat;
 use crate::daemon;
 use crate::ui::{print_banner, print_info_line, print_success_line};
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use tokio_util::sync::CancellationToken;
 
 const OPERATOR_LIVE_SESSIONS_PATH: &str = "/_plug/live-sessions";
+const OPERATOR_OAUTH_CLIENTS_PATH: &str = "/_plug/oauth/clients";
 const OPERATOR_TOKEN_HEADER: &str = "x-plug-operator-token";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +190,46 @@ async fn operator_live_sessions(
     Ok(Json(OperatorLiveSessionsResponse { sessions }))
 }
 
+fn operator_authorized(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(OPERATOR_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|provided| plug_core::auth::verify_auth_token(provided, expected))
+}
+
+async fn operator_oauth_clients(
+    State(state): State<Arc<OperatorHttpState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<plug_core::downstream_oauth::RegisteredClientSummary>>, StatusCode> {
+    if !operator_authorized(&headers, &state.operator_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let manager = state
+        .http_state
+        .downstream_oauth
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(manager.list_clients().await))
+}
+
+async fn operator_revoke_oauth_client(
+    State(state): State<Arc<OperatorHttpState>>,
+    AxumPath(client_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> StatusCode {
+    if !operator_authorized(&headers, &state.operator_token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Some(manager) = state.http_state.downstream_oauth.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
+    match manager.revoke_client(&client_id).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn build_runtime_router(
     http_state: Arc<plug_core::http::server::HttpState>,
     operator_token: Arc<str>,
@@ -199,6 +240,11 @@ fn build_runtime_router(
     });
     let operator_router = Router::new()
         .route(OPERATOR_LIVE_SESSIONS_PATH, get(operator_live_sessions))
+        .route(OPERATOR_OAUTH_CLIENTS_PATH, get(operator_oauth_clients))
+        .route(
+            &format!("{OPERATOR_OAUTH_CLIENTS_PATH}/{{client_id}}"),
+            delete(operator_revoke_oauth_client),
+        )
         .with_state(operator_state);
 
     plug_core::http::server::build_router(http_state).merge(operator_router)
@@ -229,7 +275,9 @@ fn build_configured_http_runtime(
     )?);
     let downstream_oauth =
         plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
-            .map(plug_core::downstream_oauth::DownstreamOauthManager::new);
+            .map(plug_core::downstream_oauth::DownstreamOauthManager::try_new)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!(error))?;
 
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: tool_router.clone(),
@@ -1025,10 +1073,7 @@ mod tests {
         let http = plug_core::config::HttpConfig {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             public_base_url: None,
-            oauth_client_id: None,
-            oauth_client_secret: None,
             oauth_scopes: None,
-            oauth_redirect_uri_allowlist: Vec::new(),
             bind_address: "127.0.0.1".to_string(),
             port: addr.port(),
             allowed_origins: Vec::new(),

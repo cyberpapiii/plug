@@ -7,16 +7,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-Detailed notes: [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md) and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
+Detailed notes: [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
 
 ### Added
 
+- Standards-based downstream OAuth for multiple public MCP clients, including RFC 7591 Dynamic Client Registration, OAuth Client ID Metadata Documents, explicit consent, PKCE S256, resource-bound tokens, and client list/revoke commands.
 - End-to-end config watcher coverage for normal saves, atomic-renames, parse failures, and unrelated file changes.
 - IPC proxy characterization coverage for reconnects, retries, malformed frames, notification ordering, and replayed session state.
 - CI checks for the declared Rust 1.88 minimum version, RustSec advisories, and todo-file status consistency.
 
 ### Changed
 
+- Remote MCP clients now connect with only Plug's `/mcp` URL and receive isolated registrations and grants. The old singular client ID, shared secret, and redirect allowlist configuration are intentionally removed; existing remote clients authorize once after upgrading.
 - Reconnecting daemon clients now restore capabilities, resource subscriptions, client log level, and other session state before resuming work.
 - Catalog refresh fetches resources, templates, and prompts concurrently and avoids repeated server lookups and unnecessary filtered views.
 - Oversized artifact writes run on the blocking pool instead of occupying an async runtime worker.
@@ -48,6 +50,7 @@ Detailed notes: [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-
 
 ### Security
 
+- Downstream authorization codes, access tokens, refresh tokens, redirects, revocation, quotas, and expiry are isolated by client; registration never grants tool access, and all durable OAuth state is written atomically with owner-only permissions.
 - OAuth secret directories are created with owner-only permissions.
 - Downstream OAuth state persistence fails closed on unsafe temporary-file permissions and enforces owner-only permissions after rename.
 - Expired OAuth records are swept, equivalent scope sets reuse tokens, and client-credentials requests reuse live tokens instead of growing the store on every call.

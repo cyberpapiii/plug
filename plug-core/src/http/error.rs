@@ -35,6 +35,9 @@ pub enum HttpError {
         scope: Option<String>,
     },
 
+    #[error("forbidden: insufficient scope")]
+    InsufficientScopeWithMetadata { metadata_url: String, scope: String },
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -91,6 +94,26 @@ impl IntoResponse for HttpError {
                 }
                 return response;
             }
+            HttpError::InsufficientScopeWithMetadata {
+                metadata_url,
+                scope,
+            } => {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32003, "message": "insufficient scope" },
+                    "id": null
+                });
+                let mut response = (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
+                let header_value = format!(
+                    "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"{metadata_url}\""
+                );
+                if let Ok(value) = HeaderValue::from_str(&header_value) {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, value);
+                }
+                return response;
+            }
             HttpError::InvalidOrigin => (StatusCode::FORBIDDEN, "forbidden"),
             HttpError::SessionRequired => (StatusCode::BAD_REQUEST, "session ID required"),
             HttpError::SessionNotFound => (StatusCode::NOT_FOUND, "session not found"),
@@ -138,6 +161,14 @@ mod tests {
                     scope: Some("tools:read".into()),
                 },
                 StatusCode::UNAUTHORIZED,
+            ),
+            (
+                HttpError::InsufficientScopeWithMetadata {
+                    metadata_url: "https://plug.example.com/.well-known/oauth-protected-resource"
+                        .into(),
+                    scope: "tools:read".into(),
+                },
+                StatusCode::FORBIDDEN,
             ),
             (HttpError::InvalidOrigin, StatusCode::FORBIDDEN),
             (HttpError::SessionRequired, StatusCode::BAD_REQUEST),
@@ -196,5 +227,24 @@ mod tests {
         assert!(header.starts_with("Bearer"));
         assert!(header.contains("resource_metadata="));
         assert!(header.contains("scope=\"tools:read\""));
+    }
+
+    #[test]
+    fn insufficient_scope_sets_rfc6750_challenge() {
+        let response = HttpError::InsufficientScopeWithMetadata {
+            metadata_url: "https://plug.example.com/.well-known/oauth-protected-resource".into(),
+            scope: "tools:read".into(),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let header = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .expect("www-authenticate header");
+        assert!(header.contains("error=\"insufficient_scope\""));
+        assert!(header.contains("scope=\"tools:read\""));
+        assert!(header.contains("resource_metadata="));
     }
 }

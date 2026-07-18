@@ -274,25 +274,16 @@ fn resolved_policy(mode: LazyToolMode, origin: LazyToolModeOrigin) -> ResolvedLa
 
 /// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
     /// Downstream authentication mode for remote HTTP clients.
     #[serde(default)]
     pub auth_mode: DownstreamAuthMode,
     /// Public base URL used by remote clients to reach this server.
     pub public_base_url: Option<String>,
-    /// OAuth client ID for downstream remote connectors.
-    pub oauth_client_id: Option<String>,
-    /// OAuth client secret for downstream remote connectors.
-    pub oauth_client_secret: Option<crate::types::SecretString>,
-    /// OAuth scopes to request for downstream remote connectors.
+    /// OAuth scopes available to downstream remote connectors.
     #[serde(default)]
     pub oauth_scopes: Option<Vec<String>>,
-    /// Exact-match allowlist of redirect URIs accepted by `/oauth/authorize`.
-    /// Loopback redirect URIs are always allowed; non-loopback URIs (e.g. a
-    /// remote connector's callback) must be listed here.
-    #[serde(default)]
-    pub oauth_redirect_uri_allowlist: Vec<String>,
     /// Bind address for HTTP server.
     pub bind_address: String,
     /// Port for HTTP server.
@@ -317,10 +308,7 @@ impl Default for HttpConfig {
         Self {
             auth_mode: DownstreamAuthMode::default(),
             public_base_url: None,
-            oauth_client_id: None,
-            oauth_client_secret: None,
             oauth_scopes: None,
-            oauth_redirect_uri_allowlist: Vec::new(),
             bind_address: "127.0.0.1".to_string(),
             port: 3282,
             allowed_origins: Vec::new(),
@@ -585,26 +573,38 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     {
         errors.push("http.public_base_url is required when http.auth_mode = \"oauth\"".to_string());
     }
-    if matches!(config.http.auth_mode, DownstreamAuthMode::Oauth)
-        && config.http.oauth_client_id.is_none()
-    {
-        errors.push("http.oauth_client_id is required when http.auth_mode = \"oauth\"".to_string());
+    if matches!(config.http.auth_mode, DownstreamAuthMode::Oauth) {
+        if let Some(public_base_url) = config.http.public_base_url.as_deref() {
+            match url::Url::parse(public_base_url) {
+                Ok(url)
+                    if url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.path() == "/"
+                        && url.query().is_none()
+                        && url.fragment().is_none() => {}
+                _ => errors.push(
+                    "http.public_base_url must be an HTTPS origin without a path, credentials, query, or fragment when http.auth_mode = \"oauth\""
+                        .to_string(),
+                ),
+            }
+        }
+
+        if !config
+            .http
+            .oauth_scopes
+            .as_ref()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "tools:read"))
+        {
+            errors.push(
+                "http.oauth_scopes must include \"tools:read\" when http.auth_mode = \"oauth\""
+                    .to_string(),
+            );
+        }
     }
     let externally_exposed = !http_bind_is_loopback(&config.http.bind_address)
         || http_public_base_url_is_non_loopback(config.http.public_base_url.as_deref());
-    if externally_exposed
-        && matches!(config.http.auth_mode, DownstreamAuthMode::Oauth)
-        && config.http.oauth_client_secret.is_none()
-    {
-        // A public (secretless) OAuth client lets anyone who knows the client_id
-        // mint tokens. That is only acceptable for a purely-local loopback
-        // listener; a non-loopback bind OR a non-loopback public_base_url (a
-        // tunneled deployment) must use a confidential client.
-        errors.push(
-            "http.oauth_client_secret is required when http.auth_mode = \"oauth\" and the server is reachable off-loopback (non-loopback bind or non-loopback public_base_url)"
-                .to_string(),
-        );
-    }
     if externally_exposed && matches!(config.http.auth_mode, DownstreamAuthMode::None) {
         errors.push(
             "http.auth_mode = \"none\" is not allowed when the server is reachable off-loopback (non-loopback bind or non-loopback public_base_url)"
@@ -838,12 +838,6 @@ fn transform_env_expandable_strings(
     if let Some(ref mut public_base_url) = config.http.public_base_url {
         *public_base_url = transform(public_base_url.clone());
     }
-    if let Some(ref mut client_id) = config.http.oauth_client_id {
-        *client_id = transform(client_id.clone());
-    }
-    if let Some(ref mut secret) = config.http.oauth_client_secret {
-        *secret = transform(secret.as_str().to_string()).into();
-    }
     if let Some(ref mut scopes) = config.http.oauth_scopes {
         for scope in scopes.iter_mut() {
             *scope = transform(scope.clone());
@@ -942,12 +936,6 @@ pub(crate) fn visit_env_expandable_fields(
     }
     if let Some(ref public_base_url) = config.http.public_base_url {
         visit(None, "http.public_base_url", public_base_url);
-    }
-    if let Some(ref client_id) = config.http.oauth_client_id {
-        visit(None, "http.oauth_client_id", client_id);
-    }
-    if let Some(ref secret) = config.http.oauth_client_secret {
-        visit(None, "http.oauth_client_secret", secret.as_str());
     }
     if let Some(ref scopes) = config.http.oauth_scopes {
         for scope in scopes {
@@ -1192,11 +1180,6 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.http.auth_mode, DownstreamAuthMode::Auto);
         assert_eq!(cfg.http.public_base_url, None);
-        assert_eq!(cfg.http.oauth_client_id, None);
-        assert_eq!(
-            cfg.http.oauth_client_secret.as_ref().map(|s| s.as_str()),
-            None
-        );
         assert_eq!(cfg.http.oauth_scopes, None);
         assert_eq!(cfg.http.bind_address, "127.0.0.1");
         assert_eq!(cfg.http.port, 3282);
@@ -1232,8 +1215,6 @@ mod tests {
             [http]
             auth_mode = "auto"
             public_base_url = "https://plug.example.com"
-            oauth_client_id = "client-123"
-            oauth_client_secret = "secret-123"
             oauth_scopes = ["tools:read", "tools:write"]
             port = 8080
             allowed_origins = ["https://claude.ai"]
@@ -1245,11 +1226,6 @@ mod tests {
         assert_eq!(
             cfg.http.public_base_url.as_deref(),
             Some("https://plug.example.com")
-        );
-        assert_eq!(cfg.http.oauth_client_id.as_deref(), Some("client-123"));
-        assert_eq!(
-            cfg.http.oauth_client_secret.as_ref().map(|s| s.as_str()),
-            Some("secret-123")
         );
         assert_eq!(
             cfg.http.oauth_scopes,
@@ -1667,18 +1643,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_oauth_on_loopback_is_valid_when_required_fields_are_set() {
+    fn validate_oauth_is_valid_with_https_issuer_and_tools_scope() {
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
-        cfg.http.oauth_client_id = Some("client-123".to_string());
-        // A non-loopback public_base_url (a tunneled deployment) requires a
-        // confidential client, so set the secret for a valid config.
-        cfg.http.oauth_client_secret = Some("secret".to_string().into());
+        cfg.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
         let errors = validate_config(&cfg);
         assert!(
             errors.is_empty(),
-            "expected oauth with a confidential client to be valid, got {errors:?}"
+            "expected multi-client oauth config to be valid, got {errors:?}"
         );
     }
 
@@ -1696,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_oauth_requires_client_id() {
+    fn validate_oauth_requires_tools_read_scope() {
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1704,8 +1677,39 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("oauth_client_id") && e.contains("oauth")),
-            "expected oauth/oauth_client_id validation error, got {errors:?}"
+                .any(|e| e.contains("oauth_scopes") && e.contains("tools:read")),
+            "expected oauth tools:read validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth_requires_https_public_base_url() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.public_base_url = Some("http://127.0.0.1:3282".to_string());
+        cfg.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
+        let errors = validate_config(&cfg);
+        assert!(
+            errors.iter().any(|e| e.contains("HTTPS origin")),
+            "expected oauth HTTPS issuer validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn removed_singular_downstream_oauth_keys_are_rejected() {
+        let result = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [http]
+                oauth_client_id = "legacy-client"
+                oauth_client_secret = "legacy-secret"
+                "#,
+            ))
+            .extract::<Config>();
+        assert!(
+            result.is_err(),
+            "removed singular OAuth keys must not be ignored"
         );
     }
 
@@ -1714,8 +1718,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::None;
         cfg.http.bind_address = "0.0.0.0".to_string();
-        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
-        cfg.http.tls_key_path = Some(PathBuf::from("/tmp/key.pem"));
+        cfg.http.tls_cert_path = Some(PathBuf::from("Cargo.toml"));
+        cfg.http.tls_key_path = Some(PathBuf::from("Cargo.toml"));
         let errors = validate_config(&cfg);
         assert!(
             errors
@@ -1756,76 +1760,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_secretless_oauth_on_non_loopback_is_rejected() {
+    fn validate_public_oauth_on_non_loopback_is_allowed_with_tls() {
+        let key_path =
+            std::env::temp_dir().join(format!("plug-config-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&key_path, "test key").expect("write test key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("secure test key");
+        }
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.bind_address = "0.0.0.0".to_string();
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
-        cfg.http.oauth_client_id = Some("client".to_string());
-        cfg.http.oauth_client_secret = None;
-        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
-        cfg.http.tls_key_path = Some(PathBuf::from("/tmp/key.pem"));
+        cfg.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
+        cfg.http.tls_cert_path = Some(key_path.clone());
+        cfg.http.tls_key_path = Some(key_path.clone());
         let errors = validate_config(&cfg);
+        let _ = std::fs::remove_file(key_path);
         assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("http.oauth_client_secret") && e.contains("non-loopback")),
-            "expected secretless-oauth/non-loopback validation error, got {errors:?}"
+            errors.is_empty(),
+            "public registered clients with PKCE should be valid, got {errors:?}"
         );
     }
 
     #[test]
-    fn validate_secretless_oauth_on_tunneled_loopback_bind_is_rejected() {
-        // The real tunnel topology: cloudflared -> 127.0.0.1:3282, but the
-        // server is reachable off-host via a non-loopback public_base_url.
+    fn validate_public_oauth_on_tunneled_loopback_bind_is_allowed() {
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.bind_address = "127.0.0.1".to_string();
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
-        cfg.http.oauth_client_id = Some("client".to_string());
-        cfg.http.oauth_client_secret = None;
+        cfg.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
         let errors = validate_config(&cfg);
         assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("http.oauth_client_secret") && e.contains("off-loopback")),
-            "secretless oauth tunneled via a non-loopback public_base_url must be rejected, got {errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_secretless_oauth_on_loopback_is_allowed() {
-        let mut cfg = Config::default();
-        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
-        cfg.http.bind_address = "127.0.0.1".to_string();
-        cfg.http.public_base_url = Some("http://localhost:3282".to_string());
-        cfg.http.oauth_client_id = Some("client".to_string());
-        cfg.http.oauth_client_secret = None;
-        let errors = validate_config(&cfg);
-        assert!(
-            !errors
-                .iter()
-                .any(|e| e.contains("http.oauth_client_secret")),
-            "loopback secretless oauth should be allowed, got {errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_confidential_oauth_on_non_loopback_is_allowed() {
-        let mut cfg = Config::default();
-        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
-        cfg.http.bind_address = "0.0.0.0".to_string();
-        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
-        cfg.http.oauth_client_id = Some("client".to_string());
-        cfg.http.oauth_client_secret = Some("super-secret".to_string().into());
-        cfg.http.tls_cert_path = Some(PathBuf::from("/tmp/cert.pem"));
-        cfg.http.tls_key_path = Some(PathBuf::from("/tmp/key.pem"));
-        let errors = validate_config(&cfg);
-        assert!(
-            !errors
-                .iter()
-                .any(|e| e.contains("http.oauth_client_secret")),
-            "confidential oauth on non-loopback should be allowed, got {errors:?}"
+            errors.is_empty(),
+            "tunneled public-client oauth should be allowed, got {errors:?}"
         );
     }
 

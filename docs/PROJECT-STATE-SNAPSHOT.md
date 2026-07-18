@@ -48,8 +48,8 @@ Implemented on `main`:
 - initialize response protocol-version simplification/fixups for remote compatibility
 - persisted token hydration before upstream connect
 - downstream OAuth discovery/privacy hardening, more accurate metadata, and richer challenge behavior
-- downstream OAuth authorize-redirect allowlist (loopback-default) closing the open-redirector on `build_authorize_redirect`, with percent-encoded code/state and rejection logging (PR #60)
-- secretless-OAuth exposure guard: config validation rejects `http.auth_mode = "oauth"` without `oauth_client_secret` when the server is reachable off-loopback (non-loopback bind *or* non-loopback `public_base_url`, e.g. a cloudflared tunnel) (PR #60)
+- standards-based multi-client downstream OAuth: RFC 7591 Dynamic Client Registration for Cursor and other public clients, SSRF-hardened OAuth Client ID Metadata Documents, explicit consent, PKCE S256, exact HTTPS/loopback redirects, RFC 8707 resource-bound tokens, `tools:read` enforcement, rotating refresh tokens, and cross-client grant isolation
+- issuer-wide owner-only OAuth persistence with registration rate limits, quotas, unused-client expiry, restart recovery, and fail-closed writes; `plug auth clients list/revoke` provides bounded administration without exposing credentials
 - per-upstream operability metrics in `plug status --output json`: call/error counts, last-latency, degraded-since epoch, and circuit-state label per upstream, with a stable always-present schema (zero-filled for known servers) (PR #60)
 - first-class upstream catalog availability (`healthy | degraded | absent`), distinct from connection health, surfaced additively on `ServerStatus` JSON: a transient listing failure (timeout/error) on a routable upstream is `degraded` and serves its last-known-good resources/prompts (preserving active resource subscriptions instead of pruning them); genuine removal still prunes. Closes the PR #58 subscription-rebind residual (PR #61)
 - clearer operator auth/runtime UX across `plug status`, `plug doctor`, `plug auth status`, `plug clients`, and `plug servers`
@@ -107,6 +107,16 @@ their reviewed commits are already contained in `main`.
 The current roadmap is complete on `main`.
 No required roadmap items remain for the current production-ready bar.
 Any further work is optional future scope rather than a blocker.
+
+On 2026-07-17, downstream OAuth moved from one manually configured client to
+a standards-based public-client service. A remote MCP client now starts with
+only the `/mcp` URL, registers itself (or uses a Client ID Metadata Document),
+shows the user a Plug consent page, and receives a client-isolated,
+resource-bound `tools:read` grant. The old singular client ID, shared secret,
+and redirect allowlist are removed rather than retained as a legacy path, so
+existing remote clients must authorize once after this upgrade. Local stdio
+clients are unaffected. See
+[`RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md`](RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md).
 
 On 2026-07-13, `main` upgraded the Rust MCP SDK from RMCP 1.7.0 to the exact
 stable RMCP 2.2.0 release. Plug migrated to RMCP's spec-aligned model types,

@@ -174,7 +174,117 @@ pub(crate) async fn cmd_auth(
         }
         crate::AuthCommands::Status => cmd_auth_status(config_path, output).await,
         crate::AuthCommands::Logout { server } => cmd_auth_logout(&server).await,
+        crate::AuthCommands::Clients { command } => {
+            cmd_downstream_oauth_clients(config_path, command, output).await
+        }
     }
+}
+
+async fn cmd_downstream_oauth_clients(
+    config_path: Option<&PathBuf>,
+    command: crate::DownstreamOauthClientCommands,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    let cfg = config::load_config(config_path)?;
+    if cfg.http.auth_mode != plug_core::config::DownstreamAuthMode::Oauth {
+        anyhow::bail!("downstream OAuth is not enabled");
+    }
+    let token_path = plug_core::auth::http_operator_token_path(cfg.http.port);
+    let operator_token = std::fs::read_to_string(&token_path)
+        .map_err(|error| anyhow::anyhow!("cannot read the local operator token: {error}"))?;
+    let operator_token = operator_token.trim();
+    if operator_token.is_empty() {
+        anyhow::bail!("the local operator token is empty");
+    }
+    let scheme = if cfg.http.tls_cert_path.is_some() && cfg.http.tls_key_path.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let host = match cfg.http.bind_address.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        bind => bind,
+    };
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let base = format!("{scheme}://{host}:{}/_plug/oauth/clients", cfg.http.port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        // This connection never leaves the configured local listener. Public
+        // hostname certificates commonly do not contain its bind address.
+        .danger_accept_invalid_certs(scheme == "https")
+        .build()?;
+
+    match command {
+        crate::DownstreamOauthClientCommands::List => {
+            let response = client
+                .get(&base)
+                .header("x-plug-operator-token", operator_token)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "the running Plug service rejected the client-list request ({})",
+                    response.status()
+                );
+            }
+            let clients = response
+                .json::<Vec<plug_core::downstream_oauth::RegisteredClientSummary>>()
+                .await?;
+            match output {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
+                OutputFormat::Text => {
+                    if clients.is_empty() {
+                        ui::print_info_line("No downstream OAuth clients are registered");
+                    } else {
+                        println!("{}", style("Registered downstream OAuth clients").bold());
+                        for registered in clients {
+                            println!(
+                                "  {} ({})",
+                                style(&registered.client_name).bold(),
+                                registered.client_id
+                            );
+                            println!("    Redirects: {}", registered.redirect_uris.join(", "));
+                            println!("    Source: {:?}", registered.source);
+                        }
+                    }
+                }
+            }
+        }
+        crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
+            if !yes
+                && !dialoguer::Confirm::new()
+                    .with_prompt(format!("Revoke {client_id} and all of its Plug tokens?"))
+                    .default(false)
+                    .interact()?
+            {
+                ui::print_info_line("Revocation cancelled");
+                return Ok(());
+            }
+            let mut url = reqwest::Url::parse(&base)?;
+            url.path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("invalid local operator URL"))?
+                .push(&client_id);
+            let response = client
+                .delete(url)
+                .header("x-plug-operator-token", operator_token)
+                .send()
+                .await?;
+            match response.status() {
+                reqwest::StatusCode::NO_CONTENT => ui::print_success_line(format!(
+                    "Revoked {client_id} and all of its downstream OAuth grants"
+                )),
+                reqwest::StatusCode::NOT_FOUND => anyhow::bail!("registered client not found"),
+                status => {
+                    anyhow::bail!("the running Plug service rejected the revocation ({status})")
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

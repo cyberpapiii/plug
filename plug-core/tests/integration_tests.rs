@@ -4199,12 +4199,14 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
 
     let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
         public_base_url: "https://plug.example.com".to_string(),
-        oauth_client_id: Some("client-123".to_string()),
-        oauth_client_secret: None,
         oauth_scopes: vec!["tools:read".to_string()],
-        redirect_uri_allowlist: vec!["https://client.example.com/callback".to_string()],
+        local_port: 3282,
     };
-    let manager = plug_core::downstream_oauth::DownstreamOauthManager::new(oauth_config);
+    let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+        oauth_config,
+        std::env::temp_dir().join(format!("plug-oauth-e2e-{}.json", uuid::Uuid::new_v4())),
+    )
+    .expect("isolated OAuth manager");
     let app = build_router(Arc::new(HttpState {
         router: engine.tool_router().clone(),
         sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
@@ -4263,21 +4265,54 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
 
     let verifier = oauth2::PkceCodeVerifier::new("v".repeat(43));
     let challenge = oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+    let registration_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/oauth/register")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"client_name":"Local DCR fixture","redirect_uris":["http://localhost/callback"],"token_endpoint_auth_method":"none"}"#,
+        ))
+        .unwrap();
+    let registration_resp = app.clone().oneshot(registration_req).await.unwrap();
+    assert_eq!(registration_resp.status(), StatusCode::CREATED);
+    let registration_body = axum::body::to_bytes(registration_resp.into_body(), 10_000)
+        .await
+        .unwrap();
+    let registration: serde_json::Value = serde_json::from_slice(&registration_body).unwrap();
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("registered client ID");
     let authorize_req = HttpRequest::builder()
         .method("GET")
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id=client-123&redirect_uri=http://localhost/callback&state=test-state&code_challenge={}&code_challenge_method=S256",
-            challenge.as_str()
+            "/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=http://localhost/callback&state=test-state&code_challenge={}&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp",
+            challenge.as_str(),
         ))
         .body(Body::empty())
         .unwrap();
     let authorize_resp = app.clone().oneshot(authorize_req).await.unwrap();
-    assert!(
-        authorize_resp.status().is_redirection(),
-        "unexpected authorize status {}",
-        authorize_resp.status()
-    );
-    let redirect = authorize_resp
+    assert_eq!(authorize_resp.status(), StatusCode::OK);
+    let consent_body = axum::body::to_bytes(authorize_resp.into_body(), 20_000)
+        .await
+        .unwrap();
+    let consent_html = String::from_utf8(consent_body.to_vec()).unwrap();
+    let consent_id = consent_html
+        .split("name=\"consent_id\" value=\"")
+        .nth(1)
+        .and_then(|value| value.split('\"').next())
+        .expect("consent ID");
+    let consent_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/_plug/oauth/authorize")
+        .header(header::HOST, "127.0.0.1:3282")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "consent_id={consent_id}&decision=approve"
+        )))
+        .unwrap();
+    let consent_resp = app.clone().oneshot(consent_req).await.unwrap();
+    assert!(consent_resp.status().is_redirection());
+    let redirect = consent_resp
         .headers()
         .get(header::LOCATION)
         .and_then(|value| value.to_str().ok())
@@ -4294,7 +4329,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         .uri("/oauth/token")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(format!(
-            "grant_type=authorization_code&code={code}&client_id=client-123&redirect_uri=http://localhost/callback&code_verifier={}",
+            "grant_type=authorization_code&code={code}&client_id={client_id}&redirect_uri=http://localhost/callback&code_verifier={}&resource=https%3A%2F%2Fplug.example.com%2Fmcp",
             verifier.secret()
         )))
         .unwrap();
