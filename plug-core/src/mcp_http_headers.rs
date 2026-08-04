@@ -55,6 +55,67 @@ pub(crate) fn validate_mirrored_headers(
     Ok(())
 }
 
+pub(crate) fn validate_required_mirrored_headers(
+    headers: &HeaderMap,
+    message: &ClientJsonRpcMessage,
+) -> Result<(), HeaderMismatch> {
+    let Some(fields) = mirrored_fields_for_message(message) else {
+        return Ok(());
+    };
+    require_and_validate(headers, MCP_METHOD_HEADER, &fields.method, false)?;
+    if let Some(expected_name) = fields.name {
+        require_and_validate(headers, MCP_NAME_HEADER, &expected_name, true)?;
+    }
+    Ok(())
+}
+
+fn require_and_validate(
+    headers: &HeaderMap,
+    header_name: &'static str,
+    expected: &str,
+    decode_base64: bool,
+) -> Result<(), HeaderMismatch> {
+    if !headers.contains_key(header_name) {
+        return Err(HeaderMismatch {
+            message: format!("Header mismatch: modern requests require {header_name}"),
+        });
+    }
+    let actual = headers
+        .get(header_name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| HeaderMismatch {
+            message: format!("Header mismatch: {header_name} header is malformed"),
+        })?;
+    let actual = if decode_base64 {
+        decode_standard_header_value(actual).ok_or_else(|| HeaderMismatch {
+            message: format!("Header mismatch: {header_name} header has invalid Base64"),
+        })?
+    } else {
+        actual.to_string()
+    };
+    if actual != expected {
+        return Err(HeaderMismatch {
+            message: format!(
+                "Header mismatch: {header_name} header value '{actual}' does not match body value '{expected}'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn decode_standard_header_value(value: &str) -> Option<String> {
+    use base64::{Engine, prelude::BASE64_STANDARD};
+    const PREFIX: &str = "=?base64?";
+    const SUFFIX: &str = "?=";
+    match value
+        .strip_prefix(PREFIX)
+        .and_then(|inner| inner.strip_suffix(SUFFIX))
+    {
+        Some(inner) => String::from_utf8(BASE64_STANDARD.decode(inner).ok()?).ok(),
+        None => Some(value.to_string()),
+    }
+}
+
 fn validate_if_present(
     headers: &HeaderMap,
     header_name: &'static str,
@@ -154,5 +215,31 @@ mod tests {
     fn validation_accepts_missing_headers_for_older_clients() {
         validate_mirrored_headers(&HeaderMap::new(), &tool_call_message("weather"))
             .expect("missing headers remain backward-compatible");
+    }
+
+    #[test]
+    fn modern_validation_requires_method_and_name_headers() {
+        let error =
+            validate_required_mirrored_headers(&HeaderMap::new(), &tool_call_message("weather"))
+                .expect_err("modern mirror headers are mandatory");
+        assert!(error.message.contains(MCP_METHOD_HEADER));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(MCP_METHOD_HEADER, HeaderValue::from_static("tools/call"));
+        let error = validate_required_mirrored_headers(&headers, &tool_call_message("weather"))
+            .expect_err("named methods also require Mcp-Name");
+        assert!(error.message.contains(MCP_NAME_HEADER));
+    }
+
+    #[test]
+    fn modern_validation_decodes_standard_base64_wrapped_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert(MCP_METHOD_HEADER, HeaderValue::from_static("tools/call"));
+        headers.insert(
+            MCP_NAME_HEADER,
+            HeaderValue::from_static("=?base64?d2VhdGhlcg==?="),
+        );
+        validate_required_mirrored_headers(&headers, &tool_call_message("weather"))
+            .expect("SEP-2243 wrapped name should validate");
     }
 }

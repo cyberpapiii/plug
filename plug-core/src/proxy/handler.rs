@@ -8,15 +8,30 @@ struct StdioDownstreamContext {
     client_id: Arc<str>,
     request_id: RequestId,
     client_type: ClientType,
+    protocol_version: ProtocolVersion,
+    client_metadata: Option<crate::protocol::ClientMetadata>,
+    modern_direction_enabled: bool,
+    cancellation: CancellationToken,
 }
 
 impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::stdio_for_client(
+        let mut context = DownstreamCallContext::stdio_for_client(
             Arc::clone(&self.client_id),
             self.request_id.clone(),
             self.client_type,
         )
+        .with_protocol(
+            crate::protocol::ProtocolEra::from_version(&self.protocol_version),
+            self.protocol_version.to_string(),
+        )
+        .with_modern_direction_enabled(self.modern_direction_enabled)
+        .with_lifecycle(None, self.cancellation.clone(), None);
+        if let Some(metadata) = &self.client_metadata {
+            context = context
+                .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
+        }
+        context
     }
 
     /// stdio's `tools/call` handler can only return a `CallToolResult`, so its
@@ -150,6 +165,41 @@ impl ProxyHandler {
         &self.router
     }
 
+    /// Apply the reloadable modern-downstream gate for this handler.
+    pub fn set_modern_downstream_enabled(&self, enabled: bool) {
+        self.router.set_modern_downstream_enabled(enabled);
+    }
+
+    pub fn modern_downstream_enabled(&self) -> bool {
+        self.router.modern_downstream_enabled()
+    }
+
+    fn downstream_context_for_call(
+        &self,
+        request_id: RequestId,
+        protocol_version: ProtocolVersion,
+        client_info: Option<Implementation>,
+        cancellation: CancellationToken,
+    ) -> StdioDownstreamContext {
+        let client_type = self
+            .client_type
+            .read()
+            .map(|ct| *ct)
+            .unwrap_or(ClientType::Unknown);
+        StdioDownstreamContext {
+            client_id: Arc::clone(&self.client_id),
+            request_id,
+            client_type,
+            protocol_version,
+            client_metadata: client_info.map(|info| crate::protocol::ClientMetadata {
+                name: Arc::from(info.name),
+                version: Arc::from(info.version),
+            }),
+            modern_direction_enabled: self.router.modern_downstream_enabled(),
+            cancellation,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn client_id(&self) -> Arc<str> {
         Arc::clone(&self.client_id)
@@ -159,22 +209,57 @@ impl ProxyHandler {
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for ProxyHandler {
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Owned(vec![crate::protocol::supported_protocol_version()])
+        let mut versions = vec![crate::protocol::supported_protocol_version()];
+        if self.modern_downstream_enabled() {
+            versions.push(ProtocolVersion::V_2026_07_28);
+        }
+        std::borrow::Cow::Owned(versions)
     }
 
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(self.router.synthesized_capabilities())
             .with_server_info(plug_implementation())
-            .with_protocol_version(
-                serde_json::from_value(serde_json::Value::String(
-                    LATEST_PROTOCOL_VERSION.to_string(),
-                ))
-                .expect("latest protocol version must parse"),
-            )
+            .with_protocol_version(crate::protocol::supported_protocol_version())
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.router.get_tool_definition(name)
+    }
+
+    fn discover(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<DiscoverResult, McpError>> + Send + '_ {
+        async move {
+            if !self.modern_downstream_enabled() {
+                return Err(McpError::unsupported_protocol_version(
+                    ProtocolVersion::V_2026_07_28,
+                    &self.supported_protocol_versions(),
+                ));
+            }
+            let client_info = context.client_info().ok_or_else(|| {
+                McpError::invalid_params("discover requires client implementation metadata", None)
+            })?;
+            let capabilities = context.client_capabilities().ok_or_else(|| {
+                McpError::invalid_params("discover requires client capability metadata", None)
+            })?;
+            let initialize = InitializeRequestParams::new(capabilities, client_info)
+                .with_protocol_version(ProtocolVersion::V_2026_07_28);
+
+            // Reuse the established connection-state setup without requiring a
+            // legacy initialize message on the wire. This records the client,
+            // peer, capability and notification state identically for both
+            // lifecycles.
+            let mut info = self.initialize(initialize, context).await?;
+            // U4 exposes only the ordinary core. Tasks, Apps and every other
+            // extension stay unadvertised until their bridges have their own
+            // conformance evidence.
+            crate::protocol::suppress_unimplemented_modern_capabilities(&mut info.capabilities);
+            Ok(DiscoverResult::from_server_info(
+                self.supported_protocol_versions().into_owned(),
+                info,
+            ))
+        }
     }
 
     /*fn enqueue_task(
@@ -219,8 +304,18 @@ impl ServerHandler for ProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
-            crate::protocol::ensure_supported_downstream_protocol(&request.protocol_version)?;
+            if request.protocol_version == ProtocolVersion::V_2026_07_28 {
+                if !self.modern_downstream_enabled() {
+                    return Err(McpError::unsupported_protocol_version(
+                        request.protocol_version,
+                        &self.supported_protocol_versions(),
+                    ));
+                }
+            } else {
+                crate::protocol::ensure_supported_downstream_protocol(&request.protocol_version)?;
+            }
 
+            let selected_protocol = request.protocol_version.clone();
             let client_type = detect_client(&request.client_info.name);
             tracing::info!(
                 client = %request.client_info.name,
@@ -409,12 +504,7 @@ impl ServerHandler for ProxyHandler {
             Ok(
                 InitializeResult::new(self.router.synthesized_capabilities_for_client(client_type))
                     .with_server_info(plug_implementation())
-                    .with_protocol_version(
-                        serde_json::from_value(serde_json::Value::String(
-                            LATEST_PROTOCOL_VERSION.to_string(),
-                        ))
-                        .expect("latest protocol version must parse"),
-                    ),
+                    .with_protocol_version(selected_protocol),
             )
         }
     }
@@ -559,16 +649,15 @@ impl ServerHandler for ProxyHandler {
                 ));
             }
 
-            let client_type = self
-                .client_type
-                .read()
-                .map(|ct| *ct)
-                .unwrap_or(ClientType::Unknown);
-            let ctx = StdioDownstreamContext {
-                client_id: Arc::clone(&self.client_id),
-                request_id: context.id.clone(),
-                client_type,
-            };
+            let protocol_version = context
+                .protocol_version()
+                .unwrap_or_else(crate::protocol::supported_protocol_version);
+            let ctx = self.downstream_context_for_call(
+                context.id.clone(),
+                protocol_version,
+                context.client_info(),
+                context.ct.clone(),
+            );
             match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
                 crate::dispatch::ToolCallOutcome::Called(result) => Ok(result.into()),
                 // `supports_tasks()` is false for stdio, so a task outcome is
@@ -796,5 +885,44 @@ impl ServerHandler for ProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
         async move { self.router.complete_request(request).await }
+    }
+}
+
+#[cfg(test)]
+mod modern_context_tests {
+    use super::*;
+    use crate::dispatch::DownstreamContext;
+
+    #[test]
+    fn discovered_modern_call_fails_closed_after_live_gate_is_disabled() {
+        let handler = ProxyHandler::new(
+            Arc::new(ServerManager::new()),
+            RouterConfig::from(&crate::config::Config::default()),
+        );
+        handler.set_modern_downstream_enabled(true);
+        handler.set_modern_downstream_enabled(false);
+
+        let context = handler
+            .downstream_context_for_call(
+                RequestId::Number(7),
+                ProtocolVersion::V_2026_07_28,
+                Some(Implementation::new("modern-client", "1.0")),
+                CancellationToken::new(),
+            )
+            .downstream_call_context();
+
+        assert_eq!(context.protocol_era, crate::protocol::ProtocolEra::Modern);
+        assert_eq!(
+            context
+                .client_metadata
+                .as_ref()
+                .map(|meta| meta.name.as_ref()),
+            Some("modern-client")
+        );
+        assert_eq!(
+            context.authorize(crate::protocol::MethodFamily::ToolsCall),
+            Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                .into_error(crate::protocol::ProtocolEra::Modern))
+        );
     }
 }

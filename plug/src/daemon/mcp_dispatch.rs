@@ -11,7 +11,7 @@ use rmcp::model::{
     PaginatedRequestParams, RequestId, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 
-use plug_core::ipc::IpcResponse;
+use plug_core::ipc::{IpcMcpRequestContext, IpcResponse};
 
 use super::ConnectionContext;
 
@@ -35,6 +35,8 @@ struct IpcDownstreamContext {
     /// client id, mirroring the `client_sessions.contains_key` gate the
     /// daemon's disconnect teardown uses before task cleanup.
     owner_liveness: Option<plug_core::tasks::OwnerLivenessProbe>,
+    request_context: Option<IpcMcpRequestContext>,
+    modern_direction_enabled: bool,
 }
 
 impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
@@ -44,10 +46,31 @@ impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
             self.request_id.clone(),
             self.client_type,
         );
-        match &self.registry_client_id {
+        let context = match &self.registry_client_id {
             Some(client_id) => context.with_local_principal(
                 plug_core::types::PrincipalId::daemon_ipc_registry(client_id),
             ),
+            None => context,
+        };
+        match &self.request_context {
+            Some(request) => {
+                let version = serde_json::from_value(serde_json::Value::String(
+                    request.protocol_version.clone(),
+                ))
+                .unwrap_or_else(|_| plug_core::protocol::supported_protocol_version());
+                let context = context
+                    .with_protocol(
+                        plug_core::protocol::ProtocolEra::from_version(&version),
+                        request.protocol_version.clone(),
+                    )
+                    .with_modern_direction_enabled(self.modern_direction_enabled);
+                match (&request.client_name, &request.client_version) {
+                    (Some(name), Some(version)) => {
+                        context.with_client_metadata(name.clone(), version.clone())
+                    }
+                    _ => context,
+                }
+            }
             None => context,
         }
     }
@@ -74,14 +97,26 @@ impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
 /// a `SERIALIZE_ERROR` frame if serialization fails. The single encode primitive
 /// for IPC method results — replaces the per-arm `match serde_json::to_value`
 /// ladder so every arm shares one fallback path.
+#[cfg(test)]
 pub(super) fn ipc_ok<T: serde::Serialize>(value: T) -> IpcResponse {
+    ipc_ok_with_context(value, None)
+}
+
+fn ipc_ok_with_context<T: serde::Serialize>(
+    value: T,
+    context: Option<&IpcMcpRequestContext>,
+) -> IpcResponse {
     match serde_json::to_value(value) {
         Ok(mut payload) => {
             // The daemon IPC MCP bridge serves the same legacy protocol as the
             // downstream stdio and HTTP adapters, but carries a bare result
             // rather than a JSON-RPC envelope. Keep modern RMCP 3.x result
             // discriminators from leaking onto that legacy surface.
-            plug_core::protocol::rewrite_legacy_result(&mut payload, false);
+            if !context.is_some_and(|context| {
+                context.protocol_version == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+            }) {
+                plug_core::protocol::rewrite_legacy_result(&mut payload, false);
+            }
             IpcResponse::McpResponse { payload }
         }
         Err(e) => IpcResponse::Error {
@@ -96,10 +131,13 @@ pub(super) fn ipc_ok<T: serde::Serialize>(value: T) -> IpcResponse {
 /// an `McpResponse`-with-error payload (the IPC convention — errors ride the same
 /// channel, distinguished by a `code` field). Both paths share the
 /// `SERIALIZE_ERROR` fallback via [`ipc_ok`].
-pub(super) fn ipc_from_mcp_result<T: serde::Serialize>(result: Result<T, McpError>) -> IpcResponse {
+pub(super) fn ipc_from_mcp_result<T: serde::Serialize>(
+    result: Result<T, McpError>,
+    context: Option<&IpcMcpRequestContext>,
+) -> IpcResponse {
     match result {
-        Ok(value) => ipc_ok(value),
-        Err(err) => ipc_ok(err),
+        Ok(value) => ipc_ok_with_context(value, context),
+        Err(err) => ipc_ok_with_context(err, context),
     }
 }
 
@@ -109,8 +147,26 @@ pub(super) async fn dispatch_mcp_request(
     session_id: &str,
     method: &str,
     params: Option<&serde_json::Value>,
+    request_context: Option<&IpcMcpRequestContext>,
 ) -> IpcResponse {
     let tool_router = ctx.engine.tool_router();
+
+    if let Some(response) =
+        reject_invalid_request_context(tool_router.modern_downstream_enabled(), request_context)
+    {
+        return response;
+    }
+
+    macro_rules! ipc_ok {
+        ($value:expr) => {
+            ipc_ok_with_context($value, request_context)
+        };
+    }
+    macro_rules! ipc_result {
+        ($value:expr $(,)?) => {
+            ipc_from_mcp_result($value, request_context)
+        };
+    }
 
     match method {
         "tools/list" => {
@@ -132,21 +188,21 @@ pub(super) async fn dispatch_mcp_request(
                 Some(&lazy_session_key),
                 request,
             );
-            ipc_ok(result)
+            ipc_ok!(result)
         }
 
         "resources/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_resources_page(request);
-            ipc_ok(result)
+            ipc_ok!(result)
         }
 
         "resources/templates/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_resource_templates_page(request);
-            ipc_ok(result)
+            ipc_ok!(result)
         }
 
         "resources/read" => {
@@ -160,14 +216,14 @@ pub(super) async fn dispatch_mcp_request(
                 }
             };
 
-            ipc_from_mcp_result(tool_router.read_resource(uri).await)
+            ipc_result!(tool_router.read_resource(uri).await)
         }
 
         "prompts/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
             let result = tool_router.list_prompts_page(request);
-            ipc_ok(result)
+            ipc_ok!(result)
         }
 
         "prompts/get" => {
@@ -185,7 +241,7 @@ pub(super) async fn dispatch_mcp_request(
                 .and_then(|v| v.as_object())
                 .cloned();
 
-            ipc_from_mcp_result(tool_router.get_prompt(name, arguments).await)
+            ipc_result!(tool_router.get_prompt(name, arguments).await)
         }
 
         "completion/complete" => {
@@ -207,7 +263,7 @@ pub(super) async fn dispatch_mcp_request(
                 }
             };
 
-            ipc_from_mcp_result(tool_router.complete_request(params).await)
+            ipc_result!(tool_router.complete_request(params).await)
         }
 
         "logging/setLevel" => {
@@ -240,13 +296,18 @@ pub(super) async fn dispatch_mcp_request(
             );
             tool_router.set_client_log_level(session_id, level);
             tool_router.forward_set_level_to_upstreams().await;
-            ipc_ok(serde_json::json!({}))
+            ipc_ok!(serde_json::json!({}))
         }
 
         "tools/call" => {
             let call_params = match params.map(|params| {
                 let mut params = params.clone();
-                plug_core::protocol::rewrite_legacy_call_params(&mut params);
+                if !request_context.is_some_and(|context| {
+                    context.protocol_version
+                        == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                }) {
+                    plug_core::protocol::rewrite_legacy_call_params(&mut params);
+                }
                 serde_json::from_value::<rmcp::model::CallToolRequestParams>(params)
             }) {
                 Some(Ok(p)) => p,
@@ -300,11 +361,13 @@ pub(super) async fn dispatch_mcp_request(
                     (None, None)
                 };
 
-            // Synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
-            // but the context needs one for active call tracking.
-            let request_id = RequestId::from(rmcp::model::NumberOrString::String(Arc::from(
-                format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
-            )));
+            let request_id = request_context
+                .map(|context| context.request_id.clone())
+                .unwrap_or_else(|| {
+                    RequestId::from(rmcp::model::NumberOrString::String(Arc::from(
+                        format!("ipc-{session_id}-{}", uuid::Uuid::new_v4()).as_str(),
+                    )))
+                });
             let downstream_ctx = IpcDownstreamContext {
                 session_id: Arc::from(session_id),
                 registry_client_id: registry_client_id.map(Arc::<str>::from),
@@ -312,6 +375,12 @@ pub(super) async fn dispatch_mcp_request(
                 client_type,
                 owner,
                 owner_liveness,
+                request_context: request_context.cloned(),
+                modern_direction_enabled: tool_router.modern_downstream_enabled()
+                    && request_context.is_some_and(|context| {
+                        context.protocol_version
+                            == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                    }),
             };
 
             match plug_core::dispatch::dispatch_tools_call(
@@ -321,9 +390,9 @@ pub(super) async fn dispatch_mcp_request(
             )
             .await
             {
-                Ok(plug_core::dispatch::ToolCallOutcome::Called(result)) => ipc_ok(result),
-                Ok(plug_core::dispatch::ToolCallOutcome::TaskCreated(result)) => ipc_ok(result),
-                Err(mcp_err) => ipc_ok(mcp_err),
+                Ok(plug_core::dispatch::ToolCallOutcome::Called(result)) => ipc_ok!(result),
+                Ok(plug_core::dispatch::ToolCallOutcome::TaskCreated(result)) => ipc_ok!(result),
+                Err(mcp_err) => ipc_ok!(mcp_err),
             }
         }
 
@@ -337,7 +406,7 @@ pub(super) async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            ipc_from_mcp_result(tool_router.list_tasks_for_owner(&owner, request).await)
+            ipc_result!(tool_router.list_tasks_for_owner(&owner, request).await)
         }
 
         "tasks/get" => {
@@ -361,7 +430,7 @@ pub(super) async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            ipc_from_mcp_result(tool_router.get_task_info_for_owner(&owner, task_id).await)
+            ipc_result!(tool_router.get_task_info_for_owner(&owner, task_id).await)
         }
 
         "tasks/result" => {
@@ -385,7 +454,7 @@ pub(super) async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            ipc_from_mcp_result(tool_router.get_task_result_for_owner(&owner, task_id).await)
+            ipc_result!(tool_router.get_task_result_for_owner(&owner, task_id).await)
         }
 
         "tasks/cancel" => {
@@ -409,7 +478,7 @@ pub(super) async fn dispatch_mcp_request(
                 };
             };
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            ipc_from_mcp_result(tool_router.cancel_task_for_owner(&owner, task_id).await)
+            ipc_result!(tool_router.cancel_task_for_owner(&owner, task_id).await)
         }
 
         "resources/subscribe" => {
@@ -433,7 +502,7 @@ pub(super) async fn dispatch_mcp_request(
                 client_id: Arc::from(session_id),
             };
             // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
-            ipc_from_mcp_result(
+            ipc_result!(
                 tool_router
                     .subscribe_resource(&request.uri, target)
                     .await
@@ -463,7 +532,7 @@ pub(super) async fn dispatch_mcp_request(
                 client_id: Arc::from(session_id),
             };
             // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
-            ipc_from_mcp_result(
+            ipc_result!(
                 tool_router
                     .unsubscribe_resource(&request.uri, &target)
                     .await
@@ -476,6 +545,22 @@ pub(super) async fn dispatch_mcp_request(
             message: format!("MCP method '{method}' not supported via IPC proxy"),
         },
     }
+}
+
+fn reject_invalid_request_context(
+    modern_downstream_enabled: bool,
+    context: Option<&IpcMcpRequestContext>,
+) -> Option<IpcResponse> {
+    if context.is_some_and(|context| {
+        context.protocol_version == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+    }) && !modern_downstream_enabled
+    {
+        return Some(IpcResponse::Error {
+            code: "UNSUPPORTED_PROTOCOL_VERSION".to_string(),
+            message: "modern downstream MCP is disabled by daemon configuration".to_string(),
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -503,7 +588,8 @@ mod tests {
     #[test]
     fn ipc_from_mcp_result_encodes_ok_and_err() {
         // Ok -> McpResponse with the serialized value.
-        let ok = ipc_from_mcp_result::<serde_json::Value>(Ok(serde_json::json!({ "ok": true })));
+        let ok =
+            ipc_from_mcp_result::<serde_json::Value>(Ok(serde_json::json!({ "ok": true })), None);
         let IpcResponse::McpResponse { payload } = ok else {
             panic!("expected McpResponse for Ok, got {ok:?}");
         };
@@ -511,14 +597,73 @@ mod tests {
 
         // Err -> McpResponse carrying the serialized McpError (code + message),
         // the IPC convention where errors ride the same channel.
-        let err = ipc_from_mcp_result::<serde_json::Value>(Err(McpError::invalid_params(
-            "boom".to_string(),
+        let err = ipc_from_mcp_result::<serde_json::Value>(
+            Err(McpError::invalid_params("boom".to_string(), None)),
             None,
-        )));
+        );
         let IpcResponse::McpResponse { payload } = err else {
             panic!("expected McpResponse for Err, got {err:?}");
         };
         assert_eq!(payload["code"].as_i64(), Some(-32602));
         assert_eq!(payload["message"].as_str(), Some("boom"));
+    }
+
+    #[test]
+    fn forged_modern_context_is_rejected_when_daemon_gate_is_off() {
+        let context = IpcMcpRequestContext {
+            request_id: RequestId::from(rmcp::model::NumberOrString::Number(7_i64)),
+            protocol_version: plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
+            client_name: Some("forged-client".to_string()),
+            client_version: Some("1.0".to_string()),
+        };
+
+        let error = reject_invalid_request_context(false, Some(&context))
+            .expect("daemon-authoritative gate must reject forged modern context");
+        assert!(matches!(
+            error,
+            IpcResponse::Error { ref code, .. } if code == "UNSUPPORTED_PROTOCOL_VERSION"
+        ));
+        assert!(reject_invalid_request_context(true, Some(&context)).is_none());
+    }
+
+    #[test]
+    fn contextual_ipc_request_preserves_protocol_client_and_principal() {
+        use plug_core::dispatch::DownstreamContext as _;
+
+        let request_id = RequestId::from(rmcp::model::NumberOrString::Number(23));
+        let downstream = IpcDownstreamContext {
+            session_id: Arc::from("transport-session"),
+            registry_client_id: Some(Arc::from("stable-client")),
+            request_id: request_id.clone(),
+            client_type: plug_core::types::ClientType::Unknown,
+            owner: None,
+            owner_liveness: None,
+            request_context: Some(IpcMcpRequestContext {
+                request_id: request_id.clone(),
+                protocol_version: plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                    .to_string(),
+                client_name: Some("modern-client".to_string()),
+                client_version: Some("2.0".to_string()),
+            }),
+            modern_direction_enabled: true,
+        }
+        .downstream_call_context();
+
+        assert_eq!(downstream.request_id, request_id);
+        assert_eq!(
+            downstream.protocol_era,
+            plug_core::protocol::ProtocolEra::Modern
+        );
+        assert!(downstream.modern_direction_enabled);
+        assert_eq!(downstream.protocol_version.as_ref(), "2026-07-28");
+        assert_eq!(
+            downstream.principal,
+            Some(plug_core::types::PrincipalId::daemon_ipc_registry(
+                "stable-client"
+            ))
+        );
+        let metadata = downstream.client_metadata.expect("client metadata");
+        assert_eq!(metadata.name.as_ref(), "modern-client");
+        assert_eq!(metadata.version.as_ref(), "2.0");
     }
 }

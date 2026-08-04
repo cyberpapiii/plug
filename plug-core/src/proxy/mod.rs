@@ -33,7 +33,6 @@ use crate::types::{
     ClientType, LazyToolMode, LazyToolModeOrigin, PrincipalId, ResolvedLazyToolPolicy,
 };
 
-const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Backstop timeout for a single `refresh_tools` pass inside the notification
 /// refresh task. Per-server listing calls are already bounded by
@@ -43,6 +42,8 @@ const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
+#[cfg(test)]
+const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
 fn plug_implementation() -> Implementation {
     branding::plug_implementation(env!("CARGO_PKG_VERSION"))
@@ -187,6 +188,9 @@ pub struct ToolRouter {
     task_store: Mutex<TaskStore>,
     /// One process-wide admission ledger shared by every downstream transport.
     admission_quotas: crate::protocol::AdmissionQuotas,
+    /// Process-wide, reloadable gate for the modern downstream lifecycle.
+    /// It defaults off and is captured into each downstream call context.
+    modern_downstream_enabled: AtomicBool,
     /// Serializes `refresh_tools`' decide-and-mutate phase (subscription
     /// classify → prune → snapshot publish → rebind) across concurrent
     /// refresh passes, so one pass cannot interleave reconciliation
@@ -214,6 +218,9 @@ pub struct DownstreamCallContext {
     pub trace_id: Arc<str>,
     pub protocol_era: crate::protocol::ProtocolEra,
     pub protocol_version: Arc<str>,
+    /// Reloadable transport gate captured when this request context is built.
+    /// Modern policy remains fail-closed unless the owning adapter sets it.
+    pub modern_direction_enabled: bool,
     pub principal: Option<PrincipalId>,
     pub scopes: Arc<BTreeSet<String>>,
     pub local_trust: bool,
@@ -245,6 +252,7 @@ impl DownstreamCallContext {
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            modern_direction_enabled: false,
             principal: Some(PrincipalId::stdio_process(stable_instance_uuid(
                 "stdio", &client_id,
             ))),
@@ -272,6 +280,7 @@ impl DownstreamCallContext {
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            modern_direction_enabled: false,
             principal: Some(PrincipalId::daemon_ipc(stable_instance_uuid(
                 "ipc", &client_id,
             ))),
@@ -303,6 +312,7 @@ impl DownstreamCallContext {
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            modern_direction_enabled: false,
             principal: None,
             scopes: Arc::new(BTreeSet::new()),
             local_trust: true,
@@ -329,6 +339,7 @@ impl DownstreamCallContext {
             trace_id: trace_id.into(),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            modern_direction_enabled: false,
             principal: None,
             scopes: Arc::new(BTreeSet::new()),
             local_trust: true,
@@ -387,6 +398,11 @@ impl DownstreamCallContext {
         self
     }
 
+    pub fn with_modern_direction_enabled(mut self, enabled: bool) -> Self {
+        self.modern_direction_enabled = enabled;
+        self
+    }
+
     pub fn with_lifecycle(
         mut self,
         deadline: Option<std::time::Instant>,
@@ -410,7 +426,7 @@ impl DownstreamCallContext {
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
-                modern_direction_enabled: false,
+                modern_direction_enabled: self.modern_direction_enabled,
                 bridge_implemented: false,
             },
             family,
@@ -644,6 +660,7 @@ impl ToolRouter {
             lazy_working_sets: DashMap::new(),
             task_store: Mutex::new(TaskStore::new()),
             admission_quotas,
+            modern_downstream_enabled: AtomicBool::new(false),
             refresh_reconcile_lock: Mutex::new(()),
         }
     }
@@ -669,6 +686,15 @@ impl ToolRouter {
 
     pub fn publish_protocol_notification(&self, notification: ProtocolNotification) {
         let _ = self.protocol_notification_tx.send(notification);
+    }
+
+    pub fn set_modern_downstream_enabled(&self, enabled: bool) {
+        self.modern_downstream_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    pub fn modern_downstream_enabled(&self) -> bool {
+        self.modern_downstream_enabled.load(Ordering::Acquire)
     }
 
     // ── Logging channel ──────────────────────────────────────────────────
@@ -1227,6 +1253,19 @@ impl ToolRouter {
                 tracing::warn!(error = %error, "failed to forward downstream cancellation upstream");
             }
         });
+    }
+
+    /// Cancel an active request owned by the supplied downstream context.
+    ///
+    /// Transport adapters use this narrow entry point when their own request
+    /// lifecycle ends. The router keeps the upstream-call lookup and
+    /// cancellation forwarding details private.
+    pub fn cancel_downstream_request(
+        &self,
+        context: &DownstreamCallContext,
+        reason: Option<String>,
+    ) {
+        self.forward_cancel_from_downstream(context, reason);
     }
 
     pub(crate) fn route_upstream_progress(

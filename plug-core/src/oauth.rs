@@ -1379,13 +1379,16 @@ impl CredentialStore for CompositeCredentialStore {
         let snapshot = self.fallback_auth_snapshot_inner();
         if snapshot.source == Some("keyring")
             && let Some(credentials) = snapshot.credentials.as_ref()
-            && let Err(error) = self.file_save(credentials)
         {
-            warn!(
-                server = %self.server_name,
-                %error,
-                "token file mirror repair failed after keyring-backed load"
-            );
+            if self.binding.load().as_ref().is_some() {
+                self.migrate_loaded_legacy_credentials(credentials)?;
+            } else if let Err(error) = self.file_save(credentials) {
+                warn!(
+                    server = %self.server_name,
+                    %error,
+                    "token file mirror repair failed after keyring-backed load"
+                );
+            }
         }
         Ok(snapshot.credentials)
     }
@@ -2598,6 +2601,54 @@ mod tests {
             .as_ref()
             .map(|tr| tr.access_token().secret().to_string());
         assert_eq!(token.as_deref(), Some("keyring-only-access"));
+
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_load_migrates_keyring_only_legacy_credentials_as_a_pair() {
+        let name = format!("oauth-bound-keyring-migration-{}", std::process::id());
+        let store = get_or_create_store(&name);
+        store.clear().await.unwrap();
+
+        let credentials = make_test_token(
+            "legacy-keyring-access",
+            Some("legacy-keyring-refresh"),
+            Some(3600),
+        );
+        assert!(store.keyring_save(&credentials));
+        store.file_clear();
+        store.clear_cache();
+        store.binding.store(Arc::new(Some(CredentialBinding {
+            issuer: "https://issuer.example/tenant".to_string(),
+            resource: "https://resource.example/mcp?tenant=a".to_string(),
+        })));
+
+        let loaded = store
+            .load()
+            .await
+            .expect("bound legacy migration must not panic")
+            .expect("legacy keyring credentials should migrate");
+        assert_eq!(
+            stored_access_token(&loaded).as_deref(),
+            Some("legacy-keyring-access")
+        );
+
+        let file = serde_json::from_str::<PersistedCredentialEnvelope>(
+            &store.raw_file_json().expect("migrated file mirror"),
+        )
+        .expect("valid file envelope");
+        let keyring = serde_json::from_str::<PersistedCredentialEnvelope>(
+            &store.raw_keyring_json().expect("migrated keyring mirror"),
+        )
+        .expect("valid keyring envelope");
+        let (PersistedCredentialEnvelope::Bound(file), PersistedCredentialEnvelope::Bound(keyring)) =
+            (file, keyring)
+        else {
+            panic!("both migrated mirrors must use bound envelopes");
+        };
+        assert_eq!(file.generation, keyring.generation);
+        assert_eq!(file.binding, keyring.binding);
 
         store.clear().await.unwrap();
     }

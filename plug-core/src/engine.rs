@@ -162,6 +162,7 @@ impl Engine {
         let tool_router = Arc::new(
             ToolRouter::new(server_manager.clone(), router_config).with_event_tx(event_tx.clone()),
         );
+        tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
         server_manager.set_tool_router(Arc::downgrade(&tool_router));
 
         Self {
@@ -491,6 +492,8 @@ impl Engine {
 
     /// Atomically swap in a new config.
     pub fn store_config(&self, config: Config) {
+        self.tool_router
+            .set_modern_downstream_enabled(config.http.modern_downstream_enabled);
         self.config.store(Arc::new(config));
     }
 
@@ -1177,6 +1180,28 @@ mod tests {
             .servers
             .insert(name.to_string(), mock_stdio_server_config(tools, 1));
         config
+    }
+
+    #[tokio::test]
+    async fn reload_updates_modern_downstream_gate_without_rebuilding_engine() {
+        let engine = Arc::new(Engine::new(Config::default()));
+        assert!(!engine.tool_router().modern_downstream_enabled());
+
+        let mut enabled = Config::default();
+        enabled.http.modern_downstream_enabled = true;
+        let report = engine
+            .reload_config(enabled)
+            .await
+            .expect("enable reload succeeds");
+        assert!(report.settings_changed);
+        assert!(engine.tool_router().modern_downstream_enabled());
+
+        let report = engine
+            .reload_config(Config::default())
+            .await
+            .expect("disable reload succeeds");
+        assert!(report.settings_changed);
+        assert!(!engine.tool_router().modern_downstream_enabled());
     }
 
     // ── Plan 011: reconnect/restart vs. reload interlock ──────────────────

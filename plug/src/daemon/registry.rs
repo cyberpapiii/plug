@@ -22,11 +22,13 @@ struct ClientSession {
     client_info: Option<String>,
     connected_at: Instant,
     capabilities: ClientCapabilities,
+    cancellation_capability: String,
 }
 
 pub(super) struct RegistrationResult {
     pub(super) session_id: String,
     pub(super) replaced_session_id: Option<String>,
+    pub(super) cancellation_capability: String,
 }
 
 impl ClientRegistry {
@@ -58,6 +60,11 @@ impl ClientRegistry {
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
+        let cancellation_capability = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
         let replaced_session_id = self
             .client_sessions
             .insert(client_id.clone(), session_id.clone());
@@ -77,12 +84,14 @@ impl ClientRegistry {
                 client_info,
                 connected_at: Instant::now(),
                 capabilities: ClientCapabilities::default(),
+                cancellation_capability: cancellation_capability.clone(),
             },
         );
         self.count_tx.send_modify(|c| *c = self.sessions.len());
         Ok(RegistrationResult {
             session_id,
             replaced_session_id,
+            cancellation_capability,
         })
     }
 
@@ -127,6 +136,16 @@ impl ClientRegistry {
     /// Get the stable client_id for a session.
     pub(super) fn client_id(&self, session_id: &str) -> Option<String> {
         self.sessions.get(session_id).map(|s| s.client_id.clone())
+    }
+
+    pub(super) fn cancellation_capability_matches(&self, session_id: &str, provided: &str) -> bool {
+        use subtle::ConstantTimeEq as _;
+
+        self.sessions.get(session_id).is_some_and(|session| {
+            let expected = session.cancellation_capability.as_bytes();
+            let provided = provided.as_bytes();
+            expected.len() == provided.len() && bool::from(expected.ct_eq(provided))
+        })
     }
 
     /// Number of currently connected clients.
@@ -239,6 +258,10 @@ mod tests {
         assert!(!registry.session_exists(&first.session_id));
         assert!(registry.session_exists(&second.session_id));
         assert_eq!(registry.count(), 1);
+        assert_ne!(
+            first.cancellation_capability, second.cancellation_capability,
+            "cancellation capability must rotate on reconnect"
+        );
     }
 
     #[test]

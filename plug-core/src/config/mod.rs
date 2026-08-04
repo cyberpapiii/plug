@@ -276,6 +276,10 @@ fn resolved_policy(mode: LazyToolMode, origin: LazyToolModeOrigin) -> ResolvedLa
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
+    /// Opt in to the MCP 2026-07-28 downstream lifecycle. This remains false
+    /// until modern conformance has been run for the installed release.
+    #[serde(default)]
+    pub modern_downstream_enabled: bool,
     /// Downstream authentication mode for remote HTTP clients.
     #[serde(default)]
     pub auth_mode: DownstreamAuthMode,
@@ -306,6 +310,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            modern_downstream_enabled: false,
             auth_mode: DownstreamAuthMode::default(),
             public_base_url: None,
             oauth_scopes: None,

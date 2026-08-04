@@ -12,11 +12,73 @@ use crate::types::PrincipalId;
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const ANNOUNCED_FUTURE_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// Classify an HTTP JSON-RPC envelope before any era-specific rewriting or
+/// typed deserialization occurs.
+pub fn classify_http_request_era(
+    value: &serde_json::Value,
+    header_version: Option<&str>,
+) -> Result<ProtocolEra, String> {
+    let method = value.get("method").and_then(serde_json::Value::as_str);
+    let meta_version = value
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(serde_json::Value::as_str);
+    let initialize_version = (method == Some("initialize"))
+        .then(|| {
+            value
+                .get("params")
+                .and_then(|params| params.get("protocolVersion"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .flatten();
+
+    let declared = [header_version, meta_version, initialize_version]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if let Some(first) = declared.first()
+        && declared.iter().any(|version| version != first)
+    {
+        return Err("MCP protocol version header and body metadata disagree".to_string());
+    }
+
+    let modern = method == Some("server/discover")
+        || declared
+            .first()
+            .is_some_and(|version| *version == ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+    if modern {
+        if header_version != Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION) {
+            return Err("modern requests require MCP-Protocol-Version: 2026-07-28".to_string());
+        }
+        if value.get("id").is_some() && meta_version != Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION) {
+            return Err(
+                "modern requests require matching protocolVersion in params._meta".to_string(),
+            );
+        }
+        return Ok(ProtocolEra::Modern);
+    }
+    Ok(ProtocolEra::Legacy)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolEra {
     Legacy,
     Modern,
+}
+
+/// Remove modern capabilities whose transport/ownership bridges are not yet
+/// implemented. Keep this projection shared by HTTP and direct RMCP handlers
+/// so discovery cannot outrun dispatch.
+pub fn suppress_unimplemented_modern_capabilities(
+    capabilities: &mut rmcp::model::ServerCapabilities,
+) {
+    capabilities.extensions = None;
+    capabilities.experimental = None;
+    if let Some(resources) = capabilities.resources.as_mut() {
+        resources.subscribe = None;
+    }
 }
 
 impl ProtocolEra {
@@ -638,5 +700,70 @@ mod tests {
         for thread in threads {
             drop(thread.join().unwrap());
         }
+    }
+
+    #[test]
+    fn http_era_classification_requires_consistent_modern_declarations() {
+        let modern = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            }
+        });
+        assert_eq!(
+            classify_http_request_era(&modern, Some("2026-07-28")),
+            Ok(ProtocolEra::Modern)
+        );
+        assert!(
+            classify_http_request_era(&modern, Some("2025-11-25"))
+                .unwrap_err()
+                .contains("disagree")
+        );
+    }
+
+    #[test]
+    fn legacy_http_classification_does_not_require_inline_metadata() {
+        let legacy = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        });
+        assert_eq!(
+            classify_http_request_era(&legacy, Some(SUPPORTED_PROTOCOL_VERSION)),
+            Ok(ProtocolEra::Legacy)
+        );
+    }
+
+    #[test]
+    fn modern_notification_uses_transport_version_without_request_metadata() {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 7 }
+        });
+        assert_eq!(
+            classify_http_request_era(&notification, Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION)),
+            Ok(ProtocolEra::Modern)
+        );
+    }
+
+    #[test]
+    fn modern_projection_suppresses_upstream_subscription_capability() {
+        let mut capabilities = rmcp::model::ServerCapabilities::default();
+        let mut resources = rmcp::model::ResourcesCapability::default();
+        resources.subscribe = Some(true);
+        resources.list_changed = Some(true);
+        capabilities.resources = Some(resources);
+
+        suppress_unimplemented_modern_capabilities(&mut capabilities);
+
+        let resources = capabilities.resources.expect("resources remain advertised");
+        assert_eq!(resources.subscribe, None);
+        assert_eq!(resources.list_changed, Some(true));
     }
 }

@@ -642,6 +642,9 @@ async fn handle_ipc_loop(
     // Protocol notification subscription — activated after Register so the daemon
     // can push list_changed, progress, and cancelled notifications to this IPC client.
     let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
+    let mut gate_tick = tokio::time::interval(Duration::from_millis(100));
+    gate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_modern_gate = ctx.engine.tool_router().modern_downstream_enabled();
 
     loop {
         // Proxy connections (those that have Registered) are long-lived and should
@@ -668,6 +671,17 @@ async fn handle_ipc_loop(
                         }
                     } => {
                         send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
+                    }
+                    _ = gate_tick.tick() => {
+                        let enabled = ctx.engine.tool_router().modern_downstream_enabled();
+                        if enabled != last_modern_gate {
+                            ipc::send_response(
+                                writer,
+                                &IpcResponse::ModernDownstreamGateChanged { enabled },
+                            )
+                            .await?;
+                            last_modern_gate = enabled;
+                        }
                     }
                     reverse = async {
                         if let Some(ref mut rx) = ctx.reverse_request_rx {
@@ -774,6 +788,7 @@ async fn handle_ipc_loop(
         // SESSION_REPLACED) early-returns without touching the bridge, and
         // the still-live channel must be restored as usual.
         let request_was_deregister = is_deregister_request(&request);
+        let gate_router = ctx.engine.tool_router().clone();
 
         let response = {
             use std::pin::pin;
@@ -825,6 +840,17 @@ async fn handle_ipc_loop(
                         }
                     } => {
                         send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
+                    }
+                    _ = gate_tick.tick() => {
+                        let enabled = gate_router.modern_downstream_enabled();
+                        if enabled != last_modern_gate {
+                            ipc::send_response(
+                                writer,
+                                &IpcResponse::ModernDownstreamGateChanged { enabled },
+                            )
+                            .await?;
+                            last_modern_gate = enabled;
+                        }
                     }
                 }
             }
@@ -1189,6 +1215,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
                 client_id: client_id.clone(),
                 session_id,
+                modern_downstream_enabled: ctx.engine.tool_router().modern_downstream_enabled(),
+                cancellation_capability: plug_core::ipc::IpcCancellationCapability::new(
+                    registration.cancellation_capability,
+                ),
             }
         }
 
@@ -1388,6 +1418,24 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
+        IpcRequest::ModernDownstreamGate { session_id } => {
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            IpcResponse::ModernDownstreamGate {
+                enabled: ctx.engine.tool_router().modern_downstream_enabled(),
+            }
+        }
+
         IpcRequest::UpdateRoots { session_id, roots } => {
             // Enforce session ownership
             if ctx.session_id.as_deref() != Some(session_id.as_str()) {
@@ -1478,7 +1526,70 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session is no longer active for this client".to_string(),
                 };
             }
-            dispatch_mcp_request(ctx, session_id, method, params.as_ref()).await
+            dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await
+        }
+
+        IpcRequest::McpRequestWithContext {
+            session_id,
+            method,
+            params,
+            context,
+        } => {
+            // Context-bearing requests use the same connection ownership
+            // rules as the legacy IPC request shape.
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await
+        }
+
+        IpcRequest::CancelMcpRequest {
+            session_id,
+            client_id,
+            cancellation_capability,
+            request_id,
+            reason,
+        } => {
+            // Cancellation intentionally arrives on a short-lived auxiliary
+            // socket: the primary socket may be blocked waiting for the call
+            // being cancelled. Authorize it against the active registry
+            // binding instead of this connection's session field.
+            if let Some(response) = reject_invalid_cancellation_identity(
+                &ctx.client_registry,
+                session_id,
+                client_id,
+                cancellation_capability,
+            ) {
+                return response;
+            }
+
+            let client_type = ctx
+                .client_registry
+                .client_info(session_id)
+                .as_deref()
+                .map(plug_core::client_detect::detect_client)
+                .unwrap_or(plug_core::types::ClientType::Unknown);
+            let downstream = plug_core::proxy::DownstreamCallContext::ipc_for_client(
+                session_id.as_str(),
+                request_id.clone(),
+                client_type,
+            )
+            .with_local_principal(plug_core::types::PrincipalId::daemon_ipc_registry(
+                client_id,
+            ));
+            ctx.engine
+                .tool_router()
+                .cancel_downstream_request(&downstream, reason.clone());
+            IpcResponse::Ok
         }
 
         IpcRequest::AuthStatus => dispatch_auth_status(ctx).await,
@@ -1491,6 +1602,35 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             ..
         } => dispatch_inject_token(ctx, server_name, access_token, refresh_token, expires_in).await,
     }
+}
+
+fn reject_invalid_cancellation_identity(
+    registry: &ClientRegistry,
+    session_id: &str,
+    client_id: &str,
+    cancellation_capability: &plug_core::ipc::IpcCancellationCapability,
+) -> Option<IpcResponse> {
+    if !registry.session_exists(session_id) {
+        return Some(IpcResponse::Error {
+            code: "SESSION_REPLACED".to_string(),
+            message: "session is no longer active for this client".to_string(),
+        });
+    }
+    if registry.client_id(session_id).as_deref() != Some(client_id) {
+        return Some(IpcResponse::Error {
+            code: "CLIENT_MISMATCH".to_string(),
+            message: "session_id is not owned by client_id".to_string(),
+        });
+    }
+    if !registry
+        .cancellation_capability_matches(session_id, cancellation_capability.expose_secret())
+    {
+        return Some(IpcResponse::Error {
+            code: "INVALID_CANCELLATION_CAPABILITY".to_string(),
+            message: "cancellation capability is invalid".to_string(),
+        });
+    }
+    None
 }
 
 /// Handle `InjectToken` — save credentials and trigger server reconnect.
@@ -1754,6 +1894,69 @@ mod tests {
         if let Some(dir) = config_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn cancellation_identity_cannot_cross_client_boundary() {
+        let (registry, _count_rx) = ClientRegistry::new();
+        let first = registry
+            .try_register(
+                "first-client".to_string(),
+                Some("client".to_string()),
+                MAX_REGISTERED_PROXY_CLIENTS,
+            )
+            .expect("register first client");
+        let second = registry
+            .try_register(
+                "second-client".to_string(),
+                Some("client".to_string()),
+                MAX_REGISTERED_PROXY_CLIENTS,
+            )
+            .expect("register second client");
+
+        assert!(
+            reject_invalid_cancellation_identity(
+                &registry,
+                &first.session_id,
+                "first-client",
+                &plug_core::ipc::IpcCancellationCapability::new(
+                    first.cancellation_capability.clone(),
+                ),
+            )
+            .is_none()
+        );
+        let error = reject_invalid_cancellation_identity(
+            &registry,
+            &first.session_id,
+            "second-client",
+            &plug_core::ipc::IpcCancellationCapability::new(second.cancellation_capability.clone()),
+        )
+        .expect("second client must not cancel first client's request");
+        assert!(matches!(
+            error,
+            IpcResponse::Error { ref code, .. } if code == "CLIENT_MISMATCH"
+        ));
+        assert!(
+            reject_invalid_cancellation_identity(
+                &registry,
+                &second.session_id,
+                "second-client",
+                &plug_core::ipc::IpcCancellationCapability::new(second.cancellation_capability,),
+            )
+            .is_none()
+        );
+
+        let forged = reject_invalid_cancellation_identity(
+            &registry,
+            &first.session_id,
+            "first-client",
+            &plug_core::ipc::IpcCancellationCapability::new("forged".to_string()),
+        )
+        .expect("enumerated ids without capability must fail");
+        assert!(matches!(
+            forged,
+            IpcResponse::Error { ref code, .. } if code == "INVALID_CANCELLATION_CAPABILITY"
+        ));
     }
 
     #[test]

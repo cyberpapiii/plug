@@ -182,7 +182,8 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         "daemon_grace_period_secs changed",
     );
 
-    let settings_changed = !restart_required.is_empty();
+    let settings_changed = !restart_required.is_empty()
+        || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled;
 
     ConfigDiff {
         added,

@@ -533,11 +533,17 @@ pub(crate) struct DaemonProxySession {
     pub(crate) client_info: Option<String>,
     pub(crate) session_id: String,
     pub(crate) capabilities: rmcp::model::ServerCapabilities,
+    pub(crate) modern_downstream_enabled: bool,
+    pub(crate) cancellation_capability: plug_core::ipc::IpcCancellationCapability,
     pub(crate) pending_notifications: Vec<plug_core::ipc::IpcResponse>,
 }
 
 enum PendingIpcResponse {
-    Registered(String),
+    Registered {
+        session_id: String,
+        modern_downstream_enabled: bool,
+        cancellation_capability: plug_core::ipc::IpcCancellationCapability,
+    },
     Capabilities(rmcp::model::ServerCapabilities),
 }
 
@@ -566,6 +572,8 @@ async fn read_pending_or_matching_response(
                 protocol_version,
                 client_id,
                 session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
             } => {
                 if protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
                     anyhow::bail!(
@@ -578,7 +586,11 @@ async fn read_pending_or_matching_response(
                         "daemon/client registration mismatch: expected client_id {expected_client_id}, got {client_id}"
                     );
                 }
-                return Ok(PendingIpcResponse::Registered(session_id));
+                return Ok(PendingIpcResponse::Registered {
+                    session_id,
+                    modern_downstream_enabled,
+                    cancellation_capability,
+                });
             }
             resp @ (plug_core::ipc::IpcResponse::LoggingNotification { .. }
             | plug_core::ipc::IpcResponse::ToolListChangedNotification
@@ -586,7 +598,8 @@ async fn read_pending_or_matching_response(
             | plug_core::ipc::IpcResponse::PromptListChangedNotification
             | plug_core::ipc::IpcResponse::ProgressNotification { .. }
             | plug_core::ipc::IpcResponse::CancelledNotification { .. }
-            | plug_core::ipc::IpcResponse::AuthStateChanged { .. }) => {
+            | plug_core::ipc::IpcResponse::AuthStateChanged { .. }
+            | plug_core::ipc::IpcResponse::ModernDownstreamGateChanged { .. }) => {
                 pending_notifications.push(resp);
             }
             other => {
@@ -618,22 +631,38 @@ pub(crate) async fn establish_daemon_proxy_session(
     };
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
-    let session_id = match read_pending_or_matching_response(
-        &mut reader,
-        &client_id,
-        &mut pending_notifications,
-        |response| match response {
-            plug_core::ipc::IpcResponse::Registered { session_id, .. } => {
-                Some(PendingIpcResponse::Registered(session_id.clone()))
-            }
-            _ => None,
-        },
-    )
-    .await?
-    {
-        PendingIpcResponse::Registered(session_id) => session_id,
-        PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
-    };
+    let (session_id, modern_downstream_enabled, cancellation_capability) =
+        match read_pending_or_matching_response(
+            &mut reader,
+            &client_id,
+            &mut pending_notifications,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Registered {
+                    session_id,
+                    modern_downstream_enabled,
+                    cancellation_capability,
+                    ..
+                } => Some(PendingIpcResponse::Registered {
+                    session_id: session_id.clone(),
+                    modern_downstream_enabled: *modern_downstream_enabled,
+                    cancellation_capability: cancellation_capability.clone(),
+                }),
+                _ => None,
+            },
+        )
+        .await?
+        {
+            PendingIpcResponse::Registered {
+                session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
+            } => (
+                session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
+            ),
+            PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
+        };
     let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
         session_id: session_id.clone(),
     };
@@ -655,7 +684,7 @@ pub(crate) async fn establish_daemon_proxy_session(
     .await?
     {
         PendingIpcResponse::Capabilities(capabilities) => capabilities,
-        PendingIpcResponse::Registered(_) => unreachable!("capabilities response expected"),
+        PendingIpcResponse::Registered { .. } => unreachable!("capabilities response expected"),
     };
     Ok(DaemonProxySession {
         reader,
@@ -664,14 +693,24 @@ pub(crate) async fn establish_daemon_proxy_session(
         client_info,
         session_id,
         capabilities,
+        modern_downstream_enabled,
+        cancellation_capability,
         pending_notifications,
     })
 }
 
-/// Byte-level legacy adapter required because RMCP 3.x intentionally no longer
-/// models SEP-1686 task fields. It rewrites before typed deserialization and
-/// restores the exact legacy response vocabulary on stdout.
-fn legacy_stdio_transport() -> tokio::io::DuplexStream {
+fn is_modern_stdio_message(value: &serde_json::Value) -> bool {
+    value.get("method").and_then(serde_json::Value::as_str) == Some("server/discover")
+        || value
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            == Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
+}
+
+/// Byte-level protocol adapter. Legacy sessions retain the exact SEP-1686
+/// request/response vocabulary; a gated modern session passes through without
+/// those rewrites, beginning with `server/discover` as its first message.
+fn stdio_transport(modern_downstream_enabled: bool) -> tokio::io::DuplexStream {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     let (service, bridge) = tokio::io::duplex(256 * 1024);
@@ -679,8 +718,10 @@ fn legacy_stdio_transport() -> tokio::io::DuplexStream {
     let task_requests = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
         String,
     >::new()));
+    let modern_session = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let inbound_tasks = std::sync::Arc::clone(&task_requests);
+    let inbound_modern = std::sync::Arc::clone(&modern_session);
     tokio::spawn(async move {
         let mut input = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = input.next_line().await {
@@ -689,8 +730,12 @@ fn legacy_stdio_transport() -> tokio::io::DuplexStream {
                 let _ = bridge_write.write_all(b"\n").await;
                 continue;
             };
-            let task_request = value.get("method").and_then(serde_json::Value::as_str)
-                == Some("tools/call")
+            if modern_downstream_enabled && is_modern_stdio_message(&value) {
+                inbound_modern.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let is_modern = inbound_modern.load(std::sync::atomic::Ordering::Acquire);
+            let task_request = !is_modern
+                && value.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
                 && value
                     .get("params")
                     .and_then(|params| params.get("task"))
@@ -698,7 +743,9 @@ fn legacy_stdio_transport() -> tokio::io::DuplexStream {
             if task_request && let Some(id) = value.get("id") {
                 inbound_tasks.lock().await.insert(id.to_string());
             }
-            plug_core::protocol::rewrite_legacy_request(&mut value);
+            if !is_modern {
+                plug_core::protocol::rewrite_legacy_request(&mut value);
+            }
             if let Ok(mut encoded) = serde_json::to_vec(&value) {
                 encoded.push(b'\n');
                 if bridge_write.write_all(&encoded).await.is_err() {
@@ -708,6 +755,7 @@ fn legacy_stdio_transport() -> tokio::io::DuplexStream {
         }
     });
 
+    let outbound_modern = modern_session;
     tokio::spawn(async move {
         let mut output = tokio::io::stdout();
         let mut lines = BufReader::new(bridge_read).lines();
@@ -717,12 +765,15 @@ fn legacy_stdio_transport() -> tokio::io::DuplexStream {
                 let _ = output.write_all(b"\n").await;
                 continue;
             };
-            let task_response = if let Some(id) = value.get("id") {
+            let is_modern = outbound_modern.load(std::sync::atomic::Ordering::Acquire);
+            let task_response = if !is_modern && let Some(id) = value.get("id") {
                 task_requests.lock().await.remove(&id.to_string())
             } else {
                 false
             };
-            plug_core::protocol::rewrite_legacy_response(&mut value, task_response);
+            if !is_modern {
+                plug_core::protocol::rewrite_legacy_response(&mut value, task_response);
+            }
             if let Ok(mut encoded) = serde_json::to_vec(&value) {
                 encoded.push(b'\n');
                 if output.write_all(&encoded).await.is_err() {
@@ -741,9 +792,10 @@ pub(crate) async fn connect_via_daemon(
 ) -> anyhow::Result<()> {
     let client_id = uuid::Uuid::new_v4().to_string();
     let session = establish_daemon_proxy_session(config_path, client_id, None).await?;
+    let modern_downstream_enabled = session.modern_downstream_enabled;
     let proxy = crate::ipc_proxy::IpcProxyHandler::new(session, config_path.cloned());
     use rmcp::ServiceExt as _;
-    let transport = legacy_stdio_transport();
+    let transport = stdio_transport(modern_downstream_enabled);
     let service = proxy
         .serve(transport)
         .await
@@ -759,8 +811,10 @@ pub(crate) async fn connect_standalone(
     let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
     let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+    let modern_downstream_enabled = engine.config().http.modern_downstream_enabled;
+    proxy.set_modern_downstream_enabled(modern_downstream_enabled);
     use rmcp::ServiceExt as _;
-    let transport = legacy_stdio_transport();
+    let transport = stdio_transport(modern_downstream_enabled);
     let service = proxy
         .serve(transport)
         .await
@@ -1155,6 +1209,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let http = plug_core::config::HttpConfig {
+            modern_downstream_enabled: false,
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             public_base_url: None,
             oauth_scopes: None,
