@@ -25,8 +25,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_oauth::{
-    AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
-    resource_scopes,
+    AccessTokenClaims, AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest,
+    DownstreamOauthError, resource_scopes,
 };
 use crate::mcp_http_headers::{HEADER_MISMATCH_CODE, HeaderMismatch, validate_mirrored_headers};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
@@ -76,16 +76,32 @@ struct HttpDownstreamContext {
     client_type: crate::types::ClientType,
     trace_id: Arc<str>,
     sessions: Arc<dyn SessionStore>,
+    auth_status: AuthStatus,
+    oauth_issuer: Option<Arc<str>>,
 }
 
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::http_for_client_with_trace(
+        let context = DownstreamCallContext::http_for_client_with_trace(
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
             Arc::clone(&self.trace_id),
-        )
+        );
+        match &self.auth_status {
+            AuthStatus::Authenticated(Some(claims)) => context.with_authorization(
+                crate::types::PrincipalId::downstream_oauth(
+                    self.oauth_issuer.as_deref().unwrap_or("unknown-issuer"),
+                    claims.client_id.clone(),
+                    claims.resource.clone(),
+                ),
+                claims.scopes.clone(),
+            ),
+            AuthStatus::Authenticated(None) => context.with_local_principal(
+                crate::types::PrincipalId::configured_credential("downstream-http-bearer", 0),
+            ),
+            AuthStatus::NoAuthRequired => context,
+        }
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
@@ -431,10 +447,10 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
 // ---------------------------------------------------------------------------
 
 /// Whether the request has been authenticated via bearer token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthStatus {
     /// Request authenticated with valid bearer token.
-    Authenticated,
+    Authenticated(Option<AccessTokenClaims>),
     /// No auth required (loopback-only server).
     NoAuthRequired,
 }
@@ -501,7 +517,7 @@ async fn validate_bearer_auth(
                 .validate_access_token_for(auth, &required_scopes, &manager.resource())
                 .await
             {
-                AccessTokenValidation::Valid(_) => AuthStatus::Authenticated,
+                AccessTokenValidation::Valid(claims) => AuthStatus::Authenticated(Some(claims)),
                 AccessTokenValidation::InsufficientScope => {
                     return Err(HttpError::InsufficientScopeWithMetadata {
                         metadata_url,
@@ -530,7 +546,7 @@ async fn validate_bearer_auth(
         None => AuthStatus::NoAuthRequired,
         Some(expected) => {
             if check_bearer_token(req.headers(), expected.as_ref()) {
-                AuthStatus::Authenticated
+                AuthStatus::Authenticated(None)
             } else {
                 tracing::warn!("bearer auth failed from downstream client");
                 return Err(HttpError::Unauthorized);
@@ -555,7 +571,10 @@ async fn validate_origin(
     next: Next,
 ) -> Result<Response, HttpError> {
     // Skip origin check for authenticated remote clients
-    if req.extensions().get::<AuthStatus>() == Some(&AuthStatus::Authenticated) {
+    if matches!(
+        req.extensions().get::<AuthStatus>(),
+        Some(AuthStatus::Authenticated(_))
+    ) {
         return Ok(next.run(req).await);
     }
 
@@ -596,6 +615,7 @@ async fn validate_origin(
 /// POST /mcp — handle JSON-RPC requests, notifications, and client responses.
 async fn post_mcp(
     State(state): State<Arc<HttpState>>,
+    axum::Extension(auth_status): axum::Extension<AuthStatus>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HttpError> {
@@ -627,7 +647,9 @@ async fn post_mcp(
 
     // 3. Route based on message type
     match message {
-        JsonRpcMessage::Request(req) => handle_request(req, &headers, &state, trace_id).await,
+        JsonRpcMessage::Request(req) => {
+            handle_request(req, &headers, &state, trace_id, auth_status).await
+        }
         JsonRpcMessage::Response(response) => {
             let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
@@ -1403,6 +1425,7 @@ async fn handle_request(
     headers: &HeaderMap,
     state: &Arc<HttpState>,
     trace_id: Arc<str>,
+    auth_status: AuthStatus,
 ) -> Result<Response, HttpError> {
     let request_id = req.id.clone();
 
@@ -1486,6 +1509,11 @@ async fn handle_request(
                 client_type,
                 trace_id: Arc::clone(&trace_id),
                 sessions: Arc::clone(&state.sessions),
+                auth_status,
+                oauth_issuer: state
+                    .downstream_oauth
+                    .as_ref()
+                    .map(|manager| Arc::<str>::from(manager.base_url())),
             };
             // RMCP 3.x treats the request envelope's `extensions` as the
             // canonical runtime home for wire-level `params._meta`: its

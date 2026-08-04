@@ -53,7 +53,9 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
         .position(|p| b.name.contains(p.as_str()));
 
     match (a_priority, b_priority) {
-        (Some(a_idx), Some(b_idx)) => a_idx.cmp(&b_idx),
+        (Some(a_idx), Some(b_idx)) => a_idx
+            .cmp(&b_idx)
+            .then_with(|| a.name.as_ref().cmp(b.name.as_ref())),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.name.as_ref().cmp(b.name.as_ref()),

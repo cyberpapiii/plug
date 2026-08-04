@@ -752,6 +752,7 @@ mod tests {
                         icons: Some(vec![
                             Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
                         ]),
+                        selected_protocol_version: None,
                     }),
                     trust: IpcTrustInfo::default(),
                 }],
@@ -838,6 +839,7 @@ mod tests {
                     icons: Some(vec![
                         Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
                     ]),
+                    selected_protocol_version: Some("2025-11-25".to_string()),
                 }),
                 trust: IpcTrustInfo::default(),
             }],

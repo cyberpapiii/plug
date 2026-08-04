@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
@@ -17,6 +17,7 @@ use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContex
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::artifacts::ArtifactStore;
 use crate::branding;
@@ -28,7 +29,9 @@ use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
-use crate::types::{ClientType, LazyToolMode, LazyToolModeOrigin, ResolvedLazyToolPolicy};
+use crate::types::{
+    ClientType, LazyToolMode, LazyToolModeOrigin, PrincipalId, ResolvedLazyToolPolicy,
+};
 
 const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -200,13 +203,22 @@ pub enum DownstreamTransport {
     Ipc,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DownstreamCallContext {
     pub transport: DownstreamTransport,
     pub client_id: Arc<str>,
     pub request_id: RequestId,
     pub client_type: ClientType,
     pub trace_id: Arc<str>,
+    pub protocol_era: crate::protocol::ProtocolEra,
+    pub protocol_version: Arc<str>,
+    pub principal: Option<PrincipalId>,
+    pub scopes: Arc<BTreeSet<String>>,
+    pub local_trust: bool,
+    pub client_metadata: Option<crate::protocol::ClientMetadata>,
+    pub deadline: Option<std::time::Instant>,
+    pub cancellation: CancellationToken,
+    pub durable_owner: Option<TaskOwner>,
 }
 
 impl DownstreamCallContext {
@@ -219,12 +231,24 @@ impl DownstreamCallContext {
         request_id: RequestId,
         client_type: ClientType,
     ) -> Self {
+        let client_id = client_id.into();
         Self {
             transport: DownstreamTransport::Stdio,
-            client_id: client_id.into(),
+            client_id: Arc::clone(&client_id),
             request_id,
             client_type,
             trace_id: Arc::from(new_trace_id()),
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            principal: Some(PrincipalId::stdio_process(stable_instance_uuid(
+                "stdio", &client_id,
+            ))),
+            scopes: Arc::new(BTreeSet::new()),
+            local_trust: true,
+            client_metadata: None,
+            deadline: None,
+            cancellation: CancellationToken::new(),
+            durable_owner: None,
         }
     }
 
@@ -233,12 +257,24 @@ impl DownstreamCallContext {
         request_id: RequestId,
         client_type: ClientType,
     ) -> Self {
+        let client_id = client_id.into();
         Self {
             transport: DownstreamTransport::Ipc,
-            client_id: client_id.into(),
+            client_id: Arc::clone(&client_id),
             request_id,
             client_type,
             trace_id: Arc::from(new_trace_id()),
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            principal: Some(PrincipalId::daemon_ipc(stable_instance_uuid(
+                "ipc", &client_id,
+            ))),
+            scopes: Arc::new(BTreeSet::new()),
+            local_trust: true,
+            client_metadata: None,
+            deadline: None,
+            cancellation: CancellationToken::new(),
+            durable_owner: None,
         }
     }
 
@@ -251,12 +287,22 @@ impl DownstreamCallContext {
         request_id: RequestId,
         client_type: ClientType,
     ) -> Self {
+        let session_id = session_id.into();
         Self {
             transport: DownstreamTransport::Http,
-            client_id: session_id.into(),
+            client_id: session_id,
             request_id,
             client_type,
             trace_id: Arc::from(new_trace_id()),
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            principal: None,
+            scopes: Arc::new(BTreeSet::new()),
+            local_trust: true,
+            client_metadata: None,
+            deadline: None,
+            cancellation: CancellationToken::new(),
+            durable_owner: None,
         }
     }
 
@@ -266,13 +312,92 @@ impl DownstreamCallContext {
         client_type: ClientType,
         trace_id: impl Into<Arc<str>>,
     ) -> Self {
+        let session_id = session_id.into();
         Self {
             transport: DownstreamTransport::Http,
-            client_id: session_id.into(),
+            client_id: session_id,
             request_id,
             client_type,
             trace_id: trace_id.into(),
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            principal: None,
+            scopes: Arc::new(BTreeSet::new()),
+            local_trust: true,
+            client_metadata: None,
+            deadline: None,
+            cancellation: CancellationToken::new(),
+            durable_owner: None,
         }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        principal: PrincipalId,
+        scopes: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.principal = Some(principal);
+        self.scopes = Arc::new(scopes.into_iter().collect());
+        self.local_trust = false;
+        self
+    }
+
+    pub fn with_local_principal(mut self, principal: PrincipalId) -> Self {
+        self.principal = Some(principal);
+        self.local_trust = true;
+        self
+    }
+
+    pub fn with_client_metadata(
+        mut self,
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+    ) -> Self {
+        self.client_metadata = Some(crate::protocol::ClientMetadata {
+            name: name.into(),
+            version: version.into(),
+        });
+        self
+    }
+
+    pub fn with_protocol(
+        mut self,
+        era: crate::protocol::ProtocolEra,
+        version: impl Into<Arc<str>>,
+    ) -> Self {
+        self.protocol_era = era;
+        self.protocol_version = version.into();
+        self
+    }
+
+    pub fn with_lifecycle(
+        mut self,
+        deadline: Option<std::time::Instant>,
+        cancellation: CancellationToken,
+        durable_owner: Option<TaskOwner>,
+    ) -> Self {
+        self.deadline = deadline;
+        self.cancellation = cancellation;
+        self.durable_owner = durable_owner;
+        self
+    }
+
+    pub fn policy_decision(
+        &self,
+        family: crate::protocol::MethodFamily,
+    ) -> crate::protocol::PolicyDecision {
+        crate::protocol::decide_method(
+            &crate::protocol::CapabilityPolicyInput {
+                era: self.protocol_era,
+                transport: self.transport,
+                principal: self.principal.as_ref(),
+                scopes: self.scopes.as_ref(),
+                local_trust: self.local_trust,
+                modern_direction_enabled: false,
+                bridge_implemented: false,
+            },
+            family,
+        )
     }
 
     pub fn notification_target(&self) -> NotificationTarget {
@@ -288,6 +413,17 @@ impl DownstreamCallContext {
             },
         }
     }
+}
+
+fn stable_instance_uuid(namespace: &str, value: &str) -> Uuid {
+    let mut first = std::collections::hash_map::DefaultHasher::new();
+    namespace.hash(&mut first);
+    value.hash(&mut first);
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut second);
+    namespace.hash(&mut second);
+    0x706c_7567_u32.hash(&mut second);
+    Uuid::from_u128(((first.finish() as u128) << 64) | second.finish() as u128)
 }
 
 static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);

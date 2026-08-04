@@ -50,6 +50,24 @@ fn downstream_context_preserves_supplied_http_trace_id() {
     );
 }
 
+#[test]
+fn client_metadata_never_changes_principal_identity() {
+    let request = RequestId::from(NumberOrString::Number(1));
+    let original = DownstreamCallContext::stdio_for_client(
+        "process-instance",
+        request.clone(),
+        ClientType::Unknown,
+    );
+    let changed = DownstreamCallContext::stdio_for_client(
+        "process-instance",
+        request,
+        ClientType::ClaudeCode,
+    )
+    .with_client_metadata("forged-client", "999");
+    assert_eq!(original.principal, changed.principal);
+    assert_ne!(original.client_metadata, changed.client_metadata);
+}
+
 fn router_with_git_commit_tool() -> ToolRouter {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, test_router_config());
@@ -241,6 +259,13 @@ fn priority_sort_orders_correctly() {
     assert_eq!(priority_sort(&a, &c, &priority), std::cmp::Ordering::Less);
     // Same priority: alphabetical
     assert_eq!(priority_sort(&b, &b, &priority), std::cmp::Ordering::Equal);
+
+    let d = Tool::new(
+        Cow::Borrowed("aaa__important_tool"),
+        Cow::Borrowed("desc"),
+        Arc::new(serde_json::Map::new()),
+    );
+    assert_eq!(priority_sort(&d, &a, &priority), std::cmp::Ordering::Less);
 }
 
 #[test]

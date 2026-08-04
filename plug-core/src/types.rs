@@ -4,6 +4,60 @@ use uuid::Uuid;
 
 use rmcp::model::Icon;
 
+/// Stable, authorization-grade identity for a downstream caller.
+///
+/// The enum tag is part of the identity boundary: values from different trust
+/// domains can never compare equal even when their display strings match.
+/// Self-reported MCP client metadata and session ids are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PrincipalId {
+    DownstreamOauth {
+        issuer: String,
+        client_id: String,
+        resource: String,
+    },
+    ConfiguredCredential {
+        config_id: String,
+        generation: u64,
+    },
+    StdioProcess {
+        instance_id: Uuid,
+    },
+    DaemonIpc {
+        registry_id: Uuid,
+    },
+}
+
+impl PrincipalId {
+    pub fn downstream_oauth(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        resource: impl Into<String>,
+    ) -> Self {
+        Self::DownstreamOauth {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            resource: resource.into(),
+        }
+    }
+
+    pub fn configured_credential(config_id: impl Into<String>, generation: u64) -> Self {
+        Self::ConfiguredCredential {
+            config_id: config_id.into(),
+            generation,
+        }
+    }
+
+    pub fn stdio_process(instance_id: Uuid) -> Self {
+        Self::StdioProcess { instance_id }
+    }
+
+    pub fn daemon_ipc(registry_id: Uuid) -> Self {
+        Self::DaemonIpc { registry_id }
+    }
+}
+
 /// A string that redacts its value in `Debug`/`Display` output to prevent
 /// secret leakage.
 ///
@@ -67,12 +121,31 @@ impl std::fmt::Display for SessionId {
 
 #[cfg(test)]
 mod tests {
-    use super::SecretString;
+    use super::{PrincipalId, SecretString};
+    use uuid::Uuid;
 
     #[test]
     fn secret_string_debug_is_redacted() {
         let secret = SecretString::from("super-secret".to_string());
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn principal_tags_prevent_cross_domain_collisions() {
+        let id = Uuid::from_u128(7);
+        assert_ne!(PrincipalId::stdio_process(id), PrincipalId::daemon_ipc(id));
+    }
+
+    #[test]
+    fn credential_rotation_rules_are_explicit_in_identity() {
+        assert_eq!(
+            PrincipalId::downstream_oauth("issuer", "client", "resource"),
+            PrincipalId::downstream_oauth("issuer", "client", "resource")
+        );
+        assert_ne!(
+            PrincipalId::configured_credential("key", 1),
+            PrincipalId::configured_credential("key", 2)
+        );
     }
 
     #[test]
@@ -514,4 +587,8 @@ pub struct UpstreamServerMetadata {
     pub website_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<Icon>>,
+    /// Protocol selected by the live upstream connection. Additive so older
+    /// daemon/operator JSON remains readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_version: Option<String>,
 }

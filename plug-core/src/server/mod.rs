@@ -56,6 +56,7 @@ fn upstream_metadata_from_implementation(
         description: implementation.description.clone(),
         website_url: implementation.website_url.clone(),
         icons,
+        selected_protocol_version: Some(crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string()),
     })
 }
 
