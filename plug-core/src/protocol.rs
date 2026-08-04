@@ -386,13 +386,27 @@ pub struct QuotaLease {
 impl Drop for QuotaLease {
     fn drop(&mut self) {
         let mut counts = self.inner.counts.lock().expect("quota mutex poisoned");
-        let global = counts.global.entry(self.resource).or_default();
-        *global = global.saturating_sub(self.units);
-        let principal = counts
+        if let std::collections::hash_map::Entry::Occupied(mut global) =
+            counts.global.entry(self.resource)
+        {
+            let remaining = global.get().saturating_sub(self.units);
+            if remaining == 0 {
+                global.remove();
+            } else {
+                *global.get_mut() = remaining;
+            }
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut principal) = counts
             .principals
             .entry((self.principal.clone(), self.resource))
-            .or_default();
-        *principal = principal.saturating_sub(self.units);
+        {
+            let remaining = principal.get().saturating_sub(self.units);
+            if remaining == 0 {
+                principal.remove();
+            } else {
+                *principal.get_mut() = remaining;
+            }
+        }
     }
 }
 
@@ -710,6 +724,25 @@ mod tests {
         for thread in threads {
             drop(thread.join().unwrap());
         }
+        let counts = quotas.0.counts.lock().expect("quota mutex poisoned");
+        assert!(counts.principals.is_empty());
+        assert!(counts.global.is_empty());
+    }
+
+    #[test]
+    fn quota_ledger_does_not_retain_zero_count_principals_under_churn() {
+        let quotas = AdmissionQuotas::new(AdmissionQuotaConfig::default());
+        for value in 1..=10_000 {
+            let principal = PrincipalId::daemon_ipc(Uuid::from_u128(value));
+            let lease = quotas
+                .try_acquire(&principal, QuotaResource::ConcurrentModernRequests, 1)
+                .unwrap();
+            drop(lease);
+        }
+
+        let counts = quotas.0.counts.lock().expect("quota mutex poisoned");
+        assert!(counts.principals.is_empty());
+        assert!(counts.global.is_empty());
     }
 
     #[test]

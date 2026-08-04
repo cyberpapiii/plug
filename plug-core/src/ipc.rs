@@ -12,7 +12,7 @@ use rmcp::model::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ServerHealth, ServerStatus, UpstreamServerMetadata};
+use crate::types::{SecretString, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
@@ -23,21 +23,21 @@ pub const RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 /// It is serialized over the private IPC socket but always redacted in Debug.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct IpcCancellationCapability(String);
+pub struct IpcCancellationCapability(SecretString);
 
 impl IpcCancellationCapability {
     pub fn new(secret: String) -> Self {
-        Self(secret)
+        Self(secret.into())
     }
 
     pub fn expose_secret(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Debug for IpcCancellationCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
+        fmt::Debug::fmt(&self.0, f)
     }
 }
 /// Current daemon/client IPC protocol version.
@@ -747,6 +747,23 @@ pub async fn send_chunked_response<W: tokio::io::AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_capability_preserves_wire_value_and_redaction() {
+        let capability = IpcCancellationCapability::new("capability-secret".to_string());
+
+        assert_eq!(capability.expose_secret(), "capability-secret");
+        assert_eq!(format!("{capability:?}"), "[REDACTED]");
+        assert_eq!(
+            serde_json::to_value(&capability).expect("serialize capability"),
+            serde_json::Value::String("capability-secret".to_string())
+        );
+
+        let decoded: IpcCancellationCapability =
+            serde_json::from_value(serde_json::Value::String("capability-secret".to_string()))
+                .expect("deserialize capability");
+        assert_eq!(decoded, capability);
+    }
 
     #[test]
     fn request_serialization_round_trip() {

@@ -1,5 +1,71 @@
 use super::*;
 
+/// Retained extension metadata from one upstream across one catalog refresh.
+/// Descriptor schemas and ordinary fields are not counted or limited here.
+pub(crate) const MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM: usize = 256 * 1024;
+
+/// One refresh-local budget shared by tools, resources, templates, and prompts.
+/// Once an upstream exhausts its budget, all later descriptor metadata from
+/// that upstream is dropped while the descriptors themselves remain intact.
+#[derive(Default)]
+pub(crate) struct CatalogMetadataBudget {
+    retained_bytes: HashMap<String, usize>,
+    exhausted_servers: HashSet<String>,
+}
+
+impl CatalogMetadataBudget {
+    pub(crate) fn admit(
+        &mut self,
+        server_name: &str,
+        meta: &mut Option<MetaObject>,
+        surface: &'static str,
+    ) {
+        if self.exhausted_servers.contains(server_name) {
+            *meta = None;
+            return;
+        }
+
+        let envelope = match crate::types::ExtensionEnvelope::from_peer_catalog_meta(meta.as_ref())
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                *meta = None;
+                tracing::warn!(
+                    surface,
+                    reason = %error,
+                    "discarded unsafe peer extension metadata"
+                );
+                return;
+            }
+        };
+        let encoded_bytes = envelope.encoded_bytes();
+        let admitted = envelope.into_meta();
+        if admitted.is_none() {
+            *meta = None;
+            return;
+        }
+
+        let retained = self
+            .retained_bytes
+            .entry(server_name.to_string())
+            .or_default();
+        if encoded_bytes > MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM.saturating_sub(*retained) {
+            *meta = None;
+            if self.exhausted_servers.insert(server_name.to_string()) {
+                tracing::warn!(
+                    server = %server_name,
+                    retained_metadata_limit_bytes = MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM,
+                    "catalog extension metadata budget exhausted; discarding later metadata"
+                );
+            }
+            return;
+        }
+
+        *retained += encoded_bytes;
+        *meta = admitted;
+    }
+}
+
 /// Apply the shared peer-extension policy before a catalog descriptor is
 /// cloned into Plug's cache. Invalid peer metadata is dropped as one unit;
 /// neither keys nor values are included in diagnostics.
@@ -717,5 +783,126 @@ impl super::ToolRouter {
                 ..Default::default()
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod metadata_budget_tests {
+    use super::*;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<String>>);
+
+    struct EventVisitor<'a>(&'a mut String);
+
+    impl Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = String::new();
+            event.record(&mut EventVisitor(&mut fields));
+            let mut captured = self.0.lock().expect("event capture lock");
+            captured.push_str(&fields);
+            captured.push('\n');
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn large_valid_meta(key: &str, value_prefix: &str) -> MetaObject {
+        let value = format!("{value_prefix}{}", "x".repeat(15 * 1024));
+        MetaObject::from(
+            serde_json::json!({(key): value})
+                .as_object()
+                .expect("metadata object")
+                .clone(),
+        )
+    }
+
+    #[test]
+    fn aggregate_catalog_metadata_budget_keeps_descriptors_and_logs_no_peer_data() {
+        const PEER_KEY: &str = "attacker.example/never-log-this-key";
+        const PEER_VALUE: &str = "metadata-value-must-not-leak-";
+        let capture = EventCapture::default();
+        let captured = Arc::clone(&capture.0);
+
+        let descriptors = tracing::subscriber::with_default(capture, || {
+            let mut budget = CatalogMetadataBudget::default();
+            let mut descriptors = (0..40)
+                .map(|id| {
+                    let mut meta = Some(large_valid_meta(PEER_KEY, PEER_VALUE));
+                    let surface = match id % 4 {
+                        0 => "tool",
+                        1 => "resource",
+                        2 => "resource-template",
+                        _ => "prompt",
+                    };
+                    budget.admit("untrusted-upstream", &mut meta, surface);
+                    (id, meta)
+                })
+                .collect::<Vec<_>>();
+            let mut independent_meta = Some(large_valid_meta(PEER_KEY, PEER_VALUE));
+            budget.admit("independent-upstream", &mut independent_meta, "tool");
+            descriptors.push((40, independent_meta));
+            descriptors
+        });
+
+        assert_eq!(
+            descriptors.len(),
+            41,
+            "metadata must not remove descriptors"
+        );
+        assert!(
+            descriptors.last().is_some_and(|(_, meta)| meta.is_some()),
+            "one upstream exhausting its budget must not consume another upstream's budget"
+        );
+        assert!(descriptors.iter().any(|(_, meta)| meta.is_some()));
+        assert!(descriptors.iter().any(|(_, meta)| meta.is_none()));
+
+        let retained_bytes = descriptors
+            .iter()
+            .filter(|(id, _)| *id < 40)
+            .filter_map(|(_, meta)| meta.as_ref())
+            .map(|meta| {
+                serde_json::to_vec(meta)
+                    .expect("retained metadata serializes")
+                    .len()
+            })
+            .sum::<usize>();
+        assert!(retained_bytes <= MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM);
+
+        let diagnostics = captured.lock().expect("captured diagnostics").clone();
+        assert_eq!(
+            diagnostics
+                .matches("catalog extension metadata budget exhausted")
+                .count(),
+            1,
+            "budget warning must be emitted at most once per upstream and refresh"
+        );
+        assert!(!diagnostics.contains(PEER_KEY));
+        assert!(!diagnostics.contains(PEER_VALUE));
     }
 }

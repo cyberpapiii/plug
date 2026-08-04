@@ -863,11 +863,8 @@ async fn validate_origin(
         }
 
         // Parse origin to extract host — prevents bypass via localhost.evil.com
-        let is_local = if let Some(host) = extract_origin_host(origin) {
-            host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
-        } else {
-            false
-        };
+        let is_local =
+            extract_origin_host(origin).is_some_and(crate::config::http_bind_is_loopback);
 
         if !is_local {
             return Err(HttpError::InvalidOrigin);
@@ -1056,7 +1053,7 @@ fn validate_modern_host(
         host.split(':').next().map(str::to_string)
     }
     .ok_or_else(|| HttpError::BadRequest("modern request Host is malformed".into()))?;
-    let local = matches!(host_name.as_str(), "localhost" | "127.0.0.1" | "[::1]");
+    let local = crate::config::http_bind_is_loopback(&host_name);
     let explicitly_allowed = allowed_origins.iter().any(|origin| {
         extract_origin_host(origin)
             .is_some_and(|allowed_host| allowed_host.eq_ignore_ascii_case(&host_name))
@@ -1086,9 +1083,10 @@ fn validate_modern_origin(
     {
         return Ok(());
     }
-    match extract_origin_host(origin) {
-        Some("localhost" | "127.0.0.1" | "[::1]" | "::1") => Ok(()),
-        _ => Err(HttpError::InvalidOrigin),
+    if extract_origin_host(origin).is_some_and(crate::config::http_bind_is_loopback) {
+        Ok(())
+    } else {
+        Err(HttpError::InvalidOrigin)
     }
 }
 
@@ -2719,6 +2717,48 @@ mod tests {
         let trace_id = extract_trace_id(&headers);
         assert_eq!(trace_id.len(), 32);
         assert_ne!(trace_id, "00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn shared_loopback_classifier_matches_http_parser_outputs() {
+        for origin in [
+            "http://localhost:3282",
+            "http://127.0.0.1:3282",
+            "http://[::1]:3282",
+        ] {
+            let host = extract_origin_host(origin).expect("loopback origin host");
+            assert!(
+                crate::config::http_bind_is_loopback(host),
+                "expected {host} parsed from {origin} to be loopback"
+            );
+        }
+
+        for origin in [
+            "http://localhost.evil.example:3282",
+            "http://192.0.2.1:3282",
+            "https://plug.example.com",
+        ] {
+            let host = extract_origin_host(origin).expect("non-loopback origin host");
+            assert!(
+                !crate::config::http_bind_is_loopback(host),
+                "expected {host} parsed from {origin} to remain non-loopback"
+            );
+        }
+
+        for host in ["localhost:3282", "127.0.0.1:3282", "[::1]:3282"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(validate_modern_host(&headers, &[]).is_ok(), "host {host}");
+        }
+
+        for host in ["localhost.evil.example:3282", "192.0.2.1:3282", "::1"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(
+                validate_modern_host(&headers, &[]).is_err(),
+                "host {host} must not become loopback"
+            );
+        }
     }
 
     #[test]

@@ -134,6 +134,12 @@ impl ExtensionEnvelope {
     pub fn to_meta(&self) -> Option<MetaObject> {
         (!self.meta.is_empty()).then(|| self.meta.clone())
     }
+
+    /// Exact serialized size used by aggregate retention budgets after the
+    /// envelope has applied key, value, depth, and secret-shape policy.
+    pub(crate) fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
 }
 
 fn is_typed_mcp_meta_key(key: &str) -> bool {
@@ -257,7 +263,9 @@ fn validate_trace_value(
     Ok(())
 }
 
-fn valid_traceparent(value: &str) -> bool {
+/// Validate the W3C trace-parent shape Plug admits from either MCP `_meta` or
+/// mirrored HTTP headers.
+pub(crate) fn valid_traceparent(value: &str) -> bool {
     let parts = value.split('-').collect::<Vec<_>>();
     parts.len() == 4
         && parts[0] == "00"
@@ -402,7 +410,7 @@ impl PrincipalId {
 /// `SecretString`) into logs, IPC diagnostics, or status output, since that
 /// path bypasses the `Debug`/`Display` redaction entirely and will leak the
 /// secret in plaintext.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretString(String);
 

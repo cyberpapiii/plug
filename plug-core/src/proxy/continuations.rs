@@ -5,7 +5,7 @@
 //! single use, principal/request/route binding, quotas, and restart failure.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::TryRng as _;
@@ -21,7 +21,11 @@ use crate::protocol::{AdmissionQuotas, ProtocolOutcome, QuotaLease, QuotaResourc
 use crate::types::PrincipalId;
 
 const ASSOCIATED_DATA_DOMAIN: &[u8] = b"plug/mrtr/continuation-binding/v1\0";
-const MAX_REQUEST_STATE_BYTES: usize = 4 * 1024;
+pub(crate) const MRTR_MAX_ITEMS: usize = 16;
+pub(crate) const MRTR_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const MRTR_MAX_REQUEST_STATE_BYTES: usize = 4 * 1024;
+pub(crate) const MRTR_MAX_ROUNDS: usize = 10;
+pub(crate) const MRTR_CHAIN_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Digest only the semantic original tool request. Continuation material and
 /// `_meta` are deliberately excluded: the former changes each round and the
@@ -142,9 +146,34 @@ struct Entry<T> {
 pub struct ContinuationReservation {
     _count_lease: QuotaLease,
     _bytes_lease: QuotaLease,
+    owners: Arc<Mutex<HashMap<String, OwnerState>>>,
     owner: String,
     global_generation: u64,
     owner_generation: u64,
+}
+
+#[derive(Default)]
+struct OwnerState {
+    generation: u64,
+    reservations: usize,
+}
+
+impl Drop for ContinuationReservation {
+    fn drop(&mut self) {
+        let mut owners = self
+            .owners
+            .lock()
+            .expect("continuation owner mutex poisoned");
+        let Some(owner) = owners.get_mut(&self.owner) else {
+            debug_assert!(false, "continuation reservation owner disappeared");
+            return;
+        };
+        debug_assert!(owner.reservations > 0);
+        owner.reservations -= 1;
+        if owner.reservations == 0 {
+            owners.remove(&self.owner);
+        }
+    }
 }
 
 pub struct ConsumedContinuation<T> {
@@ -187,6 +216,7 @@ impl ContinuationError {
 pub struct ContinuationRegistry<T> {
     codec: RequestStateCodec,
     state: Mutex<RegistryState<T>>,
+    owners: Arc<Mutex<HashMap<String, OwnerState>>>,
     quotas: AdmissionQuotas,
     ttl: Duration,
 }
@@ -194,7 +224,6 @@ pub struct ContinuationRegistry<T> {
 struct RegistryState<T> {
     entries: HashMap<Uuid, Entry<T>>,
     global_generation: u64,
-    owner_generations: HashMap<String, u64>,
 }
 
 impl<T> ContinuationRegistry<T> {
@@ -212,8 +241,8 @@ impl<T> ContinuationRegistry<T> {
             state: Mutex::new(RegistryState {
                 entries: HashMap::new(),
                 global_generation: 0,
-                owner_generations: HashMap::new(),
             }),
+            owners: Arc::new(Mutex::new(HashMap::new())),
             quotas,
             ttl,
         }
@@ -261,10 +290,20 @@ impl<T> ContinuationRegistry<T> {
         if state.global_generation != expected_global_generation {
             return Err(ContinuationError::Invalid);
         }
-        let owner_generation = state.owner_generations.get(&owner).copied().unwrap_or(0);
+        let mut owners = self
+            .owners
+            .lock()
+            .expect("continuation owner mutex poisoned");
+        let owner_state = owners.entry(owner.clone()).or_default();
+        owner_state.reservations = owner_state
+            .reservations
+            .checked_add(1)
+            .expect("continuation reservation count overflow");
+        let owner_generation = owner_state.generation;
         Ok(ContinuationReservation {
             _count_lease: count_lease,
             _bytes_lease: bytes_lease,
+            owners: Arc::clone(&self.owners),
             owner,
             global_generation: expected_global_generation,
             owner_generation,
@@ -290,19 +329,25 @@ impl<T> ContinuationRegistry<T> {
                     .ttl(self.ttl),
             )
             .map_err(|_| ContinuationError::Invalid)?;
-        if token.len() > MAX_REQUEST_STATE_BYTES {
+        if token.len() > MRTR_MAX_REQUEST_STATE_BYTES {
             return Err(ContinuationError::Invalid);
         }
         let mut state = self.state.lock().expect("continuation mutex poisoned");
-        let owner_generation = state
-            .owner_generations
+        let owners = self
+            .owners
+            .lock()
+            .expect("continuation owner mutex poisoned");
+        let owner_generation = owners
             .get(&reservation.owner)
-            .copied()
-            .unwrap_or(0);
+            .map(|owner| owner.generation)
+            .ok_or(ContinuationError::Invalid)?;
         if binding.principal != reservation.owner
             || state.global_generation != reservation.global_generation
             || owner_generation != reservation.owner_generation
         {
+            return Err(ContinuationError::Invalid);
+        }
+        if state.entries.contains_key(&nonce) {
             return Err(ContinuationError::Invalid);
         }
         state.entries.insert(
@@ -336,7 +381,7 @@ impl<T> ContinuationRegistry<T> {
         token: &str,
         binding: &ContinuationBinding,
     ) -> Result<ConsumedContinuation<T>, ContinuationError> {
-        if token.len() > MAX_REQUEST_STATE_BYTES {
+        if token.len() > MRTR_MAX_REQUEST_STATE_BYTES {
             return Err(ContinuationError::Invalid);
         }
         let associated_data = binding.associated_data();
@@ -379,14 +424,22 @@ impl<T> ContinuationRegistry<T> {
 
     pub fn revoke_owner_key(&self, owner: &str) {
         let mut state = self.state.lock().expect("continuation mutex poisoned");
-        let generation = state
-            .owner_generations
-            .entry(owner.to_string())
-            .or_default();
-        *generation = generation.wrapping_add(1);
-        state
+        let mut owners = self
+            .owners
+            .lock()
+            .expect("continuation owner mutex poisoned");
+        let Some(owner_state) = owners.get_mut(owner) else {
+            return;
+        };
+        owner_state.generation = owner_state.generation.wrapping_add(1);
+        let revoked = state
             .entries
-            .retain(|_, entry| entry.binding.principal != owner);
+            .extract_if(|_, entry| entry.binding.principal == owner)
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        drop(owners);
+        drop(state);
+        drop(revoked);
     }
 
     pub fn clear(&self) {
@@ -398,9 +451,18 @@ impl<T> ContinuationRegistry<T> {
     /// world can never publish after this returns, even if their upstream
     /// response was already paused immediately before insertion.
     pub fn invalidate_all_with(&self, publish: impl FnOnce()) {
+        self.publish_with_invalidation(true, publish);
+    }
+
+    /// Publish a new route snapshot under the same lock used to capture route
+    /// generations. Material route changes invalidate parked state; metadata-
+    /// only catalog refreshes preserve it.
+    pub fn publish_with_invalidation(&self, invalidate: bool, publish: impl FnOnce()) {
         let mut state = self.state.lock().expect("continuation mutex poisoned");
-        state.global_generation = state.global_generation.wrapping_add(1);
-        state.entries.clear();
+        if invalidate {
+            state.global_generation = state.global_generation.wrapping_add(1);
+            state.entries.clear();
+        }
         publish();
     }
 
@@ -410,6 +472,14 @@ impl<T> ContinuationRegistry<T> {
             .lock()
             .expect("continuation mutex poisoned")
             .entries
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_len(&self) -> usize {
+        self.owners
+            .lock()
+            .expect("continuation owner mutex poisoned")
             .len()
     }
 }
@@ -608,6 +678,36 @@ mod tests {
             Err(ContinuationError::Invalid)
         );
         assert!(registry.insert(&p, b, 20, "new").is_ok());
+    }
+
+    #[test]
+    fn owner_epochs_exist_only_while_reservations_can_publish() {
+        let registry = registry(AdmissionQuotaConfig::default());
+
+        for value in 1..=10_000 {
+            let owner = principal(value);
+            registry.revoke_principal(&owner);
+        }
+        assert_eq!(registry.owner_len(), 0);
+
+        for value in 1..=1_000 {
+            let owner = principal(value);
+            let reservation = registry.reserve(&owner, 1).unwrap();
+            assert_eq!(registry.owner_len(), 1);
+            registry.revoke_principal(&owner);
+            assert_eq!(registry.owner_len(), 1);
+            drop(reservation);
+            assert_eq!(registry.owner_len(), 0);
+        }
+
+        let owner = principal(20_000);
+        let stale = registry.reserve(&owner, 1).unwrap();
+        registry.revoke_principal(&owner);
+        assert_eq!(
+            registry.insert_reserved(binding(&owner, "alpha"), "stale", stale),
+            Err(ContinuationError::Invalid)
+        );
+        assert_eq!(registry.owner_len(), 0);
     }
 
     #[test]

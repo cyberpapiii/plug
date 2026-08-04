@@ -36,8 +36,6 @@ use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
-const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
-
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(test)]
@@ -399,16 +397,10 @@ impl ClientHandler for UpstreamClientHandler {
             if let Some(version) = &self.protocol_version_override {
                 version.clone()
             } else {
-                serde_json::from_value(serde_json::Value::String(
-                    LATEST_PROTOCOL_VERSION.to_string(),
-                ))
-                .expect("latest protocol version must parse")
+                crate::protocol::supported_protocol_version()
             }
             #[cfg(not(test))]
-            serde_json::from_value(serde_json::Value::String(
-                LATEST_PROTOCOL_VERSION.to_string(),
-            ))
-            .expect("latest protocol version must parse")
+            crate::protocol::supported_protocol_version()
         };
         info = info.with_protocol_version(protocol_version);
         info

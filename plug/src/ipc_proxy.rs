@@ -24,8 +24,6 @@ use plug_core::ipc::{
 use plug_core::legacy_tasks::CreateTaskResult as LegacyCreateTaskResult;
 
 const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
-const LATEST_PROTOCOL_VERSION: &str = plug_core::protocol::SUPPORTED_PROTOCOL_VERSION;
-
 /// Max silence (no frames of ANY kind) on a locked read before the daemon is
 /// declared wedged and the connection is torn down for reconnect. Frames
 /// (notifications, chunks, reverse requests) reset the clock, so slow tool
@@ -879,12 +877,7 @@ impl ServerHandler for IpcProxyHandler {
             .with_server_info(plug_core::branding::plug_implementation(env!(
                 "CARGO_PKG_VERSION"
             )))
-            .with_protocol_version(
-                serde_json::from_value(serde_json::Value::String(
-                    LATEST_PROTOCOL_VERSION.to_string(),
-                ))
-                .expect("latest protocol version must parse"),
-            )
+            .with_protocol_version(plug_core::protocol::supported_protocol_version())
     }
 
     fn initialize(
@@ -1916,12 +1909,7 @@ mod tests {
                 ClientCapabilities::builder().enable_tasks().build(),
                 Implementation::default(),
             )
-            .with_protocol_version(
-                serde_json::from_value(serde_json::Value::String(
-                    LATEST_PROTOCOL_VERSION.to_string(),
-                ))
-                .expect("latest protocol version must parse"),
-            )
+            .with_protocol_version(plug_core::protocol::supported_protocol_version())
         }
     }
 
@@ -1947,12 +1935,8 @@ mod tests {
 
     impl ClientHandler for ResourceNotifyClient {
         fn get_info(&self) -> ClientInfo {
-            ClientInfo::default().with_protocol_version(
-                serde_json::from_value(serde_json::Value::String(
-                    LATEST_PROTOCOL_VERSION.to_string(),
-                ))
-                .expect("latest protocol version must parse"),
-            )
+            ClientInfo::default()
+                .with_protocol_version(plug_core::protocol::supported_protocol_version())
         }
 
         async fn on_resource_updated(
@@ -3595,12 +3579,8 @@ mod tests {
 
     impl ClientHandler for LoggingCaptureClient {
         fn get_info(&self) -> ClientInfo {
-            ClientInfo::default().with_protocol_version(
-                serde_json::from_value(serde_json::Value::String(
-                    LATEST_PROTOCOL_VERSION.to_string(),
-                ))
-                .expect("latest protocol version must parse"),
-            )
+            ClientInfo::default()
+                .with_protocol_version(plug_core::protocol::supported_protocol_version())
         }
 
         async fn on_logging_message(

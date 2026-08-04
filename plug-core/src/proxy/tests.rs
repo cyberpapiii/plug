@@ -2761,6 +2761,35 @@ fn publish_tool_route_snapshot_with_original(
     });
 }
 
+fn publish_tool_route_snapshot_with_metadata(
+    router: &ToolRouter,
+    tool: &str,
+    server_id: &str,
+    description: &'static str,
+) {
+    router.replace_snapshot(RouterSnapshot {
+        routes: HashMap::from([(
+            tool.to_string(),
+            (server_id.to_string(), "tool".to_string()),
+        )]),
+        tools_all: Arc::new(vec![Tool::new(
+            Cow::Owned(tool.to_string()),
+            Cow::Borrowed(description),
+            Arc::new(serde_json::Map::new()),
+        )]),
+        meta_tools_all: Arc::new(build_meta_tools()),
+        tools_windsurf: Arc::new(Vec::new()),
+        tools_copilot: Arc::new(Vec::new()),
+        resources_all: Arc::new(Vec::new()),
+        resource_templates_all: Arc::new(Vec::new()),
+        prompts_all: Arc::new(Vec::new()),
+        resource_routes: HashMap::new(),
+        prompt_routes: HashMap::new(),
+        tool_definition_fingerprints: HashMap::new(),
+        tool_risk_inventory: HashMap::new(),
+    });
+}
+
 #[tokio::test]
 async fn native_continuation_rejects_route_replacement_before_second_invocation() {
     let sm = Arc::new(ServerManager::new());
@@ -2785,12 +2814,12 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
         )),
     )]);
     let old = sm.get_upstream("modern").unwrap();
-    let (route, route_snapshot, _) = router.tool_route_identity("Modern__tool").unwrap();
+    let (route, _) = router.tool_route_identity("Modern__tool").unwrap();
     let binding = continuations::ContinuationBinding::new(
         &principal,
         continuations::canonical_tool_request_digest(&params),
         &format!("{}\0{}", route.server_id, route.original_name),
-        route.snapshot_generation,
+        route.route_generation,
         continuations::ContinuationKind::NativeToolRound,
     );
     let token = router
@@ -2803,7 +2832,6 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
                 upstream_request_state: Some("raw-upstream-state".to_string()),
                 input_requests,
                 route,
-                route_snapshot,
                 upstream: Arc::clone(&old),
                 round: 1,
                 chain_expires_at: std::time::Instant::now() + MRTR_CHAIN_TTL,
@@ -2865,12 +2893,12 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
         )),
     )]);
     let upstream = sm.get_upstream("modern").unwrap();
-    let (route, route_snapshot, _) = router.tool_route_identity("Modern__tool").unwrap();
+    let (route, _) = router.tool_route_identity("Modern__tool").unwrap();
     let binding = continuations::ContinuationBinding::new(
         &principal,
         continuations::canonical_tool_request_digest(&params),
         &format!("{}\0{}", route.server_id, route.original_name),
-        route.snapshot_generation,
+        route.route_generation,
         continuations::ContinuationKind::NativeToolRound,
     );
     let token = router
@@ -2883,7 +2911,6 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
                 upstream_request_state: Some("raw-upstream-state".to_string()),
                 input_requests,
                 route,
-                route_snapshot,
                 upstream,
                 round: 1,
                 chain_expires_at: std::time::Instant::now() + MRTR_CHAIN_TTL,
@@ -3007,6 +3034,16 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     };
     let plug_state = first.request_state.expect("Plug continuation state");
     assert_ne!(plug_state, "raw-upstream-state");
+
+    // A catalog refresh that allocates a new snapshot but preserves the exact
+    // tool route and upstream instance must not strand the parked round.
+    publish_tool_route_snapshot_with_metadata(
+        &router,
+        "Modern__tool",
+        "modern",
+        "metadata-only refresh",
+    );
+    assert_eq!(router.continuation_registry.len(), 1);
 
     let mut second = CallToolRequestParams::new("Modern__tool");
     second.request_state = Some(plug_state);

@@ -109,7 +109,7 @@ pub(crate) fn inject_trace_context(
                 message: format!("{header_name} header is malformed"),
             });
         }
-        if header_name == TRACEPARENT_HEADER && !valid_traceparent(value) {
+        if header_name == TRACEPARENT_HEADER && !crate::types::valid_traceparent(value) {
             return Err(HeaderMismatch {
                 message: "traceparent header is malformed".to_string(),
             });
@@ -130,21 +130,6 @@ pub(crate) fn inject_trace_context(
         meta.insert(key.to_string(), value);
     }
     Ok(())
-}
-
-fn valid_traceparent(value: &str) -> bool {
-    let parts = value.split('-').collect::<Vec<_>>();
-    parts.len() == 4
-        && parts[0].len() == 2
-        && parts[0] == "00"
-        && parts[1].len() == 32
-        && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
-        && parts[1].bytes().any(|byte| byte != b'0')
-        && parts[2].len() == 16
-        && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
-        && parts[2].bytes().any(|byte| byte != b'0')
-        && parts[3].len() == 2
-        && parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn require_and_validate(

@@ -33,6 +33,9 @@ use crate::types::{
     ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
     ResolvedLazyToolPolicy,
 };
+use continuations::{
+    MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES, MRTR_MAX_ROUNDS,
+};
 
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Backstop timeout for a single `refresh_tools` pass inside the notification
@@ -43,11 +46,6 @@ const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
-const MRTR_MAX_ITEMS: usize = 16;
-const MRTR_MAX_BYTES: usize = 256 * 1024;
-const MRTR_MAX_REQUEST_STATE_BYTES: usize = 4 * 1024;
-const MRTR_MAX_ROUNDS: usize = 10;
-const MRTR_CHAIN_TTL: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
 const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
@@ -174,6 +172,10 @@ fn mrtr_pair_supported(
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
     cache: Arc<ArcSwap<RouterSnapshot>>,
+    /// Last published call-routing identity. Catalog metadata may change
+    /// without invalidating parked rounds; route targets and upstream
+    /// instances may not.
+    published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
     config: RouterConfig,
     /// Optional event sender for tool call observability.
     event_tx: Option<broadcast::Sender<EngineEvent>>,
@@ -600,15 +602,21 @@ struct ToolRoundInput {
 struct RouteIdentity {
     server_id: String,
     original_name: String,
-    snapshot_generation: u64,
-    generation: u64,
+    route_generation: u64,
+    upstream_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaterialToolRoute {
+    server_id: String,
+    original_name: String,
+    upstream_generation: Option<u64>,
 }
 
 struct NativeContinuation {
     upstream_request_state: Option<String>,
     input_requests: InputRequests,
     route: RouteIdentity,
-    route_snapshot: Arc<RouterSnapshot>,
     upstream: Arc<crate::server::UpstreamServer>,
     round: usize,
     chain_expires_at: std::time::Instant,
@@ -744,6 +752,7 @@ impl ToolRouter {
         Self {
             server_manager,
             cache,
+            published_tool_routes: std::sync::Mutex::new(HashMap::new()),
             config,
             event_tx: None,
             protocol_notification_tx,
@@ -911,10 +920,7 @@ impl ToolRouter {
         Ok(())
     }
 
-    fn tool_route_identity(
-        &self,
-        tool_name: &str,
-    ) -> Result<(RouteIdentity, Arc<RouterSnapshot>, u64), McpError> {
+    fn tool_route_identity(&self, tool_name: &str) -> Result<(RouteIdentity, u64), McpError> {
         let (resolved, global_generation) = self
             .continuation_registry
             .capture_with_global_generation(|| -> Result<_, McpError> {
@@ -943,16 +949,53 @@ impl ToolRouter {
                             server_id: server_id.clone(),
                         })
                     })?;
-                let identity = RouteIdentity {
+                Ok((
                     server_id,
                     original_name,
-                    snapshot_generation: Arc::as_ptr(&cache) as usize as u64,
-                    generation: Arc::as_ptr(&upstream) as usize as u64,
-                };
-                Ok((identity, cache))
+                    Arc::as_ptr(&upstream) as usize as u64,
+                ))
             });
-        let (identity, cache) = resolved?;
-        Ok((identity, cache, global_generation))
+        let (server_id, original_name, upstream_generation) = resolved?;
+        Ok((
+            RouteIdentity {
+                server_id,
+                original_name,
+                route_generation: global_generation,
+                upstream_generation,
+            },
+            global_generation,
+        ))
+    }
+
+    fn publish_route_snapshot(&self, snapshot: Arc<RouterSnapshot>) {
+        let material_routes = snapshot
+            .routes
+            .iter()
+            .map(|(name, (server_id, original_name))| {
+                let upstream_generation = self
+                    .server_manager
+                    .get_upstream(server_id)
+                    .map(|upstream| Arc::as_ptr(&upstream) as usize as u64);
+                (
+                    name.clone(),
+                    MaterialToolRoute {
+                        server_id: server_id.clone(),
+                        original_name: original_name.clone(),
+                        upstream_generation,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut published = self
+            .published_tool_routes
+            .lock()
+            .expect("published route mutex poisoned");
+        let invalidate = *published != material_routes;
+        self.continuation_registry
+            .publish_with_invalidation(invalidate, || {
+                *published = material_routes;
+                self.cache.store(snapshot);
+            });
     }
 
     /// Reserve one process-wide modern request slot before adapter code can
@@ -1410,9 +1453,7 @@ impl ToolRouter {
 
     #[cfg(test)]
     pub(crate) fn replace_snapshot(&self, snapshot: RouterSnapshot) {
-        let snapshot = Arc::new(snapshot);
-        self.continuation_registry
-            .invalidate_all_with(|| self.cache.store(snapshot));
+        self.publish_route_snapshot(Arc::new(snapshot));
     }
 
     fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
@@ -1723,11 +1764,12 @@ impl ToolRouter {
 
         let mut server_ctx: HashMap<String, ServerRefreshCtx> = HashMap::new();
         let mut classified: Vec<Classified> = Vec::new();
+        let mut catalog_metadata_budget = CatalogMetadataBudget::default();
 
         for (server_name, mut tool) in upstream_tools {
             // Peer metadata is admitted before the descriptor enters any
             // cache, enrichment, fingerprint, or operator-observable path.
-            admit_catalog_meta(&mut tool.meta, "tool");
+            catalog_metadata_budget.admit(&server_name, &mut tool.meta, "tool");
             let mut exposed_name = tool.name.to_string();
 
             let ctx = server_ctx.entry(server_name.clone()).or_insert_with(|| {
@@ -1977,7 +2019,7 @@ impl ToolRouter {
         let mut resource_routes = HashMap::new();
         let mut resources_vec = Vec::new();
         for (server_name, mut resource) in upstream_resources {
-            admit_catalog_meta(&mut resource.meta, "resource");
+            catalog_metadata_budget.admit(&server_name, &mut resource.meta, "resource");
             if let Some(existing_server) = resource_routes.get(&resource.uri)
                 && existing_server != &server_name
             {
@@ -2016,7 +2058,7 @@ impl ToolRouter {
 
         let mut resource_templates_vec = Vec::new();
         for (server_name, mut template) in upstream_resource_templates {
-            admit_catalog_meta(&mut template.meta, "resource-template");
+            catalog_metadata_budget.admit(&server_name, &mut template.meta, "resource-template");
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = template.name.clone();
             let routed_name = crate::tool_naming::build_wire_name(
@@ -2042,7 +2084,7 @@ impl ToolRouter {
         let mut prompt_routes = HashMap::new();
         let mut prompts_vec = Vec::new();
         for (server_name, mut prompt) in upstream_prompts {
-            admit_catalog_meta(&mut prompt.meta, "prompt");
+            catalog_metadata_budget.admit(&server_name, &mut prompt.meta, "prompt");
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = prompt.name.clone();
             let routed_name = crate::tool_naming::build_wire_name(
@@ -2121,12 +2163,11 @@ impl ToolRouter {
             tool_definition_fingerprints,
             tool_risk_inventory,
         });
-        // A continuation is bound to the exact published route snapshot. A
-        // refresh can remap an exposed name while retaining the same upstream
-        // Arc, so invalidate parked rounds immediately instead of waiting for
-        // their next consume attempt or TTL expiry.
-        self.continuation_registry
-            .invalidate_all_with(|| self.cache.store(snapshot));
+        // Only material call-routing changes invalidate parked rounds. Tool
+        // metadata, resource, or prompt refreshes publish a fresh catalog
+        // without breaking a continuation whose exact tool route and upstream
+        // instance remain unchanged.
+        self.publish_route_snapshot(snapshot);
 
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
@@ -2361,15 +2402,14 @@ impl ToolRouter {
                 )
                 .await;
         }
-        let (route, route_snapshot, global_generation) =
-            self.tool_route_identity(params.name.as_ref())?;
+        let (route, global_generation) = self.tool_route_identity(params.name.as_ref())?;
         let request_digest = continuations::canonical_tool_request_digest(&params);
         let binding = context.principal.as_ref().map(|principal| {
             continuations::ContinuationBinding::new(
                 principal,
                 request_digest,
                 &format!("{}\0{}", route.server_id, route.original_name),
-                route.snapshot_generation,
+                route.route_generation,
                 continuations::ContinuationKind::NativeToolRound,
             )
         });
@@ -2419,10 +2459,6 @@ impl ToolRouter {
                 return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
                     .into_error(context.protocol_era));
             }
-            if !Arc::ptr_eq(&route_snapshot, &parked.route_snapshot) {
-                return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
-                    .into_error(context.protocol_era));
-            }
             let responses = params.input_responses.as_ref().ok_or_else(|| {
                 crate::protocol::ProtocolOutcome::ExpiredContinuation
                     .into_error(context.protocol_era)
@@ -2468,7 +2504,8 @@ impl ToolRouter {
             return Ok(response);
         };
         context.ensure_principal_lifecycle_active()?;
-        if !Arc::ptr_eq(&self.cache.load_full(), &route_snapshot) {
+        let (current_route, _) = self.tool_route_identity(params.name.as_ref())?;
+        if current_route != route {
             return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
                 .into_error(context.protocol_era));
         }
@@ -2508,7 +2545,7 @@ impl ToolRouter {
         let upstream = self
             .server_manager
             .get_upstream(&route.server_id)
-            .filter(|upstream| Arc::as_ptr(upstream) as usize as u64 == route.generation)
+            .filter(|upstream| Arc::as_ptr(upstream) as usize as u64 == route.upstream_generation)
             .ok_or_else(|| {
                 crate::protocol::ProtocolOutcome::ExpiredContinuation
                     .into_error(context.protocol_era)
@@ -2531,7 +2568,6 @@ impl ToolRouter {
                     upstream_request_state: input_required.request_state.take(),
                     input_requests,
                     route,
-                    route_snapshot,
                     upstream,
                     round,
                     chain_expires_at,
@@ -2594,7 +2630,6 @@ impl ToolRouter {
 
             // Look up the server and original name for this exposed tool name
             let cache = self.cache.load_full();
-            let snapshot_generation = Arc::as_ptr(&cache) as usize as u64;
             let (server_id, original_name) = cache
                 .routes
                 .get(tool_name)
@@ -2680,12 +2715,7 @@ impl ToolRouter {
                 })?;
 
             if let Some(expected) = &round.expected_route {
-                let actual = RouteIdentity {
-                    server_id: server_id.clone(),
-                    original_name: original_name.clone(),
-                    snapshot_generation,
-                    generation: Arc::as_ptr(&upstream) as usize as u64,
-                };
+                let (actual, _) = self.tool_route_identity(tool_name)?;
                 if actual != *expected {
                     return Err(
                         crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(
@@ -3338,7 +3368,7 @@ impl ToolRouter {
                 // otherwise a legacy caller could reach a modern upstream via
                 // `plug__invoke_tool` even though a direct call is suppressed.
                 self.ensure_tool_round_supported(target, context, false, false)?;
-                let (route, _, _) = self.tool_route_identity(target)?;
+                let (route, _) = self.tool_route_identity(target)?;
                 if self
                     .server_manager
                     .get_upstream(&route.server_id)
