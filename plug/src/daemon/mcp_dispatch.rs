@@ -383,6 +383,23 @@ pub(super) async fn dispatch_mcp_request(
                     }),
             };
 
+            // Every modern tools/call consumes a concurrent-request slot,
+            // regardless of whether it asks for a durable task. This keeps
+            // stdio, HTTP, and IPC admission behavior aligned and prevents
+            // ordinary modern calls from bypassing the process-wide bound.
+            let downstream_call_context =
+                plug_core::dispatch::DownstreamContext::downstream_call_context(&downstream_ctx);
+            let _modern_request_lease = if downstream_call_context.protocol_era
+                == plug_core::protocol::ProtocolEra::Modern
+            {
+                match tool_router.admit_modern_request(&downstream_call_context) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => return ipc_ok!(error),
+                }
+            } else {
+                None
+            };
+
             match plug_core::dispatch::dispatch_tools_call(
                 tool_router,
                 &downstream_ctx,
@@ -391,6 +408,7 @@ pub(super) async fn dispatch_mcp_request(
             .await
             {
                 Ok(plug_core::dispatch::ToolCallOutcome::Called(result)) => ipc_ok!(result),
+                Ok(plug_core::dispatch::ToolCallOutcome::InputRequired(result)) => ipc_ok!(result),
                 Ok(plug_core::dispatch::ToolCallOutcome::TaskCreated(result)) => ipc_ok!(result),
                 Err(mcp_err) => ipc_ok!(mcp_err),
             }

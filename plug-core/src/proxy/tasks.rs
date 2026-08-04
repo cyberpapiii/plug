@@ -632,6 +632,10 @@ impl super::ToolRouter {
     /// idle-session expiry loop, which is a single serialized loop — an
     /// unbounded hang here would permanently stop idle cleanup daemon-wide.
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
+        // Durable task and continuation ownership share the authenticated
+        // principal key. Teardown/revocation must invalidate both before any
+        // asynchronous upstream cleanup can be delayed or cancelled.
+        self.continuation_registry.revoke_owner_key(owner.as_key());
         let drained = self.task_store.lock().await.cleanup_owner(owner);
 
         // Phase A: abort every still-running local future synchronously,

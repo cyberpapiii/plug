@@ -341,6 +341,8 @@ pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
     tools: Arc<ArcSwap<Vec<Tool>>>,
     router: std::sync::Weak<ToolRouter>,
+    #[cfg(test)]
+    protocol_version_override: Option<rmcp::model::ProtocolVersion>,
 }
 
 #[cfg(test)]
@@ -358,6 +360,21 @@ impl UpstreamClientHandler {
             server_id,
             tools,
             router,
+            protocol_version_override: None,
+        }
+    }
+
+    pub(crate) fn new_for_tests_with_protocol(
+        server_id: Arc<str>,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        router: std::sync::Weak<ToolRouter>,
+        protocol_version: rmcp::model::ProtocolVersion,
+    ) -> Self {
+        Self {
+            server_id,
+            tools,
+            router,
+            protocol_version_override: Some(protocol_version),
         }
     }
 }
@@ -377,12 +394,23 @@ impl ClientHandler for UpstreamClientHandler {
                 .with_form(FormElicitationCapability::default())
                 .with_url(UrlElicitationCapability::default()),
         );
-        info = info.with_protocol_version(
+        let protocol_version = {
+            #[cfg(test)]
+            if let Some(version) = &self.protocol_version_override {
+                version.clone()
+            } else {
+                serde_json::from_value(serde_json::Value::String(
+                    LATEST_PROTOCOL_VERSION.to_string(),
+                ))
+                .expect("latest protocol version must parse")
+            }
+            #[cfg(not(test))]
             serde_json::from_value(serde_json::Value::String(
                 LATEST_PROTOCOL_VERSION.to_string(),
             ))
-            .expect("latest protocol version must parse"),
-        );
+            .expect("latest protocol version must parse")
+        };
+        info = info.with_protocol_version(protocol_version);
         info
     }
 
@@ -1165,6 +1193,8 @@ impl ServerManager {
                         server_id: Arc::from(name),
                         tools: Arc::clone(&tools),
                         router: tool_router.clone(),
+                        #[cfg(test)]
+                        protocol_version_override: None,
                     });
 
                     let client: McpClient = handler
@@ -1311,6 +1341,8 @@ impl ServerManager {
                         server_id: Arc::from(name),
                         tools: Arc::clone(&tools),
                         router: tool_router.clone(),
+                        #[cfg(test)]
+                        protocol_version_override: None,
                     });
 
                     match handler
@@ -1449,6 +1481,8 @@ impl ServerManager {
             server_id: Arc::from(name),
             tools: Arc::clone(&tools),
             router: tool_router,
+            #[cfg(test)]
+            protocol_version_override: None,
         });
 
         let client: McpClient = handler
@@ -2879,6 +2913,7 @@ mod tests {
             server_id: Arc::from(name.to_string()),
             tools: Arc::clone(&tools),
             router: std::sync::Weak::new(),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -2917,6 +2952,7 @@ mod tests {
             server_id: Arc::from(name.to_string()),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3233,6 +3269,7 @@ mod tests {
             server_id: Arc::from("replace-test"),
             tools: Arc::clone(&tools_a),
             router: std::sync::Weak::new(),
+            protocol_version_override: None,
         });
         let client_a: McpClient = upstream_handler_a
             .serve(client_transport_a)
@@ -3288,6 +3325,7 @@ mod tests {
             server_id: Arc::from("replace-test"),
             tools: Arc::clone(&tools_b),
             router: std::sync::Weak::new(),
+            protocol_version_override: None,
         });
         let client_b: McpClient = upstream_handler_b
             .serve(client_transport_b)
@@ -3592,6 +3630,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3697,6 +3736,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4027,6 +4067,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4147,6 +4188,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4284,6 +4326,7 @@ mod tests {
             server_id: Arc::from("catalog"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)

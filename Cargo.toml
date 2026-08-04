@@ -30,6 +30,9 @@ rmcp = { version = "=3.1.0", features = [
     "elicitation",
     # OAuth 2.1 + PKCE upstream authentication
     "auth",
+    # Integrity-protected MCP 2026 requestState values. Plug adds the
+    # required server-side single-use and ownership ledger separately.
+    "request-state",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 

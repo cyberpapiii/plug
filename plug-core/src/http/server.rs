@@ -2076,6 +2076,12 @@ async fn handle_request(
                             request_id,
                         )
                     }
+                    Ok(crate::dispatch::ToolCallOutcome::InputRequired(result)) => {
+                        ServerJsonRpcMessage::response(
+                            ServerResult::InputRequiredResult(result),
+                            request_id,
+                        )
+                    }
                     Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
                         let result = if modern_tasks {
                             ServerResult::CreateTaskResult(rmcp::model::CreateTaskResult::new(

@@ -617,6 +617,9 @@ async fn handle_ipc_connection(
         if let Some(client_id) = removed_client_id
             && !ctx.client_registry.client_sessions.contains_key(&client_id)
         {
+            ctx.engine.tool_router().revoke_continuations_for_principal(
+                &plug_core::types::PrincipalId::daemon_ipc_registry(&client_id),
+            );
             let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
             ctx.engine
                 .tool_router()
@@ -1265,6 +1268,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if let Some(client_id) = removed_client_id
                 && !ctx.client_registry.client_sessions.contains_key(&client_id)
             {
+                ctx.engine.tool_router().revoke_continuations_for_principal(
+                    &plug_core::types::PrincipalId::daemon_ipc_registry(&client_id),
+                );
                 let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
                 ctx.engine
                     .tool_router()

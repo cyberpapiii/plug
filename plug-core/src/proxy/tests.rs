@@ -2143,6 +2143,39 @@ async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
 }
 
 #[tokio::test]
+async fn dispatch_tools_call_rejects_oversized_request_state_before_route_effects() {
+    let router = router_with_unrouted_single_route();
+    let ctx = MockDownstream {
+        supports_tasks: false,
+    };
+    let mut params = CallToolRequestParams::new("Mock__tool");
+    params.request_state = Some("x".repeat(4 * 1024 + 1));
+
+    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+        .await
+        .expect_err("oversized requestState must fail before route lookup");
+    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    assert!(!error.message.to_lowercase().contains("unavailable"));
+}
+
+#[test]
+fn mrtr_pair_policy_activates_only_native_modern_rounds() {
+    use crate::protocol::ProtocolEra::{Legacy, Modern};
+
+    assert!(mrtr_pair_supported(Modern, Modern, false, false));
+    assert!(mrtr_pair_supported(Modern, Modern, true, false));
+    assert!(mrtr_pair_supported(Modern, Legacy, false, false));
+    assert!(mrtr_pair_supported(Legacy, Legacy, false, false));
+
+    // No mixed-era continuation, no task+MRTR, and no legacy call into an
+    // upstream that may return an unrepresentable InputRequired result.
+    assert!(!mrtr_pair_supported(Modern, Legacy, true, false));
+    assert!(!mrtr_pair_supported(Legacy, Modern, true, false));
+    assert!(!mrtr_pair_supported(Legacy, Modern, false, false));
+    assert!(!mrtr_pair_supported(Modern, Modern, false, true));
+}
+
+#[tokio::test]
 async fn hostile_task_extension_is_rejected_before_durable_record_creation() {
     let router = router_with_unrouted_single_route();
     let ctx = MockDownstream {
@@ -2332,6 +2365,11 @@ struct SubscribableUpstreamState {
     subscribe_errors: std::sync::Mutex<HashSet<String>>,
     subscribe_entered: tokio::sync::Notify,
     unsubscribe_entered: tokio::sync::Notify,
+    tool_calls: std::sync::atomic::AtomicUsize,
+    tool_gate: std::sync::Mutex<Option<Arc<SubGate>>>,
+    tool_entered: tokio::sync::Notify,
+    tool_requires_input: std::sync::atomic::AtomicBool,
+    tool_growing_input: std::sync::atomic::AtomicBool,
 }
 
 impl SubscribableUpstreamState {
@@ -2345,6 +2383,11 @@ impl SubscribableUpstreamState {
             subscribe_errors: std::sync::Mutex::new(HashSet::new()),
             subscribe_entered: tokio::sync::Notify::new(),
             unsubscribe_entered: tokio::sync::Notify::new(),
+            tool_calls: std::sync::atomic::AtomicUsize::new(0),
+            tool_gate: std::sync::Mutex::new(None),
+            tool_entered: tokio::sync::Notify::new(),
+            tool_requires_input: std::sync::atomic::AtomicBool::new(false),
+            tool_growing_input: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2495,6 +2538,64 @@ impl ServerHandler for SubscribableUpstreamHandler {
             Ok(())
         }
     }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
+        let state = Arc::clone(&self.state);
+        async move {
+            let invocation = state
+                .tool_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.tool_entered.notify_one();
+            let gate = state.tool_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            if state
+                .tool_requires_input
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && (request.input_responses.is_none()
+                    || (state
+                        .tool_growing_input
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        && invocation == 1))
+            {
+                let mut requests = InputRequests::from_iter([(
+                    "answer".to_string(),
+                    InputRequest::Elicitation(ElicitRequest::new(
+                        ElicitRequestParams::UrlElicitationParams {
+                            meta: None,
+                            message: "Continue".to_string(),
+                            url: "https://example.test/continue".to_string(),
+                            elicitation_id: "answer".to_string(),
+                        },
+                    )),
+                )]);
+                if invocation == 1 {
+                    requests.insert(
+                        "details".to_string(),
+                        InputRequest::Elicitation(ElicitRequest::new(
+                            ElicitRequestParams::UrlElicitationParams {
+                                meta: None,
+                                message: "Provide more detail".repeat(64),
+                                url: "https://example.test/details".to_string(),
+                                elicitation_id: "details".to_string(),
+                            },
+                        )),
+                    );
+                }
+                return Ok(rmcp::model::InputRequiredResult::new(
+                    Some(requests),
+                    Some(format!("raw-upstream-state-{invocation}")),
+                )
+                .into());
+            }
+            Ok(CallToolResult::success(Vec::new()).into())
+        }
+    }
 }
 
 /// Build a real, duplex-connected `UpstreamServer` backed by the given
@@ -2538,6 +2639,43 @@ async fn connect_subscribable_upstream(
         upstream: None,
         protocol_era: crate::protocol::ProtocolEra::Legacy,
         selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+        protocol_gate_state: 0,
+        health: ServerHealth::Healthy,
+    }
+}
+
+async fn connect_modern_tool_upstream(
+    name: &str,
+    state: Arc<SubscribableUpstreamState>,
+) -> UpstreamServer {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = SubscribableUpstreamHandler { state }
+            .serve(server_transport)
+            .await
+            .expect("start modern tool upstream test server");
+        let _ = server.waiting().await;
+    });
+    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+    let handler = Arc::new(UpstreamClientHandler::new_for_tests_with_protocol(
+        Arc::from(name.to_string()),
+        Arc::clone(&tools),
+        std::sync::Weak::new(),
+        rmcp::model::ProtocolVersion::V_2026_07_28,
+    ));
+    let client = handler
+        .serve(client_transport)
+        .await
+        .expect("connect modern tool upstream test client");
+    UpstreamServer {
+        name: name.to_string(),
+        config: subscribable_test_server_config(),
+        client,
+        tools,
+        capabilities: ServerCapabilities::default(),
+        upstream: None,
+        protocol_era: crate::protocol::ProtocolEra::Modern,
+        selected_protocol_version: crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
         health: ServerHealth::Healthy,
     }
@@ -2592,6 +2730,674 @@ fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
     });
+}
+
+fn publish_tool_route_snapshot(router: &ToolRouter, tool: &str, server_id: &str) {
+    publish_tool_route_snapshot_with_original(router, tool, server_id, "tool");
+}
+
+fn publish_tool_route_snapshot_with_original(
+    router: &ToolRouter,
+    tool: &str,
+    server_id: &str,
+    original_name: &str,
+) {
+    router.replace_snapshot(RouterSnapshot {
+        routes: HashMap::from([(
+            tool.to_string(),
+            (server_id.to_string(), original_name.to_string()),
+        )]),
+        tools_all: Arc::new(Vec::new()),
+        meta_tools_all: Arc::new(build_meta_tools()),
+        tools_windsurf: Arc::new(Vec::new()),
+        tools_copilot: Arc::new(Vec::new()),
+        resources_all: Arc::new(Vec::new()),
+        resource_templates_all: Arc::new(Vec::new()),
+        prompts_all: Arc::new(Vec::new()),
+        resource_routes: HashMap::new(),
+        prompt_routes: HashMap::new(),
+        tool_definition_fingerprints: HashMap::new(),
+        tool_risk_inventory: HashMap::new(),
+    });
+}
+
+#[tokio::test]
+async fn native_continuation_rejects_route_replacement_before_second_invocation() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    let mut first = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
+    first.protocol_era = crate::protocol::ProtocolEra::Modern;
+    sm.replace_server("modern", first).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+
+    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(99));
+    let mut params = CallToolRequestParams::new("Modern__tool");
+    let input_requests = InputRequests::from_iter([(
+        "answer".to_string(),
+        InputRequest::Elicitation(ElicitRequest::new(
+            ElicitRequestParams::UrlElicitationParams {
+                meta: None,
+                message: "Continue".to_string(),
+                url: "https://example.test/continue".to_string(),
+                elicitation_id: "answer".to_string(),
+            },
+        )),
+    )]);
+    let old = sm.get_upstream("modern").unwrap();
+    let (route, route_snapshot, _) = router.tool_route_identity("Modern__tool").unwrap();
+    let binding = continuations::ContinuationBinding::new(
+        &principal,
+        continuations::canonical_tool_request_digest(&params),
+        &format!("{}\0{}", route.server_id, route.original_name),
+        route.snapshot_generation,
+        continuations::ContinuationKind::NativeToolRound,
+    );
+    let token = router
+        .continuation_registry
+        .insert(
+            &principal,
+            binding,
+            128,
+            NativeContinuation {
+                upstream_request_state: Some("raw-upstream-state".to_string()),
+                input_requests,
+                route,
+                route_snapshot,
+                upstream: Arc::clone(&old),
+                round: 1,
+                chain_expires_at: std::time::Instant::now() + MRTR_CHAIN_TTL,
+            },
+        )
+        .unwrap();
+    params.request_state = Some(token);
+    params.input_responses = Some(InputResponses::from_iter([(
+        "answer".to_string(),
+        serde_json::json!({"action": "accept"}),
+    )]));
+
+    let mut replacement = connect_subscribable_upstream("modern", state).await;
+    replacement.protocol_era = crate::protocol::ProtocolEra::Modern;
+    sm.replace_server("modern", replacement).await;
+
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(2)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal)
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let error = router
+        .call_tool_round_with_context(params, None, Some(context))
+        .await
+        .expect_err("replacement route must invalidate the continuation");
+    assert_eq!(error.code, ErrorCode(-32004));
+    assert!(
+        Arc::strong_count(&old) >= 2,
+        "registry retains the exact old Arc"
+    );
+}
+
+#[tokio::test]
+async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocation() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "old_tool");
+
+    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(100));
+    let mut params = CallToolRequestParams::new("Modern__tool");
+    let input_requests = InputRequests::from_iter([(
+        "answer".to_string(),
+        InputRequest::Elicitation(ElicitRequest::new(
+            ElicitRequestParams::UrlElicitationParams {
+                meta: None,
+                message: "Continue".to_string(),
+                url: "https://example.test/continue".to_string(),
+                elicitation_id: "answer".to_string(),
+            },
+        )),
+    )]);
+    let upstream = sm.get_upstream("modern").unwrap();
+    let (route, route_snapshot, _) = router.tool_route_identity("Modern__tool").unwrap();
+    let binding = continuations::ContinuationBinding::new(
+        &principal,
+        continuations::canonical_tool_request_digest(&params),
+        &format!("{}\0{}", route.server_id, route.original_name),
+        route.snapshot_generation,
+        continuations::ContinuationKind::NativeToolRound,
+    );
+    let token = router
+        .continuation_registry
+        .insert(
+            &principal,
+            binding,
+            128,
+            NativeContinuation {
+                upstream_request_state: Some("raw-upstream-state".to_string()),
+                input_requests,
+                route,
+                route_snapshot,
+                upstream,
+                round: 1,
+                chain_expires_at: std::time::Instant::now() + MRTR_CHAIN_TTL,
+            },
+        )
+        .unwrap();
+    params.request_state = Some(token);
+    params.input_responses = Some(InputResponses::from_iter([(
+        "answer".to_string(),
+        serde_json::json!({"action": "accept"}),
+    )]));
+
+    // The server Arc is unchanged; only the exposed-name mapping moved.
+    publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "new_tool");
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(3)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal)
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let error = router
+        .call_tool_round_with_context(params, None, Some(context))
+        .await
+        .expect_err("same-Arc tool remap must invalidate the continuation");
+    assert_eq!(error.code, ErrorCode(-32004));
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation() {
+    let sm = Arc::new(ServerManager::new());
+    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+        continuations: 1,
+        continuation_bytes: MRTR_MAX_BYTES,
+        per_principal_divisor: 1,
+        ..Default::default()
+    });
+    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        Arc::clone(&sm),
+        test_router_config(),
+        quotas,
+    ));
+    let state = SubscribableUpstreamState::new(&[]);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+
+    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(101));
+    let _full = router
+        .continuation_registry
+        .reserve(&principal, MRTR_MAX_BYTES)
+        .unwrap();
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(4)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal)
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let error = router
+        .call_tool_round_with_context(
+            CallToolRequestParams::new("Modern__tool"),
+            None,
+            Some(context),
+        )
+        .await
+        .expect_err("capacity must be reserved before the upstream call");
+    assert_eq!(error.code, ErrorCode(-32007));
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+
+    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(102));
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(5)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal.clone())
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let first = router
+        .call_tool_round_with_context(
+            CallToolRequestParams::new("Modern__tool"),
+            None,
+            Some(context.clone()),
+        )
+        .await
+        .unwrap();
+    let CallToolResponse::InputRequired(first) = first else {
+        panic!("first round must request input")
+    };
+    let plug_state = first.request_state.expect("Plug continuation state");
+    assert_ne!(plug_state, "raw-upstream-state");
+
+    let mut second = CallToolRequestParams::new("Modern__tool");
+    second.request_state = Some(plug_state);
+    second.input_responses = Some(InputResponses::from_iter([(
+        "answer".to_string(),
+        serde_json::json!({"action": "accept"}),
+    )]));
+    let result = router
+        .call_tool_round_with_context(second, None, Some(context))
+        .await
+        .unwrap();
+    assert!(matches!(result, CallToolResponse::Complete(_)));
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn continuation_keeps_max_byte_reservation_across_larger_second_input_required() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .tool_growing_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+
+    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(103));
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(8)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal)
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+
+    let first = router
+        .call_tool_round_with_context(
+            CallToolRequestParams::new("Modern__tool"),
+            None,
+            Some(context.clone()),
+        )
+        .await
+        .unwrap();
+    let CallToolResponse::InputRequired(first) = first else {
+        panic!("first round must request input")
+    };
+    let mut second = CallToolRequestParams::new("Modern__tool");
+    second.request_state = first.request_state;
+    second.input_responses = Some(InputResponses::from_iter([(
+        "answer".to_string(),
+        serde_json::json!({"action": "accept"}),
+    )]));
+    let second = router
+        .call_tool_round_with_context(second, None, Some(context.clone()))
+        .await
+        .unwrap();
+    let CallToolResponse::InputRequired(second) = second else {
+        panic!("second round must return a larger input request set")
+    };
+    assert_eq!(second.input_requests.as_ref().unwrap().len(), 2);
+
+    let mut third = CallToolRequestParams::new("Modern__tool");
+    third.request_state = second.request_state;
+    third.input_responses = Some(InputResponses::from_iter([
+        (
+            "answer".to_string(),
+            serde_json::json!({"action": "accept"}),
+        ),
+        (
+            "details".to_string(),
+            serde_json::json!({"action": "accept"}),
+        ),
+    ]));
+    assert!(matches!(
+        router
+            .call_tool_round_with_context(third, None, Some(context))
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        3
+    );
+}
+
+#[tokio::test]
+async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let gate = SubGate::new_closed();
+    *state.tool_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+
+    let principal =
+        crate::types::PrincipalId::downstream_oauth("https://issuer.example", "client", "plug");
+    let lifecycle = crate::downstream_oauth::PrincipalLifecycleLease::active_for_tests();
+    let context = DownstreamCallContext::http_for_client(
+        "modern-session",
+        RequestId::from(NumberOrString::Number(6)),
+        ClientType::Unknown,
+    )
+    .with_authorization(
+        principal.clone(),
+        [
+            "tools:read".to_string(),
+            "continuations:complete".to_string(),
+        ],
+    )
+    .with_principal_lifecycle(lifecycle.clone())
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let request_router = Arc::clone(&router);
+    let request = tokio::spawn(async move {
+        request_router
+            .call_tool_round_with_context(
+                CallToolRequestParams::new("Modern__tool"),
+                None,
+                Some(context),
+            )
+            .await
+    });
+    state.tool_entered.notified().await;
+    lifecycle.deactivate_for_tests();
+    router
+        .cleanup_tasks_for_owner(&crate::tasks::TaskOwner::new(principal.owner_key()))
+        .await;
+    gate.open();
+
+    let error = request
+        .await
+        .unwrap()
+        .expect_err("revoked lifecycle must reject the paused response");
+    assert_eq!(error.code, ErrorCode(-32001));
+    assert_eq!(router.continuation_registry.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
+    let sm = Arc::new(ServerManager::new());
+    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+        continuations: 1,
+        continuation_bytes: MRTR_MAX_BYTES,
+        per_principal_divisor: 1,
+        ..Default::default()
+    });
+    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        Arc::clone(&sm),
+        test_router_config(),
+        quotas,
+    ));
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", state).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "old_tool");
+    let gate = Arc::new(ContinuationInsertGate {
+        entered: Arc::new(std::sync::Barrier::new(2)),
+        release: Arc::new(std::sync::Barrier::new(2)),
+    });
+    router.set_continuation_insert_gate(Some(Arc::clone(&gate)));
+    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(105));
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(10)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal.clone())
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let request_router = Arc::clone(&router);
+    let request = tokio::spawn(async move {
+        request_router
+            .call_tool_round_with_context(
+                CallToolRequestParams::new("Modern__tool"),
+                None,
+                Some(context),
+            )
+            .await
+    });
+    gate.entered.wait();
+    publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "new_tool");
+    gate.release.wait();
+
+    let error = request
+        .await
+        .unwrap()
+        .expect_err("old-generation reservation must not publish after refresh");
+    assert_eq!(error.code, ErrorCode(-32004));
+    assert_eq!(router.continuation_registry.len(), 0);
+    assert!(
+        router
+            .continuation_registry
+            .reserve(&principal, MRTR_MAX_BYTES)
+            .is_ok(),
+        "failed publication must release both quota leases"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state() {
+    let sm = Arc::new(ServerManager::new());
+    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+        continuations: 1,
+        continuation_bytes: MRTR_MAX_BYTES,
+        per_principal_divisor: 1,
+        ..Default::default()
+    });
+    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        Arc::clone(&sm),
+        test_router_config(),
+        quotas,
+    ));
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", state).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+    let gate = Arc::new(ContinuationInsertGate {
+        entered: Arc::new(std::sync::Barrier::new(2)),
+        release: Arc::new(std::sync::Barrier::new(2)),
+    });
+    router.set_continuation_insert_gate(Some(Arc::clone(&gate)));
+    let principal = crate::types::PrincipalId::daemon_ipc_registry("ipc-client-race");
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(11)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(principal.clone())
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let request_router = Arc::clone(&router);
+    let request = tokio::spawn(async move {
+        request_router
+            .call_tool_round_with_context(
+                CallToolRequestParams::new("Modern__tool"),
+                None,
+                Some(context),
+            )
+            .await
+    });
+    gate.entered.wait();
+    router.revoke_continuations_for_principal(&principal);
+    gate.release.wait();
+
+    let error = request
+        .await
+        .unwrap()
+        .expect_err("revoked owner generation must not publish after IPC cleanup");
+    assert_eq!(error.code, ErrorCode(-32004));
+    assert_eq!(router.continuation_registry.len(), 0);
+    assert!(
+        router
+            .continuation_registry
+            .reserve(&principal, MRTR_MAX_BYTES)
+            .is_ok(),
+        "failed publication must release both quota leases"
+    );
+}
+
+#[tokio::test]
+async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    let mut upstream = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
+    upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+    let ctx = MockDownstream {
+        supports_tasks: true,
+    };
+    let owner = crate::dispatch::DownstreamContext::task_owner(&ctx).unwrap();
+    let mut params = CallToolRequestParams::new("Modern__tool");
+    params.meta.get_or_insert_with(Default::default).insert(
+        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+        serde_json::json!({}),
+    );
+
+    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+        .await
+        .expect_err("legacy task cannot target a modern upstream");
+    assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+    assert_eq!(router.task_count_for_owner(&owner).await, 0);
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn invoke_meta_tool_applies_pair_suppression_to_resolved_target() {
+    let sm = Arc::new(ServerManager::new());
+    let mut config = test_router_config();
+    config.meta_tool_mode = true;
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), config));
+    let state = SubscribableUpstreamState::new(&[]);
+    let mut upstream = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
+    upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+    let context = DownstreamCallContext::ipc_for_client(
+        "legacy-client",
+        RequestId::from(NumberOrString::Number(7)),
+        ClientType::Unknown,
+    );
+    let arguments = serde_json::Map::from_iter([
+        ("tool_name".to_string(), serde_json::json!("Modern__tool")),
+        ("arguments".to_string(), serde_json::json!({})),
+    ]);
+
+    let error = router
+        .call_tool_with_context("plug__invoke_tool", Some(arguments), None, Some(context))
+        .await
+        .expect_err("meta indirection must not bypass protocol-pair policy");
+    assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invocation() {
+    let sm = Arc::new(ServerManager::new());
+    let mut config = test_router_config();
+    config.meta_tool_mode = true;
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), config));
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+    let context = DownstreamCallContext::ipc_for_client(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(9)),
+        ClientType::Unknown,
+    )
+    .with_local_principal(crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(104)))
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+    let arguments = serde_json::Map::from_iter([
+        ("tool_name".to_string(), serde_json::json!("Modern__tool")),
+        ("arguments".to_string(), serde_json::json!({})),
+    ]);
+
+    let error = router
+        .call_tool_with_context("plug__invoke_tool", Some(arguments), None, Some(context))
+        .await
+        .expect_err("meta-tool cannot represent a modern InputRequired response");
+    assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 }
 
 /// Race manifestation 1 (rebind side): a last-member unsubscribe lands

@@ -117,6 +117,11 @@ pub struct ProxyHandler {
 impl Drop for ProxyHandler {
     fn drop(&mut self) {
         self.shutdown.cancel();
+        self.router
+            .revoke_continuations_for_principal(&PrincipalId::stdio_process(stable_instance_uuid(
+                "stdio",
+                &self.client_id,
+            )));
         let session_key =
             ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
         self.router.clear_lazy_session(&session_key);
@@ -698,9 +703,10 @@ impl ServerHandler for ProxyHandler {
                     None => request.meta = Some(context.meta.clone()),
                 }
             }
-            let modern_tasks = context
+            let modern = context
                 .protocol_version()
-                .is_some_and(|version| version == ProtocolVersion::V_2026_07_28)
+                .is_some_and(|version| version == ProtocolVersion::V_2026_07_28);
+            let modern_tasks = modern
                 && context
                     .client_capabilities()
                     .is_some_and(|capabilities| capabilities.supports_tasks())
@@ -731,7 +737,7 @@ impl ServerHandler for ProxyHandler {
                 context.client_info(),
                 context.ct.clone(),
             );
-            let _modern_request_lease = if modern_tasks {
+            let _modern_request_lease = if modern {
                 Some(
                     self.router
                         .admit_modern_request(&ctx.downstream_call_context())?,
@@ -741,6 +747,7 @@ impl ServerHandler for ProxyHandler {
             };
             match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
                 crate::dispatch::ToolCallOutcome::Called(result) => Ok(result.into()),
+                crate::dispatch::ToolCallOutcome::InputRequired(result) => Ok(result.into()),
                 crate::dispatch::ToolCallOutcome::TaskCreated(result) if modern_tasks => {
                     Ok(rmcp::model::CreateTaskResult::new((&result.task).into()).into())
                 }

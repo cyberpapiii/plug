@@ -182,6 +182,19 @@ impl PrincipalLifecycleLease {
         self.state.active.load(Ordering::SeqCst)
             && self.state.generation.load(Ordering::SeqCst) == self.generation
     }
+
+    #[cfg(test)]
+    pub(crate) fn active_for_tests() -> Self {
+        Self {
+            state: Arc::new(PrincipalLifecycleState::active()),
+            generation: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deactivate_for_tests(&self) {
+        self.state.deactivate();
+    }
 }
 
 impl std::fmt::Debug for PrincipalLifecycleLease {

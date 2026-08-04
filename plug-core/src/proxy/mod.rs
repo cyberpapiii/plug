@@ -43,6 +43,11 @@ const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
+const MRTR_MAX_ITEMS: usize = 16;
+const MRTR_MAX_BYTES: usize = 256 * 1024;
+const MRTR_MAX_REQUEST_STATE_BYTES: usize = 4 * 1024;
+const MRTR_MAX_ROUNDS: usize = 10;
+const MRTR_CHAIN_TTL: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
 const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
@@ -147,6 +152,24 @@ enum LazyToolSurface {
     LegacyMeta,
 }
 
+fn mrtr_pair_supported(
+    downstream_era: crate::protocol::ProtocolEra,
+    upstream_era: crate::protocol::ProtocolEra,
+    has_continuation: bool,
+    task_requested: bool,
+) -> bool {
+    let native_modern = downstream_era == crate::protocol::ProtocolEra::Modern
+        && upstream_era == crate::protocol::ProtocolEra::Modern;
+    if has_continuation && !native_modern {
+        return false;
+    }
+    if task_requested && upstream_era == crate::protocol::ProtocolEra::Modern {
+        return false;
+    }
+    !(downstream_era == crate::protocol::ProtocolEra::Legacy
+        && upstream_era == crate::protocol::ProtocolEra::Modern)
+}
+
 /// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
@@ -198,6 +221,11 @@ pub struct ToolRouter {
     /// decisions made against a pre-publish snapshot with another pass's
     /// publish. Per-server listing/fetch work stays outside it.
     refresh_reconcile_lock: Mutex<()>,
+    /// One-time indirection for upstream-owned modern requestState. The raw
+    /// upstream token remains server-side and is bound to the route instance.
+    continuation_registry: continuations::ContinuationRegistry<NativeContinuation>,
+    #[cfg(test)]
+    continuation_insert_gate: std::sync::Mutex<Option<Arc<ContinuationInsertGate>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -454,6 +482,39 @@ impl DownstreamCallContext {
         }
     }
 
+    fn authorize_continuation(&self) -> Result<(), rmcp::ErrorData> {
+        match crate::protocol::decide_method(
+            &crate::protocol::CapabilityPolicyInput {
+                era: self.protocol_era,
+                transport: self.transport,
+                principal: self.principal.as_ref(),
+                scopes: self.scopes.as_ref(),
+                local_trust: self.local_trust,
+                modern_direction_enabled: self.modern_direction_enabled,
+                bridge_implemented: true,
+            },
+            crate::protocol::MethodFamily::Continuations,
+        ) {
+            crate::protocol::PolicyDecision::Allow => Ok(()),
+            crate::protocol::PolicyDecision::Deny(outcome) => {
+                Err(outcome.into_error(self.protocol_era))
+            }
+        }
+    }
+
+    fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
+        if self
+            .principal_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| !lifecycle.is_active())
+        {
+            Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
+                .into_error(self.protocol_era))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn notification_target(&self) -> NotificationTarget {
         match self.transport {
             DownstreamTransport::Stdio => NotificationTarget::Stdio {
@@ -525,6 +586,38 @@ struct ActiveCallRecord {
     downstream_progress_token: Option<ProgressToken>,
     upstream_progress_token: Option<ProgressToken>,
     pending_cancel_reason: Option<Option<String>>,
+}
+
+#[derive(Clone)]
+struct ToolRoundInput {
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    input_responses: Option<InputResponses>,
+    request_state: Option<String>,
+    expected_route: Option<RouteIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteIdentity {
+    server_id: String,
+    original_name: String,
+    snapshot_generation: u64,
+    generation: u64,
+}
+
+struct NativeContinuation {
+    upstream_request_state: Option<String>,
+    input_requests: InputRequests,
+    route: RouteIdentity,
+    route_snapshot: Arc<RouterSnapshot>,
+    upstream: Arc<crate::server::UpstreamServer>,
+    round: usize,
+    chain_expires_at: std::time::Instant,
+}
+
+#[cfg(test)]
+pub(crate) struct ContinuationInsertGate {
+    pub entered: Arc<std::sync::Barrier>,
+    pub release: Arc<std::sync::Barrier>,
 }
 
 /// Abstraction for forwarding reverse requests (elicitation, sampling) to a downstream client.
@@ -646,6 +739,8 @@ impl ToolRouter {
                 },
             ));
         }
+        let continuation_registry =
+            continuations::ContinuationRegistry::new(admission_quotas.clone(), MRTR_CHAIN_TTL);
         Self {
             server_manager,
             cache,
@@ -674,6 +769,9 @@ impl ToolRouter {
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
             refresh_reconcile_lock: Mutex::new(()),
+            continuation_registry,
+            #[cfg(test)]
+            continuation_insert_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -703,10 +801,158 @@ impl ToolRouter {
     pub fn set_modern_downstream_enabled(&self, enabled: bool) {
         self.modern_downstream_enabled
             .store(enabled, Ordering::Release);
+        if !enabled {
+            self.continuation_registry.clear();
+        }
     }
 
     pub fn modern_downstream_enabled(&self) -> bool {
         self.modern_downstream_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn clear_continuations(&self) {
+        self.continuation_registry.clear();
+    }
+
+    pub fn revoke_continuations_for_principal(&self, principal: &PrincipalId) {
+        self.continuation_registry.revoke_principal(principal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_continuation_insert_gate(&self, gate: Option<Arc<ContinuationInsertGate>>) {
+        *self
+            .continuation_insert_gate
+            .lock()
+            .expect("continuation insert gate mutex poisoned") = gate;
+    }
+
+    /// Fail-closed MRTR admission before a tools/call can reach an upstream.
+    /// Mixed-era ownership transfer and task input are intentionally dormant
+    /// until their parked-call coordinators exist; native modern rounds may
+    /// pass through without Plug retaining continuation state.
+    pub fn ensure_tool_round_supported(
+        &self,
+        tool_name: &str,
+        downstream: &DownstreamCallContext,
+        has_continuation: bool,
+        task_requested: bool,
+    ) -> Result<(), McpError> {
+        if task_requested
+            && downstream.protocol_era == crate::protocol::ProtocolEra::Legacy
+            && has_continuation
+        {
+            return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                .into_error(downstream.protocol_era));
+        }
+        if canonical_plug_meta_tool_name(tool_name).is_some() {
+            if has_continuation {
+                return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                    .into_error(downstream.protocol_era));
+            }
+            return Ok(());
+        }
+        let cache = self.cache.load();
+        let server_id = cache
+            .routes
+            .get(tool_name)
+            .or_else(|| {
+                cache
+                    .routes
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+                    .map(|(_, route)| route)
+            })
+            .map(|(server_id, _)| server_id.clone());
+        drop(cache);
+        let Some(server_id) = server_id else {
+            // Legacy task wrappers intentionally create their durable record
+            // before resolving a missing route, so teardown can still own a
+            // create racing session deletion. Only a resolved modern route
+            // needs the new pre-create pair rejection below.
+            if task_requested && downstream.protocol_era == crate::protocol::ProtocolEra::Legacy {
+                return Ok(());
+            }
+            return Err(McpError::from(ProtocolError::ToolNotFound {
+                tool_name: tool_name.to_string(),
+            }));
+        };
+        let Some(upstream_era) = self
+            .server_manager
+            .get_upstream(&server_id)
+            .map(|upstream| upstream.protocol_era)
+        else {
+            // Preserve legacy task enqueue semantics: the task owns its later
+            // upstream-unavailable result. Synchronous calls still fail in the
+            // router before any upstream effect.
+            if task_requested {
+                return Ok(());
+            }
+            return Err(McpError::from(ProtocolError::ServerUnavailable {
+                server_id,
+            }));
+        };
+
+        if upstream_era == crate::protocol::ProtocolEra::Modern {
+            // A modern upstream may require another round even when this first
+            // request carries no continuation fields. Admit durable ownership
+            // before the initial tool can produce side effects.
+            downstream.authorize_continuation()?;
+        }
+
+        if !mrtr_pair_supported(
+            downstream.protocol_era,
+            upstream_era,
+            has_continuation,
+            task_requested,
+        ) {
+            return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                .into_error(downstream.protocol_era));
+        }
+        Ok(())
+    }
+
+    fn tool_route_identity(
+        &self,
+        tool_name: &str,
+    ) -> Result<(RouteIdentity, Arc<RouterSnapshot>, u64), McpError> {
+        let (resolved, global_generation) = self
+            .continuation_registry
+            .capture_with_global_generation(|| -> Result<_, McpError> {
+                let cache = self.cache.load_full();
+                let (server_id, original_name) = cache
+                    .routes
+                    .get(tool_name)
+                    .or_else(|| {
+                        cache
+                            .routes
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+                            .map(|(_, route)| route)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        McpError::from(ProtocolError::ToolNotFound {
+                            tool_name: tool_name.to_string(),
+                        })
+                    })?;
+                let upstream = self
+                    .server_manager
+                    .get_upstream(&server_id)
+                    .ok_or_else(|| {
+                        McpError::from(ProtocolError::ServerUnavailable {
+                            server_id: server_id.clone(),
+                        })
+                    })?;
+                let identity = RouteIdentity {
+                    server_id,
+                    original_name,
+                    snapshot_generation: Arc::as_ptr(&cache) as usize as u64,
+                    generation: Arc::as_ptr(&upstream) as usize as u64,
+                };
+                Ok((identity, cache))
+            });
+        let (identity, cache) = resolved?;
+        Ok((identity, cache, global_generation))
     }
 
     /// Reserve one process-wide modern request slot before adapter code can
@@ -1164,7 +1410,9 @@ impl ToolRouter {
 
     #[cfg(test)]
     pub(crate) fn replace_snapshot(&self, snapshot: RouterSnapshot) {
-        self.cache.store(Arc::new(snapshot));
+        let snapshot = Arc::new(snapshot);
+        self.continuation_registry
+            .invalidate_all_with(|| self.cache.store(snapshot));
     }
 
     fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
@@ -1859,7 +2107,7 @@ impl ToolRouter {
             }
         }
 
-        self.cache.store(Arc::new(RouterSnapshot {
+        let snapshot = Arc::new(RouterSnapshot {
             routes,
             tools_all,
             meta_tools_all: Arc::new(build_meta_tools()),
@@ -1872,7 +2120,13 @@ impl ToolRouter {
             prompt_routes,
             tool_definition_fingerprints,
             tool_risk_inventory,
-        }));
+        });
+        // A continuation is bound to the exact published route snapshot. A
+        // refresh can remap an exposed name while retaining the same upstream
+        // Arc, so invalidate parked rounds immediately instead of waiting for
+        // their next consume attempt or TTL expiry.
+        self.continuation_registry
+            .invalidate_all_with(|| self.cache.store(snapshot));
 
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
@@ -2042,15 +2296,251 @@ impl ToolRouter {
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_inner(
-            tool_name,
-            arguments,
-            progress_token,
-            downstream,
-            true,
-            false,
-        )
-        .await
+        match self
+            .call_tool_inner(
+                tool_name,
+                ToolRoundInput {
+                    arguments,
+                    input_responses: None,
+                    request_state: None,
+                    expected_route: None,
+                },
+                progress_token,
+                downstream,
+                true,
+                false,
+            )
+            .await?
+        {
+            CallToolResponse::Complete(result) => Ok(result),
+            CallToolResponse::InputRequired(_) => {
+                Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                    .into_error(crate::protocol::ProtocolEra::Legacy))
+            }
+            CallToolResponse::Task(_) => Err(McpError::internal_error(
+                "unexpected task response from synchronous tool call".to_string(),
+                None,
+            )),
+            _ => Err(McpError::internal_error(
+                "unsupported response from synchronous tool call".to_string(),
+                None,
+            )),
+        }
+    }
+
+    /// Execute one MCP 2026 tools/call round without automatically fulfilling
+    /// input requests. Continuation fields are forwarded byte-for-byte to the
+    /// same routed upstream; callers must enforce era and ownership policy.
+    pub async fn call_tool_round_with_context(
+        &self,
+        mut params: CallToolRequestParams,
+        progress_token: Option<ProgressToken>,
+        downstream: Option<DownstreamCallContext>,
+    ) -> Result<CallToolResponse, McpError> {
+        let context = downstream.clone().ok_or_else(|| {
+            McpError::internal_error("modern tool round requires downstream context", None)
+        })?;
+        if canonical_plug_meta_tool_name(params.name.as_ref()).is_some() {
+            if params.input_responses.is_some() || params.request_state.is_some() {
+                return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                    .into_error(context.protocol_era));
+            }
+            return self
+                .call_tool_inner(
+                    params.name.as_ref(),
+                    ToolRoundInput {
+                        arguments: params.arguments,
+                        input_responses: None,
+                        request_state: None,
+                        expected_route: None,
+                    },
+                    progress_token,
+                    downstream,
+                    true,
+                    false,
+                )
+                .await;
+        }
+        let (route, route_snapshot, global_generation) =
+            self.tool_route_identity(params.name.as_ref())?;
+        let request_digest = continuations::canonical_tool_request_digest(&params);
+        let binding = context.principal.as_ref().map(|principal| {
+            continuations::ContinuationBinding::new(
+                principal,
+                request_digest,
+                &format!("{}\0{}", route.server_id, route.original_name),
+                route.snapshot_generation,
+                continuations::ContinuationKind::NativeToolRound,
+            )
+        });
+        let mut round = 1;
+        let mut chain_expires_at = std::time::Instant::now() + MRTR_CHAIN_TTL;
+        let mut reservation = None;
+
+        if params.input_responses.is_some() || params.request_state.is_some() {
+            context.authorize_continuation()?;
+            context.ensure_principal_lifecycle_active()?;
+            let binding = binding.as_ref().ok_or_else(|| {
+                crate::protocol::ProtocolOutcome::AuthorizationRequired
+                    .into_error(context.protocol_era)
+            })?;
+            let token = params.request_state.as_deref().ok_or_else(|| {
+                crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era)
+            })?;
+            let consumed = self
+                .continuation_registry
+                .consume(token, binding)
+                .map_err(|error| error.protocol_outcome().into_error(context.protocol_era))?;
+            let parked = consumed.value;
+            reservation = Some(consumed.reservation);
+            if parked.route != route {
+                return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era));
+            }
+            if parked.round >= MRTR_MAX_ROUNDS {
+                return Err(crate::protocol::ProtocolOutcome::QuotaExceeded
+                    .into_error(context.protocol_era));
+            }
+            if parked.chain_expires_at <= std::time::Instant::now() {
+                return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era));
+            }
+            round = parked.round + 1;
+            chain_expires_at = parked.chain_expires_at;
+            let current_upstream = self
+                .server_manager
+                .get_upstream(&route.server_id)
+                .ok_or_else(|| {
+                    crate::protocol::ProtocolOutcome::ExpiredContinuation
+                        .into_error(context.protocol_era)
+                })?;
+            if !Arc::ptr_eq(&current_upstream, &parked.upstream) {
+                return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era));
+            }
+            if !Arc::ptr_eq(&route_snapshot, &parked.route_snapshot) {
+                return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era));
+            }
+            let responses = params.input_responses.as_ref().ok_or_else(|| {
+                crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era)
+            })?;
+            continuations::validate_input_responses(&parked.input_requests, responses)
+                .map_err(|error| error.protocol_outcome().into_error(context.protocol_era))?;
+            params.request_state = parked.upstream_request_state;
+        } else if self
+            .server_manager
+            .get_upstream(&route.server_id)
+            .is_some_and(|upstream| upstream.protocol_era == crate::protocol::ProtocolEra::Modern)
+        {
+            context.authorize_continuation()?;
+            context.ensure_principal_lifecycle_active()?;
+            let principal = context.principal.as_ref().ok_or_else(|| {
+                crate::protocol::ProtocolOutcome::AuthorizationRequired
+                    .into_error(context.protocol_era)
+            })?;
+            reservation = Some(
+                self.continuation_registry
+                    .reserve_at(principal, MRTR_MAX_BYTES, global_generation)
+                    .map_err(|error| error.protocol_outcome().into_error(context.protocol_era))?,
+            );
+        }
+
+        let response = self
+            .call_tool_inner(
+                params.name.as_ref(),
+                ToolRoundInput {
+                    arguments: params.arguments,
+                    input_responses: params.input_responses,
+                    request_state: params.request_state,
+                    expected_route: Some(route.clone()),
+                },
+                progress_token,
+                downstream,
+                true,
+                false,
+            )
+            .await?;
+
+        let CallToolResponse::InputRequired(mut input_required) = response else {
+            return Ok(response);
+        };
+        context.ensure_principal_lifecycle_active()?;
+        if !Arc::ptr_eq(&self.cache.load_full(), &route_snapshot) {
+            return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
+                .into_error(context.protocol_era));
+        }
+        let context = context;
+        let binding = binding.ok_or_else(|| {
+            crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
+        })?;
+        let input_requests = input_required.input_requests.clone().unwrap_or_default();
+        if input_requests.is_empty()
+            || input_requests.len() > MRTR_MAX_ITEMS
+            || input_required
+                .request_state
+                .as_ref()
+                .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
+            || input_requests.values().any(|request| {
+                !matches!(
+                    request,
+                    InputRequest::Elicitation(_) | InputRequest::CreateMessage(_)
+                )
+            })
+        {
+            return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                .into_error(context.protocol_era));
+        }
+        let payload_bytes = serde_json::to_vec(&input_required)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len();
+        if payload_bytes > MRTR_MAX_BYTES {
+            return Err(McpError::invalid_request(
+                "upstream multi-round response exceeds Plug's bounded continuation limits",
+                None,
+            ));
+        }
+        let reservation = reservation.ok_or_else(|| {
+            crate::protocol::ProtocolOutcome::UnsupportedBridge.into_error(context.protocol_era)
+        })?;
+        let upstream = self
+            .server_manager
+            .get_upstream(&route.server_id)
+            .filter(|upstream| Arc::as_ptr(upstream) as usize as u64 == route.generation)
+            .ok_or_else(|| {
+                crate::protocol::ProtocolOutcome::ExpiredContinuation
+                    .into_error(context.protocol_era)
+            })?;
+        #[cfg(test)]
+        if let Some(gate) = self
+            .continuation_insert_gate
+            .lock()
+            .expect("continuation insert gate mutex poisoned")
+            .clone()
+        {
+            gate.entered.wait();
+            gate.release.wait();
+        }
+        let token = self
+            .continuation_registry
+            .insert_reserved(
+                binding,
+                NativeContinuation {
+                    upstream_request_state: input_required.request_state.take(),
+                    input_requests,
+                    route,
+                    route_snapshot,
+                    upstream,
+                    round,
+                    chain_expires_at,
+                },
+                reservation,
+            )
+            .map_err(|error| error.protocol_outcome().into_error(context.protocol_era))?;
+        input_required.request_state = Some(token);
+        Ok(CallToolResponse::InputRequired(input_required))
     }
 
     /// Inner tool call implementation with retry support.
@@ -2059,13 +2549,13 @@ impl ToolRouter {
     fn call_tool_inner<'a>(
         &'a self,
         tool_name: &'a str,
-        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        round: ToolRoundInput,
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
         enforce_lazy_visibility: bool,
         is_retry: bool,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + 'a>,
     > {
         Box::pin(async move {
             // Intercept plug meta-tools (case-insensitive for LLM casing drift).
@@ -2076,27 +2566,35 @@ impl ToolRouter {
                     }));
                 }
                 match meta_tool_name {
-                    "plug__list_servers" => return Ok(self.handle_list_servers()),
-                    "plug__list_tools" => return self.handle_list_tools(arguments.clone()),
+                    "plug__list_servers" => return Ok(self.handle_list_servers().into()),
+                    "plug__list_tools" => {
+                        return self
+                            .handle_list_tools(round.arguments.clone())
+                            .map(Into::into);
+                    }
                     "plug__search_tools" => {
-                        return self.handle_search_tools(arguments.clone(), downstream.as_ref());
+                        return self
+                            .handle_search_tools(round.arguments.clone(), downstream.as_ref())
+                            .map(Into::into);
                     }
                     "plug__invoke_tool" => {
                         return self
                             .handle_invoke_tool(
-                                arguments.clone(),
+                                round.arguments.clone(),
                                 progress_token,
                                 downstream,
                                 is_retry,
                             )
-                            .await;
+                            .await
+                            .map(Into::into);
                     }
                     _ => unreachable!("canonical plug meta-tool name is exhaustive"),
                 }
             }
 
             // Look up the server and original name for this exposed tool name
-            let cache = self.cache.load();
+            let cache = self.cache.load_full();
+            let snapshot_generation = Arc::as_ptr(&cache) as usize as u64;
             let (server_id, original_name) = cache
                 .routes
                 .get(tool_name)
@@ -2181,6 +2679,25 @@ impl ToolRouter {
                     })
                 })?;
 
+            if let Some(expected) = &round.expected_route {
+                let actual = RouteIdentity {
+                    server_id: server_id.clone(),
+                    original_name: original_name.clone(),
+                    snapshot_generation,
+                    generation: Arc::as_ptr(&upstream) as usize as u64,
+                };
+                if actual != *expected {
+                    return Err(
+                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(
+                            downstream
+                                .as_ref()
+                                .map(|context| context.protocol_era)
+                                .unwrap_or(crate::protocol::ProtocolEra::Legacy),
+                        ),
+                    );
+                }
+            }
+
             let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
             let transport_type = upstream.config.transport.clone();
             let peer = upstream.client.peer().clone();
@@ -2198,9 +2715,11 @@ impl ToolRouter {
 
             // Build the upstream call with the original (unprefixed) tool name
             let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-            if let Some(ref args) = arguments {
+            if let Some(ref args) = round.arguments {
                 upstream_params = upstream_params.with_arguments(args.clone());
             }
+            upstream_params.input_responses = round.input_responses.clone();
+            upstream_params.request_state = round.request_state.clone();
             let downstream_progress_token = progress_token.clone();
             let upstream_progress_token = downstream_progress_token.as_ref().map(|_| {
                 ProgressToken(NumberOrString::String(Arc::from(format!(
@@ -2347,8 +2866,48 @@ impl ToolRouter {
                     self.artifact_store
                         .maybe_spill_tool_result(tool_name, response)
                         .await
+                        .map(Into::into)
                 }
-                Err(e) if is_session_error(&e) && !is_retry => {
+                Ok(ServerResult::InputRequiredResult(response)) => {
+                    // A modern upstream completed this round and supplied its
+                    // own continuation contract. Do not retain or replay the
+                    // old request handle; the downstream retry is a new round.
+                    if let Some(cb) = &cb {
+                        cb.on_success();
+                    }
+                    self.server_manager
+                        .record_call(&server_id, true, duration_ms);
+                    if let Some(ref mut guard) = active_call_guard {
+                        guard.disarm();
+                    }
+                    self.remove_active_call(call_id);
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(EngineEvent::ToolCallCompleted {
+                            call_id,
+                            trace_id: Arc::clone(&trace_id),
+                            server_id: Arc::clone(&server_id_arc),
+                            tool_name: Arc::clone(&tool_name_arc),
+                            duration_ms,
+                            success: true,
+                        });
+                    }
+                    tracing::info!(
+                        call_id,
+                        trace_id = %trace_id,
+                        server = %server_id,
+                        tool = %original_name,
+                        duration_ms,
+                        "proxy tool call round requires input"
+                    );
+                    Ok(CallToolResponse::InputRequired(response))
+                }
+                Err(e)
+                    if is_session_error(&e)
+                        && !is_retry
+                        && round.input_responses.is_none()
+                        && round.request_state.is_none()
+                        && round.expected_route.is_none() =>
+                {
                     // Session/transport error on first attempt — try to reconnect and retry
                     tracing::warn!(
                         server = %server_id,
@@ -2407,7 +2966,7 @@ impl ToolRouter {
                     // Retry the tool call exactly once
                     self.call_tool_inner(
                         tool_name,
-                        arguments,
+                        round,
                         progress_token,
                         downstream,
                         enforce_lazy_visibility,
@@ -2773,15 +3332,58 @@ impl ToolRouter {
                 .and_then(|value| value.as_object())
                 .cloned();
 
+            if let Some(context) = downstream.as_ref() {
+                // The meta-tool itself is only indirection. Apply pair policy
+                // to the resolved target before recursively entering routing,
+                // otherwise a legacy caller could reach a modern upstream via
+                // `plug__invoke_tool` even though a direct call is suppressed.
+                self.ensure_tool_round_supported(target, context, false, false)?;
+                let (route, _, _) = self.tool_route_identity(target)?;
+                if self
+                    .server_manager
+                    .get_upstream(&route.server_id)
+                    .is_some_and(|upstream| {
+                        upstream.protocol_era == crate::protocol::ProtocolEra::Modern
+                    })
+                {
+                    // `plug__invoke_tool` returns a legacy-shaped complete
+                    // result and has nowhere to carry requestState/inputRequests.
+                    // Until it is routed through the complete native MRTR
+                    // coordinator, suppress every modern target before effect.
+                    return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                        .into_error(context.protocol_era));
+                }
+            }
+
             self.call_tool_inner(
                 target,
-                forwarded_arguments,
+                ToolRoundInput {
+                    arguments: forwarded_arguments,
+                    input_responses: None,
+                    request_state: None,
+                    expected_route: None,
+                },
                 progress_token,
                 downstream,
                 false,
                 is_retry,
             )
             .await
+            .and_then(|response| match response {
+                CallToolResponse::Complete(result) => Ok(result),
+                CallToolResponse::InputRequired(_) => {
+                    Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
+                        .into_error(crate::protocol::ProtocolEra::Legacy))
+                }
+                CallToolResponse::Task(_) => Err(McpError::internal_error(
+                    "unexpected task response from plug__invoke_tool".to_string(),
+                    None,
+                )),
+                _ => Err(McpError::internal_error(
+                    "unsupported response from plug__invoke_tool".to_string(),
+                    None,
+                )),
+            })
         })
     }
 
@@ -2898,6 +3500,7 @@ fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
 /// `inputSchema` is REQUIRED per MCP spec (ADR-003) — never stripped.
 mod catalog;
 mod completion;
+pub mod continuations;
 mod handler;
 mod subscriptions;
 mod tasks;

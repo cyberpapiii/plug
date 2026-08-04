@@ -259,6 +259,10 @@ impl Engine {
     /// Bounded shutdown: cancel tasks, give background work a short drain window,
     /// then explicitly retire upstreams without spending the full caller timeout.
     pub async fn shutdown(&self) {
+        // Parked multi-round requests are process-local capabilities. Revoke
+        // them before waiting on background work or upstream transport
+        // teardown so shutdown has an immediate, deterministic boundary.
+        self.tool_router.clear_continuations();
         self.cancel.cancel();
         self.tracker.close();
         let _ = tokio::time::timeout(Duration::from_secs(2), self.tracker.wait()).await;

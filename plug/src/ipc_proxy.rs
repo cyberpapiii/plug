@@ -1208,14 +1208,27 @@ impl ServerHandler for IpcProxyHandler {
                             (&task.task).into(),
                         )))
                     } else {
-                        serde_json::from_value::<CallToolResult>(payload)
-                            .map(Into::into)
-                            .map_err(|e| {
-                                McpError::internal_error(
-                                    format!("unexpected tool call response: {e}"),
-                                    None,
-                                )
-                            })
+                        if payload.get("resultType").and_then(|v| v.as_str())
+                            == Some("input_required")
+                        {
+                            serde_json::from_value::<rmcp::model::InputRequiredResult>(payload)
+                                .map(Into::into)
+                                .map_err(|e| {
+                                    McpError::internal_error(
+                                        format!("unexpected input-required response: {e}"),
+                                        None,
+                                    )
+                                })
+                        } else {
+                            serde_json::from_value::<CallToolResult>(payload)
+                                .map(Into::into)
+                                .map_err(|e| {
+                                    McpError::internal_error(
+                                        format!("unexpected tool call response: {e}"),
+                                        None,
+                                    )
+                                })
+                        }
                     }
                 }
                 IpcResponse::Error { code, message } => {
