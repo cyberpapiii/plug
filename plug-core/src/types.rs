@@ -56,6 +56,23 @@ impl PrincipalId {
     pub fn daemon_ipc(registry_id: Uuid) -> Self {
         Self::DaemonIpc { registry_id }
     }
+
+    pub fn daemon_ipc_registry(registry_client_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!("plug:ipc-registry:{registry_client_id}"));
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self::daemon_ipc(Uuid::from_bytes(bytes))
+    }
+
+    /// Stable opaque key suitable for ownership indexes and logs. The
+    /// canonical principal fields themselves are never exposed.
+    pub fn owner_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_vec(self).expect("PrincipalId serialization cannot fail");
+        let digest = Sha256::digest(encoded);
+        format!("principal:{digest:x}")
+    }
 }
 
 /// A string that redacts its value in `Debug`/`Display` output to prevent

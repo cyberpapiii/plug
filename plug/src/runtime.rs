@@ -224,7 +224,23 @@ async fn operator_revoke_oauth_client(
         return StatusCode::NOT_FOUND;
     };
     match manager.revoke_client(&client_id).await {
-        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(true) => {
+            // Revocation is the durable-owner lifecycle boundary. The OAuth
+            // manager rejects future token use before this point; task cleanup
+            // then uses TaskStore's create guard/tombstone ledger so an
+            // in-flight create cannot survive the revocation.
+            let principal = plug_core::types::PrincipalId::downstream_oauth(
+                manager.base_url(),
+                client_id,
+                manager.resource(),
+            );
+            state
+                .http_state
+                .router
+                .cleanup_tasks_for_owner(&plug_core::tasks::TaskOwner::new(principal.owner_key()))
+                .await;
+            StatusCode::NO_CONTENT
+        }
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

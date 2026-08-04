@@ -156,7 +156,8 @@ pub(crate) async fn cmd_auth(
             server,
             code,
             state,
-        } => cmd_auth_complete(config_path, &server, &code, &state).await,
+            issuer,
+        } => cmd_auth_complete(config_path, &server, &code, &state, issuer.as_deref()).await,
         crate::AuthCommands::Inject {
             server,
             access_token,
@@ -340,6 +341,11 @@ async fn cmd_auth_login(
         .resolve_metadata()
         .await
         .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
+    let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
+        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
+    cred_store
+        .bind_verified_authority(&authority)
+        .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
     auth_manager.set_metadata(metadata.metadata);
 
     // 4. Configure or register client ------------------------------------
@@ -448,7 +454,7 @@ async fn cmd_auth_login(
     }
 
     // 7. Collect the callback parameters ---------------------------------
-    let (code, csrf_state) = if let Some(listener) = callback_listener {
+    let (code, csrf_state, callback_issuer) = if let Some(listener) = callback_listener {
         // Localhost callback: wait for the OAuth redirect with a 120s timeout.
         ui::print_info_line("Waiting for OAuth callback on localhost...");
         await_oauth_callback(listener, Duration::from_secs(120)).await?
@@ -477,8 +483,12 @@ async fn cmd_auth_login(
             anyhow::bail!("no state parameter provided");
         }
 
-        (code, state)
+        (code, state, None)
     };
+
+    authority
+        .validate_callback_issuer(callback_issuer.as_deref())
+        .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
 
     // 8. Exchange code for token -----------------------------------------
     ui::print_info_line("Exchanging authorization code for token...");
@@ -518,6 +528,7 @@ async fn cmd_auth_complete(
     server_name: &str,
     code: &str,
     csrf_state: &str,
+    callback_issuer: Option<&str>,
 ) -> anyhow::Result<()> {
     // 1. Load and validate config ----------------------------------------
     let cfg = config::load_config(config_path)?;
@@ -554,6 +565,14 @@ async fn cmd_auth_complete(
         .resolve_metadata()
         .await
         .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
+    let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
+        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
+    authority
+        .validate_callback_issuer(callback_issuer)
+        .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
+    cred_store
+        .bind_verified_authority(&authority)
+        .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
     auth_manager.set_metadata(metadata.metadata);
 
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
@@ -903,12 +922,12 @@ async fn cmd_auth_status(
 /// Accepts a single GET request to `/callback`, extracts `code` and `state`
 /// query parameters, returns a success page to the browser, and shuts down.
 ///
-/// Returns `(code, state)` or an error if the timeout expires or parameters
+/// Returns `(code, state, issuer)` or an error if the timeout expires or parameters
 /// are missing.
 async fn await_oauth_callback(
     listener: tokio::net::TcpListener,
     timeout: Duration,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, Option<String>)> {
     // Wrap the entire accept + read + respond cycle in the timeout so a
     // slow or malicious connection cannot hang the CLI indefinitely.
     tokio::time::timeout(timeout, await_oauth_callback_inner(listener))
@@ -923,7 +942,7 @@ async fn await_oauth_callback(
 
 async fn await_oauth_callback_inner(
     listener: tokio::net::TcpListener,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, Option<String>)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut stream, _addr) = listener
@@ -1001,6 +1020,7 @@ async fn await_oauth_callback_inner(
         .get("state")
         .ok_or_else(|| anyhow::anyhow!("callback URL missing 'state' parameter"))?
         .to_string();
+    let issuer = params.get("iss").cloned();
 
     // Respond with a success page and close.
     let success_html = "HTTP/1.1 200 OK\r\n\
@@ -1013,7 +1033,7 @@ async fn await_oauth_callback_inner(
     let _ = stream.write_all(success_html.as_bytes()).await;
     let _ = stream.shutdown().await;
 
-    Ok((code, state))
+    Ok((code, state, issuer))
 }
 
 /// Minimal HTML escaping for values interpolated into HTML responses.
@@ -1303,14 +1323,15 @@ mod tests {
             .unwrap();
         client
             .write_all(
-                b"GET /callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                b"GET /callback?code=abc123&state=xyz789&iss=https%3A%2F%2Fauth.example HTTP/1.1\r\nHost: localhost\r\n\r\n",
             )
             .await
             .unwrap();
 
-        let (code, state) = handle.await.unwrap().unwrap();
+        let (code, state, issuer) = handle.await.unwrap().unwrap();
         assert_eq!(code, "abc123");
         assert_eq!(state, "xyz789");
+        assert_eq!(issuer.as_deref(), Some("https://auth.example"));
     }
 
     /// Proves that percent-encoded callback parameters are decoded before
@@ -1335,9 +1356,10 @@ mod tests {
             .await
             .unwrap();
 
-        let (code, state) = handle.await.unwrap().unwrap();
+        let (code, state, issuer) = handle.await.unwrap().unwrap();
         assert_eq!(code, "abc/123+xyz=");
         assert_eq!(state, "hello world");
+        assert_eq!(issuer, None);
     }
 
     /// Proves that the listener returns an error when the authorization server

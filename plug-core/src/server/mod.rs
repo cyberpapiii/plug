@@ -1154,9 +1154,14 @@ impl ServerManager {
 
                     // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
                     let auth_token = if config.auth.as_deref() == Some("oauth") {
-                        match crate::oauth::current_or_stored_access_token(name).await {
-                            Some(token) => Some(token),
-                            None => {
+                        match crate::oauth::verified_access_token_for_resource(name, url).await {
+                            Ok(Some(token)) => Some(token),
+                            Err(error) => {
+                                return Err(anyhow::anyhow!(
+                                    "OAuth authority verification failed for server '{name}': {error}"
+                                ));
+                            }
+                            Ok(None) => {
                                 tracing::info!(
                                     server = %name,
                                     "OAuth server has no available token, marking AuthRequired"
@@ -1262,9 +1267,14 @@ impl ServerManager {
 
         // Resolve auth token: OAuth token from cache, or static bearer token
         let auth_token_value = if config.auth.as_deref() == Some("oauth") {
-            match crate::oauth::current_or_stored_access_token(name).await {
-                Some(token) => Some(token),
-                None => {
+            match crate::oauth::verified_access_token_for_resource(name, url).await {
+                Ok(Some(token)) => Some(token),
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "OAuth authority verification failed for server '{name}': {error}"
+                    ));
+                }
+                Ok(None) => {
                     return Err(anyhow::anyhow!(
                         "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
                     ));

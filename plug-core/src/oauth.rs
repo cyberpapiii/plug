@@ -5,6 +5,7 @@
 //! `CredentialStore` and `StateStore` traits respectively.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -255,6 +256,34 @@ pub async fn current_or_stored_access_token(server_name: &str) -> Option<String>
         .map(|tr| tr.access_token().secret().to_string())
 }
 
+fn stored_access_token(credentials: &StoredCredentials) -> Option<String> {
+    use oauth2::TokenResponse;
+    credentials
+        .token_response
+        .as_ref()
+        .map(|token| token.access_token().secret().to_string())
+}
+
+/// Resolve and verify OAuth authority without a credential store, then load a
+/// token only after the server's issuer/resource binding is established.
+pub async fn verified_access_token_for_resource(
+    server_name: &str,
+    resource_url: &str,
+) -> Result<Option<String>, AuthError> {
+    use rmcp::transport::auth::AuthorizationManager;
+
+    let manager = AuthorizationManager::new(resource_url).await?;
+    let resolution = manager.resolve_metadata().await?;
+    let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
+    let store = get_or_create_store(server_name);
+    store.bind_verified_authority(&authority)?;
+    let credentials = store.current_or_freshest_persisted_credentials().await;
+    if let Some(credentials) = credentials.as_ref() {
+        store.migrate_loaded_legacy_credentials(credentials)?;
+    }
+    Ok(credentials.and_then(|credentials| stored_access_token(&credentials)))
+}
+
 // ---------------------------------------------------------------------------
 // CachedCredentials
 // ---------------------------------------------------------------------------
@@ -294,6 +323,99 @@ pub struct CredentialDebugSnapshot {
     pub client_id: Option<String>,
     pub has_refresh_token: bool,
     pub warnings: Vec<String>,
+}
+
+const CREDENTIAL_ENVELOPE_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialBinding {
+    pub issuer: String,
+    pub resource: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct BoundCredentialEnvelope {
+    version: u8,
+    binding: CredentialBinding,
+    credentials: StoredCredentials,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedCredentialEnvelope {
+    Bound(BoundCredentialEnvelope),
+    Legacy(StoredCredentials),
+}
+
+/// Canonical, token-silent authority result used before any stored credential
+/// may be loaded or attached to an upstream request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedOAuthAuthority {
+    pub issuer: String,
+    pub resource: String,
+}
+
+impl VerifiedOAuthAuthority {
+    pub fn verify(
+        resource: &str,
+        metadata: &rmcp::transport::auth::AuthorizationMetadata,
+    ) -> Result<Self, AuthError> {
+        let resource = canonical_secure_url(resource, "OAuth resource")?;
+        // Legacy endpoint synthesis has no issuer. In that compatibility case
+        // the already-validated protected resource origin is the authority;
+        // discovered metadata with an issuer remains authoritative.
+        let issuer_raw = metadata.issuer.as_deref().unwrap_or(&resource);
+        let issuer = canonical_secure_url(issuer_raw, "OAuth issuer")?;
+        let token_endpoint =
+            canonical_secure_url(&metadata.token_endpoint, "OAuth token endpoint")?;
+        let issuer_url = reqwest::Url::parse(&issuer)
+            .map_err(|error| AuthError::InternalError(format!("invalid OAuth issuer: {error}")))?;
+        let token_url = reqwest::Url::parse(&token_endpoint).map_err(|error| {
+            AuthError::InternalError(format!("invalid OAuth token endpoint: {error}"))
+        })?;
+        if issuer_url.scheme() != token_url.scheme()
+            || issuer_url.host_str() != token_url.host_str()
+            || issuer_url.port_or_known_default() != token_url.port_or_known_default()
+        {
+            return Err(AuthError::InternalError(
+                "OAuth token endpoint is not on the verified issuer origin".to_string(),
+            ));
+        }
+        Ok(Self { issuer, resource })
+    }
+
+    pub fn validate_callback_issuer(&self, callback_issuer: Option<&str>) -> Result<(), AuthError> {
+        let Some(callback_issuer) = callback_issuer else {
+            return Ok(());
+        };
+        let callback_issuer = canonical_secure_url(callback_issuer, "callback issuer")?;
+        if callback_issuer != self.issuer {
+            return Err(AuthError::InternalError(
+                "OAuth callback issuer does not match discovered issuer".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn canonical_secure_url(value: &str, label: &str) -> Result<String, AuthError> {
+    let mut parsed = reqwest::Url::parse(value)
+        .map_err(|error| AuthError::InternalError(format!("invalid {label}: {error}")))?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err(AuthError::InternalError(format!(
+            "{label} must use HTTPS (HTTP is allowed only for loopback)"
+        )));
+    }
+    parsed.set_fragment(None);
+    parsed.set_query(None);
+    let normalized = parsed.as_str().trim_end_matches('/').to_string();
+    Ok(normalized)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +475,8 @@ impl std::fmt::Debug for CachedCredentials {
 pub struct CompositeCredentialStore {
     server_name: String,
     cache: Arc<ArcSwap<Option<CachedCredentials>>>,
+    binding: Arc<ArcSwap<Option<CredentialBinding>>>,
+    unbound_legacy_loaded: Arc<AtomicBool>,
 }
 
 impl CompositeCredentialStore {
@@ -361,7 +485,90 @@ impl CompositeCredentialStore {
         Self {
             server_name,
             cache: Arc::new(ArcSwap::from_pointee(None)),
+            binding: Arc::new(ArcSwap::from_pointee(None)),
+            unbound_legacy_loaded: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Bind all subsequent credential reads and writes to verified authority.
+    /// Existing bound credentials are rejected on conflict; unbound legacy
+    /// credentials remain readable so an explicit login can migrate them.
+    pub fn bind_verified_authority(
+        &self,
+        authority: &VerifiedOAuthAuthority,
+    ) -> Result<(), AuthError> {
+        let binding = CredentialBinding {
+            issuer: authority.issuer.clone(),
+            resource: authority.resource.clone(),
+        };
+        if let Some(existing) = self.binding.load().as_ref().as_ref()
+            && existing != &binding
+        {
+            return Err(AuthError::InternalError(
+                "stored OAuth credentials are bound to a different issuer or resource".to_string(),
+            ));
+        }
+        self.binding.store(Arc::new(Some(binding)));
+        Ok(())
+    }
+
+    pub fn credential_binding(&self) -> Option<CredentialBinding> {
+        self.binding.load().as_ref().clone()
+    }
+
+    fn decode_credentials(&self, json: &str, source: &str) -> Option<StoredCredentials> {
+        match serde_json::from_str::<PersistedCredentialEnvelope>(json) {
+            Ok(PersistedCredentialEnvelope::Legacy(credentials)) => {
+                self.unbound_legacy_loaded.store(true, Ordering::Release);
+                Some(credentials)
+            }
+            Ok(PersistedCredentialEnvelope::Bound(envelope)) => {
+                if envelope.version != CREDENTIAL_ENVELOPE_VERSION {
+                    warn!(server = %self.server_name, source, "unsupported credential envelope version");
+                    return None;
+                }
+                if let Some(expected) = self.binding.load().as_ref().as_ref()
+                    && expected != &envelope.binding
+                {
+                    warn!(server = %self.server_name, source, "credential issuer/resource binding mismatch");
+                    return None;
+                }
+                self.binding.store(Arc::new(Some(envelope.binding)));
+                Some(envelope.credentials)
+            }
+            Err(error) => {
+                warn!(server = %self.server_name, source, %error, "invalid credential JSON");
+                None
+            }
+        }
+    }
+
+    fn encode_credentials(&self, credentials: &StoredCredentials) -> Result<String, AuthError> {
+        match self.binding.load().as_ref().as_ref() {
+            Some(binding) => serde_json::to_string(&BoundCredentialEnvelope {
+                version: CREDENTIAL_ENVELOPE_VERSION,
+                binding: binding.clone(),
+                credentials: credentials.clone(),
+            }),
+            None => serde_json::to_string(credentials),
+        }
+        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
+    }
+
+    fn migrate_loaded_legacy_credentials(
+        &self,
+        credentials: &StoredCredentials,
+    ) -> Result<(), AuthError> {
+        if !self.unbound_legacy_loaded.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // File is authoritative and must succeed. Keychain is the recovery
+        // mirror; preserve current best-effort behavior to avoid making a
+        // platform credential service outage strand an otherwise valid grant.
+        self.file_save(credentials)?;
+        let _ = self.keyring_save(credentials);
+        self.update_cache(credentials);
+        Ok(())
     }
 
     // -- keyring helpers --------------------------------------------------
@@ -390,24 +597,12 @@ impl CompositeCredentialStore {
                 .expect("test keyring mutex poisoned")
                 .get(&self.server_name)
                 .cloned()?;
-            return match serde_json::from_str::<StoredCredentials>(&json) {
-                Ok(creds) => Some(creds),
-                Err(error) => {
-                    warn!(server = %self.server_name, %error, "test keyring: invalid JSON");
-                    None
-                }
-            };
+            return self.decode_credentials(&json, "test keyring");
         }
 
         let entry = self.keyring_entry()?;
         match entry.get_password() {
-            Ok(json) => match serde_json::from_str::<StoredCredentials>(&json) {
-                Ok(creds) => Some(creds),
-                Err(e) => {
-                    warn!(server = %self.server_name, error = %e, "keyring: invalid JSON, ignoring");
-                    None
-                }
-            },
+            Ok(json) => self.decode_credentials(&json, "keyring"),
             Err(platform_keyring::Error::NoEntry) => None,
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring: load failed");
@@ -418,7 +613,7 @@ impl CompositeCredentialStore {
 
     fn keyring_save(&self, creds: &StoredCredentials) -> bool {
         if let Some(environment) = test_credential_environment() {
-            let json = match serde_json::to_string(creds) {
+            let json = match self.encode_credentials(creds) {
                 Ok(json) => json,
                 Err(error) => {
                     warn!(server = %self.server_name, %error, "test keyring: serialization failed");
@@ -437,7 +632,7 @@ impl CompositeCredentialStore {
             Some(e) => e,
             None => return false,
         };
-        let json = match serde_json::to_string(creds) {
+        let json = match self.encode_credentials(creds) {
             Ok(j) => j,
             Err(e) => {
                 warn!(server = %self.server_name, error = %e, "keyring: serialization failed");
@@ -619,12 +814,23 @@ impl CompositeCredentialStore {
     }
 
     fn file_load(&self) -> Option<StoredCredentials> {
-        self.load_json_file(self.token_file_path(), "token file")
+        let path = self.token_file_path().ok()?;
+        let json = std::fs::read_to_string(path).ok()?;
+        self.decode_credentials(&json, "token file")
     }
 
     fn file_save(&self, creds: &StoredCredentials) -> Result<(), AuthError> {
         let path = self.token_file_path()?;
-        self.save_json_file(path, creds, "token file")
+        let value = match self.binding.load().as_ref().as_ref() {
+            Some(binding) => serde_json::to_value(BoundCredentialEnvelope {
+                version: CREDENTIAL_ENVELOPE_VERSION,
+                binding: binding.clone(),
+                credentials: creds.clone(),
+            }),
+            None => serde_json::to_value(creds),
+        }
+        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))?;
+        self.save_json_file(path, &value, "token file")
     }
 
     fn file_clear(&self) {
@@ -1273,13 +1479,46 @@ pub async fn refresh_access_token(
     // Ensure the TLS provider is available (reqwest needs it even for HTTP).
     crate::tls::ensure_rustls_provider_installed();
 
-    // 1. Load stored credentials from the global store.
+    // 1. Perform token-silent discovery and bind authority before any stored
+    // credential is loaded, refreshed, or eligible for attachment.
     let store = get_or_create_store(server_name);
+    let mut auth_manager = match AuthorizationManager::new(server_url).await {
+        Ok(manager) => manager,
+        Err(error) => {
+            return RefreshResult::TransientError(format!("failed to init auth manager: {error}"));
+        }
+    };
+    let refresh_store = CompositeCredentialStore::new(server_name.to_string());
+    auth_manager.set_credential_store(refresh_store.clone());
+    let metadata = match auth_manager.resolve_metadata().await {
+        Ok(resolution) => resolution.metadata,
+        Err(error) => {
+            return RefreshResult::TransientError(format!("metadata discovery failed: {error}"));
+        }
+    };
+    let authority = match VerifiedOAuthAuthority::verify(server_url, &metadata) {
+        Ok(authority) => authority,
+        Err(error) => return RefreshResult::AuthError(error.to_string()),
+    };
+    if let Err(error) = store.bind_verified_authority(&authority) {
+        return RefreshResult::AuthError(error.to_string());
+    }
+    if let Err(error) = refresh_store.bind_verified_authority(&authority) {
+        return RefreshResult::AuthError(error.to_string());
+    }
+    auth_manager.set_metadata(metadata);
+
+    // 2. Loading is safe only after the authority boundary is established.
     let creds = match CredentialStore::load(&*store).await {
         Ok(Some(c)) => c,
         Ok(None) => return RefreshResult::NoCredentials,
         Err(e) => return RefreshResult::TransientError(format!("failed to load credentials: {e}")),
     };
+    if let Err(error) = store.migrate_loaded_legacy_credentials(&creds) {
+        return RefreshResult::TransientError(format!(
+            "failed to migrate issuer-bound credentials: {error}"
+        ));
+    }
     let load_snapshot = store.fallback_auth_debug_snapshot();
     debug!(
         server = %server_name,
@@ -1292,12 +1531,12 @@ pub async fn refresh_access_token(
         "loaded OAuth credentials for refresh"
     );
 
-    // 2. Injected tokens have no real OAuth client — cannot refresh.
+    // 3. Injected tokens have no real OAuth client — cannot refresh.
     if creds.client_id == "injected" {
         return RefreshResult::InjectedToken;
     }
 
-    // 3. A refresh_token must be present.
+    // 4. A refresh_token must be present.
     let has_refresh = creds.token_response.as_ref().is_some_and(|tr| {
         use oauth2::TokenResponse;
         tr.refresh_token().is_some()
@@ -1306,28 +1545,7 @@ pub async fn refresh_access_token(
         return RefreshResult::NoRefreshToken;
     }
 
-    // 4. Build an AuthorizationManager for the server URL.
-    let mut auth_manager = match AuthorizationManager::new(server_url).await {
-        Ok(m) => m,
-        Err(e) => {
-            return RefreshResult::TransientError(format!("failed to init auth manager: {e}"));
-        }
-    };
-
-    // Fresh store instance sharing the same backing files/keyring — we
-    // cannot reuse the global Arc because `set_credential_store` takes
-    // ownership.
-    let refresh_store = CompositeCredentialStore::new(server_name.to_string());
-    auth_manager.set_credential_store(refresh_store.clone());
-
-    // 5. Discover OAuth server metadata.
-    let metadata = match auth_manager.resolve_metadata().await {
-        Ok(resolution) => resolution.metadata,
-        Err(e) => return RefreshResult::TransientError(format!("metadata discovery failed: {e}")),
-    };
-    auth_manager.set_metadata(metadata);
-
-    // 6. Configure the OAuth client.
+    // 5. Configure the OAuth client.
     let client_id = oauth_client_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| creds.client_id.clone());
@@ -1349,7 +1567,7 @@ pub async fn refresh_access_token(
         return RefreshResult::TransientError(format!("failed to configure client: {e}"));
     }
 
-    // 7. Exchange refresh_token for a new access_token.
+    // 6. Exchange refresh_token for a new access_token.
     match auth_manager.refresh_token().await {
         Ok(_) => {
             // rmcp's refresh_token() saves via the refresh store and updates its
@@ -1728,15 +1946,105 @@ mod tests {
         StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(now))
     }
 
-    /// No stored credentials → NoCredentials.
+    fn test_authority() -> VerifiedOAuthAuthority {
+        let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
+        metadata.issuer = Some("https://auth.example/".to_string());
+        metadata.authorization_endpoint = "https://auth.example/authorize".to_string();
+        metadata.token_endpoint = "https://auth.example/token".to_string();
+        VerifiedOAuthAuthority::verify("https://mcp.example/mcp", &metadata).unwrap()
+    }
+
+    #[test]
+    fn verified_authority_rejects_cross_origin_token_endpoint_and_callback_issuer() {
+        let authority = test_authority();
+        assert!(
+            authority
+                .validate_callback_issuer(Some("https://auth.example"))
+                .is_ok()
+        );
+        assert!(
+            authority
+                .validate_callback_issuer(Some("https://evil.example"))
+                .is_err()
+        );
+
+        let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
+        metadata.issuer = Some("https://auth.example".to_string());
+        metadata.authorization_endpoint = "https://auth.example/authorize".to_string();
+        metadata.token_endpoint = "https://evil.example/token".to_string();
+        assert!(VerifiedOAuthAuthority::verify("https://mcp.example/mcp", &metadata).is_err());
+    }
+
+    #[tokio::test]
+    async fn bound_credential_envelope_round_trips_and_rejects_other_issuer() {
+        let name = format!("bound-envelope-{}", uuid::Uuid::new_v4());
+        let authority = test_authority();
+        let store = CompositeCredentialStore::new(name.clone());
+        store.bind_verified_authority(&authority).unwrap();
+        let credentials = make_test_token("bound-access", Some("refresh"), Some(3600));
+        CredentialStore::save(&store, credentials.clone())
+            .await
+            .unwrap();
+
+        let reloaded = CompositeCredentialStore::new(name.clone());
+        reloaded.bind_verified_authority(&authority).unwrap();
+        assert_eq!(
+            stored_access_token(&CredentialStore::load(&reloaded).await.unwrap().unwrap())
+                .as_deref(),
+            Some("bound-access")
+        );
+
+        let conflicting = CompositeCredentialStore::new(name);
+        let other = VerifiedOAuthAuthority {
+            issuer: "https://other.example".to_string(),
+            resource: authority.resource,
+        };
+        conflicting.bind_verified_authority(&other).unwrap();
+        assert!(CredentialStore::load(&conflicting).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn verified_binding_migrates_legacy_credentials_without_changing_token() {
+        let name = format!("legacy-binding-{}", uuid::Uuid::new_v4());
+        let credentials = make_test_token("legacy-access", Some("refresh"), Some(3600));
+        let legacy = CompositeCredentialStore::new(name.clone());
+        CredentialStore::save(&legacy, credentials.clone())
+            .await
+            .unwrap();
+
+        let authority = test_authority();
+        let migrating = CompositeCredentialStore::new(name.clone());
+        migrating.bind_verified_authority(&authority).unwrap();
+        let loaded = CredentialStore::load(&migrating).await.unwrap().unwrap();
+        migrating
+            .migrate_loaded_legacy_credentials(&loaded)
+            .unwrap();
+        assert_eq!(
+            stored_access_token(&loaded).as_deref(),
+            Some("legacy-access")
+        );
+
+        let conflicting = CompositeCredentialStore::new(name);
+        conflicting
+            .bind_verified_authority(&VerifiedOAuthAuthority {
+                issuer: "https://different.example".to_string(),
+                resource: authority.resource,
+            })
+            .unwrap();
+        assert!(CredentialStore::load(&conflicting).await.unwrap().is_none());
+    }
+
+    /// Authority discovery precedes even an empty-store check, so an
+    /// unreachable resource fails without inspecting local credential state.
     #[tokio::test]
     async fn test_refresh_no_credentials() {
         let name = format!("refresh-nocreds-{}", std::process::id());
         let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::NoCredentials));
+        assert!(matches!(result, RefreshResult::TransientError(_)));
     }
 
-    /// Injected token (client_id == "injected") → InjectedToken.
+    /// An unreachable authority cannot cause an injected credential to be
+    /// loaded before issuer binding.
     #[tokio::test]
     async fn test_refresh_injected_token() {
         let name = format!("refresh-injected-{}", std::process::id());
@@ -1747,13 +2055,14 @@ mod tests {
         store.save(creds).await.unwrap();
 
         let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::InjectedToken));
+        assert!(matches!(result, RefreshResult::TransientError(_)));
 
         // Clean up
         store.clear().await.unwrap();
     }
 
-    /// No refresh_token in stored credentials → NoRefreshToken.
+    /// An unreachable authority cannot cause a no-refresh credential to be
+    /// loaded before issuer binding.
     #[tokio::test]
     async fn test_refresh_no_refresh_token() {
         let name = format!("refresh-norefresh-{}", std::process::id());
@@ -1764,7 +2073,7 @@ mod tests {
         store.save(creds).await.unwrap();
 
         let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::NoRefreshToken));
+        assert!(matches!(result, RefreshResult::TransientError(_)));
 
         // Clean up
         store.clear().await.unwrap();

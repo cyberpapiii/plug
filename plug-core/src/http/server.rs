@@ -105,9 +105,11 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        Ok(crate::proxy::ToolRouter::task_owner_for_http_session(
-            &self.session_id,
-        ))
+        let context = self.downstream_call_context();
+        Ok(match context.principal {
+            Some(principal) => crate::tasks::TaskOwner::new(principal.owner_key()),
+            None => crate::proxy::ToolRouter::task_owner_for_http_session(&self.session_id),
+        })
     }
 
     /// Session-existence probe for the enqueue path's post-guard liveness

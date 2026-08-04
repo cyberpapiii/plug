@@ -606,9 +606,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let successes = Arc::clone(&successes);
             threads.push(std::thread::spawn(move || {
-                let lease = quotas
-                    .try_acquire(&principal, QuotaResource::Tasks, 1)
-                    .ok();
+                let lease = quotas.try_acquire(&principal, QuotaResource::Tasks, 1).ok();
                 if lease.is_some() {
                     successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }

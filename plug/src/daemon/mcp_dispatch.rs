@@ -26,6 +26,7 @@ use super::ConnectionContext;
 /// frame is preserved for a task-augmented call whose session vanished.
 struct IpcDownstreamContext {
     session_id: Arc<str>,
+    registry_client_id: Option<Arc<str>>,
     request_id: RequestId,
     client_type: plug_core::types::ClientType,
     owner: Option<plug_core::tasks::TaskOwner>,
@@ -38,11 +39,17 @@ struct IpcDownstreamContext {
 
 impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
     fn downstream_call_context(&self) -> plug_core::proxy::DownstreamCallContext {
-        plug_core::proxy::DownstreamCallContext::ipc_for_client(
+        let context = plug_core::proxy::DownstreamCallContext::ipc_for_client(
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
-        )
+        );
+        match &self.registry_client_id {
+            Some(client_id) => context.with_local_principal(
+                plug_core::types::PrincipalId::daemon_ipc_registry(client_id),
+            ),
+            None => context,
+        }
     }
 
     fn task_owner(&self) -> Result<plug_core::tasks::TaskOwner, McpError> {
@@ -273,11 +280,12 @@ pub(super) async fn dispatch_mcp_request(
             // error frame is preserved for a task-augmented call whose session
             // vanished (the dispatcher only sees an opaque McpError otherwise).
             // The liveness probe is built from the same resolved client id.
+            let registry_client_id = ctx.client_registry.client_id(session_id);
             let (owner, owner_liveness) =
                 if call_params.meta.as_ref().is_some_and(|meta| {
                     meta.contains_key(plug_core::protocol::LEGACY_TASK_REQUEST_KEY)
                 }) {
-                    let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                    let Some(client_id) = registry_client_id.clone() else {
                         return IpcResponse::Error {
                             code: "UNKNOWN_SESSION".to_string(),
                             message: "session not found".to_string(),
@@ -299,6 +307,7 @@ pub(super) async fn dispatch_mcp_request(
             )));
             let downstream_ctx = IpcDownstreamContext {
                 session_id: Arc::from(session_id),
+                registry_client_id: registry_client_id.map(Arc::<str>::from),
                 request_id,
                 client_type,
                 owner,

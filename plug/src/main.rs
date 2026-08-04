@@ -358,6 +358,9 @@ pub(crate) enum AuthCommands {
         /// CSRF state parameter from the OAuth callback
         #[arg(long)]
         state: String,
+        /// Optional RFC 9207 issuer parameter from the OAuth callback
+        #[arg(long)]
+        issuer: Option<String>,
     },
     /// Clear stored OAuth credentials for a server
     Logout {
