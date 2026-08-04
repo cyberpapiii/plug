@@ -221,6 +221,9 @@ pub struct DownstreamCallContext {
     pub deadline: Option<std::time::Instant>,
     pub cancellation: CancellationToken,
     pub durable_owner: Option<TaskOwner>,
+    /// OAuth client generation captured during bearer validation. Durable
+    /// admission rechecks it after registering the TaskStore create guard.
+    pub principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
 }
 
 impl DownstreamCallContext {
@@ -251,6 +254,7 @@ impl DownstreamCallContext {
             deadline: None,
             cancellation: CancellationToken::new(),
             durable_owner: None,
+            principal_lifecycle: None,
         }
     }
 
@@ -277,6 +281,7 @@ impl DownstreamCallContext {
             deadline: None,
             cancellation: CancellationToken::new(),
             durable_owner: None,
+            principal_lifecycle: None,
         }
     }
 
@@ -305,6 +310,7 @@ impl DownstreamCallContext {
             deadline: None,
             cancellation: CancellationToken::new(),
             durable_owner: None,
+            principal_lifecycle: None,
         }
     }
 
@@ -330,6 +336,7 @@ impl DownstreamCallContext {
             deadline: None,
             cancellation: CancellationToken::new(),
             durable_owner: None,
+            principal_lifecycle: None,
         }
     }
 
@@ -347,6 +354,14 @@ impl DownstreamCallContext {
     pub fn with_local_principal(mut self, principal: PrincipalId) -> Self {
         self.principal = Some(principal);
         self.local_trust = true;
+        self
+    }
+
+    pub fn with_principal_lifecycle(
+        mut self,
+        lifecycle: crate::downstream_oauth::PrincipalLifecycleLease,
+    ) -> Self {
+        self.principal_lifecycle = Some(lifecycle);
         self
     }
 

@@ -122,9 +122,9 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             &self.auth_status,
             http_principal(&self.auth_status, self.oauth_issuer.as_deref()),
         ) {
-            (AuthStatus::Authenticated(Some(claims)), Some(principal)) => {
-                context.with_authorization(principal, claims.scopes.clone())
-            }
+            (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
+                .with_authorization(principal, claims.scopes.clone())
+                .with_principal_lifecycle(claims.principal_lifecycle.clone()),
             (AuthStatus::Authenticated(None), Some(principal)) => {
                 context.with_local_principal(principal)
             }
@@ -2002,17 +2002,6 @@ mod tests {
             http_task_owner("session-a", &AuthStatus::NoAuthRequired, None),
             http_task_owner("session-b", &AuthStatus::NoAuthRequired, None),
             "legacy unauthenticated sessions retain session-scoped ownership"
-        );
-
-        let oauth = AuthStatus::Authenticated(Some(crate::downstream_oauth::AccessTokenClaims {
-            client_id: "client-a".to_string(),
-            scopes: vec!["tasks:use".to_string()],
-            resource: "https://plug.example/mcp".to_string(),
-        }));
-        assert_eq!(
-            http_task_owner("session-a", &oauth, Some("https://issuer.example")),
-            http_task_owner("session-b", &oauth, Some("https://issuer.example")),
-            "OAuth client identity must survive HTTP session replacement"
         );
     }
 

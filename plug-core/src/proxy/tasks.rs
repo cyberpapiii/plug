@@ -153,6 +153,21 @@ impl super::ToolRouter {
             return Err(owner_closed_during_create_error());
         }
 
+        // Bearer validation and durable admission are separate moments. A
+        // client revoked between them invalidates this generation lease.
+        // This check is intentionally after the TaskStore create guard: a
+        // concurrent revocation that proceeds after we observe `active`
+        // still tombstones this in-flight owner during cleanup, preventing a
+        // late record from surviving. A revocation that already completed is
+        // rejected here before route lookup or any upstream request.
+        if let Some(context) = downstream.as_ref()
+            && let Some(lifecycle) = context.principal_lifecycle.as_ref()
+            && !lifecycle.is_active()
+        {
+            return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
+                .into_error(context.protocol_era));
+        }
+
         if canonical_plug_meta_tool_name(tool_name).is_some() {
             return Err(McpError::from(ProtocolError::InvalidRequest {
                 detail:

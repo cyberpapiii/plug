@@ -1952,6 +1952,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_revoke_204_blocks_request_validated_before_revocation_from_creating_task() {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), task_test_mock_config());
+        let engine = Arc::new(plug_core::engine::Engine::new(config));
+        engine.start().await.expect("engine start");
+        let tool_router = engine.tool_router().clone();
+
+        let oauth_path = std::env::temp_dir().join(format!(
+            "plug-runtime-revoke-race-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            plug_core::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: vec!["tools:read".to_string(), "tasks:use".to_string()],
+                local_port: 3282,
+            },
+            oauth_path.clone(),
+        )
+        .expect("OAuth manager");
+        let client = manager
+            .register_client(
+                plug_core::downstream_oauth::ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example/callback".to_string()],
+                    client_name: Some("race client".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "runtime-revoke-test",
+            )
+            .await
+            .expect("register client");
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let consent = manager
+            .begin_authorization(plug_core::downstream_oauth::AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "runtime-revoke-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read tasks:use"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let code = reqwest::Url::parse(&redirect.location)
+            .expect("redirect URL")
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization code");
+        let tokens = manager
+            .exchange_authorization_code(
+                &client.client_id,
+                &code,
+                &client.redirect_uris[0],
+                verifier,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("exchange code");
+
+        // Barrier: middleware validation has completed and captured the old
+        // client generation, but task dispatch has not begun.
+        let claims = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                &manager.resource(),
+            )
+            .await
+        {
+            plug_core::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
+            other => panic!("token must validate before revocation: {other:?}"),
+        };
+        let principal = plug_core::types::PrincipalId::downstream_oauth(
+            manager.base_url(),
+            claims.client_id.clone(),
+            claims.resource.clone(),
+        );
+        let owner = plug_core::tasks::TaskOwner::new(principal.owner_key());
+        let context = plug_core::proxy::DownstreamCallContext::http_for_client_with_trace(
+            "validated-before-revoke",
+            rmcp::model::RequestId::from(rmcp::model::NumberOrString::Number(1)),
+            plug_core::types::ClientType::Unknown,
+            Arc::<str>::from("00000000000000000000000000000001"),
+        )
+        .with_authorization(principal, claims.scopes)
+        .with_principal_lifecycle(claims.principal_lifecycle);
+
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let http_state = Arc::new(plug_core::http::server::HttpState {
+            router: tool_router.clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(manager),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        let app = build_runtime_router(http_state, Arc::from("operator-secret"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "{OPERATOR_OAUTH_CLIENTS_PATH}/{}",
+                        client.client_id
+                    ))
+                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
+                    .body(Body::empty())
+                    .expect("revoke request"),
+            )
+            .await
+            .expect("revoke response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let error = tool_router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, Some(context))
+            .await
+            .expect_err("a pre-revocation validation cannot create after the 204 boundary");
+        assert_eq!(error.code, rmcp::model::ErrorCode(-32001));
+        assert_eq!(tool_router.task_count_for_owner(&owner).await, 0);
+
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(oauth_path);
+    }
+
+    #[tokio::test]
     async fn expired_http_session_cleans_up_tasks() {
         let mut config = plug_core::config::Config::default();
         config
