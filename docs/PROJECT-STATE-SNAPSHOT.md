@@ -98,9 +98,28 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-No unmerged project work is currently present locally or on `origin`. Local
-branch names may remain temporarily while their worktrees are pruned, but
-their reviewed commits are already contained in `main`.
+The local branch `codex/mcp-2026-modernization` contains a reviewed dual-era
+MCP modernization program that is not yet on `main`:
+
+- exact RMCP 3.1.0 with legacy MCP `2025-11-25` behavior preserved by default
+- explicit legacy/modern protocol-era policy and requested/selected protocol
+  observability in both directions
+- issuer-bound OAuth credentials and fail-closed durable-operation policy
+- gated MCP `2026-07-28` downstream discovery/sessionless HTTP and upstream
+  `legacy | auto | modern` negotiation
+- gated modern task lifecycle support with ownership, quota, cancellation, and
+  cleanup enforcement
+- admitted extension metadata, Apps/UI descriptors, schemas, and W3C trace
+  propagation through safe boundaries
+- authenticated, quota-bound, single-use native modern-to-modern multi-round
+  `tools/call` continuations
+
+Both global modern protocol gates default to off. Legacy clients and servers
+keep their current path. Modern listeners, mixed-era multi-round bridging,
+task-plus-multi-round calls, Apps/UI capability advertisement, and synthesized
+multi-upstream cache directives remain suppressed where Plug cannot yet prove
+the complete contract. These changes become `done on main` only after the
+branch is merged and the post-merge truth pass succeeds.
 
 ## Release Status
 
