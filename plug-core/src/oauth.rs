@@ -88,6 +88,7 @@ static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
 struct TestCredentialEnvironment {
     tokens_dir: PathBuf,
     keyring: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    failing_keyring_writes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 static TEST_CREDENTIAL_ENVIRONMENT: OnceLock<TestCredentialEnvironment> = OnceLock::new();
@@ -101,6 +102,7 @@ pub fn install_test_credential_environment(tokens_dir: PathBuf) {
     let environment = TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
         tokens_dir: tokens_dir.clone(),
         keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
+        failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
     assert_eq!(
         environment.tokens_dir, tokens_dir,
@@ -325,7 +327,7 @@ pub struct CredentialDebugSnapshot {
     pub warnings: Vec<String>,
 }
 
-const CREDENTIAL_ENVELOPE_VERSION: u8 = 1;
+const CREDENTIAL_ENVELOPE_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialBinding {
@@ -336,6 +338,7 @@ pub struct CredentialBinding {
 #[derive(Clone, Serialize, Deserialize)]
 struct BoundCredentialEnvelope {
     version: u8,
+    generation: String,
     binding: CredentialBinding,
     credentials: StoredCredentials,
 }
@@ -345,6 +348,12 @@ struct BoundCredentialEnvelope {
 enum PersistedCredentialEnvelope {
     Bound(BoundCredentialEnvelope),
     Legacy(StoredCredentials),
+}
+
+enum BoundPairProbe {
+    NotBound,
+    Valid(Box<StoredCredentials>),
+    Invalid,
 }
 
 /// Canonical, token-silent authority result used before any stored credential
@@ -366,21 +375,11 @@ impl VerifiedOAuthAuthority {
         // discovered metadata with an issuer remains authoritative.
         let issuer_raw = metadata.issuer.as_deref().unwrap_or(&resource);
         let issuer = canonical_secure_url(issuer_raw, "OAuth issuer")?;
-        let token_endpoint =
+        // Authorization-server metadata is itself the trust statement for the
+        // token endpoint; a deployment may validly use a different HTTPS
+        // origin. Validate transport safety without inventing same-origin.
+        let _token_endpoint =
             canonical_secure_url(&metadata.token_endpoint, "OAuth token endpoint")?;
-        let issuer_url = reqwest::Url::parse(&issuer)
-            .map_err(|error| AuthError::InternalError(format!("invalid OAuth issuer: {error}")))?;
-        let token_url = reqwest::Url::parse(&token_endpoint).map_err(|error| {
-            AuthError::InternalError(format!("invalid OAuth token endpoint: {error}"))
-        })?;
-        if issuer_url.scheme() != token_url.scheme()
-            || issuer_url.host_str() != token_url.host_str()
-            || issuer_url.port_or_known_default() != token_url.port_or_known_default()
-        {
-            return Err(AuthError::InternalError(
-                "OAuth token endpoint is not on the verified issuer origin".to_string(),
-            ));
-        }
         Ok(Self { issuer, resource })
     }
 
@@ -399,7 +398,7 @@ impl VerifiedOAuthAuthority {
 }
 
 fn canonical_secure_url(value: &str, label: &str) -> Result<String, AuthError> {
-    let mut parsed = reqwest::Url::parse(value)
+    let parsed = reqwest::Url::parse(value)
         .map_err(|error| AuthError::InternalError(format!("invalid {label}: {error}")))?;
     let loopback = parsed.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
@@ -412,10 +411,14 @@ fn canonical_secure_url(value: &str, label: &str) -> Result<String, AuthError> {
             "{label} must use HTTPS (HTTP is allowed only for loopback)"
         )));
     }
-    parsed.set_fragment(None);
-    parsed.set_query(None);
-    let normalized = parsed.as_str().trim_end_matches('/').to_string();
-    Ok(normalized)
+    if parsed.fragment().is_some() {
+        return Err(AuthError::InternalError(format!(
+            "{label} must not contain a fragment"
+        )));
+    }
+    // Query and exact path are part of OAuth resource/issuer identity. Do not
+    // collapse tenant selectors such as `?tenant=a` and `?tenant=b`.
+    Ok(parsed.as_str().to_string())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,16 +546,133 @@ impl CompositeCredentialStore {
         }
     }
 
-    fn encode_credentials(&self, credentials: &StoredCredentials) -> Result<String, AuthError> {
+    fn raw_file_json(&self) -> Option<String> {
+        std::fs::read_to_string(self.token_file_path().ok()?).ok()
+    }
+
+    fn raw_keyring_json(&self) -> Option<String> {
+        if let Some(environment) = test_credential_environment() {
+            return environment
+                .keyring
+                .lock()
+                .expect("test keyring mutex poisoned")
+                .get(&self.server_name)
+                .cloned();
+        }
+        self.keyring_entry()?.get_password().ok()
+    }
+
+    fn probe_bound_pair(&self) -> BoundPairProbe {
+        let file_json = self.raw_file_json();
+        let keyring_json = self.raw_keyring_json();
+        let file = file_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<PersistedCredentialEnvelope>(json).ok());
+        let keyring = keyring_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<PersistedCredentialEnvelope>(json).ok());
+
+        let any_bound = matches!(&file, Some(PersistedCredentialEnvelope::Bound(_)))
+            || matches!(&keyring, Some(PersistedCredentialEnvelope::Bound(_)));
+        if !any_bound {
+            return BoundPairProbe::NotBound;
+        }
+        let (
+            Some(PersistedCredentialEnvelope::Bound(file)),
+            Some(PersistedCredentialEnvelope::Bound(keyring)),
+        ) = (file, keyring)
+        else {
+            warn!(server = %self.server_name, "incomplete issuer-bound credential mirror rejected");
+            return BoundPairProbe::Invalid;
+        };
+        let expected = self.binding.load();
+        let expected = expected.as_ref().as_ref();
+        let credentials_match = serde_json::to_value(&file.credentials).ok()
+            == serde_json::to_value(&keyring.credentials).ok();
+        if file.version != CREDENTIAL_ENVELOPE_VERSION
+            || keyring.version != CREDENTIAL_ENVELOPE_VERSION
+            || file.generation != keyring.generation
+            || file.binding != keyring.binding
+            || expected.is_some_and(|binding| binding != &file.binding)
+            || !credentials_match
+        {
+            warn!(server = %self.server_name, "mismatched issuer-bound credential mirror rejected");
+            return BoundPairProbe::Invalid;
+        }
+        self.binding.store(Arc::new(Some(file.binding)));
+        self.update_cache(&file.credentials);
+        BoundPairProbe::Valid(Box::new(file.credentials))
+    }
+
+    fn encode_credentials(
+        &self,
+        credentials: &StoredCredentials,
+        generation: Option<&str>,
+    ) -> Result<String, AuthError> {
         match self.binding.load().as_ref().as_ref() {
             Some(binding) => serde_json::to_string(&BoundCredentialEnvelope {
                 version: CREDENTIAL_ENVELOPE_VERSION,
+                generation: generation
+                    .expect("bound credential writes require a transaction generation")
+                    .to_string(),
                 binding: binding.clone(),
                 credentials: credentials.clone(),
             }),
             None => serde_json::to_string(credentials),
         }
         .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
+    }
+
+    fn credential_write_lock_path(&self) -> Result<PathBuf, AuthError> {
+        let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|error| {
+            AuthError::InternalError(format!("invalid server name for lock path: {error}"))
+        })?;
+        Ok(tokens_dir().join(format!("{safe}.credentials.lock")))
+    }
+
+    fn with_credential_write_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, AuthError>,
+    ) -> Result<T, AuthError> {
+        use fs4::FileExt;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = self.credential_write_lock_path()?;
+        let dir = path.parent().ok_or_else(|| {
+            AuthError::InternalError("credential lock path has no parent".to_string())
+        })?;
+        crate::fs_perm::ensure_dir_0700(dir).map_err(|error| {
+            AuthError::InternalError(format!("failed to create tokens dir: {error}"))
+        })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&path).map_err(|error| {
+            AuthError::InternalError(format!("failed to open credential lock: {error}"))
+        })?;
+        <std::fs::File as FileExt>::lock(&file).map_err(|error| {
+            AuthError::InternalError(format!("failed to lock credential transaction: {error}"))
+        })?;
+        let result = operation();
+        let unlock = <std::fs::File as FileExt>::unlock(&file).map_err(|error| {
+            AuthError::InternalError(format!("failed to unlock credential transaction: {error}"))
+        });
+        match (result, unlock) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    fn save_credential_pair(&self, credentials: &StoredCredentials) -> Result<(), AuthError> {
+        self.with_credential_write_lock(|| {
+            let generation = uuid::Uuid::new_v4().to_string();
+            self.file_save_generation(credentials, Some(&generation))?;
+            self.keyring_save_generation(credentials, Some(&generation))?;
+            Ok(())
+        })
     }
 
     fn migrate_loaded_legacy_credentials(
@@ -562,11 +682,7 @@ impl CompositeCredentialStore {
         if !self.unbound_legacy_loaded.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        // File is authoritative and must succeed. Keychain is the recovery
-        // mirror; preserve current best-effort behavior to avoid making a
-        // platform credential service outage strand an otherwise valid grant.
-        self.file_save(credentials)?;
-        let _ = self.keyring_save(credentials);
+        self.save_credential_pair(credentials)?;
         self.update_cache(credentials);
         Ok(())
     }
@@ -612,41 +728,48 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_save(&self, creds: &StoredCredentials) -> bool {
+        self.keyring_save_generation(creds, None).is_ok()
+    }
+
+    fn keyring_save_generation(
+        &self,
+        creds: &StoredCredentials,
+        generation: Option<&str>,
+    ) -> Result<(), AuthError> {
         if let Some(environment) = test_credential_environment() {
-            let json = match self.encode_credentials(creds) {
-                Ok(json) => json,
-                Err(error) => {
-                    warn!(server = %self.server_name, %error, "test keyring: serialization failed");
-                    return false;
-                }
-            };
+            if environment
+                .failing_keyring_writes
+                .lock()
+                .expect("test keyring failure mutex poisoned")
+                .contains(&self.server_name)
+            {
+                return Err(AuthError::InternalError(
+                    "injected test keyring write failure".to_string(),
+                ));
+            }
+            let json = self.encode_credentials(creds, generation)?;
             environment
                 .keyring
                 .lock()
                 .expect("test keyring mutex poisoned")
                 .insert(self.server_name.clone(), json);
-            return true;
+            return Ok(());
         }
 
-        let entry = match self.keyring_entry() {
-            Some(e) => e,
-            None => return false,
-        };
-        let json = match self.encode_credentials(creds) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!(server = %self.server_name, error = %e, "keyring: serialization failed");
-                return false;
-            }
-        };
+        let entry = self
+            .keyring_entry()
+            .ok_or_else(|| AuthError::InternalError("keyring entry is unavailable".to_string()))?;
+        let json = self.encode_credentials(creds, generation)?;
         match entry.set_password(&json) {
             Ok(()) => {
                 debug!(server = %self.server_name, "keyring: credentials saved");
-                true
+                Ok(())
             }
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring: save failed");
-                false
+                Err(AuthError::InternalError(format!(
+                    "keyring credential save failed: {e}"
+                )))
             }
         }
     }
@@ -741,7 +864,7 @@ impl CompositeCredentialStore {
 
         let json = serde_json::to_string_pretty(value)
             .map_err(|e| AuthError::InternalError(format!("serialization failed: {e}")))?;
-        let tmp_path = path.with_extension("json.tmp");
+        let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
 
         #[cfg(unix)]
         let file = {
@@ -774,14 +897,19 @@ impl CompositeCredentialStore {
             let _ = FileExt::unlock(&file);
             AuthError::InternalError(format!("failed to write temp {file_kind}: {e}"))
         })?;
-
-        FileExt::unlock(&file).map_err(|e| {
-            AuthError::InternalError(format!("failed to unlock temp {file_kind}: {e}"))
+        file.sync_all().map_err(|error| {
+            let _ = FileExt::unlock(&file);
+            AuthError::InternalError(format!("failed to sync temp {file_kind}: {error}"))
         })?;
 
         std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = FileExt::unlock(&file);
             let _ = std::fs::remove_file(&tmp_path);
             AuthError::InternalError(format!("failed to rename temp {file_kind}: {e}"))
+        })?;
+
+        FileExt::unlock(&file).map_err(|e| {
+            AuthError::InternalError(format!("failed to unlock committed {file_kind}: {e}"))
         })?;
 
         #[cfg(unix)]
@@ -820,10 +948,21 @@ impl CompositeCredentialStore {
     }
 
     fn file_save(&self, creds: &StoredCredentials) -> Result<(), AuthError> {
+        self.file_save_generation(creds, None)
+    }
+
+    fn file_save_generation(
+        &self,
+        creds: &StoredCredentials,
+        generation: Option<&str>,
+    ) -> Result<(), AuthError> {
         let path = self.token_file_path()?;
         let value = match self.binding.load().as_ref().as_ref() {
             Some(binding) => serde_json::to_value(BoundCredentialEnvelope {
                 version: CREDENTIAL_ENVELOPE_VERSION,
+                generation: generation
+                    .expect("bound credential writes require a transaction generation")
+                    .to_string(),
                 binding: binding.clone(),
                 credentials: creds.clone(),
             }),
@@ -1218,13 +1357,22 @@ impl CompositeCredentialStore {
     /// fresher persisted credentials written by another process without
     /// requiring a full restart to clear cache state.
     async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
-        self.fallback_auth_snapshot_inner().credentials
+        match self.probe_bound_pair() {
+            BoundPairProbe::Valid(credentials) => Some(*credentials),
+            BoundPairProbe::Invalid => None,
+            BoundPairProbe::NotBound => self.fallback_auth_snapshot_inner().credentials,
+        }
     }
 }
 
 #[async_trait]
 impl CredentialStore for CompositeCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        match self.probe_bound_pair() {
+            BoundPairProbe::Valid(credentials) => return Ok(Some(*credentials)),
+            BoundPairProbe::Invalid => return Ok(None),
+            BoundPairProbe::NotBound => {}
+        }
         // The normal runtime hot path must not wake the OS credential UI when
         // a protected token mirror is already available. Explicit diagnostics
         // still use `credential_snapshot_inner` to compare both backends.
@@ -1243,15 +1391,20 @@ impl CredentialStore for CompositeCredentialStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        // Normal loads treat the protected file mirror as authoritative so
-        // writing it is part of the save contract. Persist it before touching
-        // Keychain to avoid acknowledging a newer Keychain-only credential
-        // that a cold restart would mask with an older file.
-        self.file_save(&credentials)?;
-
-        // Keychain remains the recovery backend. A failure here does not make
-        // the credential unusable because the authoritative mirror is durable.
-        let _keyring_ok = self.keyring_save(&credentials);
+        if self.binding.load().as_ref().is_some() {
+            // Bound credentials are one logical mirror transaction. A partial
+            // platform write returns Err and the generation mismatch makes the
+            // split pair unreadable on the next load.
+            self.save_credential_pair(&credentials)?;
+        } else {
+            // Legacy unbound records retain their compatibility write shape.
+            self.file_save(&credentials)?;
+            if !self.keyring_save(&credentials) {
+                return Err(AuthError::InternalError(
+                    "keyring credential save failed".to_string(),
+                ));
+            }
+        }
 
         // Publish to the in-memory cache only after durable mirror success.
         self.update_cache(&credentials);
@@ -1955,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_authority_rejects_cross_origin_token_endpoint_and_callback_issuer() {
+    fn verified_authority_accepts_published_cross_origin_token_endpoint() {
         let authority = test_authority();
         assert!(
             authority
@@ -1971,8 +2124,34 @@ mod tests {
         let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
         metadata.issuer = Some("https://auth.example".to_string());
         metadata.authorization_endpoint = "https://auth.example/authorize".to_string();
-        metadata.token_endpoint = "https://evil.example/token".to_string();
-        assert!(VerifiedOAuthAuthority::verify("https://mcp.example/mcp", &metadata).is_err());
+        metadata.token_endpoint = "https://tokens.example/oauth/token".to_string();
+        assert!(VerifiedOAuthAuthority::verify("https://mcp.example/mcp", &metadata).is_ok());
+    }
+
+    #[test]
+    fn resource_identity_preserves_exact_path_and_tenant_query() {
+        let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
+        metadata.issuer = Some("https://auth.example".to_string());
+        metadata.authorization_endpoint = "https://auth.example/authorize".to_string();
+        metadata.token_endpoint = "https://tokens.example/token".to_string();
+        let tenant_a =
+            VerifiedOAuthAuthority::verify("https://mcp.example/tenant/tools?tenant=a", &metadata)
+                .unwrap();
+        let tenant_b =
+            VerifiedOAuthAuthority::verify("https://mcp.example/tenant/tools?tenant=b", &metadata)
+                .unwrap();
+        assert_eq!(
+            tenant_a.resource,
+            "https://mcp.example/tenant/tools?tenant=a"
+        );
+        assert_ne!(tenant_a.resource, tenant_b.resource);
+        assert!(
+            VerifiedOAuthAuthority::verify(
+                "https://mcp.example/tenant/tools?tenant=a#fragment",
+                &metadata,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2032,6 +2211,78 @@ mod tests {
             })
             .unwrap();
         assert!(CredentialStore::load(&conflicting).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bound_save_reports_keyring_failure_and_split_generation_is_unreadable() {
+        let name = format!("bound-keyring-failure-{}", uuid::Uuid::new_v4());
+        let authority = test_authority();
+        let store = CompositeCredentialStore::new(name.clone());
+        store.bind_verified_authority(&authority).unwrap();
+        let environment = test_credential_environment().expect("test credential environment");
+        environment
+            .failing_keyring_writes
+            .lock()
+            .unwrap()
+            .insert(name.clone());
+        let result = CredentialStore::save(
+            &store,
+            make_test_token("must-not-load", Some("refresh"), Some(3600)),
+        )
+        .await;
+        environment
+            .failing_keyring_writes
+            .lock()
+            .unwrap()
+            .remove(&name);
+        assert!(result.is_err());
+
+        let reloaded = CompositeCredentialStore::new(name);
+        reloaded.bind_verified_authority(&authority).unwrap();
+        assert!(CredentialStore::load(&reloaded).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_bound_writers_publish_one_complete_generation() {
+        let name = format!("bound-concurrent-{}", uuid::Uuid::new_v4());
+        let authority = test_authority();
+        let mut threads = Vec::new();
+        for access in ["writer-a", "writer-b"] {
+            let name = name.clone();
+            let authority = authority.clone();
+            threads.push(std::thread::spawn(move || {
+                let store = CompositeCredentialStore::new(name);
+                store.bind_verified_authority(&authority).unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime
+                    .block_on(CredentialStore::save(
+                        &store,
+                        make_test_token(access, Some("refresh"), Some(3600)),
+                    ))
+                    .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let reloaded = CompositeCredentialStore::new(name);
+        reloaded.bind_verified_authority(&authority).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let credentials = runtime
+            .block_on(CredentialStore::load(&reloaded))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stored_access_token(&credentials).as_deref(),
+            Some("writer-a" | "writer-b")
+        ));
     }
 
     /// Authority discovery precedes even an empty-store check, so an
