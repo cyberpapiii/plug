@@ -30,7 +30,7 @@ use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
 use crate::types::{ClientType, LazyToolMode, LazyToolModeOrigin, ResolvedLazyToolPolicy};
 
-const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Backstop timeout for a single `refresh_tools` pass inside the notification
 /// refresh task. Per-server listing calls are already bounded by
@@ -1948,7 +1948,7 @@ impl ToolRouter {
             options.timeout = Some(timeout_duration);
             options.meta = upstream_progress_token
                 .clone()
-                .map(Meta::with_progress_token);
+                .map(RequestMetaObject::with_progress_token);
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,

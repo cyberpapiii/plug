@@ -3581,7 +3581,10 @@ mod tests {
                 .expect("stdio client serve");
             let mut params = rmcp::model::CallToolRequestParams::new("Mock__echo".to_string());
             params = params.with_arguments(serde_json::Map::new());
-            params.task = Some(rmcp::model::TaskMetadata::new());
+            params.meta.get_or_insert_with(Default::default).insert(
+                plug_core::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                serde_json::json!({}),
+            );
             let err = client
                 .call_tool(params)
                 .await

@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{
-    CancelTaskResult, ErrorCode, GetTaskPayloadResult, GetTaskResult, ListTasksResult, RequestId,
-    Task, TaskStatus,
-};
+use rmcp::model::{ErrorCode, RequestId};
 use serde_json::Value;
 use tokio::task::JoinHandle;
+
+use crate::legacy_tasks::{
+    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult, Task, TaskStatus,
+};
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
@@ -582,11 +583,6 @@ impl TaskStore {
                 format!("task {task_id} is not in a completed state"),
                 None,
             )),
-            _ => Err(McpError::new(
-                ErrorCode::INVALID_REQUEST,
-                format!("task {task_id} has an unsupported status"),
-                None,
-            )),
         }
     }
 
@@ -614,10 +610,6 @@ impl TaskStore {
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
                 let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
                 now.duration_since(record.last_touched) < Duration::from_millis(ttl_ms)
-            }
-            _ => {
-                now.duration_since(record.last_touched)
-                    < Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
             }
         });
     }

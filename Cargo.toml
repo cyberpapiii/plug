@@ -12,7 +12,7 @@ homepage = "https://github.com/cyberpapiii/plug"
 
 [workspace.dependencies]
 # MCP SDK
-rmcp = { version = "=2.2.0", features = [
+rmcp = { version = "=3.1.0", features = [
     "client",
     "server",
     "macros",

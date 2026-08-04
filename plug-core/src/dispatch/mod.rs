@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolRequestParams, CallToolResult, CreateTaskResult, RequestParamsMeta};
+use rmcp::model::{CallToolRequestParams, CallToolResult, RequestParamsMeta};
 
+use crate::legacy_tasks::CreateTaskResult;
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 use crate::tasks::{OwnerLivenessProbe, TaskOwner};
 
@@ -95,7 +96,12 @@ pub async fn dispatch_tools_call(
     let progress_token = params.progress_token();
     let downstream = ctx.downstream_call_context();
 
-    if params.task.is_some() && ctx.supports_tasks() {
+    if params
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY))
+        && ctx.supports_tasks()
+    {
         let owner = ctx.task_owner()?;
         let result = router
             .clone()

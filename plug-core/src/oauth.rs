@@ -1321,8 +1321,8 @@ pub async fn refresh_access_token(
     auth_manager.set_credential_store(refresh_store.clone());
 
     // 5. Discover OAuth server metadata.
-    let metadata = match auth_manager.discover_metadata().await {
-        Ok(m) => m,
+    let metadata = match auth_manager.resolve_metadata().await {
+        Ok(resolution) => resolution.metadata,
         Err(e) => return RefreshResult::TransientError(format!("metadata discovery failed: {e}")),
     };
     auth_manager.set_metadata(metadata);

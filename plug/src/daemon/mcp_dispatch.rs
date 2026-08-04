@@ -69,7 +69,14 @@ impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
 /// ladder so every arm shares one fallback path.
 pub(super) fn ipc_ok<T: serde::Serialize>(value: T) -> IpcResponse {
     match serde_json::to_value(value) {
-        Ok(payload) => IpcResponse::McpResponse { payload },
+        Ok(mut payload) => {
+            // The daemon IPC MCP bridge serves the same legacy protocol as the
+            // downstream stdio and HTTP adapters, but carries a bare result
+            // rather than a JSON-RPC envelope. Keep modern RMCP 3.x result
+            // discriminators from leaking onto that legacy surface.
+            plug_core::protocol::rewrite_legacy_result(&mut payload, false);
+            IpcResponse::McpResponse { payload }
+        }
         Err(e) => IpcResponse::Error {
             code: "SERIALIZE_ERROR".to_string(),
             message: e.to_string(),
@@ -230,9 +237,11 @@ pub(super) async fn dispatch_mcp_request(
         }
 
         "tools/call" => {
-            let call_params = match params
-                .map(|p| serde_json::from_value::<rmcp::model::CallToolRequestParams>(p.clone()))
-            {
+            let call_params = match params.map(|params| {
+                let mut params = params.clone();
+                plug_core::protocol::rewrite_legacy_call_params(&mut params);
+                serde_json::from_value::<rmcp::model::CallToolRequestParams>(params)
+            }) {
                 Some(Ok(p)) => p,
                 Some(Err(e)) => {
                     return IpcResponse::Error {
@@ -264,21 +273,24 @@ pub(super) async fn dispatch_mcp_request(
             // error frame is preserved for a task-augmented call whose session
             // vanished (the dispatcher only sees an opaque McpError otherwise).
             // The liveness probe is built from the same resolved client id.
-            let (owner, owner_liveness) = if call_params.task.is_some() {
-                let Some(client_id) = ctx.client_registry.client_id(session_id) else {
-                    return IpcResponse::Error {
-                        code: "UNKNOWN_SESSION".to_string(),
-                        message: "session not found".to_string(),
+            let (owner, owner_liveness) =
+                if call_params.meta.as_ref().is_some_and(|meta| {
+                    meta.contains_key(plug_core::protocol::LEGACY_TASK_REQUEST_KEY)
+                }) {
+                    let Some(client_id) = ctx.client_registry.client_id(session_id) else {
+                        return IpcResponse::Error {
+                            code: "UNKNOWN_SESSION".to_string(),
+                            message: "session not found".to_string(),
+                        };
                     };
+                    let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                    let registry = Arc::clone(&ctx.client_registry);
+                    let probe: plug_core::tasks::OwnerLivenessProbe =
+                        Arc::new(move || registry.client_sessions.contains_key(&client_id));
+                    (Some(owner), Some(probe))
+                } else {
+                    (None, None)
                 };
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                let registry = Arc::clone(&ctx.client_registry);
-                let probe: plug_core::tasks::OwnerLivenessProbe =
-                    Arc::new(move || registry.client_sessions.contains_key(&client_id));
-                (Some(owner), Some(probe))
-            } else {
-                (None, None)
-            };
 
             // Synthetic request ID — the IPC protocol doesn't carry JSON-RPC IDs,
             // but the context needs one for active call tracking.

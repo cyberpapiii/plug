@@ -337,10 +337,10 @@ async fn cmd_auth_login(
     // 3. Discover authorization server metadata --------------------------
     ui::print_info_line("Discovering authorization server metadata...");
     let metadata = auth_manager
-        .discover_metadata()
+        .resolve_metadata()
         .await
         .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
-    auth_manager.set_metadata(metadata);
+    auth_manager.set_metadata(metadata.metadata);
 
     // 4. Configure or register client ------------------------------------
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
@@ -551,10 +551,10 @@ async fn cmd_auth_complete(
 
     // 3. Discover metadata and configure client --------------------------
     let metadata = auth_manager
-        .discover_metadata()
+        .resolve_metadata()
         .await
         .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
-    auth_manager.set_metadata(metadata);
+    auth_manager.set_metadata(metadata.metadata);
 
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 

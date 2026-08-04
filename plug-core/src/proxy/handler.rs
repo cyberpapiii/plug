@@ -1,4 +1,8 @@
 use super::*;
+use crate::legacy_tasks::{
+    CancelTaskParams as LegacyCancelTaskParams, GetTaskParams as LegacyGetTaskParams,
+    GetTaskPayloadParams as LegacyGetTaskPayloadParams,
+};
 
 struct StdioDownstreamContext {
     client_id: Arc<str>,
@@ -15,9 +19,8 @@ impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
         )
     }
 
-    /// stdio's `tools/call` handler can only return a `CallToolResult`, so a
-    /// task-augmented call falls through to the synchronous path (preserving
-    /// today's "task param ignored on stdio" behavior).
+    /// stdio's `tools/call` handler can only return a `CallToolResult`, so its
+    /// handler rejects legacy task-augmented calls before shared dispatch.
     fn supports_tasks(&self) -> bool {
         false
     }
@@ -155,6 +158,10 @@ impl ProxyHandler {
 
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for ProxyHandler {
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Owned(vec![crate::protocol::supported_protocol_version()])
+    }
+
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(self.router.synthesized_capabilities())
             .with_server_info(plug_implementation())
@@ -170,7 +177,7 @@ impl ServerHandler for ProxyHandler {
         self.router.get_tool_definition(name)
     }
 
-    fn enqueue_task(
+    /*fn enqueue_task(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -204,7 +211,7 @@ impl ServerHandler for ProxyHandler {
                 )
                 .await
         }
-    }
+    }*/
 
     fn initialize(
         &self,
@@ -218,6 +225,8 @@ impl ServerHandler for ProxyHandler {
             tracing::info!(
                 client = %request.client_info.name,
                 detected = %client_type,
+                requested_protocol = %request.protocol_version,
+                selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "client connected"
             );
 
@@ -512,7 +521,7 @@ impl ServerHandler for ProxyHandler {
         }
     }
 
-    fn list_tasks(
+    /*fn list_tasks(
         &self,
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
@@ -520,14 +529,36 @@ impl ServerHandler for ProxyHandler {
         let router = Arc::clone(&self.router);
         let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
         async move { router.list_tasks_for_owner(&owner, request).await }
-    }
+    }*/
 
     fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         async move {
+            // RMCP 3.x removes wire-level `params._meta` from typed params and
+            // exposes it through RequestContext instead. Rehydrate ordinary
+            // request metadata before dispatch, and preserve the legacy stdio
+            // contract that a task wrapper on a non-task-capable surface is an
+            // INVALID_PARAMS error rather than silently executing synchronously.
+            if !context.meta.is_empty() {
+                match request.meta.as_mut() {
+                    Some(meta) => meta.extend(context.meta.clone()),
+                    None => request.meta = Some(context.meta.clone()),
+                }
+            }
+            if request
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY))
+            {
+                return Err(McpError::invalid_params(
+                    "stdio does not support task-augmented tools/call".to_string(),
+                    None,
+                ));
+            }
+
             let client_type = self
                 .client_type
                 .read()
@@ -539,9 +570,9 @@ impl ServerHandler for ProxyHandler {
                 client_type,
             };
             match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
-                crate::dispatch::ToolCallOutcome::Called(result) => Ok(result),
-                // `supports_tasks()` is false for stdio, so the dispatcher always
-                // takes the synchronous path — a task outcome is unreachable.
+                crate::dispatch::ToolCallOutcome::Called(result) => Ok(result.into()),
+                // `supports_tasks()` is false for stdio, so a task outcome is
+                // unreachable after the explicit legacy task rejection above.
                 crate::dispatch::ToolCallOutcome::TaskCreated(_) => Err(McpError::internal_error(
                     "stdio tools/call unexpectedly produced a task result".to_string(),
                     None,
@@ -550,7 +581,7 @@ impl ServerHandler for ProxyHandler {
         }
     }
 
-    fn get_task_info(
+    /*fn get_task_info(
         &self,
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
@@ -562,9 +593,9 @@ impl ServerHandler for ProxyHandler {
                 .get_task_info_for_owner(&owner, &request.task_id)
                 .await
         }
-    }
+    }*/
 
-    fn get_task_result(
+    /*fn get_task_result(
         &self,
         request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
@@ -576,9 +607,9 @@ impl ServerHandler for ProxyHandler {
                 .get_task_result_for_owner(&owner, &request.task_id)
                 .await
         }
-    }
+    }*/
 
-    fn cancel_task(
+    /*fn cancel_task(
         &self,
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
@@ -586,6 +617,67 @@ impl ServerHandler for ProxyHandler {
         let router = Arc::clone(&self.router);
         let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
         async move { router.cancel_task_for_owner(&owner, &request.task_id).await }
+    }*/
+
+    fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CustomResult, McpError>> + Send + '_ {
+        let router = Arc::clone(&self.router);
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move {
+            let value = match request.method.as_str() {
+                "plug/legacy/tasks/list" => {
+                    let params = request
+                        .params_as::<PaginatedRequestParams>()
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                    serde_json::to_value(router.list_tasks_for_owner(&owner, params).await?)
+                }
+                "plug/legacy/tasks/get" => {
+                    let params = request
+                        .params_as::<LegacyGetTaskParams>()
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("missing task params", None))?;
+                    serde_json::to_value(
+                        router
+                            .get_task_info_for_owner(&owner, &params.task_id)
+                            .await?,
+                    )
+                }
+                "plug/legacy/tasks/result" => {
+                    let params = request
+                        .params_as::<LegacyGetTaskPayloadParams>()
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("missing task params", None))?;
+                    serde_json::to_value(
+                        router
+                            .get_task_result_for_owner(&owner, &params.task_id)
+                            .await?,
+                    )
+                }
+                "plug/legacy/tasks/cancel" => {
+                    let params = request
+                        .params_as::<LegacyCancelTaskParams>()
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("missing task params", None))?;
+                    serde_json::to_value(
+                        router
+                            .cancel_task_for_owner(&owner, &params.task_id)
+                            .await?,
+                    )
+                }
+                _ => {
+                    return Err(McpError::new(
+                        ErrorCode::METHOD_NOT_FOUND,
+                        request.method,
+                        None,
+                    ));
+                }
+            }
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            Ok(CustomResult::new(value))
+        }
     }
 
     fn on_cancelled(
@@ -642,8 +734,13 @@ impl ServerHandler for ProxyHandler {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
-        async move { self.router.read_resource(&request.uri).await }
+    ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
+        async move {
+            self.router
+                .read_resource(&request.uri)
+                .await
+                .map(Into::into)
+        }
     }
 
     fn list_prompts(
@@ -658,11 +755,12 @@ impl ServerHandler for ProxyHandler {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
         async move {
             self.router
                 .get_prompt(&request.name, request.arguments)
                 .await
+                .map(Into::into)
         }
     }
 

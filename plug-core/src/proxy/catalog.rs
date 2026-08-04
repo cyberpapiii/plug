@@ -392,6 +392,7 @@ impl super::ToolRouter {
             meta: None,
             next_cursor,
             tools,
+            ..Default::default()
         })
     }
 
@@ -509,7 +510,13 @@ impl super::ToolRouter {
             capabilities.logging = Some(serde_json::Map::new());
         }
         if self.supports_tasks_for_client(client_type) {
-            capabilities.tasks = Some(TasksCapability::server_default());
+            capabilities
+                .experimental
+                .get_or_insert_with(Default::default)
+                .insert(
+                    crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+                    serde_json::Map::new(),
+                );
         }
 
         capabilities
@@ -612,6 +619,7 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 resources,
+                ..Default::default()
             }
         })
     }
@@ -632,6 +640,7 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 resource_templates,
+                ..Default::default()
             },
         )
     }
@@ -647,6 +656,7 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 prompts,
+                ..Default::default()
             }
         })
     }

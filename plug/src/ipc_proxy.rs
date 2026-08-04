@@ -21,9 +21,10 @@ use tokio::time::MissedTickBehavior;
 use plug_core::ipc::{
     self, DaemonToProxyMessage, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse,
 };
+use plug_core::legacy_tasks::CreateTaskResult as LegacyCreateTaskResult;
 
 const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
-const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+const LATEST_PROTOCOL_VERSION: &str = plug_core::protocol::SUPPORTED_PROTOCOL_VERSION;
 
 /// Max silence (no frames of ANY kind) on a locked read before the daemon is
 /// declared wedged and the connection is torn down for reconnect. Frames
@@ -672,6 +673,9 @@ impl Drop for IpcProxyHandler {
 
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for IpcProxyHandler {
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Owned(vec![plug_core::protocol::supported_protocol_version()])
+    }
     fn get_info(&self) -> ServerInfo {
         let capabilities = self
             .shared
@@ -702,6 +706,8 @@ impl ServerHandler for IpcProxyHandler {
             let client_name = request.client_info.name.to_string();
             tracing::info!(
                 client = %client_name,
+                requested_protocol = %request.protocol_version,
+                selected_protocol = plug_core::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "client connected via IPC proxy"
             );
             self.shared.conn.lock().await.client_info = Some(client_name.clone());
@@ -867,7 +873,7 @@ impl ServerHandler for IpcProxyHandler {
         }
     }
 
-    fn enqueue_task(
+    /*fn enqueue_task(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
@@ -902,21 +908,36 @@ impl ServerHandler for IpcProxyHandler {
                 )),
             }
         }
-    }
+    }*/
 
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         async move {
+            let legacy_task_requested = request.meta.as_ref().is_some_and(|meta| {
+                meta.contains_key(plug_core::protocol::LEGACY_TASK_REQUEST_KEY)
+            }) || context
+                .meta
+                .contains_key(plug_core::protocol::LEGACY_TASK_REQUEST_KEY);
+
             // Serialize the full request so `_meta` (including
             // `progressToken`) survives to the daemon — matching
             // `enqueue_task`. A hand-built `{name, arguments}` object drops
             // the progress token and silently disables progress on the
             // default `plug connect` path.
-            let params = serde_json::to_value(&request)
+            let mut params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if !context.meta.is_empty()
+                && let Some(params) = params.as_object_mut()
+            {
+                params.insert(
+                    "_meta".to_string(),
+                    serde_json::to_value(&context.meta)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                );
+            }
             match self
                 .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| {
                     IpcRequest::McpRequest {
@@ -934,12 +955,27 @@ impl ServerHandler for IpcProxyHandler {
                     {
                         return Err(err);
                     }
-                    serde_json::from_value::<CallToolResult>(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("unexpected tool call response: {e}"),
-                            None,
-                        )
-                    })
+                    if legacy_task_requested {
+                        let task: LegacyCreateTaskResult = serde_json::from_value(payload)
+                            .map_err(|e| {
+                                McpError::internal_error(
+                                    format!("unexpected task response: {e}"),
+                                    None,
+                                )
+                            })?;
+                        Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
+                            (&task.task).into(),
+                        )))
+                    } else {
+                        serde_json::from_value::<CallToolResult>(payload)
+                            .map(Into::into)
+                            .map_err(|e| {
+                                McpError::internal_error(
+                                    format!("unexpected tool call response: {e}"),
+                                    None,
+                                )
+                            })
+                    }
                 }
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
@@ -952,7 +988,7 @@ impl ServerHandler for IpcProxyHandler {
         }
     }
 
-    fn list_tasks(
+    /*fn list_tasks(
         &self,
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
@@ -986,9 +1022,9 @@ impl ServerHandler for IpcProxyHandler {
                 )),
             }
         }
-    }
+    }*/
 
-    fn get_task_info(
+    /*fn get_task_info(
         &self,
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
@@ -1020,9 +1056,9 @@ impl ServerHandler for IpcProxyHandler {
                 )),
             }
         }
-    }
+    }*/
 
-    fn get_task_result(
+    /*fn get_task_result(
         &self,
         request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
@@ -1050,9 +1086,9 @@ impl ServerHandler for IpcProxyHandler {
                 )),
             }
         }
-    }
+    }*/
 
-    fn cancel_task(
+    /*fn cancel_task(
         &self,
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
@@ -1075,6 +1111,42 @@ impl ServerHandler for IpcProxyHandler {
                         McpError::internal_error(format!("failed to parse tasks/cancel: {e}"), None)
                     })
                 }
+                IpcResponse::Error { code, message } => {
+                    Err(McpError::internal_error(format!("{code}: {message}"), None))
+                }
+                other => Err(McpError::internal_error(
+                    format!("unexpected IPC response: {other:?}"),
+                    None,
+                )),
+            }
+        }
+    }*/
+
+    fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CustomResult, McpError>> + Send + '_ {
+        async move {
+            let method = request
+                .method
+                .strip_prefix("plug/legacy/")
+                .ok_or_else(|| {
+                    McpError::new(ErrorCode::METHOD_NOT_FOUND, request.method.clone(), None)
+                })?
+                .to_string();
+            let params = request.params.clone();
+            match self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequest {
+                        session_id: session_id.to_string(),
+                        method: method.clone(),
+                        params: params.clone(),
+                    }
+                })
+                .await?
+            {
+                IpcResponse::McpResponse { payload } => Ok(CustomResult::new(payload)),
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
                 }
@@ -1202,7 +1274,7 @@ impl ServerHandler for IpcProxyHandler {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1217,12 +1289,14 @@ impl ServerHandler for IpcProxyHandler {
                 .await?
             {
                 IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse resources/read: {e}"),
-                            None,
-                        )
-                    })
+                    serde_json::from_value::<ReadResourceResult>(payload)
+                        .map(Into::into)
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("failed to parse resources/read: {e}"),
+                                None,
+                            )
+                        })
                 }
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
@@ -1367,7 +1441,7 @@ impl ServerHandler for IpcProxyHandler {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1382,9 +1456,14 @@ impl ServerHandler for IpcProxyHandler {
                 .await?
             {
                 IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse prompts/get: {e}"), None)
-                    })
+                    serde_json::from_value::<GetPromptResult>(payload)
+                        .map(Into::into)
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("failed to parse prompts/get: {e}"),
+                                None,
+                            )
+                        })
                 }
                 IpcResponse::Error { code, message } => {
                     Err(McpError::internal_error(format!("{code}: {message}"), None))
@@ -1533,11 +1612,12 @@ mod tests {
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
     use plug_core::config::{Config, ServerConfig, TransportType};
     use plug_core::engine::Engine;
+    use plug_core::legacy_tasks::TaskMetadata;
     use rmcp::ServiceExt as _;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
-        CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskParams, GetTaskPayloadParams,
-        GetTaskPayloadRequest, GetTaskRequest, ServerResult, TaskMetadata, TaskStatus,
+        CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskParams, GetTaskRequest,
+        RequestMetaObject as Meta, ServerResult, TaskStatus,
     };
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1603,12 +1683,30 @@ mod tests {
 
     impl ClientHandler for TestClient {
         fn get_info(&self) -> ClientInfo {
-            ClientInfo::default().with_protocol_version(
+            ClientInfo::new(
+                ClientCapabilities::builder().enable_tasks().build(),
+                Implementation::default(),
+            )
+            .with_protocol_version(
                 serde_json::from_value(serde_json::Value::String(
                     LATEST_PROTOCOL_VERSION.to_string(),
                 ))
                 .expect("latest protocol version must parse"),
             )
+        }
+    }
+
+    trait LegacyTaskRequestExt {
+        fn with_task(self, task: TaskMetadata) -> Self;
+    }
+
+    impl LegacyTaskRequestExt for CallToolRequestParams {
+        fn with_task(mut self, task: TaskMetadata) -> Self {
+            self.meta.get_or_insert_with(Default::default).insert(
+                plug_core::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                serde_json::to_value(task).expect("legacy task metadata serializes"),
+            );
+            self
         }
     }
 
@@ -1929,7 +2027,7 @@ mod tests {
             .peer_info()
             .expect("server initialize info available");
         assert!(
-            server_info.capabilities.tasks.is_some(),
+            plug_core::protocol::legacy_tasks_capability(&server_info.capabilities),
             "IPC proxy should advertise tasks capability when routed tools exist"
         );
 
@@ -1962,49 +2060,66 @@ mod tests {
             other => panic!("unexpected create task response: {other:?}"),
         };
 
+        // This connection negotiated the legacy protocol. RMCP 3's SEP-2663
+        // typed task method must remain unavailable here; the outer stdio
+        // adapter maps legacy SEP-1686 `tasks/get` onto Plug's private custom
+        // method before this handler sees it.
+        let modern_error = client
+            .peer()
+            .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
+                GetTaskParams::new(task_id.clone()),
+            )))
+            .await
+            .expect_err("modern tasks/get must not be accepted on a legacy connection");
+        let rmcp::service::ServiceError::McpError(modern_error) = modern_error else {
+            panic!("expected MCP method-not-found, got {modern_error:?}");
+        };
+        assert_eq!(modern_error.code, ErrorCode::METHOD_NOT_FOUND);
+
         let final_status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let response = client
                     .peer()
-                    .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
-                        GetTaskParams::new(task_id.clone()),
+                    .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                        "plug/legacy/tasks/get",
+                        Some(serde_json::json!({"taskId": task_id})),
                     )))
                     .await
                     .expect("task info response");
-                match response {
-                    ServerResult::GetTaskResult(result) => {
-                        if result.task.status == TaskStatus::Completed {
-                            break result.task;
-                        }
-                    }
-                    other => panic!("unexpected task info response: {other:?}"),
+                let result = plug_core::legacy_tasks::parse_get_result(response)
+                    .expect("legacy task info response shape");
+                if result.task.status == plug_core::legacy_tasks::TaskStatus::Completed {
+                    break result.task;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
         .expect("task completion timeout");
-        assert_eq!(final_status.status, TaskStatus::Completed);
+        assert_eq!(
+            final_status.status,
+            plug_core::legacy_tasks::TaskStatus::Completed
+        );
 
-        let payload_response = client
+        let result = client
             .peer()
-            .send_request(ClientRequest::GetTaskPayloadRequest(
-                GetTaskPayloadRequest::new(GetTaskPayloadParams::new(task_id.clone())),
-            ))
+            .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                "plug/legacy/tasks/result",
+                Some(serde_json::json!({"taskId": task_id})),
+            )))
             .await
             .expect("task result response");
-        match payload_response {
-            ServerResult::GetTaskPayloadResult(payload) => {
-                assert!(payload.0.to_string().contains("task-mode"));
-            }
-            ServerResult::CustomResult(payload) => {
-                assert!(payload.0.to_string().contains("task-mode"));
-            }
+        let result = match result {
+            ServerResult::CustomResult(result) => result.0,
+            // The payload is itself a CallToolResult, so RMCP's response
+            // classifier may recover the typed variant for this custom legacy
+            // method. Both representations are the same legacy wire value.
             ServerResult::CallToolResult(result) => {
-                assert!(format!("{result:?}").contains("task-mode"));
+                serde_json::to_value(result).expect("task result serializes")
             }
-            other => panic!("unexpected task payload response: {other:?}"),
-        }
+            other => panic!("unexpected task result response: {other:?}"),
+        };
+        assert!(result.to_string().contains("task-mode"));
 
         engine.shutdown().await;
         daemon
@@ -2221,18 +2336,16 @@ mod tests {
             loop {
                 let response = client_b
                     .peer()
-                    .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
-                        GetTaskParams::new(task_id.clone()),
+                    .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                        "plug/legacy/tasks/get",
+                        Some(serde_json::json!({"taskId": task_id})),
                     )))
                     .await
                     .expect("replacement task info response");
-                match response {
-                    ServerResult::GetTaskResult(result) => {
-                        if result.task.status == TaskStatus::Completed {
-                            break result.task;
-                        }
-                    }
-                    other => panic!("unexpected replacement task info response: {other:?}"),
+                let result = plug_core::legacy_tasks::parse_get_result(response)
+                    .expect("legacy replacement task info response shape");
+                if result.task.status == plug_core::legacy_tasks::TaskStatus::Completed {
+                    break result.task;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -2240,27 +2353,26 @@ mod tests {
         .await
         .expect("task completion timeout after session replacement");
         assert_eq!(final_status.task_id, task_id);
-        assert_eq!(final_status.status, TaskStatus::Completed);
+        assert_eq!(
+            final_status.status,
+            plug_core::legacy_tasks::TaskStatus::Completed
+        );
 
-        let payload_response = client_b
+        let payload = client_b
             .peer()
-            .send_request(ClientRequest::GetTaskPayloadRequest(
-                GetTaskPayloadRequest::new(GetTaskPayloadParams::new(task_id.clone())),
-            ))
+            .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                "plug/legacy/tasks/result",
+                Some(serde_json::json!({"taskId": task_id})),
+            )))
             .await
-            .expect("replacement task result response");
-        match payload_response {
-            ServerResult::GetTaskPayloadResult(payload) => {
-                assert!(payload.0.to_string().contains("continuity"));
-            }
-            ServerResult::CustomResult(payload) => {
-                assert!(payload.0.to_string().contains("continuity"));
-            }
-            ServerResult::CallToolResult(result) => {
-                assert!(format!("{result:?}").contains("continuity"));
-            }
-            other => panic!("unexpected replacement task payload response: {other:?}"),
-        }
+            .expect("replacement task payload response");
+        assert!(
+            plug_core::legacy_tasks::parse_payload_result(payload)
+                .expect("legacy replacement task payload shape")
+                .0
+                .to_string()
+                .contains("continuity")
+        );
 
         engine.shutdown().await;
         daemon
@@ -2329,6 +2441,8 @@ mod tests {
         assert_eq!(server_info.protocol_version.as_str(), "2025-11-25");
         let icons = server_info
             .server_info
+            .as_ref()
+            .expect("server implementation advertised")
             .icons
             .as_ref()
             .expect("plug icons advertised");
@@ -2587,25 +2701,27 @@ mod tests {
             loop {
                 let response = client
                     .peer()
-                    .send_request(ClientRequest::GetTaskPayloadRequest(
-                        GetTaskPayloadRequest::new(GetTaskPayloadParams::new(task_id.clone())),
-                    ))
+                    .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                        "plug/legacy/tasks/get",
+                        Some(serde_json::json!({"taskId": task_id})),
+                    )))
                     .await
                     .expect("task result response");
-                match response {
-                    ServerResult::GetTaskPayloadResult(payload) => break payload,
-                    ServerResult::CustomResult(payload) => {
-                        if payload.0.get("code").is_some() && payload.0.get("message").is_some() {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        } else {
-                            break GetTaskPayloadResult::new(payload.0);
-                        }
-                    }
-                    ServerResult::CallToolResult(result) => {
-                        break GetTaskPayloadResult::new(serde_json::to_value(result).unwrap());
-                    }
-                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                let result = plug_core::legacy_tasks::parse_get_result(response)
+                    .expect("legacy task info response shape");
+                if result.task.status == plug_core::legacy_tasks::TaskStatus::Completed {
+                    let response = client
+                        .peer()
+                        .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                            "plug/legacy/tasks/result",
+                            Some(serde_json::json!({"taskId": task_id})),
+                        )))
+                        .await
+                        .expect("task payload response");
+                    break plug_core::legacy_tasks::parse_payload_result(response)
+                        .expect("legacy task payload response shape");
                 }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await

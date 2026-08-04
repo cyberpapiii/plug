@@ -2,6 +2,9 @@ use super::*;
 
 use rmcp::service::{RequestHandle, RoleClient, ServiceError};
 
+use crate::legacy_tasks::{
+    CancelTaskResult, CreateTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult,
+};
 use crate::tasks::{OwnerLivenessProbe, UpstreamRecordOutcome, owner_closed_during_create_error};
 
 /// RAII cover for the send-to-record gap in `execute_tool_task`: constructed
@@ -145,11 +148,7 @@ impl super::ToolRouter {
             .unwrap_or_else(|| Arc::from(new_trace_id()));
 
         if let Some(upstream) = self.server_manager.get_upstream(&server_id)
-            && upstream
-                .capabilities
-                .tasks
-                .as_ref()
-                .is_some_and(|tasks| tasks.supports_tools_call())
+            && crate::protocol::legacy_tasks_capability(&upstream.capabilities)
         {
             let call_timeout = Duration::from_secs(upstream.config.call_timeout_secs);
             let peer = upstream.client.peer().clone();
@@ -159,10 +158,23 @@ impl super::ToolRouter {
             if let Some(args) = arguments.clone() {
                 upstream_params = upstream_params.with_arguments(args);
             }
-            upstream_params.task = Some(TaskMetadata::new());
+            upstream_params
+                .meta
+                .get_or_insert_with(Default::default)
+                .insert(
+                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                    serde_json::json!({}),
+                );
             if let Some(token) = progress_token.clone() {
                 upstream_params.set_progress_token(token);
             }
+            let upstream_params =
+                crate::legacy_tasks::call_tool_params(upstream_params).map_err(|error| {
+                    McpError::internal_error(
+                        format!("failed to serialize legacy task-wrapped tool call: {error}"),
+                        None,
+                    )
+                })?;
 
             // The round trip is DETACHED: it runs in its own spawned task and
             // the `OwnerCreateGuard` moves into it, so a caller whose future
@@ -178,7 +190,7 @@ impl super::ToolRouter {
                 let _create_guard = create_guard;
                 let deadline = tokio::time::Instant::now() + call_timeout;
 
-                let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
+                let request = crate::legacy_tasks::request("tools/call", Some(upstream_params));
                 // DEFAULT options on purpose: setting rmcp's own
                 // `options.timeout` would hand the timeout path to
                 // `await_response`, whose auto-cancel awaits an UNBOUNDED
@@ -290,7 +302,7 @@ impl super::ToolRouter {
                     }
                 };
 
-                if let ServerResult::CreateTaskResult(result) = response {
+                if let Ok(result) = crate::legacy_tasks::parse_create_result(response) {
                     tracing::info!(
                         trace_id = %trace_id,
                         server = %server_id,
@@ -336,9 +348,7 @@ impl super::ToolRouter {
                 }
 
                 Err(McpError::internal_error(
-                    format!(
-                        "upstream task-capable server returned unexpected response for task-wrapped tool call: {response:?}"
-                    ),
+                    "upstream task-capable server returned an invalid legacy task response",
                     None,
                 ))
             });
@@ -411,18 +421,19 @@ impl super::ToolRouter {
         }) = upstream
             && let Some(server) = self.server_manager.get_upstream(&server_id)
         {
+            let params =
+                serde_json::to_value(crate::legacy_tasks::GetTaskParams::new(upstream_task_id))
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
             let response = server
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
-                    GetTaskParams::new(upstream_task_id),
-                )))
+                .send_request(crate::legacy_tasks::request("tasks/get", Some(params)))
                 .await
                 .map_err(|error| match error {
                     rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
                     other => McpError::internal_error(other.to_string(), None),
                 })?;
-            if let ServerResult::GetTaskResult(result) = response {
+            if let Ok(result) = crate::legacy_tasks::parse_get_result(response) {
                 let synced = self.task_store.lock().await.sync_from_upstream_for_owner(
                     owner,
                     task_id,
@@ -458,49 +469,30 @@ impl super::ToolRouter {
         }) = upstream
             && let Some(server) = self.server_manager.get_upstream(&server_id)
         {
+            let params = serde_json::to_value(crate::legacy_tasks::GetTaskPayloadParams::new(
+                upstream_task_id,
+            ))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
             let response = server
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskPayloadRequest(
-                    GetTaskPayloadRequest::new(GetTaskPayloadParams::new(upstream_task_id)),
-                ))
+                .send_request(crate::legacy_tasks::request("tasks/result", Some(params)))
                 .await
                 .map_err(|error| match error {
                     rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
                     other => McpError::internal_error(other.to_string(), None),
                 })?;
-            return match response {
-                ServerResult::GetTaskPayloadResult(result) => {
-                    self.task_store.lock().await.cache_result_for_owner(
-                        owner,
-                        task_id,
-                        result.0.clone(),
-                    )?;
-                    self.artifact_store
-                        .maybe_spill_task_payload(&format!("task_result:{task_id}"), result.0)
-                        .await
-                }
-                ServerResult::CallToolResult(result) => {
-                    let payload = serde_json::to_value(result).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to serialize upstream task payload: {e}"),
-                            None,
-                        )
-                    })?;
-                    self.task_store.lock().await.cache_result_for_owner(
-                        owner,
-                        task_id,
-                        payload.clone(),
-                    )?;
-                    self.artifact_store
-                        .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
-                        .await
-                }
-                _ => Err(McpError::internal_error(
-                    "unexpected upstream tasks/result response".to_string(),
-                    None,
-                )),
-            };
+            let payload = crate::legacy_tasks::parse_payload_result(response)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+                .0;
+            self.task_store
+                .lock()
+                .await
+                .cache_result_for_owner(owner, task_id, payload.clone())?;
+            return self
+                .artifact_store
+                .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
+                .await;
         }
         let payload = self
             .task_store
@@ -592,9 +584,12 @@ impl super::ToolRouter {
                     server_id,
                     task_id: upstream_task_id,
                 } => {
-                    let send = peer.send_request(ClientRequest::CancelTaskRequest(
-                        CancelTaskRequest::new(CancelTaskParams::new(upstream_task_id.clone())),
-                    ));
+                    let params = serde_json::to_value(crate::legacy_tasks::CancelTaskParams::new(
+                        upstream_task_id.clone(),
+                    ))
+                    .expect("legacy task cancel params serialize");
+                    let send = peer
+                        .send_request(crate::legacy_tasks::request("tasks/cancel", Some(params)));
                     match tokio::time::timeout(bound, send).await {
                         Err(_) => tracing::warn!(
                             server = %server_id,
@@ -662,7 +657,11 @@ impl super::ToolRouter {
         let router = Arc::clone(self);
         tokio::spawn(async move {
             match tokio::time::timeout(window, rx).await {
-                Ok(Ok(Ok(ServerResult::CreateTaskResult(result)))) => {
+                Ok(Ok(Ok(response)))
+                    if crate::legacy_tasks::parse_create_result(response.clone()).is_ok() =>
+                {
+                    let result = crate::legacy_tasks::parse_create_result(response)
+                        .expect("guard proved legacy create response");
                     tracing::warn!(
                         trace_id = %trace_id,
                         server = %server_id,
@@ -721,7 +720,7 @@ impl super::ToolRouter {
         owner: TaskOwner,
         name: &str,
         handle: tokio::task::JoinHandle<()>,
-    ) -> Task {
+    ) -> crate::legacy_tasks::Task {
         let mut store = self.task_store.lock().await;
         let task = store
             .create(owner, name)
@@ -756,23 +755,17 @@ impl super::ToolRouter {
                         let bound = Duration::from_secs(server.config.call_timeout_secs);
                         let response = tokio::time::timeout(
                             bound,
-                            server
-                                .client
-                                .peer()
-                                .send_request(ClientRequest::CancelTaskRequest(
-                                    CancelTaskRequest::new(CancelTaskParams::new(upstream_task_id)),
-                                )),
+                            server.client.peer().send_request({
+                                let params = serde_json::to_value(
+                                    crate::legacy_tasks::CancelTaskParams::new(upstream_task_id),
+                                )
+                                .expect("legacy task cancel params serialize");
+                                crate::legacy_tasks::request("tasks/cancel", Some(params))
+                            }),
                         )
                         .await;
                         match response {
-                            Ok(Ok(ServerResult::CancelTaskResult(result))) => {
-                                let synced = self
-                                    .task_store
-                                    .lock()
-                                    .await
-                                    .sync_from_upstream_for_owner(owner, task_id, &result.task)?;
-                                return Ok(CancelTaskResult::new(synced));
-                            }
+                            Ok(Ok(_)) => {}
                             Err(_) => tracing::debug!(
                                 server = %server_id,
                                 task_id = %task_id,
@@ -916,7 +909,7 @@ impl super::ToolRouter {
             let mut options = PeerRequestOptions::default();
             options.meta = upstream_progress_token
                 .clone()
-                .map(Meta::with_progress_token);
+                .map(RequestMetaObject::with_progress_token);
 
             let request_handle = match peer.send_cancellable_request(request, options).await {
                 Ok(handle) => handle,
@@ -1106,6 +1099,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::legacy_tasks::{Task, TaskStatus};
     use rmcp::model::PingRequest;
 
     fn test_router_config() -> RouterConfig {
@@ -1295,6 +1289,7 @@ mod tests {
         /// never aborts handler futures, so cooperative observation is the
         /// only way a test can see the cancel).
         enqueue_cancelled: AtomicBool,
+        enqueue_cancel_notify: tokio::sync::Notify,
         hang_cancel: bool,
         cancel_log: std::sync::Mutex<Vec<String>>,
     }
@@ -1305,6 +1300,7 @@ mod tests {
                 enqueue_gate: TestGate::new(enqueue_gate_open),
                 enqueue_entered: AtomicBool::new(false),
                 enqueue_cancelled: AtomicBool::new(false),
+                enqueue_cancel_notify: tokio::sync::Notify::new(),
                 hang_cancel,
                 cancel_log: std::sync::Mutex::new(Vec::new()),
             })
@@ -1317,77 +1313,125 @@ mod tests {
                 .iter()
                 .any(|logged| logged == upstream_task_id)
         }
-    }
 
-    struct GatedTaskUpstreamHandler {
-        state: Arc<GatedTaskUpstreamState>,
-    }
-
-    impl ServerHandler for GatedTaskUpstreamHandler {
-        fn get_info(&self) -> ServerInfo {
-            let mut capabilities = ServerCapabilities::default();
-            capabilities.tasks = Some(TasksCapability::server_default());
-            ServerInfo::new(capabilities)
-        }
-
-        fn enqueue_task(
-            &self,
-            _request: CallToolRequestParams,
-            context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
-            let state = Arc::clone(&self.state);
-            async move {
-                state.enqueue_entered.store(true, Ordering::SeqCst);
-                tokio::select! {
-                    // Request-level cancel from the proxy: no task was
-                    // created, so there is nothing to reap — return an error
-                    // (the proxy's responder is already resolved with
-                    // `Cancelled`; the response is dropped on arrival).
-                    _ = context.ct.cancelled() => {
-                        state.enqueue_cancelled.store(true, Ordering::SeqCst);
-                        return Err(McpError::internal_error(
-                            "task-wrapped call cancelled by client",
-                            None,
-                        ));
-                    }
-                    _ = state.enqueue_gate.wait() => {}
+        async fn wait_for_enqueue_cancel(&self) {
+            loop {
+                if self.enqueue_cancelled.load(Ordering::SeqCst) {
+                    return;
                 }
-                let now = rmcp::task_manager::current_timestamp();
-                Ok(CreateTaskResult::new(Task::new(
-                    "upstream-task-1".to_string(),
-                    TaskStatus::Working,
-                    now.clone(),
-                    now,
-                )))
+                let notified = self.enqueue_cancel_notify.notified();
+                if self.enqueue_cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
             }
         }
+    }
 
-        fn cancel_task(
-            &self,
-            request: CancelTaskParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
-            let state = Arc::clone(&self.state);
-            async move {
-                state
-                    .cancel_log
-                    .lock()
-                    .unwrap()
-                    .push(request.task_id.clone());
-                if state.hang_cancel {
-                    // Simulates an unresponsive upstream: the request was
-                    // received but is never answered, so the proxy side's
-                    // `send_request` would await its response forever
-                    // without the per-upstream bound.
-                    std::future::pending::<()>().await;
+    fn gated_legacy_task_capabilities() -> ServerCapabilities {
+        let mut capabilities = ServerCapabilities::default();
+        capabilities
+            .experimental
+            .get_or_insert_with(Default::default)
+            .insert(
+                crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+                serde_json::Map::new(),
+            );
+        capabilities
+    }
+
+    async fn write_gated_legacy_response(
+        write: &tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+        response: serde_json::Value,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut encoded = serde_json::to_vec(&response).expect("encode gated legacy response");
+        encoded.push(b'\n');
+        let mut write = write.lock().await;
+        write
+            .write_all(&encoded)
+            .await
+            .expect("write gated legacy response");
+        write.flush().await.expect("flush gated legacy response");
+    }
+
+    async fn serve_gated_legacy_task_upstream(
+        stream: tokio::io::DuplexStream,
+        state: Arc<GatedTaskUpstreamState>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (read, write) = tokio::io::split(stream);
+        let write = Arc::new(tokio::sync::Mutex::new(write));
+        let mut lines = BufReader::new(read).lines();
+
+        while let Some(line) = lines.next_line().await.expect("read gated legacy request") {
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("valid gated legacy JSON-RPC");
+            let method = request["method"].as_str().unwrap_or_default();
+            let Some(id) = request.get("id").cloned() else {
+                if method == "notifications/cancelled" {
+                    state.enqueue_cancelled.store(true, Ordering::SeqCst);
+                    state.enqueue_cancel_notify.notify_waiters();
                 }
-                let now = rmcp::task_manager::current_timestamp();
-                Ok(CancelTaskResult::new(Task::new(
-                    request.task_id,
-                    TaskStatus::Cancelled,
-                    now.clone(),
-                    now,
-                )))
+                continue;
+            };
+
+            match method {
+                "initialize" => {
+                    write_gated_legacy_response(
+                        write.as_ref(),
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+                            "protocolVersion":crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                            "capabilities":{"tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}}},
+                            "serverInfo":{"name":"gated-legacy-task","version":"1.0.0"}
+                        }}),
+                    )
+                    .await;
+                }
+                "tools/call" => {
+                    state.enqueue_entered.store(true, Ordering::SeqCst);
+                    let state = Arc::clone(&state);
+                    let write = Arc::clone(&write);
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = state.wait_for_enqueue_cancel() => {
+                                write_gated_legacy_response(
+                                    write.as_ref(),
+                                    serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"task-wrapped call cancelled by client"}}),
+                                ).await;
+                            }
+                            _ = state.enqueue_gate.wait() => {
+                                let now = rmcp::task_manager::current_timestamp();
+                                let task = Task::new("upstream-task-1".to_string(), TaskStatus::Working, now.clone(), now);
+                                write_gated_legacy_response(
+                                    write.as_ref(),
+                                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"task":task}}),
+                                ).await;
+                            }
+                        }
+                    });
+                }
+                "tasks/cancel" => {
+                    let task_id = request["params"]["taskId"]
+                        .as_str()
+                        .expect("legacy cancel task id")
+                        .to_string();
+                    state.cancel_log.lock().unwrap().push(task_id);
+                    if !state.hang_cancel {
+                        write_gated_legacy_response(
+                            write.as_ref(),
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+                _ => {
+                    write_gated_legacy_response(
+                        write.as_ref(),
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":method}}),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1425,11 +1469,7 @@ mod tests {
     ) -> UpstreamServer {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         tokio::spawn(async move {
-            let server = GatedTaskUpstreamHandler { state }
-                .serve(server_transport)
-                .await
-                .expect("start gated task upstream test server");
-            let _ = server.waiting().await;
+            serve_gated_legacy_task_upstream(server_transport, state).await;
         });
 
         let tools = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::<Tool>::new()));
@@ -1443,8 +1483,7 @@ mod tests {
             .await
             .expect("connect gated task upstream test client");
 
-        let mut capabilities = ServerCapabilities::default();
-        capabilities.tasks = Some(TasksCapability::server_default());
+        let capabilities = gated_legacy_task_capabilities();
 
         UpstreamServer {
             name: name.to_string(),
@@ -1963,9 +2002,10 @@ mod tests {
             "mock".to_string(),
             Arc::from("trace-reaper-test"),
         );
-        tx.send(Ok(ServerResult::CreateTaskResult(CreateTaskResult::new(
-            upstream_working_task("late-task"),
-        ))))
+        let task = upstream_working_task("late-task");
+        tx.send(Ok(ServerResult::CreateTaskResult(
+            rmcp::model::CreateTaskResult::new((&task).into()),
+        )))
         .expect("deliver the late create result to the reaper");
 
         tokio::time::timeout(Duration::from_secs(10), reaper)
@@ -2094,7 +2134,7 @@ mod tests {
             &self,
             _request: CallToolRequestParams,
             context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
             let state = Arc::clone(&self.state);
             async move {
                 state.call_entered.store(true, Ordering::SeqCst);
@@ -2104,7 +2144,7 @@ mod tests {
                         Err(McpError::internal_error("call cancelled by client", None))
                     }
                     _ = state.call_gate.wait() => {
-                        Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
+                        Ok(CallToolResult::success(vec![ContentBlock::text("done")]).into())
                     }
                 }
             }

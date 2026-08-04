@@ -1200,6 +1200,74 @@ fn mock_server_config(tools: &str) -> ServerConfig {
     }
 }
 
+#[tokio::test]
+async fn legacy_task_child_process_stdio_preserves_full_lifecycle_under_rmcp3() {
+    let mut server = mock_server_config("echo");
+    server.args = vec!["--legacy-tasks".to_string()];
+    let mut config = Config::default();
+    config.servers.insert("legacy-task".to_string(), server);
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("start raw legacy task child");
+    let router = engine.tool_router();
+    let tool_name = router
+        .list_tools()
+        .iter()
+        .find(|tool| tool.name.ends_with("__echo"))
+        .expect("legacy task child tool routed")
+        .name
+        .to_string();
+    let owner = plug_core::tasks::TaskOwner::new(Arc::<str>::from("stdio:legacy-task-e2e"));
+
+    let created = router
+        .enqueue_tool_task(
+            &tool_name,
+            Some(
+                serde_json::json!({"input":"round-trip"})
+                    .as_object()
+                    .expect("arguments object")
+                    .clone(),
+            ),
+            None,
+            owner.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("create native legacy task");
+    assert_eq!(created.task.task_id, "task_1");
+
+    let info = router
+        .get_task_info_for_owner(&owner, &created.task.task_id)
+        .await
+        .expect("get native legacy task");
+    assert_eq!(
+        info.task.status,
+        plug_core::legacy_tasks::TaskStatus::Completed
+    );
+
+    let payload = router
+        .get_task_result_for_owner(&owner, &created.task.task_id)
+        .await
+        .expect("get native legacy task result");
+    assert!(payload.0.to_string().contains("child-task round-trip"));
+
+    let second = router
+        .enqueue_tool_task(&tool_name, None, None, owner.clone(), None, None)
+        .await
+        .expect("create cancellable legacy task");
+    let cancelled = router
+        .cancel_task_for_owner(&owner, &second.task.task_id)
+        .await
+        .expect("cancel native legacy task");
+    assert_eq!(
+        cancelled.task.status,
+        plug_core::legacy_tasks::TaskStatus::Cancelled
+    );
+
+    engine.shutdown().await;
+}
+
 async fn reserve_unused_local_port() -> u16 {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -3306,10 +3374,10 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
             server_name.clone(),
         ));
         let metadata = auth_manager
-            .discover_metadata()
+            .resolve_metadata()
             .await
             .expect("discover metadata");
-        auth_manager.set_metadata(metadata);
+        auth_manager.set_metadata(metadata.metadata);
         auth_manager
             .configure_client(
                 OAuthClientConfig::new("test-client".to_string(), "http://localhost:0/callback")
@@ -3965,8 +4033,9 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
                 "initialize".to_string(),
                 "notifications/initialized".to_string(),
                 "tools/list".to_string(),
+                "tasks/list".to_string(),
             ],
-            "expected startup to exercise initialize, the initialized notification, then tools/list"
+            "expected startup to exercise initialize, the initialized notification, tools/list, then the bounded legacy-task capability probe"
         );
     })
     .catch_unwind()

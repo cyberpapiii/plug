@@ -74,6 +74,80 @@ struct Args {
     /// no delay — existing users of the mock are unaffected.
     #[arg(long, default_value = "0")]
     list_delay_ms: u64,
+
+    /// Speak the removed SEP-1686 task protocol as raw JSON-RPC. This exists
+    /// solely to prove Plug's RMCP-3 compatibility adapter against a real
+    /// child-process stdio boundary.
+    #[arg(long, default_value_t = false)]
+    legacy_tasks: bool,
+}
+
+async fn serve_legacy_tasks_stdio() -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut next_id = 0usize;
+    let mut tasks = BTreeMap::<String, (serde_json::Value, serde_json::Value)>::new();
+    while let Some(line) = lines.next_line().await? {
+        let request: serde_json::Value = serde_json::from_str(&line)?;
+        let Some(id) = request.get("id").cloned() else {
+            continue;
+        };
+        let method = request["method"].as_str().unwrap_or_default();
+        let response = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{"tools":{"listChanged":false},"tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}}},
+                    "serverInfo":{"name":"mock-legacy-task-server","version":"0.1.0"}
+                }
+            }),
+            "tools/list" => {
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}})
+            }
+            "tasks/list" => {
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tasks":tasks.values().map(|entry| entry.0.clone()).collect::<Vec<_>>()}})
+            }
+            "tools/call" if request["params"].get("task").is_some() => {
+                next_id += 1;
+                let task_id = format!("child-task-{next_id}");
+                let now = rmcp::task_manager::current_timestamp();
+                let task = serde_json::json!({"taskId":task_id,"status":"working","createdAt":now,"lastUpdatedAt":now,"ttl":60000,"pollInterval":25});
+                let input = request["params"]["arguments"]["input"]
+                    .as_str()
+                    .unwrap_or_default();
+                let payload = serde_json::json!({"content":[{"type":"text","text":format!("child-task {input}")}],"isError":false});
+                tasks.insert(task_id, (task.clone(), payload));
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"task":task}})
+            }
+            "tasks/get" => {
+                let task_id = request["params"]["taskId"].as_str().unwrap_or_default();
+                let entry = tasks.get_mut(task_id).expect("known child task");
+                entry.0["status"] = serde_json::json!("completed");
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":entry.0})
+            }
+            "tasks/result" => {
+                let task_id = request["params"]["taskId"].as_str().unwrap_or_default();
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":tasks.get(task_id).expect("known child task").1})
+            }
+            "tasks/cancel" => {
+                let task_id = request["params"]["taskId"].as_str().unwrap_or_default();
+                let entry = tasks.get_mut(task_id).expect("known child task");
+                entry.0["status"] = serde_json::json!("cancelled");
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":entry.0})
+            }
+            _ => {
+                serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":method}})
+            }
+        };
+        stdout
+            .write_all(serde_json::to_string(&response)?.as_bytes())
+            .await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+    }
+    Ok(())
 }
 
 struct MockServer {
@@ -155,7 +229,7 @@ impl ServerHandler for MockServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         async move {
             eprintln!("mock-mcp-server: call_tool {}", request.name);
 
@@ -182,7 +256,8 @@ impl ServerHandler for MockServer {
                     "tool": "structured",
                     "ok": true,
                     "count": 2
-                })));
+                }))
+                .into());
             }
 
             if request.name == "resource_link" {
@@ -192,19 +267,22 @@ impl ServerHandler for MockServer {
                         .with_description("Structured resource link test fixture")
                         .with_mime_type("text/plain")
                         .with_size(17),
-                )]));
+                )])
+                .into());
             }
 
             if request.name == "artifact_text" {
                 return Ok(CallToolResult::success(vec![ContentBlock::text(
                     "A".repeat(18 * 1024 * 1024),
-                )]));
+                )])
+                .into());
             }
 
             if request.name == "chunked_text" {
                 return Ok(CallToolResult::success(vec![ContentBlock::text(
                     "B".repeat(6 * 1024 * 1024),
-                )]));
+                )])
+                .into());
             }
 
             if request.name == "attachment_blob" {
@@ -218,9 +296,9 @@ impl ServerHandler for MockServer {
                     "encoding": "base64",
                     "content": content,
                 });
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    payload.to_string(),
-                )]));
+                return Ok(
+                    CallToolResult::success(vec![ContentBlock::text(payload.to_string())]).into(),
+                );
             }
 
             let args_str = match &request.arguments {
@@ -269,9 +347,7 @@ impl ServerHandler for MockServer {
                 _ => {}
             }
 
-            Ok(CallToolResult::success(vec![ContentBlock::text(
-                response_text,
-            )]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(response_text)]).into())
         }
     }
 
@@ -324,7 +400,7 @@ impl ServerHandler for MockServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
             if !self.resources || request.uri != "file:///tmp/mock-resource.txt" {
                 return Err(McpError::resource_not_found(
@@ -335,7 +411,8 @@ impl ServerHandler for MockServer {
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 "mock resource contents",
                 request.uri,
-            )]))
+            )])
+            .into())
         }
     }
 
@@ -417,7 +494,7 @@ impl ServerHandler for MockServer {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
         async move {
             if !self.prompts || request.name != "mock_prompt" {
                 return Err(McpError::invalid_params(
@@ -429,7 +506,8 @@ impl ServerHandler for MockServer {
                 Role::User,
                 ContentBlock::text("mock prompt body"),
             )])
-            .with_description("Mock prompt fixture"))
+            .with_description("Mock prompt fixture")
+            .into())
         }
     }
 
@@ -458,6 +536,10 @@ impl ServerHandler for MockServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.legacy_tasks {
+        return serve_legacy_tasks_stdio().await;
+    }
 
     // Set up tracing to stderr
     tracing_subscriber::fmt()

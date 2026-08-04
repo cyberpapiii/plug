@@ -652,6 +652,74 @@ pub(crate) async fn establish_daemon_proxy_session(
     })
 }
 
+/// Byte-level legacy adapter required because RMCP 3.x intentionally no longer
+/// models SEP-1686 task fields. It rewrites before typed deserialization and
+/// restores the exact legacy response vocabulary on stdout.
+fn legacy_stdio_transport() -> tokio::io::DuplexStream {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let (service, bridge) = tokio::io::duplex(256 * 1024);
+    let (bridge_read, mut bridge_write) = tokio::io::split(bridge);
+    let task_requests = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
+        String,
+    >::new()));
+
+    let inbound_tasks = std::sync::Arc::clone(&task_requests);
+    tokio::spawn(async move {
+        let mut input = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = input.next_line().await {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                let _ = bridge_write.write_all(line.as_bytes()).await;
+                let _ = bridge_write.write_all(b"\n").await;
+                continue;
+            };
+            let task_request = value.get("method").and_then(serde_json::Value::as_str)
+                == Some("tools/call")
+                && value
+                    .get("params")
+                    .and_then(|params| params.get("task"))
+                    .is_some();
+            if task_request && let Some(id) = value.get("id") {
+                inbound_tasks.lock().await.insert(id.to_string());
+            }
+            plug_core::protocol::rewrite_legacy_request(&mut value);
+            if let Ok(mut encoded) = serde_json::to_vec(&value) {
+                encoded.push(b'\n');
+                if bridge_write.write_all(&encoded).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut output = tokio::io::stdout();
+        let mut lines = BufReader::new(bridge_read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                let _ = output.write_all(line.as_bytes()).await;
+                let _ = output.write_all(b"\n").await;
+                continue;
+            };
+            let task_response = if let Some(id) = value.get("id") {
+                task_requests.lock().await.remove(&id.to_string())
+            } else {
+                false
+            };
+            plug_core::protocol::rewrite_legacy_response(&mut value, task_response);
+            if let Ok(mut encoded) = serde_json::to_vec(&value) {
+                encoded.push(b'\n');
+                if output.write_all(&encoded).await.is_err() {
+                    break;
+                }
+                let _ = output.flush().await;
+            }
+        }
+    });
+
+    service
+}
+
 pub(crate) async fn connect_via_daemon(
     config_path: Option<&std::path::PathBuf>,
 ) -> anyhow::Result<()> {
@@ -659,7 +727,7 @@ pub(crate) async fn connect_via_daemon(
     let session = establish_daemon_proxy_session(config_path, client_id, None).await?;
     let proxy = crate::ipc_proxy::IpcProxyHandler::new(session, config_path.cloned());
     use rmcp::ServiceExt as _;
-    let transport = rmcp::transport::io::stdio();
+    let transport = legacy_stdio_transport();
     let service = proxy
         .serve(transport)
         .await
@@ -676,7 +744,7 @@ pub(crate) async fn connect_standalone(
     engine.start().await?;
     let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
     use rmcp::ServiceExt as _;
-    let transport = rmcp::transport::io::stdio();
+    let transport = legacy_stdio_transport();
     let service = proxy
         .serve(transport)
         .await

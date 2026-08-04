@@ -6,13 +6,14 @@ use dashmap::DashMap;
 use directories::ProjectDirs;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolResult, ContentBlock, GetTaskPayloadResult, Meta, ReadResourceResult, Resource,
+    CallToolResult, ContentBlock, MetaObject as Meta, ReadResourceResult, Resource,
     ResourceContents,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProtocolError;
+use crate::legacy_tasks::GetTaskPayloadResult;
 
 pub const INLINE_RESULT_MAX_BYTES: usize = 512 * 1024;
 pub const ARTIFACT_RESULT_MIN_BYTES: usize = 16 * 1024 * 1024;

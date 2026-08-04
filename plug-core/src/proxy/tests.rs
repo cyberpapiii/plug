@@ -1042,11 +1042,7 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
     }));
 
     let caps = router.synthesized_capabilities();
-    assert!(caps.tasks.is_some());
-    let tasks = caps.tasks.unwrap();
-    assert!(tasks.supports_list());
-    assert!(tasks.supports_cancel());
-    assert!(tasks.supports_tools_call());
+    assert!(crate::protocol::legacy_tasks_capability(&caps));
 }
 
 #[test]
@@ -1056,7 +1052,7 @@ fn synthesized_capabilities_suppress_tasks_for_bridge_clients() {
     let caps = router.synthesized_capabilities_for_client(ClientType::OpenCode);
 
     assert!(caps.tools.is_some());
-    assert!(caps.tasks.is_none());
+    assert!(!crate::protocol::legacy_tasks_capability(&caps));
 }
 
 #[test]
@@ -2057,7 +2053,10 @@ async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
         supports_tasks: true,
     };
     let mut params = CallToolRequestParams::new("Mock__tool");
-    params.task = Some(TaskMetadata::new());
+    params.meta.get_or_insert_with(Default::default).insert(
+        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+        serde_json::json!({}),
+    );
 
     let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
         .await
@@ -2078,7 +2077,10 @@ async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
         supports_tasks: false,
     };
     let mut params = CallToolRequestParams::new("Mock__tool");
-    params.task = Some(TaskMetadata::new());
+    params.meta.get_or_insert_with(Default::default).insert(
+        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+        serde_json::json!({}),
+    );
 
     // expect_err is itself the branch-distinction proof: the task path returns
     // Ok(TaskCreated) (see the sibling test), so an Err means the sync path ran.

@@ -609,7 +609,12 @@ async fn post_mcp(
     }
 
     // 2. Parse JSON-RPC message
-    let message: ClientJsonRpcMessage = serde_json::from_slice(&body).map_err(|e| {
+    let mut raw_message: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(error = %e, "invalid JSON-RPC message from client");
+        HttpError::BadRequest("invalid JSON-RPC message".into())
+    })?;
+    crate::protocol::rewrite_legacy_request(&mut raw_message);
+    let message: ClientJsonRpcMessage = serde_json::from_value(raw_message).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
         HttpError::BadRequest("invalid JSON-RPC message".into())
     })?;
@@ -1413,6 +1418,8 @@ async fn handle_request(
                 detected = %client_type,
                 session = %session_id,
                 trace_id = %trace_id,
+                requested_protocol = %init_req.params.protocol_version,
+                selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "HTTP client connected"
             );
             // Store client type in session
@@ -1480,10 +1487,24 @@ async fn handle_request(
                 trace_id: Arc::clone(&trace_id),
                 sessions: Arc::clone(&state.sessions),
             };
+            // RMCP 3.x treats the request envelope's `extensions` as the
+            // canonical runtime home for wire-level `params._meta`: its
+            // deserializer deliberately removes `_meta` from the typed params
+            // and stores a `RequestMetaObject` in `extensions`. The shared
+            // dispatcher accepts params alone, so materialize that metadata
+            // back onto the params at this adapter boundary. Otherwise both
+            // progress tokens and Plug's rewritten legacy `params.task`
+            // marker disappear before dispatch, turning task-wrapped calls
+            // into synchronous calls.
+            let mut params = call_req.params;
+            if let Some(extension_meta) = call_req.extensions.get::<RequestMetaObject>() {
+                match params.meta.as_mut() {
+                    Some(params_meta) => params_meta.extend(extension_meta.clone()),
+                    None => params.meta = Some(extension_meta.clone()),
+                }
+            }
             let response_msg =
-                match crate::dispatch::dispatch_tools_call(&state.router, &ctx, call_req.params)
-                    .await
-                {
+                match crate::dispatch::dispatch_tools_call(&state.router, &ctx, params).await {
                     Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
                         ServerJsonRpcMessage::response(
                             ServerResult::CallToolResult(result),
@@ -1492,7 +1513,10 @@ async fn handle_request(
                     }
                     Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
                         ServerJsonRpcMessage::response(
-                            ServerResult::CreateTaskResult(result),
+                            ServerResult::CustomResult(CustomResult::new(
+                                serde_json::to_value(result)
+                                    .expect("legacy task result serializes"),
+                            )),
                             request_id,
                         )
                     }
@@ -1501,95 +1525,56 @@ async fn handle_request(
             json_response(&response_msg)
         }
 
-        ClientRequest::ListTasksRequest(list_req) => {
+        ClientRequest::CustomRequest(custom) if custom.method.starts_with("plug/legacy/tasks/") => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
-                .router
-                .list_tasks_for_owner(&owner, list_req.params)
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::ListTasksResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
+            let result = match custom.method.as_str() {
+                "plug/legacy/tasks/list" => {
+                    let params = custom
+                        .params_as::<PaginatedRequestParams>()
+                        .map_err(|_| HttpError::BadRequest("invalid task params".into()))?;
+                    state
+                        .router
+                        .list_tasks_for_owner(&owner, params)
+                        .await
+                        .and_then(|v| {
+                            serde_json::to_value(v)
+                                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                        })
                 }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
-        }
-
-        ClientRequest::GetTaskRequest(task_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
-                .router
-                .get_task_info_for_owner(&owner, &task_req.params.task_id)
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::GetTaskResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
-        }
-
-        ClientRequest::GetTaskPayloadRequest(task_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
-                .router
-                .get_task_result_for_owner(&owner, &task_req.params.task_id)
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::GetTaskPayloadResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
-        }
-
-        ClientRequest::CancelTaskRequest(task_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
-                .router
-                .cancel_task_for_owner(&owner, &task_req.params.task_id)
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::CancelTaskResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
+                "plug/legacy/tasks/get" => match legacy_task_params(&custom) {
+                    Ok(params) => state
+                        .router
+                        .get_task_info_for_owner(&owner, &params.task_id)
+                        .await
+                        .and_then(json_task_value),
+                    Err(e) => Err(e),
+                },
+                "plug/legacy/tasks/result" => match legacy_task_params(&custom) {
+                    Ok(params) => state
+                        .router
+                        .get_task_result_for_owner(&owner, &params.task_id)
+                        .await
+                        .and_then(json_task_value),
+                    Err(e) => Err(e),
+                },
+                "plug/legacy/tasks/cancel" => match legacy_task_params(&custom) {
+                    Ok(params) => state
+                        .router
+                        .cancel_task_for_owner(&owner, &params.task_id)
+                        .await
+                        .and_then(json_task_value),
+                    Err(e) => Err(e),
+                },
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(value) => Ok(axum::Json(
+                    serde_json::json!({"jsonrpc":"2.0","id":request_id,"result":value}),
+                )
+                .into_response()),
+                Err(error) => json_response(&ServerJsonRpcMessage::error(error, Some(request_id))),
             }
         }
 
@@ -1759,6 +1744,19 @@ async fn handle_request(
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn legacy_task_params(
+    request: &CustomRequest,
+) -> Result<crate::legacy_tasks::TaskIdParams, ErrorData> {
+    request
+        .params_as::<crate::legacy_tasks::TaskIdParams>()
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?
+        .ok_or_else(|| ErrorData::invalid_params("missing task params", None))
+}
+
+fn json_task_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, ErrorData> {
+    serde_json::to_value(value).map_err(|error| ErrorData::internal_error(error.to_string(), None))
+}
+
 /// Build the InitializeResult (same as ProxyHandler::get_info).
 fn build_initialize_result(
     router: &ToolRouter,
@@ -1768,7 +1766,7 @@ fn build_initialize_result(
         .with_server_info(crate::branding::plug_implementation(env!(
             "CARGO_PKG_VERSION"
         )))
-        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        .with_protocol_version(crate::protocol::supported_protocol_version())
 }
 
 /// Extract the host from an Origin header value.
@@ -1814,7 +1812,10 @@ fn validate_session_header(
 
 /// Build a JSON response from a ServerJsonRpcMessage.
 fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
-    let body = serde_json::to_vec(msg)
+    let mut value = serde_json::to_value(msg)
+        .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
+    crate::protocol::rewrite_legacy_response(&mut value, false);
+    let body = serde_json::to_vec(&value)
         .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
 
     let mut response = (StatusCode::OK, body).into_response();

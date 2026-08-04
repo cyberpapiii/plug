@@ -21,7 +21,7 @@ use rmcp::model::{
     Implementation, InitializedNotification, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
-    SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
+    SetLevelRequestParams, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
@@ -36,7 +36,7 @@ use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
-const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -57,6 +57,36 @@ fn upstream_metadata_from_implementation(
         website_url: implementation.website_url.clone(),
         icons,
     })
+}
+
+/// RMCP 3.x intentionally dropped SEP-1686's top-level `capabilities.tasks`,
+/// so serde cannot retain that bit from a legacy initialize response. Probe
+/// the legacy read-only `tasks/list` method through RMCP's raw custom-request
+/// escape hatch and restore the capability into Plug's private extension
+/// namespace when the server proves it implements the old task surface.
+async fn restore_legacy_task_capability(
+    peer: &rmcp::service::Peer<rmcp::RoleClient>,
+    capabilities: &mut ServerCapabilities,
+    timeout: Duration,
+) {
+    if crate::protocol::legacy_tasks_capability(capabilities) {
+        return;
+    }
+    let request = crate::legacy_tasks::request("tasks/list", Some(serde_json::json!({})));
+    let Ok(Ok(response)) = tokio::time::timeout(timeout, peer.send_request(request)).await else {
+        return;
+    };
+    if crate::legacy_tasks::parse_list_result(response).is_err() {
+        return;
+    }
+
+    capabilities
+        .experimental
+        .get_or_insert_with(Default::default)
+        .insert(
+            crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+            serde_json::Map::new(),
+        );
 }
 
 #[derive(Clone)]
@@ -259,7 +289,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
@@ -310,7 +340,6 @@ impl ClientHandler for UpstreamClientHandler {
         let mut roots = RootsCapabilities::default();
         roots.list_changed = Some(true);
         info.capabilities.roots = Some(roots);
-        info.capabilities.tasks = Some(TasksCapability::client_default());
         info.capabilities.sampling = Some(SamplingCapability::default());
         info.capabilities.elicitation = Some(
             ElicitationCapability::new()
@@ -1059,23 +1088,34 @@ impl ServerManager {
                     tools.store(Arc::new(tools_result));
 
                     let server_info = client.peer().peer_info();
-                    let upstream = server_info
-                        .as_ref()
-                        .and_then(|info| upstream_metadata_from_implementation(&info.server_info));
+                    let upstream = server_info.as_ref().and_then(|info| {
+                        info.server_info
+                            .as_ref()
+                            .and_then(upstream_metadata_from_implementation)
+                    });
                     if let Some(info) = server_info {
+                        let implementation = info.server_info.as_ref();
                         tracing::info!(
                             server = %name,
-                            server_name = %info.server_info.name,
-                            server_version = %info.server_info.version,
+                            server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
+                            server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
+                            requested_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                            selected_protocol = %info.protocol_version,
                             "connected to server"
                         );
                     }
 
-                    let capabilities = client
+                    let mut capabilities = client
                         .peer()
                         .peer_info()
                         .map(|info| info.capabilities.clone())
                         .unwrap_or_default();
+                    restore_legacy_task_capability(
+                        client.peer(),
+                        &mut capabilities,
+                        Duration::from_secs(config.call_timeout_secs),
+                    )
+                    .await;
 
                     Ok(UpstreamServer {
                         name: name.to_string(),
@@ -1276,23 +1316,34 @@ impl ServerManager {
         tools.store(Arc::new(tools_result));
 
         let server_info = client.peer().peer_info();
-        let upstream = server_info
-            .as_ref()
-            .and_then(|info| upstream_metadata_from_implementation(&info.server_info));
+        let upstream = server_info.as_ref().and_then(|info| {
+            info.server_info
+                .as_ref()
+                .and_then(upstream_metadata_from_implementation)
+        });
         if let Some(info) = server_info {
+            let implementation = info.server_info.as_ref();
             tracing::info!(
                 server = %name,
-                server_name = %info.server_info.name,
-                server_version = %info.server_info.version,
+                server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
+                server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
+                requested_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                selected_protocol = %info.protocol_version,
                 "connected to {transport_label}"
             );
         }
 
-        let capabilities = client
+        let mut capabilities = client
             .peer()
             .peer_info()
             .map(|info| info.capabilities.clone())
             .unwrap_or_default();
+        restore_legacy_task_capability(
+            client.peer(),
+            &mut capabilities,
+            Duration::from_secs(config.call_timeout_secs),
+        )
+        .await;
 
         Ok(UpstreamServer {
             name: name.to_string(),
@@ -1991,14 +2042,13 @@ mod tests {
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
-        CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
-        ClientJsonRpcMessage, ClientRequest, ContentBlock, CreateTaskResult, GetPromptResult,
-        GetTaskParams, GetTaskPayloadResult, GetTaskRequest, GetTaskResult, Icon, Implementation,
-        InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        ListTasksResult, ListToolsResult, Meta, NumberOrString, ProgressNotificationParam,
-        ProgressToken, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContents,
-        ResourceTemplate, Role, ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult,
-        Task, TaskStatus, TasksCapability, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
+        ClientJsonRpcMessage, ClientRequest, ContentBlock, GetPromptResponse, GetPromptResult,
+        Icon, Implementation, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, NumberOrString, ProgressNotificationParam,
+        ProgressToken, Prompt, PromptMessage, ReadResourceResponse, ReadResourceResult,
+        RequestMetaObject as Meta, Resource, ResourceContents, ResourceTemplate, Role,
+        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -2166,7 +2216,10 @@ mod tests {
                 "id": message["id"],
                 "result": {
                     "protocolVersion": "2025-11-25",
-                    "capabilities": { "tools": { "listChanged": false } },
+                    "capabilities": {
+                        "tools": { "listChanged": false },
+                        "tasks": { "list": {}, "cancel": {}, "requests": { "tools": { "call": {} } } }
+                    },
                     "serverInfo": { "name": "auth-test", "version": "1.0.0" }
                 }
             }))
@@ -2175,6 +2228,12 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": message["id"],
                 "result": { "tools": [] }
+            }))
+            .into_response(),
+            Some("tasks/list") => Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": { "tasks": [] }
             }))
             .into_response(),
             Some("notifications/initialized") => StatusCode::ACCEPTED.into_response(),
@@ -2217,7 +2276,11 @@ mod tests {
             headers.first().map(String::as_str),
             Some("Bearer static-token")
         );
-        result.expect("streamable HTTP upstream should accept static bearer token");
+        let upstream = result.expect("streamable HTTP upstream should accept static bearer token");
+        assert!(
+            crate::protocol::legacy_tasks_capability(&upstream.capabilities),
+            "raw legacy tasks/list must restore the capability RMCP 3 drops from initialize"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2325,7 +2388,7 @@ mod tests {
 
     impl ServerHandler for MutableToolServerHandler {
         fn get_info(&self) -> ServerInfo {
-            let mut capabilities = ServerCapabilities::default();
+            let mut capabilities = ServerCapabilities::builder().enable_tasks().build();
             let mut tools = rmcp::model::ToolsCapability::default();
             tools.list_changed = Some(true);
             capabilities.tools = Some(tools);
@@ -2349,11 +2412,12 @@ mod tests {
             &self,
             request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
             let content = format!("called {}", request.name);
             std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
                 content,
-            )])))
+            )])
+            .into()))
         }
     }
 
@@ -2408,14 +2472,12 @@ mod tests {
             &self,
             request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
             let cancel_signal = Arc::clone(&self.cancel_signal);
             async move {
                 let _ = request.progress_token();
                 cancel_signal.notified().await;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "cancelled upstream",
-                )]))
+                Ok(CallToolResult::success(vec![ContentBlock::text("cancelled upstream")]).into())
             }
         }
 
@@ -2435,148 +2497,110 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TaskNativeUpstreamHandler {
-        next_id: AtomicUsize,
-        tasks: Mutex<HashMap<String, (Task, serde_json::Value)>>,
-        task_result_requests: Arc<AtomicUsize>,
-    }
+    async fn serve_raw_legacy_task_upstream(
+        stream: tokio::io::DuplexStream,
+        result_requests: Arc<AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    impl ServerHandler for TaskNativeUpstreamHandler {
-        fn get_info(&self) -> ServerInfo {
-            let mut capabilities = ServerCapabilities::default();
-            let mut tools = rmcp::model::ToolsCapability::default();
-            tools.list_changed = Some(false);
-            capabilities.tools = Some(tools);
-            capabilities.tasks = Some(TasksCapability::server_default());
-            ServerInfo::new(capabilities)
-        }
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut next_id = 0usize;
+        let mut tasks = HashMap::<String, (crate::legacy_tasks::Task, serde_json::Value)>::new();
 
-        fn list_tools(
-            &self,
-            _request: Option<rmcp::model::PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
-            std::future::ready(Ok(ListToolsResult::with_all_items(vec![make_tool("echo")])))
-        }
-
-        fn call_tool(
-            &self,
-            _request: CallToolRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
-            std::future::ready(Err(McpError::internal_error(
-                "wrapper mode should not reach upstream call_tool".to_string(),
-                None,
-            )))
-        }
-
-        fn enqueue_task(
-            &self,
-            request: CallToolRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
-            let input = request
-                .arguments
-                .as_ref()
-                .and_then(|args| args.get("input"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let id = format!(
-                "upstream-task-{}",
-                self.next_id.fetch_add(1, Ordering::SeqCst) + 1
-            );
-            let now = rmcp::task_manager::current_timestamp();
-            let task = Task::new(id.clone(), TaskStatus::Working, now.clone(), now)
-                .with_status_message("Working")
-                .with_ttl(60_000)
-                .with_poll_interval(25);
-            let payload = serde_json::json!({
-                "content": [{ "type": "text", "text": format!("task-native {input}") }],
-                "isError": false
-            });
-            self.tasks
-                .lock()
-                .unwrap()
-                .insert(id, (task.clone(), payload));
-            std::future::ready(Ok(CreateTaskResult::new(task)))
-        }
-
-        fn list_tasks(
-            &self,
-            _request: Option<rmcp::model::PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
-            let tasks = self
-                .tasks
-                .lock()
-                .unwrap()
-                .values()
-                .map(|(task, _)| task.clone())
-                .collect::<Vec<_>>();
-            std::future::ready(Ok(ListTasksResult::new(tasks)))
-        }
-
-        fn get_task_info(
-            &self,
-            request: GetTaskParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
-            let mut tasks = self.tasks.lock().unwrap();
-            let task = tasks
-                .get_mut(&request.task_id)
-                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None))
-                .map(|entry| {
-                    if entry.0.status == TaskStatus::Working {
-                        entry.0.status = TaskStatus::Completed;
+        while let Some(line) = lines.next_line().await.expect("read legacy task request") {
+            let request: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+            let Some(id) = request.get("id").cloned() else {
+                continue;
+            };
+            let method = request["method"].as_str().expect("request method");
+            let response = match method {
+                "initialize" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result": {
+                        "protocolVersion": crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                        "capabilities": {
+                            "tools":{"listChanged":false},
+                            "tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}}
+                        },
+                        "serverInfo":{"name":"raw-legacy-task-upstream","version":"1.0.0"}
+                    }
+                }),
+                "tools/list" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}
+                }),
+                "tasks/list" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":{"tasks":tasks.values().map(|entry| entry.0.clone()).collect::<Vec<_>>()}
+                }),
+                "tools/call" => {
+                    assert!(
+                        request["params"].get("task").is_some(),
+                        "legacy task marker must be params.task"
+                    );
+                    assert!(
+                        request["params"]
+                            .get("_meta")
+                            .and_then(|meta| meta.get(crate::protocol::LEGACY_TASK_REQUEST_KEY))
+                            .is_none(),
+                        "private marker must not cross upstream wire"
+                    );
+                    next_id += 1;
+                    let task_id = format!("upstream-task-{next_id}");
+                    let now = rmcp::task_manager::current_timestamp();
+                    let task = crate::legacy_tasks::Task::new(
+                        task_id.clone(),
+                        crate::legacy_tasks::TaskStatus::Working,
+                        now.clone(),
+                        now,
+                    )
+                    .with_status_message("Working")
+                    .with_ttl(60_000)
+                    .with_poll_interval(25);
+                    let input = request["params"]["arguments"]["input"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let payload = serde_json::json!({
+                        "content":[{"type":"text","text":format!("task-native {input}")}],
+                        "isError":false
+                    });
+                    tasks.insert(task_id, (task.clone(), payload));
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"task":task}})
+                }
+                "tasks/get" => {
+                    let task_id = request["params"]["taskId"].as_str().expect("task id");
+                    let entry = tasks.get_mut(task_id).expect("known task");
+                    if entry.0.status == crate::legacy_tasks::TaskStatus::Working {
+                        entry.0.status = crate::legacy_tasks::TaskStatus::Completed;
                         entry.0.status_message = Some("Completed".to_string());
                         entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
                     }
-                    entry.0.clone()
-                });
-            std::future::ready(task.map(GetTaskResult::new))
-        }
-
-        fn get_task_result(
-            &self,
-            request: rmcp::model::GetTaskPayloadParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
-            let call_count = self.task_result_requests.fetch_add(1, Ordering::SeqCst);
-            if call_count > 0 {
-                return std::future::ready(Err(McpError::internal_error(
-                    "upstream task result should have been cached locally after first fetch"
-                        .to_string(),
-                    None,
-                )));
-            }
-            let result = self
-                .tasks
-                .lock()
-                .unwrap()
-                .get(&request.task_id)
-                .map(|(_, payload)| GetTaskPayloadResult::new(payload.clone()))
-                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None));
-            std::future::ready(result)
-        }
-
-        fn cancel_task(
-            &self,
-            request: CancelTaskParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
-            let mut tasks = self.tasks.lock().unwrap();
-            let task = tasks
-                .get_mut(&request.task_id)
-                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None))
-                .map(|entry| {
-                    entry.0.status = TaskStatus::Cancelled;
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":entry.0})
+                }
+                "tasks/result" => {
+                    result_requests.fetch_add(1, Ordering::SeqCst);
+                    let task_id = request["params"]["taskId"].as_str().expect("task id");
+                    let payload = &tasks.get(task_id).expect("known task").1;
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":payload})
+                }
+                "tasks/cancel" => {
+                    let task_id = request["params"]["taskId"].as_str().expect("task id");
+                    let entry = tasks.get_mut(task_id).expect("known task");
+                    entry.0.status = crate::legacy_tasks::TaskStatus::Cancelled;
                     entry.0.status_message = Some("Cancelled".to_string());
                     entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
-                    entry.0.clone()
-                });
-            std::future::ready(task.map(CancelTaskResult::new))
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":entry.0})
+                }
+                other => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "error":{"code":-32601,"message":other}
+                }),
+            };
+            let mut encoded = serde_json::to_vec(&response).expect("encode response");
+            encoded.push(b'\n');
+            write.write_all(&encoded).await.expect("write response");
+            write.flush().await.expect("flush response");
         }
     }
 
@@ -2628,15 +2652,7 @@ mod tests {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let result_request_count_for_server = Arc::clone(&result_request_count);
         tokio::spawn(async move {
-            let server = TaskNativeUpstreamHandler {
-                next_id: AtomicUsize::new(0),
-                tasks: Mutex::new(HashMap::new()),
-                task_result_requests: result_request_count_for_server,
-            }
-            .serve(server_transport)
-            .await
-            .expect("start task-native upstream test server");
-            let _ = server.waiting().await;
+            serve_raw_legacy_task_upstream(server_transport, result_request_count_for_server).await;
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
@@ -2652,11 +2668,14 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        let mut capabilities = ServerCapabilities::default();
-        let mut tools_capability = rmcp::model::ToolsCapability::default();
-        tools_capability.list_changed = Some(false);
-        capabilities.tools = Some(tools_capability);
-        capabilities.tasks = Some(TasksCapability::server_default());
+        let mut capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+        restore_legacy_task_capability(client.peer(), &mut capabilities, Duration::from_secs(1))
+            .await;
+        assert!(crate::protocol::legacy_tasks_capability(&capabilities));
 
         (
             UpstreamServer {
@@ -2739,11 +2758,13 @@ mod tests {
             &self,
             request: rmcp::model::ReadResourceRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_
+        {
             std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 "hello",
                 request.uri,
-            )])))
+            )])
+            .into()))
         }
 
         fn list_prompts(
@@ -2762,11 +2783,12 @@ mod tests {
             &self,
             request: rmcp::model::GetPromptRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetPromptResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<GetPromptResponse, rmcp::ErrorData>> + Send + '_ {
             std::future::ready(Ok(GetPromptResult::new(vec![PromptMessage::new(
                 Role::User,
                 ContentBlock::text(format!("prompt: {}", request.name)),
-            )])))
+            )])
+            .into()))
         }
     }
 
@@ -3514,7 +3536,7 @@ mod tests {
         .expect("create passthrough task timed out")
         .expect("create passthrough task");
         assert_eq!(create.task.task_id, "task_1");
-        assert_eq!(create.task.status, TaskStatus::Working);
+        assert_eq!(create.task.status, crate::legacy_tasks::TaskStatus::Working);
 
         let info = tokio::time::timeout(
             Duration::from_secs(5),
@@ -3524,7 +3546,7 @@ mod tests {
         .expect("fetch passthrough task info timed out")
         .expect("fetch passthrough task info");
         assert_eq!(info.task.task_id, "task_1");
-        assert_eq!(info.task.status, TaskStatus::Completed);
+        assert_eq!(info.task.status, crate::legacy_tasks::TaskStatus::Completed);
 
         let payload = tokio::time::timeout(
             Duration::from_secs(5),
@@ -3582,7 +3604,10 @@ mod tests {
         .expect("cancel passthrough task timed out")
         .expect("cancel passthrough task");
         assert_eq!(cancelled.task.task_id, second.task.task_id);
-        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled.task.status,
+            crate::legacy_tasks::TaskStatus::Cancelled
+        );
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -3650,7 +3675,7 @@ mod tests {
         .await
         .expect("create passthrough task timed out")
         .expect("create passthrough task");
-        assert_eq!(create.task.status, TaskStatus::Working);
+        assert_eq!(create.task.status, crate::legacy_tasks::TaskStatus::Working);
         assert_eq!(router.task_count_for_owner(&owner).await, 1);
 
         router.cleanup_tasks_for_owner(&owner).await;
@@ -3671,20 +3696,25 @@ mod tests {
             upstream_handle
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
-                    GetTaskParams::new("upstream-task-1"),
-                ))),
+                .send_request(crate::legacy_tasks::request(
+                    "tasks/get",
+                    Some(
+                        serde_json::to_value(crate::legacy_tasks::GetTaskParams::new(
+                            "upstream-task-1",
+                        ))
+                        .expect("serialize legacy task params"),
+                    ),
+                )),
         )
         .await
         .expect("query upstream task info timed out")
         .expect("query upstream task info");
 
-        let ServerResult::GetTaskResult(result) = info else {
-            panic!("unexpected upstream response to tasks/get: {info:?}");
-        };
+        let result =
+            crate::legacy_tasks::parse_get_result(info).expect("parse legacy tasks/get response");
         assert_eq!(
             result.task.status,
-            TaskStatus::Cancelled,
+            crate::legacy_tasks::TaskStatus::Cancelled,
             "owner teardown must forward CancelTaskRequest to the task-native upstream"
         );
     }
@@ -4201,6 +4231,17 @@ mod tests {
                         serde_json::to_string(&response).expect("serialize tool call response"),
                     ));
                 }
+                ClientRequest::CustomRequest(custom) if custom.method == "tasks/list" => {
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::CustomResult(rmcp::model::CustomResult::new(
+                            serde_json::json!({"tasks": []}),
+                        )),
+                        request.id,
+                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize tasks/list response"),
+                    ));
+                }
                 _ => {}
             },
             ClientJsonRpcMessage::Notification(_) => {}
@@ -4249,6 +4290,12 @@ mod tests {
             .start_and_register("legacy-sse", &config)
             .await
             .expect("start legacy SSE upstream");
+        assert!(crate::protocol::legacy_tasks_capability(
+            &server_manager
+                .get_upstream("legacy-sse")
+                .expect("legacy SSE upstream registered")
+                .capabilities
+        ));
         router.refresh_tools().await;
 
         let tool_name = router
