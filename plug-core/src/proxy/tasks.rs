@@ -86,6 +86,34 @@ impl super::ToolRouter {
         owner_liveness: Option<OwnerLivenessProbe>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CreateTaskResult, McpError> {
+        // Task augmentation is a second method family layered on tools/call.
+        // Authorize and reserve both queue + durable-record capacity before
+        // touching the lifecycle ledger, task store, or any upstream.
+        let (_queued_task_lease, task_quota_lease) = if let Some(context) = downstream.as_ref() {
+            context.authorize(crate::protocol::MethodFamily::Tasks)?;
+            let principal = context.principal.as_ref().ok_or_else(|| {
+                crate::protocol::ProtocolOutcome::AuthorizationRequired
+                    .into_error(context.protocol_era)
+            })?;
+            let queued = self
+                .admission_quotas
+                .try_acquire(
+                    principal,
+                    crate::protocol::QuotaResource::QueuedTaskCreations,
+                    1,
+                )
+                .map_err(|outcome| outcome.into_error(context.protocol_era))?;
+            let task = self
+                .admission_quotas
+                .try_acquire(principal, crate::protocol::QuotaResource::Tasks, 1)
+                .map_err(|outcome| outcome.into_error(context.protocol_era))?;
+            (Some(queued), Some(task))
+        } else {
+            // Internal/local legacy callers without a durable downstream
+            // context retain their established behavior.
+            (None, None)
+        };
+
         // Owner-lifecycle guard, registered before anything else: a teardown
         // (`cleanup_tasks_for_owner`) that runs while this enqueue is in
         // flight — most importantly across the native path's upstream round
@@ -187,6 +215,7 @@ impl super::ToolRouter {
             let router = Arc::clone(self);
             let tool_name = tool_name.to_string();
             let round_trip = tokio::spawn(async move {
+                let _queued_task_lease = _queued_task_lease;
                 let _create_guard = create_guard;
                 let deadline = tokio::time::Instant::now() + call_timeout;
 
@@ -310,15 +339,22 @@ impl super::ToolRouter {
                         task_id = %result.task.task_id,
                         "proxy native upstream task created"
                     );
-                    let created = router.task_store.lock().await.create_passthrough(
-                        owner,
-                        &tool_name,
-                        &result.task,
-                        TaskUpstreamRef::Task {
-                            server_id: server_id.clone(),
-                            task_id: result.task.task_id.clone(),
-                        },
-                    );
+                    let upstream = TaskUpstreamRef::Task {
+                        server_id: server_id.clone(),
+                        task_id: result.task.task_id.clone(),
+                    };
+                    let mut store = router.task_store.lock().await;
+                    let created = match task_quota_lease {
+                        Some(lease) => store.create_passthrough_with_quota(
+                            owner,
+                            &tool_name,
+                            &result.task,
+                            upstream,
+                            lease,
+                        ),
+                        None => store.create_passthrough(owner, &tool_name, &result.task, upstream),
+                    };
+                    drop(store);
                     return match created {
                         Ok(task) => Ok(CreateTaskResult::new(task)),
                         Err(error) => {
@@ -373,7 +409,10 @@ impl super::ToolRouter {
         // across this scope other than acquiring the lock itself.
         let task = {
             let mut store = self.task_store.lock().await;
-            let task = store.create(owner, tool_name)?;
+            let task = match task_quota_lease {
+                Some(lease) => store.create_with_quota(owner, tool_name, lease)?,
+                None => store.create(owner, tool_name)?,
+            };
             let task_id = task.task_id.clone();
             let router = Arc::clone(self);
             let tool_name = tool_name.to_string();
@@ -1868,6 +1907,125 @@ mod tests {
             tool_definition_fingerprints: HashMap::new(),
             tool_risk_inventory: HashMap::new(),
         });
+    }
+
+    fn authorized_task_context(
+        principal: crate::types::PrincipalId,
+        request_id: i64,
+    ) -> DownstreamCallContext {
+        DownstreamCallContext::http_for_client_with_trace(
+            format!("quota-session-{request_id}"),
+            RequestId::from(NumberOrString::Number(request_id)),
+            ClientType::Unknown,
+            Arc::<str>::from(format!("{request_id:032x}")),
+        )
+        .with_authorization(
+            principal,
+            std::collections::BTreeSet::from(["tools:read".to_string(), "tasks:use".to_string()]),
+        )
+    }
+
+    async fn enqueue_quota_test_task(
+        router: &Arc<ToolRouter>,
+        principal: crate::types::PrincipalId,
+        request_id: i64,
+    ) -> Result<CreateTaskResult, McpError> {
+        let owner = TaskOwner::new(principal.owner_key());
+        router
+            .enqueue_tool_task(
+                "Mock__echo",
+                None,
+                None,
+                owner,
+                None,
+                Some(authorized_task_context(principal, request_id)),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn durable_task_quota_is_principal_isolated_and_released_on_cleanup() {
+        let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+            tasks: 2,
+            queued_task_creations: 8,
+            per_principal_divisor: 2,
+            ..Default::default()
+        });
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+            sm,
+            test_router_config(),
+            quotas,
+        ));
+        install_single_route(&router, "Mock__echo", "missing", "echo");
+        let principal_a = crate::types::PrincipalId::downstream_oauth(
+            "https://issuer.example",
+            "client-a",
+            "https://plug.example/mcp",
+        );
+        let principal_b = crate::types::PrincipalId::downstream_oauth(
+            "https://issuer.example",
+            "client-b",
+            "https://plug.example/mcp",
+        );
+        let owner_a = TaskOwner::new(principal_a.owner_key());
+
+        enqueue_quota_test_task(&router, principal_a.clone(), 1)
+            .await
+            .expect("principal A first task");
+        let error = enqueue_quota_test_task(&router, principal_a.clone(), 2)
+            .await
+            .expect_err("principal A must not exceed its retained task quota");
+        assert_eq!(error.code, rmcp::model::ErrorCode(-32007));
+        enqueue_quota_test_task(&router, principal_b, 3)
+            .await
+            .expect("principal B retains an independent share");
+
+        router.cleanup_tasks_for_owner(&owner_a).await;
+        enqueue_quota_test_task(&router, principal_a, 4)
+            .await
+            .expect("cleanup must release the retained task lease");
+    }
+
+    #[tokio::test]
+    async fn durable_task_quota_enforces_global_limit_and_releases_on_cleanup() {
+        let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+            tasks: 1,
+            queued_task_creations: 8,
+            per_principal_divisor: 1,
+            ..Default::default()
+        });
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+            sm,
+            test_router_config(),
+            quotas,
+        ));
+        install_single_route(&router, "Mock__echo", "missing", "echo");
+        let principal_a = crate::types::PrincipalId::downstream_oauth(
+            "https://issuer.example",
+            "client-a",
+            "https://plug.example/mcp",
+        );
+        let principal_b = crate::types::PrincipalId::downstream_oauth(
+            "https://issuer.example",
+            "client-b",
+            "https://plug.example/mcp",
+        );
+        let owner_a = TaskOwner::new(principal_a.owner_key());
+
+        enqueue_quota_test_task(&router, principal_a, 10)
+            .await
+            .expect("first global task slot");
+        let error = enqueue_quota_test_task(&router, principal_b.clone(), 11)
+            .await
+            .expect_err("global quota must reject another principal while full");
+        assert_eq!(error.code, rmcp::model::ErrorCode(-32007));
+
+        router.cleanup_tasks_for_owner(&owner_a).await;
+        enqueue_quota_test_task(&router, principal_b, 12)
+            .await
+            .expect("cleanup must release global capacity");
     }
 
     /// T1 (Part 1): an owner-liveness probe reporting the owner closed must

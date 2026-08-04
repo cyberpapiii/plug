@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use crate::legacy_tasks::{
     CancelTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult, Task, TaskStatus,
 };
+use crate::protocol::QuotaLease;
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
@@ -66,6 +67,8 @@ struct TaskRecord {
     /// `pending_cancel_reason` guard in `proxy/mod.rs`'s
     /// `attach_upstream_request_id`.
     pending_cancel_reason: Option<String>,
+    /// Capacity remains reserved for the full lifetime of the durable record.
+    _quota_lease: Option<QuotaLease>,
 }
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
@@ -251,6 +254,24 @@ impl TaskStore {
     }
 
     pub fn create(&mut self, owner: TaskOwner, name: &str) -> Result<Task, McpError> {
+        self.create_inner(owner, name, None)
+    }
+
+    pub fn create_with_quota(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        quota_lease: QuotaLease,
+    ) -> Result<Task, McpError> {
+        self.create_inner(owner, name, Some(quota_lease))
+    }
+
+    fn create_inner(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        quota_lease: Option<QuotaLease>,
+    ) -> Result<Task, McpError> {
         self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
@@ -272,6 +293,7 @@ impl TaskStore {
                 upstream: None,
                 last_touched: Instant::now(),
                 pending_cancel_reason: None,
+                _quota_lease: quota_lease,
             },
         );
 
@@ -319,6 +341,28 @@ impl TaskStore {
         upstream_task: &Task,
         upstream: TaskUpstreamRef,
     ) -> Result<Task, McpError> {
+        self.create_passthrough_inner(owner, name, upstream_task, upstream, None)
+    }
+
+    pub fn create_passthrough_with_quota(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+        quota_lease: QuotaLease,
+    ) -> Result<Task, McpError> {
+        self.create_passthrough_inner(owner, name, upstream_task, upstream, Some(quota_lease))
+    }
+
+    fn create_passthrough_inner(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+        quota_lease: Option<QuotaLease>,
+    ) -> Result<Task, McpError> {
         self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
@@ -340,6 +384,7 @@ impl TaskStore {
                 upstream: Some(upstream),
                 last_touched: Instant::now(),
                 pending_cancel_reason: None,
+                _quota_lease: quota_lease,
             },
         );
 

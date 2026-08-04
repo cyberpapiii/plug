@@ -96,18 +96,7 @@ pub async fn dispatch_tools_call(
     let progress_token = params.progress_token();
     let downstream = ctx.downstream_call_context();
 
-    if let crate::protocol::PolicyDecision::Deny(outcome) =
-        downstream.policy_decision(crate::protocol::MethodFamily::ToolsCall)
-    {
-        let encoded = outcome.encode(downstream.protocol_era);
-        return Err(McpError::invalid_request(
-            encoded.message.to_string(),
-            Some(serde_json::json!({
-                "kind": encoded.kind,
-                "retryable": encoded.retryable,
-            })),
-        ));
-    }
+    downstream.authorize(crate::protocol::MethodFamily::ToolsCall)?;
 
     if params
         .meta
@@ -115,6 +104,7 @@ pub async fn dispatch_tools_call(
         .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY))
         && ctx.supports_tasks()
     {
+        downstream.authorize(crate::protocol::MethodFamily::Tasks)?;
         let owner = ctx.task_owner()?;
         let result = router
             .clone()

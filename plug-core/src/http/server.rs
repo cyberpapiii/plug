@@ -80,6 +80,36 @@ struct HttpDownstreamContext {
     oauth_issuer: Option<Arc<str>>,
 }
 
+fn http_principal(
+    auth_status: &AuthStatus,
+    oauth_issuer: Option<&str>,
+) -> Option<crate::types::PrincipalId> {
+    match auth_status {
+        AuthStatus::Authenticated(Some(claims)) => {
+            Some(crate::types::PrincipalId::downstream_oauth(
+                oauth_issuer.unwrap_or("unknown-issuer"),
+                claims.client_id.clone(),
+                claims.resource.clone(),
+            ))
+        }
+        AuthStatus::Authenticated(None) => Some(crate::types::PrincipalId::configured_credential(
+            "downstream-http-bearer",
+            0,
+        )),
+        AuthStatus::NoAuthRequired => None,
+    }
+}
+
+fn http_task_owner(
+    session_id: &str,
+    auth_status: &AuthStatus,
+    oauth_issuer: Option<&str>,
+) -> crate::tasks::TaskOwner {
+    http_principal(auth_status, oauth_issuer)
+        .map(|principal| crate::tasks::TaskOwner::new(principal.owner_key()))
+        .unwrap_or_else(|| crate::proxy::ToolRouter::task_owner_for_http_session(session_id))
+}
+
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
         let context = DownstreamCallContext::http_for_client_with_trace(
@@ -88,28 +118,26 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             self.client_type,
             Arc::clone(&self.trace_id),
         );
-        match &self.auth_status {
-            AuthStatus::Authenticated(Some(claims)) => context.with_authorization(
-                crate::types::PrincipalId::downstream_oauth(
-                    self.oauth_issuer.as_deref().unwrap_or("unknown-issuer"),
-                    claims.client_id.clone(),
-                    claims.resource.clone(),
-                ),
-                claims.scopes.clone(),
-            ),
-            AuthStatus::Authenticated(None) => context.with_local_principal(
-                crate::types::PrincipalId::configured_credential("downstream-http-bearer", 0),
-            ),
-            AuthStatus::NoAuthRequired => context,
+        match (
+            &self.auth_status,
+            http_principal(&self.auth_status, self.oauth_issuer.as_deref()),
+        ) {
+            (AuthStatus::Authenticated(Some(claims)), Some(principal)) => {
+                context.with_authorization(principal, claims.scopes.clone())
+            }
+            (AuthStatus::Authenticated(None), Some(principal)) => {
+                context.with_local_principal(principal)
+            }
+            _ => context,
         }
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        let context = self.downstream_call_context();
-        Ok(match context.principal {
-            Some(principal) => crate::tasks::TaskOwner::new(principal.owner_key()),
-            None => crate::proxy::ToolRouter::task_owner_for_http_session(&self.session_id),
-        })
+        Ok(http_task_owner(
+            &self.session_id,
+            &self.auth_status,
+            self.oauth_issuer.as_deref(),
+        ))
     }
 
     /// Session-existence probe for the enqueue path's post-guard liveness
@@ -1042,6 +1070,9 @@ async fn delete_mcp(
             &session_id,
         );
         state.router.clear_lazy_session(&lazy_session_key);
+        // Session-owned legacy records end with the wire session. Durable
+        // principal-owned records intentionally survive and can be resumed
+        // by a later session authenticated as the same principal.
         let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
         state.router.cleanup_tasks_for_owner(&owner).await;
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
@@ -1558,7 +1589,32 @@ async fn handle_request(
         ClientRequest::CustomRequest(custom) if custom.method.starts_with("plug/legacy/tasks/") => {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
+            let client_type = state
+                .sessions
+                .get_client_type(&session_id)
+                .unwrap_or(crate::types::ClientType::Unknown);
+            let ctx = HttpDownstreamContext {
+                session_id: Arc::<str>::from(session_id.as_str()),
+                request_id: request_id.clone(),
+                client_type,
+                trace_id: Arc::clone(&trace_id),
+                sessions: Arc::clone(&state.sessions),
+                auth_status,
+                oauth_issuer: state
+                    .downstream_oauth
+                    .as_ref()
+                    .map(|manager| Arc::<str>::from(manager.base_url())),
+            };
+            let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
+            if let Err(error) = downstream.authorize(crate::protocol::MethodFamily::Tasks) {
+                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
+            }
+            let owner = match crate::dispatch::DownstreamContext::task_owner(&ctx) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
+                }
+            };
             let result = match custom.method.as_str() {
                 "plug/legacy/tasks/list" => {
                     let params = custom
@@ -1931,6 +1987,33 @@ mod tests {
         let trace_id = extract_trace_id(&headers);
         assert_eq!(trace_id.len(), 32);
         assert_ne!(trace_id, "00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn authenticated_http_task_owner_is_stable_across_sessions() {
+        let authenticated = AuthStatus::Authenticated(None);
+        assert_eq!(
+            http_task_owner("session-a", &authenticated, None),
+            http_task_owner("session-b", &authenticated, None),
+            "the configured credential, not the replaceable HTTP session, owns durable tasks"
+        );
+
+        assert_ne!(
+            http_task_owner("session-a", &AuthStatus::NoAuthRequired, None),
+            http_task_owner("session-b", &AuthStatus::NoAuthRequired, None),
+            "legacy unauthenticated sessions retain session-scoped ownership"
+        );
+
+        let oauth = AuthStatus::Authenticated(Some(crate::downstream_oauth::AccessTokenClaims {
+            client_id: "client-a".to_string(),
+            scopes: vec!["tasks:use".to_string()],
+            resource: "https://plug.example/mcp".to_string(),
+        }));
+        assert_eq!(
+            http_task_owner("session-a", &oauth, Some("https://issuer.example")),
+            http_task_owner("session-b", &oauth, Some("https://issuer.example")),
+            "OAuth client identity must survive HTTP session replacement"
+        );
     }
 
     async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {

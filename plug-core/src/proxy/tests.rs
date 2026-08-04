@@ -2025,6 +2025,46 @@ impl crate::dispatch::DownstreamContext for MockDownstream {
     }
 }
 
+/// OAuth-backed transport context whose tool scope is intentionally narrower
+/// than its task scope. Task-wrapped tools/call must pass both checks.
+struct ScopedTaskDownstream {
+    scopes: std::collections::BTreeSet<String>,
+}
+
+impl crate::dispatch::DownstreamContext for ScopedTaskDownstream {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        DownstreamCallContext::http_for_client_with_trace(
+            "session-scoped",
+            RequestId::from(NumberOrString::Number(1)),
+            ClientType::Unknown,
+            Arc::<str>::from("00000000000000000000000000000001"),
+        )
+        .with_authorization(
+            crate::types::PrincipalId::downstream_oauth(
+                "https://issuer.example",
+                "client-a",
+                "https://plug.example/mcp",
+            ),
+            self.scopes.clone(),
+        )
+    }
+
+    fn supports_tasks(&self) -> bool {
+        true
+    }
+
+    fn task_owner(&self) -> Result<TaskOwner, McpError> {
+        Ok(TaskOwner::new(
+            crate::types::PrincipalId::downstream_oauth(
+                "https://issuer.example",
+                "client-a",
+                "https://plug.example/mcp",
+            )
+            .owner_key(),
+        ))
+    }
+}
+
 /// Build a router with a single route to a server that has no registered
 /// upstream. The sync path then fails with `ServerUnavailable`, while the task
 /// path falls through to a local passthrough task and succeeds — making the two
@@ -2091,6 +2131,28 @@ async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
         matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
         "expected TaskCreated outcome, got {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_record() {
+    let router = router_with_unrouted_single_route();
+    let ctx = ScopedTaskDownstream {
+        scopes: std::collections::BTreeSet::from(["tools:read".to_string()]),
+    };
+    let owner =
+        crate::dispatch::DownstreamContext::task_owner(&ctx).expect("stable principal owner");
+    let mut params = CallToolRequestParams::new("Mock__tool");
+    params.meta.get_or_insert_with(Default::default).insert(
+        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+        serde_json::json!({}),
+    );
+
+    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+        .await
+        .expect_err("tools scope alone must not authorize durable task creation");
+
+    assert_eq!(err.code, ErrorCode(-32005));
+    assert_eq!(router.task_count_for_owner(&owner).await, 0);
 }
 
 #[tokio::test]

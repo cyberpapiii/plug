@@ -185,6 +185,8 @@ pub struct ToolRouter {
     lazy_working_sets: DashMap<String, VecDeque<String>>,
     /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
     task_store: Mutex<TaskStore>,
+    /// One process-wide admission ledger shared by every downstream transport.
+    admission_quotas: crate::protocol::AdmissionQuotas,
     /// Serializes `refresh_tools`' decide-and-mutate phase (subscription
     /// classify → prune → snapshot publish → rebind) across concurrent
     /// refresh passes, so one pass cannot interleave reconciliation
@@ -400,6 +402,15 @@ impl DownstreamCallContext {
         )
     }
 
+    pub fn authorize(&self, family: crate::protocol::MethodFamily) -> Result<(), rmcp::ErrorData> {
+        match self.policy_decision(family) {
+            crate::protocol::PolicyDecision::Allow => Ok(()),
+            crate::protocol::PolicyDecision::Deny(outcome) => {
+                Err(outcome.into_error(self.protocol_era))
+            }
+        }
+    }
+
     pub fn notification_target(&self) -> NotificationTarget {
         match self.transport {
             DownstreamTransport::Stdio => NotificationTarget::Stdio {
@@ -493,6 +504,18 @@ pub trait DownstreamBridge: Send + Sync {
 
 impl ToolRouter {
     pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
+        Self::new_with_quotas(
+            server_manager,
+            config,
+            crate::protocol::AdmissionQuotas::new(Default::default()),
+        )
+    }
+
+    fn new_with_quotas(
+        server_manager: Arc<ServerManager>,
+        config: RouterConfig,
+        admission_quotas: crate::protocol::AdmissionQuotas,
+    ) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
         let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
@@ -605,8 +628,18 @@ impl ToolRouter {
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
             task_store: Mutex::new(TaskStore::new()),
+            admission_quotas,
             refresh_reconcile_lock: Mutex::new(()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_admission_quotas_for_tests(
+        server_manager: Arc<ServerManager>,
+        config: RouterConfig,
+        admission_quotas: crate::protocol::AdmissionQuotas,
+    ) -> Self {
+        Self::new_with_quotas(server_manager, config, admission_quotas)
     }
 
     /// Set the event sender for tool call observability.

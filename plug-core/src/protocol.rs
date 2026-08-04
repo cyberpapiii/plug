@@ -192,6 +192,18 @@ impl ProtocolOutcome {
             retryable,
         }
     }
+
+    pub fn into_error(self, era: ProtocolEra) -> McpError {
+        let encoded = self.encode(era);
+        McpError::new(
+            rmcp::model::ErrorCode(encoded.code),
+            encoded.message,
+            Some(serde_json::json!({
+                "kind": encoded.kind,
+                "retryable": encoded.retryable,
+            })),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -564,6 +576,13 @@ mod tests {
             assert!(!legacy.message.is_empty());
             assert!(!modern.message.is_empty());
         }
+    }
+
+    #[test]
+    fn outcome_error_preserves_custom_protocol_code() {
+        let error = ProtocolOutcome::QuotaExceeded.into_error(ProtocolEra::Legacy);
+        assert_eq!(error.code, rmcp::model::ErrorCode(-32007));
+        assert_eq!(error.data.unwrap()["kind"], "quota_exceeded");
     }
 
     #[test]
