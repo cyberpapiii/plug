@@ -1573,6 +1573,16 @@ impl ToolRouter {
             let upstream_annotations = c.tool.annotations.clone();
             let mut prefixed_tool = c.tool.clone();
             let mut inferred_tool = c.tool.clone();
+            if server_ctx
+                .get(&c.server_name)
+                .and_then(|ctx| ctx.upstream.as_ref())
+                .is_some_and(|upstream| {
+                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
+                })
+            {
+                suppress_deferred_modern_tool_metadata(&mut prefixed_tool);
+                suppress_deferred_modern_tool_metadata(&mut inferred_tool);
+            }
             let upstream_icons = server_ctx
                 .get(&c.server_name)
                 .and_then(|ctx| ctx.icons.clone());
@@ -1691,6 +1701,15 @@ impl ToolRouter {
         let mut resource_routes = HashMap::new();
         let mut resources_vec = Vec::new();
         for (server_name, mut resource) in upstream_resources {
+            if self
+                .server_manager
+                .get_upstream(&server_name)
+                .is_some_and(|upstream| {
+                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
+                })
+            {
+                suppress_deferred_modern_resource_metadata(&mut resource);
+            }
             if let Some(existing_server) = resource_routes.get(&resource.uri)
                 && existing_server != &server_name
             {
@@ -1729,6 +1748,15 @@ impl ToolRouter {
 
         let mut resource_templates_vec = Vec::new();
         for (server_name, mut template) in upstream_resource_templates {
+            if self
+                .server_manager
+                .get_upstream(&server_name)
+                .is_some_and(|upstream| {
+                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
+                })
+            {
+                suppress_deferred_modern_template_metadata(&mut template);
+            }
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = template.name.clone();
             let routed_name = crate::tool_naming::build_wire_name(
@@ -1754,6 +1782,15 @@ impl ToolRouter {
         let mut prompt_routes = HashMap::new();
         let mut prompts_vec = Vec::new();
         for (server_name, mut prompt) in upstream_prompts {
+            if self
+                .server_manager
+                .get_upstream(&server_name)
+                .is_some_and(|upstream| {
+                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
+                })
+            {
+                suppress_deferred_modern_prompt_metadata(&mut prompt);
+            }
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = prompt.name.clone();
             let routed_name = crate::tool_naming::build_wire_name(

@@ -1497,6 +1497,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: crate::config::TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1546,6 +1547,9 @@ mod tests {
             tools,
             capabilities,
             upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate_state: 0,
             health: ServerHealth::Healthy,
         }
     }
@@ -2358,6 +2362,9 @@ mod tests {
             tools,
             capabilities: ServerCapabilities::default(),
             upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate_state: 0,
             health: ServerHealth::Healthy,
         }
     }

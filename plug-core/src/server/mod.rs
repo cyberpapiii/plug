@@ -13,7 +13,6 @@ use dashmap::DashMap;
 use futures::future::join_all;
 use futures::stream::BoxStream;
 use rmcp::ErrorData as McpError;
-use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
@@ -28,10 +27,11 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
     StreamableHttpError, StreamableHttpPostResponse,
 };
+use rmcp::{ClientLifecycleMode, ClientServiceExt as _, ServiceExt as _};
 use sse_stream::{Error as SseError, Sse};
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
-use crate::config::{Config, ServerConfig, TransportType};
+use crate::config::{Config, ServerConfig, TransportType, UpstreamProtocolMode};
 use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
@@ -47,6 +47,7 @@ const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 fn upstream_metadata_from_implementation(
     implementation: &Implementation,
+    selected_protocol_version: &str,
 ) -> Option<UpstreamServerMetadata> {
     let icons = crate::icons::normalize_icons(implementation.icons.as_deref());
     Some(UpstreamServerMetadata {
@@ -56,8 +57,37 @@ fn upstream_metadata_from_implementation(
         description: implementation.description.clone(),
         website_url: implementation.website_url.clone(),
         icons,
-        selected_protocol_version: Some(crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string()),
+        selected_protocol_version: Some(selected_protocol_version.to_string()),
     })
+}
+
+fn effective_upstream_protocol_mode(
+    configured: UpstreamProtocolMode,
+    modern_upstream_enabled: bool,
+) -> UpstreamProtocolMode {
+    if modern_upstream_enabled {
+        configured
+    } else {
+        UpstreamProtocolMode::Legacy
+    }
+}
+
+fn client_lifecycle_mode(mode: UpstreamProtocolMode) -> ClientLifecycleMode {
+    match mode {
+        UpstreamProtocolMode::Legacy => ClientLifecycleMode::Initialize,
+        UpstreamProtocolMode::Auto => ClientLifecycleMode::Auto {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
+        },
+        UpstreamProtocolMode::Modern => ClientLifecycleMode::Discover {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+        },
+    }
+}
+
+fn should_fallback_to_legacy_sse(mode: UpstreamProtocolMode, error: &anyhow::Error) -> bool {
+    mode == UpstreamProtocolMode::Legacy
+        && crate::transport::sse_client::should_fallback_http_error(error)
 }
 
 /// RMCP 3.x intentionally dropped SEP-1686's top-level `capabilities.tasks`,
@@ -542,6 +572,13 @@ pub struct UpstreamServer {
     pub(crate) tools: Arc<ArcSwap<Vec<rmcp::model::Tool>>>,
     pub capabilities: ServerCapabilities,
     pub upstream: Option<UpstreamServerMetadata>,
+    /// Protocol era and version selected by this live connection.
+    pub protocol_era: crate::protocol::ProtocolEra,
+    pub selected_protocol_version: String,
+    /// Exact global protocol-gate generation/value used when this connection
+    /// began. Commit validation uses it to reject a connection made stale by
+    /// a concurrent live gate flip.
+    pub(crate) protocol_gate_state: u64,
     pub health: ServerHealth,
 }
 
@@ -678,6 +715,8 @@ pub struct ServerManager {
     /// (no shutdown) never observes a `true` value, so the grace period is
     /// unaffected.
     shutdown_signal: tokio::sync::watch::Sender<bool>,
+    /// Live, reloadable safety gate for modern upstream negotiation.
+    modern_upstream_gate_state: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -743,7 +782,36 @@ impl ServerManager {
             tool_router: std::sync::RwLock::new(None),
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             shutdown_signal,
+            modern_upstream_gate_state: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_modern_upstream_enabled(&self, enabled: bool) {
+        let enabled_bit = u64::from(enabled);
+        let mut current = self.modern_upstream_gate_state.load(Ordering::Acquire);
+        loop {
+            if current & 1 == enabled_bit {
+                return;
+            }
+            let next = current.wrapping_add(2) ^ 1;
+            match self.modern_upstream_gate_state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn modern_upstream_enabled(&self) -> bool {
+        self.modern_upstream_gate_state.load(Ordering::Acquire) & 1 == 1
+    }
+
+    pub(crate) fn modern_upstream_gate_state(&self) -> u64 {
+        self.modern_upstream_gate_state.load(Ordering::Acquire)
     }
 
     /// Record the outcome and latency of a tool call to an upstream. Read-side
@@ -920,6 +988,7 @@ impl ServerManager {
 
     /// Start all enabled servers from config, batched by `config.startup_concurrency`.
     pub async fn start_all(&self, config: &Config) -> Result<(), anyhow::Error> {
+        self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
             .iter()
@@ -946,9 +1015,15 @@ impl ServerManager {
                 let name_clone = name.clone();
                 let sc = server_config.clone();
                 let tool_router = self.tool_router();
+                let modern_upstream_gate_state = self.modern_upstream_gate_state();
                 join_set.spawn(async move {
-                    let result =
-                        Self::start_server_with_router(&name_clone, &sc, tool_router).await;
+                    let result = Self::start_server_with_router(
+                        &name_clone,
+                        &sc,
+                        tool_router,
+                        modern_upstream_gate_state,
+                    )
+                    .await;
                     (name_clone, result)
                 });
             }
@@ -1026,13 +1101,25 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        Self::start_server_with_router(name, config, self.tool_router()).await
+        self.start_server_with_protocol_gate_state(name, config, self.modern_upstream_gate_state())
+            .await
+    }
+
+    pub(crate) async fn start_server_with_protocol_gate_state(
+        &self,
+        name: &str,
+        config: &ServerConfig,
+        modern_upstream_gate_state: u64,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        Self::start_server_with_router(name, config, self.tool_router(), modern_upstream_gate_state)
+            .await
     }
 
     async fn start_server_with_router(
         name: &str,
         config: &ServerConfig,
         tool_router: std::sync::Weak<ToolRouter>,
+        modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         // Recursion shield: never start a server named "plug"
         if name == "plug" {
@@ -1040,6 +1127,10 @@ impl ServerManager {
         }
 
         let timeout_duration = Duration::from_secs(config.timeout_secs);
+        let effective_protocol_mode = effective_upstream_protocol_mode(
+            config.protocol_mode,
+            modern_upstream_gate_state & 1 == 1,
+        );
 
         let result = tokio::time::timeout(timeout_duration, async {
             match config.transport {
@@ -1077,7 +1168,10 @@ impl ServerManager {
                     });
 
                     let client: McpClient = handler
-                        .serve(transport)
+                        .serve_with_lifecycle(
+                            transport,
+                            client_lifecycle_mode(effective_protocol_mode),
+                        )
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to initialize client: {e}"))?;
 
@@ -1089,10 +1183,25 @@ impl ServerManager {
                     tools.store(Arc::new(tools_result));
 
                     let server_info = client.peer().peer_info();
+                    let selected_protocol_version = server_info
+                        .as_ref()
+                        .map(|info| info.protocol_version.to_string())
+                        .unwrap_or_else(|| crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string());
+                    let protocol_era = crate::protocol::ProtocolEra::from_version(
+                        &server_info
+                            .as_ref()
+                            .map(|info| info.protocol_version.clone())
+                            .unwrap_or(rmcp::model::ProtocolVersion::V_2025_11_25),
+                    );
                     let upstream = server_info.as_ref().and_then(|info| {
                         info.server_info
                             .as_ref()
-                            .and_then(upstream_metadata_from_implementation)
+                            .and_then(|implementation| {
+                                upstream_metadata_from_implementation(
+                                    implementation,
+                                    &selected_protocol_version,
+                                )
+                            })
                     });
                     if let Some(info) = server_info {
                         let implementation = info.server_info.as_ref();
@@ -1100,7 +1209,8 @@ impl ServerManager {
                             server = %name,
                             server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
                             server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
-                            requested_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                            configured_protocol = ?config.protocol_mode,
+                            effective_protocol = ?effective_protocol_mode,
                             selected_protocol = %info.protocol_version,
                             "connected to server"
                         );
@@ -1111,12 +1221,17 @@ impl ServerManager {
                         .peer_info()
                         .map(|info| info.capabilities.clone())
                         .unwrap_or_default();
-                    restore_legacy_task_capability(
-                        client.peer(),
-                        &mut capabilities,
-                        Duration::from_secs(config.call_timeout_secs),
-                    )
-                    .await;
+                    if protocol_era == crate::protocol::ProtocolEra::Legacy {
+                        restore_legacy_task_capability(
+                            client.peer(),
+                            &mut capabilities,
+                            Duration::from_secs(config.call_timeout_secs),
+                        )
+                        .await;
+                    } else {
+                        capabilities.extensions = None;
+                        capabilities.experimental = None;
+                    }
 
                     Ok(UpstreamServer {
                         name: name.to_string(),
@@ -1125,6 +1240,9 @@ impl ServerManager {
                         tools,
                         capabilities,
                         upstream,
+                        protocol_era,
+                        selected_protocol_version,
+                        protocol_gate_state: modern_upstream_gate_state,
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -1195,20 +1313,38 @@ impl ServerManager {
                         router: tool_router.clone(),
                     });
 
-                    match handler.serve(transport).await {
+                    match handler
+                        .serve_with_lifecycle(
+                            transport,
+                            client_lifecycle_mode(effective_protocol_mode),
+                        )
+                        .await
+                    {
                         Ok(client) => {
-                            Self::finish_upstream_connection(name, config, client, tools, "HTTP upstream").await
+                            Self::finish_upstream_connection(
+                                name,
+                                config,
+                                client,
+                                tools,
+                                "HTTP upstream",
+                                modern_upstream_gate_state,
+                            ).await
                         }
                         Err(e) => {
                             let error = anyhow::Error::new(e)
                                 .context("failed to connect to HTTP upstream");
-                            if crate::transport::sse_client::should_fallback_http_error(&error) {
+                            if should_fallback_to_legacy_sse(effective_protocol_mode, &error) {
                                 tracing::info!(
                                     server = %name,
                                     error = %error,
                                     "HTTP upstream looks legacy-SSE compatible; falling back"
                                 );
-                                Self::connect_sse_upstream(name, config, tool_router).await
+                                Self::connect_sse_upstream(
+                                    name,
+                                    config,
+                                    tool_router,
+                                    modern_upstream_gate_state,
+                                ).await
                             } else {
                                 Err(error)
                             }
@@ -1216,7 +1352,18 @@ impl ServerManager {
                     }
                 }
                 TransportType::Sse => {
-                    Self::connect_sse_upstream(name, config, tool_router).await
+                    if effective_protocol_mode != UpstreamProtocolMode::Legacy {
+                        anyhow::bail!(
+                            "legacy SSE transport does not support {:?} MCP lifecycle negotiation",
+                            effective_protocol_mode
+                        );
+                    }
+                    Self::connect_sse_upstream(
+                        name,
+                        config,
+                        tool_router,
+                        modern_upstream_gate_state,
+                    ).await
                 }
             }
         })
@@ -1244,6 +1391,7 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
         tool_router: std::sync::Weak<ToolRouter>,
+        modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         crate::tls::ensure_rustls_provider_installed();
 
@@ -1308,7 +1456,15 @@ impl ServerManager {
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to legacy SSE upstream: {e}"))?;
 
-        Self::finish_upstream_connection(name, config, client, tools, "legacy SSE upstream").await
+        Self::finish_upstream_connection(
+            name,
+            config,
+            client,
+            tools,
+            "legacy SSE upstream",
+            modern_upstream_gate_state,
+        )
+        .await
     }
 
     /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
@@ -1318,6 +1474,7 @@ impl ServerManager {
         client: McpClient,
         tools: Arc<ArcSwap<Vec<Tool>>>,
         transport_label: &str,
+        modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let tools_result = client
             .peer()
@@ -1327,10 +1484,20 @@ impl ServerManager {
         tools.store(Arc::new(tools_result));
 
         let server_info = client.peer().peer_info();
-        let upstream = server_info.as_ref().and_then(|info| {
-            info.server_info
+        let selected_protocol_version = server_info
+            .as_ref()
+            .map(|info| info.protocol_version.to_string())
+            .unwrap_or_else(|| crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string());
+        let protocol_era = crate::protocol::ProtocolEra::from_version(
+            &server_info
                 .as_ref()
-                .and_then(upstream_metadata_from_implementation)
+                .map(|info| info.protocol_version.clone())
+                .unwrap_or(rmcp::model::ProtocolVersion::V_2025_11_25),
+        );
+        let upstream = server_info.as_ref().and_then(|info| {
+            info.server_info.as_ref().and_then(|implementation| {
+                upstream_metadata_from_implementation(implementation, &selected_protocol_version)
+            })
         });
         if let Some(info) = server_info {
             let implementation = info.server_info.as_ref();
@@ -1338,7 +1505,7 @@ impl ServerManager {
                 server = %name,
                 server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
                 server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
-                requested_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                configured_protocol = ?config.protocol_mode,
                 selected_protocol = %info.protocol_version,
                 "connected to {transport_label}"
             );
@@ -1349,12 +1516,17 @@ impl ServerManager {
             .peer_info()
             .map(|info| info.capabilities.clone())
             .unwrap_or_default();
-        restore_legacy_task_capability(
-            client.peer(),
-            &mut capabilities,
-            Duration::from_secs(config.call_timeout_secs),
-        )
-        .await;
+        if protocol_era == crate::protocol::ProtocolEra::Legacy {
+            restore_legacy_task_capability(
+                client.peer(),
+                &mut capabilities,
+                Duration::from_secs(config.call_timeout_secs),
+            )
+            .await;
+        } else {
+            capabilities.extensions = None;
+            capabilities.experimental = None;
+        }
 
         Ok(UpstreamServer {
             name: name.to_string(),
@@ -1363,6 +1535,9 @@ impl ServerManager {
             tools,
             capabilities,
             upstream,
+            protocol_era,
+            selected_protocol_version,
+            protocol_gate_state: modern_upstream_gate_state,
             health: ServerHealth::Healthy,
         })
     }
@@ -1750,6 +1925,8 @@ impl ServerManager {
                     upstream: upstream.upstream.clone(),
                     metrics: Some(self.metrics_snapshot_or_default(&upstream.name)),
                     availability: self.availability_for(&upstream.name, health),
+                    selected_protocol_era: Some(upstream.protocol_era),
+                    selected_protocol_version: Some(upstream.selected_protocol_version.clone()),
                     last_seen: None,
                 }
             })
@@ -1773,6 +1950,8 @@ impl ServerManager {
                 upstream: None,
                 metrics: self.metrics_snapshot(entry.key()),
                 availability: self.availability_for(entry.key(), entry.health),
+                selected_protocol_era: None,
+                selected_protocol_version: None,
                 last_seen: None,
             });
         }
@@ -2133,8 +2312,11 @@ mod tests {
                 Icon::new("file:///tmp/icon.png").with_mime_type("image/png"),
             ]);
 
-        let metadata =
-            upstream_metadata_from_implementation(&implementation).expect("metadata present");
+        let metadata = upstream_metadata_from_implementation(
+            &implementation,
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+        )
+        .expect("metadata present");
 
         assert_eq!(metadata.name, "iMessage Max");
         assert_eq!(metadata.title.as_deref(), Some("iMessage Max"));
@@ -2149,13 +2331,73 @@ mod tests {
     fn upstream_metadata_preserves_required_identity_without_optional_fields() {
         let implementation = Implementation::new("plain-server", "0.1.0");
 
-        let metadata =
-            upstream_metadata_from_implementation(&implementation).expect("metadata present");
+        let metadata = upstream_metadata_from_implementation(
+            &implementation,
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+        )
+        .expect("metadata present");
 
         assert_eq!(metadata.name, "plain-server");
         assert_eq!(metadata.version, "0.1.0");
         assert_eq!(metadata.title, None);
         assert_eq!(metadata.icons, None);
+    }
+
+    #[test]
+    fn upstream_protocol_gate_and_lifecycle_mapping_are_exact() {
+        assert_eq!(
+            effective_upstream_protocol_mode(UpstreamProtocolMode::Modern, false),
+            UpstreamProtocolMode::Legacy
+        );
+        assert_eq!(
+            effective_upstream_protocol_mode(UpstreamProtocolMode::Auto, true),
+            UpstreamProtocolMode::Auto
+        );
+
+        assert_eq!(
+            client_lifecycle_mode(UpstreamProtocolMode::Auto),
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
+            }
+        );
+        assert_eq!(
+            client_lifecycle_mode(UpstreamProtocolMode::Modern),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            }
+        );
+    }
+
+    #[test]
+    fn modern_modes_never_enter_the_legacy_sse_error_fallback() {
+        let method_not_allowed =
+            anyhow::anyhow!("unexpected server response: HTTP 405 Method Not Allowed");
+        assert!(should_fallback_to_legacy_sse(
+            UpstreamProtocolMode::Legacy,
+            &method_not_allowed
+        ));
+        assert!(!should_fallback_to_legacy_sse(
+            UpstreamProtocolMode::Auto,
+            &method_not_allowed
+        ));
+        assert!(!should_fallback_to_legacy_sse(
+            UpstreamProtocolMode::Modern,
+            &method_not_allowed
+        ));
+
+        for message in [
+            "HTTP 401 Unauthorized",
+            "TLS certificate validation failed",
+            "request timed out",
+            "HTTP 429 Too Many Requests",
+            "HTTP 500 Internal Server Error",
+        ] {
+            assert!(!should_fallback_to_legacy_sse(
+                UpstreamProtocolMode::Legacy,
+                &anyhow::anyhow!(message)
+            ));
+        }
     }
 
     fn test_router_config() -> RouterConfig {
@@ -2179,6 +2421,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -2651,6 +2894,9 @@ mod tests {
             tools,
             capabilities: ServerCapabilities::default(),
             upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate_state: 0,
             health: ServerHealth::Healthy,
         }
     }
@@ -2696,6 +2942,9 @@ mod tests {
                 tools,
                 capabilities,
                 upstream: None,
+                protocol_era: crate::protocol::ProtocolEra::Legacy,
+                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+                protocol_gate_state: 0,
                 health: ServerHealth::Healthy,
             },
             result_request_count,
@@ -3005,6 +3254,9 @@ mod tests {
                 tools: tools_a,
                 capabilities: ServerCapabilities::default(),
                 upstream: None,
+                protocol_era: crate::protocol::ProtocolEra::Legacy,
+                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+                protocol_gate_state: 0,
                 health: ServerHealth::Healthy,
             },
         )
@@ -3057,6 +3309,9 @@ mod tests {
                 tools: tools_b,
                 capabilities: ServerCapabilities::default(),
                 upstream: None,
+                protocol_era: crate::protocol::ProtocolEra::Legacy,
+                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+                protocol_gate_state: 0,
                 health: ServerHealth::Healthy,
             },
         )
@@ -3262,6 +3517,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Http,
+            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
             auth_token: None,
             auth: Some("oauth".to_string()),
@@ -3354,6 +3610,10 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3455,6 +3715,10 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3781,6 +4045,10 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3897,6 +4165,10 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4035,6 +4307,10 @@ mod tests {
                     tools,
                     capabilities,
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
                     health: ServerHealth::Healthy,
                 },
             )

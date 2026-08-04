@@ -770,6 +770,8 @@ mod tests {
             upstream: None,
             metrics: None,
             availability: Default::default(),
+            selected_protocol_era: None,
+            selected_protocol_version: None,
             last_seen: None,
         }];
         let json = status_json(
@@ -826,6 +828,8 @@ mod tests {
                 last_restart_epoch_secs: Some(1_700_000_500),
             }),
             availability: plug_core::types::Availability::Degraded,
+            selected_protocol_era: None,
+            selected_protocol_version: None,
             last_seen: None,
         }];
         let json = status_json(

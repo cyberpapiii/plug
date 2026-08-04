@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use futures::stream::{self, StreamExt};
 
-use crate::config::{Config, ServerConfig};
+use crate::config::{Config, ServerConfig, UpstreamProtocolMode};
 use crate::engine::EngineEvent;
 use crate::server::ServerManager;
 
@@ -97,7 +97,11 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     for name in old_names.intersection(&new_names) {
         let old_cfg = &old.servers[*name];
         let new_cfg = &new.servers[*name];
-        if server_config_changed(old_cfg, new_cfg) {
+        let gate_change_requires_renegotiation = old.modern_upstream_enabled
+            != new.modern_upstream_enabled
+            && (old_cfg.protocol_mode != UpstreamProtocolMode::Legacy
+                || new_cfg.protocol_mode != UpstreamProtocolMode::Legacy);
+        if server_config_changed(old_cfg, new_cfg) || gate_change_requires_renegotiation {
             changed.push(((*name).clone(), new_cfg.clone()));
         } else {
             unchanged.push((*name).clone());
@@ -183,7 +187,8 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     );
 
     let settings_changed = !restart_required.is_empty()
-        || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled;
+        || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled
+        || old.modern_upstream_enabled != new.modern_upstream_enabled;
 
     ConfigDiff {
         added,
@@ -207,6 +212,7 @@ pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> b
         || old.args != new.args
         || old.env != new.env
         || old.transport != new.transport
+        || old.protocol_mode != new.protocol_mode
         || old.url != new.url
         || old.timeout_secs != new.timeout_secs
         || old.call_timeout_secs != new.call_timeout_secs
@@ -246,6 +252,10 @@ pub async fn apply_reload(
     };
 
     let server_manager = engine.server_manager();
+    // Set the live gate before any replacement starts. Existing connections
+    // remain valid until their targeted restart below; credentials stay in the
+    // existing stores and are resolved normally by the replacement.
+    server_manager.set_modern_upstream_enabled(new_config.modern_upstream_enabled);
     let mut spawn_after_swap: Vec<(String, ServerConfig)> = Vec::new();
 
     // 1. Stop removed servers
@@ -365,6 +375,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -436,6 +447,33 @@ mod tests {
         assert!(diff.removed.is_empty());
         assert!(diff.changed.is_empty());
         assert_eq!(diff.unchanged, vec!["github"]);
+    }
+
+    #[test]
+    fn protocol_mode_or_live_gate_change_targets_only_affected_upstreams() {
+        let mut old = Config::default();
+        old.servers.insert("legacy".into(), make_server("legacy"));
+        let mut auto = make_server("auto");
+        auto.protocol_mode = UpstreamProtocolMode::Auto;
+        old.servers.insert("auto".into(), auto.clone());
+
+        let mut enabled = old.clone();
+        enabled.modern_upstream_enabled = true;
+        let diff = diff_configs(&old, &enabled);
+        assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.changed[0].0, "auto");
+        assert_eq!(diff.unchanged, vec!["legacy"]);
+        assert!(diff.settings_changed);
+
+        let mut forced_modern = old.clone();
+        forced_modern
+            .servers
+            .get_mut("legacy")
+            .expect("legacy config")
+            .protocol_mode = UpstreamProtocolMode::Modern;
+        let diff = diff_configs(&old, &forced_modern);
+        assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.changed[0].0, "legacy");
     }
 
     #[test]

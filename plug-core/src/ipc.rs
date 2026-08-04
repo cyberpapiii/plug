@@ -961,6 +961,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             enabled: true,
             transport: crate::config::TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: Some(crate::types::SecretString::from("secret-token".to_string())),
             auth: None,

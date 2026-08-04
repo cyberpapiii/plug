@@ -263,6 +263,8 @@ mod tests {
             upstream: None,
             metrics: None,
             availability: Availability::Degraded,
+            selected_protocol_era: None,
+            selected_protocol_version: None,
             last_seen: None,
         };
         let value = serde_json::to_value(&status).unwrap();
@@ -583,6 +585,13 @@ pub struct ServerStatus {
     /// stays stable: an older daemon's JSON without the key deserializes as `healthy`.
     #[serde(default)]
     pub availability: Availability,
+    /// Protocol selected by the current live upstream connection. Both values
+    /// are absent when no connection exists, so configured intent is never
+    /// mistaken for runtime truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_era: Option<crate::protocol::ProtocolEra>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_version: Option<String>,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }

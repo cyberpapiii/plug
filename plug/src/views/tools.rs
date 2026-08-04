@@ -328,6 +328,8 @@ mod tests {
             upstream: None,
             metrics: None,
             availability: Default::default(),
+            selected_protocol_era: None,
+            selected_protocol_version: None,
             last_seen: None,
         }
     }

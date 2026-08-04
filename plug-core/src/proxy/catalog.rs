@@ -1,5 +1,21 @@
 use super::*;
 
+pub(crate) fn suppress_deferred_modern_tool_metadata(tool: &mut Tool) {
+    tool.meta = None;
+}
+
+pub(crate) fn suppress_deferred_modern_resource_metadata(resource: &mut Resource) {
+    resource.meta = None;
+}
+
+pub(crate) fn suppress_deferred_modern_template_metadata(template: &mut ResourceTemplate) {
+    template.meta = None;
+}
+
+pub(crate) fn suppress_deferred_modern_prompt_metadata(prompt: &mut Prompt) {
+    prompt.meta = None;
+}
+
 pub(crate) fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
     if let Some(ref desc) = tool.description {
         let sanitized = sanitize_description(desc);

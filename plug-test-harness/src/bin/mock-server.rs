@@ -80,6 +80,99 @@ struct Args {
     /// child-process stdio boundary.
     #[arg(long, default_value_t = false)]
     legacy_tasks: bool,
+
+    /// Lifecycle fixture: `rmcp` accepts both eras, `legacy-only` rejects
+    /// server/discover, and `modern-only` rejects initialize.
+    #[arg(long, default_value = "rmcp")]
+    lifecycle: String,
+
+    /// Optional newline-delimited request-method log for deterministic
+    /// lifecycle sequence assertions.
+    #[arg(long)]
+    request_log_file: Option<String>,
+}
+
+async fn append_request_log(path: Option<&str>, method: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(format!("{method}\n").as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+async fn serve_lifecycle_stdio(mode: &str, request_log_file: Option<&str>) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = lines.next_line().await? {
+        let request: serde_json::Value = serde_json::from_str(&line)?;
+        let method = request["method"].as_str().unwrap_or_default();
+        append_request_log(request_log_file, method).await?;
+        let Some(id) = request.get("id").cloned() else {
+            continue;
+        };
+        let response = match (mode, method) {
+            ("legacy-only", "server/discover") | ("modern-only", "initialize") => {
+                serde_json::json!({
+                    "jsonrpc":"2.0","id":id,
+                    "error":{"code":-32601,"message":method}
+                })
+            }
+            ("legacy-only", "initialize") => serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{"tools":{"listChanged":false}},
+                    "serverInfo":{"name":"mock-legacy-only","version":"0.1.0"}
+                }
+            }),
+            ("modern-only", "server/discover") => serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{
+                    "resultType":"complete",
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{"tools":{"listChanged":false}},
+                    "ttlMs":0,
+                    "cacheScope":"private",
+                    "_meta":{"io.modelcontextprotocol/serverInfo":{
+                        "name":"mock-modern-only","version":"0.1.0"
+                    }}
+                }
+            }),
+            (_, "tools/list") => serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{
+                    "resultType":"complete",
+                    "tools":[{
+                        "name":"echo","description":"echo","inputSchema":{"type":"object"},
+                        "_meta":{"io.modelcontextprotocol/deferredFixture":true}
+                    }]
+                }
+            }),
+            (_, "tools/call") => serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{
+                    "resultType":"complete",
+                    "content":[{"type":"text","text":"lifecycle fixture echo"}],
+                    "isError":false
+                }
+            }),
+            _ => serde_json::json!({
+                "jsonrpc":"2.0","id":id,
+                "error":{"code":-32601,"message":method}
+            }),
+        };
+        stdout
+            .write_all(serde_json::to_string(&response)?.as_bytes())
+            .await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+    }
+    Ok(())
 }
 
 async fn serve_legacy_tasks_stdio() -> anyhow::Result<()> {
@@ -540,6 +633,13 @@ async fn main() -> anyhow::Result<()> {
     if args.legacy_tasks {
         return serve_legacy_tasks_stdio().await;
     }
+    if matches!(args.lifecycle.as_str(), "legacy-only" | "modern-only") {
+        return serve_lifecycle_stdio(&args.lifecycle, args.request_log_file.as_deref()).await;
+    }
+    anyhow::ensure!(
+        args.lifecycle == "rmcp",
+        "--lifecycle must be rmcp, legacy-only, or modern-only"
+    );
 
     // Set up tracing to stderr
     tracing_subscriber::fmt()

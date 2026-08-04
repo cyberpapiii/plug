@@ -2444,6 +2444,9 @@ async fn connect_subscribable_upstream(
         tools,
         capabilities,
         upstream: None,
+        protocol_era: crate::protocol::ProtocolEra::Legacy,
+        selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+        protocol_gate_state: 0,
         health: ServerHealth::Healthy,
     }
 }
@@ -2455,6 +2458,7 @@ fn subscribable_test_server_config() -> crate::config::ServerConfig {
         env: HashMap::new(),
         enabled: true,
         transport: crate::config::TransportType::Stdio,
+        protocol_mode: Default::default(),
         url: None,
         auth_token: None,
         auth: None,
