@@ -235,7 +235,8 @@ branch was considered releasable:
 
 - Legacy OAuth credentials without a verified issuer now fail closed and ask
   for reauthorization instead of being silently attached to a newly discovered
-  authority.
+  authority. Startup detects that legacy file state before touching Keychain,
+  so a token that cannot be admitted does not create a useless password prompt.
 - Duplicate in-flight JSON-RPC IDs from the same modern principal are rejected
   atomically, so cancellation can never target the wrong operation.
 - Expired or revoked principals are removed from the downstream OAuth lifecycle,

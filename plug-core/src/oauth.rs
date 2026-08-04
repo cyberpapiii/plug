@@ -88,6 +88,7 @@ static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
 struct TestCredentialEnvironment {
     tokens_dir: PathBuf,
     keyring: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    keyring_reads: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     failing_keyring_writes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
@@ -102,6 +103,7 @@ pub fn install_test_credential_environment(tokens_dir: PathBuf) {
     let environment = TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
         tokens_dir: tokens_dir.clone(),
         keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
+        keyring_reads: std::sync::Mutex::new(std::collections::HashMap::new()),
         failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
     assert_eq!(
@@ -550,6 +552,12 @@ impl CompositeCredentialStore {
 
     fn raw_keyring_json(&self) -> Option<String> {
         if let Some(environment) = test_credential_environment() {
+            *environment
+                .keyring_reads
+                .lock()
+                .expect("test keyring read-count mutex poisoned")
+                .entry(self.server_name.clone())
+                .or_default() += 1;
             return environment
                 .keyring
                 .lock()
@@ -562,24 +570,24 @@ impl CompositeCredentialStore {
 
     fn probe_bound_pair(&self) -> BoundPairProbe {
         let file_json = self.raw_file_json();
-        let keyring_json = self.raw_keyring_json();
         let file = file_json
             .as_deref()
             .and_then(|json| serde_json::from_str::<PersistedCredentialEnvelope>(json).ok());
+
+        // The protected file mirror is the runtime admission gate. Legacy,
+        // missing, or malformed file state cannot form a verified pair, so do
+        // not wake macOS Keychain merely to reach the same fail-closed result.
+        // An explicit authorization flow rewrites both stores as one bound
+        // generation; only then is a Keychain comparison useful.
+        let Some(PersistedCredentialEnvelope::Bound(file)) = file else {
+            return BoundPairProbe::NotBound;
+        };
+
+        let keyring_json = self.raw_keyring_json();
         let keyring = keyring_json
             .as_deref()
             .and_then(|json| serde_json::from_str::<PersistedCredentialEnvelope>(json).ok());
-
-        let any_bound = matches!(&file, Some(PersistedCredentialEnvelope::Bound(_)))
-            || matches!(&keyring, Some(PersistedCredentialEnvelope::Bound(_)));
-        if !any_bound {
-            return BoundPairProbe::NotBound;
-        }
-        let (
-            Some(PersistedCredentialEnvelope::Bound(file)),
-            Some(PersistedCredentialEnvelope::Bound(keyring)),
-        ) = (file, keyring)
-        else {
+        let Some(PersistedCredentialEnvelope::Bound(keyring)) = keyring else {
             warn!(server = %self.server_name, "incomplete issuer-bound credential mirror rejected");
             return BoundPairProbe::Invalid;
         };
@@ -2230,6 +2238,18 @@ mod tests {
         assert_eq!(
             token, None,
             "unbound legacy token must require reauthorization"
+        );
+        assert_eq!(
+            test_credential_environment()
+                .expect("test credential environment")
+                .keyring_reads
+                .lock()
+                .unwrap()
+                .get(&name)
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "legacy file state must fail closed before touching Keychain"
         );
         assert_eq!(current_access_token(&name), None);
         assert!(matches!(
