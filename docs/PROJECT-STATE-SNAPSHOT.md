@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after the 2026-07-13 RMCP 2.2 migration and stable dependency refresh.
+Baseline: `main` after PR #68 merged the 2026-08-04 dual-era MCP modernization.
 
 This is the canonical current-state doc for the project.
 
@@ -28,8 +28,8 @@ Implemented on `main`:
 - reconnecting IPC proxy sessions with capability, subscription, and log-level replay plus a read-silence watchdog
 - session-store seam / stateless prep
 - downstream protocol-version validation
-- upstream MCP-Protocol-Version send-side (provided by RMCP 2.2.0's StreamableHttpClientTransport after initialization; repo-local confidence test confirms)
-- RMCP 2.2.0 with spec-aligned `ContentBlock`, resource, prompt, task, elicitation, and cancellation models while continuing to negotiate MCP `2025-11-25`
+- upstream MCP-Protocol-Version send-side with requested/selected protocol telemetry
+- exact RMCP 3.1.0 with explicit legacy/modern protocol-era policy; legacy MCP `2025-11-25` remains the default while gated MCP `2026-07-28` paths are available for proven peers
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation reverse-request forwarding across stdio, HTTP, and daemon IPC
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
@@ -90,6 +90,9 @@ Implemented on `main`:
 - reload/reconnect installation coordinated through one material-configuration check
 - centralized config env traversal reused by doctor env checks, with broader coverage across config fields
 - stricter runtime-truth handling across `status`, `tools`, `servers`, `clients`, and `doctor` when the daemon is reachable but IPC/runtime inspection fails
+- gated MCP `2026-07-28` downstream discovery/sessionless HTTP and upstream `legacy | auto | modern` negotiation
+- modern principal-owned task lifecycle, admitted extension/schema/trace propagation, and secure native modern-to-modern multi-round `tools/call` continuations
+- issuer-bound upstream OAuth credentials with fail-closed handling for legacy unbound records
 
 Partial on `main`:
 
@@ -98,28 +101,13 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-The local branch `codex/mcp-2026-modernization` contains a reviewed dual-era
-MCP modernization program that is not yet on `main`:
+No roadmap-relevant implementation is currently classified as `exists off-main`.
 
-- exact RMCP 3.1.0 with legacy MCP `2025-11-25` behavior preserved by default
-- explicit legacy/modern protocol-era policy and requested/selected protocol
-  observability in both directions
-- issuer-bound OAuth credentials and fail-closed durable-operation policy
-- gated MCP `2026-07-28` downstream discovery/sessionless HTTP and upstream
-  `legacy | auto | modern` negotiation
-- gated modern task lifecycle support with ownership, quota, cancellation, and
-  cleanup enforcement
-- admitted extension metadata, Apps/UI descriptors, schemas, and W3C trace
-  propagation through safe boundaries
-- authenticated, quota-bound, single-use native modern-to-modern multi-round
-  `tools/call` continuations
-
-Both global modern protocol gates default to off. Legacy clients and servers
-keep their current path. Modern listeners, mixed-era multi-round bridging,
-task-plus-multi-round calls, Apps/UI capability advertisement, and synthesized
-multi-upstream cache directives remain suppressed where Plug cannot yet prove
-the complete contract. These changes become `done on main` only after the
-branch is merged and the post-merge truth pass succeeds.
+The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
+modern protocol gates still default to off. Modern listeners, mixed-era
+multi-round bridging, task-plus-multi-round calls, Apps/UI capability
+advertisement, and synthesized multi-upstream cache directives remain missing
+and are intentionally suppressed rather than advertised.
 
 ## Release Status
 

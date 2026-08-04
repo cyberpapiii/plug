@@ -1,16 +1,15 @@
 # Plug MCP 2026 dual-era modernization
 
-**Development-branch release notes — August 4, 2026**
+**Released on `main` — August 4, 2026**
 
-These notes describe the current modernization branch. They do not claim that
-the changes are on `main`, published in a release, or installed and running on
-your machine. Until the branch is merged, released, and reinstalled, your live
-Plug remains unchanged.
+PR #68 is merged on `main`, and the signed binary is installed and running on
+this machine. The live daemon came back with 25 connected clients; Exa is
+healthy with its bearer credential and eight tools.
 
 ## The short version
 
 Plug can now grow into MCP `2026-07-28` without breaking the clients and servers
-you already use. The branch adds a real modern protocol path alongside the
+you already use. The release adds a real modern protocol path alongside the
 legacy path, upgrades the Rust MCP foundation to RMCP `3.1.0`, and keeps both
 modern gates off by default until real-peer conformance testing is complete.
 
@@ -259,7 +258,7 @@ self-test. All passed.
 
 ## Release and installation posture
 
-The branch pins RMCP to exactly `3.1.0` and carries repository-level tests for
+The release pins RMCP to exactly `3.1.0` and carries repository-level tests for
 the implemented behavior. Source tests are necessary but are not sufficient to
 turn a new wire protocol on by default.
 
@@ -268,6 +267,13 @@ an official or reference modern client and server, at least one independent
 modern client and server, the real installed clients listed above, OAuth flows,
 daemon restart, installed-binary health checks, and a rollback rehearsal.
 
-Until that evidence exists in a merged release and the release is installed,
-the current machine should be treated as running its previously installed Plug,
-not this modernization branch.
+The final GitHub matrix passed formatting and Clippy, macOS and Ubuntu tests,
+Rust 1.88 compatibility, both cross-compilation checks, dependency advisories,
+and the 10 MiB binary-size gate. The local signed install is running from
+`~/.cargo/bin/plug` with the stable `Plug Local Signing` identity.
+
+Notion, Todoist, and Krisp currently report `AuthRequired`. Their older token
+files predate issuer binding, so Plug refuses to silently trust or relabel them;
+each needs one explicit OAuth consent flow. Exa and the other non-OAuth
+upstreams are healthy. This is a deliberate security cutover, not lost API-key
+data.
