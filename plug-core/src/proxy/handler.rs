@@ -1,4 +1,5 @@
 use super::*;
+use crate::dispatch::DownstreamContext as _;
 use crate::legacy_tasks::{
     CancelTaskParams as LegacyCancelTaskParams, GetTaskParams as LegacyGetTaskParams,
     GetTaskPayloadParams as LegacyGetTaskPayloadParams,
@@ -34,14 +35,13 @@ impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
         context
     }
 
-    /// stdio's `tools/call` handler can only return a `CallToolResult`, so its
-    /// handler rejects legacy task-augmented calls before shared dispatch.
+    /// Modern RMCP can return the SEP-2663 task result union. Legacy stdio
+    /// still rejects the removed task-augmented request shape.
     fn supports_tasks(&self) -> bool {
-        false
+        self.protocol_version == ProtocolVersion::V_2026_07_28
     }
 
     fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        // Never reached while `supports_tasks()` is false; provided for completeness.
         Ok(TaskOwner::new(Arc::<str>::from(
             format!("stdio:{}", self.client_id).as_str(),
         )))
@@ -200,6 +200,47 @@ impl ProxyHandler {
         }
     }
 
+    fn admit_modern_task_method(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<crate::protocol::QuotaLease, McpError> {
+        if !self.router.supports_tasks() {
+            return Err(McpError::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "tasks extension is not available",
+                None,
+            ));
+        }
+        if !context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks())
+        {
+            return Err(McpError::missing_required_client_capability(
+                ClientCapabilities::builder().enable_tasks().build(),
+            ));
+        }
+        let protocol_version = context
+            .protocol_version()
+            .unwrap_or_else(crate::protocol::supported_protocol_version);
+        let adapter = self.downstream_context_for_call(
+            context.id.clone(),
+            protocol_version,
+            context.client_info(),
+            context.ct.clone(),
+        );
+        let downstream = adapter.downstream_call_context();
+        downstream.authorize(crate::protocol::MethodFamily::Tasks)?;
+        if downstream
+            .principal_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| !lifecycle.is_active())
+        {
+            return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
+                .into_error(downstream.protocol_era));
+        }
+        self.router.admit_modern_request(&downstream)
+    }
+
     #[cfg(test)]
     pub(crate) fn client_id(&self) -> Arc<str> {
         Arc::clone(&self.client_id)
@@ -217,7 +258,17 @@ impl ServerHandler for ProxyHandler {
     }
 
     fn get_info(&self) -> ServerInfo {
-        InitializeResult::new(self.router.synthesized_capabilities())
+        let mut capabilities = self.router.synthesized_capabilities();
+        if self.router.modern_downstream_enabled() && self.router.supports_tasks() {
+            capabilities
+                .extensions
+                .get_or_insert_with(Default::default)
+                .insert(
+                    rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                    Default::default(),
+                );
+        }
+        InitializeResult::new(capabilities)
             .with_server_info(plug_implementation())
             .with_protocol_version(crate::protocol::supported_protocol_version())
     }
@@ -255,6 +306,15 @@ impl ServerHandler for ProxyHandler {
             // extension stay unadvertised until their bridges have their own
             // conformance evidence.
             crate::protocol::suppress_unimplemented_modern_capabilities(&mut info.capabilities);
+            if self.router.supports_tasks() {
+                info.capabilities
+                    .extensions
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                        Default::default(),
+                    );
+            }
             Ok(DiscoverResult::from_server_info(
                 self.supported_protocol_versions().into_owned(),
                 info,
@@ -638,6 +698,13 @@ impl ServerHandler for ProxyHandler {
                     None => request.meta = Some(context.meta.clone()),
                 }
             }
+            let modern_tasks = context
+                .protocol_version()
+                .is_some_and(|version| version == ProtocolVersion::V_2026_07_28)
+                && context
+                    .client_capabilities()
+                    .is_some_and(|capabilities| capabilities.supports_tasks())
+                && self.router.supports_tasks();
             if request
                 .meta
                 .as_ref()
@@ -647,6 +714,12 @@ impl ServerHandler for ProxyHandler {
                     "stdio does not support task-augmented tools/call".to_string(),
                     None,
                 ));
+            }
+            if modern_tasks {
+                request.meta.get_or_insert_with(Default::default).insert(
+                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                    serde_json::json!({}),
+                );
             }
 
             let protocol_version = context
@@ -658,15 +731,71 @@ impl ServerHandler for ProxyHandler {
                 context.client_info(),
                 context.ct.clone(),
             );
+            let _modern_request_lease = if modern_tasks {
+                Some(
+                    self.router
+                        .admit_modern_request(&ctx.downstream_call_context())?,
+                )
+            } else {
+                None
+            };
             match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
                 crate::dispatch::ToolCallOutcome::Called(result) => Ok(result.into()),
-                // `supports_tasks()` is false for stdio, so a task outcome is
-                // unreachable after the explicit legacy task rejection above.
+                crate::dispatch::ToolCallOutcome::TaskCreated(result) if modern_tasks => {
+                    Ok(rmcp::model::CreateTaskResult::new((&result.task).into()).into())
+                }
                 crate::dispatch::ToolCallOutcome::TaskCreated(_) => Err(McpError::internal_error(
-                    "stdio tools/call unexpectedly produced a task result".to_string(),
+                    "legacy stdio unexpectedly produced a task result".to_string(),
                     None,
                 )),
             }
+        }
+    }
+
+    fn get_task(
+        &self,
+        request: rmcp::model::GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::GetTaskResult, McpError>> + Send + '_ {
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move {
+            let _request_lease = self.admit_modern_task_method(&context)?;
+            self.router
+                .get_modern_task_for_owner(&owner, &request.task_id)
+                .await
+        }
+    }
+
+    fn update_task(
+        &self,
+        request: rmcp::model::UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let _request_lease = self.admit_modern_task_method(&context)?;
+            let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+            self.router
+                .validate_task_owner(&owner, &request.task_id)
+                .await?;
+            Err(McpError::invalid_request(
+                "this task has no outstanding input request",
+                None,
+            ))
+        }
+    }
+
+    fn cancel_task(
+        &self,
+        request: rmcp::model::CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        async move {
+            let _request_lease = self.admit_modern_task_method(&context)?;
+            self.router
+                .cancel_task_for_owner(&owner, &request.task_id)
+                .await?;
+            Ok(())
         }
     }
 

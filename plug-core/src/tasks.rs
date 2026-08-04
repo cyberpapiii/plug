@@ -557,6 +557,75 @@ impl TaskStore {
         Ok(GetTaskResult::new(record.task.clone()))
     }
 
+    /// Project Plug's retained task record onto SEP-2663's status-specific
+    /// `DetailedTask` shape. The legacy task model intentionally stays inside
+    /// the store; modern wire vocabulary is created only at this adapter edge.
+    pub fn get_modern_for_owner(
+        &mut self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<rmcp::model::GetTaskResult, McpError> {
+        self.prune_expired();
+        let record = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| task_not_found(task_id))?;
+        ensure_owner(owner, record)?;
+
+        let task = rmcp::model::Task::from(&record.task);
+        let payload = match record.task.status {
+            TaskStatus::Working => rmcp::model::TaskPayload::Working,
+            TaskStatus::InputRequired => {
+                return Err(McpError::invalid_request(
+                    "task input requests are not bridged to modern clients yet",
+                    None,
+                ));
+            }
+            TaskStatus::Completed => {
+                let result = record
+                    .result
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .ok_or_else(|| {
+                        McpError::internal_error("task result missing or malformed", None)
+                    })?;
+                rmcp::model::TaskPayload::Completed { result }
+            }
+            TaskStatus::Failed => rmcp::model::TaskPayload::Failed {
+                error: serde_json::Map::from_iter([
+                    (
+                        "code".to_string(),
+                        serde_json::json!(ErrorCode::INTERNAL_ERROR.0),
+                    ),
+                    (
+                        "message".to_string(),
+                        serde_json::json!(
+                            record
+                                .task
+                                .status_message
+                                .as_deref()
+                                .unwrap_or("task failed")
+                        ),
+                    ),
+                ]),
+            },
+            TaskStatus::Cancelled => rmcp::model::TaskPayload::Cancelled,
+        };
+        Ok(rmcp::model::GetTaskResult::new(
+            rmcp::model::DetailedTask::new(task, payload),
+        ))
+    }
+
+    pub fn validate_owner(&mut self, owner: &TaskOwner, task_id: &str) -> Result<(), McpError> {
+        self.prune_expired();
+        let record = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| task_not_found(task_id))?;
+        ensure_owner(owner, record)
+    }
+
     pub fn sync_from_upstream_for_owner(
         &mut self,
         owner: &TaskOwner,
@@ -732,6 +801,92 @@ fn paginate_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modern_status(result: &rmcp::model::GetTaskResult) -> rmcp::model::TaskStatus {
+        result.task.task.status
+    }
+
+    #[test]
+    fn modern_projection_covers_every_task_state_and_owner_boundary() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
+        let other = TaskOwner::new(Arc::<str>::from("principal:b"));
+
+        let working = store.create(owner.clone(), "working").expect("working");
+        assert_eq!(
+            modern_status(
+                &store
+                    .get_modern_for_owner(&owner, &working.task_id)
+                    .expect("working projection")
+            ),
+            rmcp::model::TaskStatus::Working
+        );
+
+        let input = store.create(owner.clone(), "input").expect("input");
+        let input_record = store.tasks.get_mut(&input.task_id).expect("input record");
+        input_record.task.status = TaskStatus::InputRequired;
+        let error = store
+            .get_modern_for_owner(&owner, &input.task_id)
+            .expect_err("residual legacy input-required state must fail closed");
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert!(error.message.contains("not bridged"));
+
+        let completed = store.create(owner.clone(), "completed").expect("completed");
+        store.complete(
+            &completed.task_id,
+            serde_json::json!({"content": [], "isError": false}),
+        );
+        let completed = store
+            .get_modern_for_owner(&owner, &completed.task_id)
+            .expect("completed projection");
+        assert!(matches!(
+            completed.task.payload,
+            rmcp::model::TaskPayload::Completed { .. }
+        ));
+
+        let failed = store.create(owner.clone(), "failed").expect("failed");
+        store.fail(&failed.task_id, "boom".to_string());
+        let failed = store
+            .get_modern_for_owner(&owner, &failed.task_id)
+            .expect("failed projection");
+        assert!(matches!(
+            failed.task.payload,
+            rmcp::model::TaskPayload::Failed { .. }
+        ));
+
+        let cancelled = store.create(owner.clone(), "cancelled").expect("cancelled");
+        store
+            .mark_cancelled(&owner, &cancelled.task_id)
+            .expect("cancel");
+        assert_eq!(
+            modern_status(
+                &store
+                    .get_modern_for_owner(&owner, &cancelled.task_id)
+                    .expect("cancelled projection")
+            ),
+            rmcp::model::TaskStatus::Cancelled
+        );
+
+        assert!(
+            store
+                .get_modern_for_owner(&other, &working.task_id)
+                .is_err(),
+            "another principal must not observe the task"
+        );
+    }
+
+    #[test]
+    fn modern_completed_projection_fails_closed_without_object_result() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
+        let task = store.create(owner.clone(), "completed").expect("task");
+        store.complete(&task.task_id, serde_json::json!("not-an-object"));
+
+        let error = store
+            .get_modern_for_owner(&owner, &task.task_id)
+            .expect_err("malformed retained result must not produce invalid modern wire data");
+        assert!(error.message.contains("malformed"));
+    }
 
     #[test]
     fn task_owner_isolated_for_info_and_result_access() {

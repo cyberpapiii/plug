@@ -697,6 +697,29 @@ impl ToolRouter {
         self.modern_downstream_enabled.load(Ordering::Acquire)
     }
 
+    /// Reserve one process-wide modern request slot before adapter code can
+    /// trigger routing, durable state, or upstream effects. Anonymous local
+    /// transports receive a stable process-scoped quota identity; durable
+    /// method policy still independently requires an authenticated principal.
+    pub fn admit_modern_request(
+        &self,
+        context: &DownstreamCallContext,
+    ) -> Result<crate::protocol::QuotaLease, McpError> {
+        let principal = context.principal.clone().unwrap_or_else(|| {
+            PrincipalId::stdio_process(stable_instance_uuid(
+                "modern-request",
+                context.client_id.as_ref(),
+            ))
+        });
+        self.admission_quotas
+            .try_acquire(
+                &principal,
+                crate::protocol::QuotaResource::ConcurrentModernRequests,
+                1,
+            )
+            .map_err(|outcome| outcome.into_error(context.protocol_era))
+    }
+
     // ── Logging channel ──────────────────────────────────────────────────
 
     pub fn subscribe_logging(&self) -> broadcast::Receiver<ProtocolNotification> {

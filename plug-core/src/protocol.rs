@@ -511,6 +511,16 @@ pub fn rewrite_legacy_result(value: &mut serde_json::Value, task_response: bool)
         .get_mut("capabilities")
         .and_then(serde_json::Value::as_object_mut)
     {
+        let remove_extensions = capabilities
+            .get_mut("extensions")
+            .and_then(serde_json::Value::as_object_mut)
+            .is_some_and(|extensions| {
+                extensions.remove(rmcp::model::TASKS_EXTENSION_ID);
+                extensions.is_empty()
+            });
+        if remove_extensions {
+            capabilities.remove("extensions");
+        }
         let (tasks, remove_experimental) = capabilities
             .get_mut("experimental")
             .and_then(serde_json::Value::as_object_mut)
@@ -765,5 +775,25 @@ mod tests {
         let resources = capabilities.resources.expect("resources remain advertised");
         assert_eq!(resources.subscribe, None);
         assert_eq!(resources.list_changed, Some(true));
+    }
+
+    #[test]
+    fn legacy_capability_rewrite_removes_modern_tasks_extension() {
+        let mut value = serde_json::json!({
+            "capabilities": {
+                "extensions": {
+                    "io.modelcontextprotocol/tasks": {}
+                },
+                "experimental": {
+                    "plug.dev/legacy-tasks": {}
+                }
+            }
+        });
+
+        rewrite_legacy_result(&mut value, false);
+
+        assert_eq!(value["capabilities"]["tasks"], serde_json::json!({}));
+        assert!(value["capabilities"].get("extensions").is_none());
+        assert!(value["capabilities"].get("experimental").is_none());
     }
 }

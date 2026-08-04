@@ -35,6 +35,7 @@ use crate::mcp_http_headers::{
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
 use crate::session::{SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
+use crate::tasks::TaskOwner;
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -240,7 +241,55 @@ fn projected_modern_capabilities(
         projected.completions = source.completions;
     }
     crate::protocol::suppress_unimplemented_modern_capabilities(&mut projected);
+    if context
+        .policy_decision(crate::protocol::MethodFamily::Tasks)
+        .is_allowed()
+        && router.supports_tasks()
+    {
+        projected
+            .extensions
+            .get_or_insert_with(Default::default)
+            .insert(
+                rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                Default::default(),
+            );
+    }
     projected
+}
+
+fn admit_modern_task_operation(
+    router: &ToolRouter,
+    context: &DownstreamCallContext,
+    request_meta: Option<&RequestMetaObject>,
+) -> Result<TaskOwner, McpError> {
+    if !router.supports_tasks() {
+        return Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "tasks extension is not available",
+            None,
+        ));
+    }
+    if !request_meta
+        .and_then(RequestMetaObject::client_capabilities)
+        .is_some_and(|capabilities| capabilities.supports_tasks())
+    {
+        return Err(McpError::missing_required_client_capability(
+            ClientCapabilities::builder().enable_tasks().build(),
+        ));
+    }
+    context.authorize(crate::protocol::MethodFamily::Tasks)?;
+    if context
+        .principal_lifecycle
+        .as_ref()
+        .is_some_and(|lifecycle| !lifecycle.is_active())
+    {
+        return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
+            .into_error(context.protocol_era));
+    }
+    let principal = context.principal.as_ref().ok_or_else(|| {
+        crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
+    })?;
+    Ok(TaskOwner::new(principal.owner_key()))
 }
 
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
@@ -301,7 +350,7 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     }
 
     fn supports_tasks(&self) -> bool {
-        self.protocol_era == crate::protocol::ProtocolEra::Legacy
+        true
     }
 
     /// Session-existence probe for the enqueue path's post-guard liveness
@@ -1807,6 +1856,19 @@ async fn handle_request(
             Arc::clone(&trace_id),
         )
     };
+    let _modern_request_lease = if modern {
+        match state.router.admit_modern_request(&policy_context) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     match req.request {
         ClientRequest::DiscoverRequest(_) if modern => {
@@ -1985,12 +2047,24 @@ async fn handle_request(
             // progress tokens and Plug's rewritten legacy `params.task`
             // marker disappear before dispatch, turning task-wrapped calls
             // into synchronous calls.
+            let modern_tasks = modern
+                && request_meta
+                    .as_ref()
+                    .and_then(RequestMetaObject::client_capabilities)
+                    .is_some_and(|capabilities| capabilities.supports_tasks())
+                && state.router.supports_tasks();
             let mut params = call_req.params;
             if let Some(extension_meta) = call_req.extensions.get::<RequestMetaObject>() {
                 match params.meta.as_mut() {
                     Some(params_meta) => params_meta.extend(extension_meta.clone()),
                     None => params.meta = Some(extension_meta.clone()),
                 }
+            }
+            if modern_tasks {
+                params.meta.get_or_insert_with(Default::default).insert(
+                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                    serde_json::json!({}),
+                );
             }
             let response_msg =
                 match crate::dispatch::dispatch_tools_call(&state.router, &ctx, params).await {
@@ -2001,13 +2075,17 @@ async fn handle_request(
                         )
                     }
                     Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
-                        ServerJsonRpcMessage::response(
+                        let result = if modern_tasks {
+                            ServerResult::CreateTaskResult(rmcp::model::CreateTaskResult::new(
+                                (&result.task).into(),
+                            ))
+                        } else {
                             ServerResult::CustomResult(CustomResult::new(
                                 serde_json::to_value(result)
                                     .expect("legacy task result serializes"),
-                            )),
-                            request_id,
-                        )
+                            ))
+                        };
+                        ServerJsonRpcMessage::response(result, request_id)
                     }
                     Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
                 };
@@ -2098,6 +2176,84 @@ async fn handle_request(
                 .into_response()),
                 Err(error) => json_response(&ServerJsonRpcMessage::error(error, Some(request_id))),
             }
+        }
+
+        ClientRequest::GetTaskRequest(task_req) if modern => {
+            let owner = match admit_modern_task_operation(
+                state.router.as_ref(),
+                &policy_context,
+                request_meta.as_ref(),
+            ) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return json_response_for_era(
+                        &ServerJsonRpcMessage::error(error, Some(request_id)),
+                        era,
+                    );
+                }
+            };
+            let response = match state
+                .router
+                .get_modern_task_for_owner(&owner, &task_req.params.task_id)
+                .await
+            {
+                Ok(result) => {
+                    ServerJsonRpcMessage::response(ServerResult::GetTaskResult(result), request_id)
+                }
+                Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
+            };
+            json_response_for_era(&response, era)
+        }
+
+        ClientRequest::CancelTaskRequest(task_req) if modern => {
+            let owner = match admit_modern_task_operation(
+                state.router.as_ref(),
+                &policy_context,
+                request_meta.as_ref(),
+            ) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return json_response_for_era(
+                        &ServerJsonRpcMessage::error(error, Some(request_id)),
+                        era,
+                    );
+                }
+            };
+            let response = match state
+                .router
+                .cancel_task_for_owner(&owner, &task_req.params.task_id)
+                .await
+            {
+                Ok(_) => ServerJsonRpcMessage::response(
+                    ServerResult::TaskAckResult(TaskAckResult::new()),
+                    request_id,
+                ),
+                Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
+            };
+            json_response_for_era(&response, era)
+        }
+
+        ClientRequest::UpdateTaskRequest(task_req) if modern => {
+            let error = match admit_modern_task_operation(
+                state.router.as_ref(),
+                &policy_context,
+                request_meta.as_ref(),
+            ) {
+                Ok(owner) => match state
+                    .router
+                    .validate_task_owner(&owner, &task_req.params.task_id)
+                    .await
+                {
+                    Ok(()) => McpError::new(
+                        ErrorCode::INVALID_REQUEST,
+                        "this task has no outstanding input request",
+                        None,
+                    ),
+                    Err(error) => error,
+                },
+                Err(error) => error,
+            };
+            json_response_for_era(&ServerJsonRpcMessage::error(error, Some(request_id)), era)
         }
 
         ClientRequest::ListResourcesRequest(list_req) => {
@@ -2508,6 +2664,7 @@ fn json_response_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::RouterSnapshot;
     use axum::body::Body;
     use http::Request as HttpRequest;
     use std::sync::atomic::AtomicUsize;
@@ -2637,6 +2794,59 @@ mod tests {
         })
     }
 
+    fn enable_test_task_surface(router: &ToolRouter) {
+        router.replace_snapshot(RouterSnapshot {
+            routes: HashMap::from([(
+                "Mock__echo".to_string(),
+                ("mock".to_string(), "echo".to_string()),
+            )]),
+            tools_all: Arc::new(vec![Tool::new(
+                std::borrow::Cow::Borrowed("Mock__echo"),
+                std::borrow::Cow::Borrowed("Echo"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        });
+    }
+
+    fn modern_task_meta(client_supports_tasks: bool) -> RequestMetaObject {
+        let capabilities = if client_supports_tasks {
+            ClientCapabilities::builder().enable_tasks().build()
+        } else {
+            ClientCapabilities::default()
+        };
+        RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            Implementation::new("modern-task-test", "1.0"),
+            capabilities,
+        )
+    }
+
+    fn modern_task_policy_context(
+        gate_enabled: bool,
+        scopes: impl IntoIterator<Item = String>,
+    ) -> DownstreamCallContext {
+        DownstreamCallContext::http("task-client", RequestId::Number(1))
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+            )
+            .with_modern_direction_enabled(gate_enabled)
+            .with_authorization(
+                crate::types::PrincipalId::configured_credential("task-test", 1),
+                scopes,
+            )
+    }
+
     fn modern_request(method: &str, mut params: serde_json::Value) -> HttpRequest<Body> {
         params.as_object_mut().expect("params object").insert(
             "_meta".to_string(),
@@ -2757,6 +2967,78 @@ mod tests {
         assert!(value["result"]["capabilities"]["extensions"].is_null());
         assert!(value["result"]["capabilities"]["experimental"].is_null());
         assert!(value["result"]["capabilities"]["logging"].is_null());
+    }
+
+    #[test]
+    fn modern_http_task_admission_matrix_is_consistent() {
+        let state = test_state();
+        let allowed = modern_task_policy_context(true, ["tasks:use".to_string()]);
+        let task_meta = modern_task_meta(true);
+
+        let unavailable =
+            admit_modern_task_operation(state.router.as_ref(), &allowed, Some(&task_meta))
+                .expect_err("server without task surface must reject all task methods");
+        assert_eq!(unavailable.code, ErrorCode::METHOD_NOT_FOUND);
+
+        enable_test_task_surface(state.router.as_ref());
+        let missing_client = admit_modern_task_operation(
+            state.router.as_ref(),
+            &allowed,
+            Some(&modern_task_meta(false)),
+        )
+        .expect_err("client capability is mandatory");
+        assert_eq!(
+            missing_client.code,
+            ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+        );
+
+        let denied = modern_task_policy_context(true, ["tools:read".to_string()]);
+        let permission =
+            admit_modern_task_operation(state.router.as_ref(), &denied, Some(&task_meta))
+                .expect_err("task scope is mandatory");
+        assert_eq!(
+            permission.code.0,
+            crate::protocol::ProtocolOutcome::PermissionDenied
+                .encode(crate::protocol::ProtocolEra::Modern)
+                .code
+        );
+
+        let gate_off = modern_task_policy_context(false, ["tasks:use".to_string()]);
+        let disabled =
+            admit_modern_task_operation(state.router.as_ref(), &gate_off, Some(&task_meta))
+                .expect_err("live gate must apply to direct task methods");
+        assert_eq!(
+            disabled,
+            crate::protocol::ProtocolOutcome::UnsupportedBridge
+                .into_error(crate::protocol::ProtocolEra::Modern)
+        );
+
+        let owner = admit_modern_task_operation(state.router.as_ref(), &allowed, Some(&task_meta))
+            .expect("fully admitted task method");
+        assert_eq!(
+            owner.as_key(),
+            allowed.principal.as_ref().expect("principal").owner_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_off_rejects_every_modern_http_task_method_before_dispatch() {
+        let state = test_state();
+        enable_test_task_surface(state.router.as_ref());
+        for (method, params) in [
+            ("tasks/get", json!({"taskId":"task_1"})),
+            (
+                "tasks/update",
+                json!({"taskId":"task_1","inputResponses":{}}),
+            ),
+            ("tasks/cancel", json!({"taskId":"task_1"})),
+        ] {
+            let response = build_router(Arc::clone(&state))
+                .oneshot(modern_request(method, params))
+                .await
+                .expect("task response");
+            assert_ne!(response.status(), StatusCode::OK, "{method} escaped gate");
+        }
     }
 
     #[tokio::test]

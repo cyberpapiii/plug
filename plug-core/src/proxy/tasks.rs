@@ -190,7 +190,11 @@ impl super::ToolRouter {
             .map(|context| Arc::clone(&context.trace_id))
             .unwrap_or_else(|| Arc::from(new_trace_id()));
 
-        if let Some(upstream) = self.server_manager.get_upstream(&server_id)
+        let modern_downstream = downstream
+            .as_ref()
+            .is_some_and(|context| context.protocol_era == crate::protocol::ProtocolEra::Modern);
+        if !modern_downstream
+            && let Some(upstream) = self.server_manager.get_upstream(&server_id)
             && crate::protocol::legacy_tasks_capability(&upstream.capabilities)
         {
             let call_timeout = Duration::from_secs(upstream.config.call_timeout_secs);
@@ -504,6 +508,37 @@ impl super::ToolRouter {
             .lock()
             .await
             .get_info_for_owner(owner, task_id)
+    }
+
+    /// SEP-2663 projection of the same retained task record used by legacy
+    /// task clients. Refresh passthrough state first, then let `TaskStore`
+    /// build the status-specific modern payload.
+    pub async fn get_modern_task_for_owner(
+        &self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<rmcp::model::GetTaskResult, McpError> {
+        let info = self.get_task_info_for_owner(owner, task_id).await?;
+        if info.task.status == crate::legacy_tasks::TaskStatus::Completed {
+            // A legacy-native passthrough task created earlier in this process
+            // may later be polled by a modern client under the same durable
+            // principal. Legacy `tasks/get` carries status only; fetch and
+            // cache its separate `tasks/result` payload before projecting the
+            // modern inlined completed result.
+            let _ = self.get_task_result_for_owner(owner, task_id).await?;
+        }
+        self.task_store
+            .lock()
+            .await
+            .get_modern_for_owner(owner, task_id)
+    }
+
+    pub async fn validate_task_owner(
+        &self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<(), McpError> {
+        self.task_store.lock().await.validate_owner(owner, task_id)
     }
 
     pub async fn get_task_result_for_owner(
@@ -1479,6 +1514,30 @@ mod tests {
                         .await;
                     }
                 }
+                "tasks/get" => {
+                    let now = rmcp::task_manager::current_timestamp();
+                    let task = Task::new(
+                        "upstream-task-1".to_string(),
+                        TaskStatus::Completed,
+                        now.clone(),
+                        now,
+                    );
+                    write_gated_legacy_response(
+                        write.as_ref(),
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":task}),
+                    )
+                    .await;
+                }
+                "tasks/result" => {
+                    write_gated_legacy_response(
+                        write.as_ref(),
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+                            "content":[{"type":"text","text":"done"}],
+                            "isError":false
+                        }}),
+                    )
+                    .await;
+                }
                 _ => {
                     write_gated_legacy_response(
                         write.as_ref(),
@@ -1942,6 +2001,101 @@ mod tests {
             principal,
             std::collections::BTreeSet::from(["tools:read".to_string(), "tasks:use".to_string()]),
         )
+    }
+
+    fn authorized_modern_task_context(
+        principal: crate::types::PrincipalId,
+        request_id: i64,
+    ) -> DownstreamCallContext {
+        authorized_task_context(principal, request_id)
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+            )
+            .with_modern_direction_enabled(true)
+    }
+
+    #[tokio::test]
+    async fn modern_downstream_forces_local_wrapper_around_legacy_native_upstream() {
+        let state = GatedTaskUpstreamState::new(false, false);
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        sm.replace_server(
+            "mock",
+            connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
+        )
+        .await;
+        install_single_route(&router, "Mock__echo", "mock", "echo");
+
+        let principal = crate::types::PrincipalId::downstream_oauth(
+            "https://issuer.example",
+            "modern-client",
+            "https://plug.example/mcp",
+        );
+        let owner = TaskOwner::new(principal.owner_key());
+        let created = router
+            .enqueue_tool_task(
+                "Mock__echo",
+                None,
+                None,
+                owner.clone(),
+                None,
+                Some(authorized_modern_task_context(principal, 77)),
+            )
+            .await
+            .expect("create Plug-owned modern task");
+
+        assert_ne!(created.task.task_id, "upstream-task-1");
+        assert!(
+            yield_until(&state.enqueue_entered).await,
+            "ordinary upstream call must start inside the local wrapper"
+        );
+        let upstream = router
+            .task_store
+            .lock()
+            .await
+            .upstream_for_owner(&owner, &created.task.task_id)
+            .expect("task ownership");
+        assert!(
+            matches!(upstream, Some(TaskUpstreamRef::Request { .. })),
+            "modern task must track an ordinary request, never a legacy native task"
+        );
+
+        router.cleanup_tasks_for_owner(&owner).await;
+    }
+
+    #[tokio::test]
+    async fn modern_get_inlines_result_for_legacy_passthrough_completed_in_same_process() {
+        let state = GatedTaskUpstreamState::new(false, true);
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        sm.replace_server("mock", connect_gated_task_upstream("mock", state, 5).await)
+            .await;
+        let owner = TaskOwner::new(Arc::<str>::from("shared-durable-principal"));
+        let local = router
+            .task_store
+            .lock()
+            .await
+            .create_passthrough(
+                owner.clone(),
+                "Mock__echo",
+                &upstream_working_task("upstream-task-1"),
+                TaskUpstreamRef::Task {
+                    server_id: "mock".to_string(),
+                    task_id: "upstream-task-1".to_string(),
+                },
+            )
+            .expect("legacy passthrough record");
+
+        let modern = router
+            .get_modern_task_for_owner(&owner, &local.task_id)
+            .await
+            .expect("modern projection fetches separate legacy result");
+        let rmcp::model::TaskPayload::Completed { result } = modern.task.payload else {
+            panic!("expected completed task payload");
+        };
+        assert_eq!(result["content"][0]["text"], "done");
+        assert_eq!(result["isError"], false);
     }
 
     async fn enqueue_quota_test_task(
