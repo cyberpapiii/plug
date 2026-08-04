@@ -272,8 +272,10 @@ Rust 1.88 compatibility, both cross-compilation checks, dependency advisories,
 and the 10 MiB binary-size gate. The local signed install is running from
 `~/.cargo/bin/plug` with the stable `Plug Local Signing` identity.
 
-Notion, Todoist, and Krisp currently report `AuthRequired`. Their older token
-files predate issuer binding, so Plug refuses to silently trust or relabel them;
-each needs one explicit OAuth consent flow. Exa and the other non-OAuth
-upstreams are healthy. This is a deliberate security cutover, not lost API-key
-data.
+Notion and Todoist have completed fresh OAuth consent flows and are healthy in
+the running daemon. Krisp remains `AuthRequired` because Krisp's authorization
+page limits its MCP integration to Core and Advanced subscriptions; Plug did
+not purchase or change the account plan. Supabase retains credentials but its
+live authorization is degraded and requires a separate refresh. Exa and the
+other non-OAuth upstreams are healthy. The original reauthorization was a
+deliberate issuer-binding security cutover, not lost API-key data.
