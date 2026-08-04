@@ -30,7 +30,8 @@ use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
 use crate::types::{
-    ClientType, LazyToolMode, LazyToolModeOrigin, PrincipalId, ResolvedLazyToolPolicy,
+    ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
+    ResolvedLazyToolPolicy,
 };
 
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -231,6 +232,8 @@ pub struct DownstreamCallContext {
     /// OAuth client generation captured during bearer validation. Durable
     /// admission rechecks it after registering the TaskStore create guard.
     pub principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
+    /// Admitted peer metadata stays opaque to authorization and routing code.
+    pub(crate) extension_envelope: Option<ExtensionEnvelope>,
 }
 
 impl DownstreamCallContext {
@@ -263,6 +266,7 @@ impl DownstreamCallContext {
             cancellation: CancellationToken::new(),
             durable_owner: None,
             principal_lifecycle: None,
+            extension_envelope: None,
         }
     }
 
@@ -291,6 +295,7 @@ impl DownstreamCallContext {
             cancellation: CancellationToken::new(),
             durable_owner: None,
             principal_lifecycle: None,
+            extension_envelope: None,
         }
     }
 
@@ -321,6 +326,7 @@ impl DownstreamCallContext {
             cancellation: CancellationToken::new(),
             durable_owner: None,
             principal_lifecycle: None,
+            extension_envelope: None,
         }
     }
 
@@ -348,6 +354,7 @@ impl DownstreamCallContext {
             cancellation: CancellationToken::new(),
             durable_owner: None,
             principal_lifecycle: None,
+            extension_envelope: None,
         }
     }
 
@@ -373,6 +380,11 @@ impl DownstreamCallContext {
         lifecycle: crate::downstream_oauth::PrincipalLifecycleLease,
     ) -> Self {
         self.principal_lifecycle = Some(lifecycle);
+        self
+    }
+
+    pub(crate) fn with_extension_envelope(mut self, envelope: ExtensionEnvelope) -> Self {
+        self.extension_envelope = Some(envelope);
         self
     }
 
@@ -1464,7 +1476,10 @@ impl ToolRouter {
         let mut server_ctx: HashMap<String, ServerRefreshCtx> = HashMap::new();
         let mut classified: Vec<Classified> = Vec::new();
 
-        for (server_name, tool) in upstream_tools {
+        for (server_name, mut tool) in upstream_tools {
+            // Peer metadata is admitted before the descriptor enters any
+            // cache, enrichment, fingerprint, or operator-observable path.
+            admit_catalog_meta(&mut tool.meta, "tool");
             let mut exposed_name = tool.name.to_string();
 
             let ctx = server_ctx.entry(server_name.clone()).or_insert_with(|| {
@@ -1596,16 +1611,6 @@ impl ToolRouter {
             let upstream_annotations = c.tool.annotations.clone();
             let mut prefixed_tool = c.tool.clone();
             let mut inferred_tool = c.tool.clone();
-            if server_ctx
-                .get(&c.server_name)
-                .and_then(|ctx| ctx.upstream.as_ref())
-                .is_some_and(|upstream| {
-                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
-                })
-            {
-                suppress_deferred_modern_tool_metadata(&mut prefixed_tool);
-                suppress_deferred_modern_tool_metadata(&mut inferred_tool);
-            }
             let upstream_icons = server_ctx
                 .get(&c.server_name)
                 .and_then(|ctx| ctx.icons.clone());
@@ -1724,15 +1729,7 @@ impl ToolRouter {
         let mut resource_routes = HashMap::new();
         let mut resources_vec = Vec::new();
         for (server_name, mut resource) in upstream_resources {
-            if self
-                .server_manager
-                .get_upstream(&server_name)
-                .is_some_and(|upstream| {
-                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
-                })
-            {
-                suppress_deferred_modern_resource_metadata(&mut resource);
-            }
+            admit_catalog_meta(&mut resource.meta, "resource");
             if let Some(existing_server) = resource_routes.get(&resource.uri)
                 && existing_server != &server_name
             {
@@ -1771,15 +1768,7 @@ impl ToolRouter {
 
         let mut resource_templates_vec = Vec::new();
         for (server_name, mut template) in upstream_resource_templates {
-            if self
-                .server_manager
-                .get_upstream(&server_name)
-                .is_some_and(|upstream| {
-                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
-                })
-            {
-                suppress_deferred_modern_template_metadata(&mut template);
-            }
+            admit_catalog_meta(&mut template.meta, "resource-template");
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = template.name.clone();
             let routed_name = crate::tool_naming::build_wire_name(
@@ -1805,15 +1794,7 @@ impl ToolRouter {
         let mut prompt_routes = HashMap::new();
         let mut prompts_vec = Vec::new();
         for (server_name, mut prompt) in upstream_prompts {
-            if self
-                .server_manager
-                .get_upstream(&server_name)
-                .is_some_and(|upstream| {
-                    upstream.protocol_era == crate::protocol::ProtocolEra::Modern
-                })
-            {
-                suppress_deferred_modern_prompt_metadata(&mut prompt);
-            }
+            admit_catalog_meta(&mut prompt.meta, "prompt");
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = prompt.name.clone();
             let routed_name = crate::tool_naming::build_wire_name(
@@ -2210,6 +2191,10 @@ impl ToolRouter {
                 .as_ref()
                 .map(|context| Arc::clone(&context.trace_id))
                 .unwrap_or_else(|| Arc::from(new_trace_id()));
+            let extension_meta = downstream
+                .as_ref()
+                .and_then(|context| context.extension_envelope.as_ref())
+                .and_then(ExtensionEnvelope::to_meta);
 
             // Build the upstream call with the original (unprefixed) tool name
             let mut upstream_params = CallToolRequestParams::new(original_name.clone());
@@ -2225,13 +2210,20 @@ impl ToolRouter {
             if let Some(token) = upstream_progress_token.clone() {
                 upstream_params.set_progress_token(token);
             }
+            if let Some(meta) = extension_meta.clone() {
+                upstream_params.meta = Some(RequestMetaObject(meta));
+            }
 
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
             let mut options = PeerRequestOptions::default();
             options.timeout = Some(timeout_duration);
-            options.meta = upstream_progress_token
-                .clone()
-                .map(RequestMetaObject::with_progress_token);
+            options.meta = extension_meta.clone().map(RequestMetaObject);
+            if let Some(token) = upstream_progress_token.clone() {
+                options
+                    .meta
+                    .get_or_insert_with(RequestMetaObject::new)
+                    .set_progress_token(token);
+            }
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,
@@ -2321,7 +2313,10 @@ impl ToolRouter {
             let cb = self.server_manager.circuit_breakers.get(&server_id);
 
             match result {
-                Ok(ServerResult::CallToolResult(response)) => {
+                Ok(ServerResult::CallToolResult(mut response)) => {
+                    // Sanitize before artifact serialization, cache/buffer
+                    // decisions, IPC conversion, or downstream encoding.
+                    admit_tool_result_meta(&mut response);
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }

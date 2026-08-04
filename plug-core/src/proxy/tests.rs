@@ -2112,6 +2112,98 @@ async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
 }
 
 #[tokio::test]
+async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
+    let router = router_with_unrouted_single_route();
+    let ctx = MockDownstream {
+        supports_tasks: false,
+    };
+
+    for (key, value) in [
+        ("plug.dev/legacy-task-support", serde_json::json!(true)),
+        (
+            "attacker.example/authorization",
+            serde_json::json!("Bearer stolen"),
+        ),
+        ("attacker.example/value", serde_json::json!("Bearer stolen")),
+    ] {
+        let mut params = CallToolRequestParams::new("Mock__tool");
+        params
+            .meta
+            .get_or_insert_with(Default::default)
+            .insert(key.to_string(), value);
+        let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+            .await
+            .expect_err("hostile metadata must fail before route lookup");
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "hostile key: {key}");
+        assert!(
+            !error.message.to_lowercase().contains("unavailable"),
+            "a route effect occurred before extension admission for {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hostile_task_extension_is_rejected_before_durable_record_creation() {
+    let router = router_with_unrouted_single_route();
+    let ctx = MockDownstream {
+        supports_tasks: true,
+    };
+    let mut params = CallToolRequestParams::new("Mock__tool");
+    let meta = params.meta.get_or_insert_with(Default::default);
+    meta.insert(
+        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+        serde_json::json!({}),
+    );
+    meta.insert(
+        "attacker.example/principal".to_string(),
+        serde_json::json!("someone-else"),
+    );
+
+    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+        .await
+        .expect_err("hostile task metadata must fail before durable creation");
+    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    assert_eq!(
+        router
+            .task_count_for_owner(&TaskOwner::new(Arc::<str>::from("test-owner")))
+            .await,
+        0
+    );
+}
+
+#[test]
+fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
+    let source = MetaObject::from(
+        serde_json::json!({
+            "example.test/typed": {
+                "boolean": true,
+                "number": 7,
+                "array": [null, "value"]
+            },
+            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    for downstream in [
+        crate::protocol::ProtocolEra::Legacy,
+        crate::protocol::ProtocolEra::Modern,
+    ] {
+        for upstream in [
+            crate::protocol::ProtocolEra::Legacy,
+            crate::protocol::ProtocolEra::Modern,
+        ] {
+            let admitted = crate::types::ExtensionEnvelope::from_peer_meta(Some(&source))
+                .unwrap()
+                .into_meta()
+                .unwrap();
+            assert_eq!(admitted, source, "pair {downstream:?} -> {upstream:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
     let router = router_with_unrouted_single_route();
     let ctx = MockDownstream {

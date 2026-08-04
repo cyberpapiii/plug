@@ -148,9 +148,16 @@ async fn serve_lifecycle_stdio(mode: &str, request_log_file: Option<&str>) -> an
             (_, "tools/list") => serde_json::json!({
                 "jsonrpc":"2.0","id":id,"result":{
                     "resultType":"complete",
+                    "ttlMs":0,
+                    "cacheScope":"private",
                     "tools":[{
                         "name":"echo","description":"echo","inputSchema":{"type":"object"},
-                        "_meta":{"io.modelcontextprotocol/deferredFixture":true}
+                        "outputSchema":{"type":"object","properties":{"echoed":{"type":"boolean"}}},
+                        "_meta":{
+                            "io.modelcontextprotocol/deferredFixture":true,
+                            "io.modelcontextprotocol/ui":{"resourceUri":"ui://plug/fixture"},
+                            "example.test/typed":{"boolean":true,"number":7,"array":[null,"value"]}
+                        }
                     }]
                 }
             }),
@@ -158,7 +165,8 @@ async fn serve_lifecycle_stdio(mode: &str, request_log_file: Option<&str>) -> an
                 "jsonrpc":"2.0","id":id,"result":{
                     "resultType":"complete",
                     "content":[{"type":"text","text":"lifecycle fixture echo"}],
-                    "isError":false
+                    "isError":false,
+                    "_meta":{"example.test/result":{"boolean":true,"number":7}}
                 }
             }),
             _ => serde_json::json!({

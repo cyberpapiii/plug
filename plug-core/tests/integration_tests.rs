@@ -1345,10 +1345,27 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         .find(|tool| tool.name.ends_with("__echo"))
         .expect("modern tool routed")
         .clone();
+    let projected_page = modern_engine
+        .tool_router()
+        .list_tools_page_for_client(ClientType::Unknown, None);
+    assert_eq!(projected_page.ttl_ms, None);
+    assert_eq!(projected_page.cache_scope, None);
+    let routed_meta = routed_tool.meta.as_ref().expect("admitted U7 metadata");
     assert_eq!(
-        routed_tool.meta, None,
-        "U7 metadata must not leak through the ordinary U5 bridge"
+        routed_meta.get("example.test/typed"),
+        Some(&serde_json::json!({
+            "boolean": true,
+            "number": 7,
+            "array": [null, "value"]
+        })),
+        "admitted extension values must retain JSON type fidelity"
     );
+    assert_eq!(
+        routed_meta.get("io.modelcontextprotocol/ui"),
+        Some(&serde_json::json!({"resourceUri":"ui://plug/fixture"})),
+        "Apps/UI descriptor metadata must survive the routed catalog"
+    );
+    assert!(routed_tool.output_schema.is_some());
     let tool_name = routed_tool.name.to_string();
     let result = modern_engine
         .tool_router()
@@ -1360,6 +1377,14 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
             .as_text()
             .is_some_and(|text| text.text == "lifecycle fixture echo")
     }));
+    assert_eq!(
+        result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("example.test/result")),
+        Some(&serde_json::json!({"boolean": true, "number": 7})),
+        "admitted result metadata must survive before artifact handling"
+    );
     let modern_sequence = lifecycle_sequence(&modern_log);
     assert_eq!(
         modern_sequence.first().map(String::as_str),

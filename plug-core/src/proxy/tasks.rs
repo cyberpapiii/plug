@@ -7,6 +7,11 @@ use crate::legacy_tasks::{
 };
 use crate::tasks::{OwnerLivenessProbe, UpstreamRecordOutcome, owner_closed_during_create_error};
 
+struct TaskWireContext {
+    progress_token: Option<ProgressToken>,
+    extension_meta: Option<MetaObject>,
+}
+
 /// RAII cover for the send-to-record gap in `execute_tool_task`: constructed
 /// the moment `send_cancellable_request` returns (the upstream request is in
 /// flight) and defused once the request id is safely recorded on the task
@@ -86,6 +91,10 @@ impl super::ToolRouter {
         owner_liveness: Option<OwnerLivenessProbe>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CreateTaskResult, McpError> {
+        let extension_meta = downstream
+            .as_ref()
+            .and_then(|context| context.extension_envelope.as_ref())
+            .and_then(crate::types::ExtensionEnvelope::to_meta);
         // Task augmentation is a second method family layered on tools/call.
         // Authorize and reserve both queue + durable-record capacity before
         // touching the lifecycle ledger, task store, or any upstream.
@@ -204,6 +213,9 @@ impl super::ToolRouter {
             let mut upstream_params = CallToolRequestParams::new(original_name.clone());
             if let Some(args) = arguments.clone() {
                 upstream_params = upstream_params.with_arguments(args);
+            }
+            if let Some(meta) = extension_meta.clone() {
+                upstream_params.meta = Some(RequestMetaObject(meta));
             }
             upstream_params
                 .meta
@@ -441,7 +453,10 @@ impl super::ToolRouter {
                         task_id,
                         tool_name,
                         arguments,
-                        progress_token,
+                        TaskWireContext {
+                            progress_token,
+                            extension_meta,
+                        },
                         false,
                         trace_id,
                     )
@@ -902,10 +917,14 @@ impl super::ToolRouter {
         task_id: String,
         tool_name: String,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
-        progress_token: Option<ProgressToken>,
+        wire: TaskWireContext,
         is_retry: bool,
         trace_id: Arc<str>,
     ) {
+        let TaskWireContext {
+            progress_token,
+            extension_meta,
+        } = wire;
         let cache = self.cache.load();
         let (server_id, original_name) = match cache.routes.get(tool_name.as_str()).or_else(|| {
             cache
@@ -986,6 +1005,9 @@ impl super::ToolRouter {
             if let Some(args) = current_arguments.take() {
                 upstream_params = upstream_params.with_arguments(args);
             }
+            if let Some(meta) = extension_meta.clone() {
+                upstream_params.meta = Some(RequestMetaObject(meta));
+            }
             if let Some(token) = upstream_progress_token.clone() {
                 upstream_params.set_progress_token(token);
             }
@@ -996,9 +1018,13 @@ impl super::ToolRouter {
             // forever. The bound lives in our own `tokio::time::timeout`
             // below, paired with a bounded explicit cancel.
             let mut options = PeerRequestOptions::default();
-            options.meta = upstream_progress_token
-                .clone()
-                .map(RequestMetaObject::with_progress_token);
+            options.meta = extension_meta.clone().map(RequestMetaObject);
+            if let Some(token) = upstream_progress_token.clone() {
+                options
+                    .meta
+                    .get_or_insert_with(RequestMetaObject::new)
+                    .set_progress_token(token);
+            }
 
             let request_handle = match peer.send_cancellable_request(request, options).await {
                 Ok(handle) => handle,
@@ -1130,7 +1156,8 @@ impl super::ToolRouter {
             drop(permit);
 
             match result {
-                Ok(ServerResult::CallToolResult(response)) => {
+                Ok(ServerResult::CallToolResult(mut response)) => {
+                    admit_tool_result_meta(&mut response);
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,

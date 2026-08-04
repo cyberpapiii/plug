@@ -29,7 +29,7 @@ use crate::downstream_oauth::{
     DownstreamOauthError, resource_scopes,
 };
 use crate::mcp_http_headers::{
-    HEADER_MISMATCH_CODE, HeaderMismatch, validate_mirrored_headers,
+    HEADER_MISMATCH_CODE, HeaderMismatch, inject_trace_context, validate_mirrored_headers,
     validate_required_mirrored_headers,
 };
 use crate::notifications::{NotificationTarget, ProtocolNotification};
@@ -907,6 +907,8 @@ async fn post_mcp(
         .and_then(|value| value.to_str().ok());
     let era = crate::protocol::classify_http_request_era(&raw_message, header_version)
         .map_err(HttpError::BadRequest)?;
+    inject_trace_context(&headers, &mut raw_message)
+        .map_err(|error| HttpError::BadRequest(error.message))?;
     if era == crate::protocol::ProtocolEra::Modern {
         if !state.router.modern_downstream_enabled() {
             return Err(HttpError::UnsupportedProtocolVersion(

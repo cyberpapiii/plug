@@ -93,8 +93,14 @@ pub async fn dispatch_tools_call(
     ctx: &dyn DownstreamContext,
     params: CallToolRequestParams,
 ) -> Result<ToolCallOutcome, McpError> {
+    // Admit unknown metadata once, before routing, task creation, buffering,
+    // or forwarding. Typed MCP fields remain owned by their typed adapters.
+    let extensions = crate::types::ExtensionEnvelope::from_peer_meta(params.meta.as_deref())
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
     let progress_token = params.progress_token();
-    let downstream = ctx.downstream_call_context();
+    let downstream = ctx
+        .downstream_call_context()
+        .with_extension_envelope(extensions);
 
     downstream.authorize(crate::protocol::MethodFamily::ToolsCall)?;
 

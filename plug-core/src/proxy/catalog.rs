@@ -1,19 +1,53 @@
 use super::*;
 
-pub(crate) fn suppress_deferred_modern_tool_metadata(tool: &mut Tool) {
-    tool.meta = None;
+/// Apply the shared peer-extension policy before a catalog descriptor is
+/// cloned into Plug's cache. Invalid peer metadata is dropped as one unit;
+/// neither keys nor values are included in diagnostics.
+pub(crate) fn admit_catalog_meta(meta: &mut Option<MetaObject>, surface: &'static str) {
+    match crate::types::ExtensionEnvelope::from_peer_catalog_meta(meta.as_ref()) {
+        Ok(envelope) => *meta = envelope.into_meta(),
+        Err(error) => {
+            *meta = None;
+            tracing::warn!(surface, reason = %error, "discarded unsafe peer extension metadata");
+        }
+    }
 }
 
-pub(crate) fn suppress_deferred_modern_resource_metadata(resource: &mut Resource) {
-    resource.meta = None;
+pub(crate) fn admit_resource_contents_meta(contents: &mut ResourceContents) {
+    match contents {
+        ResourceContents::TextResourceContents { meta, .. }
+        | ResourceContents::BlobResourceContents { meta, .. } => {
+            admit_catalog_meta(meta, "resource-content");
+        }
+        // RMCP marks this enum non-exhaustive; a future variant must add an
+        // explicit metadata arm before that RMCP version is adopted.
+        _ => {}
+    }
 }
 
-pub(crate) fn suppress_deferred_modern_template_metadata(template: &mut ResourceTemplate) {
-    template.meta = None;
+pub(crate) fn admit_content_block_meta(content: &mut ContentBlock) {
+    match content {
+        ContentBlock::Text(content) => admit_catalog_meta(&mut content.meta, "text-content"),
+        ContentBlock::Image(content) => admit_catalog_meta(&mut content.meta, "image-content"),
+        ContentBlock::Audio(content) => admit_catalog_meta(&mut content.meta, "audio-content"),
+        ContentBlock::Resource(content) => {
+            admit_catalog_meta(&mut content.meta, "embedded-resource");
+            admit_resource_contents_meta(&mut content.resource);
+        }
+        ContentBlock::ResourceLink(resource) => {
+            admit_catalog_meta(&mut resource.meta, "resource-link");
+        }
+        // See the ResourceContents note above. Current RMCP variants are all
+        // covered explicitly.
+        _ => {}
+    }
 }
 
-pub(crate) fn suppress_deferred_modern_prompt_metadata(prompt: &mut Prompt) {
-    prompt.meta = None;
+pub(crate) fn admit_tool_result_meta(result: &mut CallToolResult) {
+    admit_catalog_meta(&mut result.meta, "tool-result");
+    for content in &mut result.content {
+        admit_content_block_meta(content);
+    }
 }
 
 pub(crate) fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
@@ -407,6 +441,12 @@ impl super::ToolRouter {
     ) -> ListToolsResult {
         let tools = self.list_tools_for_client_session(client_type, session_key);
         paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
+            // This is a synthesized, shared multi-upstream view. RMCP's
+            // list_all_tools discards per-page directive provenance, so Plug
+            // must not copy a private, zero/negative, or short upstream TTL
+            // onto this different response. Keep cache directives absent
+            // until the catalog has principal-scoped directive sidecars and a
+            // conservative aggregation rule (never lengthen upstream TTLs).
             meta: None,
             next_cursor,
             tools,
