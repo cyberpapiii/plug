@@ -65,7 +65,8 @@ impl ExtensionEnvelope {
     /// Admit extension fields from a peer-owned `_meta` map.
     ///
     /// MCP core fields are intentionally omitted: RMCP and Plug's typed
-    /// protocol adapters own them. Unknown fields must be namespaced.
+    /// protocol adapters own them. Valid unprefixed fields are accepted but
+    /// ignored; only safe vendor-prefixed extensions cross the proxy boundary.
     pub fn from_peer_meta(meta: Option<&MetaObject>) -> Result<Self, ExtensionEnvelopeError> {
         Self::from_peer_meta_with_reserved_policy(meta, false)
     }
@@ -103,7 +104,9 @@ impl ExtensionEnvelope {
             if strip_reserved && is_reserved_extension_key(key) {
                 continue;
             }
-            validate_extension_key(key)?;
+            if validate_extension_key(key)? == ExtensionKeyDisposition::Ignore {
+                continue;
+            }
             if matches!(
                 key.as_str(),
                 "io.modelcontextprotocol/ui" | "io.modelcontextprotocol/apps"
@@ -142,8 +145,8 @@ impl ExtensionEnvelope {
     }
 }
 
-/// Core fields and client-local correlation fields that Plug must consume or
-/// ignore rather than forwarding as peer extensions.
+/// Core fields that Plug must consume or ignore rather than forwarding as peer
+/// extensions.
 fn is_non_forwarded_meta_key(key: &str) -> bool {
     matches!(
         key,
@@ -156,28 +159,85 @@ fn is_non_forwarded_meta_key(key: &str) -> bool {
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"
             | "plug.dev/legacy-task"
-            | "threadId"
     )
 }
 
-fn validate_extension_key(key: &str) -> Result<(), ExtensionEnvelopeError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtensionKeyDisposition {
+    Forward,
+    Ignore,
+}
+
+/// Validate the MCP `_meta` key grammar and decide whether the value may cross
+/// Plug's proxy boundary. MCP allows an optional prefix, so valid unprefixed
+/// metadata is ignored rather than rejected. Third-party extensions need a
+/// prefix to be forwarded.
+fn validate_extension_key(key: &str) -> Result<ExtensionKeyDisposition, ExtensionEnvelopeError> {
     if is_reserved_extension_key(key) {
         return Err(ExtensionEnvelopeError::ReservedNamespace);
     }
-    let Some((namespace, name)) = key.split_once('/') else {
-        return Err(ExtensionEnvelopeError::InvalidKey);
+
+    let Some((prefix, name)) = key.split_once('/') else {
+        validate_meta_name(key)?;
+        return Ok(ExtensionKeyDisposition::Ignore);
     };
-    if namespace.is_empty()
-        || name.is_empty()
-        || name.contains('/')
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
-    {
+    if name.contains('/') || !valid_meta_prefix(prefix) {
         return Err(ExtensionEnvelopeError::InvalidKey);
+    }
+    validate_meta_name(name)?;
+    if is_mcp_reserved_prefix(prefix) && !is_forwarded_mcp_extension_key(key) {
+        return Ok(ExtensionKeyDisposition::Ignore);
     }
     if control_shaped_extension_name(name) {
         return Err(ExtensionEnvelopeError::ControlShapedKey);
+    }
+    Ok(ExtensionKeyDisposition::Forward)
+}
+
+/// MCP 2026 reserves any prefix whose second DNS label is `mcp` or
+/// `modelcontextprotocol`. Unknown protocol-owned metadata must not be
+/// interpreted as a vendor extension and forwarded across Plug's trust
+/// boundary.
+fn is_mcp_reserved_prefix(prefix: &str) -> bool {
+    prefix.split('.').nth(1).is_some_and(|label| {
+        label.eq_ignore_ascii_case("mcp") || label.eq_ignore_ascii_case("modelcontextprotocol")
+    })
+}
+
+/// Official MCP extensions that Plug deliberately transports as opaque wire
+/// metadata. Their object shape is checked at the ingress loop before they are
+/// retained.
+fn is_forwarded_mcp_extension_key(key: &str) -> bool {
+    matches!(
+        key,
+        "io.modelcontextprotocol/ui" | "io.modelcontextprotocol/apps"
+    )
+}
+
+fn valid_meta_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.first().is_some_and(u8::is_ascii_alphabetic)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+fn validate_meta_name(name: &str) -> Result<(), ExtensionEnvelopeError> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    let bytes = name.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ExtensionEnvelopeError::InvalidKey);
     }
     Ok(())
 }
@@ -523,13 +583,52 @@ mod tests {
     }
 
     #[test]
-    fn extension_envelope_drops_codex_thread_correlation_metadata() {
+    fn extension_envelope_ignores_valid_unprefixed_metadata() {
         let source = meta(serde_json::json!({
-            "threadId": "019fcd41-75ee-7573-a0d7-3be296f09c3a"
+            "threadId": "019fcd41-75ee-7573-a0d7-3be296f09c3a",
+            "x-codex-turn-metadata": {
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium",
+                "sandbox": "none",
+                "session_id": "019fcd41-75ee-7573-a0d7-3be296f09c3a",
+                "thread_id": "019fcd41-75ee-7573-a0d7-3be296f09c3a",
+                "thread_source": "user",
+                "turn_id": "019fcda7-4109-76f1-8676-c5e6417c93a1",
+                "turn_started_at_unix_ms": 1785861718313_i64,
+                "workspace_kind": "project",
+                "workspaces": {
+                    "/Users/example/project": {
+                        "associated_remote_urls": {
+                            "origin": "https://github.com/example/project.git"
+                        },
+                        "has_changes": true,
+                        "latest_git_commit_hash": "01c88f16d442ee1a63d038e99da56a6f290a7cf6"
+                    }
+                }
+            },
+            "future-client-key": {"value": true},
+            "": "empty names are valid and ignored"
         }));
         let admitted = ExtensionEnvelope::from_peer_meta(Some(&source))
-            .expect("Codex thread correlation must not block a tool call");
+            .expect("valid unprefixed metadata must not block a tool call");
         assert!(admitted.into_meta().is_none());
+    }
+
+    #[test]
+    fn extension_envelope_ignores_unprefixed_without_dropping_namespaced_extensions() {
+        let source = meta(serde_json::json!({
+            "x-client-local": {"private": true},
+            "acme.example/value": {"forwarded": true}
+        }));
+        let admitted = ExtensionEnvelope::from_peer_meta(Some(&source))
+            .unwrap()
+            .into_meta()
+            .unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            admitted.get("acme.example/value"),
+            Some(&serde_json::json!({"forwarded": true}))
+        );
     }
 
     #[test]
@@ -544,7 +643,7 @@ mod tests {
                 ExtensionEnvelopeError::ControlShapedKey,
             ),
             (
-                serde_json::json!({"not-namespaced": true}),
+                serde_json::json!({"bad prefix/value": true}),
                 ExtensionEnvelopeError::InvalidKey,
             ),
         ] {
@@ -553,6 +652,81 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn extension_envelope_enforces_spec_key_grammar() {
+        for key in [
+            "vendor/value",
+            "vendor-label.example/value",
+            "com.example/value",
+            "com.example/",
+        ] {
+            let source = meta(serde_json::json!({(key): true}));
+            let admitted = ExtensionEnvelope::from_peer_meta(Some(&source))
+                .unwrap()
+                .into_meta()
+                .unwrap();
+            assert_eq!(admitted.get(key), Some(&serde_json::json!(true)));
+        }
+
+        for key in [
+            "1vendor/value",
+            "vendor-/value",
+            "vendor..example/value",
+            "vendor.example/value/extra",
+            "vendor.example/-value",
+            "vendor.example/value-",
+            "bad prefix/value",
+        ] {
+            let source = meta(serde_json::json!({(key): true}));
+            assert_eq!(
+                ExtensionEnvelope::from_peer_meta(Some(&source)).unwrap_err(),
+                ExtensionEnvelopeError::InvalidKey,
+                "invalid metadata key escaped: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_envelope_drops_unknown_mcp_reserved_prefixes() {
+        for key in [
+            "io.modelcontextprotocol/value",
+            "dev.mcp/value",
+            "org.modelcontextprotocol.api/value",
+            "com.mcp.tools/value",
+            "IO.MODELCONTEXTPROTOCOL/value",
+        ] {
+            let source = meta(serde_json::json!({(key): {"peer_controlled": true}}));
+            let request = ExtensionEnvelope::from_peer_meta(Some(&source)).unwrap();
+            let catalog = ExtensionEnvelope::from_peer_catalog_meta(Some(&source)).unwrap();
+            assert!(request.into_meta().is_none(), "request retained {key}");
+            assert!(catalog.into_meta().is_none(), "catalog retained {key}");
+        }
+
+        let non_reserved = meta(serde_json::json!({
+            "com.example.mcp/value": {"forwarded": true}
+        }));
+        let admitted = ExtensionEnvelope::from_peer_meta(Some(&non_reserved))
+            .unwrap()
+            .into_meta()
+            .unwrap();
+        assert_eq!(
+            admitted.get("com.example.mcp/value"),
+            non_reserved.get("com.example.mcp/value")
+        );
+
+        let official_extension = meta(serde_json::json!({
+            "io.modelcontextprotocol/ui": {"resourceUri": "ui://widget"}
+        }));
+        let admitted = ExtensionEnvelope::from_peer_meta(Some(&official_extension))
+            .unwrap()
+            .into_meta()
+            .unwrap();
+        assert_eq!(
+            admitted.get("io.modelcontextprotocol/ui"),
+            official_extension.get("io.modelcontextprotocol/ui")
+        );
     }
 
     #[test]
