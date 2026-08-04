@@ -25,7 +25,8 @@ forwarding work:
 - daemon continuity recovery (stdio clients via IPC proxy reconnect)
 - session-store abstraction seam and stateless design prep
 - MCP-Protocol-Version header validation on downstream HTTP POST requests
-- MCP-Protocol-Version header on upstream HTTP requests (provided by RMCP 2.2.0 after initialization)
+- exact RMCP 3.1.0 with requested/selected protocol telemetry and explicit legacy/modern era policy
+- gated MCP `2026-07-28` downstream discovery/sessionless HTTP and upstream `legacy | auto | modern` negotiation, with legacy behavior preserved by default
 - subscription pruning and rebind on route refresh (todo 039 resolved)
 - roots forwarding with union cache across stdio, HTTP, and daemon IPC
 - elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC (PR #34)
@@ -97,24 +98,21 @@ Optional future scope only:
 - further low-priority simplification of internal reload/session/SSE helper structure
 - end-to-end metrics-recording test plus an RAII recording guard, and an operator-guide note on `degraded_since` vs. health divergence (deferred from PR #60)
 
-## Designed-But-Deferred Program Phases
+## Modernization And Prior Program Phases
 
-### 2026-08-03 MCP 2026 dual-era modernization — exists off-main
+### 2026-08-04 MCP 2026 dual-era modernization — done on main
 
-The reviewed implementation on local branch `codex/mcp-2026-modernization`
-upgrades the foundation to exact RMCP 3.1.0, introduces explicit legacy/modern
-wire policy, and implements gated MCP `2026-07-28` downstream and upstream
-paths without removing the production MCP `2025-11-25` path. It also adds
-modern task handling, safe extension/schema/trace propagation, stronger OAuth
-issuer binding, and secure native modern-to-modern multi-round tool calls.
+PR #68 upgraded the foundation to exact RMCP 3.1.0, introduced explicit
+legacy/modern wire policy, and landed gated MCP `2026-07-28` downstream and
+upstream paths without removing the production MCP `2025-11-25` path. It also
+added modern task handling, safe extension/schema/trace propagation, stronger
+OAuth issuer binding, and secure native modern-to-modern multi-round tool calls.
 
-The branch is intentionally fail-closed beyond its proven matrix. Both global
+The release is intentionally fail-closed beyond its proven matrix. Both global
 modern gates remain off by default. Modern `subscriptions/listen`, mixed-era
 multi-round translation, task-plus-multi-round calls, Apps/UI capability
 advertisement, and synthesized cache directives for Plug's combined catalog
-remain future work. This section must not be promoted to `done on main` until
-the branch is merged and current code, installation, and truth documents are
-re-verified.
+remain optional future work and are not advertised.
 
 The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred larger items. Sequenced **item 3 → item 1 → item 2b**, plus the independent test-infra work:
 
