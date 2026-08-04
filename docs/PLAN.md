@@ -99,6 +99,23 @@ Optional future scope only:
 
 ## Designed-But-Deferred Program Phases
 
+### 2026-08-03 MCP 2026 dual-era modernization — exists off-main
+
+The reviewed implementation on local branch `codex/mcp-2026-modernization`
+upgrades the foundation to exact RMCP 3.1.0, introduces explicit legacy/modern
+wire policy, and implements gated MCP `2026-07-28` downstream and upstream
+paths without removing the production MCP `2025-11-25` path. It also adds
+modern task handling, safe extension/schema/trace propagation, stronger OAuth
+issuer binding, and secure native modern-to-modern multi-round tool calls.
+
+The branch is intentionally fail-closed beyond its proven matrix. Both global
+modern gates remain off by default. Modern `subscriptions/listen`, mixed-era
+multi-round translation, task-plus-multi-round calls, Apps/UI capability
+advertisement, and synthesized cache directives for Plug's combined catalog
+remain future work. This section must not be promoted to `done on main` until
+the branch is merged and current code, installation, and truth documents are
+re-verified.
+
 The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred larger items. Sequenced **item 3 → item 1 → item 2b**, plus the independent test-infra work:
 
 - **Degraded-vs-absent core model** — ✅ done on `main` via PR #61 (see dated entry below). Closed the PR #58 subscription-rebind residual at the model level.

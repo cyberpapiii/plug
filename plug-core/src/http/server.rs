@@ -25,13 +25,17 @@ use tower_http::limit::RequestBodyLimitLayer;
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_oauth::{
-    AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
-    resource_scopes,
+    AccessTokenClaims, AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest,
+    DownstreamOauthError, resource_scopes,
 };
-use crate::mcp_http_headers::{HEADER_MISMATCH_CODE, HeaderMismatch, validate_mirrored_headers};
+use crate::mcp_http_headers::{
+    HEADER_MISMATCH_CODE, HeaderMismatch, inject_trace_context, validate_mirrored_headers,
+    validate_required_mirrored_headers,
+};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
 use crate::session::{SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
+use crate::tasks::TaskOwner;
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -76,22 +80,280 @@ struct HttpDownstreamContext {
     client_type: crate::types::ClientType,
     trace_id: Arc<str>,
     sessions: Arc<dyn SessionStore>,
+    auth_status: AuthStatus,
+    oauth_issuer: Option<Arc<str>>,
+    protocol_era: crate::protocol::ProtocolEra,
+    modern_direction_enabled: bool,
+    cancellation: CancellationToken,
+    session_bound: bool,
+    client_metadata: Option<crate::protocol::ClientMetadata>,
+}
+
+fn http_principal(
+    auth_status: &AuthStatus,
+    oauth_issuer: Option<&str>,
+) -> Option<crate::types::PrincipalId> {
+    match auth_status {
+        AuthStatus::Authenticated(Some(claims)) => {
+            Some(crate::types::PrincipalId::downstream_oauth(
+                oauth_issuer.unwrap_or("unknown-issuer"),
+                claims.client_id.clone(),
+                claims.resource.clone(),
+            ))
+        }
+        AuthStatus::Authenticated(None) => Some(crate::types::PrincipalId::configured_credential(
+            "downstream-http-bearer",
+            0,
+        )),
+        AuthStatus::NoAuthRequired => None,
+    }
+}
+
+fn http_task_owner(
+    session_id: &str,
+    auth_status: &AuthStatus,
+    oauth_issuer: Option<&str>,
+) -> crate::tasks::TaskOwner {
+    http_principal(auth_status, oauth_issuer)
+        .map(|principal| crate::tasks::TaskOwner::new(principal.owner_key()))
+        .unwrap_or_else(|| crate::proxy::ToolRouter::task_owner_for_http_session(session_id))
+}
+
+fn modern_http_call_context(
+    state: &HttpState,
+    auth_status: &AuthStatus,
+    request_id: RequestId,
+    trace_id: Arc<str>,
+    meta: Option<&RequestMetaObject>,
+) -> DownstreamCallContext {
+    let client_info = meta.and_then(RequestMetaObject::client_info);
+    let oauth_issuer = state
+        .downstream_oauth
+        .as_ref()
+        .map(|manager| manager.base_url());
+    let principal = http_principal(auth_status, oauth_issuer);
+    let client_id: Arc<str> = principal
+        .as_ref()
+        .map(|principal| Arc::from(principal.owner_key()))
+        .unwrap_or_else(|| {
+            client_info
+                .as_ref()
+                .map(|info| Arc::from(format!("anonymous:{}:{}", info.name, info.version)))
+                .unwrap_or_else(|| Arc::from(format!("anonymous:{trace_id}")))
+        });
+    let mut context = DownstreamCallContext::http_for_client_with_trace(
+        client_id,
+        request_id,
+        client_info
+            .as_ref()
+            .map(|info| crate::client_detect::detect_client(&info.name))
+            .unwrap_or(crate::types::ClientType::Unknown),
+        trace_id,
+    )
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(state.router.modern_downstream_enabled());
+    if let Some(info) = client_info {
+        context = context.with_client_metadata(info.name, info.version);
+    }
+    match (auth_status, principal) {
+        (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
+            .with_authorization(principal, claims.scopes.clone())
+            .with_principal_lifecycle(claims.principal_lifecycle.clone()),
+        (AuthStatus::Authenticated(None), Some(principal)) => {
+            context.with_local_principal(principal)
+        }
+        _ => context,
+    }
+}
+
+fn legacy_http_policy_context(
+    state: &HttpState,
+    auth_status: &AuthStatus,
+    request_id: RequestId,
+    trace_id: Arc<str>,
+) -> DownstreamCallContext {
+    let context = DownstreamCallContext::http_for_client_with_trace(
+        "legacy-http-policy",
+        request_id,
+        crate::types::ClientType::Unknown,
+        trace_id,
+    );
+    match (
+        auth_status,
+        http_principal(
+            auth_status,
+            state
+                .downstream_oauth
+                .as_ref()
+                .map(|manager| manager.base_url()),
+        ),
+    ) {
+        (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
+            // The legacy OAuth contract predates method-family scopes. Keep
+            // the verified identity and revocation lifecycle, but retain the
+            // legacy all-MCP-method compatibility policy for that principal.
+            .with_local_principal(principal)
+            .with_principal_lifecycle(claims.principal_lifecycle.clone()),
+        (AuthStatus::Authenticated(None), Some(principal)) => {
+            context.with_local_principal(principal)
+        }
+        _ => context,
+    }
+}
+
+fn projected_modern_capabilities(
+    router: &ToolRouter,
+    context: &DownstreamCallContext,
+) -> ServerCapabilities {
+    let source = router.synthesized_capabilities_for_client(context.client_type);
+    let mut projected = ServerCapabilities::default();
+    if context
+        .policy_decision(crate::protocol::MethodFamily::ToolsList)
+        .is_allowed()
+        && context
+            .policy_decision(crate::protocol::MethodFamily::ToolsCall)
+            .is_allowed()
+    {
+        projected.tools = source.tools;
+    }
+    if context
+        .policy_decision(crate::protocol::MethodFamily::ResourcesList)
+        .is_allowed()
+        && context
+            .policy_decision(crate::protocol::MethodFamily::ResourcesRead)
+            .is_allowed()
+    {
+        projected.resources = source.resources;
+    }
+    if context
+        .policy_decision(crate::protocol::MethodFamily::PromptsList)
+        .is_allowed()
+        && context
+            .policy_decision(crate::protocol::MethodFamily::PromptsGet)
+            .is_allowed()
+    {
+        projected.prompts = source.prompts;
+    }
+    if context
+        .policy_decision(crate::protocol::MethodFamily::Completion)
+        .is_allowed()
+    {
+        projected.completions = source.completions;
+    }
+    crate::protocol::suppress_unimplemented_modern_capabilities(&mut projected);
+    if context
+        .policy_decision(crate::protocol::MethodFamily::Tasks)
+        .is_allowed()
+        && router.supports_tasks()
+    {
+        projected
+            .extensions
+            .get_or_insert_with(Default::default)
+            .insert(
+                rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                Default::default(),
+            );
+    }
+    projected
+}
+
+fn admit_modern_task_operation(
+    router: &ToolRouter,
+    context: &DownstreamCallContext,
+    request_meta: Option<&RequestMetaObject>,
+) -> Result<TaskOwner, McpError> {
+    if !router.supports_tasks() {
+        return Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "tasks extension is not available",
+            None,
+        ));
+    }
+    if !request_meta
+        .and_then(RequestMetaObject::client_capabilities)
+        .is_some_and(|capabilities| capabilities.supports_tasks())
+    {
+        return Err(McpError::missing_required_client_capability(
+            ClientCapabilities::builder().enable_tasks().build(),
+        ));
+    }
+    context.authorize(crate::protocol::MethodFamily::Tasks)?;
+    if context
+        .principal_lifecycle
+        .as_ref()
+        .is_some_and(|lifecycle| !lifecycle.is_active())
+    {
+        return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
+            .into_error(context.protocol_era));
+    }
+    let principal = context.principal.as_ref().ok_or_else(|| {
+        crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
+    })?;
+    Ok(TaskOwner::new(principal.owner_key()))
 }
 
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::http_for_client_with_trace(
+        let mut context = DownstreamCallContext::http_for_client_with_trace(
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
             Arc::clone(&self.trace_id),
         )
+        .with_protocol(
+            self.protocol_era,
+            match self.protocol_era {
+                crate::protocol::ProtocolEra::Legacy => crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                crate::protocol::ProtocolEra::Modern => {
+                    crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                }
+            },
+        )
+        .with_modern_direction_enabled(self.modern_direction_enabled)
+        .with_lifecycle(None, self.cancellation.clone(), None);
+        if let Some(metadata) = &self.client_metadata {
+            context = context
+                .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
+        }
+        match (
+            &self.auth_status,
+            http_principal(&self.auth_status, self.oauth_issuer.as_deref()),
+        ) {
+            (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
+                .with_authorization(principal, claims.scopes.clone())
+                .with_principal_lifecycle(claims.principal_lifecycle.clone()),
+            (AuthStatus::Authenticated(None), Some(principal)) => {
+                context.with_local_principal(principal)
+            }
+            (AuthStatus::NoAuthRequired, None)
+                if self.protocol_era == crate::protocol::ProtocolEra::Legacy =>
+            {
+                // Legacy loopback sessions retain their long-standing task
+                // behavior. The trust comes from the loopback-only listener,
+                // not from client-provided metadata; ownership remains scoped
+                // to the server-minted session id in `task_owner`.
+                context.with_local_principal(crate::types::PrincipalId::configured_credential(
+                    "downstream-http-loopback",
+                    0,
+                ))
+            }
+            _ => context,
+        }
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        Ok(crate::proxy::ToolRouter::task_owner_for_http_session(
+        Ok(http_task_owner(
             &self.session_id,
+            &self.auth_status,
+            self.oauth_issuer.as_deref(),
         ))
+    }
+
+    fn supports_tasks(&self) -> bool {
+        true
     }
 
     /// Session-existence probe for the enqueue path's post-guard liveness
@@ -101,9 +363,36 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     /// sound "teardown has not started" signal — see the ordering argument
     /// at the check site in `proxy::tasks`.
     fn owner_liveness_probe(&self) -> Option<crate::tasks::OwnerLivenessProbe> {
+        if !self.session_bound {
+            return None;
+        }
         let sessions = Arc::clone(&self.sessions);
         let session_id = Arc::clone(&self.session_id);
         Some(Arc::new(move || sessions.validate(&session_id).is_ok()))
+    }
+}
+
+struct HttpRequestCancellationGuard {
+    router: Arc<ToolRouter>,
+    context: DownstreamCallContext,
+    armed: bool,
+}
+
+impl HttpRequestCancellationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HttpRequestCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.context.cancellation.cancel();
+            self.router.cancel_downstream_request(
+                &self.context,
+                Some("downstream HTTP request ended".to_string()),
+            );
+        }
     }
 }
 
@@ -431,10 +720,10 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
 // ---------------------------------------------------------------------------
 
 /// Whether the request has been authenticated via bearer token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthStatus {
     /// Request authenticated with valid bearer token.
-    Authenticated,
+    Authenticated(Option<AccessTokenClaims>),
     /// No auth required (loopback-only server).
     NoAuthRequired,
 }
@@ -483,7 +772,6 @@ async fn validate_bearer_auth(
         let metadata_url = protected_resource_metadata_url(manager.base_url());
         let advertised_scopes = resource_scopes(&manager.config.oauth_scopes);
         let scope = (!advertised_scopes.is_empty()).then(|| advertised_scopes.join(" "));
-        let required_scopes = vec!["tools:read".to_string()];
 
         let auth_status = if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
             let auth = auth_header
@@ -498,10 +786,10 @@ async fn validate_bearer_auth(
                     scope: scope.clone(),
                 })?;
             match manager
-                .validate_access_token_for(auth, &required_scopes, &manager.resource())
+                .validate_access_token_for(auth, &[], &manager.resource())
                 .await
             {
-                AccessTokenValidation::Valid(_) => AuthStatus::Authenticated,
+                AccessTokenValidation::Valid(claims) => AuthStatus::Authenticated(Some(claims)),
                 AccessTokenValidation::InsufficientScope => {
                     return Err(HttpError::InsufficientScopeWithMetadata {
                         metadata_url,
@@ -530,7 +818,7 @@ async fn validate_bearer_auth(
         None => AuthStatus::NoAuthRequired,
         Some(expected) => {
             if check_bearer_token(req.headers(), expected.as_ref()) {
-                AuthStatus::Authenticated
+                AuthStatus::Authenticated(None)
             } else {
                 tracing::warn!("bearer auth failed from downstream client");
                 return Err(HttpError::Unauthorized);
@@ -555,7 +843,10 @@ async fn validate_origin(
     next: Next,
 ) -> Result<Response, HttpError> {
     // Skip origin check for authenticated remote clients
-    if req.extensions().get::<AuthStatus>() == Some(&AuthStatus::Authenticated) {
+    if matches!(
+        req.extensions().get::<AuthStatus>(),
+        Some(AuthStatus::Authenticated(_))
+    ) {
         return Ok(next.run(req).await);
     }
 
@@ -575,11 +866,8 @@ async fn validate_origin(
         }
 
         // Parse origin to extract host — prevents bypass via localhost.evil.com
-        let is_local = if let Some(host) = extract_origin_host(origin) {
-            host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
-        } else {
-            false
-        };
+        let is_local =
+            extract_origin_host(origin).is_some_and(crate::config::http_bind_is_loopback);
 
         if !is_local {
             return Err(HttpError::InvalidOrigin);
@@ -596,6 +884,7 @@ async fn validate_origin(
 /// POST /mcp — handle JSON-RPC requests, notifications, and client responses.
 async fn post_mcp(
     State(state): State<Arc<HttpState>>,
+    axum::Extension(auth_status): axum::Extension<AuthStatus>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HttpError> {
@@ -609,27 +898,103 @@ async fn post_mcp(
     }
 
     // 2. Parse JSON-RPC message
-    let message: ClientJsonRpcMessage = serde_json::from_slice(&body).map_err(|e| {
+    let mut raw_message: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(error = %e, "invalid JSON-RPC message from client");
+        HttpError::BadRequest("invalid JSON-RPC message".into())
+    })?;
+    let header_version = headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let era = crate::protocol::classify_http_request_era(&raw_message, header_version)
+        .map_err(HttpError::BadRequest)?;
+    inject_trace_context(&headers, &mut raw_message)
+        .map_err(|error| HttpError::BadRequest(error.message))?;
+    if era == crate::protocol::ProtocolEra::Modern {
+        if !state.router.modern_downstream_enabled() {
+            return Err(HttpError::UnsupportedProtocolVersion(
+                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
+            ));
+        }
+        if raw_message.get("id").is_some() {
+            validate_modern_request_metadata(&raw_message)?;
+        }
+        validate_modern_host(
+            &headers,
+            &state.allowed_origins,
+            state
+                .downstream_oauth
+                .as_ref()
+                .map(crate::downstream_oauth::DownstreamOauthManager::base_url),
+        )?;
+        validate_modern_origin(&headers, &state.allowed_origins)?;
+        if headers.contains_key(SESSION_ID_HEADER) {
+            return Err(HttpError::BadRequest(
+                "modern requests must not use Mcp-Session-Id".to_string(),
+            ));
+        }
+    } else {
+        crate::protocol::rewrite_legacy_request(&mut raw_message);
+    }
+    let message: ClientJsonRpcMessage = serde_json::from_value(raw_message).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
         HttpError::BadRequest("invalid JSON-RPC message".into())
     })?;
 
-    validate_protocol_version_for_post(&headers, &message)?;
-    if let Err(err) = validate_mirrored_headers(&headers, &message) {
-        return Ok(header_mismatch_response(&message, err));
+    validate_protocol_version_for_post(&headers, &message, era)?;
+    let mirrored = if era == crate::protocol::ProtocolEra::Modern {
+        validate_required_mirrored_headers(&headers, &message)
+    } else {
+        validate_mirrored_headers(&headers, &message)
+    };
+    if let Err(err) = mirrored {
+        return Ok(header_mismatch_response(&message, err, era));
     }
     let trace_id = Arc::<str>::from(extract_trace_id(&headers));
 
     // 3. Route based on message type
     match message {
-        JsonRpcMessage::Request(req) => handle_request(req, &headers, &state, trace_id).await,
-        JsonRpcMessage::Response(response) => {
+        JsonRpcMessage::Request(req) => {
+            handle_request(req, &headers, &state, trace_id, auth_status, era).await
+        }
+        JsonRpcMessage::Response(response) if era == crate::protocol::ProtocolEra::Legacy => {
             let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
             handle_client_response(response, &session_id, &state).await?;
             Ok(StatusCode::ACCEPTED.into_response())
         }
-        JsonRpcMessage::Notification(notification) => {
+        JsonRpcMessage::Notification(notification)
+            if era == crate::protocol::ProtocolEra::Modern =>
+        {
+            match notification.notification {
+                ClientNotification::CancelledNotification(cancelled) => {
+                    let oauth_issuer = state
+                        .downstream_oauth
+                        .as_ref()
+                        .map(|manager| manager.base_url());
+                    if http_principal(&auth_status, oauth_issuer).is_some()
+                        && let Some(request_id) = cancelled.params.request_id.clone()
+                    {
+                        let context = modern_http_call_context(
+                            &state,
+                            &auth_status,
+                            request_id,
+                            trace_id,
+                            None,
+                        );
+                        state
+                            .router
+                            .cancel_downstream_request(&context, cancelled.params.reason);
+                    }
+                    Ok(StatusCode::ACCEPTED.into_response())
+                }
+                _ => Err(HttpError::BadRequest(
+                    "modern HTTP notification is not supported".into(),
+                )),
+            }
+        }
+        JsonRpcMessage::Notification(notification)
+            if era == crate::protocol::ProtocolEra::Legacy =>
+        {
             let session_id = extract_session_id(&headers)?;
             validate_session_header(&headers, state.sessions.as_ref())?;
             match notification.notification {
@@ -676,10 +1041,74 @@ async fn post_mcp(
         JsonRpcMessage::Error(_) => Err(HttpError::BadRequest(
             "unexpected error message from client".into(),
         )),
+        _ => Err(HttpError::BadRequest(
+            "modern HTTP accepts request messages only".into(),
+        )),
     }
 }
 
-fn header_mismatch_response(message: &ClientJsonRpcMessage, err: HeaderMismatch) -> Response {
+fn validate_modern_host(
+    headers: &HeaderMap,
+    allowed_origins: &[Arc<str>],
+    public_base_url: Option<&str>,
+) -> Result<(), HttpError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            HttpError::BadRequest("modern requests require a valid Host header".into())
+        })?;
+    let host_name = if host.starts_with('[') {
+        host.split(']').next().map(|value| format!("{value}]"))
+    } else {
+        host.split(':').next().map(str::to_string)
+    }
+    .ok_or_else(|| HttpError::BadRequest("modern request Host is malformed".into()))?;
+    let local = crate::config::http_bind_is_loopback(&host_name);
+    let explicitly_allowed = allowed_origins.iter().any(|origin| {
+        extract_origin_host(origin)
+            .is_some_and(|allowed_host| allowed_host.eq_ignore_ascii_case(&host_name))
+    }) || public_base_url.is_some_and(|base_url| {
+        extract_origin_host(base_url)
+            .is_some_and(|public_host| public_host.eq_ignore_ascii_case(&host_name))
+    });
+    if !local && !explicitly_allowed {
+        return Err(HttpError::BadRequest(
+            "modern request Host is not allowed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_modern_origin(
+    headers: &HeaderMap,
+    allowed_origins: &[Arc<str>],
+) -> Result<(), HttpError> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let origin = origin.to_str().map_err(|_| HttpError::InvalidOrigin)?;
+    if origin == "null" {
+        return Err(HttpError::InvalidOrigin);
+    }
+    if allowed_origins
+        .iter()
+        .any(|allowed| allowed.as_ref() == origin)
+    {
+        return Ok(());
+    }
+    if extract_origin_host(origin).is_some_and(crate::config::http_bind_is_loopback) {
+        Ok(())
+    } else {
+        Err(HttpError::InvalidOrigin)
+    }
+}
+
+fn header_mismatch_response(
+    message: &ClientJsonRpcMessage,
+    err: HeaderMismatch,
+    era: crate::protocol::ProtocolEra,
+) -> Response {
     let id = match message {
         JsonRpcMessage::Request(request) => serde_json::to_value(&request.id).unwrap_or_default(),
         _ => serde_json::Value::Null,
@@ -692,13 +1121,24 @@ fn header_mismatch_response(message: &ClientJsonRpcMessage, err: HeaderMismatch)
             "message": err.message,
         }
     });
-    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    if era == crate::protocol::ProtocolEra::Modern {
+        response.headers_mut().insert(
+            PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+        );
+    }
+    response
 }
 
 fn validate_protocol_version_for_post(
     headers: &HeaderMap,
     message: &ClientJsonRpcMessage,
+    era: crate::protocol::ProtocolEra,
 ) -> Result<(), HttpError> {
+    if era == crate::protocol::ProtocolEra::Modern {
+        return Ok(());
+    }
     let require_header = !matches!(
         message,
         JsonRpcMessage::Request(req)
@@ -718,6 +1158,24 @@ fn validate_protocol_version_for_post(
         None if require_header => Err(HttpError::MissingProtocolVersion),
         None => Ok(()),
     }
+}
+
+fn validate_modern_request_metadata(value: &serde_json::Value) -> Result<(), HttpError> {
+    let meta = value
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .cloned()
+        .ok_or_else(|| HttpError::BadRequest("modern request metadata is required".into()))?;
+    let meta: RequestMetaObject = serde_json::from_value(meta)
+        .map_err(|_| HttpError::BadRequest("modern request metadata is malformed".into()))?;
+    let missing = meta.missing_required_keys(&ProtocolVersion::V_2026_07_28);
+    if !missing.is_empty() {
+        return Err(HttpError::BadRequest(format!(
+            "modern request metadata is missing: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn extract_trace_id(headers: &HeaderMap) -> String {
@@ -1013,6 +1471,9 @@ async fn delete_mcp(
             &session_id,
         );
         state.router.clear_lazy_session(&lazy_session_key);
+        // Session-owned legacy records end with the wire session. Durable
+        // principal-owned records intentionally survive and can be resumed
+        // by a later session authenticated as the same principal.
         let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
         state.router.cleanup_tasks_for_owner(&owner).await;
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
@@ -1398,11 +1859,66 @@ async fn handle_request(
     headers: &HeaderMap,
     state: &Arc<HttpState>,
     trace_id: Arc<str>,
+    auth_status: AuthStatus,
+    era: crate::protocol::ProtocolEra,
 ) -> Result<Response, HttpError> {
     let request_id = req.id.clone();
+    let modern = era == crate::protocol::ProtocolEra::Modern;
+    let request_meta = modern.then(|| rmcp::model::GetMeta::get_meta(&req.request).clone());
+    let policy_context = if modern {
+        modern_http_call_context(
+            state,
+            &auth_status,
+            request_id.clone(),
+            Arc::clone(&trace_id),
+            request_meta.as_ref(),
+        )
+    } else {
+        legacy_http_policy_context(
+            state,
+            &auth_status,
+            request_id.clone(),
+            Arc::clone(&trace_id),
+        )
+    };
+    let _modern_request_lease = if modern {
+        match state.router.admit_modern_request(&policy_context) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     match req.request {
+        ClientRequest::DiscoverRequest(_) if modern => {
+            let mut result = DiscoverResult::new(
+                vec![ProtocolVersion::V_2026_07_28],
+                projected_modern_capabilities(state.router.as_ref(), &policy_context),
+            );
+            result.set_server_info(crate::branding::plug_implementation(env!(
+                "CARGO_PKG_VERSION"
+            )));
+            json_response_for_era(
+                &ServerJsonRpcMessage::response(ServerResult::DiscoverResult(result), request_id),
+                era,
+            )
+        }
         ClientRequest::InitializeRequest(init_req) => {
+            if modern {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(
+                        McpError::method_not_found::<InitializeResultMethod>(),
+                        Some(request_id),
+                    ),
+                    era,
+                );
+            }
             // Initialize: create session, return server info
             let session_id = state.sessions.create_session()?;
 
@@ -1413,6 +1929,8 @@ async fn handle_request(
                 detected = %client_type,
                 session = %session_id,
                 trace_id = %trace_id,
+                requested_protocol = %init_req.params.protocol_version,
+                selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "HTTP client connected"
             );
             // Store client type in session
@@ -1437,6 +1955,15 @@ async fn handle_request(
         }
 
         ClientRequest::PingRequest(_) => {
+            if modern {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(
+                        McpError::method_not_found::<PingRequestMethod>(),
+                        Some(request_id),
+                    ),
+                    era,
+                );
+            }
             validate_session_header(headers, state.sessions.as_ref())?;
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::EmptyResult(EmptyResult {}),
@@ -1446,27 +1973,160 @@ async fn handle_request(
         }
 
         ClientRequest::ListToolsRequest(list_req) => {
-            let session_id_str = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let client_type = state
-                .sessions
-                .get_client_type(&session_id_str)
+            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::ToolsList) {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            let session_id_str = if modern {
+                None
+            } else {
+                let session_id = extract_session_id(headers)?;
+                validate_session_header(headers, state.sessions.as_ref())?;
+                Some(session_id)
+            };
+            let client_type = session_id_str
+                .as_deref()
+                .map(|session_id| {
+                    state
+                        .sessions
+                        .get_client_type(session_id)
+                        .unwrap_or(crate::types::ClientType::Unknown)
+                })
                 .unwrap_or(crate::types::ClientType::Unknown);
-            let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
-                crate::proxy::DownstreamTransport::Http,
-                &session_id_str,
-            );
+            let lazy_session_key = session_id_str.as_deref().map(|session_id| {
+                crate::proxy::ToolRouter::lazy_session_key(
+                    crate::proxy::DownstreamTransport::Http,
+                    session_id,
+                )
+            });
             let result = state.router.list_tools_page_for_client_session(
                 client_type,
-                Some(&lazy_session_key),
+                lazy_session_key.as_deref(),
                 list_req.params,
             );
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListToolsResult(result), request_id);
-            json_response(&response_msg)
+            json_response_for_era(&response_msg, era)
         }
 
         ClientRequest::CallToolRequest(call_req) => {
+            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::ToolsCall) {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            let session_id = if modern {
+                policy_context.client_id.to_string()
+            } else {
+                let session_id = extract_session_id(headers)?;
+                validate_session_header(headers, state.sessions.as_ref())?;
+                session_id
+            };
+            let client_type = if modern {
+                crate::types::ClientType::Unknown
+            } else {
+                state
+                    .sessions
+                    .get_client_type(&session_id)
+                    .unwrap_or(crate::types::ClientType::Unknown)
+            };
+            let cancellation = CancellationToken::new();
+            let ctx = HttpDownstreamContext {
+                session_id: Arc::<str>::from(session_id.as_str()),
+                request_id: request_id.clone(),
+                client_type,
+                trace_id: Arc::clone(&trace_id),
+                sessions: Arc::clone(&state.sessions),
+                auth_status,
+                oauth_issuer: state
+                    .downstream_oauth
+                    .as_ref()
+                    .map(|manager| Arc::<str>::from(manager.base_url())),
+                protocol_era: era,
+                modern_direction_enabled: state.router.modern_downstream_enabled(),
+                cancellation: cancellation.clone(),
+                session_bound: !modern,
+                client_metadata: request_meta
+                    .as_ref()
+                    .and_then(RequestMetaObject::client_info)
+                    .map(|info| crate::protocol::ClientMetadata {
+                        name: Arc::from(info.name),
+                        version: Arc::from(info.version),
+                    }),
+            };
+            let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
+            let mut cancellation_guard = HttpRequestCancellationGuard {
+                router: Arc::clone(&state.router),
+                context: downstream,
+                armed: modern,
+            };
+            // RMCP 3.x treats the request envelope's `extensions` as the
+            // canonical runtime home for wire-level `params._meta`: its
+            // deserializer deliberately removes `_meta` from the typed params
+            // and stores a `RequestMetaObject` in `extensions`. The shared
+            // dispatcher accepts params alone, so materialize that metadata
+            // back onto the params at this adapter boundary. Otherwise both
+            // progress tokens and Plug's rewritten legacy `params.task`
+            // marker disappear before dispatch, turning task-wrapped calls
+            // into synchronous calls.
+            let modern_tasks = modern
+                && request_meta
+                    .as_ref()
+                    .and_then(RequestMetaObject::client_capabilities)
+                    .is_some_and(|capabilities| capabilities.supports_tasks())
+                && state.router.supports_tasks();
+            let mut params = call_req.params;
+            if let Some(extension_meta) = call_req.extensions.get::<RequestMetaObject>() {
+                match params.meta.as_mut() {
+                    Some(params_meta) => params_meta.extend(extension_meta.clone()),
+                    None => params.meta = Some(extension_meta.clone()),
+                }
+            }
+            if modern_tasks {
+                params.meta.get_or_insert_with(Default::default).insert(
+                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                    serde_json::json!({}),
+                );
+            }
+            let response_msg =
+                match crate::dispatch::dispatch_tools_call(&state.router, &ctx, params).await {
+                    Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
+                        ServerJsonRpcMessage::response(
+                            ServerResult::CallToolResult(result),
+                            request_id,
+                        )
+                    }
+                    Ok(crate::dispatch::ToolCallOutcome::InputRequired(result)) => {
+                        ServerJsonRpcMessage::response(
+                            ServerResult::InputRequiredResult(result),
+                            request_id,
+                        )
+                    }
+                    Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
+                        let result = if modern_tasks {
+                            ServerResult::CreateTaskResult(rmcp::model::CreateTaskResult::new(
+                                (&result.task).into(),
+                            ))
+                        } else {
+                            ServerResult::CustomResult(CustomResult::new(
+                                serde_json::to_value(result)
+                                    .expect("legacy task result serializes"),
+                            ))
+                        };
+                        ServerJsonRpcMessage::response(result, request_id)
+                    }
+                    Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
+                };
+            cancellation_guard.disarm();
+            json_response_for_era(&response_msg, era)
+        }
+
+        ClientRequest::CustomRequest(custom)
+            if !modern && custom.method.starts_with("plug/legacy/tasks/") =>
+        {
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let client_type = state
@@ -1479,167 +2139,249 @@ async fn handle_request(
                 client_type,
                 trace_id: Arc::clone(&trace_id),
                 sessions: Arc::clone(&state.sessions),
+                auth_status,
+                oauth_issuer: state
+                    .downstream_oauth
+                    .as_ref()
+                    .map(|manager| Arc::<str>::from(manager.base_url())),
+                protocol_era: era,
+                modern_direction_enabled: false,
+                cancellation: CancellationToken::new(),
+                session_bound: true,
+                client_metadata: None,
             };
-            let response_msg =
-                match crate::dispatch::dispatch_tools_call(&state.router, &ctx, call_req.params)
-                    .await
-                {
-                    Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
-                        ServerJsonRpcMessage::response(
-                            ServerResult::CallToolResult(result),
-                            request_id,
-                        )
-                    }
-                    Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
-                        ServerJsonRpcMessage::response(
-                            ServerResult::CreateTaskResult(result),
-                            request_id,
-                        )
-                    }
-                    Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
-                };
-            json_response(&response_msg)
-        }
-
-        ClientRequest::ListTasksRequest(list_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
-                .router
-                .list_tasks_for_owner(&owner, list_req.params)
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::ListTasksResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
+            let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
+            if let Err(error) = downstream.authorize(crate::protocol::MethodFamily::Tasks) {
+                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
+            }
+            let owner = match crate::dispatch::DownstreamContext::task_owner(&ctx) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
                 }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
+            };
+            let result = match custom.method.as_str() {
+                "plug/legacy/tasks/list" => {
+                    let params = custom
+                        .params_as::<PaginatedRequestParams>()
+                        .map_err(|_| HttpError::BadRequest("invalid task params".into()))?;
+                    state
+                        .router
+                        .list_tasks_for_owner(&owner, params)
+                        .await
+                        .and_then(|v| {
+                            serde_json::to_value(v)
+                                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                        })
                 }
+                "plug/legacy/tasks/get" => match legacy_task_params(&custom) {
+                    Ok(params) => state
+                        .router
+                        .get_task_info_for_owner(&owner, &params.task_id)
+                        .await
+                        .and_then(json_task_value),
+                    Err(e) => Err(e),
+                },
+                "plug/legacy/tasks/result" => match legacy_task_params(&custom) {
+                    Ok(params) => state
+                        .router
+                        .get_task_result_for_owner(&owner, &params.task_id)
+                        .await
+                        .and_then(json_task_value),
+                    Err(e) => Err(e),
+                },
+                "plug/legacy/tasks/cancel" => match legacy_task_params(&custom) {
+                    Ok(params) => state
+                        .router
+                        .cancel_task_for_owner(&owner, &params.task_id)
+                        .await
+                        .and_then(json_task_value),
+                    Err(e) => Err(e),
+                },
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(value) => Ok(axum::Json(
+                    serde_json::json!({"jsonrpc":"2.0","id":request_id,"result":value}),
+                )
+                .into_response()),
+                Err(error) => json_response(&ServerJsonRpcMessage::error(error, Some(request_id))),
             }
         }
 
-        ClientRequest::GetTaskRequest(task_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
+        ClientRequest::GetTaskRequest(task_req) if modern => {
+            let owner = match admit_modern_task_operation(
+                state.router.as_ref(),
+                &policy_context,
+                request_meta.as_ref(),
+            ) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return json_response_for_era(
+                        &ServerJsonRpcMessage::error(error, Some(request_id)),
+                        era,
+                    );
+                }
+            };
+            let response = match state
                 .router
-                .get_task_info_for_owner(&owner, &task_req.params.task_id)
+                .get_modern_task_for_owner(&owner, &task_req.params.task_id)
                 .await
             {
                 Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::GetTaskResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
+                    ServerJsonRpcMessage::response(ServerResult::GetTaskResult(result), request_id)
                 }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
+                Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
+            };
+            json_response_for_era(&response, era)
         }
 
-        ClientRequest::GetTaskPayloadRequest(task_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
-                .router
-                .get_task_result_for_owner(&owner, &task_req.params.task_id)
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::GetTaskPayloadResult(result),
-                        request_id,
+        ClientRequest::CancelTaskRequest(task_req) if modern => {
+            let owner = match admit_modern_task_operation(
+                state.router.as_ref(),
+                &policy_context,
+                request_meta.as_ref(),
+            ) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return json_response_for_era(
+                        &ServerJsonRpcMessage::error(error, Some(request_id)),
+                        era,
                     );
-                    json_response(&response_msg)
                 }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
-        }
-
-        ClientRequest::CancelTaskRequest(task_req) => {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-            match state
+            };
+            let response = match state
                 .router
                 .cancel_task_for_owner(&owner, &task_req.params.task_id)
                 .await
             {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::CancelTaskResult(result),
-                        request_id,
-                    );
-                    json_response(&response_msg)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
+                Ok(_) => ServerJsonRpcMessage::response(
+                    ServerResult::TaskAckResult(TaskAckResult::new()),
+                    request_id,
+                ),
+                Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
+            };
+            json_response_for_era(&response, era)
+        }
+
+        ClientRequest::UpdateTaskRequest(task_req) if modern => {
+            let error = match admit_modern_task_operation(
+                state.router.as_ref(),
+                &policy_context,
+                request_meta.as_ref(),
+            ) {
+                Ok(owner) => match state
+                    .router
+                    .validate_task_owner(&owner, &task_req.params.task_id)
+                    .await
+                {
+                    Ok(()) => McpError::new(
+                        ErrorCode::INVALID_REQUEST,
+                        "this task has no outstanding input request",
+                        None,
+                    ),
+                    Err(error) => error,
+                },
+                Err(error) => error,
+            };
+            json_response_for_era(&ServerJsonRpcMessage::error(error, Some(request_id)), era)
         }
 
         ClientRequest::ListResourcesRequest(list_req) => {
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if let Err(error) =
+                policy_context.authorize(crate::protocol::MethodFamily::ResourcesList)
+            {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             let result = state.router.list_resources_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourcesResult(result),
                 request_id,
             );
-            json_response(&response_msg)
+            json_response_for_era(&response_msg, era)
         }
 
         ClientRequest::ListResourceTemplatesRequest(list_req) => {
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if let Err(error) =
+                policy_context.authorize(crate::protocol::MethodFamily::ResourcesList)
+            {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             let result = state.router.list_resource_templates_page(list_req.params);
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourceTemplatesResult(result),
                 request_id,
             );
-            json_response(&response_msg)
+            json_response_for_era(&response_msg, era)
         }
 
         ClientRequest::ReadResourceRequest(read_req) => {
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if let Err(error) =
+                policy_context.authorize(crate::protocol::MethodFamily::ResourcesRead)
+            {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             match state.router.read_resource(&read_req.params.uri).await {
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
                         ServerResult::ReadResourceResult(result),
                         request_id,
                     );
-                    json_response(&response_msg)
+                    json_response_for_era(&response_msg, era)
                 }
                 Err(mcp_err) => {
                     let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
+                    json_response_for_era(&response_msg, era)
                 }
             }
         }
 
         ClientRequest::ListPromptsRequest(list_req) => {
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::PromptsList)
+            {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             let result = state.router.list_prompts_page(list_req.params);
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
-            json_response(&response_msg)
+            json_response_for_era(&response_msg, era)
         }
 
         ClientRequest::GetPromptRequest(prompt_req) => {
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::PromptsGet)
+            {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             match state
                 .router
                 .get_prompt(&prompt_req.params.name, prompt_req.params.arguments)
@@ -1650,16 +2392,30 @@ async fn handle_request(
                         ServerResult::GetPromptResult(result),
                         request_id,
                     );
-                    json_response(&response_msg)
+                    json_response_for_era(&response_msg, era)
                 }
                 Err(mcp_err) => {
                     let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
+                    json_response_for_era(&response_msg, era)
                 }
             }
         }
 
         ClientRequest::SubscribeRequest(sub_req) => {
+            if modern {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(
+                        McpError::method_not_found::<SubscribeRequestMethod>(),
+                        Some(request_id),
+                    ),
+                    era,
+                );
+            }
+            if let Err(error) =
+                policy_context.authorize(crate::protocol::MethodFamily::ResourcesSubscribe)
+            {
+                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
+            }
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let target = NotificationTarget::Http {
@@ -1685,6 +2441,20 @@ async fn handle_request(
         }
 
         ClientRequest::UnsubscribeRequest(unsub_req) => {
+            if modern {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(
+                        McpError::method_not_found::<UnsubscribeRequestMethod>(),
+                        Some(request_id),
+                    ),
+                    era,
+                );
+            }
+            if let Err(error) =
+                policy_context.authorize(crate::protocol::MethodFamily::ResourcesSubscribe)
+            {
+                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
+            }
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             let target = NotificationTarget::Http {
@@ -1710,23 +2480,41 @@ async fn handle_request(
         }
 
         ClientRequest::CompleteRequest(complete_req) => {
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::Completion)
+            {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             match state.router.complete_request(complete_req.params).await {
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
                         ServerResult::CompleteResult(result),
                         request_id,
                     );
-                    json_response(&response_msg)
+                    json_response_for_era(&response_msg, era)
                 }
                 Err(mcp_err) => {
                     let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
+                    json_response_for_era(&response_msg, era)
                 }
             }
         }
 
         ClientRequest::SetLevelRequest(set_level_req) => {
+            if modern {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(
+                        McpError::method_not_found::<SetLevelRequestMethod>(),
+                        Some(request_id),
+                    ),
+                    era,
+                );
+            }
             let session_id = extract_session_id(headers)?;
             validate_session_header(headers, state.sessions.as_ref())?;
             tracing::info!(
@@ -1747,10 +2535,12 @@ async fn handle_request(
 
         _ => {
             // Unsupported method — return JSON-RPC method not found error
-            validate_session_header(headers, state.sessions.as_ref())?;
+            if !modern {
+                validate_session_header(headers, state.sessions.as_ref())?;
+            }
             let error = ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not supported", None);
             let response_msg = ServerJsonRpcMessage::error(error, Some(request_id));
-            json_response(&response_msg)
+            json_response_for_era(&response_msg, era)
         }
     }
 }
@@ -1758,6 +2548,19 @@ async fn handle_request(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn legacy_task_params(
+    request: &CustomRequest,
+) -> Result<crate::legacy_tasks::TaskIdParams, ErrorData> {
+    request
+        .params_as::<crate::legacy_tasks::TaskIdParams>()
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?
+        .ok_or_else(|| ErrorData::invalid_params("missing task params", None))
+}
+
+fn json_task_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, ErrorData> {
+    serde_json::to_value(value).map_err(|error| ErrorData::internal_error(error.to_string(), None))
+}
 
 /// Build the InitializeResult (same as ProxyHandler::get_info).
 fn build_initialize_result(
@@ -1768,7 +2571,7 @@ fn build_initialize_result(
         .with_server_info(crate::branding::plug_implementation(env!(
             "CARGO_PKG_VERSION"
         )))
-        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        .with_protocol_version(crate::protocol::supported_protocol_version())
 }
 
 /// Extract the host from an Origin header value.
@@ -1814,10 +2617,42 @@ fn validate_session_header(
 
 /// Build a JSON response from a ServerJsonRpcMessage.
 fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
-    let body = serde_json::to_vec(msg)
+    json_response_for_era(msg, crate::protocol::ProtocolEra::Legacy)
+}
+
+fn json_response_for_era(
+    msg: &ServerJsonRpcMessage,
+    era: crate::protocol::ProtocolEra,
+) -> Result<Response, HttpError> {
+    let status = if era == crate::protocol::ProtocolEra::Modern {
+        match msg {
+            JsonRpcMessage::Error(error) if error.error.code == ErrorCode::METHOD_NOT_FOUND => {
+                StatusCode::NOT_FOUND
+            }
+            JsonRpcMessage::Error(error)
+                if matches!(
+                    error.error.code,
+                    ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
+                        | ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+                        | ErrorCode::INVALID_PARAMS
+                ) =>
+            {
+                StatusCode::BAD_REQUEST
+            }
+            _ => StatusCode::OK,
+        }
+    } else {
+        StatusCode::OK
+    };
+    let mut value = serde_json::to_value(msg)
+        .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
+    if era == crate::protocol::ProtocolEra::Legacy {
+        crate::protocol::rewrite_legacy_response(&mut value, false);
+    }
+    let body = serde_json::to_vec(&value)
         .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
 
-    let mut response = (StatusCode::OK, body).into_response();
+    let mut response = (status, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -1829,6 +2664,12 @@ fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if era == crate::protocol::ProtocolEra::Modern {
+        response.headers_mut().insert(
+            PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+        );
+    }
 
     Ok(response)
 }
@@ -1854,6 +2695,7 @@ fn json_response_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::RouterSnapshot;
     use axum::body::Body;
     use http::Request as HttpRequest;
     use std::sync::atomic::AtomicUsize;
@@ -1900,6 +2742,94 @@ mod tests {
         let trace_id = extract_trace_id(&headers);
         assert_eq!(trace_id.len(), 32);
         assert_ne!(trace_id, "00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn shared_loopback_classifier_matches_http_parser_outputs() {
+        for origin in [
+            "http://localhost:3282",
+            "http://127.0.0.1:3282",
+            "http://[::1]:3282",
+        ] {
+            let host = extract_origin_host(origin).expect("loopback origin host");
+            assert!(
+                crate::config::http_bind_is_loopback(host),
+                "expected {host} parsed from {origin} to be loopback"
+            );
+        }
+
+        for origin in [
+            "http://localhost.evil.example:3282",
+            "http://192.0.2.1:3282",
+            "https://plug.example.com",
+        ] {
+            let host = extract_origin_host(origin).expect("non-loopback origin host");
+            assert!(
+                !crate::config::http_bind_is_loopback(host),
+                "expected {host} parsed from {origin} to remain non-loopback"
+            );
+        }
+
+        for host in ["localhost:3282", "127.0.0.1:3282", "[::1]:3282"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(
+                validate_modern_host(&headers, &[], None).is_ok(),
+                "host {host}"
+            );
+        }
+
+        for host in ["localhost.evil.example:3282", "192.0.2.1:3282", "::1"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(
+                validate_modern_host(&headers, &[], None).is_err(),
+                "host {host} must not become loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_host_accepts_public_tunnel_without_allowing_unrelated_browser_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("plug-tunnel.example.com"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://unrelated.example.com"),
+        );
+
+        // OAuth mode supplies the manager's downstream base URL directly.
+        assert!(
+            validate_modern_host(&headers, &[], Some("https://plug-tunnel.example.com/mcp"))
+                .is_ok()
+        );
+        // Non-OAuth public_base_url configuration contributes a host-only URL
+        // marker to this list; it can satisfy Host without satisfying Origin.
+        let configured_public_host = [Arc::from(
+            "https://plug-tunnel.example.com/.plug-public-host-only",
+        )];
+        assert!(validate_modern_host(&headers, &configured_public_host, None).is_ok());
+        assert!(validate_modern_origin(&headers, &configured_public_host).is_err());
+        assert!(validate_modern_origin(&headers, &[]).is_err());
+    }
+
+    #[test]
+    fn authenticated_http_task_owner_is_stable_across_sessions() {
+        let authenticated = AuthStatus::Authenticated(None);
+        assert_eq!(
+            http_task_owner("session-a", &authenticated, None),
+            http_task_owner("session-b", &authenticated, None),
+            "the configured credential, not the replaceable HTTP session, owns durable tasks"
+        );
+
+        assert_ne!(
+            http_task_owner("session-a", &AuthStatus::NoAuthRequired, None),
+            http_task_owner("session-b", &AuthStatus::NoAuthRequired, None),
+            "legacy unauthenticated sessions retain session-scoped ownership"
+        );
     }
 
     async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
@@ -1965,6 +2895,417 @@ mod tests {
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         })
+    }
+
+    fn enable_test_task_surface(router: &ToolRouter) {
+        router.replace_snapshot(RouterSnapshot {
+            routes: HashMap::from([(
+                "Mock__echo".to_string(),
+                ("mock".to_string(), "echo".to_string()),
+            )]),
+            tools_all: Arc::new(vec![Tool::new(
+                std::borrow::Cow::Borrowed("Mock__echo"),
+                std::borrow::Cow::Borrowed("Echo"),
+                Arc::new(serde_json::Map::new()),
+            )]),
+            meta_tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        });
+    }
+
+    fn modern_task_meta(client_supports_tasks: bool) -> RequestMetaObject {
+        let capabilities = if client_supports_tasks {
+            ClientCapabilities::builder().enable_tasks().build()
+        } else {
+            ClientCapabilities::default()
+        };
+        RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            Implementation::new("modern-task-test", "1.0"),
+            capabilities,
+        )
+    }
+
+    fn modern_task_policy_context(
+        gate_enabled: bool,
+        scopes: impl IntoIterator<Item = String>,
+    ) -> DownstreamCallContext {
+        DownstreamCallContext::http("task-client", RequestId::Number(1))
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+            )
+            .with_modern_direction_enabled(gate_enabled)
+            .with_authorization(
+                crate::types::PrincipalId::configured_credential("task-test", 1),
+                scopes,
+            )
+    }
+
+    fn modern_request(method: &str, mut params: serde_json::Value) -> HttpRequest<Body> {
+        params.as_object_mut().expect("params object").insert(
+            "_meta".to_string(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "plug-modern-test",
+                    "version": "1.0.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        );
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::HOST, "localhost:3282")
+            .header(PROTOCOL_VERSION_HEADER, "2026-07-28")
+            .header(crate::mcp_http_headers::MCP_METHOD_HEADER, method)
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn issue_test_oauth_token(
+        manager: &crate::downstream_oauth::DownstreamOauthManager,
+        scope: &str,
+    ) -> String {
+        let redirect_uri = "https://client.example.com/callback";
+        let registration = manager
+            .register_client(
+                ClientRegistrationRequest {
+                    redirect_uris: vec![redirect_uri.to_string()],
+                    client_name: Some("modern-scope-test".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec![
+                        "authorization_code".to_string(),
+                        "refresh_token".to_string(),
+                    ]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "modern-scope-test",
+            )
+            .await
+            .expect("register client");
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &registration.client_id,
+                redirect_uri,
+                state: "scope-test",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some(scope),
+                resource: &manager.resource(),
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let code = url::Url::parse(&redirect.location)
+            .expect("redirect URL")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+            .expect("authorization code");
+        manager
+            .exchange_authorization_code(
+                &registration.client_id,
+                &code,
+                redirect_uri,
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                &manager.resource(),
+            )
+            .await
+            .expect("exchange authorization code")
+            .access_token
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_read_oauth_principal_keeps_pre_scope_method_compatibility() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "tools:read").await;
+        let claims = match manager
+            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims,
+            other => panic!("issued token must validate, got {other:?}"),
+        };
+        let state = test_state();
+        let context = legacy_http_policy_context(
+            &state,
+            &AuthStatus::Authenticated(Some(claims)),
+            RequestId::Number(91),
+            Arc::from("legacy-oauth-regression"),
+        );
+
+        assert!(
+            context.principal.is_some(),
+            "verified principal is preserved"
+        );
+        assert!(
+            context.principal_lifecycle.is_some(),
+            "revocation lifecycle is preserved"
+        );
+        for family in [
+            crate::protocol::MethodFamily::ToolsList,
+            crate::protocol::MethodFamily::ResourcesList,
+            crate::protocol::MethodFamily::ResourcesRead,
+            crate::protocol::MethodFamily::ResourcesSubscribe,
+            crate::protocol::MethodFamily::PromptsList,
+            crate::protocol::MethodFamily::PromptsGet,
+            crate::protocol::MethodFamily::Completion,
+            crate::protocol::MethodFamily::Tasks,
+            crate::protocol::MethodFamily::Listeners,
+        ] {
+            assert!(
+                context.policy_decision(family).is_allowed(),
+                "legacy OAuth principal lost access to {family:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_is_default_off_then_sessionless_when_enabled() {
+        let state = test_state();
+        let disabled = build_router(Arc::clone(&state))
+            .oneshot(modern_request("server/discover", json!({})))
+            .await
+            .unwrap();
+        assert_ne!(disabled.status(), StatusCode::OK);
+
+        state.router.set_modern_downstream_enabled(true);
+        let response = build_router(Arc::clone(&state))
+            .oneshot(modern_request("server/discover", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(SESSION_ID_HEADER).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(PROTOCOL_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2026-07-28")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["resultType"], "complete");
+        assert_eq!(value["result"]["supportedVersions"][0], "2026-07-28");
+        assert!(value["result"]["capabilities"]["extensions"].is_null());
+        assert!(value["result"]["capabilities"]["experimental"].is_null());
+        assert!(value["result"]["capabilities"]["logging"].is_null());
+    }
+
+    #[test]
+    fn modern_http_task_admission_matrix_is_consistent() {
+        let state = test_state();
+        let allowed = modern_task_policy_context(true, ["tasks:use".to_string()]);
+        let task_meta = modern_task_meta(true);
+
+        let unavailable =
+            admit_modern_task_operation(state.router.as_ref(), &allowed, Some(&task_meta))
+                .expect_err("server without task surface must reject all task methods");
+        assert_eq!(unavailable.code, ErrorCode::METHOD_NOT_FOUND);
+
+        enable_test_task_surface(state.router.as_ref());
+        let missing_client = admit_modern_task_operation(
+            state.router.as_ref(),
+            &allowed,
+            Some(&modern_task_meta(false)),
+        )
+        .expect_err("client capability is mandatory");
+        assert_eq!(
+            missing_client.code,
+            ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+        );
+
+        let denied = modern_task_policy_context(true, ["tools:read".to_string()]);
+        let permission =
+            admit_modern_task_operation(state.router.as_ref(), &denied, Some(&task_meta))
+                .expect_err("task scope is mandatory");
+        assert_eq!(
+            permission.code.0,
+            crate::protocol::ProtocolOutcome::PermissionDenied
+                .encode(crate::protocol::ProtocolEra::Modern)
+                .code
+        );
+
+        let gate_off = modern_task_policy_context(false, ["tasks:use".to_string()]);
+        let disabled =
+            admit_modern_task_operation(state.router.as_ref(), &gate_off, Some(&task_meta))
+                .expect_err("live gate must apply to direct task methods");
+        assert_eq!(
+            disabled,
+            crate::protocol::ProtocolOutcome::UnsupportedBridge
+                .into_error(crate::protocol::ProtocolEra::Modern)
+        );
+
+        let owner = admit_modern_task_operation(state.router.as_ref(), &allowed, Some(&task_meta))
+            .expect("fully admitted task method");
+        assert_eq!(
+            owner.as_key(),
+            allowed.principal.as_ref().expect("principal").owner_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_off_rejects_every_modern_http_task_method_before_dispatch() {
+        let state = test_state();
+        enable_test_task_surface(state.router.as_ref());
+        for (method, params) in [
+            ("tasks/get", json!({"taskId":"task_1"})),
+            (
+                "tasks/update",
+                json!({"taskId":"task_1","inputResponses":{}}),
+            ),
+            ("tasks/cancel", json!({"taskId":"task_1"})),
+        ] {
+            let response = build_router(Arc::clone(&state))
+                .oneshot(modern_request(method, params))
+                .await
+                .expect("task response");
+            assert_ne!(response.status(), StatusCode::OK, "{method} escaped gate");
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_catalog_is_sessionless_and_deterministic() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let app = build_router(state);
+        let first = app
+            .clone()
+            .oneshot(modern_request("tools/list", json!({})))
+            .await
+            .unwrap();
+        let second = app
+            .oneshot(modern_request("tools/list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let first = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn modern_unsupported_method_uses_modern_http_status() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let response = build_router(state)
+            .oneshot(modern_request("ping", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resource_only_oauth_token_can_discover_and_list_resources_but_not_tools() {
+        let manager = isolated_oauth_manager(vec!["resources:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "resources:read").await;
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let state = Arc::new(HttpState {
+            router: Arc::clone(&state.router),
+            sessions: Arc::clone(&state.sessions),
+            cancel: state.cancel.clone(),
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(manager),
+            sse_channel_capacity: state.sse_channel_capacity,
+            allowed_origins: state.allowed_origins.clone(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        });
+        let app = build_router(state);
+        let authorized = |method: &str| {
+            let mut request = modern_request(method, json!({}));
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {access_token}"))
+                    .expect("authorization header"),
+            );
+            request
+        };
+
+        let discovery = app
+            .clone()
+            .oneshot(authorized("server/discover"))
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::OK);
+
+        let resources = app
+            .clone()
+            .oneshot(authorized("resources/list"))
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+
+        let tools = app.oneshot(authorized("tools/list")).await.unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(tools.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["data"]["kind"], "permission_denied");
+    }
+
+    #[test]
+    fn modern_capability_projection_is_permission_filtered_and_bridge_free() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let context = DownstreamCallContext::http("scoped-client", RequestId::Number(1))
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+            )
+            .with_modern_direction_enabled(true)
+            .with_authorization(
+                crate::types::PrincipalId::configured_credential("test", 1),
+                ["tools:read".to_string()],
+            );
+        let capabilities = projected_modern_capabilities(state.router.as_ref(), &context);
+        assert!(
+            context
+                .policy_decision(crate::protocol::MethodFamily::ToolsList)
+                .is_allowed()
+        );
+        assert!(capabilities.resources.is_none());
+        assert!(capabilities.prompts.is_none());
+        assert!(capabilities.completions.is_none());
+        assert!(capabilities.extensions.is_none());
+        assert!(capabilities.experimental.is_none());
+        assert!(capabilities.logging.is_none());
     }
 
     /// Session-store wrapper that parks the owner-liveness validation (the
@@ -2296,6 +3637,38 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Mcp-Name")
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_missing_mcp_name_error_carries_modern_protocol_header() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let response = build_router(state)
+            .oneshot(modern_request(
+                "tools/call",
+                json!({"name": "actual_tool", "arguments": {}}),
+            ))
+            .await
+            .expect("header mismatch response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(PROTOCOL_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], HEADER_MISMATCH_CODE);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Mcp-Name"))
         );
     }
 

@@ -13,7 +13,6 @@ use dashmap::DashMap;
 use futures::future::join_all;
 use futures::stream::BoxStream;
 use rmcp::ErrorData as McpError;
-use rmcp::ServiceExt as _;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
@@ -21,22 +20,21 @@ use rmcp::model::{
     Implementation, InitializedNotification, LoggingMessageNotificationParam,
     ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
     ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
-    SetLevelRequestParams, TasksCapability, Tool, UrlElicitationCapability,
+    SetLevelRequestParams, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
     StreamableHttpError, StreamableHttpPostResponse,
 };
+use rmcp::{ClientLifecycleMode, ClientServiceExt as _, ServiceExt as _};
 use sse_stream::{Error as SseError, Sse};
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
-use crate::config::{Config, ServerConfig, TransportType};
+use crate::config::{Config, ServerConfig, TransportType, UpstreamProtocolMode};
 use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
-
-const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -47,6 +45,7 @@ const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 fn upstream_metadata_from_implementation(
     implementation: &Implementation,
+    selected_protocol_version: &str,
 ) -> Option<UpstreamServerMetadata> {
     let icons = crate::icons::normalize_icons(implementation.icons.as_deref());
     Some(UpstreamServerMetadata {
@@ -56,7 +55,67 @@ fn upstream_metadata_from_implementation(
         description: implementation.description.clone(),
         website_url: implementation.website_url.clone(),
         icons,
+        selected_protocol_version: Some(selected_protocol_version.to_string()),
     })
+}
+
+fn effective_upstream_protocol_mode(
+    configured: UpstreamProtocolMode,
+    modern_upstream_enabled: bool,
+) -> UpstreamProtocolMode {
+    if modern_upstream_enabled {
+        configured
+    } else {
+        UpstreamProtocolMode::Legacy
+    }
+}
+
+fn client_lifecycle_mode(mode: UpstreamProtocolMode) -> ClientLifecycleMode {
+    match mode {
+        UpstreamProtocolMode::Legacy => ClientLifecycleMode::Initialize,
+        UpstreamProtocolMode::Auto => ClientLifecycleMode::Auto {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
+        },
+        UpstreamProtocolMode::Modern => ClientLifecycleMode::Discover {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+        },
+    }
+}
+
+fn should_fallback_to_legacy_sse(mode: UpstreamProtocolMode, error: &anyhow::Error) -> bool {
+    mode == UpstreamProtocolMode::Legacy
+        && crate::transport::sse_client::should_fallback_http_error(error)
+}
+
+/// RMCP 3.x intentionally dropped SEP-1686's top-level `capabilities.tasks`,
+/// so serde cannot retain that bit from a legacy initialize response. Probe
+/// the legacy read-only `tasks/list` method through RMCP's raw custom-request
+/// escape hatch and restore the capability into Plug's private extension
+/// namespace when the server proves it implements the old task surface.
+async fn restore_legacy_task_capability(
+    peer: &rmcp::service::Peer<rmcp::RoleClient>,
+    capabilities: &mut ServerCapabilities,
+    timeout: Duration,
+) {
+    if crate::protocol::legacy_tasks_capability(capabilities) {
+        return;
+    }
+    let request = crate::legacy_tasks::request("tasks/list", Some(serde_json::json!({})));
+    let Ok(Ok(response)) = tokio::time::timeout(timeout, peer.send_request(request)).await else {
+        return;
+    };
+    if crate::legacy_tasks::parse_list_result(response).is_err() {
+        return;
+    }
+
+    capabilities
+        .experimental
+        .get_or_insert_with(Default::default)
+        .insert(
+            crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+            serde_json::Map::new(),
+        );
 }
 
 #[derive(Clone)]
@@ -259,7 +318,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
@@ -280,6 +339,8 @@ pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
     tools: Arc<ArcSwap<Vec<Tool>>>,
     router: std::sync::Weak<ToolRouter>,
+    #[cfg(test)]
+    protocol_version_override: Option<rmcp::model::ProtocolVersion>,
 }
 
 #[cfg(test)]
@@ -297,6 +358,21 @@ impl UpstreamClientHandler {
             server_id,
             tools,
             router,
+            protocol_version_override: None,
+        }
+    }
+
+    pub(crate) fn new_for_tests_with_protocol(
+        server_id: Arc<str>,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        router: std::sync::Weak<ToolRouter>,
+        protocol_version: rmcp::model::ProtocolVersion,
+    ) -> Self {
+        Self {
+            server_id,
+            tools,
+            router,
+            protocol_version_override: Some(protocol_version),
         }
     }
 }
@@ -310,19 +386,23 @@ impl ClientHandler for UpstreamClientHandler {
         let mut roots = RootsCapabilities::default();
         roots.list_changed = Some(true);
         info.capabilities.roots = Some(roots);
-        info.capabilities.tasks = Some(TasksCapability::client_default());
         info.capabilities.sampling = Some(SamplingCapability::default());
         info.capabilities.elicitation = Some(
             ElicitationCapability::new()
                 .with_form(FormElicitationCapability::default())
                 .with_url(UrlElicitationCapability::default()),
         );
-        info = info.with_protocol_version(
-            serde_json::from_value(serde_json::Value::String(
-                LATEST_PROTOCOL_VERSION.to_string(),
-            ))
-            .expect("latest protocol version must parse"),
-        );
+        let protocol_version = {
+            #[cfg(test)]
+            if let Some(version) = &self.protocol_version_override {
+                version.clone()
+            } else {
+                crate::protocol::supported_protocol_version()
+            }
+            #[cfg(not(test))]
+            crate::protocol::supported_protocol_version()
+        };
+        info = info.with_protocol_version(protocol_version);
         info
     }
 
@@ -512,7 +592,28 @@ pub struct UpstreamServer {
     pub(crate) tools: Arc<ArcSwap<Vec<rmcp::model::Tool>>>,
     pub capabilities: ServerCapabilities,
     pub upstream: Option<UpstreamServerMetadata>,
+    /// Protocol era and version selected by this live connection.
+    pub protocol_era: crate::protocol::ProtocolEra,
+    pub selected_protocol_version: String,
+    /// Exact global protocol-gate generation/value used when this connection
+    /// began. Commit validation uses it to reject a connection made stale by
+    /// a concurrent live gate flip.
+    pub(crate) protocol_gate_state: u64,
+    /// Monotonic identity of this concrete connection. Unlike an `Arc`
+    /// address, this cannot be recycled after a reconnect and is stable for
+    /// every clone of the published connection.
+    pub(crate) generation: u64,
     pub health: ServerHealth,
+}
+
+static NEXT_UPSTREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_upstream_generation() -> u64 {
+    NEXT_UPSTREAM_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .expect("upstream connection generation exhausted")
 }
 
 /// Manages the lifecycle of upstream MCP servers.
@@ -648,6 +749,8 @@ pub struct ServerManager {
     /// (no shutdown) never observes a `true` value, so the grace period is
     /// unaffected.
     shutdown_signal: tokio::sync::watch::Sender<bool>,
+    /// Live, reloadable safety gate for modern upstream negotiation.
+    modern_upstream_gate_state: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -713,7 +816,36 @@ impl ServerManager {
             tool_router: std::sync::RwLock::new(None),
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             shutdown_signal,
+            modern_upstream_gate_state: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_modern_upstream_enabled(&self, enabled: bool) {
+        let enabled_bit = u64::from(enabled);
+        let mut current = self.modern_upstream_gate_state.load(Ordering::Acquire);
+        loop {
+            if current & 1 == enabled_bit {
+                return;
+            }
+            let next = current.wrapping_add(2) ^ 1;
+            match self.modern_upstream_gate_state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn modern_upstream_enabled(&self) -> bool {
+        self.modern_upstream_gate_state.load(Ordering::Acquire) & 1 == 1
+    }
+
+    pub(crate) fn modern_upstream_gate_state(&self) -> u64 {
+        self.modern_upstream_gate_state.load(Ordering::Acquire)
     }
 
     /// Record the outcome and latency of a tool call to an upstream. Read-side
@@ -890,6 +1022,7 @@ impl ServerManager {
 
     /// Start all enabled servers from config, batched by `config.startup_concurrency`.
     pub async fn start_all(&self, config: &Config) -> Result<(), anyhow::Error> {
+        self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
             .iter()
@@ -916,9 +1049,15 @@ impl ServerManager {
                 let name_clone = name.clone();
                 let sc = server_config.clone();
                 let tool_router = self.tool_router();
+                let modern_upstream_gate_state = self.modern_upstream_gate_state();
                 join_set.spawn(async move {
-                    let result =
-                        Self::start_server_with_router(&name_clone, &sc, tool_router).await;
+                    let result = Self::start_server_with_router(
+                        &name_clone,
+                        &sc,
+                        tool_router,
+                        modern_upstream_gate_state,
+                    )
+                    .await;
                     (name_clone, result)
                 });
             }
@@ -996,13 +1135,25 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        Self::start_server_with_router(name, config, self.tool_router()).await
+        self.start_server_with_protocol_gate_state(name, config, self.modern_upstream_gate_state())
+            .await
+    }
+
+    pub(crate) async fn start_server_with_protocol_gate_state(
+        &self,
+        name: &str,
+        config: &ServerConfig,
+        modern_upstream_gate_state: u64,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        Self::start_server_with_router(name, config, self.tool_router(), modern_upstream_gate_state)
+            .await
     }
 
     async fn start_server_with_router(
         name: &str,
         config: &ServerConfig,
         tool_router: std::sync::Weak<ToolRouter>,
+        modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         // Recursion shield: never start a server named "plug"
         if name == "plug" {
@@ -1010,6 +1161,10 @@ impl ServerManager {
         }
 
         let timeout_duration = Duration::from_secs(config.timeout_secs);
+        let effective_protocol_mode = effective_upstream_protocol_mode(
+            config.protocol_mode,
+            modern_upstream_gate_state & 1 == 1,
+        );
 
         let result = tokio::time::timeout(timeout_duration, async {
             match config.transport {
@@ -1044,10 +1199,15 @@ impl ServerManager {
                         server_id: Arc::from(name),
                         tools: Arc::clone(&tools),
                         router: tool_router.clone(),
+                        #[cfg(test)]
+                        protocol_version_override: None,
                     });
 
                     let client: McpClient = handler
-                        .serve(transport)
+                        .serve_with_lifecycle(
+                            transport,
+                            client_lifecycle_mode(effective_protocol_mode),
+                        )
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to initialize client: {e}"))?;
 
@@ -1059,23 +1219,55 @@ impl ServerManager {
                     tools.store(Arc::new(tools_result));
 
                     let server_info = client.peer().peer_info();
-                    let upstream = server_info
+                    let selected_protocol_version = server_info
                         .as_ref()
-                        .and_then(|info| upstream_metadata_from_implementation(&info.server_info));
+                        .map(|info| info.protocol_version.to_string())
+                        .unwrap_or_else(|| crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string());
+                    let protocol_era = crate::protocol::ProtocolEra::from_version(
+                        &server_info
+                            .as_ref()
+                            .map(|info| info.protocol_version.clone())
+                            .unwrap_or(rmcp::model::ProtocolVersion::V_2025_11_25),
+                    );
+                    let upstream = server_info.as_ref().and_then(|info| {
+                        info.server_info
+                            .as_ref()
+                            .and_then(|implementation| {
+                                upstream_metadata_from_implementation(
+                                    implementation,
+                                    &selected_protocol_version,
+                                )
+                            })
+                    });
                     if let Some(info) = server_info {
+                        let implementation = info.server_info.as_ref();
                         tracing::info!(
                             server = %name,
-                            server_name = %info.server_info.name,
-                            server_version = %info.server_info.version,
+                            server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
+                            server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
+                            configured_protocol = ?config.protocol_mode,
+                            effective_protocol = ?effective_protocol_mode,
+                            selected_protocol = %info.protocol_version,
                             "connected to server"
                         );
                     }
 
-                    let capabilities = client
+                    let mut capabilities = client
                         .peer()
                         .peer_info()
                         .map(|info| info.capabilities.clone())
                         .unwrap_or_default();
+                    if protocol_era == crate::protocol::ProtocolEra::Legacy {
+                        restore_legacy_task_capability(
+                            client.peer(),
+                            &mut capabilities,
+                            Duration::from_secs(config.call_timeout_secs),
+                        )
+                        .await;
+                    } else {
+                        capabilities.extensions = None;
+                        capabilities.experimental = None;
+                    }
 
                     Ok(UpstreamServer {
                         name: name.to_string(),
@@ -1084,6 +1276,10 @@ impl ServerManager {
                         tools,
                         capabilities,
                         upstream,
+                        protocol_era,
+                        selected_protocol_version,
+                        protocol_gate_state: modern_upstream_gate_state,
+                        generation: next_upstream_generation(),
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -1113,9 +1309,14 @@ impl ServerManager {
 
                     // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
                     let auth_token = if config.auth.as_deref() == Some("oauth") {
-                        match crate::oauth::current_or_stored_access_token(name).await {
-                            Some(token) => Some(token),
-                            None => {
+                        match crate::oauth::verified_access_token_for_resource(name, url).await {
+                            Ok(Some(token)) => Some(token),
+                            Err(error) => {
+                                return Err(anyhow::anyhow!(
+                                    "OAuth authority verification failed for server '{name}': {error}"
+                                ));
+                            }
+                            Ok(None) => {
                                 tracing::info!(
                                     server = %name,
                                     "OAuth server has no available token, marking AuthRequired"
@@ -1147,22 +1348,42 @@ impl ServerManager {
                         server_id: Arc::from(name),
                         tools: Arc::clone(&tools),
                         router: tool_router.clone(),
+                        #[cfg(test)]
+                        protocol_version_override: None,
                     });
 
-                    match handler.serve(transport).await {
+                    match handler
+                        .serve_with_lifecycle(
+                            transport,
+                            client_lifecycle_mode(effective_protocol_mode),
+                        )
+                        .await
+                    {
                         Ok(client) => {
-                            Self::finish_upstream_connection(name, config, client, tools, "HTTP upstream").await
+                            Self::finish_upstream_connection(
+                                name,
+                                config,
+                                client,
+                                tools,
+                                "HTTP upstream",
+                                modern_upstream_gate_state,
+                            ).await
                         }
                         Err(e) => {
                             let error = anyhow::Error::new(e)
                                 .context("failed to connect to HTTP upstream");
-                            if crate::transport::sse_client::should_fallback_http_error(&error) {
+                            if should_fallback_to_legacy_sse(effective_protocol_mode, &error) {
                                 tracing::info!(
                                     server = %name,
                                     error = %error,
                                     "HTTP upstream looks legacy-SSE compatible; falling back"
                                 );
-                                Self::connect_sse_upstream(name, config, tool_router).await
+                                Self::connect_sse_upstream(
+                                    name,
+                                    config,
+                                    tool_router,
+                                    modern_upstream_gate_state,
+                                ).await
                             } else {
                                 Err(error)
                             }
@@ -1170,7 +1391,18 @@ impl ServerManager {
                     }
                 }
                 TransportType::Sse => {
-                    Self::connect_sse_upstream(name, config, tool_router).await
+                    if effective_protocol_mode != UpstreamProtocolMode::Legacy {
+                        anyhow::bail!(
+                            "legacy SSE transport does not support {:?} MCP lifecycle negotiation",
+                            effective_protocol_mode
+                        );
+                    }
+                    Self::connect_sse_upstream(
+                        name,
+                        config,
+                        tool_router,
+                        modern_upstream_gate_state,
+                    ).await
                 }
             }
         })
@@ -1198,6 +1430,7 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
         tool_router: std::sync::Weak<ToolRouter>,
+        modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         crate::tls::ensure_rustls_provider_installed();
 
@@ -1221,9 +1454,14 @@ impl ServerManager {
 
         // Resolve auth token: OAuth token from cache, or static bearer token
         let auth_token_value = if config.auth.as_deref() == Some("oauth") {
-            match crate::oauth::current_or_stored_access_token(name).await {
-                Some(token) => Some(token),
-                None => {
+            match crate::oauth::verified_access_token_for_resource(name, url).await {
+                Ok(Some(token)) => Some(token),
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "OAuth authority verification failed for server '{name}': {error}"
+                    ));
+                }
+                Ok(None) => {
                     return Err(anyhow::anyhow!(
                         "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
                     ));
@@ -1250,6 +1488,8 @@ impl ServerManager {
             server_id: Arc::from(name),
             tools: Arc::clone(&tools),
             router: tool_router,
+            #[cfg(test)]
+            protocol_version_override: None,
         });
 
         let client: McpClient = handler
@@ -1257,7 +1497,15 @@ impl ServerManager {
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to legacy SSE upstream: {e}"))?;
 
-        Self::finish_upstream_connection(name, config, client, tools, "legacy SSE upstream").await
+        Self::finish_upstream_connection(
+            name,
+            config,
+            client,
+            tools,
+            "legacy SSE upstream",
+            modern_upstream_gate_state,
+        )
+        .await
     }
 
     /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
@@ -1267,6 +1515,7 @@ impl ServerManager {
         client: McpClient,
         tools: Arc<ArcSwap<Vec<Tool>>>,
         transport_label: &str,
+        modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let tools_result = client
             .peer()
@@ -1276,23 +1525,49 @@ impl ServerManager {
         tools.store(Arc::new(tools_result));
 
         let server_info = client.peer().peer_info();
-        let upstream = server_info
+        let selected_protocol_version = server_info
             .as_ref()
-            .and_then(|info| upstream_metadata_from_implementation(&info.server_info));
+            .map(|info| info.protocol_version.to_string())
+            .unwrap_or_else(|| crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string());
+        let protocol_era = crate::protocol::ProtocolEra::from_version(
+            &server_info
+                .as_ref()
+                .map(|info| info.protocol_version.clone())
+                .unwrap_or(rmcp::model::ProtocolVersion::V_2025_11_25),
+        );
+        let upstream = server_info.as_ref().and_then(|info| {
+            info.server_info.as_ref().and_then(|implementation| {
+                upstream_metadata_from_implementation(implementation, &selected_protocol_version)
+            })
+        });
         if let Some(info) = server_info {
+            let implementation = info.server_info.as_ref();
             tracing::info!(
                 server = %name,
-                server_name = %info.server_info.name,
-                server_version = %info.server_info.version,
+                server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
+                server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
+                configured_protocol = ?config.protocol_mode,
+                selected_protocol = %info.protocol_version,
                 "connected to {transport_label}"
             );
         }
 
-        let capabilities = client
+        let mut capabilities = client
             .peer()
             .peer_info()
             .map(|info| info.capabilities.clone())
             .unwrap_or_default();
+        if protocol_era == crate::protocol::ProtocolEra::Legacy {
+            restore_legacy_task_capability(
+                client.peer(),
+                &mut capabilities,
+                Duration::from_secs(config.call_timeout_secs),
+            )
+            .await;
+        } else {
+            capabilities.extensions = None;
+            capabilities.experimental = None;
+        }
 
         Ok(UpstreamServer {
             name: name.to_string(),
@@ -1301,6 +1576,10 @@ impl ServerManager {
             tools,
             capabilities,
             upstream,
+            protocol_era,
+            selected_protocol_version,
+            protocol_gate_state: modern_upstream_gate_state,
+            generation: next_upstream_generation(),
             health: ServerHealth::Healthy,
         })
     }
@@ -1688,6 +1967,8 @@ impl ServerManager {
                     upstream: upstream.upstream.clone(),
                     metrics: Some(self.metrics_snapshot_or_default(&upstream.name)),
                     availability: self.availability_for(&upstream.name, health),
+                    selected_protocol_era: Some(upstream.protocol_era),
+                    selected_protocol_version: Some(upstream.selected_protocol_version.clone()),
                     last_seen: None,
                 }
             })
@@ -1711,6 +1992,8 @@ impl ServerManager {
                 upstream: None,
                 metrics: self.metrics_snapshot(entry.key()),
                 availability: self.availability_for(entry.key(), entry.health),
+                selected_protocol_era: None,
+                selected_protocol_version: None,
                 last_seen: None,
             });
         }
@@ -1991,14 +2274,13 @@ mod tests {
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
-        CallToolRequest, CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
-        ClientJsonRpcMessage, ClientRequest, ContentBlock, CreateTaskResult, GetPromptResult,
-        GetTaskParams, GetTaskPayloadResult, GetTaskRequest, GetTaskResult, Icon, Implementation,
-        InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        ListTasksResult, ListToolsResult, Meta, NumberOrString, ProgressNotificationParam,
-        ProgressToken, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContents,
-        ResourceTemplate, Role, ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult,
-        Task, TaskStatus, TasksCapability, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
+        ClientJsonRpcMessage, ClientRequest, ContentBlock, GetPromptResponse, GetPromptResult,
+        Icon, Implementation, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, NumberOrString, ProgressNotificationParam,
+        ProgressToken, Prompt, PromptMessage, ReadResourceResponse, ReadResourceResult,
+        RequestMetaObject as Meta, Resource, ResourceContents, ResourceTemplate, Role,
+        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Tool,
     };
     use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
     use rmcp::{ClientHandler, ServiceExt};
@@ -2072,8 +2354,11 @@ mod tests {
                 Icon::new("file:///tmp/icon.png").with_mime_type("image/png"),
             ]);
 
-        let metadata =
-            upstream_metadata_from_implementation(&implementation).expect("metadata present");
+        let metadata = upstream_metadata_from_implementation(
+            &implementation,
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+        )
+        .expect("metadata present");
 
         assert_eq!(metadata.name, "iMessage Max");
         assert_eq!(metadata.title.as_deref(), Some("iMessage Max"));
@@ -2088,13 +2373,73 @@ mod tests {
     fn upstream_metadata_preserves_required_identity_without_optional_fields() {
         let implementation = Implementation::new("plain-server", "0.1.0");
 
-        let metadata =
-            upstream_metadata_from_implementation(&implementation).expect("metadata present");
+        let metadata = upstream_metadata_from_implementation(
+            &implementation,
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+        )
+        .expect("metadata present");
 
         assert_eq!(metadata.name, "plain-server");
         assert_eq!(metadata.version, "0.1.0");
         assert_eq!(metadata.title, None);
         assert_eq!(metadata.icons, None);
+    }
+
+    #[test]
+    fn upstream_protocol_gate_and_lifecycle_mapping_are_exact() {
+        assert_eq!(
+            effective_upstream_protocol_mode(UpstreamProtocolMode::Modern, false),
+            UpstreamProtocolMode::Legacy
+        );
+        assert_eq!(
+            effective_upstream_protocol_mode(UpstreamProtocolMode::Auto, true),
+            UpstreamProtocolMode::Auto
+        );
+
+        assert_eq!(
+            client_lifecycle_mode(UpstreamProtocolMode::Auto),
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
+            }
+        );
+        assert_eq!(
+            client_lifecycle_mode(UpstreamProtocolMode::Modern),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            }
+        );
+    }
+
+    #[test]
+    fn modern_modes_never_enter_the_legacy_sse_error_fallback() {
+        let method_not_allowed =
+            anyhow::anyhow!("unexpected server response: HTTP 405 Method Not Allowed");
+        assert!(should_fallback_to_legacy_sse(
+            UpstreamProtocolMode::Legacy,
+            &method_not_allowed
+        ));
+        assert!(!should_fallback_to_legacy_sse(
+            UpstreamProtocolMode::Auto,
+            &method_not_allowed
+        ));
+        assert!(!should_fallback_to_legacy_sse(
+            UpstreamProtocolMode::Modern,
+            &method_not_allowed
+        ));
+
+        for message in [
+            "HTTP 401 Unauthorized",
+            "TLS certificate validation failed",
+            "request timed out",
+            "HTTP 429 Too Many Requests",
+            "HTTP 500 Internal Server Error",
+        ] {
+            assert!(!should_fallback_to_legacy_sse(
+                UpstreamProtocolMode::Legacy,
+                &anyhow::anyhow!(message)
+            ));
+        }
     }
 
     fn test_router_config() -> RouterConfig {
@@ -2118,6 +2463,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -2166,7 +2512,10 @@ mod tests {
                 "id": message["id"],
                 "result": {
                     "protocolVersion": "2025-11-25",
-                    "capabilities": { "tools": { "listChanged": false } },
+                    "capabilities": {
+                        "tools": { "listChanged": false },
+                        "tasks": { "list": {}, "cancel": {}, "requests": { "tools": { "call": {} } } }
+                    },
                     "serverInfo": { "name": "auth-test", "version": "1.0.0" }
                 }
             }))
@@ -2175,6 +2524,12 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": message["id"],
                 "result": { "tools": [] }
+            }))
+            .into_response(),
+            Some("tasks/list") => Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": { "tasks": [] }
             }))
             .into_response(),
             Some("notifications/initialized") => StatusCode::ACCEPTED.into_response(),
@@ -2217,7 +2572,11 @@ mod tests {
             headers.first().map(String::as_str),
             Some("Bearer static-token")
         );
-        result.expect("streamable HTTP upstream should accept static bearer token");
+        let upstream = result.expect("streamable HTTP upstream should accept static bearer token");
+        assert!(
+            crate::protocol::legacy_tasks_capability(&upstream.capabilities),
+            "raw legacy tasks/list must restore the capability RMCP 3 drops from initialize"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2325,7 +2684,7 @@ mod tests {
 
     impl ServerHandler for MutableToolServerHandler {
         fn get_info(&self) -> ServerInfo {
-            let mut capabilities = ServerCapabilities::default();
+            let mut capabilities = ServerCapabilities::builder().enable_tasks().build();
             let mut tools = rmcp::model::ToolsCapability::default();
             tools.list_changed = Some(true);
             capabilities.tools = Some(tools);
@@ -2349,11 +2708,12 @@ mod tests {
             &self,
             request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
             let content = format!("called {}", request.name);
             std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
                 content,
-            )])))
+            )])
+            .into()))
         }
     }
 
@@ -2408,14 +2768,12 @@ mod tests {
             &self,
             request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
             let cancel_signal = Arc::clone(&self.cancel_signal);
             async move {
                 let _ = request.progress_token();
                 cancel_signal.notified().await;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "cancelled upstream",
-                )]))
+                Ok(CallToolResult::success(vec![ContentBlock::text("cancelled upstream")]).into())
             }
         }
 
@@ -2435,148 +2793,110 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TaskNativeUpstreamHandler {
-        next_id: AtomicUsize,
-        tasks: Mutex<HashMap<String, (Task, serde_json::Value)>>,
-        task_result_requests: Arc<AtomicUsize>,
-    }
+    async fn serve_raw_legacy_task_upstream(
+        stream: tokio::io::DuplexStream,
+        result_requests: Arc<AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    impl ServerHandler for TaskNativeUpstreamHandler {
-        fn get_info(&self) -> ServerInfo {
-            let mut capabilities = ServerCapabilities::default();
-            let mut tools = rmcp::model::ToolsCapability::default();
-            tools.list_changed = Some(false);
-            capabilities.tools = Some(tools);
-            capabilities.tasks = Some(TasksCapability::server_default());
-            ServerInfo::new(capabilities)
-        }
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut next_id = 0usize;
+        let mut tasks = HashMap::<String, (crate::legacy_tasks::Task, serde_json::Value)>::new();
 
-        fn list_tools(
-            &self,
-            _request: Option<rmcp::model::PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
-            std::future::ready(Ok(ListToolsResult::with_all_items(vec![make_tool("echo")])))
-        }
-
-        fn call_tool(
-            &self,
-            _request: CallToolRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
-            std::future::ready(Err(McpError::internal_error(
-                "wrapper mode should not reach upstream call_tool".to_string(),
-                None,
-            )))
-        }
-
-        fn enqueue_task(
-            &self,
-            request: CallToolRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
-            let input = request
-                .arguments
-                .as_ref()
-                .and_then(|args| args.get("input"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let id = format!(
-                "upstream-task-{}",
-                self.next_id.fetch_add(1, Ordering::SeqCst) + 1
-            );
-            let now = rmcp::task_manager::current_timestamp();
-            let task = Task::new(id.clone(), TaskStatus::Working, now.clone(), now)
-                .with_status_message("Working")
-                .with_ttl(60_000)
-                .with_poll_interval(25);
-            let payload = serde_json::json!({
-                "content": [{ "type": "text", "text": format!("task-native {input}") }],
-                "isError": false
-            });
-            self.tasks
-                .lock()
-                .unwrap()
-                .insert(id, (task.clone(), payload));
-            std::future::ready(Ok(CreateTaskResult::new(task)))
-        }
-
-        fn list_tasks(
-            &self,
-            _request: Option<rmcp::model::PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
-            let tasks = self
-                .tasks
-                .lock()
-                .unwrap()
-                .values()
-                .map(|(task, _)| task.clone())
-                .collect::<Vec<_>>();
-            std::future::ready(Ok(ListTasksResult::new(tasks)))
-        }
-
-        fn get_task_info(
-            &self,
-            request: GetTaskParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
-            let mut tasks = self.tasks.lock().unwrap();
-            let task = tasks
-                .get_mut(&request.task_id)
-                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None))
-                .map(|entry| {
-                    if entry.0.status == TaskStatus::Working {
-                        entry.0.status = TaskStatus::Completed;
+        while let Some(line) = lines.next_line().await.expect("read legacy task request") {
+            let request: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+            let Some(id) = request.get("id").cloned() else {
+                continue;
+            };
+            let method = request["method"].as_str().expect("request method");
+            let response = match method {
+                "initialize" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result": {
+                        "protocolVersion": crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                        "capabilities": {
+                            "tools":{"listChanged":false},
+                            "tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}}
+                        },
+                        "serverInfo":{"name":"raw-legacy-task-upstream","version":"1.0.0"}
+                    }
+                }),
+                "tools/list" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}
+                }),
+                "tasks/list" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":{"tasks":tasks.values().map(|entry| entry.0.clone()).collect::<Vec<_>>()}
+                }),
+                "tools/call" => {
+                    assert!(
+                        request["params"].get("task").is_some(),
+                        "legacy task marker must be params.task"
+                    );
+                    assert!(
+                        request["params"]
+                            .get("_meta")
+                            .and_then(|meta| meta.get(crate::protocol::LEGACY_TASK_REQUEST_KEY))
+                            .is_none(),
+                        "private marker must not cross upstream wire"
+                    );
+                    next_id += 1;
+                    let task_id = format!("upstream-task-{next_id}");
+                    let now = rmcp::task_manager::current_timestamp();
+                    let task = crate::legacy_tasks::Task::new(
+                        task_id.clone(),
+                        crate::legacy_tasks::TaskStatus::Working,
+                        now.clone(),
+                        now,
+                    )
+                    .with_status_message("Working")
+                    .with_ttl(60_000)
+                    .with_poll_interval(25);
+                    let input = request["params"]["arguments"]["input"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let payload = serde_json::json!({
+                        "content":[{"type":"text","text":format!("task-native {input}")}],
+                        "isError":false
+                    });
+                    tasks.insert(task_id, (task.clone(), payload));
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"task":task}})
+                }
+                "tasks/get" => {
+                    let task_id = request["params"]["taskId"].as_str().expect("task id");
+                    let entry = tasks.get_mut(task_id).expect("known task");
+                    if entry.0.status == crate::legacy_tasks::TaskStatus::Working {
+                        entry.0.status = crate::legacy_tasks::TaskStatus::Completed;
                         entry.0.status_message = Some("Completed".to_string());
                         entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
                     }
-                    entry.0.clone()
-                });
-            std::future::ready(task.map(GetTaskResult::new))
-        }
-
-        fn get_task_result(
-            &self,
-            request: rmcp::model::GetTaskPayloadParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
-            let call_count = self.task_result_requests.fetch_add(1, Ordering::SeqCst);
-            if call_count > 0 {
-                return std::future::ready(Err(McpError::internal_error(
-                    "upstream task result should have been cached locally after first fetch"
-                        .to_string(),
-                    None,
-                )));
-            }
-            let result = self
-                .tasks
-                .lock()
-                .unwrap()
-                .get(&request.task_id)
-                .map(|(_, payload)| GetTaskPayloadResult::new(payload.clone()))
-                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None));
-            std::future::ready(result)
-        }
-
-        fn cancel_task(
-            &self,
-            request: CancelTaskParams,
-            _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
-            let mut tasks = self.tasks.lock().unwrap();
-            let task = tasks
-                .get_mut(&request.task_id)
-                .ok_or_else(|| McpError::invalid_params("unknown upstream task", None))
-                .map(|entry| {
-                    entry.0.status = TaskStatus::Cancelled;
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":entry.0})
+                }
+                "tasks/result" => {
+                    result_requests.fetch_add(1, Ordering::SeqCst);
+                    let task_id = request["params"]["taskId"].as_str().expect("task id");
+                    let payload = &tasks.get(task_id).expect("known task").1;
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":payload})
+                }
+                "tasks/cancel" => {
+                    let task_id = request["params"]["taskId"].as_str().expect("task id");
+                    let entry = tasks.get_mut(task_id).expect("known task");
+                    entry.0.status = crate::legacy_tasks::TaskStatus::Cancelled;
                     entry.0.status_message = Some("Cancelled".to_string());
                     entry.0.last_updated_at = rmcp::task_manager::current_timestamp();
-                    entry.0.clone()
-                });
-            std::future::ready(task.map(CancelTaskResult::new))
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":entry.0})
+                }
+                other => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "error":{"code":-32601,"message":other}
+                }),
+            };
+            let mut encoded = serde_json::to_vec(&response).expect("encode response");
+            encoded.push(b'\n');
+            write.write_all(&encoded).await.expect("write response");
+            write.flush().await.expect("flush response");
         }
     }
 
@@ -2601,6 +2921,7 @@ mod tests {
             server_id: Arc::from(name.to_string()),
             tools: Arc::clone(&tools),
             router: std::sync::Weak::new(),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -2616,6 +2937,10 @@ mod tests {
             tools,
             capabilities: ServerCapabilities::default(),
             upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate_state: 0,
+            generation: next_upstream_generation(),
             health: ServerHealth::Healthy,
         }
     }
@@ -2628,15 +2953,7 @@ mod tests {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let result_request_count_for_server = Arc::clone(&result_request_count);
         tokio::spawn(async move {
-            let server = TaskNativeUpstreamHandler {
-                next_id: AtomicUsize::new(0),
-                tasks: Mutex::new(HashMap::new()),
-                task_result_requests: result_request_count_for_server,
-            }
-            .serve(server_transport)
-            .await
-            .expect("start task-native upstream test server");
-            let _ = server.waiting().await;
+            serve_raw_legacy_task_upstream(server_transport, result_request_count_for_server).await;
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
@@ -2644,6 +2961,7 @@ mod tests {
             server_id: Arc::from(name.to_string()),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -2652,11 +2970,14 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        let mut capabilities = ServerCapabilities::default();
-        let mut tools_capability = rmcp::model::ToolsCapability::default();
-        tools_capability.list_changed = Some(false);
-        capabilities.tools = Some(tools_capability);
-        capabilities.tasks = Some(TasksCapability::server_default());
+        let mut capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+        restore_legacy_task_capability(client.peer(), &mut capabilities, Duration::from_secs(1))
+            .await;
+        assert!(crate::protocol::legacy_tasks_capability(&capabilities));
 
         (
             UpstreamServer {
@@ -2666,6 +2987,10 @@ mod tests {
                 tools,
                 capabilities,
                 upstream: None,
+                protocol_era: crate::protocol::ProtocolEra::Legacy,
+                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+                protocol_gate_state: 0,
+                generation: next_upstream_generation(),
                 health: ServerHealth::Healthy,
             },
             result_request_count,
@@ -2739,11 +3064,13 @@ mod tests {
             &self,
             request: rmcp::model::ReadResourceRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_
+        {
             std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 "hello",
                 request.uri,
-            )])))
+            )])
+            .into()))
         }
 
         fn list_prompts(
@@ -2762,11 +3089,12 @@ mod tests {
             &self,
             request: rmcp::model::GetPromptRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetPromptResult, rmcp::ErrorData>> + Send + '_ {
+        ) -> impl Future<Output = Result<GetPromptResponse, rmcp::ErrorData>> + Send + '_ {
             std::future::ready(Ok(GetPromptResult::new(vec![PromptMessage::new(
                 Role::User,
                 ContentBlock::text(format!("prompt: {}", request.name)),
-            )])))
+            )])
+            .into()))
         }
     }
 
@@ -2850,6 +3178,27 @@ mod tests {
         assert!(servers.contains_key("alpha"));
         assert!(servers.contains_key("beta"));
         assert_eq!(servers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconnect_publishes_a_new_monotonic_connection_generation() {
+        let mgr = ServerManager::new();
+        let first = make_connected_test_upstream("generation-test").await;
+        let first_generation = first.generation;
+        mgr.replace_server("generation-test", first).await;
+        assert_eq!(
+            mgr.get_upstream("generation-test").unwrap().generation,
+            first_generation
+        );
+
+        let replacement = make_connected_test_upstream("generation-test").await;
+        let replacement_generation = replacement.generation;
+        assert!(replacement_generation > first_generation);
+        mgr.replace_server("generation-test", replacement).await;
+        assert_eq!(
+            mgr.get_upstream("generation-test").unwrap().generation,
+            replacement_generation
+        );
     }
 
     #[tokio::test]
@@ -2951,6 +3300,7 @@ mod tests {
             server_id: Arc::from("replace-test"),
             tools: Arc::clone(&tools_a),
             router: std::sync::Weak::new(),
+            protocol_version_override: None,
         });
         let client_a: McpClient = upstream_handler_a
             .serve(client_transport_a)
@@ -2972,6 +3322,10 @@ mod tests {
                 tools: tools_a,
                 capabilities: ServerCapabilities::default(),
                 upstream: None,
+                protocol_era: crate::protocol::ProtocolEra::Legacy,
+                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+                protocol_gate_state: 0,
+                generation: next_upstream_generation(),
                 health: ServerHealth::Healthy,
             },
         )
@@ -3003,6 +3357,7 @@ mod tests {
             server_id: Arc::from("replace-test"),
             tools: Arc::clone(&tools_b),
             router: std::sync::Weak::new(),
+            protocol_version_override: None,
         });
         let client_b: McpClient = upstream_handler_b
             .serve(client_transport_b)
@@ -3024,6 +3379,10 @@ mod tests {
                 tools: tools_b,
                 capabilities: ServerCapabilities::default(),
                 upstream: None,
+                protocol_era: crate::protocol::ProtocolEra::Legacy,
+                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+                protocol_gate_state: 0,
+                generation: next_upstream_generation(),
                 health: ServerHealth::Healthy,
             },
         )
@@ -3229,6 +3588,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Http,
+            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
             auth_token: None,
             auth: Some("oauth".to_string()),
@@ -3303,6 +3663,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3321,6 +3682,11 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3404,6 +3770,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3422,6 +3789,11 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3514,7 +3886,7 @@ mod tests {
         .expect("create passthrough task timed out")
         .expect("create passthrough task");
         assert_eq!(create.task.task_id, "task_1");
-        assert_eq!(create.task.status, TaskStatus::Working);
+        assert_eq!(create.task.status, crate::legacy_tasks::TaskStatus::Working);
 
         let info = tokio::time::timeout(
             Duration::from_secs(5),
@@ -3524,7 +3896,7 @@ mod tests {
         .expect("fetch passthrough task info timed out")
         .expect("fetch passthrough task info");
         assert_eq!(info.task.task_id, "task_1");
-        assert_eq!(info.task.status, TaskStatus::Completed);
+        assert_eq!(info.task.status, crate::legacy_tasks::TaskStatus::Completed);
 
         let payload = tokio::time::timeout(
             Duration::from_secs(5),
@@ -3582,7 +3954,10 @@ mod tests {
         .expect("cancel passthrough task timed out")
         .expect("cancel passthrough task");
         assert_eq!(cancelled.task.task_id, second.task.task_id);
-        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled.task.status,
+            crate::legacy_tasks::TaskStatus::Cancelled
+        );
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -3650,7 +4025,7 @@ mod tests {
         .await
         .expect("create passthrough task timed out")
         .expect("create passthrough task");
-        assert_eq!(create.task.status, TaskStatus::Working);
+        assert_eq!(create.task.status, crate::legacy_tasks::TaskStatus::Working);
         assert_eq!(router.task_count_for_owner(&owner).await, 1);
 
         router.cleanup_tasks_for_owner(&owner).await;
@@ -3671,20 +4046,25 @@ mod tests {
             upstream_handle
                 .client
                 .peer()
-                .send_request(ClientRequest::GetTaskRequest(GetTaskRequest::new(
-                    GetTaskParams::new("upstream-task-1"),
-                ))),
+                .send_request(crate::legacy_tasks::request(
+                    "tasks/get",
+                    Some(
+                        serde_json::to_value(crate::legacy_tasks::GetTaskParams::new(
+                            "upstream-task-1",
+                        ))
+                        .expect("serialize legacy task params"),
+                    ),
+                )),
         )
         .await
         .expect("query upstream task info timed out")
         .expect("query upstream task info");
 
-        let ServerResult::GetTaskResult(result) = info else {
-            panic!("unexpected upstream response to tasks/get: {info:?}");
-        };
+        let result =
+            crate::legacy_tasks::parse_get_result(info).expect("parse legacy tasks/get response");
         assert_eq!(
             result.task.status,
-            TaskStatus::Cancelled,
+            crate::legacy_tasks::TaskStatus::Cancelled,
             "owner teardown must forward CancelTaskRequest to the task-native upstream"
         );
     }
@@ -3722,6 +4102,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3740,6 +4121,11 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3838,6 +4224,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3856,6 +4243,11 @@ mod tests {
                     tools,
                     capabilities: ServerCapabilities::default(),
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3971,6 +4363,7 @@ mod tests {
             server_id: Arc::from("catalog"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3994,6 +4387,11 @@ mod tests {
                     tools,
                     capabilities,
                     upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4201,6 +4599,17 @@ mod tests {
                         serde_json::to_string(&response).expect("serialize tool call response"),
                     ));
                 }
+                ClientRequest::CustomRequest(custom) if custom.method == "tasks/list" => {
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::CustomResult(rmcp::model::CustomResult::new(
+                            serde_json::json!({"tasks": []}),
+                        )),
+                        request.id,
+                    );
+                    let _ = state.tx.send(sse_stream::Sse::default().data(
+                        serde_json::to_string(&response).expect("serialize tasks/list response"),
+                    ));
+                }
                 _ => {}
             },
             ClientJsonRpcMessage::Notification(_) => {}
@@ -4249,6 +4658,12 @@ mod tests {
             .start_and_register("legacy-sse", &config)
             .await
             .expect("start legacy SSE upstream");
+        assert!(crate::protocol::legacy_tasks_capability(
+            &server_manager
+                .get_upstream("legacy-sse")
+                .expect("legacy SSE upstream registered")
+                .capabilities
+        ));
         router.refresh_tools().await;
 
         let tool_name = router

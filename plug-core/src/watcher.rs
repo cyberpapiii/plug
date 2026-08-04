@@ -176,6 +176,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,

@@ -115,6 +115,8 @@ pub(crate) async fn cmd_server_list(
                                 "tool_count": server.tool_count,
                                 "auth_status": server.auth_status,
                                 "upstream": server.upstream,
+                                "selected_protocol_era": server.selected_protocol_era,
+                                "selected_protocol_version": server.selected_protocol_version,
                                 "source": server_cfg.map(plug_core::ipc::IpcServerSourceInfo::from_config),
                                 "trust": plug_core::ipc::IpcTrustInfo::for_server(&server.server_id, server_cfg),
                             })
@@ -182,15 +184,23 @@ pub(crate) async fn cmd_server_list(
                             let transport = summarize_server_transport(server_cfg);
                             let auth = summarize_server_auth(server_cfg);
                             let target = summarize_server_target(server_cfg, 28);
+                            let protocol = match (
+                                s.selected_protocol_era,
+                                s.selected_protocol_version.as_deref(),
+                            ) {
+                                (Some(era), Some(version)) => format!("{era:?} {version}"),
+                                _ => "not connected".to_string(),
+                            };
                             println!(
-                                "  {} {:<18} {:<12} {:<8} {:<6} {:<28} ({} tools)",
+                                "  {} {:<18} {:<12} {:<8} {:<6} {:<28} ({} tools; {})",
                                 status_marker(&s.health),
                                 style(&s.server_id).bold(),
                                 status_label(&s.health),
                                 transport,
                                 auth,
                                 target,
-                                s.tool_count
+                                s.tool_count,
+                                protocol.to_ascii_lowercase()
                             );
                         }
                         let auth_required_servers = servers

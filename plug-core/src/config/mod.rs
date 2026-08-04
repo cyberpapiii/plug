@@ -46,6 +46,12 @@ pub struct Config {
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
+    /// Allow configured upstreams to negotiate the MCP 2026-07-28 lifecycle.
+    /// This remains false until modern upstream conformance has been run for
+    /// the installed release. When false, every upstream uses legacy
+    /// initialization regardless of its per-server `protocol` setting.
+    #[serde(default)]
+    pub modern_upstream_enabled: bool,
     /// Seconds to keep daemon alive after last client disconnects.
     /// Default is 0, which disables auto-shutdown and keeps the daemon alive
     /// until explicit shutdown.
@@ -76,6 +82,7 @@ impl Default for Config {
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
             http: HttpConfig::default(),
+            modern_upstream_enabled: false,
             daemon_grace_period_secs: 0,
             supervision: SupervisionConfig::default(),
             servers: HashMap::new(),
@@ -276,6 +283,10 @@ fn resolved_policy(mode: LazyToolMode, origin: LazyToolModeOrigin) -> ResolvedLa
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
+    /// Opt in to the MCP 2026-07-28 downstream lifecycle. This remains false
+    /// until modern conformance has been run for the installed release.
+    #[serde(default)]
+    pub modern_downstream_enabled: bool,
     /// Downstream authentication mode for remote HTTP clients.
     #[serde(default)]
     pub auth_mode: DownstreamAuthMode,
@@ -306,6 +317,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            modern_downstream_enabled: false,
             auth_mode: DownstreamAuthMode::default(),
             public_base_url: None,
             oauth_scopes: None,
@@ -372,6 +384,11 @@ pub struct ServerConfig {
     /// Transport type.
     #[serde(default)]
     pub transport: TransportType,
+    /// MCP lifecycle negotiation policy for this upstream. Omitted is always
+    /// `legacy`; `auto` and `modern` only take effect while the global modern
+    /// upstream gate is enabled.
+    #[serde(default, rename = "protocol", alias = "protocol_mode")]
+    pub protocol_mode: UpstreamProtocolMode,
     /// URL for HTTP transport.
     pub url: Option<String>,
     /// Bearer token for HTTP upstream authentication.
@@ -481,6 +498,19 @@ pub enum TransportType {
     Stdio,
     Http,
     Sse,
+}
+
+/// MCP lifecycle negotiation policy for one upstream server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamProtocolMode {
+    /// Use only the legacy `initialize` lifecycle.
+    #[default]
+    Legacy,
+    /// Probe `server/discover` and fall back only on JSON-RPC method-not-found.
+    Auto,
+    /// Require the modern `server/discover` lifecycle.
+    Modern,
 }
 
 /// A rule for classifying tools into named groups (sub-services).
@@ -1425,6 +1455,35 @@ mod tests {
         assert_eq!(srv.args, vec!["server.js"]);
         assert_eq!(srv.timeout_secs, 10);
         assert!(srv.enabled);
+        assert_eq!(srv.protocol_mode, UpstreamProtocolMode::Legacy);
+        assert!(!cfg.modern_upstream_enabled);
+    }
+
+    #[test]
+    fn modern_upstream_protocol_requires_explicit_global_and_server_opt_in() {
+        let cfg = config_from_toml(
+            r#"
+            modern_upstream_enabled = true
+
+            [servers.modern]
+            command = "modern-server"
+            protocol = "modern"
+
+            [servers.auto]
+            command = "auto-server"
+            protocol_mode = "auto"
+            "#,
+        );
+
+        assert!(cfg.modern_upstream_enabled);
+        assert_eq!(
+            cfg.servers["modern"].protocol_mode,
+            UpstreamProtocolMode::Modern
+        );
+        assert_eq!(
+            cfg.servers["auto"].protocol_mode,
+            UpstreamProtocolMode::Auto
+        );
     }
 
     #[test]
@@ -1474,6 +1533,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1530,6 +1590,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1566,6 +1627,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1602,6 +1664,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1894,6 +1957,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1930,6 +1994,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1963,6 +2028,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some("https://example.com/mcp".to_string()),
                 auth_token: Some(crate::types::SecretString::from("token".to_string())),
                 auth: Some("oauth".to_string()),
@@ -1995,6 +2061,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -2027,6 +2094,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some("https://example.com/mcp".to_string()),
                 auth_token: None,
                 auth: Some("basic".to_string()),
@@ -2059,6 +2127,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -2095,6 +2164,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some("https://mcp.notion.so/mcp".to_string()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),

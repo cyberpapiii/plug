@@ -23,7 +23,7 @@ impl super::ToolRouter {
                 })
             })?;
 
-        upstream
+        let mut result = upstream
             .client
             .peer()
             .read_resource(ReadResourceRequestParams::new(uri))
@@ -31,7 +31,12 @@ impl super::ToolRouter {
             .map_err(|error| match error {
                 rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
                 other => McpError::internal_error(other.to_string(), None),
-            })
+            })?;
+        admit_catalog_meta(&mut result.meta, "resource-read-result");
+        for contents in &mut result.contents {
+            admit_resource_contents_meta(contents);
+        }
+        Ok(result)
     }
 
     pub async fn get_prompt(
@@ -62,7 +67,7 @@ impl super::ToolRouter {
             request = request.with_arguments(arguments);
         }
 
-        upstream
+        let mut result = upstream
             .client
             .peer()
             .get_prompt(request)
@@ -70,7 +75,12 @@ impl super::ToolRouter {
             .map_err(|error| match error {
                 rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
                 other => McpError::internal_error(other.to_string(), None),
-            })
+            })?;
+        admit_catalog_meta(&mut result.meta, "prompt-result");
+        for message in &mut result.messages {
+            admit_content_block_meta(&mut message.content);
+        }
+        Ok(result)
     }
 
     /// Forward a `completion/complete` request to the correct upstream server
@@ -122,14 +132,17 @@ impl super::ToolRouter {
                 })
             })?;
 
-        upstream
-            .client
-            .peer()
-            .complete(params)
-            .await
-            .map_err(|error| match error {
-                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                other => McpError::internal_error(other.to_string(), None),
-            })
+        let mut result =
+            upstream
+                .client
+                .peer()
+                .complete(params)
+                .await
+                .map_err(|error| match error {
+                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+                    other => McpError::internal_error(other.to_string(), None),
+                })?;
+        admit_catalog_meta(&mut result.meta, "completion-result");
+        Ok(result)
     }
 }

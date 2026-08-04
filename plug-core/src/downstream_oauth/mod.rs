@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -61,6 +62,7 @@ impl DownstreamOauthConfig {
 pub struct DownstreamOauthManager {
     pub config: DownstreamOauthConfig,
     state: Arc<Mutex<DownstreamOauthState>>,
+    principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
     registration_rate: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
     state_path: Arc<PathBuf>,
 }
@@ -144,11 +146,81 @@ pub struct TokenResponsePayload {
     pub scope: Option<String>,
 }
 
+#[derive(Debug)]
+struct PrincipalLifecycleState {
+    generation: AtomicU64,
+    active: AtomicBool,
+}
+
+impl PrincipalLifecycleState {
+    fn active() -> Self {
+        Self {
+            generation: AtomicU64::new(1),
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Validation-time lease for a downstream OAuth principal.
+///
+/// The access token proves who the caller was when middleware validated it;
+/// this lease additionally proves that the same client generation is still
+/// active when durable work is admitted later in the request.
+#[derive(Clone)]
+pub struct PrincipalLifecycleLease {
+    state: Arc<PrincipalLifecycleState>,
+    generation: u64,
+}
+
+impl PrincipalLifecycleLease {
+    pub fn is_active(&self) -> bool {
+        self.state.active.load(Ordering::SeqCst)
+            && self.state.generation.load(Ordering::SeqCst) == self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_for_tests() -> Self {
+        Self {
+            state: Arc::new(PrincipalLifecycleState::active()),
+            generation: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deactivate_for_tests(&self) {
+        self.state.deactivate();
+    }
+}
+
+impl std::fmt::Debug for PrincipalLifecycleLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrincipalLifecycleLease")
+            .field("generation", &self.generation)
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+impl PartialEq for PrincipalLifecycleLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation && Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for PrincipalLifecycleLease {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessTokenClaims {
     pub client_id: String,
     pub scopes: Vec<String>,
     pub resource: String,
+    pub principal_lifecycle: PrincipalLifecycleLease,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +359,7 @@ impl Default for DownstreamOauthState {
 }
 
 impl DownstreamOauthState {
-    fn evict_expired(&mut self, now: u64) {
+    fn evict_expired(&mut self, now: u64) -> HashSet<String> {
         let expired: HashSet<String> = self
             .clients
             .iter()
@@ -302,6 +374,7 @@ impl DownstreamOauthState {
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
         self.refresh_tokens
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
+        expired
     }
 
     fn remove_client_material(&mut self, client_id: &str) {
@@ -343,9 +416,20 @@ impl DownstreamOauthManager {
         state_path: PathBuf,
     ) -> Result<Self, DownstreamOauthError> {
         let state = load_persisted_state(&state_path)?;
+        let principal_lifecycles = state
+            .clients
+            .keys()
+            .map(|client_id| {
+                (
+                    client_id.clone(),
+                    Arc::new(PrincipalLifecycleState::active()),
+                )
+            })
+            .collect();
         Ok(Self {
             config,
             state: Arc::new(Mutex::new(state)),
+            principal_lifecycles: Arc::new(principal_lifecycles),
             registration_rate: Arc::new(Mutex::new(HashMap::new())),
             state_path: Arc::new(state_path),
         })
@@ -411,7 +495,7 @@ impl DownstreamOauthManager {
         let now = epoch_secs();
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
-        next.evict_expired(now);
+        let expired = next.evict_expired(now);
         if next.clients.len() >= MAX_REGISTRATIONS {
             return Err(DownstreamOauthError::RegistrationQuotaExceeded);
         }
@@ -428,8 +512,14 @@ impl DownstreamOauthManager {
             expires_at: now + UNACTIVATED_REGISTRATION_LIFETIME_SECS,
         };
         next.clients.insert(client_id.clone(), client);
+        self.deactivate_principal_lifecycles(&expired);
         persist_state(&self.state_path, &next)?;
+        self.principal_lifecycles.insert(
+            client_id.clone(),
+            Arc::new(PrincipalLifecycleState::active()),
+        );
         *guard = next;
+        self.remove_principal_lifecycles(&expired);
 
         Ok(ClientRegistrationResponse {
             client_id,
@@ -468,11 +558,18 @@ impl DownstreamOauthManager {
         if !existed {
             return Ok(false);
         }
+        // Invalidate validation-time leases before removing credentials or
+        // starting task cleanup. If persistence fails, this process remains
+        // fail-closed; the operator did not receive a successful revocation.
+        if let Some(lifecycle) = self.principal_lifecycles.get(client_id) {
+            lifecycle.deactivate();
+        }
         let mut next = guard.clone();
         next.remove_client_material(client_id);
         next.revoked_client_ids.insert(client_id.to_string());
         persist_state(&self.state_path, &next)?;
         *guard = next;
+        self.principal_lifecycles.remove(client_id);
         Ok(existed)
     }
 
@@ -490,7 +587,14 @@ impl DownstreamOauthManager {
         self.ensure_client(request.client_id).await?;
         let now = epoch_secs();
         let mut guard = self.state.lock().await;
-        guard.evict_expired(now);
+        let mut next = guard.clone();
+        let expired = next.evict_expired(now);
+        if !expired.is_empty() {
+            self.deactivate_principal_lifecycles(&expired);
+            persist_state(&self.state_path, &next)?;
+            *guard = next;
+            self.remove_principal_lifecycles(&expired);
+        }
         let client = guard
             .clients
             .get(request.client_id)
@@ -700,6 +804,20 @@ impl DownstreamOauthManager {
             client_id: record.client_id.clone(),
             scopes: record.scopes.clone(),
             resource: record.resource.clone(),
+            principal_lifecycle: {
+                let Some(lifecycle) = self.principal_lifecycles.get(&record.client_id) else {
+                    return AccessTokenValidation::Invalid;
+                };
+                let generation = lifecycle.generation.load(Ordering::SeqCst);
+                let lease = PrincipalLifecycleLease {
+                    state: Arc::clone(lifecycle.value()),
+                    generation,
+                };
+                if !lease.is_active() {
+                    return AccessTokenValidation::Invalid;
+                }
+                lease
+            },
         })
     }
 
@@ -808,14 +926,33 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidClient);
         }
         let mut next = guard.clone();
-        next.evict_expired(now);
+        let expired = next.evict_expired(now);
         if !next.clients.contains_key(client_id) && next.clients.len() >= MAX_REGISTRATIONS {
             return Err(DownstreamOauthError::RegistrationQuotaExceeded);
         }
         next.clients.insert(client_id.to_string(), client);
+        self.deactivate_principal_lifecycles(&expired);
         persist_state(&self.state_path, &next)?;
         *guard = next;
+        self.remove_principal_lifecycles(&expired);
+        self.principal_lifecycles
+            .entry(client_id.to_string())
+            .or_insert_with(|| Arc::new(PrincipalLifecycleState::active()));
         Ok(())
+    }
+
+    fn deactivate_principal_lifecycles(&self, client_ids: &HashSet<String>) {
+        for client_id in client_ids {
+            if let Some(lifecycle) = self.principal_lifecycles.get(client_id) {
+                lifecycle.deactivate();
+            }
+        }
+    }
+
+    fn remove_principal_lifecycles(&self, client_ids: &HashSet<String>) {
+        for client_id in client_ids {
+            self.principal_lifecycles.remove(client_id);
+        }
     }
 }
 
@@ -1114,7 +1251,7 @@ fn load_persisted_state(
     }
     state.pending_consents.clear();
     state.pending_codes.clear();
-    state.evict_expired(epoch_secs());
+    let _ = state.evict_expired(epoch_secs());
     Ok(state)
 }
 
@@ -1432,6 +1569,186 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[tokio::test]
+    async fn committed_revocation_removes_lifecycle_entry_but_held_lease_stays_inactive() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let lease = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                "https://plug.example.com/mcp",
+            )
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            other => panic!("token must validate before revocation: {other:?}"),
+        };
+
+        assert!(manager.revoke_client(&client.client_id).await.unwrap());
+
+        assert!(!manager.principal_lifecycles.contains_key(&client.client_id));
+        assert!(!lease.is_active());
+    }
+
+    #[tokio::test]
+    async fn committed_expiry_removes_lifecycle_entry_but_held_lease_stays_inactive() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let lease = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                "https://plug.example.com/mcp",
+            )
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            other => panic!("token must validate before expiry: {other:?}"),
+        };
+        manager
+            .state
+            .lock()
+            .await
+            .clients
+            .get_mut(&client.client_id)
+            .expect("client")
+            .expires_at = 0;
+        manager.registration_rate.lock().await.clear();
+
+        register(&manager, "expiry-trigger", "http://localhost:8788/callback").await;
+
+        assert!(!manager.principal_lifecycles.contains_key(&client.client_id));
+        assert!(!lease.is_active());
+    }
+
+    #[tokio::test]
+    async fn repeated_registration_and_revocation_does_not_grow_lifecycle_map() {
+        let (manager, _) = test_manager();
+        for index in 0..32 {
+            manager.registration_rate.lock().await.clear();
+            let client = register(
+                &manager,
+                &format!("client-{index}"),
+                "http://localhost:8787/callback",
+            )
+            .await;
+            assert!(manager.revoke_client(&client.client_id).await.unwrap());
+        }
+
+        assert!(manager.principal_lifecycles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validation_before_revocation_cannot_enqueue_after_revocation_barrier() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+
+        let server_manager = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager,
+            crate::proxy::RouterConfig {
+                prefix_delimiter: "__".to_string(),
+                priority_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                tool_description_max_chars: None,
+                tool_search_threshold: 50,
+                meta_tool_mode: false,
+                lazy_tools: crate::config::LazyToolsConfig::default(),
+                tool_filter_enabled: true,
+                enrichment_servers: std::collections::HashSet::new(),
+            },
+        ));
+        router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes: std::collections::HashMap::from([(
+                "Mock__echo".to_string(),
+                ("missing".to_string(), "echo".to_string()),
+            )]),
+            tools_all: Arc::new(Vec::new()),
+            meta_tools_all: Arc::new(Vec::new()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: std::collections::HashMap::new(),
+            prompt_routes: std::collections::HashMap::new(),
+            tool_definition_fingerprints: std::collections::HashMap::new(),
+            tool_risk_inventory: std::collections::HashMap::new(),
+        });
+
+        let principal = crate::types::PrincipalId::downstream_oauth(
+            manager.base_url(),
+            client.client_id.clone(),
+            manager.resource(),
+        );
+        let owner = crate::tasks::TaskOwner::new(principal.owner_key());
+        let request_manager = manager.clone();
+        let request_router = Arc::clone(&router);
+        let request_owner = owner.clone();
+        let access_token = tokens.access_token.clone();
+        let (validated_tx, validated_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+
+        let request = tokio::spawn(async move {
+            let claims = match request_manager
+                .validate_access_token_for(
+                    &access_token,
+                    &["tools:read".to_string()],
+                    &request_manager.resource(),
+                )
+                .await
+            {
+                AccessTokenValidation::Valid(claims) => claims,
+                other => panic!("token must validate before barrier: {other:?}"),
+            };
+            validated_tx.send(()).expect("signal validated request");
+            resume_rx.await.expect("release request after revocation");
+
+            let context = crate::proxy::DownstreamCallContext::http_for_client_with_trace(
+                "session-before-revoke",
+                rmcp::model::RequestId::from(rmcp::model::NumberOrString::Number(1)),
+                crate::types::ClientType::Unknown,
+                Arc::<str>::from("00000000000000000000000000000001"),
+            )
+            .with_authorization(
+                crate::types::PrincipalId::downstream_oauth(
+                    request_manager.base_url(),
+                    claims.client_id,
+                    claims.resource,
+                ),
+                ["tools:read".to_string(), "tasks:use".to_string()],
+            )
+            .with_principal_lifecycle(claims.principal_lifecycle);
+
+            request_router
+                .enqueue_tool_task("Mock__echo", None, None, request_owner, None, Some(context))
+                .await
+        });
+
+        validated_rx
+            .await
+            .expect("request reached validation barrier");
+        assert!(
+            manager
+                .revoke_client(&client.client_id)
+                .await
+                .expect("revoke client")
+        );
+        router.cleanup_tasks_for_owner(&owner).await;
+        resume_tx.send(()).expect("release revoked request");
+
+        let error = request
+            .await
+            .expect("request task")
+            .expect_err("revoked validation generation must fail before task creation");
+        assert_eq!(error.code, rmcp::model::ErrorCode(-32001));
+        assert_eq!(router.task_count_for_owner(&owner).await, 0);
     }
 
     #[tokio::test]

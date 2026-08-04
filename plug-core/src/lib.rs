@@ -23,6 +23,7 @@ pub mod http;
 pub mod icons;
 pub mod import;
 pub mod ipc;
+pub mod legacy_tasks;
 pub(crate) mod mcp_http_headers;
 pub mod notifications;
 pub mod oauth;

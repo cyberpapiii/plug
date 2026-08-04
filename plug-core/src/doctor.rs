@@ -1179,6 +1179,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1200,6 +1201,7 @@ mod tests {
     fn oauth_http_server(url: &str) -> ServerConfig {
         ServerConfig {
             transport: TransportType::Http,
+            protocol_mode: Default::default(),
             url: Some(url.to_string()),
             auth: Some("oauth".to_string()),
             oauth_scopes: Some(vec!["read".to_string()]),

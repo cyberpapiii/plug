@@ -18,8 +18,10 @@
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolRequestParams, CallToolResult, CreateTaskResult, RequestParamsMeta};
+use rmcp::model::{CallToolRequestParams, CallToolResult, InputRequiredResult, RequestParamsMeta};
 
+use crate::legacy_tasks::CreateTaskResult;
+use crate::proxy::continuations::{MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES};
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 use crate::tasks::{OwnerLivenessProbe, TaskOwner};
 
@@ -33,6 +35,8 @@ use crate::tasks::{OwnerLivenessProbe, TaskOwner};
 pub enum ToolCallOutcome {
     /// A synchronous tool result.
     Called(CallToolResult),
+    /// A native modern upstream requires another client round.
+    InputRequired(InputRequiredResult),
     /// A background task was created for a task-augmented call.
     TaskCreated(CreateTaskResult),
 }
@@ -92,10 +96,51 @@ pub async fn dispatch_tools_call(
     ctx: &dyn DownstreamContext,
     params: CallToolRequestParams,
 ) -> Result<ToolCallOutcome, McpError> {
+    // Admit unknown metadata once, before routing, task creation, buffering,
+    // or forwarding. Typed MCP fields remain owned by their typed adapters.
+    let extensions = crate::types::ExtensionEnvelope::from_peer_meta(params.meta.as_deref())
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
     let progress_token = params.progress_token();
-    let downstream = ctx.downstream_call_context();
+    let downstream = ctx
+        .downstream_call_context()
+        .with_extension_envelope(extensions);
 
-    if params.task.is_some() && ctx.supports_tasks() {
+    downstream.authorize(crate::protocol::MethodFamily::ToolsCall)?;
+
+    let task_requested = params
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY))
+        && ctx.supports_tasks();
+    let has_continuation = params.input_responses.is_some() || params.request_state.is_some();
+    if params
+        .request_state
+        .as_ref()
+        .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
+        || params
+            .input_responses
+            .as_ref()
+            .is_some_and(|responses| responses.len() > MRTR_MAX_ITEMS)
+        || params
+            .input_responses
+            .as_ref()
+            .and_then(|responses| serde_json::to_vec(responses).ok())
+            .is_some_and(|encoded| encoded.len() > MRTR_MAX_BYTES)
+    {
+        return Err(McpError::invalid_params(
+            "multi-round tool input exceeds Plug's bounded continuation limits".to_string(),
+            None,
+        ));
+    }
+    router.ensure_tool_round_supported(
+        params.name.as_ref(),
+        &downstream,
+        has_continuation,
+        task_requested,
+    )?;
+
+    if task_requested {
+        downstream.authorize(crate::protocol::MethodFamily::Tasks)?;
         let owner = ctx.task_owner()?;
         let result = router
             .clone()
@@ -110,14 +155,38 @@ pub async fn dispatch_tools_call(
             .await?;
         Ok(ToolCallOutcome::TaskCreated(result))
     } else {
-        let result = router
-            .call_tool_with_context(
-                params.name.as_ref(),
-                params.arguments,
-                progress_token,
-                Some(downstream),
-            )
-            .await?;
-        Ok(ToolCallOutcome::Called(result))
+        match router
+            .call_tool_round_with_context(params, progress_token, Some(downstream))
+            .await?
+        {
+            rmcp::model::CallToolResponse::Complete(result) => Ok(ToolCallOutcome::Called(result)),
+            rmcp::model::CallToolResponse::InputRequired(result) => {
+                if result
+                    .request_state
+                    .as_ref()
+                    .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
+                    || result
+                        .input_requests
+                        .as_ref()
+                        .is_some_and(|requests| requests.len() > MRTR_MAX_ITEMS)
+                    || serde_json::to_vec(&result)
+                        .is_ok_and(|encoded| encoded.len() > MRTR_MAX_BYTES)
+                {
+                    return Err(McpError::invalid_request(
+                        "upstream multi-round response exceeds Plug's bounded continuation limits",
+                        None,
+                    ));
+                }
+                Ok(ToolCallOutcome::InputRequired(result))
+            }
+            rmcp::model::CallToolResponse::Task(_) => Err(McpError::internal_error(
+                "upstream unexpectedly returned a task from synchronous dispatch".to_string(),
+                None,
+            )),
+            _ => Err(McpError::internal_error(
+                "unsupported upstream tools/call response".to_string(),
+                None,
+            )),
+        }
     }
 }

@@ -7,7 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-Detailed notes: [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
+The MCP 2026 entries below describe the current development branch. They do not
+claim that the work is on `main`, released, or installed on a user's machine.
+
+Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md), [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
 
 ### Added
 
@@ -15,6 +18,10 @@ Detailed notes: [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-
 - End-to-end config watcher coverage for normal saves, atomic-renames, parse failures, and unrelated file changes.
 - IPC proxy characterization coverage for reconnects, retries, malformed frames, notification ordering, and replayed session state.
 - CI checks for the declared Rust 1.88 minimum version, RustSec advisories, and todo-file status consistency.
+- Opt-in MCP `2026-07-28` downstream and upstream protocol adapters, with independent global gates and a per-server `legacy`, `auto`, or `modern` negotiation policy.
+- Modern task lifecycle support with principal-scoped ownership, retrieval, cancellation, expiry, and disconnect-safe execution.
+- Secure native modern-to-modern multi-round tool continuations using integrity-protected, principal-bound, expiring, single-use request state.
+- A bounded extension envelope that preserves admitted protocol metadata and W3C trace context without allowing unknown fields to influence authorization, identity, routing, credentials, or continuation state.
 
 ### Changed
 
@@ -25,7 +32,7 @@ Detailed notes: [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-
 - Native task creation and task teardown now use bounded waits derived from each upstream server's call timeout.
 - Split the daemon implementation into focused framing, path, registry, auth, notification, and MCP dispatch modules without changing its public behavior.
 - Source builds now require Rust 1.88.
-- Upgraded the Rust MCP SDK from RMCP 1.7.0 to exactly RMCP 2.2.0 while preserving MCP `2025-11-25` negotiation and the existing transport/method surface.
+- Upgraded the Rust MCP SDK from RMCP 1.7.0 through 2.2.0 to exactly RMCP 3.1.0. The new protocol path remains default-off while legacy behavior stays available for current clients and servers.
 - Migrated to RMCP's spec-aligned content, resource, prompt, task, elicitation, and cancellation APIs.
 - Refreshed every direct Rust dependency to its latest compatible stable release, including Keyring 4.1.4, Rand 0.10.2, TOML 1.1.2, and Tower HTTP 0.7.0.
 
@@ -47,6 +54,14 @@ Detailed notes: [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-
 - Local macOS reinstalls now sign and verify a staged binary before atomically replacing the live executable, eliminating the unsigned execution window that could retrigger Keychain prompts.
 - Daemon auth-status queries no longer fall back to a missing token mirror's Keychain entry, preventing a read-only diagnostic from freezing IPC and HTTP behind a macOS authorization dialog.
 - Engine concurrency tests now launch the prebuilt mock server directly, avoiding parallel `cargo run` lock contention that could exhaust their startup timeout on macOS CI.
+- Unbound legacy OAuth credentials now require explicit reauthorization instead of being silently rebound to a newly discovered issuer.
+- Startup rejects an unbound legacy OAuth file before probing Keychain, avoiding authorization prompts for credentials that cannot be admitted.
+- Modern duplicate in-flight JSON-RPC IDs are rejected atomically, with cancellation and cleanup tied to the exact admitted call.
+- Expired durable tasks abort local work and forward bounded upstream cancellation before releasing their quota.
+- Authorization-required upstreams now produce a distinct machine-readable protocol outcome rather than a generic unavailable-server error.
+- Modern Host validation accepts the configured public URL without weakening unrelated-origin checks, and protocol mismatch responses consistently identify the selected MCP revision.
+- Failed stdio discovery probes no longer latch the modern era before a successful discovery response.
+- MCP conformance selectors now fail if they match zero tests.
 
 ### Security
 
@@ -55,6 +70,15 @@ Detailed notes: [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-
 - Downstream OAuth state persistence fails closed on unsafe temporary-file permissions and enforces owner-only permissions after rename.
 - Expired OAuth records are swept, equivalent scope sets reuse tokens, and client-credentials requests reuse live tokens instead of growing the store on every call.
 - Replaced the unmaintained `fs2` lock dependency with `fs4` and removed the duplicate default HTTP stack from `oauth2`.
+- Modern continuation state is authenticated and bound to the initiating principal, request, and route, with expiration, replay prevention, bounded storage, and revocation cleanup.
+
+### Known limitations
+
+- `modern_upstream_enabled` and `http.modern_downstream_enabled` default to `false` until real-peer conformance evidence supports changing the defaults.
+- Modern downstream negotiation is gated independently across HTTP, stdio, and daemon IPC; existing clients still negotiate the legacy lifecycle by default.
+- `subscriptions/listen` is not advertised yet, even though ownership and quota foundations exist.
+- Legacy-downstream calls into modern upstream tools, modern-downstream calls into legacy upstream multi-round tools, and task-plus-modern-upstream calls are suppressed rather than risking a stranded request.
+- MCP Apps/UI capabilities and synthesized list-result cache directives are not advertised. Admitted metadata can still travel as opaque, policy-limited data.
 
 ## [0.3.0] - 2026-05-17
 

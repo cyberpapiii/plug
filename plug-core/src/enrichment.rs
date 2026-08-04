@@ -4,7 +4,9 @@
 //! `plug` also applies semantic normalization to all routed tools so clients
 //! do not inherit obviously wrong upstream safety hints.
 
-use rmcp::model::{TaskSupport, Tool, ToolExecution};
+use rmcp::model::Tool;
+
+const LEGACY_TASK_SUPPORT_META_KEY: &str = "plug.dev/legacy-task-support";
 
 /// Apply enrichment to a tool: infer annotations from name patterns,
 /// normalize title from snake_case. Only fills missing values.
@@ -556,14 +558,16 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
 
 fn infer_task_support(tool: &Tool, name: &str, semantics: ToolSemantics) -> ToolTaskSupportMode {
     if let Some(task_support) = tool
-        .execution
+        .meta
         .as_ref()
-        .and_then(|execution| execution.task_support)
+        .and_then(|meta| meta.0.get(LEGACY_TASK_SUPPORT_META_KEY))
+        .and_then(serde_json::Value::as_str)
     {
         return match task_support {
-            TaskSupport::Forbidden => ToolTaskSupportMode::Forbidden,
-            TaskSupport::Optional => ToolTaskSupportMode::Optional,
-            TaskSupport::Required => ToolTaskSupportMode::Required,
+            "forbidden" => ToolTaskSupportMode::Forbidden,
+            "optional" => ToolTaskSupportMode::Optional,
+            "required" => ToolTaskSupportMode::Required,
+            _ => ToolTaskSupportMode::Unknown,
         };
     }
 
@@ -636,23 +640,17 @@ pub fn normalize_annotations(tool: &mut Tool, name: &str) {
         ToolWorldScope::Unknown => {}
     }
 
-    match profile.task_support {
-        ToolTaskSupportMode::Forbidden => {
-            tool.execution
-                .get_or_insert_with(ToolExecution::default)
-                .task_support = Some(TaskSupport::Forbidden);
-        }
-        ToolTaskSupportMode::Optional => {
-            tool.execution
-                .get_or_insert_with(ToolExecution::default)
-                .task_support = Some(TaskSupport::Optional);
-        }
-        ToolTaskSupportMode::Required => {
-            tool.execution
-                .get_or_insert_with(ToolExecution::default)
-                .task_support = Some(TaskSupport::Required);
-        }
-        ToolTaskSupportMode::Unknown => {}
+    let task_support = match profile.task_support {
+        ToolTaskSupportMode::Forbidden => Some("forbidden"),
+        ToolTaskSupportMode::Optional => Some("optional"),
+        ToolTaskSupportMode::Required => Some("required"),
+        ToolTaskSupportMode::Unknown => None,
+    };
+    if let Some(task_support) = task_support {
+        tool.meta.get_or_insert_with(Default::default).0.insert(
+            LEGACY_TASK_SUPPORT_META_KEY.to_string(),
+            task_support.into(),
+        );
     }
 }
 
@@ -1184,10 +1182,11 @@ mod tests {
 
         normalize_annotations(&mut tool, "deep_researcher_start");
         assert_eq!(
-            tool.execution
+            tool.meta
                 .as_ref()
-                .and_then(|execution| execution.task_support),
-            Some(TaskSupport::Required)
+                .and_then(|meta| meta.0.get(LEGACY_TASK_SUPPORT_META_KEY))
+                .and_then(serde_json::Value::as_str),
+            Some("required")
         );
     }
 

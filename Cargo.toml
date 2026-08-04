@@ -12,7 +12,7 @@ homepage = "https://github.com/cyberpapiii/plug"
 
 [workspace.dependencies]
 # MCP SDK
-rmcp = { version = "=2.2.0", features = [
+rmcp = { version = "=3.1.0", features = [
     "client",
     "server",
     "macros",
@@ -30,6 +30,9 @@ rmcp = { version = "=2.2.0", features = [
     "elicitation",
     # OAuth 2.1 + PKCE upstream authentication
     "auth",
+    # Integrity-protected MCP 2026 requestState values. Plug adds the
+    # required server-side single-use and ownership ledger separately.
+    "request-state",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
@@ -120,7 +123,7 @@ tempfile = "3"
 strip = true
 lto = "fat"
 codegen-units = 1
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 
 [profile.ci]

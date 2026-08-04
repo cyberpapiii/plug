@@ -224,7 +224,23 @@ async fn operator_revoke_oauth_client(
         return StatusCode::NOT_FOUND;
     };
     match manager.revoke_client(&client_id).await {
-        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(true) => {
+            // Revocation is the durable-owner lifecycle boundary. The OAuth
+            // manager rejects future token use before this point; task cleanup
+            // then uses TaskStore's create guard/tombstone ledger so an
+            // in-flight create cannot survive the revocation.
+            let principal = plug_core::types::PrincipalId::downstream_oauth(
+                manager.base_url(),
+                client_id,
+                manager.resource(),
+            );
+            state
+                .http_state
+                .router
+                .cleanup_tasks_for_owner(&plug_core::tasks::TaskOwner::new(principal.owner_key()))
+                .await;
+            StatusCode::NO_CONTENT
+        }
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -253,6 +269,15 @@ fn build_runtime_router(
 struct ConfiguredHttpRuntime {
     router: Router,
     sessions: Arc<dyn plug_core::session::SessionStore>,
+}
+
+fn public_host_allowance(public_base_url: &str) -> Option<Arc<str>> {
+    (!public_base_url.trim().is_empty()).then(|| {
+        Arc::from(format!(
+            "{}/.plug-public-host-only",
+            public_base_url.trim_end_matches('/')
+        ))
+    })
 }
 
 fn build_configured_http_runtime(
@@ -292,6 +317,13 @@ fn build_configured_http_runtime(
             .iter()
             .cloned()
             .map(Arc::<str>::from)
+            .chain(
+                config
+                    .http
+                    .public_base_url
+                    .as_deref()
+                    .and_then(public_host_allowance),
+            )
             .collect(),
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
         auth_token,
@@ -517,11 +549,17 @@ pub(crate) struct DaemonProxySession {
     pub(crate) client_info: Option<String>,
     pub(crate) session_id: String,
     pub(crate) capabilities: rmcp::model::ServerCapabilities,
+    pub(crate) modern_downstream_enabled: bool,
+    pub(crate) cancellation_capability: plug_core::ipc::IpcCancellationCapability,
     pub(crate) pending_notifications: Vec<plug_core::ipc::IpcResponse>,
 }
 
 enum PendingIpcResponse {
-    Registered(String),
+    Registered {
+        session_id: String,
+        modern_downstream_enabled: bool,
+        cancellation_capability: plug_core::ipc::IpcCancellationCapability,
+    },
     Capabilities(rmcp::model::ServerCapabilities),
 }
 
@@ -550,6 +588,8 @@ async fn read_pending_or_matching_response(
                 protocol_version,
                 client_id,
                 session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
             } => {
                 if protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
                     anyhow::bail!(
@@ -562,7 +602,11 @@ async fn read_pending_or_matching_response(
                         "daemon/client registration mismatch: expected client_id {expected_client_id}, got {client_id}"
                     );
                 }
-                return Ok(PendingIpcResponse::Registered(session_id));
+                return Ok(PendingIpcResponse::Registered {
+                    session_id,
+                    modern_downstream_enabled,
+                    cancellation_capability,
+                });
             }
             resp @ (plug_core::ipc::IpcResponse::LoggingNotification { .. }
             | plug_core::ipc::IpcResponse::ToolListChangedNotification
@@ -570,7 +614,8 @@ async fn read_pending_or_matching_response(
             | plug_core::ipc::IpcResponse::PromptListChangedNotification
             | plug_core::ipc::IpcResponse::ProgressNotification { .. }
             | plug_core::ipc::IpcResponse::CancelledNotification { .. }
-            | plug_core::ipc::IpcResponse::AuthStateChanged { .. }) => {
+            | plug_core::ipc::IpcResponse::AuthStateChanged { .. }
+            | plug_core::ipc::IpcResponse::ModernDownstreamGateChanged { .. }) => {
                 pending_notifications.push(resp);
             }
             other => {
@@ -602,22 +647,38 @@ pub(crate) async fn establish_daemon_proxy_session(
     };
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
-    let session_id = match read_pending_or_matching_response(
-        &mut reader,
-        &client_id,
-        &mut pending_notifications,
-        |response| match response {
-            plug_core::ipc::IpcResponse::Registered { session_id, .. } => {
-                Some(PendingIpcResponse::Registered(session_id.clone()))
-            }
-            _ => None,
-        },
-    )
-    .await?
-    {
-        PendingIpcResponse::Registered(session_id) => session_id,
-        PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
-    };
+    let (session_id, modern_downstream_enabled, cancellation_capability) =
+        match read_pending_or_matching_response(
+            &mut reader,
+            &client_id,
+            &mut pending_notifications,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Registered {
+                    session_id,
+                    modern_downstream_enabled,
+                    cancellation_capability,
+                    ..
+                } => Some(PendingIpcResponse::Registered {
+                    session_id: session_id.clone(),
+                    modern_downstream_enabled: *modern_downstream_enabled,
+                    cancellation_capability: cancellation_capability.clone(),
+                }),
+                _ => None,
+            },
+        )
+        .await?
+        {
+            PendingIpcResponse::Registered {
+                session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
+            } => (
+                session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
+            ),
+            PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
+        };
     let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
         session_id: session_id.clone(),
     };
@@ -639,7 +700,7 @@ pub(crate) async fn establish_daemon_proxy_session(
     .await?
     {
         PendingIpcResponse::Capabilities(capabilities) => capabilities,
-        PendingIpcResponse::Registered(_) => unreachable!("capabilities response expected"),
+        PendingIpcResponse::Registered { .. } => unreachable!("capabilities response expected"),
     };
     Ok(DaemonProxySession {
         reader,
@@ -648,8 +709,154 @@ pub(crate) async fn establish_daemon_proxy_session(
         client_info,
         session_id,
         capabilities,
+        modern_downstream_enabled,
+        cancellation_capability,
         pending_notifications,
     })
+}
+
+fn is_modern_stdio_message(value: &serde_json::Value) -> bool {
+    value.get("method").and_then(serde_json::Value::as_str) == Some("server/discover")
+        || value
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            == Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
+}
+
+#[derive(Default)]
+struct StdioProtocolState {
+    modern_confirmed: bool,
+    pending_discovery_ids: std::collections::HashSet<String>,
+}
+
+impl StdioProtocolState {
+    fn observe_inbound(
+        &mut self,
+        value: &serde_json::Value,
+        modern_downstream_enabled: bool,
+    ) -> bool {
+        if !modern_downstream_enabled {
+            self.modern_confirmed = false;
+            self.pending_discovery_ids.clear();
+            return false;
+        }
+
+        let method = value.get("method").and_then(serde_json::Value::as_str);
+        let explicit_legacy_initialize = method == Some("initialize")
+            && value
+                .pointer("/params/protocolVersion")
+                .and_then(serde_json::Value::as_str)
+                != Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+        if explicit_legacy_initialize {
+            self.modern_confirmed = false;
+            self.pending_discovery_ids.clear();
+            return false;
+        }
+
+        if method == Some("server/discover") {
+            if let Some(id) = value.get("id") {
+                self.pending_discovery_ids.insert(id.to_string());
+            }
+        } else if is_modern_stdio_message(value) {
+            self.modern_confirmed = true;
+        }
+        self.modern_confirmed
+    }
+
+    fn observe_outbound(&mut self, value: &serde_json::Value) -> bool {
+        if let Some(id) = value.get("id")
+            && self.pending_discovery_ids.remove(&id.to_string())
+            && value.get("result").is_some()
+            && value.get("error").is_none()
+        {
+            self.modern_confirmed = true;
+        }
+        self.modern_confirmed
+    }
+}
+
+/// Byte-level protocol adapter. Legacy sessions retain the exact SEP-1686
+/// request/response vocabulary; a gated modern session passes through without
+/// those rewrites, beginning with `server/discover` as its first message.
+fn stdio_transport(modern_gate: Arc<dyn Fn() -> bool + Send + Sync>) -> tokio::io::DuplexStream {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let (service, bridge) = tokio::io::duplex(256 * 1024);
+    let (bridge_read, mut bridge_write) = tokio::io::split(bridge);
+    let task_requests = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
+        String,
+    >::new()));
+    let protocol_state = std::sync::Arc::new(std::sync::Mutex::new(StdioProtocolState::default()));
+
+    let inbound_tasks = std::sync::Arc::clone(&task_requests);
+    let inbound_protocol = std::sync::Arc::clone(&protocol_state);
+    tokio::spawn(async move {
+        let mut input = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = input.next_line().await {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                let _ = bridge_write.write_all(line.as_bytes()).await;
+                let _ = bridge_write.write_all(b"\n").await;
+                continue;
+            };
+            let modern_downstream_enabled = modern_gate();
+            let is_modern = inbound_protocol
+                .lock()
+                .map(|mut state| state.observe_inbound(&value, modern_downstream_enabled))
+                .unwrap_or(false);
+            let task_request = !is_modern
+                && value.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
+                && value
+                    .get("params")
+                    .and_then(|params| params.get("task"))
+                    .is_some();
+            if task_request && let Some(id) = value.get("id") {
+                inbound_tasks.lock().await.insert(id.to_string());
+            }
+            if !is_modern {
+                plug_core::protocol::rewrite_legacy_request(&mut value);
+            }
+            if let Ok(mut encoded) = serde_json::to_vec(&value) {
+                encoded.push(b'\n');
+                if bridge_write.write_all(&encoded).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let outbound_protocol = protocol_state;
+    tokio::spawn(async move {
+        let mut output = tokio::io::stdout();
+        let mut lines = BufReader::new(bridge_read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                let _ = output.write_all(line.as_bytes()).await;
+                let _ = output.write_all(b"\n").await;
+                continue;
+            };
+            let is_modern = outbound_protocol
+                .lock()
+                .map(|mut state| state.observe_outbound(&value))
+                .unwrap_or(false);
+            let task_response = if !is_modern && let Some(id) = value.get("id") {
+                task_requests.lock().await.remove(&id.to_string())
+            } else {
+                false
+            };
+            if !is_modern {
+                plug_core::protocol::rewrite_legacy_response(&mut value, task_response);
+            }
+            if let Ok(mut encoded) = serde_json::to_vec(&value) {
+                encoded.push(b'\n');
+                if output.write_all(&encoded).await.is_err() {
+                    break;
+                }
+                let _ = output.flush().await;
+            }
+        }
+    });
+
+    service
 }
 
 pub(crate) async fn connect_via_daemon(
@@ -658,8 +865,9 @@ pub(crate) async fn connect_via_daemon(
     let client_id = uuid::Uuid::new_v4().to_string();
     let session = establish_daemon_proxy_session(config_path, client_id, None).await?;
     let proxy = crate::ipc_proxy::IpcProxyHandler::new(session, config_path.cloned());
+    let modern_gate = proxy.modern_gate_reader();
     use rmcp::ServiceExt as _;
-    let transport = rmcp::transport::io::stdio();
+    let transport = stdio_transport(modern_gate);
     let service = proxy
         .serve(transport)
         .await
@@ -675,8 +883,13 @@ pub(crate) async fn connect_standalone(
     let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
     engine.start().await?;
     let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
+    let modern_downstream_enabled = engine.config().http.modern_downstream_enabled;
+    proxy.set_modern_downstream_enabled(modern_downstream_enabled);
+    let router = Arc::clone(proxy.router());
+    let modern_gate: Arc<dyn Fn() -> bool + Send + Sync> =
+        Arc::new(move || router.modern_downstream_enabled());
     use rmcp::ServiceExt as _;
-    let transport = rmcp::transport::io::stdio();
+    let transport = stdio_transport(modern_gate);
     let service = proxy
         .serve(transport)
         .await
@@ -1023,6 +1236,84 @@ mod tests {
         path
     }
 
+    #[test]
+    fn failed_modern_discovery_probe_falls_back_to_explicit_legacy_initialize() {
+        let mut protocol = StdioProtocolState::default();
+        let discovery = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "server/discover",
+            "params": {}
+        });
+        assert!(!protocol.observe_inbound(&discovery, true));
+        assert!(!protocol.observe_outbound(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {"code": -32601, "message": "not supported"}
+        })));
+
+        let mut initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tasks": {"list": {}}},
+                "clientInfo": {"name": "legacy-after-probe", "version": "1.0"}
+            }
+        });
+        assert!(!protocol.observe_inbound(&initialize, true));
+        plug_core::protocol::rewrite_legacy_request(&mut initialize);
+        assert!(initialize.pointer("/params/capabilities/tasks").is_none());
+        assert!(
+            initialize
+                .pointer("/params/capabilities/experimental/plug.dev~1legacy-tasks")
+                .is_some()
+        );
+
+        let mut response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "result": {"resultType": "complete", "tools": []}
+        });
+        assert!(!protocol.observe_outbound(&response));
+        plug_core::protocol::rewrite_legacy_response(&mut response, false);
+        assert!(response.pointer("/result/resultType").is_none());
+    }
+
+    #[test]
+    fn successful_modern_discovery_confirms_modern_stdio_era() {
+        let mut protocol = StdioProtocolState::default();
+        let discovery = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "server/discover",
+            "params": {}
+        });
+        assert!(!protocol.observe_inbound(&discovery, true));
+        assert!(protocol.observe_outbound(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {"supportedVersions": ["2026-07-28"]}
+        })));
+        assert!(
+            !protocol.observe_inbound(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                        }
+                    }
+                }),
+                false,
+            ),
+            "a live gate disable must clear the confirmed modern era"
+        );
+    }
+
     // Shared with the daemon and ipc_proxy test modules so all global runtime-path
     // tests serialize on one lock (see daemon::runtime_paths_test_lock).
     fn runtime_path_test_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1071,6 +1362,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let http = plug_core::config::HttpConfig {
+            modern_downstream_enabled: false,
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             public_base_url: None,
             oauth_scopes: None,
@@ -1850,6 +2142,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             enabled: true,
             transport: plug_core::config::TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1865,6 +2158,151 @@ mod tests {
             tool_groups: Vec::new(),
             sandbox: None,
         }
+    }
+
+    #[tokio::test]
+    async fn oauth_revoke_204_blocks_request_validated_before_revocation_from_creating_task() {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), task_test_mock_config());
+        let engine = Arc::new(plug_core::engine::Engine::new(config));
+        engine.start().await.expect("engine start");
+        let tool_router = engine.tool_router().clone();
+
+        let oauth_path = std::env::temp_dir().join(format!(
+            "plug-runtime-revoke-race-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            plug_core::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: vec!["tools:read".to_string(), "tasks:use".to_string()],
+                local_port: 3282,
+            },
+            oauth_path.clone(),
+        )
+        .expect("OAuth manager");
+        let client = manager
+            .register_client(
+                plug_core::downstream_oauth::ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example/callback".to_string()],
+                    client_name: Some("race client".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "runtime-revoke-test",
+            )
+            .await
+            .expect("register client");
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let consent = manager
+            .begin_authorization(plug_core::downstream_oauth::AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "runtime-revoke-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read tasks:use"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let code = reqwest::Url::parse(&redirect.location)
+            .expect("redirect URL")
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization code");
+        let tokens = manager
+            .exchange_authorization_code(
+                &client.client_id,
+                &code,
+                &client.redirect_uris[0],
+                verifier,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("exchange code");
+
+        // Barrier: middleware validation has completed and captured the old
+        // client generation, but task dispatch has not begun.
+        let claims = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                &manager.resource(),
+            )
+            .await
+        {
+            plug_core::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
+            other => panic!("token must validate before revocation: {other:?}"),
+        };
+        let principal = plug_core::types::PrincipalId::downstream_oauth(
+            manager.base_url(),
+            claims.client_id.clone(),
+            claims.resource.clone(),
+        );
+        let owner = plug_core::tasks::TaskOwner::new(principal.owner_key());
+        let context = plug_core::proxy::DownstreamCallContext::http_for_client_with_trace(
+            "validated-before-revoke",
+            rmcp::model::RequestId::from(rmcp::model::NumberOrString::Number(1)),
+            plug_core::types::ClientType::Unknown,
+            Arc::<str>::from("00000000000000000000000000000001"),
+        )
+        .with_authorization(principal, claims.scopes)
+        .with_principal_lifecycle(claims.principal_lifecycle);
+
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let http_state = Arc::new(plug_core::http::server::HttpState {
+            router: tool_router.clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(manager),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        let app = build_runtime_router(http_state, Arc::from("operator-secret"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "{OPERATOR_OAUTH_CLIENTS_PATH}/{}",
+                        client.client_id
+                    ))
+                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
+                    .body(Body::empty())
+                    .expect("revoke request"),
+            )
+            .await
+            .expect("revoke response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let error = tool_router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, Some(context))
+            .await
+            .expect_err("a pre-revocation validation cannot create after the 204 boundary");
+        assert_eq!(error.code, rmcp::model::ErrorCode(-32001));
+        assert_eq!(tool_router.task_count_for_owner(&owner).await, 0);
+
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(oauth_path);
     }
 
     #[tokio::test]

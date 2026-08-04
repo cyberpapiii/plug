@@ -8,16 +8,38 @@ use std::fmt;
 
 use rmcp::model::{
     ClientCapabilities, CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams,
-    ElicitResult, Icon, ToolAnnotations,
+    ElicitResult, Icon, RequestId, ToolAnnotations,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ServerHealth, ServerStatus, UpstreamServerMetadata};
+use crate::types::{SecretString, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 /// Raw payload bytes per chunk when a logical daemon response exceeds one frame.
 pub const RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
+
+/// Opaque, per-registration capability authorizing out-of-band cancellation.
+/// It is serialized over the private IPC socket but always redacted in Debug.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IpcCancellationCapability(SecretString);
+
+impl IpcCancellationCapability {
+    pub fn new(secret: String) -> Self {
+        Self(secret.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for IpcCancellationCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 
@@ -74,6 +96,8 @@ pub enum IpcRequest {
     ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
     Capabilities { session_id: String },
+    /// Query the daemon-authoritative modern downstream gate.
+    ModernDownstreamGate { session_id: String },
 
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
@@ -82,6 +106,25 @@ pub enum IpcRequest {
         method: String,
         /// JSON-RPC params object.
         params: Option<serde_json::Value>,
+    },
+
+    /// Context-preserving MCP request used by current proxy clients. The
+    /// legacy variant remains for old IPC callers and reconnect replay.
+    McpRequestWithContext {
+        session_id: String,
+        method: String,
+        params: Option<serde_json::Value>,
+        context: IpcMcpRequestContext,
+    },
+
+    /// Cancel one in-flight downstream request. The daemon verifies that the
+    /// transport session still belongs to `client_id` before routing it.
+    CancelMcpRequest {
+        session_id: String,
+        client_id: String,
+        cancellation_capability: IpcCancellationCapability,
+        request_id: RequestId,
+        reason: Option<String>,
     },
 
     /// Push updated workspace roots from a downstream client to the daemon.
@@ -161,12 +204,41 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("Capabilities")
                 .field("session_id", session_id)
                 .finish(),
+            Self::ModernDownstreamGate { session_id } => f
+                .debug_struct("ModernDownstreamGate")
+                .field("session_id", session_id)
+                .finish(),
             Self::McpRequest {
                 session_id, method, ..
             } => f
                 .debug_struct("McpRequest")
                 .field("session_id", session_id)
                 .field("method", method)
+                .finish(),
+            Self::McpRequestWithContext {
+                session_id,
+                method,
+                context,
+                ..
+            } => f
+                .debug_struct("McpRequestWithContext")
+                .field("session_id", session_id)
+                .field("method", method)
+                .field("context", context)
+                .finish(),
+            Self::CancelMcpRequest {
+                session_id,
+                client_id,
+                cancellation_capability: _,
+                request_id,
+                reason,
+            } => f
+                .debug_struct("CancelMcpRequest")
+                .field("session_id", session_id)
+                .field("client_id", client_id)
+                .field("cancellation_capability", &"[REDACTED]")
+                .field("request_id", request_id)
+                .field("reason", reason)
                 .finish(),
             Self::UpdateRoots { session_id, .. } => f
                 .debug_struct("UpdateRoots")
@@ -199,6 +271,17 @@ impl fmt::Debug for IpcRequest {
                 .finish(),
         }
     }
+}
+
+/// Request-scoped downstream identity that must survive the private daemon
+/// hop. Principal and durable owner are deliberately not serialized: the
+/// daemon derives both from its authenticated client registry entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcMcpRequestContext {
+    pub request_id: RequestId,
+    pub protocol_version: String,
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +521,8 @@ pub enum IpcResponse {
     },
     /// Synthesized MCP capabilities for the daemon-backed shared runtime.
     Capabilities { capabilities: serde_json::Value },
+    /// Current daemon-authoritative modern downstream gate.
+    ModernDownstreamGate { enabled: bool },
     /// Success acknowledgement for mutating commands.
     Ok,
     /// Config reload result with restart-required warnings.
@@ -452,6 +537,12 @@ pub enum IpcResponse {
         protocol_version: u16,
         client_id: String,
         session_id: String,
+        /// Shared, daemon-authoritative modern downstream gate.
+        #[serde(default)]
+        modern_downstream_enabled: bool,
+        /// Secret capability for auxiliary cancellation sockets.
+        #[serde(default)]
+        cancellation_capability: IpcCancellationCapability,
     },
 
     /// MCP JSON-RPC response from the daemon's shared Engine.
@@ -492,6 +583,8 @@ pub enum IpcResponse {
         server_id: String,
         state: ServerHealth,
     },
+    /// Push update for the daemon-authoritative modern downstream gate.
+    ModernDownstreamGateChanged { enabled: bool },
 }
 
 // ──────────────────────── Reverse-request IPC types ──────────────────────────
@@ -656,6 +749,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancellation_capability_preserves_wire_value_and_redaction() {
+        let capability = IpcCancellationCapability::new("capability-secret".to_string());
+
+        assert_eq!(capability.expose_secret(), "capability-secret");
+        assert_eq!(format!("{capability:?}"), "[REDACTED]");
+        assert_eq!(
+            serde_json::to_value(&capability).expect("serialize capability"),
+            serde_json::Value::String("capability-secret".to_string())
+        );
+
+        let decoded: IpcCancellationCapability =
+            serde_json::from_value(serde_json::Value::String("capability-secret".to_string()))
+                .expect("deserialize capability");
+        assert_eq!(decoded, capability);
+    }
+
+    #[test]
     fn request_serialization_round_trip() {
         let requests = vec![
             IpcRequest::Status,
@@ -752,6 +862,7 @@ mod tests {
                         icons: Some(vec![
                             Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
                         ]),
+                        selected_protocol_version: None,
                     }),
                     trust: IpcTrustInfo::default(),
                 }],
@@ -772,6 +883,8 @@ mod tests {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 client_id: "client-123".to_string(),
                 session_id: "sess-456".to_string(),
+                modern_downstream_enabled: false,
+                cancellation_capability: IpcCancellationCapability::default(),
             },
             IpcResponse::Capabilities {
                 capabilities: serde_json::json!({"tools": {"listChanged": true}}),
@@ -838,6 +951,7 @@ mod tests {
                     icons: Some(vec![
                         Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
                     ]),
+                    selected_protocol_version: Some("2025-11-25".to_string()),
                 }),
                 trust: IpcTrustInfo::default(),
             }],
@@ -864,6 +978,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             enabled: true,
             transport: crate::config::TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: Some(crate::types::SecretString::from("secret-token".to_string())),
             auth: None,
@@ -955,6 +1070,24 @@ mod tests {
             session_id: "s".to_string(),
             method: "tools/list".to_string(),
             params: None,
+        }));
+        assert!(!requires_auth(&IpcRequest::McpRequestWithContext {
+            session_id: "s".to_string(),
+            method: "tools/list".to_string(),
+            params: None,
+            context: IpcMcpRequestContext {
+                request_id: RequestId::from(rmcp::model::NumberOrString::Number(1)),
+                protocol_version: "2026-07-28".to_string(),
+                client_name: Some("client".to_string()),
+                client_version: Some("1".to_string()),
+            },
+        }));
+        assert!(!requires_auth(&IpcRequest::CancelMcpRequest {
+            session_id: "s".to_string(),
+            client_id: "client".to_string(),
+            cancellation_capability: IpcCancellationCapability::new("secret".to_string()),
+            request_id: RequestId::from(rmcp::model::NumberOrString::Number(1)),
+            reason: Some("stop".to_string()),
         }));
         assert!(!requires_auth(&IpcRequest::AuthStatus));
     }
@@ -1090,6 +1223,8 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             client_id: "client-123".to_string(),
             session_id: "sess-123".to_string(),
+            modern_downstream_enabled: false,
+            cancellation_capability: IpcCancellationCapability::default(),
         };
 
         let value = serde_json::to_value(resp).unwrap();
@@ -1097,6 +1232,52 @@ mod tests {
         assert_eq!(value["protocol_version"], IPC_PROTOCOL_VERSION);
         assert_eq!(value["client_id"], "client-123");
         assert_eq!(value["session_id"], "sess-123");
+    }
+
+    #[test]
+    fn contextual_request_and_typed_cancellation_round_trip() {
+        let request_id = RequestId::from(rmcp::model::NumberOrString::String(
+            std::sync::Arc::from("req-7"),
+        ));
+        let request = IpcRequest::McpRequestWithContext {
+            session_id: "session-1".to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({"name": "server__tool"})),
+            context: IpcMcpRequestContext {
+                request_id: request_id.clone(),
+                protocol_version: "2026-07-28".to_string(),
+                client_name: Some("modern-client".to_string()),
+                client_version: Some("2.0".to_string()),
+            },
+        };
+        let encoded = serde_json::to_vec(&request).expect("serialize contextual request");
+        let decoded: IpcRequest =
+            serde_json::from_slice(&encoded).expect("deserialize contextual request");
+        assert!(matches!(
+            decoded,
+            IpcRequest::McpRequestWithContext { context, .. }
+                if context.request_id == request_id
+                    && context.protocol_version == "2026-07-28"
+        ));
+
+        let cancellation = IpcRequest::CancelMcpRequest {
+            session_id: "session-1".to_string(),
+            client_id: "stable-client".to_string(),
+            cancellation_capability: IpcCancellationCapability::new("secret".to_string()),
+            request_id: request_id.clone(),
+            reason: Some("user cancelled".to_string()),
+        };
+        let debug = format!("{cancellation:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret"));
+        let encoded = serde_json::to_vec(&cancellation).expect("serialize cancellation");
+        let decoded: IpcRequest =
+            serde_json::from_slice(&encoded).expect("deserialize cancellation");
+        assert!(matches!(
+            decoded,
+            IpcRequest::CancelMcpRequest { client_id, request_id: id, .. }
+                if client_id == "stable-client" && id == request_id
+        ));
     }
 
     #[test]

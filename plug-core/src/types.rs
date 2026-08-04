@@ -3,6 +3,401 @@ use std::fmt;
 use uuid::Uuid;
 
 use rmcp::model::Icon;
+use rmcp::model::MetaObject;
+
+/// The only peer-controlled MCP `_meta` data Plug will retain or forward.
+///
+/// This is deliberately a one-way wire envelope, not a general map exposed to
+/// policy code.  Authentication, ownership, routing, credentials, and
+/// continuation state therefore cannot accidentally start consulting an
+/// extension field in a later refactor.
+#[derive(Clone, PartialEq)]
+pub struct ExtensionEnvelope {
+    meta: MetaObject,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionEnvelopeError {
+    InvalidKey,
+    ReservedNamespace,
+    ControlShapedKey,
+    SecretShapedValue,
+    TooDeep,
+    TooManyValues,
+    TooLarge,
+}
+
+impl fmt::Display for ExtensionEnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::InvalidKey => "extension metadata contains an invalid key",
+            Self::ReservedNamespace => "extension metadata uses Plug's reserved namespace",
+            Self::ControlShapedKey => {
+                "extension metadata uses an authentication or routing control key"
+            }
+            Self::SecretShapedValue => "extension metadata contains a secret-shaped value",
+            Self::TooDeep => "extension metadata exceeds the nesting limit",
+            Self::TooManyValues => "extension metadata exceeds the value-count limit",
+            Self::TooLarge => "extension metadata exceeds the byte limit",
+        };
+        f.write_str(reason)
+    }
+}
+
+impl std::error::Error for ExtensionEnvelopeError {}
+
+impl fmt::Debug for ExtensionEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtensionEnvelope")
+            .field("field_count", &self.meta.len())
+            .field("encoded_bytes", &self.encoded_bytes)
+            .field("values", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl ExtensionEnvelope {
+    pub const MAX_ENCODED_BYTES: usize = 16 * 1024;
+    pub const MAX_DEPTH: usize = 8;
+    pub const MAX_VALUES: usize = 128;
+
+    /// Admit extension fields from a peer-owned `_meta` map.
+    ///
+    /// MCP core fields are intentionally omitted: RMCP and Plug's typed
+    /// protocol adapters own them. Unknown fields must be namespaced.
+    pub fn from_peer_meta(meta: Option<&MetaObject>) -> Result<Self, ExtensionEnvelopeError> {
+        Self::from_peer_meta_with_reserved_policy(meta, false)
+    }
+
+    /// Catalog/result ingress strips peer attempts to claim Plug's namespace,
+    /// while retaining other independently valid fields. Request ingress uses
+    /// [`Self::from_peer_meta`] and rejects the same collision before effects.
+    pub fn from_peer_catalog_meta(
+        meta: Option<&MetaObject>,
+    ) -> Result<Self, ExtensionEnvelopeError> {
+        Self::from_peer_meta_with_reserved_policy(meta, true)
+    }
+
+    fn from_peer_meta_with_reserved_policy(
+        meta: Option<&MetaObject>,
+        strip_reserved: bool,
+    ) -> Result<Self, ExtensionEnvelopeError> {
+        let mut admitted = serde_json::Map::new();
+        let Some(meta) = meta else {
+            return Ok(Self {
+                meta: MetaObject::new(),
+                encoded_bytes: 2,
+            });
+        };
+
+        let mut value_count = 0;
+        for (key, value) in meta.iter() {
+            if is_typed_mcp_meta_key(key) {
+                if matches!(key.as_str(), "traceparent" | "tracestate" | "baggage") {
+                    validate_trace_value(key, value)?;
+                    admitted.insert(key.clone(), value.clone());
+                }
+                continue;
+            }
+            if strip_reserved && is_reserved_extension_key(key) {
+                continue;
+            }
+            validate_extension_key(key)?;
+            if matches!(
+                key.as_str(),
+                "io.modelcontextprotocol/ui" | "io.modelcontextprotocol/apps"
+            ) && !value.is_object()
+            {
+                return Err(ExtensionEnvelopeError::InvalidKey);
+            }
+            validate_value(value, 1, &mut value_count)?;
+            admitted.insert(key.clone(), value.clone());
+        }
+
+        let encoded_bytes = serde_json::to_vec(&admitted)
+            .map_err(|_| ExtensionEnvelopeError::TooLarge)?
+            .len();
+        if encoded_bytes > Self::MAX_ENCODED_BYTES {
+            return Err(ExtensionEnvelopeError::TooLarge);
+        }
+        Ok(Self {
+            meta: MetaObject::from(admitted),
+            encoded_bytes,
+        })
+    }
+
+    pub fn into_meta(self) -> Option<MetaObject> {
+        (!self.meta.is_empty()).then_some(self.meta)
+    }
+
+    pub fn to_meta(&self) -> Option<MetaObject> {
+        (!self.meta.is_empty()).then(|| self.meta.clone())
+    }
+
+    /// Exact serialized size used by aggregate retention budgets after the
+    /// envelope has applied key, value, depth, and secret-shape policy.
+    pub(crate) fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+}
+
+fn is_typed_mcp_meta_key(key: &str) -> bool {
+    matches!(
+        key,
+        "progressToken"
+            | "traceparent"
+            | "tracestate"
+            | "baggage"
+            | "io.modelcontextprotocol/protocolVersion"
+            | "io.modelcontextprotocol/clientInfo"
+            | "io.modelcontextprotocol/clientCapabilities"
+            | "io.modelcontextprotocol/logLevel"
+            | "plug.dev/legacy-task"
+    )
+}
+
+fn validate_extension_key(key: &str) -> Result<(), ExtensionEnvelopeError> {
+    if is_reserved_extension_key(key) {
+        return Err(ExtensionEnvelopeError::ReservedNamespace);
+    }
+    let Some((namespace, name)) = key.split_once('/') else {
+        return Err(ExtensionEnvelopeError::InvalidKey);
+    };
+    if namespace.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    {
+        return Err(ExtensionEnvelopeError::InvalidKey);
+    }
+    if control_shaped_extension_name(name) {
+        return Err(ExtensionEnvelopeError::ControlShapedKey);
+    }
+    Ok(())
+}
+
+fn control_shaped_extension_name(name: &str) -> bool {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for character in name.chars() {
+        if matches!(character, '.' | '_' | '-') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if character.is_ascii_uppercase() && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(character.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    if words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "auth"
+                | "authentication"
+                | "authorization"
+                | "authorize"
+                | "oauth"
+                | "token"
+                | "password"
+                | "secret"
+                | "cookie"
+                | "credential"
+                | "credentials"
+                | "principal"
+                | "scope"
+                | "scopes"
+                | "route"
+                | "routing"
+                | "requeststate"
+                | "continuation"
+        )
+    }) {
+        return true;
+    }
+
+    let compact = words.concat();
+    matches!(
+        compact.as_str(),
+        "accesstoken"
+            | "refreshtoken"
+            | "authtoken"
+            | "apikey"
+            | "privatekey"
+            | "clientcredential"
+            | "clientcredentials"
+            | "requeststate"
+    )
+}
+
+fn is_reserved_extension_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.starts_with("plug/")
+        || lower.starts_with("plug.")
+        || lower.starts_with("io.plug/")
+        || lower.starts_with("com.plug/")
+}
+
+fn validate_trace_value(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), ExtensionEnvelopeError> {
+    let Some(value) = value.as_str() else {
+        return Err(ExtensionEnvelopeError::InvalidKey);
+    };
+    let limit = if key == "baggage" { 4096 } else { 512 };
+    if value.len() > limit || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ExtensionEnvelopeError::TooLarge);
+    }
+    if key == "traceparent" && !valid_traceparent(value) {
+        return Err(ExtensionEnvelopeError::InvalidKey);
+    }
+    Ok(())
+}
+
+/// Validate the W3C trace-parent shape Plug admits from either MCP `_meta` or
+/// mirrored HTTP headers.
+pub(crate) fn valid_traceparent(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0] == "00"
+        && parts[1].len() == 32
+        && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && parts[1].bytes().any(|byte| byte != b'0')
+        && parts[2].len() == 16
+        && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && parts[2].bytes().any(|byte| byte != b'0')
+        && parts[3].len() == 2
+        && parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_value(
+    value: &serde_json::Value,
+    depth: usize,
+    count: &mut usize,
+) -> Result<(), ExtensionEnvelopeError> {
+    *count += 1;
+    if *count > ExtensionEnvelope::MAX_VALUES {
+        return Err(ExtensionEnvelopeError::TooManyValues);
+    }
+    if depth > ExtensionEnvelope::MAX_DEPTH {
+        return Err(ExtensionEnvelopeError::TooDeep);
+    }
+    match value {
+        serde_json::Value::String(value) if looks_secret_shaped(value) => {
+            Err(ExtensionEnvelopeError::SecretShapedValue)
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_value(value, depth + 1, count)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                validate_value(value, depth + 1, count)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn looks_secret_shaped(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("bearer ")
+        || lower.starts_with("basic ")
+        || lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xoxb-")
+        || lower.starts_with("ya29.")
+        || value.contains("-----BEGIN PRIVATE KEY-----")
+        || (value.split('.').count() == 3
+            && value.len() >= 48
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+}
+
+/// Stable, authorization-grade identity for a downstream caller.
+///
+/// The enum tag is part of the identity boundary: values from different trust
+/// domains can never compare equal even when their display strings match.
+/// Self-reported MCP client metadata and session ids are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PrincipalId {
+    DownstreamOauth {
+        issuer: String,
+        client_id: String,
+        resource: String,
+    },
+    ConfiguredCredential {
+        config_id: String,
+        generation: u64,
+    },
+    StdioProcess {
+        instance_id: Uuid,
+    },
+    DaemonIpc {
+        registry_id: Uuid,
+    },
+}
+
+impl PrincipalId {
+    pub fn downstream_oauth(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        resource: impl Into<String>,
+    ) -> Self {
+        Self::DownstreamOauth {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            resource: resource.into(),
+        }
+    }
+
+    pub fn configured_credential(config_id: impl Into<String>, generation: u64) -> Self {
+        Self::ConfiguredCredential {
+            config_id: config_id.into(),
+            generation,
+        }
+    }
+
+    pub fn stdio_process(instance_id: Uuid) -> Self {
+        Self::StdioProcess { instance_id }
+    }
+
+    pub fn daemon_ipc(registry_id: Uuid) -> Self {
+        Self::DaemonIpc { registry_id }
+    }
+
+    pub fn daemon_ipc_registry(registry_client_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!("plug:ipc-registry:{registry_client_id}"));
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self::daemon_ipc(Uuid::from_bytes(bytes))
+    }
+
+    /// Stable opaque key suitable for ownership indexes and logs. The
+    /// canonical principal fields themselves are never exposed.
+    pub fn owner_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_vec(self).expect("PrincipalId serialization cannot fail");
+        let digest = Sha256::digest(encoded);
+        format!("principal:{digest:x}")
+    }
+}
 
 /// A string that redacts its value in `Debug`/`Display` output to prevent
 /// secret leakage.
@@ -15,7 +410,7 @@ use rmcp::model::Icon;
 /// `SecretString`) into logs, IPC diagnostics, or status output, since that
 /// path bypasses the `Debug`/`Display` redaction entirely and will leak the
 /// secret in plaintext.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretString(String);
 
@@ -67,7 +462,9 @@ impl std::fmt::Display for SessionId {
 
 #[cfg(test)]
 mod tests {
-    use super::SecretString;
+    use super::{ExtensionEnvelope, ExtensionEnvelopeError, PrincipalId, SecretString};
+    use rmcp::model::MetaObject;
+    use uuid::Uuid;
 
     #[test]
     fn secret_string_debug_is_redacted() {
@@ -76,9 +473,157 @@ mod tests {
     }
 
     #[test]
+    fn principal_tags_prevent_cross_domain_collisions() {
+        let id = Uuid::from_u128(7);
+        assert_ne!(PrincipalId::stdio_process(id), PrincipalId::daemon_ipc(id));
+    }
+
+    #[test]
+    fn credential_rotation_rules_are_explicit_in_identity() {
+        assert_eq!(
+            PrincipalId::downstream_oauth("issuer", "client", "resource"),
+            PrincipalId::downstream_oauth("issuer", "client", "resource")
+        );
+        assert_ne!(
+            PrincipalId::configured_credential("key", 1),
+            PrincipalId::configured_credential("key", 2)
+        );
+    }
+
+    #[test]
     fn secret_string_display_is_redacted() {
         let secret = SecretString::from("super-secret".to_string());
         assert_eq!(format!("{secret}"), "[REDACTED]");
+    }
+
+    fn meta(value: serde_json::Value) -> MetaObject {
+        MetaObject::from(value.as_object().expect("object").clone())
+    }
+
+    #[test]
+    fn extension_envelope_preserves_admitted_types_and_trace_context() {
+        let source = meta(serde_json::json!({
+            "acme.example/ui": {"enabled": true, "count": 2, "items": [null, "x"]},
+            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01",
+            "progressToken": "typed-core-field-is-not-forwarded"
+        }));
+        let admitted = ExtensionEnvelope::from_peer_meta(Some(&source))
+            .unwrap()
+            .into_meta()
+            .unwrap();
+        assert_eq!(
+            admitted.get("acme.example/ui"),
+            source.get("acme.example/ui")
+        );
+        assert_eq!(admitted.get("traceparent"), source.get("traceparent"));
+        assert!(!admitted.contains_key("progressToken"));
+    }
+
+    #[test]
+    fn extension_envelope_rejects_reserved_and_control_namespaces() {
+        for (value, expected) in [
+            (
+                serde_json::json!({"plug.dev/legacy-task-support": true}),
+                ExtensionEnvelopeError::ReservedNamespace,
+            ),
+            (
+                serde_json::json!({"evil.example/authorization": "not-even-used"}),
+                ExtensionEnvelopeError::ControlShapedKey,
+            ),
+            (
+                serde_json::json!({"not-namespaced": true}),
+                ExtensionEnvelopeError::InvalidKey,
+            ),
+        ] {
+            assert_eq!(
+                ExtensionEnvelope::from_peer_meta(Some(&meta(value))).unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn extension_envelope_rejects_compound_control_key_spellings() {
+        for key in [
+            "evil.example/api_key",
+            "evil.example/api-key",
+            "evil.example/apiKey",
+            "evil.example/auth_token",
+            "evil.example/auth-token",
+            "evil.example/authToken",
+            "evil.example/private_key",
+            "evil.example/private-key",
+            "evil.example/privateKey",
+            "evil.example/clientCredentials",
+        ] {
+            let source = meta(serde_json::json!({(key): "opaque"}));
+            assert_eq!(
+                ExtensionEnvelope::from_peer_meta(Some(&source)).unwrap_err(),
+                ExtensionEnvelopeError::ControlShapedKey,
+                "compound control key escaped: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_envelope_strips_peer_plug_keys_but_keeps_safe_extensions() {
+        let source = meta(serde_json::json!({
+            "plug.dev/legacy-task-support": true,
+            "example.test/value": {"ok": true}
+        }));
+        let admitted = ExtensionEnvelope::from_peer_catalog_meta(Some(&source))
+            .unwrap()
+            .into_meta()
+            .unwrap();
+        assert!(!admitted.contains_key("plug.dev/legacy-task-support"));
+        assert_eq!(
+            admitted.get("example.test/value"),
+            Some(&serde_json::json!({"ok": true}))
+        );
+    }
+
+    #[test]
+    fn extension_envelope_rejects_secret_depth_count_and_byte_bombs() {
+        let secret = meta(serde_json::json!({"acme.example/value": "Bearer top-secret"}));
+        assert_eq!(
+            ExtensionEnvelope::from_peer_meta(Some(&secret)).unwrap_err(),
+            ExtensionEnvelopeError::SecretShapedValue
+        );
+
+        let mut nested = serde_json::json!(true);
+        for _ in 0..=ExtensionEnvelope::MAX_DEPTH {
+            nested = serde_json::json!([nested]);
+        }
+        let nested = meta(serde_json::json!({"acme.example/value": nested}));
+        assert_eq!(
+            ExtensionEnvelope::from_peer_meta(Some(&nested)).unwrap_err(),
+            ExtensionEnvelopeError::TooDeep
+        );
+
+        let many = meta(serde_json::json!({
+            "acme.example/value": vec![true; ExtensionEnvelope::MAX_VALUES + 1]
+        }));
+        assert_eq!(
+            ExtensionEnvelope::from_peer_meta(Some(&many)).unwrap_err(),
+            ExtensionEnvelopeError::TooManyValues
+        );
+
+        let huge = meta(serde_json::json!({
+            "acme.example/value": "x".repeat(ExtensionEnvelope::MAX_ENCODED_BYTES)
+        }));
+        assert_eq!(
+            ExtensionEnvelope::from_peer_meta(Some(&huge)).unwrap_err(),
+            ExtensionEnvelopeError::TooLarge
+        );
+    }
+
+    #[test]
+    fn extension_envelope_debug_never_contains_values() {
+        let source = meta(serde_json::json!({"acme.example/value": "operator-private"}));
+        let envelope = ExtensionEnvelope::from_peer_meta(Some(&source)).unwrap();
+        let rendered = format!("{envelope:?}");
+        assert!(!rendered.contains("operator-private"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 
     /// Pins the deliberate asymmetry documented on `SecretString`: `Serialize`
@@ -173,6 +718,8 @@ mod tests {
             upstream: None,
             metrics: None,
             availability: Availability::Degraded,
+            selected_protocol_era: None,
+            selected_protocol_version: None,
             last_seen: None,
         };
         let value = serde_json::to_value(&status).unwrap();
@@ -493,6 +1040,13 @@ pub struct ServerStatus {
     /// stays stable: an older daemon's JSON without the key deserializes as `healthy`.
     #[serde(default)]
     pub availability: Availability,
+    /// Protocol selected by the current live upstream connection. Both values
+    /// are absent when no connection exists, so configured intent is never
+    /// mistaken for runtime truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_era: Option<crate::protocol::ProtocolEra>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_version: Option<String>,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }
@@ -514,4 +1068,8 @@ pub struct UpstreamServerMetadata {
     pub website_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<Icon>>,
+    /// Protocol selected by the live upstream connection. Additive so older
+    /// daemon/operator JSON remains readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_version: Option<String>,
 }

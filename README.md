@@ -153,6 +153,47 @@ For Cursor, Windsurf, Gemini CLI, and others — see [docs/CLIENT-COMPAT.md](doc
 
 **3. That's it.** All your servers are available through every client simultaneously.
 
+## MCP 2026 dual-era preview (development branch)
+
+This development branch adds an opt-in MCP `2026-07-28` path while preserving
+the legacy lifecycle used by today's installed Claude, Cursor, and Codex clients.
+It does not change an installed Plug binary until the branch is merged, released,
+and installed. Both modern-protocol gates default to `false` pending conformance
+testing with real independent peers.
+
+The two directions can be enabled independently. A cautious upstream-only canary
+looks like this:
+
+```toml
+modern_upstream_enabled = true
+
+[http]
+modern_downstream_enabled = false
+
+[servers.modern-example]
+transport = "http"
+url = "https://example.com/mcp"
+protocol = "auto"
+```
+
+`protocol = "auto"` tries modern discovery and falls back to the legacy
+`initialize` lifecycle only when the server reports that discovery is not
+implemented. Use `protocol = "modern"` only for a server known to require the
+new lifecycle. Existing servers default to `protocol = "legacy"`.
+
+Across the proven modern paths, Plug supports durable tasks on eligible routes,
+preserves admitted extension metadata and W3C trace context, and protects
+native synchronous modern-to-modern tool continuations with principal-bound,
+expiring, single-use state. Task calls targeting modern upstreams remain
+suppressed until task input-required handling is complete. Plug also does not
+advertise listeners, mixed-era multi-round tool requests, MCP Apps/UI, or
+synthesized list-cache directives yet.
+
+See the [MCP 2026 dual-era guide](docs/guides/mcp-2026-dual-era.md) for exact
+activation, verification, rollback, compatibility, and limitation details. See
+the [branch release notes](docs/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md)
+for the practical user and agent impact.
+
 ## Why plug?
 
 You use 10 different AI coding tools. Each one needs its own MCP server configuration. Each one runs its own copies of the same servers. They conflict with each other. Configuration is scattered across a dozen files in different formats.
@@ -202,6 +243,7 @@ Full configuration reference:
 enable_prefix = true       # Legacy compatibility field; tool names are always prefixed
 prefix_delimiter = "__"    # Delimiter between server name and tool name
 daemon_grace_period_secs = 0  # Default: keep the shared daemon alive until explicit shutdown
+modern_upstream_enabled = false  # Development preview: allow per-server modern negotiation
 
 [lazy_tools]
 mode = "auto"              # auto, standard, native, bridge
@@ -214,6 +256,7 @@ opencode = "bridge"        # search bridge, then direct-call loaded routed tools
 [http]
 bind_address = "127.0.0.1"
 port = 3282
+modern_downstream_enabled = false  # Development preview: accept modern downstream clients
 
 [servers.github]
 command = "npx"
@@ -240,6 +283,7 @@ enrichment = true          # Infer tool annotations from name patterns
 [servers.workspace]
 transport = "http"
 url = "http://localhost:8000/mcp"
+protocol = "legacy"        # legacy (default), auto, or modern
 
   [servers.workspace.tool_renames]
   search_docs = "get_doc_search_results"

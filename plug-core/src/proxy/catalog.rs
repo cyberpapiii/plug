@@ -1,5 +1,121 @@
 use super::*;
 
+/// Retained extension metadata from one upstream across one catalog refresh.
+/// Descriptor schemas and ordinary fields are not counted or limited here.
+pub(crate) const MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM: usize = 256 * 1024;
+
+/// One refresh-local budget shared by tools, resources, templates, and prompts.
+/// Once an upstream exhausts its budget, all later descriptor metadata from
+/// that upstream is dropped while the descriptors themselves remain intact.
+#[derive(Default)]
+pub(crate) struct CatalogMetadataBudget {
+    retained_bytes: HashMap<String, usize>,
+    exhausted_servers: HashSet<String>,
+}
+
+impl CatalogMetadataBudget {
+    pub(crate) fn admit(
+        &mut self,
+        server_name: &str,
+        meta: &mut Option<MetaObject>,
+        surface: &'static str,
+    ) {
+        if self.exhausted_servers.contains(server_name) {
+            *meta = None;
+            return;
+        }
+
+        let envelope = match crate::types::ExtensionEnvelope::from_peer_catalog_meta(meta.as_ref())
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                *meta = None;
+                tracing::warn!(
+                    surface,
+                    reason = %error,
+                    "discarded unsafe peer extension metadata"
+                );
+                return;
+            }
+        };
+        let encoded_bytes = envelope.encoded_bytes();
+        let admitted = envelope.into_meta();
+        if admitted.is_none() {
+            *meta = None;
+            return;
+        }
+
+        let retained = self
+            .retained_bytes
+            .entry(server_name.to_string())
+            .or_default();
+        if encoded_bytes > MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM.saturating_sub(*retained) {
+            *meta = None;
+            if self.exhausted_servers.insert(server_name.to_string()) {
+                tracing::warn!(
+                    server = %server_name,
+                    retained_metadata_limit_bytes = MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM,
+                    "catalog extension metadata budget exhausted; discarding later metadata"
+                );
+            }
+            return;
+        }
+
+        *retained += encoded_bytes;
+        *meta = admitted;
+    }
+}
+
+/// Apply the shared peer-extension policy before a catalog descriptor is
+/// cloned into Plug's cache. Invalid peer metadata is dropped as one unit;
+/// neither keys nor values are included in diagnostics.
+pub(crate) fn admit_catalog_meta(meta: &mut Option<MetaObject>, surface: &'static str) {
+    match crate::types::ExtensionEnvelope::from_peer_catalog_meta(meta.as_ref()) {
+        Ok(envelope) => *meta = envelope.into_meta(),
+        Err(error) => {
+            *meta = None;
+            tracing::warn!(surface, reason = %error, "discarded unsafe peer extension metadata");
+        }
+    }
+}
+
+pub(crate) fn admit_resource_contents_meta(contents: &mut ResourceContents) {
+    match contents {
+        ResourceContents::TextResourceContents { meta, .. }
+        | ResourceContents::BlobResourceContents { meta, .. } => {
+            admit_catalog_meta(meta, "resource-content");
+        }
+        // RMCP marks this enum non-exhaustive; a future variant must add an
+        // explicit metadata arm before that RMCP version is adopted.
+        _ => {}
+    }
+}
+
+pub(crate) fn admit_content_block_meta(content: &mut ContentBlock) {
+    match content {
+        ContentBlock::Text(content) => admit_catalog_meta(&mut content.meta, "text-content"),
+        ContentBlock::Image(content) => admit_catalog_meta(&mut content.meta, "image-content"),
+        ContentBlock::Audio(content) => admit_catalog_meta(&mut content.meta, "audio-content"),
+        ContentBlock::Resource(content) => {
+            admit_catalog_meta(&mut content.meta, "embedded-resource");
+            admit_resource_contents_meta(&mut content.resource);
+        }
+        ContentBlock::ResourceLink(resource) => {
+            admit_catalog_meta(&mut resource.meta, "resource-link");
+        }
+        // See the ResourceContents note above. Current RMCP variants are all
+        // covered explicitly.
+        _ => {}
+    }
+}
+
+pub(crate) fn admit_tool_result_meta(result: &mut CallToolResult) {
+    admit_catalog_meta(&mut result.meta, "tool-result");
+    for content in &mut result.content {
+        admit_content_block_meta(content);
+    }
+}
+
 pub(crate) fn strip_optional_fields(tool: &mut Tool, max_desc_chars: Option<usize>) {
     if let Some(ref desc) = tool.description {
         let sanitized = sanitize_description(desc);
@@ -53,7 +169,9 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
         .position(|p| b.name.contains(p.as_str()));
 
     match (a_priority, b_priority) {
-        (Some(a_idx), Some(b_idx)) => a_idx.cmp(&b_idx),
+        (Some(a_idx), Some(b_idx)) => a_idx
+            .cmp(&b_idx)
+            .then_with(|| a.name.as_ref().cmp(b.name.as_ref())),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.name.as_ref().cmp(b.name.as_ref()),
@@ -389,9 +507,16 @@ impl super::ToolRouter {
     ) -> ListToolsResult {
         let tools = self.list_tools_for_client_session(client_type, session_key);
         paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
+            // This is a synthesized, shared multi-upstream view. RMCP's
+            // list_all_tools discards per-page directive provenance, so Plug
+            // must not copy a private, zero/negative, or short upstream TTL
+            // onto this different response. Keep cache directives absent
+            // until the catalog has principal-scoped directive sidecars and a
+            // conservative aggregation rule (never lengthen upstream TTLs).
             meta: None,
             next_cursor,
             tools,
+            ..Default::default()
         })
     }
 
@@ -509,7 +634,13 @@ impl super::ToolRouter {
             capabilities.logging = Some(serde_json::Map::new());
         }
         if self.supports_tasks_for_client(client_type) {
-            capabilities.tasks = Some(TasksCapability::server_default());
+            capabilities
+                .experimental
+                .get_or_insert_with(Default::default)
+                .insert(
+                    crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+                    serde_json::Map::new(),
+                );
         }
 
         capabilities
@@ -612,6 +743,7 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 resources,
+                ..Default::default()
             }
         })
     }
@@ -632,6 +764,7 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 resource_templates,
+                ..Default::default()
             },
         )
     }
@@ -647,7 +780,129 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 prompts,
+                ..Default::default()
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod metadata_budget_tests {
+    use super::*;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<String>>);
+
+    struct EventVisitor<'a>(&'a mut String);
+
+    impl Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = String::new();
+            event.record(&mut EventVisitor(&mut fields));
+            let mut captured = self.0.lock().expect("event capture lock");
+            captured.push_str(&fields);
+            captured.push('\n');
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn large_valid_meta(key: &str, value_prefix: &str) -> MetaObject {
+        let value = format!("{value_prefix}{}", "x".repeat(15 * 1024));
+        MetaObject::from(
+            serde_json::json!({(key): value})
+                .as_object()
+                .expect("metadata object")
+                .clone(),
+        )
+    }
+
+    #[test]
+    fn aggregate_catalog_metadata_budget_keeps_descriptors_and_logs_no_peer_data() {
+        const PEER_KEY: &str = "attacker.example/never-log-this-key";
+        const PEER_VALUE: &str = "metadata-value-must-not-leak-";
+        let capture = EventCapture::default();
+        let captured = Arc::clone(&capture.0);
+
+        let descriptors = tracing::subscriber::with_default(capture, || {
+            let mut budget = CatalogMetadataBudget::default();
+            let mut descriptors = (0..40)
+                .map(|id| {
+                    let mut meta = Some(large_valid_meta(PEER_KEY, PEER_VALUE));
+                    let surface = match id % 4 {
+                        0 => "tool",
+                        1 => "resource",
+                        2 => "resource-template",
+                        _ => "prompt",
+                    };
+                    budget.admit("untrusted-upstream", &mut meta, surface);
+                    (id, meta)
+                })
+                .collect::<Vec<_>>();
+            let mut independent_meta = Some(large_valid_meta(PEER_KEY, PEER_VALUE));
+            budget.admit("independent-upstream", &mut independent_meta, "tool");
+            descriptors.push((40, independent_meta));
+            descriptors
+        });
+
+        assert_eq!(
+            descriptors.len(),
+            41,
+            "metadata must not remove descriptors"
+        );
+        assert!(
+            descriptors.last().is_some_and(|(_, meta)| meta.is_some()),
+            "one upstream exhausting its budget must not consume another upstream's budget"
+        );
+        assert!(descriptors.iter().any(|(_, meta)| meta.is_some()));
+        assert!(descriptors.iter().any(|(_, meta)| meta.is_none()));
+
+        let retained_bytes = descriptors
+            .iter()
+            .filter(|(id, _)| *id < 40)
+            .filter_map(|(_, meta)| meta.as_ref())
+            .map(|meta| {
+                serde_json::to_vec(meta)
+                    .expect("retained metadata serializes")
+                    .len()
+            })
+            .sum::<usize>();
+        assert!(retained_bytes <= MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM);
+
+        let diagnostics = captured.lock().expect("captured diagnostics").clone();
+        assert_eq!(
+            diagnostics
+                .matches("catalog extension metadata budget exhausted")
+                .count(),
+            1,
+            "budget warning must be emitted at most once per upstream and refresh"
+        );
+        assert!(!diagnostics.contains(PEER_KEY));
+        assert!(!diagnostics.contains(PEER_VALUE));
     }
 }

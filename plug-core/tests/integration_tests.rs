@@ -23,7 +23,9 @@ use axum::response::{IntoResponse, Redirect, Response};
 use futures::FutureExt;
 use oauth2::{AccessToken, RefreshToken, TokenResponse, basic::BasicTokenType};
 use plug_core::client_detect::detect_client;
-use plug_core::config::{Config, ServerConfig, TransportType, validate_config};
+use plug_core::config::{
+    Config, ServerConfig, TransportType, UpstreamProtocolMode, validate_config,
+};
 use plug_core::engine::Engine;
 use plug_core::http::server::{HttpState, build_router};
 use plug_core::http::session::SessionManager;
@@ -86,6 +88,29 @@ fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
     token.set_expires_in(Some(&Duration::from_secs(3600)));
 
     StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(0))
+}
+
+async fn save_bound_oauth_test_credentials(
+    store: &oauth::CompositeCredentialStore,
+    issuer: &str,
+    resource: &str,
+    access: &str,
+    refresh: &str,
+) {
+    store
+        .bind_verified_authority(&oauth::VerifiedOAuthAuthority {
+            issuer: reqwest::Url::parse(issuer)
+                .expect("valid OAuth test issuer")
+                .to_string(),
+            resource: reqwest::Url::parse(resource)
+                .expect("valid OAuth test resource")
+                .to_string(),
+        })
+        .expect("bind OAuth test authority");
+    store
+        .save(oauth_test_credentials(access, refresh))
+        .await
+        .expect("seed bound OAuth credentials");
 }
 
 fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
@@ -1182,6 +1207,7 @@ fn mock_server_config(tools: &str) -> ServerConfig {
         env: HashMap::new(),
         enabled: true,
         transport: TransportType::Stdio,
+        protocol_mode: Default::default(),
         url: None,
         auth_token: None,
         auth: None,
@@ -1198,6 +1224,285 @@ fn mock_server_config(tools: &str) -> ServerConfig {
 
         sandbox: None,
     }
+}
+
+fn lifecycle_server_config(
+    fixture_mode: &str,
+    configured_mode: UpstreamProtocolMode,
+    request_log_file: &std::path::Path,
+) -> ServerConfig {
+    let mut config = mock_server_config("echo");
+    config.args = vec![
+        "--lifecycle".to_string(),
+        fixture_mode.to_string(),
+        "--request-log-file".to_string(),
+        request_log_file.to_string_lossy().into_owned(),
+    ];
+    config.protocol_mode = configured_mode;
+    config
+}
+
+fn unique_lifecycle_log(label: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "plug-u5-{label}-{}-{nonce}.log",
+        std::process::id()
+    ))
+}
+
+fn lifecycle_sequence(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .expect("lifecycle request log")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
+    // The global gate is the first safety boundary: even a server configured
+    // modern uses initialize while the gate is off.
+    let gated_log = unique_lifecycle_log("gated");
+    let mut gated_config = Config::default();
+    gated_config.servers.insert(
+        "gated".to_string(),
+        lifecycle_server_config("legacy-only", UpstreamProtocolMode::Modern, &gated_log),
+    );
+    let gated_engine = Arc::new(Engine::new(gated_config));
+    gated_engine
+        .start()
+        .await
+        .expect("start gate-off legacy path");
+    let gated_status = gated_engine
+        .server_statuses()
+        .into_iter()
+        .find(|status| status.server_id == "gated")
+        .expect("gated status");
+    assert_eq!(
+        gated_status.selected_protocol_era,
+        Some(plug_core::protocol::ProtocolEra::Legacy)
+    );
+    let gated_sequence = lifecycle_sequence(&gated_log);
+    assert_eq!(
+        gated_sequence.first().map(String::as_str),
+        Some("initialize")
+    );
+    assert!(
+        !gated_sequence
+            .iter()
+            .any(|method| method == "server/discover")
+    );
+    gated_engine.shutdown().await;
+    let _ = std::fs::remove_file(&gated_log);
+
+    // Auto uses RMCP's exact method-not-found fallback on the same transport.
+    let auto_log = unique_lifecycle_log("auto");
+    let mut auto_config = Config {
+        modern_upstream_enabled: true,
+        ..Config::default()
+    };
+    auto_config.servers.insert(
+        "auto".to_string(),
+        lifecycle_server_config("legacy-only", UpstreamProtocolMode::Auto, &auto_log),
+    );
+    let auto_engine = Arc::new(Engine::new(auto_config));
+    auto_engine.start().await.expect("start auto fallback path");
+    let auto_sequence = lifecycle_sequence(&auto_log);
+    assert_eq!(
+        &auto_sequence[..4],
+        &[
+            "server/discover",
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+        ]
+    );
+    let auto_status = auto_engine
+        .server_statuses()
+        .into_iter()
+        .find(|status| status.server_id == "auto")
+        .expect("auto status");
+    assert_eq!(
+        auto_status.selected_protocol_version.as_deref(),
+        Some("2025-11-25")
+    );
+    auto_engine.shutdown().await;
+    let _ = std::fs::remove_file(&auto_log);
+
+    // Forced modern selects discovery, records live truth, and routes an
+    // ordinary tool call through the existing shared router.
+    let modern_log = unique_lifecycle_log("modern");
+    let mut modern_config = Config {
+        modern_upstream_enabled: true,
+        ..Config::default()
+    };
+    modern_config.servers.insert(
+        "modern".to_string(),
+        lifecycle_server_config("modern-only", UpstreamProtocolMode::Modern, &modern_log),
+    );
+    let modern_engine = Arc::new(Engine::new(modern_config));
+    modern_engine
+        .start()
+        .await
+        .expect("start forced modern path");
+    let modern_status = modern_engine
+        .server_statuses()
+        .into_iter()
+        .find(|status| status.server_id == "modern")
+        .expect("modern status");
+    assert_eq!(
+        modern_status.selected_protocol_era,
+        Some(plug_core::protocol::ProtocolEra::Modern)
+    );
+    assert_eq!(
+        modern_status.selected_protocol_version.as_deref(),
+        Some("2026-07-28")
+    );
+    let routed_tool = modern_engine
+        .tool_router()
+        .list_tools()
+        .iter()
+        .find(|tool| tool.name.ends_with("__echo"))
+        .expect("modern tool routed")
+        .clone();
+    let projected_page = modern_engine
+        .tool_router()
+        .list_tools_page_for_client(ClientType::Unknown, None);
+    assert_eq!(projected_page.ttl_ms, None);
+    assert_eq!(projected_page.cache_scope, None);
+    let routed_meta = routed_tool.meta.as_ref().expect("admitted U7 metadata");
+    assert_eq!(
+        routed_meta.get("example.test/typed"),
+        Some(&serde_json::json!({
+            "boolean": true,
+            "number": 7,
+            "array": [null, "value"]
+        })),
+        "admitted extension values must retain JSON type fidelity"
+    );
+    assert_eq!(
+        routed_meta.get("io.modelcontextprotocol/ui"),
+        Some(&serde_json::json!({"resourceUri":"ui://plug/fixture"})),
+        "Apps/UI descriptor metadata must survive the routed catalog"
+    );
+    assert!(routed_tool.output_schema.is_some());
+    let tool_name = routed_tool.name.to_string();
+    let result = modern_engine
+        .tool_router()
+        .call_tool(&tool_name, None)
+        .await
+        .expect("ordinary modern upstream call translates");
+    assert!(result.content.iter().any(|content| {
+        content
+            .as_text()
+            .is_some_and(|text| text.text == "lifecycle fixture echo")
+    }));
+    assert_eq!(
+        result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("example.test/result")),
+        Some(&serde_json::json!({"boolean": true, "number": 7})),
+        "admitted result metadata must survive before artifact handling"
+    );
+    let modern_sequence = lifecycle_sequence(&modern_log);
+    assert_eq!(
+        modern_sequence.first().map(String::as_str),
+        Some("server/discover")
+    );
+    assert!(!modern_sequence.iter().any(|method| method == "initialize"));
+    modern_engine.shutdown().await;
+    let _ = std::fs::remove_file(&modern_log);
+}
+
+#[tokio::test]
+async fn forced_modern_rejects_a_legacy_only_upstream_without_fallback() {
+    let log = unique_lifecycle_log("forced-modern-rejects-legacy");
+    let manager = ServerManager::new();
+    manager.set_modern_upstream_enabled(true);
+    let config = lifecycle_server_config("legacy-only", UpstreamProtocolMode::Modern, &log);
+
+    let error = match manager.start_server("legacy-only", &config).await {
+        Ok(_) => panic!("forced modern must reject method-not-found"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("Method not found") || error.to_string().contains("-32601"),
+        "unexpected forced-modern error: {error:#}"
+    );
+    assert_eq!(lifecycle_sequence(&log), vec!["server/discover"]);
+    let _ = std::fs::remove_file(log);
+}
+
+#[tokio::test]
+async fn legacy_task_child_process_stdio_preserves_full_lifecycle_under_rmcp3() {
+    let mut server = mock_server_config("echo");
+    server.args = vec!["--legacy-tasks".to_string()];
+    let mut config = Config::default();
+    config.servers.insert("legacy-task".to_string(), server);
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("start raw legacy task child");
+    let router = engine.tool_router();
+    let tool_name = router
+        .list_tools()
+        .iter()
+        .find(|tool| tool.name.ends_with("__echo"))
+        .expect("legacy task child tool routed")
+        .name
+        .to_string();
+    let owner = plug_core::tasks::TaskOwner::new(Arc::<str>::from("stdio:legacy-task-e2e"));
+
+    let created = router
+        .enqueue_tool_task(
+            &tool_name,
+            Some(
+                serde_json::json!({"input":"round-trip"})
+                    .as_object()
+                    .expect("arguments object")
+                    .clone(),
+            ),
+            None,
+            owner.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("create native legacy task");
+    assert_eq!(created.task.task_id, "task_1");
+
+    let info = router
+        .get_task_info_for_owner(&owner, &created.task.task_id)
+        .await
+        .expect("get native legacy task");
+    assert_eq!(
+        info.task.status,
+        plug_core::legacy_tasks::TaskStatus::Completed
+    );
+
+    let payload = router
+        .get_task_result_for_owner(&owner, &created.task.task_id)
+        .await
+        .expect("get native legacy task result");
+    assert!(payload.0.to_string().contains("child-task round-trip"));
+
+    let second = router
+        .enqueue_tool_task(&tool_name, None, None, owner.clone(), None, None)
+        .await
+        .expect("create cancellable legacy task");
+    let cancelled = router
+        .cancel_task_for_owner(&owner, &second.task.task_id)
+        .await
+        .expect("cancel native legacy task");
+    assert_eq!(
+        cancelled.task.status,
+        plug_core::legacy_tasks::TaskStatus::Cancelled
+    );
+
+    engine.shutdown().await;
 }
 
 async fn reserve_unused_local_port() -> u16 {
@@ -1666,6 +1971,7 @@ fn test_config_validation_valid() {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1698,6 +2004,7 @@ fn test_config_validation_catches_missing_command() {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1764,6 +2071,7 @@ async fn test_stdio_timeout_reconnects_cleanly() {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1845,6 +2153,7 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -2109,6 +2418,7 @@ async fn run_http_upstream_crash_restart_scenario(
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Http,
+            protocol_mode: Default::default(),
             url: Some(format!("http://{addr}/mcp")),
             auth_token: None,
             auth: None,
@@ -3197,13 +3507,15 @@ async fn test_upstream_http_sends_protocol_version_header() {
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
     plug_core::tls::ensure_rustls_provider_installed();
-    store
-        .save(oauth_test_credentials(
-            "oauth-access-token",
-            "oauth-refresh-token",
-        ))
-        .await
-        .expect("seed OAuth credentials");
+    let resource_url = format!("http://127.0.0.1:{port}/mcp");
+    save_bound_oauth_test_credentials(
+        &store,
+        &resource_url,
+        &resource_url,
+        "oauth-access-token",
+        "oauth-refresh-token",
+    )
+    .await;
 
     // Connect through plug's upstream HTTP path (ServerManager::start_server).
     let sm = Arc::new(ServerManager::new());
@@ -3213,7 +3525,8 @@ async fn test_upstream_http_sends_protocol_version_header() {
         env: HashMap::new(),
         enabled: true,
         transport: TransportType::Http,
-        url: Some(format!("http://127.0.0.1:{port}/mcp")),
+        protocol_mode: Default::default(),
+        url: Some(resource_url),
         auth_token: None,
         auth: Some("oauth".to_string()),
         oauth_client_id: Some("test-client".to_string()),
@@ -3306,10 +3619,10 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
             server_name.clone(),
         ));
         let metadata = auth_manager
-            .discover_metadata()
+            .resolve_metadata()
             .await
             .expect("discover metadata");
-        auth_manager.set_metadata(metadata);
+        auth_manager.set_metadata(metadata.metadata);
         auth_manager
             .configure_client(
                 OAuthClientConfig::new("test-client".to_string(), "http://localhost:0/callback")
@@ -3402,10 +3715,14 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
     plug_core::tls::ensure_rustls_provider_installed();
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
         let mut config = Config::default();
@@ -3417,6 +3734,7 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -3529,10 +3847,14 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
         .clear()
         .await
         .expect("clear required OAuth store before test");
-    healthy_store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed healthy oauth credentials");
+    save_bound_oauth_test_credentials(
+        &healthy_store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let failed_port = reserve_unused_local_port().await;
     let mut engine: Option<Arc<Engine>> = None;
@@ -3549,6 +3871,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -3574,6 +3897,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -3599,6 +3923,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(format!("http://127.0.0.1:{failed_port}/mcp")),
                 auth_token: None,
                 auth: None,
@@ -3714,10 +4039,14 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
     let server_name = format!("oauth-stateless-{}", std::process::id());
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -3730,6 +4059,7 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -3808,10 +4138,14 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
     let server_name = format!("oauth-startup-failure-{}", std::process::id());
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -3824,6 +4158,7 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -3894,10 +4229,14 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
     );
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -3910,6 +4249,7 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -3965,8 +4305,9 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
                 "initialize".to_string(),
                 "notifications/initialized".to_string(),
                 "tools/list".to_string(),
+                "tasks/list".to_string(),
             ],
-            "expected startup to exercise initialize, the initialized notification, then tools/list"
+            "expected startup to exercise initialize, the initialized notification, tools/list, then the bounded legacy-task capability probe"
         );
     })
     .catch_unwind()
@@ -3994,10 +4335,14 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
     );
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -4010,6 +4355,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -4086,10 +4432,14 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
     );
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -4102,6 +4452,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Http,
+                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -4450,6 +4801,7 @@ fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -
         env: HashMap::new(),
         enabled: true,
         transport: TransportType::Stdio,
+        protocol_mode: Default::default(),
         url: None,
         auth_token: None,
         auth: None,

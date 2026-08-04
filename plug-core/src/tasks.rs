@@ -1,19 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{
-    CancelTaskResult, ErrorCode, GetTaskPayloadResult, GetTaskResult, ListTasksResult, RequestId,
-    Task, TaskStatus,
-};
+use rmcp::model::{ErrorCode, RequestId};
 use serde_json::Value;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use crate::legacy_tasks::{
+    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult, Task, TaskStatus,
+};
+use crate::protocol::QuotaLease;
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_MAX_COMPLETED_TASKS_PER_OWNER: usize = 100;
-const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Transport-supplied probe reporting whether a task owner's downstream
 /// session is still live. Checked by `enqueue_tool_task` immediately after it
@@ -65,6 +68,17 @@ struct TaskRecord {
     /// `pending_cancel_reason` guard in `proxy/mod.rs`'s
     /// `attach_upstream_request_id`.
     pending_cancel_reason: Option<String>,
+    /// Capacity remains reserved for the full lifetime of the durable record.
+    _quota_lease: Option<QuotaLease>,
+}
+
+/// Work detached from the store by stale in-flight expiry. The local future
+/// has already been aborted before this value is created. Keeping the quota
+/// lease here delays capacity release until the router has attempted bounded
+/// upstream cancellation.
+pub(crate) struct ExpiredTaskCleanup {
+    pub(crate) upstream: Option<TaskUpstreamRef>,
+    _quota_lease: Option<QuotaLease>,
 }
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
@@ -204,6 +218,7 @@ pub struct TaskStore {
     tasks: HashMap<String, TaskRecord>,
     next_task_id: u64,
     lifecycle: Arc<OwnerLifecycleLedger>,
+    expired_cleanup: Vec<ExpiredTaskCleanup>,
 }
 
 impl Default for TaskStore {
@@ -218,6 +233,7 @@ impl TaskStore {
             tasks: HashMap::new(),
             next_task_id: 1,
             lifecycle: Arc::new(OwnerLifecycleLedger::default()),
+            expired_cleanup: Vec::new(),
         }
     }
 
@@ -250,6 +266,24 @@ impl TaskStore {
     }
 
     pub fn create(&mut self, owner: TaskOwner, name: &str) -> Result<Task, McpError> {
+        self.create_inner(owner, name, None)
+    }
+
+    pub fn create_with_quota(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        quota_lease: QuotaLease,
+    ) -> Result<Task, McpError> {
+        self.create_inner(owner, name, Some(quota_lease))
+    }
+
+    fn create_inner(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        quota_lease: Option<QuotaLease>,
+    ) -> Result<Task, McpError> {
         self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
@@ -271,6 +305,7 @@ impl TaskStore {
                 upstream: None,
                 last_touched: Instant::now(),
                 pending_cancel_reason: None,
+                _quota_lease: quota_lease,
             },
         );
 
@@ -318,6 +353,28 @@ impl TaskStore {
         upstream_task: &Task,
         upstream: TaskUpstreamRef,
     ) -> Result<Task, McpError> {
+        self.create_passthrough_inner(owner, name, upstream_task, upstream, None)
+    }
+
+    pub fn create_passthrough_with_quota(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+        quota_lease: QuotaLease,
+    ) -> Result<Task, McpError> {
+        self.create_passthrough_inner(owner, name, upstream_task, upstream, Some(quota_lease))
+    }
+
+    fn create_passthrough_inner(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+        quota_lease: Option<QuotaLease>,
+    ) -> Result<Task, McpError> {
         self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
@@ -339,6 +396,7 @@ impl TaskStore {
                 upstream: Some(upstream),
                 last_touched: Instant::now(),
                 pending_cancel_reason: None,
+                _quota_lease: quota_lease,
             },
         );
 
@@ -511,6 +569,75 @@ impl TaskStore {
         Ok(GetTaskResult::new(record.task.clone()))
     }
 
+    /// Project Plug's retained task record onto SEP-2663's status-specific
+    /// `DetailedTask` shape. The legacy task model intentionally stays inside
+    /// the store; modern wire vocabulary is created only at this adapter edge.
+    pub fn get_modern_for_owner(
+        &mut self,
+        owner: &TaskOwner,
+        task_id: &str,
+    ) -> Result<rmcp::model::GetTaskResult, McpError> {
+        self.prune_expired();
+        let record = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| task_not_found(task_id))?;
+        ensure_owner(owner, record)?;
+
+        let task = rmcp::model::Task::from(&record.task);
+        let payload = match record.task.status {
+            TaskStatus::Working => rmcp::model::TaskPayload::Working,
+            TaskStatus::InputRequired => {
+                return Err(McpError::invalid_request(
+                    "task input requests are not bridged to modern clients yet",
+                    None,
+                ));
+            }
+            TaskStatus::Completed => {
+                let result = record
+                    .result
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .ok_or_else(|| {
+                        McpError::internal_error("task result missing or malformed", None)
+                    })?;
+                rmcp::model::TaskPayload::Completed { result }
+            }
+            TaskStatus::Failed => rmcp::model::TaskPayload::Failed {
+                error: serde_json::Map::from_iter([
+                    (
+                        "code".to_string(),
+                        serde_json::json!(ErrorCode::INTERNAL_ERROR.0),
+                    ),
+                    (
+                        "message".to_string(),
+                        serde_json::json!(
+                            record
+                                .task
+                                .status_message
+                                .as_deref()
+                                .unwrap_or("task failed")
+                        ),
+                    ),
+                ]),
+            },
+            TaskStatus::Cancelled => rmcp::model::TaskPayload::Cancelled,
+        };
+        Ok(rmcp::model::GetTaskResult::new(
+            rmcp::model::DetailedTask::new(task, payload),
+        ))
+    }
+
+    pub fn validate_owner(&mut self, owner: &TaskOwner, task_id: &str) -> Result<(), McpError> {
+        self.prune_expired();
+        let record = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| task_not_found(task_id))?;
+        ensure_owner(owner, record)
+    }
+
     pub fn sync_from_upstream_for_owner(
         &mut self,
         owner: &TaskOwner,
@@ -582,11 +709,6 @@ impl TaskStore {
                 format!("task {task_id} is not in a completed state"),
                 None,
             )),
-            _ => Err(McpError::new(
-                ErrorCode::INVALID_REQUEST,
-                format!("task {task_id} has an unsupported status"),
-                None,
-            )),
         }
     }
 
@@ -604,22 +726,54 @@ impl TaskStore {
         Ok(CancelTaskResult::new(record.task.clone()))
     }
 
+    /// Drain stale in-flight cleanup after the synchronous store operation
+    /// that discovered it. The router owns bounded upstream cancellation;
+    /// dropping these values releases their retained quota leases.
+    pub(crate) fn take_expired_cleanup(&mut self) -> Vec<ExpiredTaskCleanup> {
+        std::mem::take(&mut self.expired_cleanup)
+    }
+
     fn prune_expired(&mut self) {
         let now = Instant::now();
-        self.tasks.retain(|_, record| match record.task.status {
-            TaskStatus::Working | TaskStatus::InputRequired => {
-                now.duration_since(record.last_touched)
-                    < Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
+        let expired = self
+            .tasks
+            .iter()
+            .filter_map(|(task_id, record)| {
+                let expired = match record.task.status {
+                    TaskStatus::Working | TaskStatus::InputRequired => {
+                        now.duration_since(record.last_touched)
+                            >= Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
+                    }
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+                        let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
+                        now.duration_since(record.last_touched) >= Duration::from_millis(ttl_ms)
+                    }
+                };
+                expired.then(|| task_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for task_id in expired {
+            let Some(mut record) = self.tasks.remove(&task_id) else {
+                continue;
+            };
+            if matches!(
+                record.task.status,
+                TaskStatus::Working | TaskStatus::InputRequired
+            ) {
+                // Abort is synchronous and deliberately precedes moving the
+                // quota lease out of the record. The router will next send
+                // bounded upstream cancellation, then drop the cleanup and
+                // release quota.
+                if let Some(handle) = record.abort_handle.take() {
+                    handle.abort();
+                }
+                self.expired_cleanup.push(ExpiredTaskCleanup {
+                    upstream: record.upstream.take(),
+                    _quota_lease: record._quota_lease.take(),
+                });
             }
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
-                let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
-                now.duration_since(record.last_touched) < Duration::from_millis(ttl_ms)
-            }
-            _ => {
-                now.duration_since(record.last_touched)
-                    < Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
-            }
-        });
+        }
     }
 
     fn enforce_owner_completed_retention(&mut self) {
@@ -695,6 +849,92 @@ fn paginate_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modern_status(result: &rmcp::model::GetTaskResult) -> rmcp::model::TaskStatus {
+        result.task.task.status
+    }
+
+    #[test]
+    fn modern_projection_covers_every_task_state_and_owner_boundary() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
+        let other = TaskOwner::new(Arc::<str>::from("principal:b"));
+
+        let working = store.create(owner.clone(), "working").expect("working");
+        assert_eq!(
+            modern_status(
+                &store
+                    .get_modern_for_owner(&owner, &working.task_id)
+                    .expect("working projection")
+            ),
+            rmcp::model::TaskStatus::Working
+        );
+
+        let input = store.create(owner.clone(), "input").expect("input");
+        let input_record = store.tasks.get_mut(&input.task_id).expect("input record");
+        input_record.task.status = TaskStatus::InputRequired;
+        let error = store
+            .get_modern_for_owner(&owner, &input.task_id)
+            .expect_err("residual legacy input-required state must fail closed");
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert!(error.message.contains("not bridged"));
+
+        let completed = store.create(owner.clone(), "completed").expect("completed");
+        store.complete(
+            &completed.task_id,
+            serde_json::json!({"content": [], "isError": false}),
+        );
+        let completed = store
+            .get_modern_for_owner(&owner, &completed.task_id)
+            .expect("completed projection");
+        assert!(matches!(
+            completed.task.payload,
+            rmcp::model::TaskPayload::Completed { .. }
+        ));
+
+        let failed = store.create(owner.clone(), "failed").expect("failed");
+        store.fail(&failed.task_id, "boom".to_string());
+        let failed = store
+            .get_modern_for_owner(&owner, &failed.task_id)
+            .expect("failed projection");
+        assert!(matches!(
+            failed.task.payload,
+            rmcp::model::TaskPayload::Failed { .. }
+        ));
+
+        let cancelled = store.create(owner.clone(), "cancelled").expect("cancelled");
+        store
+            .mark_cancelled(&owner, &cancelled.task_id)
+            .expect("cancel");
+        assert_eq!(
+            modern_status(
+                &store
+                    .get_modern_for_owner(&owner, &cancelled.task_id)
+                    .expect("cancelled projection")
+            ),
+            rmcp::model::TaskStatus::Cancelled
+        );
+
+        assert!(
+            store
+                .get_modern_for_owner(&other, &working.task_id)
+                .is_err(),
+            "another principal must not observe the task"
+        );
+    }
+
+    #[test]
+    fn modern_completed_projection_fails_closed_without_object_result() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
+        let task = store.create(owner.clone(), "completed").expect("task");
+        store.complete(&task.task_id, serde_json::json!("not-an-object"));
+
+        let error = store
+            .get_modern_for_owner(&owner, &task.task_id)
+            .expect_err("malformed retained result must not produce invalid modern wire data");
+        assert!(error.message.contains("malformed"));
+    }
 
     #[test]
     fn task_owner_isolated_for_info_and_result_access() {
@@ -1090,5 +1330,42 @@ mod tests {
         store
             .create(owner.clone(), "Mock__echo")
             .expect("create for the same owner key after a quiescent teardown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_live_task_expiry_aborts_local_work_before_cleanup_is_drained() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("http:expired"));
+        let task = store.create(owner.clone(), "slow").expect("create task");
+        store
+            .tasks
+            .get_mut(&task.task_id)
+            .expect("task record")
+            .task
+            .status = TaskStatus::InputRequired;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let handle = tokio::spawn(async move {
+            let _guard = Dropped(dropped_in_task);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        store.attach_abort_handle(&task.task_id, handle);
+
+        tokio::time::advance(Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS + 1)).await;
+        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "expiry must abort the local future before returning cleanup"
+        );
+        assert_eq!(store.take_expired_cleanup().len(), 1);
     }
 }

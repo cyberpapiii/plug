@@ -162,6 +162,7 @@ impl Engine {
         let tool_router = Arc::new(
             ToolRouter::new(server_manager.clone(), router_config).with_event_tx(event_tx.clone()),
         );
+        tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
         server_manager.set_tool_router(Arc::downgrade(&tool_router));
 
         Self {
@@ -258,6 +259,10 @@ impl Engine {
     /// Bounded shutdown: cancel tasks, give background work a short drain window,
     /// then explicitly retire upstreams without spending the full caller timeout.
     pub async fn shutdown(&self) {
+        // Parked multi-round requests are process-local capabilities. Revoke
+        // them before waiting on background work or upstream transport
+        // teardown so shutdown has an immediate, deterministic boundary.
+        self.tool_router.clear_continuations();
         self.cancel.cancel();
         self.tracker.close();
         let _ = tokio::time::timeout(Duration::from_secs(2), self.tracker.wait()).await;
@@ -491,6 +496,10 @@ impl Engine {
 
     /// Atomically swap in a new config.
     pub fn store_config(&self, config: Config) {
+        self.tool_router
+            .set_modern_downstream_enabled(config.http.modern_downstream_enabled);
+        self.server_manager
+            .set_modern_upstream_enabled(config.modern_upstream_enabled);
         self.config.store(Arc::new(config));
     }
 
@@ -534,8 +543,13 @@ impl Engine {
     ) -> ReplaceOutcome {
         let _guard = self.reload_lock.lock().await;
         let current = self.config.load();
+        let protocol_gate_is_current = connected_with.protocol_mode
+            == crate::config::UpstreamProtocolMode::Legacy
+            || upstream.protocol_gate_state == self.server_manager.modern_upstream_gate_state();
         match current.servers.get(server_id) {
-            Some(cfg) if !server_config_changed(connected_with, cfg) => {
+            Some(cfg)
+                if !server_config_changed(connected_with, cfg) && protocol_gate_is_current =>
+            {
                 self.server_manager
                     .replace_server(server_id, upstream)
                     .await;
@@ -585,6 +599,7 @@ impl Engine {
             .get(server_id)
             .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?
             .clone();
+        let protocol_gate_state = self.server_manager.modern_upstream_gate_state();
 
         let _ = self.event_tx.send(EngineEvent::ServerStopped {
             server_id: Arc::from(server_id),
@@ -593,7 +608,7 @@ impl Engine {
         // Restart the server
         match self
             .server_manager
-            .start_server(server_id, &server_config)
+            .start_server_with_protocol_gate_state(server_id, &server_config, protocol_gate_state)
             .await
         {
             Ok(upstream) => {
@@ -672,6 +687,7 @@ impl Engine {
             .get(server_id)
             .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?
             .clone();
+        let protocol_gate_state = self.server_manager.modern_upstream_gate_state();
 
         let mut attempt = 1;
         let mut delay = RECONNECT_RETRY_MIN_DELAY;
@@ -685,8 +701,11 @@ impl Engine {
             // or we would abandon a reconnect that reload never replaced,
             // stranding the server down.
             let current = self.config.load();
+            let gate_is_current = server_config.protocol_mode
+                == crate::config::UpstreamProtocolMode::Legacy
+                || protocol_gate_state == self.server_manager.modern_upstream_gate_state();
             match current.servers.get(server_id) {
-                Some(cfg) if !server_config_changed(&server_config, cfg) => {}
+                Some(cfg) if !server_config_changed(&server_config, cfg) && gate_is_current => {}
                 _ => {
                     tracing::info!(
                         server = %server_id,
@@ -699,7 +718,11 @@ impl Engine {
 
             match self
                 .server_manager
-                .start_server(server_id, &server_config)
+                .start_server_with_protocol_gate_state(
+                    server_id,
+                    &server_config,
+                    protocol_gate_state,
+                )
                 .await
             {
                 Ok(upstream) => break upstream,
@@ -1116,6 +1139,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: Some("oauth".to_string()),
@@ -1153,6 +1177,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
             url: None,
             auth_token: None,
             auth: None,
@@ -1177,6 +1202,28 @@ mod tests {
             .servers
             .insert(name.to_string(), mock_stdio_server_config(tools, 1));
         config
+    }
+
+    #[tokio::test]
+    async fn reload_updates_modern_downstream_gate_without_rebuilding_engine() {
+        let engine = Arc::new(Engine::new(Config::default()));
+        assert!(!engine.tool_router().modern_downstream_enabled());
+
+        let mut enabled = Config::default();
+        enabled.http.modern_downstream_enabled = true;
+        let report = engine
+            .reload_config(enabled)
+            .await
+            .expect("enable reload succeeds");
+        assert!(report.settings_changed);
+        assert!(engine.tool_router().modern_downstream_enabled());
+
+        let report = engine
+            .reload_config(Config::default())
+            .await
+            .expect("disable reload succeeds");
+        assert!(report.settings_changed);
+        assert!(!engine.tool_router().modern_downstream_enabled());
     }
 
     // ── Plan 011: reconnect/restart vs. reload interlock ──────────────────
@@ -1261,6 +1308,54 @@ mod tests {
         assert!(
             engine.server_manager().get_upstream("foo").is_some(),
             "committed upstream should be installed"
+        );
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn commit_discards_connection_started_before_modern_upstream_gate_flip() {
+        let mut initial = mock_stdio_config("foo", "echo");
+        initial
+            .servers
+            .get_mut("foo")
+            .expect("foo configured")
+            .protocol_mode = crate::config::UpstreamProtocolMode::Auto;
+        let engine = Arc::new(Engine::new(initial.clone()));
+        let snapshot = initial.servers["foo"].clone();
+
+        // Park the old reconnect immediately before commit. Gate-off forces
+        // this Auto server through legacy initialize.
+        let stale = engine
+            .server_manager()
+            .start_server("foo", &snapshot)
+            .await
+            .expect("stale legacy connection opens");
+        assert_eq!(stale.protocol_era, crate::protocol::ProtocolEra::Legacy);
+
+        // A real reload flips the gate and installs the authoritative modern
+        // replacement while the old reconnect remains parked.
+        let mut enabled = initial;
+        enabled.modern_upstream_enabled = true;
+        engine
+            .reload_config(enabled)
+            .await
+            .expect("gate-enabling reload succeeds");
+        let installed = engine
+            .server_manager()
+            .get_upstream("foo")
+            .expect("reload installed replacement");
+        assert_eq!(installed.protocol_era, crate::protocol::ProtocolEra::Modern);
+
+        let outcome = engine.commit_replacement("foo", &snapshot, stale).await;
+        assert!(matches!(outcome, ReplaceOutcome::StaleDiscarded));
+        assert_eq!(
+            engine
+                .server_manager()
+                .get_upstream("foo")
+                .expect("authoritative replacement remains")
+                .protocol_era,
+            crate::protocol::ProtocolEra::Modern
         );
 
         engine.shutdown().await;
@@ -1439,6 +1534,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1636,6 +1732,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1674,6 +1771,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -1731,6 +1829,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
@@ -2047,6 +2146,7 @@ mod tests {
                 env: HashMap::new(),
                 enabled: true,
                 transport: TransportType::Stdio,
+                protocol_mode: Default::default(),
                 url: None,
                 auth_token: None,
                 auth: None,
