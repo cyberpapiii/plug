@@ -93,7 +93,7 @@ impl ExtensionEnvelope {
 
         let mut value_count = 0;
         for (key, value) in meta.iter() {
-            if is_typed_mcp_meta_key(key) {
+            if is_non_forwarded_meta_key(key) {
                 if matches!(key.as_str(), "traceparent" | "tracestate" | "baggage") {
                     validate_trace_value(key, value)?;
                     admitted.insert(key.clone(), value.clone());
@@ -142,7 +142,9 @@ impl ExtensionEnvelope {
     }
 }
 
-fn is_typed_mcp_meta_key(key: &str) -> bool {
+/// Core fields and client-local correlation fields that Plug must consume or
+/// ignore rather than forwarding as peer extensions.
+fn is_non_forwarded_meta_key(key: &str) -> bool {
     matches!(
         key,
         "progressToken"
@@ -154,6 +156,7 @@ fn is_typed_mcp_meta_key(key: &str) -> bool {
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"
             | "plug.dev/legacy-task"
+            | "threadId"
     )
 }
 
@@ -517,6 +520,16 @@ mod tests {
         );
         assert_eq!(admitted.get("traceparent"), source.get("traceparent"));
         assert!(!admitted.contains_key("progressToken"));
+    }
+
+    #[test]
+    fn extension_envelope_drops_codex_thread_correlation_metadata() {
+        let source = meta(serde_json::json!({
+            "threadId": "019fcd41-75ee-7573-a0d7-3be296f09c3a"
+        }));
+        let admitted = ExtensionEnvelope::from_peer_meta(Some(&source))
+            .expect("Codex thread correlation must not block a tool call");
+        assert!(admitted.into_meta().is_none());
     }
 
     #[test]
