@@ -5,6 +5,10 @@ use crate::legacy_tasks::{
     GetTaskPayloadParams as LegacyGetTaskPayloadParams,
 };
 
+fn selected_protocol_for_log(protocol: &ProtocolVersion) -> &str {
+    protocol.as_str()
+}
+
 struct StdioDownstreamContext {
     client_id: Arc<str>,
     request_id: RequestId,
@@ -386,7 +390,7 @@ impl ServerHandler for ProxyHandler {
                 client = %request.client_info.name,
                 detected = %client_type,
                 requested_protocol = %request.protocol_version,
-                selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                selected_protocol = selected_protocol_for_log(&selected_protocol),
                 "client connected"
             );
 
@@ -1028,6 +1032,18 @@ impl ServerHandler for ProxyHandler {
 mod modern_context_tests {
     use super::*;
     use crate::dispatch::DownstreamContext;
+
+    #[test]
+    fn selected_protocol_log_uses_negotiated_request_version() {
+        assert_eq!(
+            selected_protocol_for_log(&ProtocolVersion::V_2026_07_28),
+            crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            selected_protocol_for_log(&ProtocolVersion::V_2025_11_25),
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION
+        );
+    }
 
     #[test]
     fn discovered_modern_call_fails_closed_after_live_gate_is_disabled() {

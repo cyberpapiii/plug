@@ -31,7 +31,7 @@ use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
 use crate::types::{
     ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
-    ResolvedLazyToolPolicy,
+    ResolvedLazyToolPolicy, ServerHealth,
 };
 use continuations::{
     MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES, MRTR_MAX_ROUNDS,
@@ -949,11 +949,7 @@ impl ToolRouter {
                             server_id: server_id.clone(),
                         })
                     })?;
-                Ok((
-                    server_id,
-                    original_name,
-                    Arc::as_ptr(&upstream) as usize as u64,
-                ))
+                Ok((server_id, original_name, upstream.generation))
             });
         let (server_id, original_name, upstream_generation) = resolved?;
         Ok((
@@ -975,7 +971,7 @@ impl ToolRouter {
                 let upstream_generation = self
                     .server_manager
                     .get_upstream(server_id)
-                    .map(|upstream| Arc::as_ptr(&upstream) as usize as u64);
+                    .map(|upstream| upstream.generation);
                 (
                     name.clone(),
                     MaterialToolRoute {
@@ -1456,9 +1452,19 @@ impl ToolRouter {
         self.publish_route_snapshot(Arc::new(snapshot));
     }
 
-    fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) {
-        self.active_call_lookup
-            .insert(DownstreamCallKey::from(&record.downstream), call_id);
+    fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) -> Result<(), McpError> {
+        let downstream_key = DownstreamCallKey::from(&record.downstream);
+        self.active_calls.insert(call_id, record.clone());
+        match self.active_call_lookup.entry(downstream_key) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                self.active_calls.remove(&call_id);
+                return Err(crate::protocol::ProtocolOutcome::RetryableTransition
+                    .into_error(record.downstream.protocol_era));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(call_id);
+            }
+        }
         if let Some(request_id) = record.upstream_request_id.clone() {
             self.upstream_request_lookup.insert(
                 UpstreamRequestKey {
@@ -1477,7 +1483,7 @@ impl ToolRouter {
                 call_id,
             );
         }
-        self.active_calls.insert(call_id, record);
+        Ok(())
     }
 
     fn attach_upstream_request_id(&self, call_id: u64, server_id: &str, request_id: RequestId) {
@@ -1511,19 +1517,27 @@ impl ToolRouter {
 
     fn remove_active_call(&self, call_id: u64) {
         if let Some((_, record)) = self.active_calls.remove(&call_id) {
-            self.active_call_lookup
-                .remove(&DownstreamCallKey::from(&record.downstream));
+            self.active_call_lookup.remove_if(
+                &DownstreamCallKey::from(&record.downstream),
+                |_, registered| *registered == call_id,
+            );
             if let Some(request_id) = record.upstream_request_id {
-                self.upstream_request_lookup.remove(&UpstreamRequestKey {
-                    server_id: record.upstream_server_id.clone(),
-                    request_id,
-                });
+                self.upstream_request_lookup.remove_if(
+                    &UpstreamRequestKey {
+                        server_id: record.upstream_server_id.clone(),
+                        request_id,
+                    },
+                    |_, registered| *registered == call_id,
+                );
             }
             if let Some(progress_token) = record.upstream_progress_token {
-                self.upstream_progress_lookup.remove(&UpstreamProgressKey {
-                    server_id: record.upstream_server_id,
-                    progress_token,
-                });
+                self.upstream_progress_lookup.remove_if(
+                    &UpstreamProgressKey {
+                        server_id: record.upstream_server_id,
+                        progress_token,
+                    },
+                    |_, registered| *registered == call_id,
+                );
             }
         }
     }
@@ -2545,7 +2559,7 @@ impl ToolRouter {
         let upstream = self
             .server_manager
             .get_upstream(&route.server_id)
-            .filter(|upstream| Arc::as_ptr(upstream) as usize as u64 == route.upstream_generation)
+            .filter(|upstream| upstream.generation == route.upstream_generation)
             .ok_or_else(|| {
                 crate::protocol::ProtocolOutcome::ExpiredContinuation
                     .into_error(context.protocol_era)
@@ -2656,17 +2670,17 @@ impl ToolRouter {
                 self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;
             }
 
-            // Health gate — reject calls to Failed servers
-            let health_ok = self
-                .server_manager
-                .health
-                .get(&server_id)
-                .map(|h| h.health.is_routable())
-                .unwrap_or(true);
-            if !health_ok {
-                return Err(McpError::from(ProtocolError::ServerUnavailable {
-                    server_id: server_id.clone(),
-                }));
+            // Health gate — auth failure is actionable and must not be
+            // flattened into a generic availability failure. The existing
+            // outcome encoding tells clients not to retry until they have
+            // re-authorized, without returning any credential material.
+            let health = self.server_manager.health.get(&server_id).map(|h| h.health);
+            if let Some(outcome) = health.and_then(health_gate_outcome) {
+                let era = downstream
+                    .as_ref()
+                    .map(|context| context.protocol_era)
+                    .unwrap_or(crate::protocol::ProtocolEra::Legacy);
+                return Err(outcome.into_error(era));
             }
 
             // Circuit breaker gate
@@ -2683,55 +2697,6 @@ impl ToolRouter {
                 .get_upstream(&server_id)
                 .map(|upstream| Duration::from_secs(upstream.config.call_timeout_secs))
                 .unwrap_or(Duration::from_secs(30));
-
-            // Acquire concurrency semaphore
-            let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
-                Some(
-                    tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned())
-                        .await
-                        .map_err(|_| {
-                            McpError::from(ProtocolError::ServerBusy {
-                                server_id: server_id.clone(),
-                            })
-                        })?
-                        .map_err(|_| {
-                            McpError::from(ProtocolError::ServerUnavailable {
-                                server_id: server_id.clone(),
-                            })
-                        })?,
-                )
-            } else {
-                None
-            };
-
-            // Get the upstream server
-            let upstream = self
-                .server_manager
-                .get_upstream(&server_id)
-                .ok_or_else(|| {
-                    McpError::from(ProtocolError::ServerUnavailable {
-                        server_id: server_id.clone(),
-                    })
-                })?;
-
-            if let Some(expected) = &round.expected_route {
-                let (actual, _) = self.tool_route_identity(tool_name)?;
-                if actual != *expected {
-                    return Err(
-                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(
-                            downstream
-                                .as_ref()
-                                .map(|context| context.protocol_era)
-                                .unwrap_or(crate::protocol::ProtocolEra::Legacy),
-                        ),
-                    );
-                }
-            }
-
-            let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
-            let transport_type = upstream.config.transport.clone();
-            let peer = upstream.client.peer().clone();
-            drop(upstream); // Release Arc early
 
             let call_id = next_call_id();
             let trace_id = downstream
@@ -2764,15 +2729,6 @@ impl ToolRouter {
             }
 
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
-            let mut options = PeerRequestOptions::default();
-            options.timeout = Some(timeout_duration);
-            options.meta = extension_meta.clone().map(RequestMetaObject);
-            if let Some(token) = upstream_progress_token.clone() {
-                options
-                    .meta
-                    .get_or_insert_with(RequestMetaObject::new)
-                    .set_progress_token(token);
-            }
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,
@@ -2802,15 +2758,82 @@ impl ToolRouter {
                         upstream_server_id: server_id.clone(),
                         upstream_request_id: None,
                         downstream_progress_token,
-                        upstream_progress_token,
+                        upstream_progress_token: upstream_progress_token.clone(),
                         pending_cancel_reason: None,
                     },
-                );
+                )?;
                 active_call_guard = Some(ActiveCallGuard {
                     router: self,
                     call_id,
                     armed: true,
                 });
+            }
+
+            // Reserve the downstream key before waiting for upstream
+            // concurrency. A duplicate modern request must be rejected while
+            // the first is queued or executing, rather than waiting for the
+            // semaphore and becoming a second side effect after the first
+            // call unregisters.
+            let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
+                Some(
+                    tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned())
+                        .await
+                        .map_err(|_| {
+                            McpError::from(ProtocolError::ServerBusy {
+                                server_id: server_id.clone(),
+                            })
+                        })?
+                        .map_err(|_| {
+                            McpError::from(ProtocolError::ServerUnavailable {
+                                server_id: server_id.clone(),
+                            })
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            // Resolve the live peer only after the queue wait. A reconnect may
+            // replace the upstream while this call is waiting for a permit;
+            // retaining the pre-wait peer would dispatch onto the retired
+            // session. Continuations also need their route checked against the
+            // connection that will actually receive the resumed call.
+            let upstream = self
+                .server_manager
+                .get_upstream(&server_id)
+                .ok_or_else(|| {
+                    McpError::from(ProtocolError::ServerUnavailable {
+                        server_id: server_id.clone(),
+                    })
+                })?;
+
+            if let Some(expected) = &round.expected_route {
+                let (actual, _) = self.tool_route_identity(tool_name)?;
+                if actual != *expected {
+                    return Err(
+                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(
+                            downstream
+                                .as_ref()
+                                .map(|context| context.protocol_era)
+                                .unwrap_or(crate::protocol::ProtocolEra::Legacy),
+                        ),
+                    );
+                }
+            }
+
+            let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
+            let transport_type = upstream.config.transport.clone();
+            let peer = upstream.client.peer().clone();
+            drop(upstream);
+
+            let mut options = PeerRequestOptions::default();
+            options.timeout = Some(timeout_duration);
+            options.meta = extension_meta.clone().map(RequestMetaObject);
+            if let Some(token) = upstream_progress_token.clone() {
+                options
+                    .meta
+                    .get_or_insert_with(RequestMetaObject::new)
+                    .set_progress_token(token);
             }
             let request_handle = peer
                 .send_cancellable_request(request, options)
@@ -3516,6 +3539,155 @@ fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
         // Cancelled = task cancelled
         // UnexpectedResponse = wrong response type
         _ => false,
+    }
+}
+
+fn health_gate_outcome(health: ServerHealth) -> Option<crate::protocol::ProtocolOutcome> {
+    match health {
+        ServerHealth::AuthRequired => Some(crate::protocol::ProtocolOutcome::AuthorizationRequired),
+        ServerHealth::Failed => Some(crate::protocol::ProtocolOutcome::UpstreamUnavailable),
+        ServerHealth::Healthy | ServerHealth::Degraded => None,
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regression_tests {
+    use super::*;
+
+    fn test_router_config() -> RouterConfig {
+        RouterConfig {
+            prefix_delimiter: "__".to_string(),
+            priority_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            tool_description_max_chars: None,
+            tool_search_threshold: 50,
+            meta_tool_mode: false,
+            lazy_tools: crate::config::LazyToolsConfig::default(),
+            tool_filter_enabled: true,
+            enrichment_servers: std::collections::HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn auth_required_health_has_non_retryable_authorization_outcome() {
+        let outcome = health_gate_outcome(ServerHealth::AuthRequired)
+            .expect("auth-required health must reject the call");
+        assert_eq!(
+            outcome,
+            crate::protocol::ProtocolOutcome::AuthorizationRequired
+        );
+        let encoded = outcome.encode(crate::protocol::ProtocolEra::Modern);
+        assert!(
+            !encoded.retryable,
+            "client must re-authorize before retrying"
+        );
+
+        assert_eq!(
+            health_gate_outcome(ServerHealth::Failed),
+            Some(crate::protocol::ProtocolOutcome::UpstreamUnavailable)
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicate_downstream_key_never_evicts_the_winner() {
+        let router = Arc::new(ToolRouter::new(
+            Arc::new(ServerManager::new()),
+            test_router_config(),
+        ));
+        let mut notifications = router.subscribe_notifications();
+        let context = DownstreamCallContext::stdio(
+            "same-principal",
+            RequestId::from(NumberOrString::Number(77)),
+        )
+        .with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+        );
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let (send, receive) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for call_id in [41_u64, 42_u64] {
+                let router = Arc::clone(&router);
+                let context = context.clone();
+                let start = Arc::clone(&start);
+                let send = send.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    let result = router.register_active_call(
+                        call_id,
+                        ActiveCallRecord {
+                            downstream: context,
+                            upstream_server_id: "upstream".to_string(),
+                            upstream_request_id: Some(RequestId::from(NumberOrString::Number(
+                                call_id as i64,
+                            ))),
+                            downstream_progress_token: None,
+                            upstream_progress_token: None,
+                            pending_cancel_reason: None,
+                        },
+                    );
+                    send.send((call_id, result))
+                        .expect("send registration result");
+                });
+            }
+            start.wait();
+        });
+
+        let results = [receive.recv().unwrap(), receive.recv().unwrap()];
+        let winner = results
+            .iter()
+            .find_map(|(call_id, result)| result.is_ok().then_some(*call_id))
+            .expect("exactly one registration wins");
+        let loser = results
+            .iter()
+            .find_map(|(call_id, result)| result.is_err().then_some(*call_id))
+            .expect("duplicate registration is rejected");
+        assert_ne!(winner, loser);
+        let loser_error = results
+            .iter()
+            .find(|(call_id, _)| *call_id == loser)
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap_err();
+        assert_eq!(
+            loser_error.code,
+            rmcp::model::ErrorCode(
+                crate::protocol::ProtocolOutcome::RetryableTransition
+                    .encode(crate::protocol::ProtocolEra::Modern)
+                    .code
+            )
+        );
+
+        // A losing guard/drop must not remove the winning key or record.
+        router.remove_active_call(loser);
+        let key = DownstreamCallKey::from(&context);
+        assert_eq!(
+            router.active_call_lookup.get(&key).map(|entry| *entry),
+            Some(winner)
+        );
+        assert!(router.active_calls.contains_key(&winner));
+        assert!(!router.active_calls.contains_key(&loser));
+
+        // A cancellation carrying the rejected call's would-be upstream id
+        // must not resolve to or notify the winning downstream call.
+        router.route_upstream_cancelled(
+            "upstream",
+            CancelledNotificationParam::new(
+                Some(RequestId::from(NumberOrString::Number(loser as i64))),
+                Some("loser cancelled".to_string()),
+            ),
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(router.active_calls.contains_key(&winner));
+
+        router.remove_active_call(winner);
+        assert!(!router.active_call_lookup.contains_key(&key));
+        assert!(router.active_calls.is_empty());
     }
 }
 

@@ -192,7 +192,10 @@ fn legacy_http_policy_context(
         ),
     ) {
         (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-            .with_authorization(principal, claims.scopes.clone())
+            // The legacy OAuth contract predates method-family scopes. Keep
+            // the verified identity and revocation lifecycle, but retain the
+            // legacy all-MCP-method compatibility policy for that principal.
+            .with_local_principal(principal)
             .with_principal_lifecycle(claims.principal_lifecycle.clone()),
         (AuthStatus::Authenticated(None), Some(principal)) => {
             context.with_local_principal(principal)
@@ -915,7 +918,14 @@ async fn post_mcp(
         if raw_message.get("id").is_some() {
             validate_modern_request_metadata(&raw_message)?;
         }
-        validate_modern_host(&headers, &state.allowed_origins)?;
+        validate_modern_host(
+            &headers,
+            &state.allowed_origins,
+            state
+                .downstream_oauth
+                .as_ref()
+                .map(crate::downstream_oauth::DownstreamOauthManager::base_url),
+        )?;
         validate_modern_origin(&headers, &state.allowed_origins)?;
         if headers.contains_key(SESSION_ID_HEADER) {
             return Err(HttpError::BadRequest(
@@ -937,7 +947,7 @@ async fn post_mcp(
         validate_mirrored_headers(&headers, &message)
     };
     if let Err(err) = mirrored {
-        return Ok(header_mismatch_response(&message, err));
+        return Ok(header_mismatch_response(&message, err, era));
     }
     let trace_id = Arc::<str>::from(extract_trace_id(&headers));
 
@@ -1040,6 +1050,7 @@ async fn post_mcp(
 fn validate_modern_host(
     headers: &HeaderMap,
     allowed_origins: &[Arc<str>],
+    public_base_url: Option<&str>,
 ) -> Result<(), HttpError> {
     let host = headers
         .get(header::HOST)
@@ -1057,6 +1068,9 @@ fn validate_modern_host(
     let explicitly_allowed = allowed_origins.iter().any(|origin| {
         extract_origin_host(origin)
             .is_some_and(|allowed_host| allowed_host.eq_ignore_ascii_case(&host_name))
+    }) || public_base_url.is_some_and(|base_url| {
+        extract_origin_host(base_url)
+            .is_some_and(|public_host| public_host.eq_ignore_ascii_case(&host_name))
     });
     if !local && !explicitly_allowed {
         return Err(HttpError::BadRequest(
@@ -1090,7 +1104,11 @@ fn validate_modern_origin(
     }
 }
 
-fn header_mismatch_response(message: &ClientJsonRpcMessage, err: HeaderMismatch) -> Response {
+fn header_mismatch_response(
+    message: &ClientJsonRpcMessage,
+    err: HeaderMismatch,
+    era: crate::protocol::ProtocolEra,
+) -> Response {
     let id = match message {
         JsonRpcMessage::Request(request) => serde_json::to_value(&request.id).unwrap_or_default(),
         _ => serde_json::Value::Null,
@@ -1103,7 +1121,14 @@ fn header_mismatch_response(message: &ClientJsonRpcMessage, err: HeaderMismatch)
             "message": err.message,
         }
     });
-    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    if era == crate::protocol::ProtocolEra::Modern {
+        response.headers_mut().insert(
+            PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+        );
+    }
+    response
 }
 
 fn validate_protocol_version_for_post(
@@ -2748,17 +2773,47 @@ mod tests {
         for host in ["localhost:3282", "127.0.0.1:3282", "[::1]:3282"] {
             let mut headers = HeaderMap::new();
             headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
-            assert!(validate_modern_host(&headers, &[]).is_ok(), "host {host}");
+            assert!(
+                validate_modern_host(&headers, &[], None).is_ok(),
+                "host {host}"
+            );
         }
 
         for host in ["localhost.evil.example:3282", "192.0.2.1:3282", "::1"] {
             let mut headers = HeaderMap::new();
             headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
             assert!(
-                validate_modern_host(&headers, &[]).is_err(),
+                validate_modern_host(&headers, &[], None).is_err(),
                 "host {host} must not become loopback"
             );
         }
+    }
+
+    #[test]
+    fn modern_host_accepts_public_tunnel_without_allowing_unrelated_browser_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("plug-tunnel.example.com"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://unrelated.example.com"),
+        );
+
+        // OAuth mode supplies the manager's downstream base URL directly.
+        assert!(
+            validate_modern_host(&headers, &[], Some("https://plug-tunnel.example.com/mcp"))
+                .is_ok()
+        );
+        // Non-OAuth public_base_url configuration contributes a host-only URL
+        // marker to this list; it can satisfy Host without satisfying Origin.
+        let configured_public_host = [Arc::from(
+            "https://plug-tunnel.example.com/.plug-public-host-only",
+        )];
+        assert!(validate_modern_host(&headers, &configured_public_host, None).is_ok());
+        assert!(validate_modern_origin(&headers, &configured_public_host).is_err());
+        assert!(validate_modern_origin(&headers, &[]).is_err());
     }
 
     #[test]
@@ -2981,6 +3036,51 @@ mod tests {
             .await
             .expect("exchange authorization code")
             .access_token
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_read_oauth_principal_keeps_pre_scope_method_compatibility() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "tools:read").await;
+        let claims = match manager
+            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims,
+            other => panic!("issued token must validate, got {other:?}"),
+        };
+        let state = test_state();
+        let context = legacy_http_policy_context(
+            &state,
+            &AuthStatus::Authenticated(Some(claims)),
+            RequestId::Number(91),
+            Arc::from("legacy-oauth-regression"),
+        );
+
+        assert!(
+            context.principal.is_some(),
+            "verified principal is preserved"
+        );
+        assert!(
+            context.principal_lifecycle.is_some(),
+            "revocation lifecycle is preserved"
+        );
+        for family in [
+            crate::protocol::MethodFamily::ToolsList,
+            crate::protocol::MethodFamily::ResourcesList,
+            crate::protocol::MethodFamily::ResourcesRead,
+            crate::protocol::MethodFamily::ResourcesSubscribe,
+            crate::protocol::MethodFamily::PromptsList,
+            crate::protocol::MethodFamily::PromptsGet,
+            crate::protocol::MethodFamily::Completion,
+            crate::protocol::MethodFamily::Tasks,
+            crate::protocol::MethodFamily::Listeners,
+        ] {
+            assert!(
+                context.policy_decision(family).is_allowed(),
+                "legacy OAuth principal lost access to {family:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3537,6 +3637,38 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Mcp-Name")
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_missing_mcp_name_error_carries_modern_protocol_header() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let response = build_router(state)
+            .oneshot(modern_request(
+                "tools/call",
+                json!({"name": "actual_tool", "arguments": {}}),
+            ))
+            .await
+            .expect("header mismatch response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(PROTOCOL_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], HEADER_MISMATCH_CODE);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Mcp-Name"))
         );
     }
 

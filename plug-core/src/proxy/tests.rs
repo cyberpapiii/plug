@@ -1190,6 +1190,10 @@ async fn call_tool_times_out_waiting_for_semaphore() {
     let server_manager = Arc::new(ServerManager::new());
     let router = ToolRouter::new(server_manager.clone(), test_router_config());
 
+    let upstream =
+        connect_subscribable_upstream("busy-server", SubscribableUpstreamState::new(&[])).await;
+    server_manager.replace_server("busy-server", upstream).await;
+
     server_manager.semaphores.insert(
         "busy-server".to_string(),
         Arc::new(tokio::sync::Semaphore::new(0)),
@@ -1224,6 +1228,67 @@ async fn call_tool_times_out_waiting_for_semaphore() {
     assert!(
         err.message.contains("server overloaded"),
         "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
+    let server_manager = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(
+        Arc::clone(&server_manager),
+        test_router_config(),
+    ));
+    let old_state = SubscribableUpstreamState::new(&[]);
+    let old_upstream = connect_subscribable_upstream("queued-server", Arc::clone(&old_state)).await;
+    server_manager
+        .replace_server("queued-server", old_upstream)
+        .await;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+    server_manager
+        .semaphores
+        .insert("queued-server".to_string(), Arc::clone(&semaphore));
+    publish_tool_route_snapshot(&router, "Queued__tool", "queued-server");
+
+    let call_router = Arc::clone(&router);
+    let call = tokio::spawn(async move {
+        call_router
+            .call_tool_with_context(
+                "Queued__tool",
+                None,
+                None,
+                Some(DownstreamCallContext::stdio_for_client(
+                    "queued-client",
+                    RequestId::Number(1),
+                    ClientType::Unknown,
+                )),
+            )
+            .await
+    });
+    while router.active_call_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let replacement_state = SubscribableUpstreamState::new(&[]);
+    let replacement =
+        connect_subscribable_upstream("queued-server", Arc::clone(&replacement_state)).await;
+    server_manager
+        .replace_server("queued-server", replacement)
+        .await;
+    semaphore.add_permits(1);
+
+    call.await
+        .expect("queued call task")
+        .expect("queued call should use replacement upstream");
+    assert_eq!(
+        old_state.tool_calls.load(Ordering::SeqCst),
+        0,
+        "the retired upstream must not receive the queued call"
+    );
+    assert_eq!(
+        replacement_state.tool_calls.load(Ordering::SeqCst),
+        1,
+        "the live replacement must receive the queued call"
     );
 }
 
@@ -1291,20 +1356,22 @@ async fn route_upstream_progress_publishes_targeted_notification() {
     let mut rx = router.subscribe_notifications();
     let progress_token = ProgressToken(NumberOrString::String(Arc::from("progress-1")));
 
-    router.register_active_call(
-        42,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::stdio(
-                Arc::from("client-1"),
-                RequestId::from(NumberOrString::Number(1)),
-            ),
-            upstream_server_id: "upstream".to_string(),
-            upstream_request_id: None,
-            downstream_progress_token: Some(progress_token.clone()),
-            upstream_progress_token: Some(progress_token.clone()),
-            pending_cancel_reason: None,
-        },
-    );
+    router
+        .register_active_call(
+            42,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-1"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "upstream".to_string(),
+                upstream_request_id: None,
+                downstream_progress_token: Some(progress_token.clone()),
+                upstream_progress_token: Some(progress_token.clone()),
+                pending_cancel_reason: None,
+            },
+        )
+        .expect("register active call");
 
     router.route_upstream_progress(
         "upstream",
@@ -1750,34 +1817,38 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, test_router_config());
 
-    router.register_active_call(
-        1,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::stdio(
-                Arc::from("client-a"),
-                RequestId::from(NumberOrString::Number(1)),
-            ),
-            upstream_server_id: "s1".to_string(),
-            upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
-            downstream_progress_token: None,
-            upstream_progress_token: None,
-            pending_cancel_reason: None,
-        },
-    );
-    router.register_active_call(
-        2,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::http(
-                Arc::from("session-b"),
-                RequestId::from(NumberOrString::Number(2)),
-            ),
-            upstream_server_id: "s1".to_string(),
-            upstream_request_id: Some(RequestId::from(NumberOrString::Number(202))),
-            downstream_progress_token: None,
-            upstream_progress_token: None,
-            pending_cancel_reason: None,
-        },
-    );
+    router
+        .register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: None,
+            },
+        )
+        .expect("register first active call");
+    router
+        .register_active_call(
+            2,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::http(
+                    Arc::from("session-b"),
+                    RequestId::from(NumberOrString::Number(2)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(202))),
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: None,
+            },
+        )
+        .expect("register second active call");
 
     let result = router
         .active_call_for_upstream_request("s1", &RequestId::from(NumberOrString::Number(202)));
@@ -1796,24 +1867,26 @@ fn test_route_upstream_progress_restores_downstream_token() {
     let router = Arc::new(ToolRouter::new(sm, test_router_config()));
     let mut rx = router.subscribe_notifications();
 
-    router.register_active_call(
-        1,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::stdio(
-                Arc::from("client-a"),
-                RequestId::from(NumberOrString::Number(1)),
-            ),
-            upstream_server_id: "s1".to_string(),
-            upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
-            downstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
-                "downstream-token",
-            )))),
-            upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
-                "upstream-token",
-            )))),
-            pending_cancel_reason: None,
-        },
-    );
+    router
+        .register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
+                downstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "downstream-token",
+                )))),
+                upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "upstream-token",
+                )))),
+                pending_cancel_reason: None,
+            },
+        )
+        .expect("register active call");
 
     router.route_upstream_progress(
         "s1",
@@ -1847,20 +1920,22 @@ fn test_anonymous_upstream_cancellation_preserves_active_call() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, test_router_config());
 
-    router.register_active_call(
-        1,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::stdio(
-                Arc::from("client-a"),
-                RequestId::from(NumberOrString::Number(1)),
-            ),
-            upstream_server_id: "s1".to_string(),
-            upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
-            downstream_progress_token: None,
-            upstream_progress_token: None,
-            pending_cancel_reason: None,
-        },
-    );
+    router
+        .register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: None,
+            },
+        )
+        .expect("register active call");
 
     router.route_upstream_cancelled(
         "s1",
@@ -1876,20 +1951,22 @@ fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, test_router_config());
 
-    router.register_active_call(
-        1,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::stdio(
-                Arc::from("client-a"),
-                RequestId::from(NumberOrString::Number(1)),
-            ),
-            upstream_server_id: "s1".to_string(),
-            upstream_request_id: None,
-            downstream_progress_token: None,
-            upstream_progress_token: None,
-            pending_cancel_reason: Some(Some("cancelled".to_string())),
-        },
-    );
+    router
+        .register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: None,
+                downstream_progress_token: None,
+                upstream_progress_token: None,
+                pending_cancel_reason: Some(Some("cancelled".to_string())),
+            },
+        )
+        .expect("register active call");
 
     router.attach_upstream_request_id(1, "s1", RequestId::from(NumberOrString::Number(42)));
     let record = router.active_calls.get(&1).expect("active call").clone();
@@ -1905,24 +1982,26 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, test_router_config());
 
-    router.register_active_call(
-        1,
-        ActiveCallRecord {
-            downstream: DownstreamCallContext::stdio(
-                Arc::from("client-a"),
-                RequestId::from(NumberOrString::Number(1)),
-            ),
-            upstream_server_id: "s1".to_string(),
-            upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
-            downstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
-                "downstream-token",
-            )))),
-            upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
-                "upstream-token",
-            )))),
-            pending_cancel_reason: None,
-        },
-    );
+    router
+        .register_active_call(
+            1,
+            ActiveCallRecord {
+                downstream: DownstreamCallContext::stdio(
+                    Arc::from("client-a"),
+                    RequestId::from(NumberOrString::Number(1)),
+                ),
+                upstream_server_id: "s1".to_string(),
+                upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
+                downstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "downstream-token",
+                )))),
+                upstream_progress_token: Some(ProgressToken(NumberOrString::String(Arc::from(
+                    "upstream-token",
+                )))),
+                pending_cancel_reason: None,
+            },
+        )
+        .expect("register active call");
 
     assert_eq!(
         router
@@ -2640,6 +2719,7 @@ async fn connect_subscribable_upstream(
         protocol_era: crate::protocol::ProtocolEra::Legacy,
         selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
+        generation: crate::server::next_upstream_generation(),
         health: ServerHealth::Healthy,
     }
 }
@@ -2677,6 +2757,7 @@ async fn connect_modern_tool_upstream(
         protocol_era: crate::protocol::ProtocolEra::Modern,
         selected_protocol_version: crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
+        generation: crate::server::next_upstream_generation(),
         health: ServerHealth::Healthy,
     }
 }

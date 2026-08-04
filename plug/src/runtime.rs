@@ -271,6 +271,15 @@ struct ConfiguredHttpRuntime {
     sessions: Arc<dyn plug_core::session::SessionStore>,
 }
 
+fn public_host_allowance(public_base_url: &str) -> Option<Arc<str>> {
+    (!public_base_url.trim().is_empty()).then(|| {
+        Arc::from(format!(
+            "{}/.plug-public-host-only",
+            public_base_url.trim_end_matches('/')
+        ))
+    })
+}
+
 fn build_configured_http_runtime(
     config: &plug_core::config::Config,
     engine: &Arc<plug_core::engine::Engine>,
@@ -308,6 +317,13 @@ fn build_configured_http_runtime(
             .iter()
             .cloned()
             .map(Arc::<str>::from)
+            .chain(
+                config
+                    .http
+                    .public_base_url
+                    .as_deref()
+                    .and_then(public_host_allowance),
+            )
             .collect(),
         notification_task_started: std::sync::atomic::AtomicBool::new(false),
         auth_token,
@@ -707,10 +723,62 @@ fn is_modern_stdio_message(value: &serde_json::Value) -> bool {
             == Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
 }
 
+#[derive(Default)]
+struct StdioProtocolState {
+    modern_confirmed: bool,
+    pending_discovery_ids: std::collections::HashSet<String>,
+}
+
+impl StdioProtocolState {
+    fn observe_inbound(
+        &mut self,
+        value: &serde_json::Value,
+        modern_downstream_enabled: bool,
+    ) -> bool {
+        if !modern_downstream_enabled {
+            self.modern_confirmed = false;
+            self.pending_discovery_ids.clear();
+            return false;
+        }
+
+        let method = value.get("method").and_then(serde_json::Value::as_str);
+        let explicit_legacy_initialize = method == Some("initialize")
+            && value
+                .pointer("/params/protocolVersion")
+                .and_then(serde_json::Value::as_str)
+                != Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+        if explicit_legacy_initialize {
+            self.modern_confirmed = false;
+            self.pending_discovery_ids.clear();
+            return false;
+        }
+
+        if method == Some("server/discover") {
+            if let Some(id) = value.get("id") {
+                self.pending_discovery_ids.insert(id.to_string());
+            }
+        } else if is_modern_stdio_message(value) {
+            self.modern_confirmed = true;
+        }
+        self.modern_confirmed
+    }
+
+    fn observe_outbound(&mut self, value: &serde_json::Value) -> bool {
+        if let Some(id) = value.get("id")
+            && self.pending_discovery_ids.remove(&id.to_string())
+            && value.get("result").is_some()
+            && value.get("error").is_none()
+        {
+            self.modern_confirmed = true;
+        }
+        self.modern_confirmed
+    }
+}
+
 /// Byte-level protocol adapter. Legacy sessions retain the exact SEP-1686
 /// request/response vocabulary; a gated modern session passes through without
 /// those rewrites, beginning with `server/discover` as its first message.
-fn stdio_transport(modern_downstream_enabled: bool) -> tokio::io::DuplexStream {
+fn stdio_transport(modern_gate: Arc<dyn Fn() -> bool + Send + Sync>) -> tokio::io::DuplexStream {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     let (service, bridge) = tokio::io::duplex(256 * 1024);
@@ -718,10 +786,10 @@ fn stdio_transport(modern_downstream_enabled: bool) -> tokio::io::DuplexStream {
     let task_requests = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
         String,
     >::new()));
-    let modern_session = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let protocol_state = std::sync::Arc::new(std::sync::Mutex::new(StdioProtocolState::default()));
 
     let inbound_tasks = std::sync::Arc::clone(&task_requests);
-    let inbound_modern = std::sync::Arc::clone(&modern_session);
+    let inbound_protocol = std::sync::Arc::clone(&protocol_state);
     tokio::spawn(async move {
         let mut input = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = input.next_line().await {
@@ -730,10 +798,11 @@ fn stdio_transport(modern_downstream_enabled: bool) -> tokio::io::DuplexStream {
                 let _ = bridge_write.write_all(b"\n").await;
                 continue;
             };
-            if modern_downstream_enabled && is_modern_stdio_message(&value) {
-                inbound_modern.store(true, std::sync::atomic::Ordering::Release);
-            }
-            let is_modern = inbound_modern.load(std::sync::atomic::Ordering::Acquire);
+            let modern_downstream_enabled = modern_gate();
+            let is_modern = inbound_protocol
+                .lock()
+                .map(|mut state| state.observe_inbound(&value, modern_downstream_enabled))
+                .unwrap_or(false);
             let task_request = !is_modern
                 && value.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
                 && value
@@ -755,7 +824,7 @@ fn stdio_transport(modern_downstream_enabled: bool) -> tokio::io::DuplexStream {
         }
     });
 
-    let outbound_modern = modern_session;
+    let outbound_protocol = protocol_state;
     tokio::spawn(async move {
         let mut output = tokio::io::stdout();
         let mut lines = BufReader::new(bridge_read).lines();
@@ -765,7 +834,10 @@ fn stdio_transport(modern_downstream_enabled: bool) -> tokio::io::DuplexStream {
                 let _ = output.write_all(b"\n").await;
                 continue;
             };
-            let is_modern = outbound_modern.load(std::sync::atomic::Ordering::Acquire);
+            let is_modern = outbound_protocol
+                .lock()
+                .map(|mut state| state.observe_outbound(&value))
+                .unwrap_or(false);
             let task_response = if !is_modern && let Some(id) = value.get("id") {
                 task_requests.lock().await.remove(&id.to_string())
             } else {
@@ -792,10 +864,10 @@ pub(crate) async fn connect_via_daemon(
 ) -> anyhow::Result<()> {
     let client_id = uuid::Uuid::new_v4().to_string();
     let session = establish_daemon_proxy_session(config_path, client_id, None).await?;
-    let modern_downstream_enabled = session.modern_downstream_enabled;
     let proxy = crate::ipc_proxy::IpcProxyHandler::new(session, config_path.cloned());
+    let modern_gate = proxy.modern_gate_reader();
     use rmcp::ServiceExt as _;
-    let transport = stdio_transport(modern_downstream_enabled);
+    let transport = stdio_transport(modern_gate);
     let service = proxy
         .serve(transport)
         .await
@@ -813,8 +885,11 @@ pub(crate) async fn connect_standalone(
     let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
     let modern_downstream_enabled = engine.config().http.modern_downstream_enabled;
     proxy.set_modern_downstream_enabled(modern_downstream_enabled);
+    let router = Arc::clone(proxy.router());
+    let modern_gate: Arc<dyn Fn() -> bool + Send + Sync> =
+        Arc::new(move || router.modern_downstream_enabled());
     use rmcp::ServiceExt as _;
-    let transport = stdio_transport(modern_downstream_enabled);
+    let transport = stdio_transport(modern_gate);
     let service = proxy
         .serve(transport)
         .await
@@ -1159,6 +1234,84 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn failed_modern_discovery_probe_falls_back_to_explicit_legacy_initialize() {
+        let mut protocol = StdioProtocolState::default();
+        let discovery = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "server/discover",
+            "params": {}
+        });
+        assert!(!protocol.observe_inbound(&discovery, true));
+        assert!(!protocol.observe_outbound(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {"code": -32601, "message": "not supported"}
+        })));
+
+        let mut initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tasks": {"list": {}}},
+                "clientInfo": {"name": "legacy-after-probe", "version": "1.0"}
+            }
+        });
+        assert!(!protocol.observe_inbound(&initialize, true));
+        plug_core::protocol::rewrite_legacy_request(&mut initialize);
+        assert!(initialize.pointer("/params/capabilities/tasks").is_none());
+        assert!(
+            initialize
+                .pointer("/params/capabilities/experimental/plug.dev~1legacy-tasks")
+                .is_some()
+        );
+
+        let mut response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "result": {"resultType": "complete", "tools": []}
+        });
+        assert!(!protocol.observe_outbound(&response));
+        plug_core::protocol::rewrite_legacy_response(&mut response, false);
+        assert!(response.pointer("/result/resultType").is_none());
+    }
+
+    #[test]
+    fn successful_modern_discovery_confirms_modern_stdio_era() {
+        let mut protocol = StdioProtocolState::default();
+        let discovery = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "server/discover",
+            "params": {}
+        });
+        assert!(!protocol.observe_inbound(&discovery, true));
+        assert!(protocol.observe_outbound(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {"supportedVersions": ["2026-07-28"]}
+        })));
+        assert!(
+            !protocol.observe_inbound(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                        }
+                    }
+                }),
+                false,
+            ),
+            "a live gate disable must clear the confirmed modern era"
+        );
     }
 
     // Shared with the daemon and ipc_proxy test modules so all global runtime-path

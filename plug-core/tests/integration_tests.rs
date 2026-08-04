@@ -90,6 +90,29 @@ fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
     StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(0))
 }
 
+async fn save_bound_oauth_test_credentials(
+    store: &oauth::CompositeCredentialStore,
+    issuer: &str,
+    resource: &str,
+    access: &str,
+    refresh: &str,
+) {
+    store
+        .bind_verified_authority(&oauth::VerifiedOAuthAuthority {
+            issuer: reqwest::Url::parse(issuer)
+                .expect("valid OAuth test issuer")
+                .to_string(),
+            resource: reqwest::Url::parse(resource)
+                .expect("valid OAuth test resource")
+                .to_string(),
+        })
+        .expect("bind OAuth test authority");
+    store
+        .save(oauth_test_credentials(access, refresh))
+        .await
+        .expect("seed bound OAuth credentials");
+}
+
 fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
     let safe_server =
         plug_core::config::sanitize_server_name_for_path(server_name).expect("valid server name");
@@ -3484,13 +3507,15 @@ async fn test_upstream_http_sends_protocol_version_header() {
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
     plug_core::tls::ensure_rustls_provider_installed();
-    store
-        .save(oauth_test_credentials(
-            "oauth-access-token",
-            "oauth-refresh-token",
-        ))
-        .await
-        .expect("seed OAuth credentials");
+    let resource_url = format!("http://127.0.0.1:{port}/mcp");
+    save_bound_oauth_test_credentials(
+        &store,
+        &resource_url,
+        &resource_url,
+        "oauth-access-token",
+        "oauth-refresh-token",
+    )
+    .await;
 
     // Connect through plug's upstream HTTP path (ServerManager::start_server).
     let sm = Arc::new(ServerManager::new());
@@ -3501,7 +3526,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
         enabled: true,
         transport: TransportType::Http,
         protocol_mode: Default::default(),
-        url: Some(format!("http://127.0.0.1:{port}/mcp")),
+        url: Some(resource_url),
         auth_token: None,
         auth: Some("oauth".to_string()),
         oauth_client_id: Some("test-client".to_string()),
@@ -3690,10 +3715,14 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
     plug_core::tls::ensure_rustls_provider_installed();
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
         let mut config = Config::default();
@@ -3818,10 +3847,14 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
         .clear()
         .await
         .expect("clear required OAuth store before test");
-    healthy_store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed healthy oauth credentials");
+    save_bound_oauth_test_credentials(
+        &healthy_store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let failed_port = reserve_unused_local_port().await;
     let mut engine: Option<Arc<Engine>> = None;
@@ -4006,10 +4039,14 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
     let server_name = format!("oauth-stateless-{}", std::process::id());
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -4101,10 +4138,14 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
     let server_name = format!("oauth-startup-failure-{}", std::process::id());
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -4188,10 +4229,14 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
     );
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -4290,10 +4335,14 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
     );
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {
@@ -4383,10 +4432,14 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
     );
     let store = oauth::get_or_create_store(&server_name);
     store.clear().await.expect("clear OAuth store before test");
-    store
-        .save(oauth_test_credentials("access-token-1", "refresh-token-1"))
-        .await
-        .expect("seed oauth credentials");
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "access-token-1",
+        "refresh-token-1",
+    )
+    .await;
 
     let mut engine: Option<Arc<Engine>> = None;
     let result = AssertUnwindSafe(async {

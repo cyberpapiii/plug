@@ -35,6 +35,15 @@ Run the focused repository tests behind the `proven-local` rows:
 scripts/check-mcp-conformance.sh local
 ```
 
+`local` first lists the relevant Cargo test targets and fails if any configured
+selector matches zero tests. It also verifies that every `proven-local`
+inventory evidence selector maps to the local run. The selector guard has a
+fast deterministic check that does not compile or run the Rust suite:
+
+```sh
+scripts/check-mcp-conformance.sh self-test
+```
+
 The external conformance modes are intentionally not part of the default
 repository gates. They never start, install, configure, or stop Plug. An
 operator must separately start a disposable HTTP endpoint with the intended

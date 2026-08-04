@@ -54,6 +54,13 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - Local macOS reinstalls now sign and verify a staged binary before atomically replacing the live executable, eliminating the unsigned execution window that could retrigger Keychain prompts.
 - Daemon auth-status queries no longer fall back to a missing token mirror's Keychain entry, preventing a read-only diagnostic from freezing IPC and HTTP behind a macOS authorization dialog.
 - Engine concurrency tests now launch the prebuilt mock server directly, avoiding parallel `cargo run` lock contention that could exhaust their startup timeout on macOS CI.
+- Unbound legacy OAuth credentials now require explicit reauthorization instead of being silently rebound to a newly discovered issuer.
+- Modern duplicate in-flight JSON-RPC IDs are rejected atomically, with cancellation and cleanup tied to the exact admitted call.
+- Expired durable tasks abort local work and forward bounded upstream cancellation before releasing their quota.
+- Authorization-required upstreams now produce a distinct machine-readable protocol outcome rather than a generic unavailable-server error.
+- Modern Host validation accepts the configured public URL without weakening unrelated-origin checks, and protocol mismatch responses consistently identify the selected MCP revision.
+- Failed stdio discovery probes no longer latch the modern era before a successful discovery response.
+- MCP conformance selectors now fail if they match zero tests.
 
 ### Security
 

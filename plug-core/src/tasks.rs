@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{ErrorCode, RequestId};
 use serde_json::Value;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::legacy_tasks::{
     CancelTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult, Task, TaskStatus,
@@ -15,7 +16,7 @@ use crate::protocol::QuotaLease;
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_MAX_COMPLETED_TASKS_PER_OWNER: usize = 100;
-const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Transport-supplied probe reporting whether a task owner's downstream
 /// session is still live. Checked by `enqueue_tool_task` immediately after it
@@ -68,6 +69,15 @@ struct TaskRecord {
     /// `attach_upstream_request_id`.
     pending_cancel_reason: Option<String>,
     /// Capacity remains reserved for the full lifetime of the durable record.
+    _quota_lease: Option<QuotaLease>,
+}
+
+/// Work detached from the store by stale in-flight expiry. The local future
+/// has already been aborted before this value is created. Keeping the quota
+/// lease here delays capacity release until the router has attempted bounded
+/// upstream cancellation.
+pub(crate) struct ExpiredTaskCleanup {
+    pub(crate) upstream: Option<TaskUpstreamRef>,
     _quota_lease: Option<QuotaLease>,
 }
 
@@ -208,6 +218,7 @@ pub struct TaskStore {
     tasks: HashMap<String, TaskRecord>,
     next_task_id: u64,
     lifecycle: Arc<OwnerLifecycleLedger>,
+    expired_cleanup: Vec<ExpiredTaskCleanup>,
 }
 
 impl Default for TaskStore {
@@ -222,6 +233,7 @@ impl TaskStore {
             tasks: HashMap::new(),
             next_task_id: 1,
             lifecycle: Arc::new(OwnerLifecycleLedger::default()),
+            expired_cleanup: Vec::new(),
         }
     }
 
@@ -714,18 +726,54 @@ impl TaskStore {
         Ok(CancelTaskResult::new(record.task.clone()))
     }
 
+    /// Drain stale in-flight cleanup after the synchronous store operation
+    /// that discovered it. The router owns bounded upstream cancellation;
+    /// dropping these values releases their retained quota leases.
+    pub(crate) fn take_expired_cleanup(&mut self) -> Vec<ExpiredTaskCleanup> {
+        std::mem::take(&mut self.expired_cleanup)
+    }
+
     fn prune_expired(&mut self) {
         let now = Instant::now();
-        self.tasks.retain(|_, record| match record.task.status {
-            TaskStatus::Working | TaskStatus::InputRequired => {
-                now.duration_since(record.last_touched)
-                    < Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
+        let expired = self
+            .tasks
+            .iter()
+            .filter_map(|(task_id, record)| {
+                let expired = match record.task.status {
+                    TaskStatus::Working | TaskStatus::InputRequired => {
+                        now.duration_since(record.last_touched)
+                            >= Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS)
+                    }
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+                        let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
+                        now.duration_since(record.last_touched) >= Duration::from_millis(ttl_ms)
+                    }
+                };
+                expired.then(|| task_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for task_id in expired {
+            let Some(mut record) = self.tasks.remove(&task_id) else {
+                continue;
+            };
+            if matches!(
+                record.task.status,
+                TaskStatus::Working | TaskStatus::InputRequired
+            ) {
+                // Abort is synchronous and deliberately precedes moving the
+                // quota lease out of the record. The router will next send
+                // bounded upstream cancellation, then drop the cleanup and
+                // release quota.
+                if let Some(handle) = record.abort_handle.take() {
+                    handle.abort();
+                }
+                self.expired_cleanup.push(ExpiredTaskCleanup {
+                    upstream: record.upstream.take(),
+                    _quota_lease: record._quota_lease.take(),
+                });
             }
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
-                let ttl_ms = record.task.ttl.unwrap_or(DEFAULT_TASK_TTL_MS);
-                now.duration_since(record.last_touched) < Duration::from_millis(ttl_ms)
-            }
-        });
+        }
     }
 
     fn enforce_owner_completed_retention(&mut self) {
@@ -1282,5 +1330,42 @@ mod tests {
         store
             .create(owner.clone(), "Mock__echo")
             .expect("create for the same owner key after a quiescent teardown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_live_task_expiry_aborts_local_work_before_cleanup_is_drained() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("http:expired"));
+        let task = store.create(owner.clone(), "slow").expect("create task");
+        store
+            .tasks
+            .get_mut(&task.task_id)
+            .expect("task record")
+            .task
+            .status = TaskStatus::InputRequired;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let handle = tokio::spawn(async move {
+            let _guard = Dropped(dropped_in_task);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        store.attach_abort_handle(&task.task_id, handle);
+
+        tokio::time::advance(Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS + 1)).await;
+        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "expiry must abort the local future before returning cleanup"
+        );
+        assert_eq!(store.take_expired_cleanup().len(), 1);
     }
 }

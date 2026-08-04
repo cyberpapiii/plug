@@ -374,18 +374,23 @@ impl super::ToolRouter {
                         server_id: server_id.clone(),
                         task_id: result.task.task_id.clone(),
                     };
-                    let mut store = router.task_store.lock().await;
-                    let created = match task_quota_lease {
-                        Some(lease) => store.create_passthrough_with_quota(
-                            owner,
-                            &tool_name,
-                            &result.task,
-                            upstream,
-                            lease,
-                        ),
-                        None => store.create_passthrough(owner, &tool_name, &result.task, upstream),
+                    let (created, expired_cleanup) = {
+                        let mut store = router.task_store.lock().await;
+                        let created = match task_quota_lease {
+                            Some(lease) => store.create_passthrough_with_quota(
+                                owner,
+                                &tool_name,
+                                &result.task,
+                                upstream,
+                                lease,
+                            ),
+                            None => {
+                                store.create_passthrough(owner, &tool_name, &result.task, upstream)
+                            }
+                        };
+                        (created, store.take_expired_cleanup())
                     };
-                    drop(store);
+                    router.finish_expired_task_cleanup(expired_cleanup).await;
                     return match created {
                         Ok(task) => Ok(CreateTaskResult::new(task)),
                         Err(error) => {
@@ -438,33 +443,47 @@ impl super::ToolRouter {
         // detaching the future, which kept running and kept holding its
         // server's `max_concurrent` semaphore permit.) No await is held
         // across this scope other than acquiring the lock itself.
-        let task = {
+        let created = {
             let mut store = self.task_store.lock().await;
             let task = match task_quota_lease {
-                Some(lease) => store.create_with_quota(owner, tool_name, lease)?,
-                None => store.create(owner, tool_name)?,
+                Some(lease) => store.create_with_quota(owner, tool_name, lease),
+                None => store.create(owner, tool_name),
             };
-            let task_id = task.task_id.clone();
-            let router = Arc::clone(self);
-            let tool_name = tool_name.to_string();
-            let handle = tokio::spawn(async move {
-                router
-                    .execute_tool_task(
-                        task_id,
-                        tool_name,
-                        arguments,
-                        TaskWireContext {
-                            progress_token,
-                            extension_meta,
-                        },
-                        false,
-                        trace_id,
-                    )
-                    .await;
-            });
-            store.attach_abort_handle(&task.task_id, handle);
-            task
+            match task {
+                Ok(task) => {
+                    let task_id = task.task_id.clone();
+                    let router = Arc::clone(self);
+                    let tool_name = tool_name.to_string();
+                    let handle = tokio::spawn(async move {
+                        router
+                            .execute_tool_task(
+                                task_id,
+                                tool_name,
+                                arguments,
+                                TaskWireContext {
+                                    progress_token,
+                                    extension_meta,
+                                },
+                                false,
+                                trace_id,
+                            )
+                            .await;
+                    });
+                    store.attach_abort_handle(&task.task_id, handle);
+                    Ok((task, store.take_expired_cleanup()))
+                }
+                Err(error) => Err((error, store.take_expired_cleanup())),
+            }
         };
+
+        let (task, expired_cleanup) = match created {
+            Ok(created) => created,
+            Err((error, cleanup)) => {
+                self.finish_expired_task_cleanup(cleanup).await;
+                return Err(error);
+            }
+        };
+        self.finish_expired_task_cleanup(expired_cleanup).await;
 
         Ok(CreateTaskResult::new(task))
     }
@@ -474,7 +493,13 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         request: Option<PaginatedRequestParams>,
     ) -> Result<ListTasksResult, McpError> {
-        Ok(self.task_store.lock().await.list_for_owner(owner, request))
+        let (result, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let result = store.list_for_owner(owner, request);
+            (result, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        Ok(result)
     }
 
     pub async fn get_task_info_for_owner(
@@ -482,12 +507,13 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskResult, McpError> {
-        let upstream = {
-            self.task_store
-                .lock()
-                .await
-                .upstream_for_owner(owner, task_id)?
+        let (upstream, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let upstream = store.upstream_for_owner(owner, task_id);
+            (upstream, store.take_expired_cleanup())
         };
+        self.finish_expired_task_cleanup(cleanup).await;
+        let upstream = upstream?;
         if let Some(TaskUpstreamRef::Task {
             server_id,
             task_id: upstream_task_id,
@@ -507,22 +533,26 @@ impl super::ToolRouter {
                     other => McpError::internal_error(other.to_string(), None),
                 })?;
             if let Ok(result) = crate::legacy_tasks::parse_get_result(response) {
-                let synced = self.task_store.lock().await.sync_from_upstream_for_owner(
-                    owner,
-                    task_id,
-                    &result.task,
-                )?;
-                return Ok(GetTaskResult::new(synced));
+                let (synced, cleanup) = {
+                    let mut store = self.task_store.lock().await;
+                    let synced = store.sync_from_upstream_for_owner(owner, task_id, &result.task);
+                    (synced, store.take_expired_cleanup())
+                };
+                self.finish_expired_task_cleanup(cleanup).await;
+                return Ok(GetTaskResult::new(synced?));
             }
             return Err(McpError::internal_error(
                 "unexpected upstream tasks/get response".to_string(),
                 None,
             ));
         }
-        self.task_store
-            .lock()
-            .await
-            .get_info_for_owner(owner, task_id)
+        let (result, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let result = store.get_info_for_owner(owner, task_id);
+            (result, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        result
     }
 
     /// SEP-2663 projection of the same retained task record used by legacy
@@ -542,10 +572,13 @@ impl super::ToolRouter {
             // modern inlined completed result.
             let _ = self.get_task_result_for_owner(owner, task_id).await?;
         }
-        self.task_store
-            .lock()
-            .await
-            .get_modern_for_owner(owner, task_id)
+        let (result, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let result = store.get_modern_for_owner(owner, task_id);
+            (result, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        result
     }
 
     pub async fn validate_task_owner(
@@ -553,7 +586,13 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<(), McpError> {
-        self.task_store.lock().await.validate_owner(owner, task_id)
+        let (result, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let result = store.validate_owner(owner, task_id);
+            (result, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        result
     }
 
     pub async fn get_task_result_for_owner(
@@ -561,12 +600,13 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        let upstream = {
-            self.task_store
-                .lock()
-                .await
-                .upstream_for_owner(owner, task_id)?
+        let (upstream, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let upstream = store.upstream_for_owner(owner, task_id);
+            (upstream, store.take_expired_cleanup())
         };
+        self.finish_expired_task_cleanup(cleanup).await;
+        let upstream = upstream?;
         if let Some(TaskUpstreamRef::Task {
             server_id,
             task_id: upstream_task_id,
@@ -589,20 +629,25 @@ impl super::ToolRouter {
             let payload = crate::legacy_tasks::parse_payload_result(response)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?
                 .0;
-            self.task_store
-                .lock()
-                .await
-                .cache_result_for_owner(owner, task_id, payload.clone())?;
+            let (cached, cleanup) = {
+                let mut store = self.task_store.lock().await;
+                let cached = store.cache_result_for_owner(owner, task_id, payload.clone());
+                (cached, store.take_expired_cleanup())
+            };
+            self.finish_expired_task_cleanup(cleanup).await;
+            cached?;
             return self
                 .artifact_store
                 .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
                 .await;
         }
-        let payload = self
-            .task_store
-            .lock()
-            .await
-            .get_result_for_owner(owner, task_id)?;
+        let (payload, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let payload = store.get_result_for_owner(owner, task_id);
+            (payload, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        let payload = payload?;
         self.artifact_store
             .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload.0)
             .await
@@ -664,6 +709,20 @@ impl super::ToolRouter {
         for cancellation in cancellations {
             let _ = cancellation.await;
         }
+    }
+
+    async fn finish_expired_task_cleanup(&self, cleanup: Vec<crate::tasks::ExpiredTaskCleanup>) {
+        let cancellations = cleanup
+            .iter()
+            .filter_map(|item| item.upstream.clone())
+            .filter_map(|upstream| self.spawn_bounded_upstream_cancellation(upstream))
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            let _ = cancellation.await;
+        }
+        // Dropping only after every bounded cancellation attempt releases
+        // the quota leases retained by stale live records.
+        drop(cleanup);
     }
 
     /// Spawns a best-effort cancellation of `upstream` (task cancel request
@@ -809,12 +868,13 @@ impl super::ToolRouter {
     /// owner-scoped so this cannot observe another owner's records; it
     /// exists as a test probe for teardown-cleanup assertions.
     pub async fn task_count_for_owner(&self, owner: &TaskOwner) -> usize {
-        self.task_store
-            .lock()
-            .await
-            .list_for_owner(owner, None)
-            .tasks
-            .len()
+        let (count, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let count = store.list_for_owner(owner, None).tasks.len();
+            (count, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        count
     }
 
     /// Creates a task record for `owner` with `handle` attached as its abort
@@ -842,11 +902,13 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<CancelTaskResult, McpError> {
-        let (task, upstream, handle) = self
-            .task_store
-            .lock()
-            .await
-            .mark_cancelled(owner, task_id)?;
+        let (cancelled, cleanup) = {
+            let mut store = self.task_store.lock().await;
+            let cancelled = store.mark_cancelled(owner, task_id);
+            (cancelled, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(cleanup).await;
+        let (task, upstream, handle) = cancelled?;
         if let Some(upstream) = upstream {
             match upstream {
                 TaskUpstreamRef::Task {
@@ -1640,6 +1702,7 @@ mod tests {
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
+            generation: crate::server::next_upstream_generation(),
             health: ServerHealth::Healthy,
         }
     }
@@ -1794,6 +1857,48 @@ mod tests {
         assert!(
             state.cancel_received_for("upstream-task-hung"),
             "the hung upstream must have received the forwarded cancel request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_live_task_expiry_sends_bounded_upstream_cancellation() {
+        let state = GatedTaskUpstreamState::new(true, false);
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(Arc::clone(&sm), test_router_config());
+        sm.replace_server(
+            "expiry-upstream",
+            connect_gated_task_upstream("expiry-upstream", Arc::clone(&state), 5).await,
+        )
+        .await;
+
+        let owner = ToolRouter::task_owner_for_http_session("session-expired-upstream");
+        {
+            let mut store = router.task_store.lock().await;
+            store
+                .create_passthrough(
+                    owner.clone(),
+                    "slow",
+                    &upstream_working_task("upstream-expired-1"),
+                    TaskUpstreamRef::Task {
+                        server_id: "expiry-upstream".to_string(),
+                        task_id: "upstream-expired-1".to_string(),
+                    },
+                )
+                .expect("create stale passthrough task");
+        }
+
+        tokio::time::advance(Duration::from_millis(
+            crate::tasks::DEFAULT_STALE_IN_FLIGHT_TTL_MS + 1,
+        ))
+        .await;
+        let listed = router
+            .list_tasks_for_owner(&owner, None)
+            .await
+            .expect("expiry cleanup remains best effort");
+        assert!(listed.tasks.is_empty());
+        assert_eq!(
+            state.cancel_log.lock().unwrap().as_slice(),
+            ["upstream-expired-1"]
         );
     }
 
@@ -2550,6 +2655,7 @@ mod tests {
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
+            generation: crate::server::next_upstream_generation(),
             health: ServerHealth::Healthy,
         }
     }

@@ -228,6 +228,34 @@ These limits are user protection. Plug should never advertise a feature that an
 agent can start but cannot finish through authorization, effects, cancellation,
 and cleanup.
 
+## Final review hardening
+
+The final adversarial review found and fixed several boundary cases before the
+branch was considered releasable:
+
+- Legacy OAuth credentials without a verified issuer now fail closed and ask
+  for reauthorization instead of being silently attached to a newly discovered
+  authority.
+- Duplicate in-flight JSON-RPC IDs from the same modern principal are rejected
+  atomically, so cancellation can never target the wrong operation.
+- Expired or revoked principals are removed from the downstream OAuth lifecycle,
+  while existing leases remain inactive.
+- Task expiry aborts local work first, forwards bounded upstream cancellation,
+  and retains quota until cleanup finishes.
+- Authorization-required failures remain machine-readable instead of looking
+  like generic upstream outages.
+- Modern Host validation accepts the configured public tunnel URL without
+  weakening unrelated-origin protection.
+- Failed stdio discovery probes fall back cleanly to explicit legacy
+  initialization instead of permanently latching a modern protocol era.
+- Conformance selectors now fail when they match no tests, preventing a green
+  check that exercised nothing.
+
+The final source gate ran 981 workspace tests, Clippy with warnings denied,
+format checking, Rust 1.88 compatibility checking, dependency advisory checks,
+the todo-status guard, and the local MCP conformance inventory and selector
+self-test. All passed.
+
 ## Release and installation posture
 
 The branch pins RMCP to exactly `3.1.0` and carries repository-level tests for

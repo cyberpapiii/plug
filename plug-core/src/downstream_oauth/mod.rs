@@ -359,7 +359,7 @@ impl Default for DownstreamOauthState {
 }
 
 impl DownstreamOauthState {
-    fn evict_expired(&mut self, now: u64) {
+    fn evict_expired(&mut self, now: u64) -> HashSet<String> {
         let expired: HashSet<String> = self
             .clients
             .iter()
@@ -374,6 +374,7 @@ impl DownstreamOauthState {
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
         self.refresh_tokens
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
+        expired
     }
 
     fn remove_client_material(&mut self, client_id: &str) {
@@ -494,7 +495,7 @@ impl DownstreamOauthManager {
         let now = epoch_secs();
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
-        next.evict_expired(now);
+        let expired = next.evict_expired(now);
         if next.clients.len() >= MAX_REGISTRATIONS {
             return Err(DownstreamOauthError::RegistrationQuotaExceeded);
         }
@@ -511,12 +512,14 @@ impl DownstreamOauthManager {
             expires_at: now + UNACTIVATED_REGISTRATION_LIFETIME_SECS,
         };
         next.clients.insert(client_id.clone(), client);
+        self.deactivate_principal_lifecycles(&expired);
         persist_state(&self.state_path, &next)?;
         self.principal_lifecycles.insert(
             client_id.clone(),
             Arc::new(PrincipalLifecycleState::active()),
         );
         *guard = next;
+        self.remove_principal_lifecycles(&expired);
 
         Ok(ClientRegistrationResponse {
             client_id,
@@ -566,6 +569,7 @@ impl DownstreamOauthManager {
         next.revoked_client_ids.insert(client_id.to_string());
         persist_state(&self.state_path, &next)?;
         *guard = next;
+        self.principal_lifecycles.remove(client_id);
         Ok(existed)
     }
 
@@ -583,7 +587,14 @@ impl DownstreamOauthManager {
         self.ensure_client(request.client_id).await?;
         let now = epoch_secs();
         let mut guard = self.state.lock().await;
-        guard.evict_expired(now);
+        let mut next = guard.clone();
+        let expired = next.evict_expired(now);
+        if !expired.is_empty() {
+            self.deactivate_principal_lifecycles(&expired);
+            persist_state(&self.state_path, &next)?;
+            *guard = next;
+            self.remove_principal_lifecycles(&expired);
+        }
         let client = guard
             .clients
             .get(request.client_id)
@@ -915,17 +926,33 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidClient);
         }
         let mut next = guard.clone();
-        next.evict_expired(now);
+        let expired = next.evict_expired(now);
         if !next.clients.contains_key(client_id) && next.clients.len() >= MAX_REGISTRATIONS {
             return Err(DownstreamOauthError::RegistrationQuotaExceeded);
         }
         next.clients.insert(client_id.to_string(), client);
+        self.deactivate_principal_lifecycles(&expired);
         persist_state(&self.state_path, &next)?;
+        *guard = next;
+        self.remove_principal_lifecycles(&expired);
         self.principal_lifecycles
             .entry(client_id.to_string())
             .or_insert_with(|| Arc::new(PrincipalLifecycleState::active()));
-        *guard = next;
         Ok(())
+    }
+
+    fn deactivate_principal_lifecycles(&self, client_ids: &HashSet<String>) {
+        for client_id in client_ids {
+            if let Some(lifecycle) = self.principal_lifecycles.get(client_id) {
+                lifecycle.deactivate();
+            }
+        }
+    }
+
+    fn remove_principal_lifecycles(&self, client_ids: &HashSet<String>) {
+        for client_id in client_ids {
+            self.principal_lifecycles.remove(client_id);
+        }
     }
 }
 
@@ -1224,7 +1251,7 @@ fn load_persisted_state(
     }
     state.pending_consents.clear();
     state.pending_codes.clear();
-    state.evict_expired(epoch_secs());
+    let _ = state.evict_expired(epoch_secs());
     Ok(state)
 }
 
@@ -1542,6 +1569,78 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[tokio::test]
+    async fn committed_revocation_removes_lifecycle_entry_but_held_lease_stays_inactive() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let lease = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                "https://plug.example.com/mcp",
+            )
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            other => panic!("token must validate before revocation: {other:?}"),
+        };
+
+        assert!(manager.revoke_client(&client.client_id).await.unwrap());
+
+        assert!(!manager.principal_lifecycles.contains_key(&client.client_id));
+        assert!(!lease.is_active());
+    }
+
+    #[tokio::test]
+    async fn committed_expiry_removes_lifecycle_entry_but_held_lease_stays_inactive() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let lease = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                "https://plug.example.com/mcp",
+            )
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            other => panic!("token must validate before expiry: {other:?}"),
+        };
+        manager
+            .state
+            .lock()
+            .await
+            .clients
+            .get_mut(&client.client_id)
+            .expect("client")
+            .expires_at = 0;
+        manager.registration_rate.lock().await.clear();
+
+        register(&manager, "expiry-trigger", "http://localhost:8788/callback").await;
+
+        assert!(!manager.principal_lifecycles.contains_key(&client.client_id));
+        assert!(!lease.is_active());
+    }
+
+    #[tokio::test]
+    async fn repeated_registration_and_revocation_does_not_grow_lifecycle_map() {
+        let (manager, _) = test_manager();
+        for index in 0..32 {
+            manager.registration_rate.lock().await.clear();
+            let client = register(
+                &manager,
+                &format!("client-{index}"),
+                "http://localhost:8787/callback",
+            )
+            .await;
+            assert!(manager.revoke_client(&client.client_id).await.unwrap());
+        }
+
+        assert!(manager.principal_lifecycles.is_empty());
     }
 
     #[tokio::test]

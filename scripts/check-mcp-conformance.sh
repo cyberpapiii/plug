@@ -14,12 +14,86 @@ Usage: scripts/check-mcp-conformance.sh MODE
 Modes:
   inventory               Validate and summarize checked-in evidence (default)
   local                   Run focused local protocol-pair regressions
+  self-test               Check selector failure detection without running Cargo
   official-legacy-server  Run pinned stable suite against an existing endpoint
   official-modern-server  Run pinned prerelease suite against an existing endpoint
 
 External modes require PLUG_MCP_CONFORMANCE_URL. They do not start or configure
 Plug and are deliberately excluded from default repository gates.
 EOF
+}
+
+local_specs=(
+  $'core\tprotocol::tests::'
+  $'core\thttp::server::tests::modern_'
+  $'core\tproxy::tests::native_modern_upstream_completes_a_real_two_round_tool_call'
+  $'core\tproxy::tasks::tests::modern_downstream_forces_local_wrapper_around_legacy_native_upstream'
+  $'core\tproxy::tests::legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect'
+  $'integration\tupstream_lifecycle_modes_negotiate_independently_with_live_truth'
+)
+
+selector_matches_list() {
+  local selector=$1
+  awk -v selector="$selector" '
+    index($0, selector) > 0 && $0 ~ /: test$/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+assert_selector_present() {
+  local selector=$1
+  local listed_tests=$2
+  if ! selector_matches_list "$selector" <<<"$listed_tests"; then
+    printf 'local MCP selector matched zero tests: %s\n' "$selector" >&2
+    return 1
+  fi
+}
+
+validate_local_evidence_mapping() {
+  local evidence selector spec_target spec_selector mapped
+  while IFS= read -r evidence; do
+    IFS=';' read -ra selectors <<<"$evidence"
+    for selector in "${selectors[@]}"; do
+      selector=${selector#"${selector%%[![:space:]]*}"}
+      selector=${selector%"${selector##*[![:space:]]}"}
+      mapped=false
+      for spec in "${local_specs[@]}"; do
+        IFS=$'\t' read -r spec_target spec_selector <<<"$spec"
+        if [[ "$selector" == "$spec_selector" ]]; then
+          mapped=true
+          break
+        fi
+      done
+      if [[ "$mapped" != true ]]; then
+        printf 'proven-local evidence has no local selector mapping: %s\n' "$selector" >&2
+        return 1
+      fi
+    done
+  done < <(awk -F '\t' 'NR > 1 && $4 == "proven-local" { print $5 }' "$inventory")
+}
+
+preflight_local_selectors() {
+  local core_tests integration_tests spec target selector
+  core_tests=$(cargo test -p plug-core --lib -- --list)
+  integration_tests=$(cargo test -p plug-core --test integration_tests -- --list)
+  for spec in "${local_specs[@]}"; do
+    IFS=$'\t' read -r target selector <<<"$spec"
+    case "$target" in
+      core) assert_selector_present "$selector" "$core_tests" ;;
+      integration) assert_selector_present "$selector" "$integration_tests" ;;
+      *) printf 'unknown local selector target: %s\n' "$target" >&2; return 1 ;;
+    esac
+  done
+}
+
+run_self_test() {
+  local fixture=$'protocol::tests::legacy_round_trip: test\nhttp::server::tests::modern_discovery: test'
+  assert_selector_present 'protocol::tests::' "$fixture"
+  if assert_selector_present 'definitely::bogus::selector' "$fixture" 2>/dev/null; then
+    printf '%s\n' 'selector self-test failed: bogus selector unexpectedly matched' >&2
+    return 1
+  fi
+  printf '%s\n' 'Selector zero-match self-test passed.'
 }
 
 validate_inventory() {
@@ -65,13 +139,16 @@ run_local() {
   summarize_inventory
   cd "$repo_root"
 
-  cargo test -p plug-core protocol::tests::
-  cargo test -p plug-core http::server::tests::modern_
-  cargo test -p plug-core \
+  validate_local_evidence_mapping
+  preflight_local_selectors
+
+  cargo test -p plug-core --lib protocol::tests::
+  cargo test -p plug-core --lib http::server::tests::modern_
+  cargo test -p plug-core --lib \
     proxy::tests::native_modern_upstream_completes_a_real_two_round_tool_call -- --exact
-  cargo test -p plug-core \
+  cargo test -p plug-core --lib \
     proxy::tasks::tests::modern_downstream_forces_local_wrapper_around_legacy_native_upstream -- --exact
-  cargo test -p plug-core \
+  cargo test -p plug-core --lib \
     proxy::tests::legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect -- --exact
   cargo test -p plug-core --test integration_tests \
     upstream_lifecycle_modes_negotiate_independently_with_live_truth -- --exact
@@ -126,6 +203,7 @@ mode=${1:-inventory}
 case "$mode" in
   inventory) summarize_inventory ;;
   local) run_local ;;
+  self-test) run_self_test ;;
   official-legacy-server)
     run_external_server "$legacy_suite_version" stable 2025-11-25
     ;;

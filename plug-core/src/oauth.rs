@@ -279,11 +279,9 @@ pub async fn verified_access_token_for_resource(
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     let store = get_or_create_store(server_name);
     store.bind_verified_authority(&authority)?;
-    let credentials = store.current_or_freshest_persisted_credentials().await;
-    if let Some(credentials) = credentials.as_ref() {
-        store.migrate_loaded_legacy_credentials(credentials)?;
-    }
-    Ok(credentials.and_then(|credentials| stored_access_token(&credentials)))
+    Ok(store
+        .verified_bound_credentials()
+        .and_then(|credentials| stored_access_token(&credentials)))
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +600,22 @@ impl CompositeCredentialStore {
         self.binding.store(Arc::new(Some(file.binding)));
         self.update_cache(&file.credentials);
         BoundPairProbe::Valid(Box::new(file.credentials))
+    }
+
+    /// Load credentials for a runtime lookup only when both persisted mirrors
+    /// carry the same issuer/resource-bound envelope.
+    ///
+    /// Bare legacy credentials intentionally remain untouched here. They can
+    /// only be migrated or replaced by an explicit authorization flow that has
+    /// the human consent boundary needed to assign an authority safely.
+    fn verified_bound_credentials(&self) -> Option<StoredCredentials> {
+        match self.probe_bound_pair() {
+            BoundPairProbe::Valid(credentials) => Some(*credentials),
+            BoundPairProbe::NotBound | BoundPairProbe::Invalid => {
+                self.clear_cache();
+                None
+            }
+        }
     }
 
     fn encode_credentials(
@@ -1664,17 +1678,12 @@ pub async fn refresh_access_token(
     }
     auth_manager.set_metadata(metadata);
 
-    // 2. Loading is safe only after the authority boundary is established.
-    let creds = match CredentialStore::load(&*store).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return RefreshResult::NoCredentials,
-        Err(e) => return RefreshResult::TransientError(format!("failed to load credentials: {e}")),
+    // 2. Runtime refresh is allowed only for an exact issuer/resource-bound
+    // pair. Bare legacy credentials remain available to the explicit login
+    // flow, but discovery alone is not authority to refresh or migrate them.
+    let Some(creds) = store.verified_bound_credentials() else {
+        return RefreshResult::NoCredentials;
     };
-    if let Err(error) = store.migrate_loaded_legacy_credentials(&creds) {
-        return RefreshResult::TransientError(format!(
-            "failed to migrate issuer-bound credentials: {error}"
-        ));
-    }
     let load_snapshot = store.fallback_auth_debug_snapshot();
     debug!(
         server = %server_name,
@@ -2185,35 +2194,94 @@ mod tests {
         assert!(CredentialStore::load(&conflicting).await.unwrap().is_none());
     }
 
+    async fn spawn_empty_oauth_authority() -> (String, tokio::task::JoinHandle<()>) {
+        crate::tls::ensure_rustls_provider_installed();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OAuth authority");
+        let address = listener.local_addr().expect("OAuth authority address");
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve empty OAuth authority");
+        });
+        (format!("http://{address}/mcp"), task)
+    }
+
     #[tokio::test]
-    async fn verified_binding_migrates_legacy_credentials_without_changing_token() {
+    async fn verified_runtime_lookup_rejects_and_preserves_unbound_legacy_credentials() {
         let name = format!("legacy-binding-{}", uuid::Uuid::new_v4());
         let credentials = make_test_token("legacy-access", Some("refresh"), Some(3600));
-        let legacy = CompositeCredentialStore::new(name.clone());
-        CredentialStore::save(&legacy, credentials.clone())
+        let runtime_store = get_or_create_store(&name);
+        CredentialStore::save(runtime_store.as_ref(), credentials)
             .await
             .unwrap();
-
-        let authority = test_authority();
-        let migrating = CompositeCredentialStore::new(name.clone());
-        migrating.bind_verified_authority(&authority).unwrap();
-        let loaded = CredentialStore::load(&migrating).await.unwrap().unwrap();
-        migrating
-            .migrate_loaded_legacy_credentials(&loaded)
-            .unwrap();
         assert_eq!(
-            stored_access_token(&loaded).as_deref(),
+            current_access_token(&name).as_deref(),
             Some("legacy-access")
         );
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
 
-        let conflicting = CompositeCredentialStore::new(name);
-        conflicting
-            .bind_verified_authority(&VerifiedOAuthAuthority {
-                issuer: "https://different.example".to_string(),
-                resource: authority.resource,
-            })
-            .unwrap();
-        assert!(CredentialStore::load(&conflicting).await.unwrap().is_none());
+        let token = verified_access_token_for_resource(&name, &resource_url)
+            .await
+            .expect("discover and bind verified authority");
+
+        assert_eq!(
+            token, None,
+            "unbound legacy token must require reauthorization"
+        );
+        assert_eq!(current_access_token(&name), None);
+        assert!(matches!(
+            refresh_access_token(&name, &resource_url, None).await,
+            RefreshResult::NoCredentials
+        ));
+        assert!(matches!(
+            runtime_store
+                .raw_file_json()
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            Some(PersistedCredentialEnvelope::Legacy(_))
+        ));
+        assert!(matches!(
+            runtime_store
+                .raw_keyring_json()
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            Some(PersistedCredentialEnvelope::Legacy(_))
+        ));
+        authority_task.abort();
+        runtime_store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verified_runtime_lookup_returns_matching_bound_credential_pair() {
+        use rmcp::transport::auth::AuthorizationManager;
+
+        let name = format!("bound-runtime-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let manager = AuthorizationManager::new(&resource_url).await.unwrap();
+        let resolution = manager.resolve_metadata().await.unwrap();
+        let authority =
+            VerifiedOAuthAuthority::verify(&resource_url, &resolution.metadata).unwrap();
+        let store = get_or_create_store(&name);
+        store.bind_verified_authority(&authority).unwrap();
+        CredentialStore::save(
+            store.as_ref(),
+            make_test_token("bound-access", Some("refresh"), Some(3600)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            verified_access_token_for_resource(&name, &resource_url)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bound-access")
+        );
+        authority_task.abort();
+        store.clear().await.unwrap();
     }
 
     #[tokio::test]

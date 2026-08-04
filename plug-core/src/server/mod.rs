@@ -599,7 +599,21 @@ pub struct UpstreamServer {
     /// began. Commit validation uses it to reject a connection made stale by
     /// a concurrent live gate flip.
     pub(crate) protocol_gate_state: u64,
+    /// Monotonic identity of this concrete connection. Unlike an `Arc`
+    /// address, this cannot be recycled after a reconnect and is stable for
+    /// every clone of the published connection.
+    pub(crate) generation: u64,
     pub health: ServerHealth,
+}
+
+static NEXT_UPSTREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_upstream_generation() -> u64 {
+    NEXT_UPSTREAM_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .expect("upstream connection generation exhausted")
 }
 
 /// Manages the lifecycle of upstream MCP servers.
@@ -1265,6 +1279,7 @@ impl ServerManager {
                         protocol_era,
                         selected_protocol_version,
                         protocol_gate_state: modern_upstream_gate_state,
+                        generation: next_upstream_generation(),
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -1564,6 +1579,7 @@ impl ServerManager {
             protocol_era,
             selected_protocol_version,
             protocol_gate_state: modern_upstream_gate_state,
+            generation: next_upstream_generation(),
             health: ServerHealth::Healthy,
         })
     }
@@ -2924,6 +2940,7 @@ mod tests {
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
+            generation: next_upstream_generation(),
             health: ServerHealth::Healthy,
         }
     }
@@ -2973,6 +2990,7 @@ mod tests {
                 protocol_era: crate::protocol::ProtocolEra::Legacy,
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
+                generation: next_upstream_generation(),
                 health: ServerHealth::Healthy,
             },
             result_request_count,
@@ -3163,6 +3181,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_publishes_a_new_monotonic_connection_generation() {
+        let mgr = ServerManager::new();
+        let first = make_connected_test_upstream("generation-test").await;
+        let first_generation = first.generation;
+        mgr.replace_server("generation-test", first).await;
+        assert_eq!(
+            mgr.get_upstream("generation-test").unwrap().generation,
+            first_generation
+        );
+
+        let replacement = make_connected_test_upstream("generation-test").await;
+        let replacement_generation = replacement.generation;
+        assert!(replacement_generation > first_generation);
+        mgr.replace_server("generation-test", replacement).await;
+        assert_eq!(
+            mgr.get_upstream("generation-test").unwrap().generation,
+            replacement_generation
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_all_retires_entries_even_when_map_arc_is_shared() {
         let mgr = ServerManager::new();
         let upstream = make_connected_test_upstream("shared-shutdown").await;
@@ -3286,6 +3325,7 @@ mod tests {
                 protocol_era: crate::protocol::ProtocolEra::Legacy,
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
+                generation: next_upstream_generation(),
                 health: ServerHealth::Healthy,
             },
         )
@@ -3342,6 +3382,7 @@ mod tests {
                 protocol_era: crate::protocol::ProtocolEra::Legacy,
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
+                generation: next_upstream_generation(),
                 health: ServerHealth::Healthy,
             },
         )
@@ -3645,6 +3686,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3751,6 +3793,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4082,6 +4125,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4203,6 +4247,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4346,6 +4391,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
+                    generation: next_upstream_generation(),
                     health: ServerHealth::Healthy,
                 },
             )

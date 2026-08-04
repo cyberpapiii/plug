@@ -30,6 +30,10 @@ const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 /// calls that emit progress are unaffected. See plans/009.
 const READ_WATCHDOG: Duration = Duration::from_secs(120);
 
+fn selected_protocol_for_log(protocol: &ProtocolVersion) -> &str {
+    protocol.as_str()
+}
+
 /// Test-only override for `READ_WATCHDOG` so the suite can exercise watchdog
 /// expiry without a real 120s wait. Zero means "no override, use the real
 /// constant." This must never grow into a runtime/config knob — see
@@ -158,6 +162,15 @@ impl IpcProxyHandler {
         });
         let heartbeat = tokio::spawn(Self::heartbeat_loop(shared.clone()));
         Self { shared, heartbeat }
+    }
+
+    pub(crate) fn modern_gate_reader(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move || {
+            shared
+                .modern_downstream_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     fn request_context(context: &RequestContext<RoleServer>) -> ipc::IpcMcpRequestContext {
@@ -903,7 +916,7 @@ impl ServerHandler for IpcProxyHandler {
             tracing::info!(
                 client = %client_name,
                 requested_protocol = %request.protocol_version,
-                selected_protocol = plug_core::protocol::SUPPORTED_PROTOCOL_VERSION,
+                selected_protocol = selected_protocol_for_log(&request.protocol_version),
                 "client connected via IPC proxy"
             );
             self.shared.conn.lock().await.client_info = Some(client_name.clone());
@@ -1845,6 +1858,18 @@ mod tests {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn selected_protocol_log_uses_requested_protocol_version() {
+        assert_eq!(
+            selected_protocol_for_log(&ProtocolVersion::V_2026_07_28),
+            plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            selected_protocol_for_log(&ProtocolVersion::V_2025_11_25),
+            plug_core::protocol::SUPPORTED_PROTOCOL_VERSION
+        );
+    }
 
     // Shared with the daemon and runtime test modules: every test that touches the
     // global runtime-paths slot must serialize on the SAME lock so the suite is
