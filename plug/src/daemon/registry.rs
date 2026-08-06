@@ -44,21 +44,16 @@ impl ClientRegistry {
         )
     }
 
-    /// Register a new client, returning the assigned session ID.
+    /// Register a live local client, returning the assigned session ID.
     ///
-    /// Enforces a cap on concurrently registered proxy sessions while still
-    /// allowing an existing client ID to replace its prior session.
-    pub(super) fn try_register(
+    /// The Unix socket and connection lifetime are the resource boundary. Each
+    /// connection is automatically deregistered when its socket closes, while a
+    /// reconnect with the same stable client ID replaces the prior session.
+    pub(super) fn register(
         &self,
         client_id: String,
         client_info: Option<String>,
-        max_clients: usize,
-    ) -> Result<RegistrationResult, ()> {
-        let replacing_existing_client = self.client_sessions.contains_key(&client_id);
-        if !replacing_existing_client && self.sessions.len() >= max_clients {
-            return Err(());
-        }
-
+    ) -> RegistrationResult {
         let session_id = uuid::Uuid::new_v4().to_string();
         let cancellation_capability = format!(
             "{}{}",
@@ -88,11 +83,11 @@ impl ClientRegistry {
             },
         );
         self.count_tx.send_modify(|c| *c = self.sessions.len());
-        Ok(RegistrationResult {
+        RegistrationResult {
             session_id,
             replaced_session_id,
             cancellation_capability,
-        })
+        }
     }
 
     /// Deregister a client session.
@@ -229,26 +224,24 @@ impl ClientRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::MAX_REGISTERED_PROXY_CLIENTS;
+
+    #[test]
+    fn registration_does_not_reject_live_desktop_connections_at_an_arbitrary_count() {
+        let (registry, _count_rx) = ClientRegistry::new();
+
+        for i in 0..256 {
+            registry.register(format!("client-{i}"), Some("codex-desktop".to_string()));
+        }
+
+        assert_eq!(registry.count(), 256);
+    }
 
     #[test]
     fn register_replaces_existing_session_for_same_client_id() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        let first = registry
-            .try_register(
-                "client-123".to_string(),
-                Some("claude-code".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("first registration");
-        let second = registry
-            .try_register(
-                "client-123".to_string(),
-                Some("claude-code".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("second registration");
+        let first = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+        let second = registry.register("client-123".to_string(), Some("claude-code".to_string()));
 
         assert!(first.replaced_session_id.is_none());
         assert_eq!(
@@ -268,87 +261,12 @@ mod tests {
     fn deregistering_replaced_session_does_not_remove_active_replacement() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        let first = registry
-            .try_register(
-                "client-123".to_string(),
-                Some("claude-code".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("first registration");
-        let second = registry
-            .try_register(
-                "client-123".to_string(),
-                Some("claude-code".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("second registration");
+        let first = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+        let second = registry.register("client-123".to_string(), Some("claude-code".to_string()));
 
         registry.deregister(&first.session_id);
 
         assert!(registry.session_exists(&second.session_id));
         assert_eq!(registry.count(), 1);
-    }
-
-    #[test]
-    fn registration_rejects_new_client_once_cap_is_reached() {
-        let (registry, _count_rx) = ClientRegistry::new();
-
-        for i in 0..MAX_REGISTERED_PROXY_CLIENTS {
-            registry
-                .try_register(
-                    format!("client-{i}"),
-                    Some("claude-code".to_string()),
-                    MAX_REGISTERED_PROXY_CLIENTS,
-                )
-                .expect("registration within cap");
-        }
-
-        let overflow = registry.try_register(
-            "overflow-client".to_string(),
-            Some("claude-code".to_string()),
-            MAX_REGISTERED_PROXY_CLIENTS,
-        );
-
-        assert!(overflow.is_err(), "new client should be rejected at cap");
-        assert_eq!(registry.count(), MAX_REGISTERED_PROXY_CLIENTS);
-    }
-
-    #[test]
-    fn registration_allows_existing_client_to_replace_session_at_cap() {
-        let (registry, _count_rx) = ClientRegistry::new();
-
-        let original = registry
-            .try_register(
-                "stable-client".to_string(),
-                Some("claude-code".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("initial registration");
-
-        for i in 1..MAX_REGISTERED_PROXY_CLIENTS {
-            registry
-                .try_register(
-                    format!("other-client-{i}"),
-                    Some("claude-code".to_string()),
-                    MAX_REGISTERED_PROXY_CLIENTS,
-                )
-                .expect("fill cap");
-        }
-
-        let replacement = registry
-            .try_register(
-                "stable-client".to_string(),
-                Some("claude-code".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("replacement at cap");
-
-        assert_eq!(
-            replacement.replaced_session_id.as_deref(),
-            Some(original.session_id.as_str())
-        );
-        assert_eq!(registry.count(), MAX_REGISTERED_PROXY_CLIENTS);
-        assert!(!registry.session_exists(&original.session_id));
-        assert!(registry.session_exists(&replacement.session_id));
     }
 }

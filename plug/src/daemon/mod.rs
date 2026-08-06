@@ -43,13 +43,6 @@ use notify::send_ipc_control_notification;
 mod mcp_dispatch;
 use mcp_dispatch::dispatch_mcp_request;
 
-/// Maximum concurrently registered proxy client sessions.
-///
-/// Short-lived admin/query sockets are not counted toward this limit so runtime
-/// inspection remains available even when many long-lived `plug connect`
-/// clients are active.
-const MAX_REGISTERED_PROXY_CLIENTS: usize = 32;
-
 /// Idle timeout for short-lived IPC connections (status queries, admin commands).
 /// Proxy connections (those that have called Register) are exempt from this timeout.
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1140,26 +1133,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if let Some(ref old_session) = ctx.session_id {
                 ctx.client_registry.deregister(old_session);
             }
-            let registration = match ctx.client_registry.try_register(
-                client_id.clone(),
-                client_info.clone(),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            ) {
-                Ok(registration) => registration,
-                Err(()) => {
-                    tracing::warn!(
-                        client_id = %client_id,
-                        max_registered_proxy_clients = MAX_REGISTERED_PROXY_CLIENTS,
-                        "proxy client registration rejected: max registered sessions reached"
-                    );
-                    return IpcResponse::Error {
-                        code: "MAX_CONNECTIONS_REACHED".to_string(),
-                        message: format!(
-                            "maximum registered proxy sessions reached ({MAX_REGISTERED_PROXY_CLIENTS})"
-                        ),
-                    };
-                }
-            };
+            let registration = ctx
+                .client_registry
+                .register(client_id.clone(), client_info.clone());
             if let Some(ref replaced_session_id) = registration.replaced_session_id {
                 tracing::info!(
                     client_id = %client_id,
@@ -1905,20 +1881,8 @@ mod tests {
     #[test]
     fn cancellation_identity_cannot_cross_client_boundary() {
         let (registry, _count_rx) = ClientRegistry::new();
-        let first = registry
-            .try_register(
-                "first-client".to_string(),
-                Some("client".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("register first client");
-        let second = registry
-            .try_register(
-                "second-client".to_string(),
-                Some("client".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("register second client");
+        let first = registry.register("first-client".to_string(), Some("client".to_string()));
+        let second = registry.register("second-client".to_string(), Some("client".to_string()));
 
         assert!(
             reject_invalid_cancellation_identity(
@@ -2091,9 +2055,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grace_period_shuts_down_when_no_http_sessions() {
         let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry
-            .try_register("client-1".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
-            .expect("register");
+        let registration = registry.register("client-1".to_string(), None);
 
         let daemon_cancel = CancellationToken::new();
         let grace_cancel = CancellationToken::new();
@@ -2121,9 +2083,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grace_period_rearms_when_http_sessions_drain_to_zero() {
         let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry
-            .try_register("client-1".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
-            .expect("register");
+        let registration = registry.register("client-1".to_string(), None);
 
         let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
         let http_session_id = session_store.create_session().expect("session");
@@ -2167,9 +2127,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grace_period_ipc_reconnect_during_held_alive_resumes_watching() {
         let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry
-            .try_register("client-1".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
-            .expect("register");
+        let registration = registry.register("client-1".to_string(), None);
 
         let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
         let _http_session_id = session_store.create_session().expect("session");
@@ -2194,9 +2152,7 @@ mod tests {
         assert!(!daemon_cancel.is_cancelled());
 
         // An IPC client reconnects while the daemon is held alive by the HTTP session.
-        let reconnect = registry
-            .try_register("client-2".to_string(), None, MAX_REGISTERED_PROXY_CLIENTS)
-            .expect("reconnect");
+        let reconnect = registry.register("client-2".to_string(), None);
 
         // Give the re-check loop's `count_rx.changed()` branch time to observe it.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2507,13 +2463,7 @@ mod tests {
 
         let (registry, _count_rx) = ClientRegistry::new();
         let registry = Arc::new(registry);
-        let reg_result = registry
-            .try_register(
-                "test-client".to_string(),
-                Some("test".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("registration");
+        let reg_result = registry.register("test-client".to_string(), Some("test".to_string()));
         // Capabilities default to None for elicitation/sampling
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -2585,13 +2535,7 @@ mod tests {
 
         let (registry, _count_rx) = ClientRegistry::new();
         let registry = Arc::new(registry);
-        let reg_result = registry
-            .try_register(
-                "test-client".to_string(),
-                Some("test".to_string()),
-                MAX_REGISTERED_PROXY_CLIENTS,
-            )
-            .expect("registration");
+        let reg_result = registry.register("test-client".to_string(), Some("test".to_string()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let bridge = DaemonBridge {
