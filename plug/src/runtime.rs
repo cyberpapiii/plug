@@ -876,29 +876,6 @@ pub(crate) async fn connect_via_daemon(
     Ok(())
 }
 
-pub(crate) async fn connect_standalone(
-    config_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<()> {
-    let config = plug_core::config::load_config(config_path)?;
-    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
-    engine.start().await?;
-    let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
-    let modern_downstream_enabled = engine.config().http.modern_downstream_enabled;
-    proxy.set_modern_downstream_enabled(modern_downstream_enabled);
-    let router = Arc::clone(proxy.router());
-    let modern_gate: Arc<dyn Fn() -> bool + Send + Sync> =
-        Arc::new(move || router.modern_downstream_enabled());
-    use rmcp::ServiceExt as _;
-    let transport = stdio_transport(modern_gate);
-    let service = proxy
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let _ = service.waiting().await;
-    engine.shutdown().await;
-    Ok(())
-}
-
 pub(crate) fn auto_start_daemon(
     config_path: Option<&std::path::PathBuf>,
 ) -> anyhow::Result<std::process::Child> {
@@ -943,8 +920,13 @@ impl std::fmt::Display for DaemonStartupContention {
 
 impl std::error::Error for DaemonStartupContention {}
 
-fn allows_standalone_fallback(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<DaemonStartupContention>().is_none()
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonProxyFailurePolicy {
+    RefuseStandalone,
+}
+
+fn daemon_proxy_failure_policy(_error: &anyhow::Error) -> DaemonProxyFailurePolicy {
+    DaemonProxyFailurePolicy::RefuseStandalone
 }
 
 async fn wait_for_daemon_ready_with_timeouts(
@@ -1027,20 +1009,18 @@ pub(crate) async fn daemon_query<T>(
 }
 
 pub(crate) async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    match connect_via_daemon(config_path).await {
-        Ok(()) => return Ok(()),
-        Err(error) if !allows_standalone_fallback(&error) => {
-            tracing::error!(
-                error = %error,
-                "daemon startup is still owned by another process; refusing duplicate standalone startup"
-            );
-            return Err(error);
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "daemon proxy failed — falling back to standalone mode");
+    if let Err(error) = connect_via_daemon(config_path).await {
+        match daemon_proxy_failure_policy(&error) {
+            DaemonProxyFailurePolicy::RefuseStandalone => {
+                tracing::error!(
+                    error = %error,
+                        "daemon proxy failed; refusing to start a private engine"
+                );
+                return Err(error);
+            }
         }
     }
-    connect_standalone(config_path).await
+    Ok(())
 }
 
 pub(crate) async fn cmd_start(
@@ -1885,7 +1865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_winner_lock_times_out_without_allowing_standalone_fallback() {
+    async fn daemon_failures_never_allow_standalone_fallback() {
         let _guard = runtime_path_test_lock().lock().await;
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let runtime_root = std::path::PathBuf::from(format!("/tmp/plug-cr-{suffix}"));
@@ -1909,13 +1889,16 @@ mod tests {
         .await
         .expect_err("held winner without a socket must fail closed");
         assert!(error.downcast_ref::<DaemonStartupContention>().is_some());
-        assert!(
-            !allows_standalone_fallback(&error),
-            "lock contention must never reopen duplicate standalone startup"
+        assert_eq!(
+            daemon_proxy_failure_policy(&error),
+            DaemonProxyFailurePolicy::RefuseStandalone,
+            "lock contention must refuse duplicate standalone startup"
         );
-        assert!(allows_standalone_fallback(&anyhow::anyhow!(
-            "ordinary daemon failure"
-        )));
+        assert_eq!(
+            daemon_proxy_failure_policy(&anyhow::anyhow!("ordinary daemon failure")),
+            DaemonProxyFailurePolicy::RefuseStandalone,
+            "ordinary daemon failures must not fork a private engine"
+        );
 
         drop(winning_lock);
         clear_test_runtime_paths();
