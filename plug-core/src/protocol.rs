@@ -508,6 +508,10 @@ pub fn rewrite_legacy_result(value: &mut serde_json::Value, task_response: bool)
     // on paginated results even while Plug deliberately negotiates 2025-11-25.
     // Never expose that modern-only discriminator on a legacy connection.
     result.remove("resultType");
+    // Synthesized catalog pages carry modern cache directives for 2026 clients.
+    // Legacy peers must not see ttlMs / cacheScope on ordinary list results.
+    result.remove("ttlMs");
+    result.remove("cacheScope");
 
     if task_response
         && let Some(task) = result
@@ -828,5 +832,22 @@ mod tests {
         assert_eq!(value["capabilities"]["tasks"], serde_json::json!({}));
         assert!(value["capabilities"].get("extensions").is_none());
         assert!(value["capabilities"].get("experimental").is_none());
+    }
+
+    #[test]
+    fn legacy_result_rewrite_strips_modern_catalog_cache_directives() {
+        let mut value = serde_json::json!({
+            "resultType": "complete",
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "tools": []
+        });
+
+        rewrite_legacy_result(&mut value, false);
+
+        assert!(value.get("resultType").is_none());
+        assert!(value.get("ttlMs").is_none());
+        assert!(value.get("cacheScope").is_none());
+        assert_eq!(value["tools"], serde_json::json!([]));
     }
 }

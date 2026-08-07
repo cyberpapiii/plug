@@ -7,7 +7,7 @@ about dependency shape, not roadmap status.
 
 ## Core Runtime
 
-- `rmcp` `=2.2.0`
+- `rmcp` `=3.1.0`
   MCP protocol implementation for both downstream server handlers and upstream client sessions.
   Version policy: exact pin. RMCP releases can change model types, negotiated
   protocol behavior, and transport helper contracts, so every upgrade is a

@@ -105,9 +105,10 @@ No roadmap-relevant implementation is currently classified as `exists off-main`.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era
-multi-round bridging, task-plus-multi-round calls, Apps/UI capability
-advertisement, and synthesized multi-upstream cache directives remain missing
-and are intentionally suppressed rather than advertised.
+multi-round bridging, task-plus-multi-round calls, and Apps/UI capability
+advertisement remain intentionally suppressed rather than advertised.
+Synthesized multi-upstream catalog pages emit conservative cache directives
+(`ttlMs: 0`, `cacheScope: private`) for modern peers; legacy responses strip them.
 
 ## Release Status
 
@@ -130,9 +131,10 @@ stable RMCP 2.2.0 release. Plug migrated to RMCP's spec-aligned model types,
 accepts cancellation notifications without a request id without touching an
 unrelated active call, and keeps its existing stdio, Streamable HTTP, daemon
 IPC, OAuth, Tasks, elicitation, sampling, resources, prompts, completion, and
-notification behavior. The negotiated MCP wire revision remains `2025-11-25`;
-stdio and daemon-IPC clients requesting the announced-but-unimplemented
-`2026-07-28` revision are rejected. See
+notification behavior. At that historical point the negotiated wire revision
+remained `2025-11-25` and `2026-07-28` was still rejected. PR #68 later upgraded
+to RMCP 3.1.0 and added gated dual-era support; see the top of this snapshot for
+current truth. Historical notes:
 [`RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md`](RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md).
 
 The same release refreshed all direct Rust dependencies to their latest

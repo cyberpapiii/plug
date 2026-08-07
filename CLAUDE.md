@@ -136,7 +136,7 @@ Every roadmap-affecting PR should complete this checklist after merge:
 ## Tech Stack
 
 - Rust 2024 edition
-- `rmcp` 2.2.0 (exact workspace pin)
+- `rmcp` 3.1.0 (exact workspace pin)
 - Tokio
 - Axum
 - DashMap

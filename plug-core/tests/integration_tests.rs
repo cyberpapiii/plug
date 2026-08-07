@@ -1371,8 +1371,11 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
     let projected_page = modern_engine
         .tool_router()
         .list_tools_page_for_client(ClientType::Unknown, None);
-    assert_eq!(projected_page.ttl_ms, None);
-    assert_eq!(projected_page.cache_scope, None);
+    assert_eq!(projected_page.ttl_ms, Some(0));
+    assert_eq!(
+        projected_page.cache_scope,
+        Some(rmcp::model::CacheScope::Private)
+    );
     let routed_meta = routed_tool.meta.as_ref().expect("admitted U7 metadata");
     assert_eq!(
         routed_meta.get("example.test/typed"),
