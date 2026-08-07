@@ -8,10 +8,11 @@ golden_replayer="$repo_root/scripts/fleet/golden.py"
 contract_checker="$repo_root/scripts/fleet/contract.py"
 load_runner="$repo_root/scripts/fleet/load.py"
 fault_runner="$repo_root/scripts/fleet/fault.py"
+obs_runner="$repo_root/scripts/fleet/obs.py"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract|load|fault]
+Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract|load|fault|obs]
 
 Stages:
   conformance        Fast gate: MCP inventory plus selector self-test
@@ -20,7 +21,8 @@ Stages:
   contract           Check mock MCP list responses against committed contracts
   load               Concurrent sessions against a mock upstream (default: 2 x 5m)
   fault              Expected failure/recovery checks against mock upstream faults
-  all                Run fast stages; load and fault stages remain opt-in (default)
+  obs                Required fleet observability signals (default: 2 x 5s)
+  all                Run fast stages; load, fault, and obs remain opt-in (default)
 EOF
 }
 
@@ -167,6 +169,28 @@ run_fault() {
   return 1
 }
 
+run_obs() {
+  printf '%-16s %s\n' 'stage' 'obs'
+  printf '%-16s %s\n' 'scope' 'latency/errors/in-flight/process resources/stderr'
+  if [ ! -f "$obs_runner" ]; then
+    printf 'fleet-truth: missing obs runner: %s\n' "$obs_runner" >&2
+    printf '%s\n' 'STAGE obs FAIL'
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'fleet-truth: python3 is required for obs checks' >&2
+    printf '%s\n' 'STAGE obs FAIL'
+    return 1
+  fi
+  if PYTHONDONTWRITEBYTECODE=1 python3 "$obs_runner"; then
+    printf '%s\n' 'STAGE obs PASS'
+    return 0
+  fi
+
+  printf '%s\n' 'STAGE obs FAIL'
+  return 1
+}
+
 run_all() {
   local result=0
   run_conformance || result=$?
@@ -174,6 +198,7 @@ run_all() {
   run_contract || result=$?
   printf '%s\n' 'STAGE load SKIP (opt-in: scripts/fleet-truth.sh load)'
   printf '%s\n' 'STAGE fault SKIP (opt-in: scripts/fleet-truth.sh fault)'
+  printf '%s\n' 'STAGE obs SKIP (opt-in: scripts/fleet-truth.sh obs)'
   printf '%s\n' 'STAGE fleet-runtime SKIP (not implemented)'
   printf '%s\n' 'STAGE fleet-official SKIP (opt-in only)'
   return "$result"
@@ -188,6 +213,7 @@ case "$mode" in
   contract) run_contract ;;
   load) run_load ;;
   fault) run_fault ;;
+  obs) run_obs ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

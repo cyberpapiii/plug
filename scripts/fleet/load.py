@@ -123,7 +123,12 @@ def write_config(path: pathlib.Path, mock_server: pathlib.Path, sessions: int) -
 
 class McpSession:
     def __init__(
-        self, plug: pathlib.Path, config: pathlib.Path, env: dict[str, str], index: int
+        self,
+        plug: pathlib.Path,
+        config: pathlib.Path,
+        env: dict[str, str],
+        index: int,
+        stderr: Any = subprocess.DEVNULL,
     ) -> None:
         self.index = index
         self.next_id = 1
@@ -133,7 +138,7 @@ class McpSession:
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr,
             text=True,
             bufsize=1,
         )
