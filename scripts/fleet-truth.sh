@@ -9,6 +9,7 @@ contract_checker="$repo_root/scripts/fleet/contract.py"
 load_runner="$repo_root/scripts/fleet/load.py"
 fault_runner="$repo_root/scripts/fleet/fault.py"
 obs_runner="$repo_root/scripts/fleet/obs.py"
+baseline_runner="$repo_root/scripts/fleet/baseline.py"
 
 usage() {
   cat <<'EOF'
@@ -22,7 +23,7 @@ Stages:
   load               Concurrent sessions against a mock upstream (default: 2 x 5m)
   fault              Expected failure/recovery checks against mock upstream faults
   obs                Required fleet observability signals (default: 2 x 5s)
-  all                Run fast stages; load, fault, and obs remain opt-in (default)
+  all                Run fast stages, print the fleet table, and update BASELINE.md (default)
 EOF
 }
 
@@ -192,16 +193,15 @@ run_obs() {
 }
 
 run_all() {
-  local result=0
-  run_conformance || result=$?
-  run_golden || result=$?
-  run_contract || result=$?
-  printf '%s\n' 'STAGE load SKIP (opt-in: scripts/fleet-truth.sh load)'
-  printf '%s\n' 'STAGE fault SKIP (opt-in: scripts/fleet-truth.sh fault)'
-  printf '%s\n' 'STAGE obs SKIP (opt-in: scripts/fleet-truth.sh obs)'
-  printf '%s\n' 'STAGE fleet-runtime SKIP (not implemented)'
-  printf '%s\n' 'STAGE fleet-official SKIP (opt-in only)'
-  return "$result"
+  if [ ! -f "$baseline_runner" ]; then
+    printf 'fleet-truth: missing baseline runner: %s\n' "$baseline_runner" >&2
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'fleet-truth: python3 is required for the baseline summary' >&2
+    return 1
+  fi
+  PYTHONDONTWRITEBYTECODE=1 python3 "$baseline_runner"
 }
 
 mode=${1:-all}
