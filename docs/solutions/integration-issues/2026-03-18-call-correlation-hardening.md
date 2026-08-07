@@ -3,6 +3,11 @@ title: Call correlation hardening for reverse requests, progress, and cancellati
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/http
+problem_type: integration_issue
+summary: The router previously treated several multiplexed behaviors as if one upstream server implied one downstream owner
+tags:
+  - integration-issues
 ---
 
 # Call correlation hardening for reverse requests, progress, and cancellation

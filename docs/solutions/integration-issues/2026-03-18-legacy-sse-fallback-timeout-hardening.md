@@ -3,6 +3,14 @@ title: Legacy SSE fallback and endpoint timeout hardening
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/http
+problem_type: integration_issue
+summary: The legacy SSE path had two brittle behaviors
+tags:
+  - sse
+  - legacy
+  - timeout
+  - integration-issues
 ---
 
 # Legacy SSE fallback and endpoint timeout hardening

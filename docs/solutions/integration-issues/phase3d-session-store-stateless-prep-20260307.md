@@ -31,6 +31,8 @@ related:
   - plug-core/src/http/server.rs
   - plug-core/src/http/session.rs
   - plug/src/runtime.rs
+problem_type: integration_issue
+summary: The code already had a working stateful downstream session manager, but it was still embedded inside the HTTP module.
 ---
 
 # Phase 3D session-store abstraction keeps HTTP behavior stable while creating the stateless seam

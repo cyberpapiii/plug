@@ -3,6 +3,12 @@ title: Upstream replacement now retires old connections explicitly and engine sh
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/upstream
+problem_type: integration_issue
+summary: "Reconnect and restart cutover still relied too heavily on `Drop` behavior"
+tags:
+  - upstream
+  - integration-issues
 ---
 
 # Upstream replacement now retires old connections explicitly and engine shutdown stays bounded

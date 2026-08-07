@@ -48,7 +48,7 @@ CE remains the operating system. In this repo, doc roles are:
 - intended work:
   - `docs/plans/*.md`
 - historical / compound knowledge:
-  - `docs/solutions/*.md` — searchable store of documented solutions (bugs, best practices, design patterns) by category, with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in a documented area
+  - `docs/solutions/` — searchable store of documented solutions (bugs, best practices, design patterns) by category; start at `docs/solutions/README.md`; learnings use YAML frontmatter (`module`, `tags`, `problem_type`, `summary`); relevant when implementing or debugging in a documented area
   - `docs/research/*.md`
   - older phase plans
 - tracked issues:

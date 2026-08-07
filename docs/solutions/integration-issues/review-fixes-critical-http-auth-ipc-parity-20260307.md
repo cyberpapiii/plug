@@ -30,6 +30,8 @@ related:
   - plug/src/ipc_proxy.rs
   - plug-core/src/proxy/mod.rs
   - plug-core/src/notifications.rs
+problem_type: integration_issue
+summary: The Phase 2 / Phase 3 rollout was broadly sound, but the review found a few issues that were both real and severe enough to fix immediately
 ---
 
 # Critical review fixes: authenticated HTTP upstreams, daemon IPC parity, and active-call cleanup

@@ -3,6 +3,13 @@ title: HTTP reverse requests now fail fast when no live SSE consumer exists
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/http
+problem_type: integration_issue
+summary: Reverse requests to downstream HTTP sessions still allocated timeout-backed pending state even when there was no live SSE consumer to receive them.
+tags:
+  - sse
+  - http
+  - integration-issues
 ---
 
 # HTTP reverse requests now fail fast when no live SSE consumer exists

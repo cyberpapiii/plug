@@ -4,6 +4,8 @@ module: "downstream-oauth"
 tags: [oauth, mcp, dcr, cursor, pkce, resource-indicators]
 problem_type: integration
 date: 2026-07-17
+problem_type: integration_issue
+summary: Plug's original downstream OAuth server recognized one client ID, one optional secret, and one operator-maintained redirect allowlist. Discovery succeeded, but a client such as Cursor stopped because the authorization server could not regis...
 ---
 
 # Use dynamic public-client OAuth for remote MCP clients

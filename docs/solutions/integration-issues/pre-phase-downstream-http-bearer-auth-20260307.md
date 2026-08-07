@@ -8,6 +8,8 @@ root_cause: "HTTP server designed for localhost-only use, then extended to non-l
 date: 2026-03-07
 pr: "#25"
 branch: feat/pre-phase-http-auth
+problem_type: integration_issue
+summary: "plug's downstream HTTP server (`plug serve`) had no authentication. The only protection was origin validation middleware that rejected non-localhost origins, but this is insufficient for remote access (phone clients, remote AI assistants). ..."
 ---
 
 # Downstream HTTP Bearer Token Authentication

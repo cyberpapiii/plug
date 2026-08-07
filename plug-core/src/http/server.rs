@@ -1230,9 +1230,7 @@ async fn send_http_client_request(
     timeout: Option<Duration>,
 ) -> Result<ClientResult, McpError> {
     let id = i64::try_from(state.reverse_request_counter.fetch_add(1, Ordering::SeqCst))
-        .map_err(|_| {
-            McpError::internal_error("reverse request id overflow".to_string(), None)
-        })?;
+        .map_err(|_| McpError::internal_error("reverse request id overflow".to_string(), None))?;
     let request_id = RequestId::from(NumberOrString::Number(id));
     let message = ServerJsonRpcMessage::request(request, request_id);
     let message = serde_json::to_value(message)
@@ -2889,6 +2887,10 @@ mod tests {
 
     fn enable_test_task_surface(router: &ToolRouter) {
         router.replace_snapshot(RouterSnapshot {
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: HashMap::from([(
                 "Mock__echo".to_string(),
                 ("mock".to_string(), "echo".to_string()),
@@ -3830,6 +3832,10 @@ mod tests {
         // Give the router a routable tool so `enqueue_tool_task` can create a
         // task record for this session without needing a live upstream.
         state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: std::collections::HashMap::from([(
                 "git__commit".to_string(),
                 ("git".to_string(), "commit".to_string()),
@@ -4198,6 +4204,10 @@ mod tests {
         });
 
         state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: std::collections::HashMap::from([(
                 "Git__commit".to_string(),
                 ("git".to_string(), "commit".to_string()),

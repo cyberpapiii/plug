@@ -27,6 +27,8 @@ related:
   - plug-core/tests/integration_tests.rs
   - plug-core/src/proxy/mod.rs
   - docs/solutions/integration-issues/proxy-timeout-handling-semaphore-bounds-stdio-reconnect-20260306.md
+problem_type: integration_issue
+summary: Post-v0.2 upstream restart recovery was already correct; it needed an end-to-end proof
 ---
 
 # Post-v0.2 upstream restart recovery was already correct; it needed an end-to-end proof

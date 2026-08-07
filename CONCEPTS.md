@@ -14,6 +14,16 @@ The authoritative mapping from a downstream-visible MCP item to the Upstream and
 
 Routes are published as coherent snapshots so listing and invocation see the same ownership view. When a route changes, persistent state tied to the old owner, such as a resource subscription, must be reconciled rather than inferred only from the new snapshot.
 
+### Catalog refresh
+The rebuild of the published merged MCP surface — tools, resources, prompts, and Routes — from current Upstream listings.
+
+A catalog refresh is distinct from connection health probes. Reload may skip it when only Tool shaping changed, because shaping is not applied to the live routing view without a process restart.
+
+### Tool shaping
+Configuration that controls how the merged tool surface is named, filtered, prioritized, disabled, or lazily exposed to Downstreams.
+
+Tool shaping is restart-required for the live routing view: a config reload that only changes shaping does not rewrite the in-memory shaping policy, so a Catalog refresh alone would rebuild Routes with stale shaping.
+
 ### Resource subscription
 A downstream request for change notifications on a resource URI, represented in Plug as shared membership backed by one confirmed upstream subscription.
 

@@ -32,6 +32,8 @@ related:
   - plug/src/daemon/mod.rs
   - plug/src/ipc_proxy.rs
   - plug/src/runtime.rs
+problem_type: integration_issue
+summary: The reconnect story at the daemon boundary looked complete on paper
 ---
 
 # Phase 3C daemon continuity recovery requires active IPC connections to honor daemon shutdown

@@ -3,6 +3,13 @@ title: OAuth credential reads now use one freshest-persisted snapshot path
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/oauth
+problem_type: integration_issue
+summary: The OAuth store still had two different read behaviors
+tags:
+  - oauth
+  - auth
+  - integration-issues
 ---
 
 # OAuth credential reads now use one freshest-persisted snapshot path

@@ -3,6 +3,14 @@ title: Legacy SSE startup and backlog handling are hardened and health checks us
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/http
+problem_type: integration_issue
+summary: Three reliability gaps were still open after the earlier SSE hardening work
+tags:
+  - health
+  - sse
+  - legacy
+  - integration-issues
 ---
 
 # Legacy SSE startup and backlog handling are hardened and health checks use lighter liveness probes

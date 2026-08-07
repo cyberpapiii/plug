@@ -19,6 +19,7 @@ tags:
   - lifecycle
   - mcp
   - rust
+summary: "Resource subscription state spans two systems: Plug records downstream members locally, while an upstream MCP server owns the actual `resources/subscribe` state. A local `HashSet` plus first-subscriber/last-subscriber calls is not enough on..."
 ---
 
 # Serialize resource-subscription transitions and reconcile the confirmed owner

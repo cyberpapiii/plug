@@ -20,6 +20,7 @@ tags:
   - oauth
   - self-signed-cert
   - developer-experience
+summary: On macOS, plug re-prompts for Keychain access ("plug wants to use your confidential information stored in 'plug' in your keychain") constantly — every time an agent or app that talks to plug starts. Clicking **Always Allow** does not stop i...
 ---
 
 # A stable self-signed code-signing identity stops repeated macOS Keychain prompts
