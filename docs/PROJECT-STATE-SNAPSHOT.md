@@ -97,7 +97,8 @@ Implemented on `main`:
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
-- some low-priority internal simplification remains possible in reload/session/SSE helper structure, but no roadmap-critical correctness work remains open
+- some low-priority internal simplification remains possible in reload/session helpers, but no roadmap-critical correctness work remains open
+- official modern npm conformance remains opt-in evidence (`0.2.0-alpha.10`); use mock `--official-modern-fixture` plus `enable_prefix = false` for suite content rows; elicitation/sampling/progress/logging fixture rows stay expected-fail until reverse-request fixture coverage lands
 
 ## What Exists Off-Main
 

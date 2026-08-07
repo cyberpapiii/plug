@@ -74,37 +74,36 @@ where
     Sse::new(stream)
 }
 
+/// Collect SSE events from a response body until the stream ends or timeout.
+/// Shared by HTTP SSE unit tests so `server` and `sse` modules do not diverge.
+#[cfg(test)]
+pub(crate) async fn collect_sse_events(body: axum::body::Body, max_events: usize) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut stream = body.into_data_stream();
+
+    let timeout = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            for part in text.split("\n\n") {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    events.push(trimmed.to_string());
+                }
+            }
+            if events.len() >= max_events {
+                break;
+            }
+        }
+    });
+
+    let _ = timeout.await;
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
     use axum::response::IntoResponse;
-
-    /// Collect SSE events from the response body until the stream ends or timeout.
-    async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
-        let mut events = Vec::new();
-        let mut stream = body.into_data_stream();
-        use futures::StreamExt;
-
-        let timeout = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(Ok(chunk)) = stream.next().await {
-                let text = String::from_utf8_lossy(&chunk).to_string();
-                // Split into individual events (separated by double newlines)
-                for part in text.split("\n\n") {
-                    let trimmed = part.trim();
-                    if !trimmed.is_empty() {
-                        events.push(trimmed.to_string());
-                    }
-                }
-                if events.len() >= max_events {
-                    break;
-                }
-            }
-        });
-
-        let _ = timeout.await;
-        events
-    }
 
     #[tokio::test]
     async fn priming_event_is_first() {

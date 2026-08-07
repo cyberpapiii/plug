@@ -96,7 +96,7 @@ Optional future scope only:
 - fully live runtime reconfiguration, if the product bar is expanded beyond the current release scope
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
-- end-to-end metrics-recording test plus an RAII recording guard, and an operator-guide note on `degraded_since` vs. health divergence (deferred from PR #60)
+- further optional modern follow-through behind gates (`subscriptions/listen`, mixed-era MRTR, task+MRTR) when production clients speak 2026
 
 ## Modernization And Prior Program Phases
 

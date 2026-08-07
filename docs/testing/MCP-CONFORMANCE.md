@@ -104,3 +104,30 @@ expects a command that accepts the scenario server URL appended by the suite.
 Plug does not yet expose that client-adapter contract, so upstream-facing
 official client conformance remains explicitly unavailable rather than being
 papered over with a custom local mock.
+
+## Official modern content fixture (opt-in)
+
+The modern npm suite (`0.2.0-alpha.10`) expects fixed `test_*` / `test://…`
+catalog entries. An empty Plug multiplexer cannot satisfy those rows. For
+operator-driven evidence runs, start the mock harness in fixture mode and
+attach it as the sole upstream with tool prefixing disabled so suite names
+pass through unchanged:
+
+```sh
+# Terminal A — fixture upstream (stdio)
+cargo run -p plug-test-harness --bin mock-mcp-server -- --official-modern-fixture
+
+# Terminal B — disposable Plug HTTP with modern gate on, enable_prefix=false,
+# one stdio upstream pointing at that mock binary, then:
+PLUG_MCP_CONFORMANCE_URL=http://127.0.0.1:<port>/mcp \
+  scripts/check-mcp-conformance.sh official-modern-server
+```
+
+Fixture coverage today: simple/error/image/audio/embedded/mixed tools,
+`test://static-text` / `test://static-binary`, simple + args + image +
+embedded-resource prompts, and `completion/complete`. Rows that need
+client reverse requests or mid-call notifications
+(`test_elicitation`, `test_sampling`, `test_tool_with_logging`,
+`test_tool_with_progress`, …) remain expected-fail until a reverse-request
+fixture lands. The suite package is still alpha — never report a green
+opt-in run as stable certification. Modern gates stay default-off.

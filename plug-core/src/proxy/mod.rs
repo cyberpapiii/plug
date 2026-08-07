@@ -2946,6 +2946,36 @@ impl ToolRouter {
             // Drop semaphore permit
             drop(permit);
 
+            // Metrics RAII: any early exit / panic after await still records a
+            // failure unless a terminal arm settles the guard first.
+            struct MetricsCallGuard<'a> {
+                server_manager: &'a ServerManager,
+                server_id: String,
+                start: std::time::Instant,
+                settled: bool,
+            }
+            impl MetricsCallGuard<'_> {
+                fn settle(&mut self, ok: bool) {
+                    if self.settled {
+                        return;
+                    }
+                    let duration_ms = self.start.elapsed().as_millis() as u64;
+                    self.server_manager
+                        .record_call(&self.server_id, ok, duration_ms);
+                    self.settled = true;
+                }
+            }
+            impl Drop for MetricsCallGuard<'_> {
+                fn drop(&mut self) {
+                    self.settle(false);
+                }
+            }
+            let mut metrics_guard = MetricsCallGuard {
+                server_manager: &self.server_manager,
+                server_id: server_id.clone(),
+                start: call_start,
+                settled: false,
+            };
             let duration_ms = call_start.elapsed().as_millis() as u64;
 
             // Record circuit breaker outcome
@@ -2959,8 +2989,7 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
-                    self.server_manager
-                        .record_call(&server_id, true, duration_ms);
+                    metrics_guard.settle(true);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }
@@ -2995,8 +3024,7 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_success();
                     }
-                    self.server_manager
-                        .record_call(&server_id, true, duration_ms);
+                    metrics_guard.settle(true);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }
@@ -3063,8 +3091,7 @@ impl ToolRouter {
                             // Count the transient failure that triggered the
                             // reconnect so the degradation blip is visible; the
                             // retry below records its own (terminal) outcome.
-                            self.server_manager
-                                .record_call(&server_id, false, duration_ms);
+                            metrics_guard.settle(false);
                         }
                         Err(reconnect_err) => {
                             tracing::error!(
@@ -3077,8 +3104,7 @@ impl ToolRouter {
                             if let Some(cb) = &cb {
                                 cb.on_failure();
                             }
-                            self.server_manager
-                                .record_call(&server_id, false, duration_ms);
+                            metrics_guard.settle(false);
                             return Err(McpError::internal_error(e.to_string(), None));
                         }
                     }
@@ -3117,8 +3143,7 @@ impl ToolRouter {
                         });
                     }
 
-                    self.server_manager
-                        .record_call(&server_id, false, duration_ms);
+                    metrics_guard.settle(false);
 
                     if matches!(transport_type, crate::config::TransportType::Stdio) {
                         self.reconnect_server_in_background(server_id.clone());
@@ -3138,8 +3163,7 @@ impl ToolRouter {
                     if let Some(cb) = &cb {
                         cb.on_failure();
                     }
-                    self.server_manager
-                        .record_call(&server_id, false, duration_ms);
+                    metrics_guard.settle(false);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }
@@ -3162,8 +3186,7 @@ impl ToolRouter {
                 Ok(other) => {
                     // An unexpected upstream response is a terminal failure —
                     // record it like the other terminal branches.
-                    self.server_manager
-                        .record_call(&server_id, false, duration_ms);
+                    metrics_guard.settle(false);
                     if let Some(ref mut guard) = active_call_guard {
                         guard.disarm();
                     }
