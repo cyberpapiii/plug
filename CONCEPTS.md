@@ -62,6 +62,9 @@ A supervised restart is bounded by an exponential inter-episode backoff so a per
 ### Proactive recovery
 The backoff-bounded reconnect attempted when an upstream has failed or disconnected; the shared mechanism a supervised restart reuses to actually restart (stdio) or reconnect (HTTP/SSE) the upstream.
 
+### Metrics `degraded_since`
+A tool-call degradation clock on `plug status --output json` (`metrics.degraded_since_epoch_secs`). It stamps the start of a failing *call* streak (errors / timeouts that trip call accounting) and clears on the next successful call. Orthogonal to both Server health (probe liveness) and Availability (catalog freshness). An upstream can be connection-healthy and catalog-healthy while still showing `degraded_since` after recent tool-call failures, or the reverse.
+
 ## Flagged ambiguities
 
-- "Degraded" names two distinct, orthogonal states: a **Server health** Degraded (probes failing, upstream still routable) and an **Availability** Degraded (catalog listing failed, serving last-known-good). They must not be conflated.
+- "Degraded" names two distinct, orthogonal states: a **Server health** Degraded (probes failing, upstream still routable) and an **Availability** Degraded (catalog listing failed, serving last-known-good). They must not be conflated. Neither is the metrics `degraded_since` tool-call clock.

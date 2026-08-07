@@ -2821,27 +2821,7 @@ mod tests {
     }
 
     async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
-        let mut events = Vec::new();
-        let mut stream = body.into_data_stream();
-        use futures::StreamExt;
-
-        let timeout = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(Ok(chunk)) = stream.next().await {
-                let text = String::from_utf8_lossy(&chunk).to_string();
-                for part in text.split("\n\n") {
-                    let trimmed = part.trim();
-                    if !trimmed.is_empty() {
-                        events.push(trimmed.to_string());
-                    }
-                }
-                if events.len() >= max_events {
-                    break;
-                }
-            }
-        });
-
-        let _ = timeout.await;
-        events
+        crate::http::sse::collect_sse_events(body, max_events).await
     }
 
     fn sse_event_id(event: &str) -> Option<u64> {

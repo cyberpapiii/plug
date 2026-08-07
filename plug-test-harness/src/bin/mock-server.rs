@@ -90,6 +90,13 @@ struct Args {
     /// lifecycle sequence assertions.
     #[arg(long)]
     request_log_file: Option<String>,
+
+    /// Speak the official `@modelcontextprotocol/conformance` content fixtures
+    /// (`test_simple_text`, `test://static-text`, …). Opt-in evidence only —
+    /// does not change the default mock catalog. Attach under Plug with
+    /// `enable_prefix = false` so suite tool names stay unprefixed.
+    #[arg(long, default_value_t = false)]
+    official_modern_fixture: bool,
 }
 
 async fn append_request_log(path: Option<&str>, method: &str) -> anyhow::Result<()> {
@@ -631,12 +638,336 @@ impl ServerHandler for MockServer {
     }
 }
 
+/// Minimal 1x1 red PNG for official suite image/binary rows.
+const FIXTURE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+struct OfficialModernFixture;
+
+impl OfficialModernFixture {
+    fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
+        Tool::new(
+            Cow::Owned(name.to_string()),
+            Cow::Owned(description.to_string()),
+            Arc::new(rmcp::model::object(schema)),
+        )
+    }
+
+    fn empty_object_schema() -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl ServerHandler for OfficialModernFixture {
+    fn get_info(&self) -> ServerInfo {
+        let mut capabilities = ServerCapabilities::default();
+        let mut tools = ToolsCapability::default();
+        tools.list_changed = Some(false);
+        capabilities.tools = Some(tools);
+        let mut resources = ResourcesCapability::default();
+        resources.subscribe = Some(false);
+        resources.list_changed = Some(false);
+        capabilities.resources = Some(resources);
+        let mut prompts = PromptsCapability::default();
+        prompts.list_changed = Some(false);
+        capabilities.prompts = Some(prompts);
+        capabilities.completions = Some(serde_json::Map::new());
+        InitializeResult::new(capabilities)
+            .with_server_info(Implementation::new("official-modern-fixture", "0.1.0"))
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        async move {
+            let tools = vec![
+                Self::tool(
+                    "test_simple_text",
+                    "Official suite simple text tool",
+                    Self::empty_object_schema(),
+                ),
+                Self::tool(
+                    "test_error_handling",
+                    "Official suite intentional error tool",
+                    Self::empty_object_schema(),
+                ),
+                Self::tool(
+                    "test_image_content",
+                    "Official suite image content tool",
+                    Self::empty_object_schema(),
+                ),
+                Self::tool(
+                    "test_audio_content",
+                    "Official suite audio content tool",
+                    Self::empty_object_schema(),
+                ),
+                Self::tool(
+                    "test_embedded_resource",
+                    "Official suite embedded resource tool",
+                    Self::empty_object_schema(),
+                ),
+                Self::tool(
+                    "test_multiple_content_types",
+                    "Official suite mixed content tool",
+                    Self::empty_object_schema(),
+                ),
+            ];
+            Ok(ListToolsResult::with_all_items(tools))
+        }
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
+        async move {
+            match request.name.as_ref() {
+                "test_simple_text" => Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "This is a simple text response for testing.",
+                )])
+                .into()),
+                "test_error_handling" => Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "This tool intentionally returns an error for testing",
+                )])
+                .into()),
+                "test_image_content" => Ok(CallToolResult::success(vec![ContentBlock::image(
+                    FIXTURE_PNG_B64,
+                    "image/png",
+                )])
+                .into()),
+                "test_audio_content" => {
+                    // Tiny valid-enough WAV header + silence for suite shape checks.
+                    let wav = base64::engine::general_purpose::STANDARD.encode([
+                        0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+                        0x66, 0x6d, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+                        0x44, 0xac, 0x00, 0x00, 0x88, 0x58, 0x01, 0x00, 0x02, 0x00, 0x10, 0x00,
+                        0x64, 0x61, 0x74, 0x61, 0x00, 0x00, 0x00, 0x00,
+                    ]);
+                    Ok(CallToolResult::success(vec![ContentBlock::audio(wav, "audio/wav")]).into())
+                }
+                "test_embedded_resource" => {
+                    let resource = ResourceContents::text(
+                        "This is an embedded resource content.",
+                        "test://embedded-resource",
+                    )
+                    .with_mime_type("text/plain");
+                    Ok(CallToolResult::success(vec![ContentBlock::resource(resource)]).into())
+                }
+                "test_multiple_content_types" => {
+                    let resource = ResourceContents::text(
+                        r#"{"test":"data","value":123}"#,
+                        "test://mixed-content-resource",
+                    )
+                    .with_mime_type("application/json");
+                    Ok(CallToolResult::success(vec![
+                        ContentBlock::text("Multiple content types test:"),
+                        ContentBlock::image(FIXTURE_PNG_B64, "image/png"),
+                        ContentBlock::resource(resource),
+                    ])
+                    .into())
+                }
+                other => Err(McpError::invalid_params(
+                    format!("unknown official fixture tool: {other}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        async move {
+            let resources = vec![
+                Resource::new("test://static-text", "static-text").with_mime_type("text/plain"),
+                Resource::new("test://static-binary", "static-binary").with_mime_type("image/png"),
+            ];
+            Ok(ListResourcesResult::with_all_items(resources))
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
+        async move {
+            match request.uri.as_str() {
+                "test://static-text" => Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(
+                        "This is the content of the static text resource.",
+                        "test://static-text",
+                    )
+                    .with_mime_type("text/plain"),
+                ])
+                .into()),
+                "test://static-binary" => Ok(ReadResourceResult::new(vec![
+                    ResourceContents::blob(FIXTURE_PNG_B64, "test://static-binary")
+                        .with_mime_type("image/png"),
+                ])
+                .into()),
+                other => Err(McpError::resource_not_found(
+                    format!("unknown official fixture resource: {other}"),
+                    Some(serde_json::json!({"uri": other})),
+                )),
+            }
+        }
+    }
+
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
+        async move {
+            let prompts = vec![
+                Prompt::new(
+                    "test_simple_prompt",
+                    Some("Official suite simple prompt"),
+                    None,
+                ),
+                Prompt::new(
+                    "test_prompt_with_arguments",
+                    Some("Official suite prompt with arguments"),
+                    Some(vec![
+                        PromptArgument::new("arg1")
+                            .with_description("First test argument")
+                            .with_required(true),
+                        PromptArgument::new("arg2")
+                            .with_description("Second test argument")
+                            .with_required(true),
+                    ]),
+                ),
+                Prompt::new(
+                    "test_prompt_with_image",
+                    Some("Official suite prompt with image"),
+                    None,
+                ),
+                Prompt::new(
+                    "test_prompt_with_embedded_resource",
+                    Some("Official suite prompt with embedded resource"),
+                    Some(vec![
+                        PromptArgument::new("resourceUri")
+                            .with_description("URI of the resource to embed")
+                            .with_required(true),
+                    ]),
+                ),
+            ];
+            Ok(ListPromptsResult::with_all_items(prompts))
+        }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
+        async move {
+            match request.name.as_str() {
+                "test_simple_prompt" => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    Role::User,
+                    "This is a simple prompt for testing.",
+                )])
+                .into()),
+                "test_prompt_with_arguments" => {
+                    let args = request.arguments.unwrap_or_default();
+                    let arg1 = args
+                        .get("arg1")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let arg2 = args
+                        .get("arg2")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                        Role::User,
+                        format!("Prompt with arguments: arg1='{arg1}', arg2='{arg2}'"),
+                    )])
+                    .into())
+                }
+                "test_prompt_with_image" => Ok(GetPromptResult::new(vec![
+                    PromptMessage::new(
+                        Role::User,
+                        ContentBlock::image(FIXTURE_PNG_B64, "image/png"),
+                    ),
+                    PromptMessage::new_text(Role::User, "Please analyze the image above."),
+                ])
+                .into()),
+                "test_prompt_with_embedded_resource" => {
+                    let args = request.arguments.unwrap_or_default();
+                    let uri = args
+                        .get("resourceUri")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("test://static-text")
+                        .to_string();
+                    Ok(GetPromptResult::new(vec![
+                        PromptMessage::new_resource(
+                            Role::User,
+                            uri,
+                            Some("text/plain".to_string()),
+                            Some("Embedded resource content for testing.".to_string()),
+                            None,
+                            None,
+                            None,
+                        ),
+                        PromptMessage::new_text(
+                            Role::User,
+                            "Please process the embedded resource above.",
+                        ),
+                    ])
+                    .into())
+                }
+                other => Err(McpError::invalid_params(
+                    format!("unknown official fixture prompt: {other}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        async move {
+            let completion = CompletionInfo::with_all_values(vec![
+                "paris".to_string(),
+                "park".to_string(),
+                "party".to_string(),
+            ])
+            .expect("three completion values within MCP max");
+            Ok(CompleteResult::new(completion))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     if args.legacy_tasks {
         return serve_legacy_tasks_stdio().await;
+    }
+    if args.official_modern_fixture {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("MOCK_LOG")
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .compact()
+            .init();
+        tracing::info!("starting official modern conformance fixture server");
+        let transport = rmcp::transport::io::stdio();
+        let service = OfficialModernFixture.serve(transport).await?;
+        service.waiting().await?;
+        return Ok(());
     }
     if matches!(args.lifecycle.as_str(), "legacy-only" | "modern-only") {
         return serve_lifecycle_stdio(&args.lifecycle, args.request_log_file.as_deref()).await;
