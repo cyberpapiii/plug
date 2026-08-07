@@ -21,6 +21,7 @@ tags:
   - bearer-auth
   - oauth
   - dependency-upgrade
+summary: "After Plug upgraded to the exact `rmcp = \"=2.2.0\"` release, static-token-authenticated Streamable HTTP upstreams could no longer initialize. Exa exposed the shared formatting defect; restoring a valid credential alone could not correct the ..."
 ---
 
 # RMCP Streamable HTTP authentication requires raw bearer tokens

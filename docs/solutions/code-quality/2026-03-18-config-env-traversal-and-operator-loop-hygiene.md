@@ -3,6 +3,13 @@ title: Centralized config env traversal and refreshed operator loop state
 date: 2026-03-18
 category: code-quality
 status: completed
+module: plug/cli
+problem_type: best_practice
+summary: There were two small but persistent hygiene issues
+tags:
+  - config
+  - operator
+  - code-quality
 ---
 
 # Centralized config env traversal and refreshed operator loop state

@@ -9,6 +9,8 @@ date: 2026-03-07
 severity: high
 complexity: medium
 reuse_potential: high
+problem_type: integration_issue
+summary: "Every MCP SDK emits log notifications via `notifications/message` by default. plug silently dropped all of them because `UpstreamClientHandler` didn't implement `on_logging_message()`. Additionally"
 ---
 
 # MCP Logging Notification Forwarding (Phase A1)

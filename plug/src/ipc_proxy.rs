@@ -368,16 +368,14 @@ impl IpcProxyHandler {
                 }
             };
 
-            // Discriminate by top-level tag: DaemonToProxyMessage uses
-            // `"envelope"`, plain IpcResponse uses `"type"`.
-            let frame_value: serde_json::Value =
-                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
-                    message: format!("invalid IPC frame: {e}"),
-                    reconnectable: false,
-                })?;
-            if frame_value.get("envelope").is_some() {
-                let daemon_msg: DaemonToProxyMessage = serde_json::from_value(frame_value)
-                    .map_err(|e| TransportFailure {
+            // Peek the discriminant key so plain `IpcResponse` frames (hot path)
+            // deserialize once. Envelope frames carry `"envelope"`.
+            let looks_like_envelope = frame
+                .windows(b"\"envelope\"".len())
+                .any(|window| window == b"\"envelope\"");
+            if looks_like_envelope {
+                let daemon_msg: DaemonToProxyMessage =
+                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
                         message: format!("invalid envelope message: {e}"),
                         reconnectable: false,
                     })?;
@@ -470,39 +468,39 @@ impl IpcProxyHandler {
                         continue; // keep reading for the actual tool call response
                     }
                 }
-            }
-
-            let response: IpcResponse =
-                serde_json::from_value(frame_value).map_err(|e| TransportFailure {
-                    message: format!("invalid IPC response: {e}"),
-                    reconnectable: false,
-                })?;
-
-            match response {
-                IpcResponse::LoggingNotification { params } => {
-                    if let Some(peer) = peer
-                        && let Ok(notif_params) =
-                            serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                    {
-                        let _ = peer.notify_logging_message(notif_params).await;
+            } else {
+                let response: IpcResponse =
+                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                        message: format!("invalid IPC response: {e}"),
+                        reconnectable: false,
+                    })?;
+                match response {
+                    IpcResponse::LoggingNotification { params } => {
+                        if let Some(peer) = peer
+                            && let Ok(notif_params) =
+                                serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                        {
+                            let _ = peer.notify_logging_message(notif_params).await;
+                        }
+                        continue; // keep reading for the actual response
                     }
-                    continue; // keep reading for the actual response
+                    resp @ (IpcResponse::ToolListChangedNotification
+                    | IpcResponse::ResourceListChangedNotification
+                    | IpcResponse::ResourceUpdatedNotification { .. }
+                    | IpcResponse::PromptListChangedNotification
+                    | IpcResponse::ProgressNotification { .. }
+                    | IpcResponse::CancelledNotification { .. }
+                    | IpcResponse::AuthStateChanged { .. }) => {
+                        forward_control_notification(peer, resp).await;
+                        continue;
+                    }
+                    IpcResponse::ModernDownstreamGateChanged { enabled } => {
+                        modern_downstream_enabled
+                            .store(enabled, std::sync::atomic::Ordering::Release);
+                        continue;
+                    }
+                    other => return Ok(other),
                 }
-                resp @ (IpcResponse::ToolListChangedNotification
-                | IpcResponse::ResourceListChangedNotification
-                | IpcResponse::ResourceUpdatedNotification { .. }
-                | IpcResponse::PromptListChangedNotification
-                | IpcResponse::ProgressNotification { .. }
-                | IpcResponse::CancelledNotification { .. }
-                | IpcResponse::AuthStateChanged { .. }) => {
-                    forward_control_notification(peer, resp).await;
-                    continue;
-                }
-                IpcResponse::ModernDownstreamGateChanged { enabled } => {
-                    modern_downstream_enabled.store(enabled, std::sync::atomic::Ordering::Release);
-                    continue;
-                }
-                other => return Ok(other),
             }
         }
     }
@@ -689,18 +687,16 @@ impl IpcProxyHandler {
             }
         }
 
-        for uri in &replay.subscriptions {
-            let params = serde_json::to_value(SubscribeRequestParams::new(uri.clone())).ok();
-            let request = IpcRequest::McpRequest {
+        if !replay.subscriptions.is_empty() {
+            let request = IpcRequest::RestoreResourceSubscriptions {
                 session_id: conn.session_id.clone(),
-                method: "resources/subscribe".to_string(),
-                params,
+                uris: replay.subscriptions.iter().cloned().collect(),
             };
             if let Err(e) =
                 Self::send_replay_request(conn, peer, &request, &shared.modern_downstream_enabled)
                     .await
             {
-                tracing::warn!(%uri, error = %e, "reconnect: failed to replay subscription");
+                tracing::warn!(error = %e, "reconnect: failed to replay subscriptions");
             }
         }
 
@@ -3697,21 +3693,14 @@ mod tests {
             let req: IpcRequest =
                 serde_json::from_slice(&frame).expect("parse replayed subscribe request");
             match req {
-                IpcRequest::McpRequest { method, params, .. } => {
-                    assert_eq!(method, "resources/subscribe");
-                    let params = params.expect("subscribe replay must carry params");
-                    assert_eq!(params["uri"], serde_json::json!("test://resource"));
+                IpcRequest::RestoreResourceSubscriptions { uris, .. } => {
+                    assert_eq!(uris, vec!["test://resource".to_string()]);
                 }
-                other => panic!("expected replayed resources/subscribe, got {other:?}"),
+                other => panic!("expected RestoreResourceSubscriptions, got {other:?}"),
             }
-            ipc::send_response(
-                &mut writer2,
-                &IpcResponse::McpResponse {
-                    payload: serde_json::json!({}),
-                },
-            )
-            .await
-            .expect("send replayed subscribe ack");
+            ipc::send_response(&mut writer2, &IpcResponse::Ok)
+                .await
+                .expect("send replayed subscribe ack");
 
             let frame = ipc::read_frame(&mut reader2)
                 .await
@@ -3780,8 +3769,12 @@ mod tests {
             let req: IpcRequest =
                 serde_json::from_slice(&frame).expect("parse replayed subscribe request");
             assert!(
-                is_mcp_request(&req, "resources/subscribe"),
-                "expected replayed resources/subscribe, got {req:?}"
+                matches!(
+                    req,
+                    IpcRequest::RestoreResourceSubscriptions { ref uris, .. }
+                        if uris == &["test://rejected".to_string()]
+                ),
+                "expected RestoreResourceSubscriptions, got {req:?}"
             );
             ipc::send_response(
                 &mut writer2,

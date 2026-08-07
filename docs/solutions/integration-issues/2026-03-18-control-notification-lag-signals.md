@@ -3,6 +3,12 @@ title: Control-channel lag now emits downstream-visible warning signals
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/proxy
+problem_type: integration_issue
+summary: "When the control notification channel lagged, `plug` only logged a local warning. Downstream clients could miss `progress`, `cancelled`, or `list_changed` traffic without receiving any protocol-visible hint that delivery had degraded."
+tags:
+  - notification
+  - integration-issues
 ---
 
 # Control-channel lag now emits downstream-visible warning signals

@@ -30,6 +30,8 @@ related:
   - plug-core/src/server/mod.rs
   - plug-core/src/proxy/mod.rs
   - plug-core/src/http/server.rs
+problem_type: integration_issue
+summary: "After Phase 2A and 2B, `plug` had a strong tool and control-flow path, but the next MCP surfaces were still not real"
 ---
 
 # Phase 2C resources, prompts, pagination, and capability synthesis

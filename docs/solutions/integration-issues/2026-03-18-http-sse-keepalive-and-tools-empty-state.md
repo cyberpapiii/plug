@@ -1,7 +1,17 @@
 ---
-title: HTTP SSE keepalives now preserve session activity and tool inventory empty states are explicit
+title: HTTP SSE keepalives now preserve session activity and tool inventory empty
+  states are explicit
 date: 2026-03-18
 category: integration-issues
+module: plug-core/http
+problem_type: integration_issue
+summary: HTTP SSE keepalives now preserve session activity and tool inventory empty
+  states are explicit
+tags:
+- sse
+- http
+- session
+- integration-issues
 status: completed
 ---
 
@@ -22,9 +32,13 @@ Two small operator-facing gaps remained:
   than Axum’s opaque keepalive helper
 - each keepalive heartbeat updates the HTTP session’s activity timestamp before
   emitting the comment frame
-- `plug tools` now distinguishes four empty-state cases in text mode:
-  no configured servers, runtime unavailable, all servers unavailable, and a
-  truly empty merged tool set
+- `plug tools` now distinguishes five empty-state cases in text mode via
+  `ToolInventoryEmptyState`:
+  - `NoConfiguredServers`
+  - `RuntimeUnavailable` (daemon unreachable)
+  - `RuntimeInspectionFailed` (daemon reachable but inventory inspection failed)
+  - `AllServersUnavailable`
+  - `EmptyMergedSet` (configured and reachable, but the merged tool set is empty)
 
 ## Key decision
 

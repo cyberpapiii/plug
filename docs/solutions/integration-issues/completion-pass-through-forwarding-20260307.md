@@ -15,6 +15,8 @@ date: 2026-03-07
 pr: "#28"
 phase: "A3 — MCP Spec Compliance Roadmap"
 note: "Historical solution record for the original completion pass-through landing. Current truth must be checked against main."
+problem_type: integration_issue
+summary: Completion Pass-Through Forwarding for MCP Proxy
 ---
 
 # Completion Pass-Through Forwarding for MCP Proxy

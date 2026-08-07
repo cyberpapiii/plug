@@ -2,6 +2,13 @@
 title: Reload startup is now batched and health refreshes are coalesced
 date: 2026-03-18
 category: integration-issues
+module: plug-core/reload
+problem_type: integration_issue
+summary: Two related control-plane costs were still higher than they needed to be
+tags:
+- reload
+- health
+- integration-issues
 status: completed
 ---
 
@@ -27,14 +34,20 @@ Two related control-plane costs were still higher than they needed to be:
 - reload now separates “stop changed servers” from “start changed and added
   servers”, then starts the touched servers in a bounded concurrent batch
 - reload still records every start/restart failure and preserves `Failed` /
-  `AuthRequired` visibility before doing the final config swap and refresh
+  `AuthRequired` visibility before doing the final config swap
+- after the swap, catalog refresh (`refresh_tools`) runs only when the upstream
+  server set changed (`added` / `changed` / `removed`). Tool-shaping fields
+  (prefix, filters, priority/disabled lists, lazy-tools policy, etc.) are
+  restart-required and do not update live `RouterConfig`, so refreshing on
+  those alone would rebuild routes with stale shaping
 
 ## Key decisions
 
 - concurrency is bounded rather than unbounded
 - changed servers are still stopped before replacement startup begins
-- config swap and downstream refresh remain single-shot after the batch
-  completes so operator truth and background task ownership stay stable
+- config swap remains single-shot after the batch so operator truth and
+  background task ownership stay stable
+- catalog rebuild is gated on server-set dirtiness, not every reload
 
 This keeps the semantics conservative while removing the worst serialized
 control-plane work.

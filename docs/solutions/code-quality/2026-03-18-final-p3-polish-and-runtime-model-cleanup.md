@@ -3,6 +3,12 @@ title: Final P3 polish and runtime model cleanup
 date: 2026-03-18
 category: code-quality
 status: completed
+module: plug
+problem_type: best_practice
+summary: After the correctness and operator-truth fixes landed, a few lower-priority cleanup items still remained
+tags:
+  - runtime
+  - code-quality
 ---
 
 # Final P3 polish and runtime model cleanup

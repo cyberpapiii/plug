@@ -12,6 +12,11 @@ related:
   - docs/brainstorms/2026-03-07-review-fixes-tls-backend-portability-brainstorm.md
   - docs/plans/2026-03-07-fix-review-fixes-tls-backend-portability-plan.md
   - https://github.com/cyberpapiii/plug/pull/21
+module: plug-core/http
+problem_type: build_error
+tags:
+  - tls
+  - integration-issues
 ---
 
 # Review Fixes TLS Backend Portability

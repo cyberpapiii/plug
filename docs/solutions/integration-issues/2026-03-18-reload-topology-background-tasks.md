@@ -3,6 +3,13 @@ title: Reload topology now rebuilds health and refresh task ownership
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/reload
+problem_type: integration_issue
+summary: Hot reload previously updated server processes and config snapshots, but it did not rebuild the runtime maintenance topology to match.
+tags:
+  - reload
+  - health
+  - integration-issues
 ---
 
 # Reload topology now rebuilds health and refresh task ownership

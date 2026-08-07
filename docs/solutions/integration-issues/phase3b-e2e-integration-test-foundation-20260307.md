@@ -31,6 +31,8 @@ related:
   - docs/solutions/integration-issues/phase3a-meta-tool-mode-tool-drift-20260307.md
   - plug-core/tests/integration_tests.rs
   - plug-test-harness/src/bin/mock-server.rs
+problem_type: integration_issue
+summary: The codebase already had good local confidence, but not enough boundary confidence.
 ---
 
 # Phase 3B end-to-end integration test foundation for stdio, HTTP, and shared upstream clients

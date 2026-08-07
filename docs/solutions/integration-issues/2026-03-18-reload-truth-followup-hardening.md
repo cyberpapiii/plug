@@ -3,6 +3,13 @@ title: Reload serialization and operator truth follow-up hardening
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/reload
+problem_type: integration_issue
+summary: The post-performance review found a second round of issues after the batching and fanout work landed
+tags:
+  - reload
+  - operator
+  - integration-issues
 ---
 
 # Reload serialization and operator truth follow-up hardening

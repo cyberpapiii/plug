@@ -3,6 +3,16 @@ title: Runtime truth, config env, session, and downstream OAuth hardening
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/oauth
+problem_type: integration_issue
+summary: The remediation review surfaced four related reliability gaps
+tags:
+  - oauth
+  - auth
+  - session
+  - runtime
+  - config
+  - integration-issues
 ---
 
 # Runtime truth, config env, session, and downstream OAuth hardening

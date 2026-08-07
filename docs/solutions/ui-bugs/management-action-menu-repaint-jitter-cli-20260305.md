@@ -13,6 +13,7 @@ root_cause: wrong_api
 resolution_type: code_fix
 severity: medium
 tags: [cli, dialoguer, terminal-ui, management-views, repaint, menu]
+summary: "The new management views for `plug clients`, `plug servers`, and `plug tools` rendered correctly at first, but the interactive action picker behaved badly once the selector moved. The menu appeared to jump upward, and extra visual framing m..."
 ---
 
 # Troubleshooting: Management Action Menu Repaint Jitter In CLI Views

@@ -9,6 +9,8 @@ date: 2026-03-04
 status: stale
 stale_date: 2026-07-13
 stale_reason: "The full-screen TUI was removed; only selected daemon and broadcast principles remain current, so this composite must not be used as present architecture guidance."
+problem_type: integration_issue
+summary: Phase 4 introduced two major subsystems — a live TUI dashboard and a background daemon — that both need to interact with the core multiplexer engine. This creates several intersecting challenges
 ---
 
 # Phase 4 TUI Dashboard and Daemon Mode Patterns

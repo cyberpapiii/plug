@@ -3,6 +3,14 @@ title: Injected OAuth credential refreshability follows configured client identi
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/oauth
+problem_type: integration_issue
+summary: "`plug auth inject` previously stored all injected credentials with the synthetic client id `injected`."
+tags:
+  - oauth
+  - auth
+  - config
+  - integration-issues
 ---
 
 # Injected OAuth credential refreshability follows configured client identity

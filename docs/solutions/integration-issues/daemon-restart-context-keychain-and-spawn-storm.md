@@ -21,6 +21,7 @@ tags:
   - process-spawn
   - competing-daemons
   - operations
+summary: "Activating a freshly-installed `plug` binary by restarting the daemon from inside an agent/automation shell (or any detached, non-GUI-session context) took the whole multiplexer down. The daemon would start, connect most upstreams, then han..."
 ---
 
 # Restart the plug daemon in the user's login session, never from a detached/sandboxed context

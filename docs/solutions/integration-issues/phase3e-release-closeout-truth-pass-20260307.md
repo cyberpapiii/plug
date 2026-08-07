@@ -34,6 +34,8 @@ related:
   - docs/ARCHITECTURE.md
   - docs/CRATE-STACK.md
   - plug/src/ipc_proxy.rs
+problem_type: integration_issue
+summary: By the time Phase 3D was merged, the code and the repo’s tracked operational docs no longer agreed about the project’s state.
 ---
 
 # Phase 3E release closeout required a truth pass across the tracked operating docs

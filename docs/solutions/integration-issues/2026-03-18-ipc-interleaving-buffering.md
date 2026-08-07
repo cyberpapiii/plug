@@ -2,6 +2,14 @@
 title: IPC interleaving buffering during daemon registration and roots updates
 date: 2026-03-18
 category: integration-issues
+module: plug/ipc
+problem_type: integration_issue
+summary: Two IPC paths still assumed a response-only stream even though the daemon
+  can push notifications on registered connections
+tags:
+- ipc
+- daemon
+- integration-issues
 status: completed
 ---
 
@@ -26,6 +34,11 @@ expected response, desynchronizing the connection or failing registration.
   the downstream peer is available
 - roots refresh now forwards interleaved control notifications and logging
   instead of treating them as protocol noise
+- the active proxy read loop discriminates framed traffic by peeking for the
+  top-level `"envelope"` key before typed deserialize: `DaemonToProxyMessage`
+  (normal `Response`, `ResponseChunk`, `ReverseRequest`) vs plain `IpcResponse`
+  control/logging pushes. Registration and `UpdateRoots` still consume plain
+  `IpcResponse` replies on those short-lived request paths
 
 ## Key decision
 
@@ -43,4 +56,5 @@ Why:
 
 Daemon-backed stdio sessions now treat registration/capabilities and roots
 updates like the rest of the IPC proxy path: notifications are part of the
-stream, not protocol violations.
+stream, not protocol violations. Hot-path round trips also accept enveloped
+daemon messages without mistaking them for the next request response.

@@ -531,6 +531,8 @@ impl SubscriptionRegistry {
         tx: watch::Sender<TransitionSignal>,
     ) {
         let lock = self.transition_lock(&uri);
+        // Hold the per-URI transition mutex across the upstream RTT on purpose:
+        // it serializes subscribe/drain/rebind for one URI (see module invariants).
         let _guard = lock.lock().await;
 
         let still_current = self

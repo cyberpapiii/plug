@@ -68,6 +68,8 @@ Agent workflow guide:
 
 - `AGENTS.md`
 - `docs/WORKFLOW-OPERATING-MODEL.md`
+- `CONCEPTS.md` — shared domain vocabulary
+- `docs/solutions/README.md` — compounded learnings by category (not current truth)
 
 Strategy / planning docs:
 
