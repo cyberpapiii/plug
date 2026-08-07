@@ -4,6 +4,7 @@
 //! Wire format: 4-byte big-endian u32 length prefix + JSON payload.
 
 use base64::Engine as _;
+use std::borrow::Cow;
 use std::fmt;
 
 use rmcp::model::{
@@ -108,8 +109,9 @@ pub enum IpcRequest {
         params: Option<serde_json::Value>,
     },
 
-    /// Context-preserving MCP request used by current proxy clients. The
-    /// legacy variant remains for old IPC callers and reconnect replay.
+    /// Context-preserving MCP request used by current proxy clients.
+    /// Legacy `McpRequest` remains for old callers; subscription reconnect
+    /// replay uses `RestoreResourceSubscriptions`.
     McpRequestWithContext {
         session_id: String,
         method: String,
@@ -138,6 +140,12 @@ pub enum IpcRequest {
     UpdateCapabilities {
         session_id: String,
         capabilities: Box<ClientCapabilities>,
+    },
+
+    /// Restore many resource subscriptions in one IPC round-trip (reconnect replay).
+    RestoreResourceSubscriptions {
+        session_id: String,
+        uris: Vec<String>,
     },
 
     /// Query OAuth authentication status for all configured servers.
@@ -247,6 +255,11 @@ impl fmt::Debug for IpcRequest {
             Self::UpdateCapabilities { session_id, .. } => f
                 .debug_struct("UpdateCapabilities")
                 .field("session_id", session_id)
+                .finish(),
+            Self::RestoreResourceSubscriptions { session_id, uris } => f
+                .debug_struct("RestoreResourceSubscriptions")
+                .field("session_id", session_id)
+                .field("uris", uris)
                 .finish(),
             Self::AuthStatus => write!(f, "AuthStatus"),
             Self::InjectToken {
@@ -703,13 +716,51 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Pre-encoded payloads for unit-shaped `IpcResponse` values (no params).
+fn cached_unit_response_payload(response: &IpcResponse) -> Option<&'static [u8]> {
+    use std::sync::OnceLock;
+    macro_rules! unit_payload {
+        ($variant:expr) => {{
+            static PAYLOAD: OnceLock<Vec<u8>> = OnceLock::new();
+            Some(
+                PAYLOAD
+                    .get_or_init(|| {
+                        serde_json::to_vec(&$variant).expect("unit IpcResponse serializes")
+                    })
+                    .as_slice(),
+            )
+        }};
+    }
+    match response {
+        IpcResponse::ToolListChangedNotification => {
+            unit_payload!(IpcResponse::ToolListChangedNotification)
+        }
+        IpcResponse::ResourceListChangedNotification => {
+            unit_payload!(IpcResponse::ResourceListChangedNotification)
+        }
+        IpcResponse::PromptListChangedNotification => {
+            unit_payload!(IpcResponse::PromptListChangedNotification)
+        }
+        IpcResponse::Ok => unit_payload!(IpcResponse::Ok),
+        IpcResponse::Pong => unit_payload!(IpcResponse::Pong),
+        _ => None,
+    }
+}
+
+fn encode_response_payload(response: &IpcResponse) -> anyhow::Result<Cow<'_, [u8]>> {
+    if let Some(payload) = cached_unit_response_payload(response) {
+        return Ok(Cow::Borrowed(payload));
+    }
+    Ok(Cow::Owned(serde_json::to_vec(response)?))
+}
+
 /// Send an IpcResponse as a length-prefixed JSON frame.
 pub async fn send_response<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
     response: &IpcResponse,
 ) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(response)?;
-    write_frame(writer, &payload).await
+    let payload = encode_response_payload(response)?;
+    write_frame(writer, payload.as_ref()).await
 }
 
 /// Send a `DaemonToProxyMessage` as a length-prefixed JSON frame.
@@ -726,9 +777,9 @@ pub async fn send_chunked_response<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
     response: &IpcResponse,
 ) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(response)?;
+    let payload = encode_response_payload(response)?;
     if payload.len() <= MAX_FRAME_SIZE as usize {
-        return write_frame(writer, &payload).await;
+        return write_frame(writer, payload.as_ref()).await;
     }
 
     let chunk_count = payload.len().div_ceil(RESPONSE_CHUNK_BYTES);

@@ -473,34 +473,34 @@ impl SessionStore for StatefulSessionStore {
     }
 
     fn broadcast(&self, message: SseMessage) {
-        let session_ids: Vec<String> = self
-            .sessions
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
+        // Snapshot keys first so shard write locks are not held across every
+        // try_send (DashMap `iter_mut` would pin the shard for the whole loop).
+        let session_ids: Vec<String> = self.sessions.iter().map(|entry| entry.key().clone()).collect();
+        let mut expired = Vec::new();
         for session_id in session_ids {
-            let mut expired = false;
-            if let Some(mut entry) = self.sessions.get_mut(&session_id) {
-                if entry.last_activity.elapsed() > self.timeout {
-                    expired = true;
-                } else {
-                    let event = Self::next_event(&mut entry, message.clone());
-                    if let Some(sender) = entry.sse_sender.clone() {
-                        match sender.try_send(event.clone()) {
-                            Ok(()) => entry.last_activity = Instant::now(),
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-                            | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                entry.sse_sender = None;
-                                Self::enqueue_pending(&mut entry, event);
-                            }
-                        }
-                    } else {
+            let Some(mut entry) = self.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            if entry.last_activity.elapsed() > self.timeout {
+                expired.push(session_id);
+                continue;
+            }
+            let event = Self::next_event(&mut entry, message.clone());
+            if let Some(sender) = entry.sse_sender.clone() {
+                match sender.try_send(event) {
+                    Ok(()) => entry.last_activity = Instant::now(),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(event))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                        entry.sse_sender = None;
                         Self::enqueue_pending(&mut entry, event);
                     }
                 }
+            } else {
+                Self::enqueue_pending(&mut entry, event);
             }
-            if expired && self.sessions.remove(&session_id).is_some() {
+        }
+        for session_id in expired {
+            if self.sessions.remove(&session_id).is_some() {
                 self.notify_expired(&session_id);
             }
         }

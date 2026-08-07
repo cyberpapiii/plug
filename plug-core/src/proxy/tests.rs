@@ -90,10 +90,13 @@ fn router_with_git_commit_tool() -> ToolRouter {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
     router
 }
 
@@ -437,6 +440,9 @@ fn list_tools_for_client_returns_correct_counts() {
 
     router.cache.store(Arc::new(RouterSnapshot {
         routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         tools_all,
         meta_tools_all: Arc::new(build_meta_tools()),
         tools_windsurf,
@@ -448,7 +454,7 @@ fn list_tools_for_client_returns_correct_counts() {
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     assert_eq!(
         router.list_tools_for_client(ClientType::Windsurf).len(),
@@ -496,6 +502,9 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
     // disabled: tools_windsurf/tools_copilot stay empty.
     router.cache.store(Arc::new(RouterSnapshot {
         routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(tools),
         meta_tools_all: Arc::new(build_meta_tools()),
         tools_windsurf: Arc::new(Vec::new()),
@@ -507,7 +516,7 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     assert_eq!(
         router
@@ -573,10 +582,13 @@ fn search_tools_returns_matches() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     // Search by name
     let mut args = serde_json::Map::new();
@@ -631,10 +643,13 @@ fn meta_tool_mode_lists_only_meta_tools() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let visible_tools = router.list_tools_for_client(ClientType::ClaudeCode);
     let names = visible_tools
@@ -655,6 +670,9 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
 
     router.cache.store(Arc::new(RouterSnapshot {
         routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(vec![Tool::new(
             Cow::Borrowed("git__commit"),
             Cow::Borrowed("Create a git commit"),
@@ -670,7 +688,7 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let visible_tools = router.list_tools_for_client(ClientType::OpenCode);
     let names = visible_tools
@@ -709,10 +727,13 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
     assert_eq!(
@@ -768,10 +789,13 @@ fn bridge_search_keeps_session_working_set_bounded() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let downstream = DownstreamCallContext::stdio_for_client(
         "client-a",
@@ -828,10 +852,13 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let mut notifications = router.subscribe_notifications();
     let downstream = DownstreamCallContext::stdio_for_client(
@@ -888,10 +915,13 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
     router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
@@ -1061,10 +1091,13 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let caps = router.synthesized_capabilities();
     assert!(crate::protocol::legacy_tasks_capability(&caps));
@@ -1163,24 +1196,18 @@ fn case_insensitive_route_lookup() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let snapshot = router.cache.load();
     assert!(snapshot.routes.contains_key("Slack__search_messages"));
-    let lower = "slack__search_messages";
     let found = snapshot
-        .routes
-        .get(lower)
-        .or_else(|| {
-            snapshot
-                .routes
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(lower))
-                .map(|(_, v)| v)
-        })
+        .resolve_route("slack__search_messages")
         .expect("case-insensitive route lookup");
     assert_eq!(found.0, "slack");
     assert_eq!(found.1, "conversations_search_messages");
@@ -1215,10 +1242,13 @@ async fn call_tool_times_out_waiting_for_semaphore() {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let call = router.call_tool("Busy__tool", None);
     tokio::pin!(call);
@@ -1308,6 +1338,9 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
         .collect();
     router.cache.store(Arc::new(RouterSnapshot {
         routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         tools_windsurf: Arc::new(tools.iter().take(100).cloned().collect()),
         tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
         tools_all: Arc::new(tools),
@@ -1319,7 +1352,7 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
 
     let first = router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
     assert_eq!(first.tools.len(), 500);
@@ -2167,10 +2200,13 @@ fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
-    }));
+    }.with_indexes()));
     router
 }
 
@@ -2800,6 +2836,9 @@ fn sub_target(id: &str) -> NotificationTarget {
 fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
     router.replace_snapshot(RouterSnapshot {
         routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
         tools_windsurf: Arc::new(Vec::new()),
@@ -2837,6 +2876,9 @@ fn publish_tool_route_snapshot_with_original(
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),
@@ -2866,6 +2908,9 @@ fn publish_tool_route_snapshot_with_metadata(
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
         prompt_routes: HashMap::new(),
         tool_definition_fingerprints: HashMap::new(),
         tool_risk_inventory: HashMap::new(),

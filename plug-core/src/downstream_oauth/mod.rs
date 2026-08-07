@@ -1664,7 +1664,10 @@ mod tests {
                 enrichment_servers: std::collections::HashSet::new(),
             },
         ));
-        router.replace_snapshot(crate::proxy::RouterSnapshot {
+        router.replace_snapshot(crate::proxy::RouterSnapshot {            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: std::collections::HashMap::from([(
                 "Mock__echo".to_string(),
                 ("missing".to_string(), "echo".to_string()),

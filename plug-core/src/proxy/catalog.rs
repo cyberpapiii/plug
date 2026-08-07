@@ -179,10 +179,18 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
 }
 
 pub(crate) fn is_disabled_tool(patterns: &[String], tool_name: &str) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    // Prefer pre-lowercased patterns (`RouterConfig::from`); still tolerate mixed case.
     let tool_name = tool_name.to_ascii_lowercase();
-    patterns
-        .iter()
-        .any(|pattern| wildcard_match(&pattern.to_ascii_lowercase(), &tool_name))
+    patterns.iter().any(|pattern| {
+        if pattern.bytes().all(|b| !b.is_ascii_uppercase()) {
+            wildcard_match(pattern, &tool_name)
+        } else {
+            wildcard_match(&pattern.to_ascii_lowercase(), &tool_name)
+        }
+    })
 }
 
 pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -268,12 +276,10 @@ pub(crate) fn fingerprint_tool_definition(tool: &Tool) -> u64 {
     tool.name.hash(&mut hasher);
     tool.description.as_deref().unwrap_or("").hash(&mut hasher);
     tool.title.as_deref().unwrap_or("").hash(&mut hasher);
-    serde_json::to_string(&tool.input_schema)
-        .expect("tool input schema serializes")
-        .hash(&mut hasher);
-    serde_json::to_string(&tool.annotations)
-        .expect("tool annotations serialize")
-        .hash(&mut hasher);
+    hasher.write(
+        &serde_json::to_vec(&tool.input_schema).expect("tool input schema serializes"),
+    );
+    hasher.write(&serde_json::to_vec(&tool.annotations).expect("tool annotations serialize"));
     hasher.finish()
 }
 
@@ -569,12 +575,7 @@ impl super::ToolRouter {
     }
 
     pub fn get_tool_definition(&self, name: &str) -> Option<Tool> {
-        self.cache
-            .load()
-            .tools_all
-            .iter()
-            .find(|tool| tool.name.eq_ignore_ascii_case(name))
-            .cloned()
+        self.cache.load().tool_by_name(name).cloned()
     }
 
     pub fn supports_tasks(&self) -> bool {
@@ -691,11 +692,7 @@ impl super::ToolRouter {
         drop(loaded);
 
         for loaded_name in loaded_names {
-            if let Some(tool) = snapshot
-                .tools_all
-                .iter()
-                .find(|tool| tool.name.as_ref() == loaded_name)
-            {
+            if let Some(tool) = snapshot.tool_by_name(&loaded_name) {
                 tools.push(tool.clone());
             }
         }

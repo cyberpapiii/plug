@@ -2888,7 +2888,10 @@ mod tests {
     }
 
     fn enable_test_task_surface(router: &ToolRouter) {
-        router.replace_snapshot(RouterSnapshot {
+        router.replace_snapshot(RouterSnapshot {            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: HashMap::from([(
                 "Mock__echo".to_string(),
                 ("mock".to_string(), "echo".to_string()),
@@ -3829,7 +3832,10 @@ mod tests {
 
         // Give the router a routable tool so `enqueue_tool_task` can create a
         // task record for this session without needing a live upstream.
-        state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+        state.router.replace_snapshot(crate::proxy::RouterSnapshot {            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: std::collections::HashMap::from([(
                 "git__commit".to_string(),
                 ("git".to_string(), "commit".to_string()),
@@ -4197,7 +4203,10 @@ mod tests {
             enrichment_servers: std::collections::HashSet::new(),
         });
 
-        state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+        state.router.replace_snapshot(crate::proxy::RouterSnapshot {            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+
             routes: std::collections::HashMap::from([(
                 "Git__commit".to_string(),
                 ("git".to_string(), "commit".to_string()),

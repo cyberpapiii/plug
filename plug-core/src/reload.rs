@@ -316,6 +316,12 @@ pub async fn apply_reload(
         }
     }
 
+    // Catalog rebuild only when the upstream server set changes. Tool-shaping
+    // fields are restart-required and do not update live `RouterConfig`, so
+    // refreshing on those alone rebuilds routes with stale shaping.
+    let catalog_dirty =
+        !diff.added.is_empty() || !diff.changed.is_empty() || !diff.removed.is_empty();
+
     // Swap config atomically before spawning background tasks so new tasks
     // observe the updated server set immediately.
     engine.store_config(new_config);
@@ -324,7 +330,9 @@ pub async fn apply_reload(
         engine.spawn_background_tasks_for_server(name, cfg);
     }
 
-    engine.tool_router().refresh_tools().await;
+    if catalog_dirty {
+        engine.tool_router().refresh_tools().await;
+    }
 
     let _ = engine.event_sender().send(EngineEvent::ConfigReloaded);
 

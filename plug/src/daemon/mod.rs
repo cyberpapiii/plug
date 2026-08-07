@@ -1490,6 +1490,74 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
+        IpcRequest::RestoreResourceSubscriptions { session_id, uris } => {
+            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
+                return IpcResponse::Error {
+                    code: "SESSION_MISMATCH".to_string(),
+                    message: "session_id does not match this connection".to_string(),
+                };
+            }
+            if !ctx.client_registry.session_exists(session_id) {
+                return IpcResponse::Error {
+                    code: "SESSION_REPLACED".to_string(),
+                    message: "session is no longer active for this client".to_string(),
+                };
+            }
+            let target = plug_core::notifications::NotificationTarget::Ipc {
+                client_id: Arc::from(session_id.as_str()),
+            };
+            let tool_router = Arc::clone(ctx.engine.tool_router());
+            let uris = uris.clone();
+            const MAX_RESTORE_URIS: usize = 256;
+            const MAX_RESTORE_IN_FLIGHT: usize = 8;
+            if uris.len() > MAX_RESTORE_URIS {
+                return IpcResponse::Error {
+                    code: "RESTORE_SUBSCRIPTIONS_TOO_LARGE".to_string(),
+                    message: format!(
+                        "refusing to restore {} subscriptions (max {MAX_RESTORE_URIS})",
+                        uris.len()
+                    ),
+                };
+            }
+            let mut join_set = tokio::task::JoinSet::new();
+            let mut failures = Vec::new();
+            for uri in uris {
+                while join_set.len() >= MAX_RESTORE_IN_FLIGHT {
+                    match join_set.join_next().await {
+                        Some(Ok(Err(failure))) => failures.push(failure),
+                        Some(Err(join_error)) => {
+                            failures.push(format!("subscribe task failed: {join_error}"))
+                        }
+                        Some(Ok(Ok(()))) | None => {}
+                    }
+                }
+                let tool_router = Arc::clone(&tool_router);
+                let target = target.clone();
+                join_set.spawn(async move {
+                    tool_router
+                        .subscribe_resource(&uri, target)
+                        .await
+                        .map_err(|error| format!("{uri}: {error}"))
+                });
+            }
+            while let Some(joined) = join_set.join_next().await {
+                match joined {
+                    Ok(Err(failure)) => failures.push(failure),
+                    Err(join_error) => failures.push(format!("subscribe task failed: {join_error}")),
+                    Ok(Ok(())) => {}
+                }
+            }
+            if failures.is_empty() {
+                IpcResponse::Ok
+            } else {
+                let preview: Vec<_> = failures.into_iter().take(8).collect();
+                IpcResponse::Error {
+                    code: "RESTORE_SUBSCRIPTIONS_PARTIAL".to_string(),
+                    message: preview.join("; "),
+                }
+            }
+        }
+
         IpcRequest::McpRequest {
             session_id,
             method,

@@ -186,7 +186,7 @@ impl super::ToolRouter {
         }
 
         let cache = self.cache.load();
-        let (server_id, original_name) = cache.routes.get(tool_name).cloned().ok_or_else(|| {
+        let (server_id, original_name) = cache.resolve_route(tool_name).cloned().ok_or_else(|| {
             McpError::from(ProtocolError::ToolNotFound {
                 tool_name: tool_name.to_string(),
             })
@@ -992,13 +992,7 @@ impl super::ToolRouter {
             extension_meta,
         } = wire;
         let cache = self.cache.load();
-        let (server_id, original_name) = match cache.routes.get(tool_name.as_str()).or_else(|| {
-            cache
-                .routes
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(tool_name.as_str()))
-                .map(|(_, v)| v)
-        }) {
+        let (server_id, original_name) = match cache.resolve_route(tool_name.as_str()) {
             Some(route) => route.clone(),
             None => {
                 drop(cache);
@@ -1979,6 +1973,9 @@ mod tests {
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
             tool_risk_inventory: HashMap::new(),
@@ -2080,6 +2077,9 @@ mod tests {
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
             tool_risk_inventory: HashMap::new(),
@@ -2117,6 +2117,9 @@ mod tests {
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
             resource_routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
             prompt_routes: HashMap::new(),
             tool_definition_fingerprints: HashMap::new(),
             tool_risk_inventory: HashMap::new(),

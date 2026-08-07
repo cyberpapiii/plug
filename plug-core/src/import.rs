@@ -168,9 +168,11 @@ pub fn import(existing: &HashMap<String, ServerConfig>, sources: &[ClientSource]
     dedup_servers(&mut all_discovered);
     let duplicates_merged = duplicates_before - all_discovered.len();
 
+    let existing_sigs: std::collections::HashSet<String> =
+        existing.values().map(server_signature).collect();
     let new_servers: Vec<DiscoveredServer> = all_discovered
         .into_iter()
-        .filter(|d| !is_existing_server(d, existing))
+        .filter(|d| !is_existing_server(d, &existing_sigs))
         .collect();
 
     let skipped = duplicates_before - duplicates_merged - new_servers.len();
@@ -828,17 +830,26 @@ fn dedup_servers(servers: &mut Vec<DiscoveredServer>) {
 /// Check if a discovered server already exists in the config.
 fn is_existing_server(
     discovered: &DiscoveredServer,
-    existing: &HashMap<String, ServerConfig>,
+    existing_sigs: &std::collections::HashSet<String>,
 ) -> bool {
-    let sig = server_signature(&discovered.config);
-    existing
-        .values()
-        .any(|existing_cfg| server_signature(existing_cfg) == sig)
+    existing_sigs.contains(&server_signature(&discovered.config))
 }
 
 /// Resolve name collisions: if name already exists, append source suffix.
 pub fn resolve_name(name: &str, source: ClientSource, existing_names: &[String]) -> String {
-    if !existing_names.contains(&name.to_string()) {
+    if !existing_names.iter().any(|existing| existing == name) {
+        return name.to_string();
+    }
+    let existing: std::collections::HashSet<String> = existing_names.iter().cloned().collect();
+    resolve_name_against_set(name, source, &existing)
+}
+
+fn resolve_name_against_set(
+    name: &str,
+    source: ClientSource,
+    existing_names: &std::collections::HashSet<String>,
+) -> String {
+    if !existing_names.contains(name) {
         return name.to_string();
     }
     let suffix = match source {
@@ -901,11 +912,12 @@ pub fn unlink_toml(content: &str) -> String {
 /// Generate TOML entries for new servers to append to config.toml.
 pub fn servers_to_toml(servers: &[DiscoveredServer], existing_names: &[String]) -> String {
     let mut output = String::new();
-    let mut used_names: Vec<String> = existing_names.to_vec();
+    let mut used_names: std::collections::HashSet<String> =
+        existing_names.iter().cloned().collect();
 
     for server in servers {
-        let name = resolve_name(&server.name, server.source, &used_names);
-        used_names.push(name.clone());
+        let name = resolve_name_against_set(&server.name, server.source, &used_names);
+        used_names.insert(name.clone());
 
         output.push_str(&format!("\n[servers.{name}]\n"));
 
@@ -1177,9 +1189,11 @@ extensions:
             source: ClientSource::ClaudeDesktop,
         }];
 
+        let existing_sigs: std::collections::HashSet<String> =
+            existing.values().map(server_signature).collect();
         let filtered: Vec<_> = discovered
             .into_iter()
-            .filter(|d| !is_existing_server(d, &existing))
+            .filter(|d| !is_existing_server(d, &existing_sigs))
             .collect();
         assert!(filtered.is_empty());
     }

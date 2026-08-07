@@ -1590,12 +1590,16 @@ impl ServerManager {
                 .get(server_name)
                 .map(|h| h.health.is_routable())
                 .unwrap_or(true);
-            if health_ok {
-                let tools = upstream.tools.load();
-                for tool in tools.iter() {
-                    result.push((server_name.clone(), tool.clone()));
-                }
+            if !health_ok {
+                continue;
             }
+            let tools = upstream.tools.load();
+            result.reserve(tools.len());
+            result.extend(
+                tools
+                    .iter()
+                    .map(|tool| (server_name.clone(), tool.clone())),
+            );
         }
         result
     }

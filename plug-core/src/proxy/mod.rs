@@ -56,6 +56,7 @@ fn plug_implementation() -> Implementation {
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
 /// Built once at `refresh_tools()` time so that `list_tools_for_client()` is O(1).
+#[derive(Clone)]
 pub(crate) struct RouterSnapshot {
     /// Full sorted tool list (for clients with no limit).
     pub tools_all: Arc<Vec<Tool>>,
@@ -67,6 +68,12 @@ pub(crate) struct RouterSnapshot {
     pub tools_copilot: Arc<Vec<Tool>>,
     /// Tool name → (server name, original tool name) routing table.
     pub routes: HashMap<String, (String, String)>,
+    /// ASCII-lowercased route keys for O(1) case-insensitive tools/call fallback.
+    pub routes_lower: HashMap<String, (String, String)>,
+    /// Exact tool name → index into `tools_all`.
+    pub tools_by_name: HashMap<String, usize>,
+    /// ASCII-lowercased tool name → index into `tools_all`.
+    pub tools_by_name_lower: HashMap<String, usize>,
     /// Routed resources for downstream list responses.
     pub resources_all: Arc<Vec<Resource>>,
     /// Routed resource templates for downstream list responses.
@@ -81,6 +88,43 @@ pub(crate) struct RouterSnapshot {
     pub tool_definition_fingerprints: HashMap<String, u64>,
     /// Tool name -> operator-only risk metadata preserving upstream-vs-Plug annotation provenance.
     pub tool_risk_inventory: HashMap<String, crate::ipc::IpcToolRiskInfo>,
+}
+
+impl RouterSnapshot {
+    /// Populate O(1) lookup indexes after routes/tools are finalized.
+    pub(crate) fn with_indexes(mut self) -> Self {
+        self.routes_lower = self
+            .routes
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        self.tools_by_name = self
+            .tools_all
+            .iter()
+            .enumerate()
+            .map(|(i, tool)| (tool.name.to_string(), i))
+            .collect();
+        self.tools_by_name_lower = self
+            .tools_all
+            .iter()
+            .enumerate()
+            .map(|(i, tool)| (tool.name.to_ascii_lowercase(), i))
+            .collect();
+        self
+    }
+
+    pub(crate) fn resolve_route(&self, tool_name: &str) -> Option<&(String, String)> {
+        self.routes
+            .get(tool_name)
+            .or_else(|| self.routes_lower.get(&tool_name.to_ascii_lowercase()))
+    }
+
+    pub(crate) fn tool_by_name(&self, name: &str) -> Option<&Tool> {
+        self.tools_by_name
+            .get(name)
+            .or_else(|| self.tools_by_name_lower.get(&name.to_ascii_lowercase()))
+            .and_then(|&i| self.tools_all.get(i))
+    }
 }
 
 /// Configuration for token efficiency and tool filtering.
@@ -103,7 +147,11 @@ impl From<&Config> for RouterConfig {
         Self {
             prefix_delimiter: config.prefix_delimiter.clone(),
             priority_tools: config.priority_tools.clone(),
-            disabled_tools: config.disabled_tools.clone(),
+            disabled_tools: config
+                .disabled_tools
+                .iter()
+                .map(|pattern| pattern.to_ascii_lowercase())
+                .collect(),
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
             meta_tool_mode: config.meta_tool_mode,
@@ -664,6 +712,9 @@ impl ToolRouter {
         let (logging_tx, _) = broadcast::channel(512);
         let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
             routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
             tools_windsurf: Arc::new(Vec::new()),
@@ -862,15 +913,7 @@ impl ToolRouter {
         }
         let cache = self.cache.load();
         let server_id = cache
-            .routes
-            .get(tool_name)
-            .or_else(|| {
-                cache
-                    .routes
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
-                    .map(|(_, route)| route)
-            })
+            .resolve_route(tool_name)
             .map(|(server_id, _)| server_id.clone());
         drop(cache);
         let Some(server_id) = server_id else {
@@ -926,15 +969,7 @@ impl ToolRouter {
             .capture_with_global_generation(|| -> Result<_, McpError> {
                 let cache = self.cache.load_full();
                 let (server_id, original_name) = cache
-                    .routes
-                    .get(tool_name)
-                    .or_else(|| {
-                        cache
-                            .routes
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
-                            .map(|(_, route)| route)
-                    })
+                    .resolve_route(tool_name)
                     .cloned()
                     .ok_or_else(|| {
                         McpError::from(ProtocolError::ToolNotFound {
@@ -964,6 +999,13 @@ impl ToolRouter {
     }
 
     fn publish_route_snapshot(&self, snapshot: Arc<RouterSnapshot>) {
+        let needs_indexes = (snapshot.routes_lower.is_empty() && !snapshot.routes.is_empty())
+            || (snapshot.tools_by_name.is_empty() && !snapshot.tools_all.is_empty());
+        let snapshot = if needs_indexes {
+            Arc::new((*snapshot).clone().with_indexes())
+        } else {
+            snapshot
+        };
         let material_routes = snapshot
             .routes
             .iter()
@@ -1447,7 +1489,7 @@ impl ToolRouter {
 
     #[cfg(test)]
     pub(crate) fn replace_snapshot(&self, snapshot: RouterSnapshot) {
-        self.publish_route_snapshot(Arc::new(snapshot));
+        self.publish_route_snapshot(Arc::new(snapshot.with_indexes()));
     }
 
     fn register_active_call(&self, call_id: u64, record: ActiveCallRecord) -> Result<(), McpError> {
@@ -1777,6 +1819,18 @@ impl ToolRouter {
         let mut server_ctx: HashMap<String, ServerRefreshCtx> = HashMap::new();
         let mut classified: Vec<Classified> = Vec::new();
         let mut catalog_metadata_budget = CatalogMetadataBudget::default();
+        let resolve_server_icons = |server_ctx: &HashMap<String, ServerRefreshCtx>,
+                                   server_name: &str|
+         -> Option<Vec<Icon>> {
+            server_ctx
+                .get(server_name)
+                .and_then(|ctx| ctx.icons.clone())
+                .or_else(|| {
+                    self.server_manager
+                        .get_upstream_metadata(server_name)
+                        .and_then(|metadata| metadata.icons)
+                })
+        };
 
         for (server_name, mut tool) in upstream_tools {
             // Peer metadata is admitted before the descriptor enters any
@@ -1911,14 +1965,16 @@ impl ToolRouter {
             );
 
             let upstream_annotations = c.tool.annotations.clone();
-            let mut prefixed_tool = c.tool.clone();
-            let mut inferred_tool = c.tool.clone();
-            let upstream_icons = server_ctx
-                .get(&c.server_name)
-                .and_then(|ctx| ctx.icons.clone());
-            inferred_tool.name = Cow::Owned(final_name.clone());
-            inferred_tool.annotations = None;
-            crate::enrichment::normalize_annotations(&mut inferred_tool, &final_name);
+            let mut prefixed_tool = c.tool;
+            let upstream_icons = resolve_server_icons(&server_ctx, &c.server_name);
+
+            let inferred_annotations = {
+                let mut inferred = prefixed_tool.clone();
+                inferred.name = Cow::Owned(final_name.clone());
+                inferred.annotations = None;
+                crate::enrichment::normalize_annotations(&mut inferred, &final_name);
+                inferred.annotations
+            };
 
             // Enrich BEFORE setting wire name (so get_* patterns match)
             if self.config.enrichment_servers.contains(&c.server_name) {
@@ -1944,7 +2000,7 @@ impl ToolRouter {
                 prefixed_name.clone(),
                 crate::ipc::IpcToolRiskInfo::from_annotations(
                     upstream_annotations.as_ref(),
-                    inferred_tool.annotations.as_ref(),
+                    inferred_annotations.as_ref(),
                     prefixed_tool.annotations.as_ref(),
                 ),
             );
@@ -1952,8 +2008,7 @@ impl ToolRouter {
         }
 
         // Sort: priority tools first, then alphabetical
-        let priority = &self.config.priority_tools;
-        tools.sort_unstable_by(|a, b| priority_sort(a, b, priority));
+        tools.sort_unstable_by(|a, b| priority_sort(a, b, &self.config.priority_tools));
 
         // Add search_tools meta-tool if tool count exceeds threshold
         if tools.len() >= self.config.tool_search_threshold
@@ -2058,9 +2113,7 @@ impl ToolRouter {
             }
             resource.icons = normalized_icons_with_fallback(
                 resource.icons.as_deref(),
-                self.server_manager
-                    .get_upstream_metadata(&server_name)
-                    .and_then(|metadata| metadata.icons),
+                resolve_server_icons(&server_ctx, &server_name),
             );
             resource.name = routed_name;
             resources_vec.push(resource);
@@ -2083,9 +2136,7 @@ impl ToolRouter {
             }
             template.icons = normalized_icons_with_fallback(
                 template.icons.as_deref(),
-                self.server_manager
-                    .get_upstream_metadata(&server_name)
-                    .and_then(|metadata| metadata.icons),
+                resolve_server_icons(&server_ctx, &server_name),
             );
             template.name = routed_name;
             resource_templates_vec.push(template);
@@ -2112,9 +2163,7 @@ impl ToolRouter {
             }
             prompt.icons = normalized_icons_with_fallback(
                 prompt.icons.as_deref(),
-                self.server_manager
-                    .get_upstream_metadata(&server_name)
-                    .and_then(|metadata| metadata.icons),
+                resolve_server_icons(&server_ctx, &server_name),
             );
             prompt.name = routed_name;
             prompts_vec.push(prompt);
@@ -2149,32 +2198,53 @@ impl ToolRouter {
         // Execute prunes for URIs that lost their route entirely
         // (best-effort upstream unsubscribe) before publishing the new
         // snapshot — same ordering as the historical stale-unsubscribe pass.
-        for item in &reconciliation {
-            if let subscriptions::RouteReconciliation::Prune { uri, old_server_id } = item {
-                let upstream = old_server_id
-                    .as_deref()
-                    .and_then(|server_id| self.server_manager.get_upstream(server_id))
-                    .map(subscriptions::as_upstream_ops);
-                self.resource_subscriptions
-                    .prune(uri, old_server_id.as_deref(), upstream)
-                    .await;
-            }
+        // Distinct URIs use distinct transition locks, so parallelize under the
+        // reconcile guard (wall-clock = max RTT, not sum).
+        {
+            let prune_futs: Vec<_> = reconciliation
+                .iter()
+                .filter_map(|item| {
+                    let subscriptions::RouteReconciliation::Prune { uri, old_server_id } = item
+                    else {
+                        return None;
+                    };
+                    let registry = Arc::clone(&self.resource_subscriptions);
+                    let upstream = old_server_id
+                        .as_deref()
+                        .and_then(|server_id| self.server_manager.get_upstream(server_id))
+                        .map(subscriptions::as_upstream_ops);
+                    let uri = uri.clone();
+                    let old_server_id = old_server_id.clone();
+                    Some(async move {
+                        registry
+                            .prune(&uri, old_server_id.as_deref(), upstream)
+                            .await;
+                    })
+                })
+                .collect();
+            futures::future::join_all(prune_futs).await;
         }
 
-        let snapshot = Arc::new(RouterSnapshot {
-            routes,
-            tools_all,
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf,
-            tools_copilot,
-            resources_all,
-            resource_templates_all,
-            prompts_all,
-            resource_routes,
-            prompt_routes,
-            tool_definition_fingerprints,
-            tool_risk_inventory,
-        });
+        let snapshot = Arc::new(
+            RouterSnapshot {
+                routes,
+                routes_lower: HashMap::new(),
+                tools_by_name: HashMap::new(),
+                tools_by_name_lower: HashMap::new(),
+                tools_all,
+                meta_tools_all: Arc::new(build_meta_tools()),
+                tools_windsurf,
+                tools_copilot,
+                resources_all,
+                resource_templates_all,
+                prompts_all,
+                resource_routes,
+                prompt_routes,
+                tool_definition_fingerprints,
+                tool_risk_inventory,
+            }
+            .with_indexes(),
+        );
         // Only material call-routing changes invalidate parked rounds. Tool
         // metadata, resource, or prompt refreshes publish a fresh catalog
         // without breaking a continuation whose exact tool route and upstream
@@ -2186,26 +2256,14 @@ impl ToolRouter {
         }
 
         // Rebind subscriptions whose URI still exists but ownership changed,
-        // after publishing the new snapshot (same ordering as before). A
-        // failed migration already pruned the entry's local subscribers
-        // inside the transition; log and continue.
-        for item in &reconciliation {
-            if let subscriptions::RouteReconciliation::Rebind {
-                uri,
-                old_server_id,
-                new_server_id,
-            } = item
-                && let Err(error) = self
-                    .rebind_subscription_route(uri, old_server_id, new_server_id)
-                    .await
-            {
-                tracing::warn!(
-                    uri = %uri,
-                    error = %error,
-                    "resource subscription rebind failed during route refresh"
-                );
-            }
-        }
+        // after publishing the new snapshot (same ordering as before).
+        Self::rebind_reconciled_routes(
+            &self.server_manager,
+            &self.resource_subscriptions,
+            reconciliation.iter(),
+            "resource subscription rebind failed during route refresh",
+        )
+        .await;
 
         // Release the reconcile guard before the post-publish sweep: the
         // sweep classifies against the just-published snapshot only, and
@@ -2248,28 +2306,55 @@ impl ToolRouter {
         let snapshot = cache.load_full();
         let reconciliation =
             registry.classify_route_changes(&snapshot.resource_routes, &snapshot.resource_routes);
-        for item in reconciliation {
-            if let subscriptions::RouteReconciliation::Rebind {
-                uri,
-                old_server_id,
-                new_server_id,
-            } = item
-                && let Err(error) = Self::rebind_subscription_route_with(
-                    &server_manager,
-                    &registry,
-                    &uri,
-                    &old_server_id,
-                    &new_server_id,
-                )
-                .await
-            {
-                tracing::warn!(
-                    uri = %uri,
-                    error = %error,
-                    "post-publish sweep failed to rebind resource subscription"
-                );
-            }
-        }
+        Self::rebind_reconciled_routes(
+            &server_manager,
+            &registry,
+            reconciliation.iter(),
+            "post-publish sweep failed to rebind resource subscription",
+        )
+        .await;
+    }
+
+    async fn rebind_reconciled_routes<'a, I>(
+        server_manager: &Arc<ServerManager>,
+        registry: &Arc<subscriptions::SubscriptionRegistry>,
+        items: I,
+        failure_message: &'static str,
+    ) where
+        I: IntoIterator<Item = &'a subscriptions::RouteReconciliation>,
+    {
+        let rebind_futs: Vec<_> = items
+            .into_iter()
+            .filter_map(|item| {
+                let subscriptions::RouteReconciliation::Rebind {
+                    uri,
+                    old_server_id,
+                    new_server_id,
+                } = item
+                else {
+                    return None;
+                };
+                let server_manager = Arc::clone(server_manager);
+                let registry = Arc::clone(registry);
+                let uri = uri.clone();
+                let old_server_id = old_server_id.clone();
+                let new_server_id = new_server_id.clone();
+                Some(async move {
+                    if let Err(error) = Self::rebind_subscription_route_with(
+                        &server_manager,
+                        &registry,
+                        &uri,
+                        &old_server_id,
+                        &new_server_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(uri = %uri, error = %error, "{failure_message}");
+                    }
+                })
+            })
+            .collect();
+        futures::future::join_all(rebind_futs).await;
     }
 
     /// Resolve the upstream handles/capabilities for a subscription rebind
@@ -2641,23 +2726,11 @@ impl ToolRouter {
             }
 
             let cache = self.cache.load_full();
-            let (server_id, original_name) = cache
-                .routes
-                .get(tool_name)
-                .or_else(|| {
-                    // Case-insensitive fallback for LLM casing drift
-                    // (e.g. "slack__search_messages" → "Slack__search_messages")
-                    cache
-                        .routes
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(tool_name))
-                        .map(|(_, v)| v)
+            let (server_id, original_name) = cache.resolve_route(tool_name).ok_or_else(|| {
+                McpError::from(ProtocolError::ToolNotFound {
+                    tool_name: tool_name.to_string(),
                 })
-                .ok_or_else(|| {
-                    McpError::from(ProtocolError::ToolNotFound {
-                        tool_name: tool_name.to_string(),
-                    })
-                })?;
+            })?;
 
             let server_id = server_id.clone();
             let original_name = original_name.to_string();
@@ -3121,12 +3194,9 @@ impl ToolRouter {
         match surface {
             LazyToolSurface::Bridge => meta_tool_name == "plug__search_tools",
             LazyToolSurface::LegacyMeta => legacy_meta_tool_names().contains(&meta_tool_name),
-            LazyToolSurface::Standard | LazyToolSurface::Native => self
-                .cache
-                .load()
-                .routes
-                .keys()
-                .any(|name| name.eq_ignore_ascii_case(meta_tool_name)),
+            LazyToolSurface::Standard | LazyToolSurface::Native => {
+                self.cache.load().resolve_route(meta_tool_name).is_some()
+            }
         }
     }
 
@@ -3275,19 +3345,18 @@ impl ToolRouter {
             let Some(score) = score_tool_match(tool, server_id, &query_phrase, &tokens) else {
                 continue;
             };
-            ranked.push((score, server_id.clone(), tool.clone()));
+            ranked.push((score, server_id.as_str(), tool.name.as_ref()));
         }
-        ranked.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.2.name.as_ref().cmp(b.2.name.as_ref()))
-        });
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(b.2)));
         ranked.truncate(limit);
-        drop(snapshot);
 
         let mut matches = Vec::new();
         let mut tools = Vec::new();
         let mut available_tools = Vec::new();
-        for (score, server_id, tool) in ranked {
+        for (score, server_id, tool_name) in ranked {
+            let Some(tool) = snapshot.tool_by_name(tool_name) else {
+                continue;
+            };
             let canonical_name = tool.name.to_string();
             matches.push(serde_json::json!({
                 "name": canonical_name.clone(),
@@ -3298,6 +3367,7 @@ impl ToolRouter {
             available_tools.push(canonical_name);
             tools.push(tool.clone());
         }
+        drop(snapshot);
 
         let mut newly_loaded_tools = Vec::new();
         let mut evicted_tools = Vec::new();
