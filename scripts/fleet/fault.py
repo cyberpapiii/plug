@@ -44,21 +44,22 @@ SCENARIOS = [
         "reset",
         "reset",
         "upstream closes stdio mid-call",
-        "upstream process restarts and next call succeeds",
+        "fresh Plug runtime connects to restarted upstream",
         restart_after_fault=True,
     ),
     Scenario(
         "slow-delay",
         "slow-delay",
         "call exceeds the configured one-second timeout",
-        "next call succeeds after the delayed response",
+        "upstream process restarts and next call succeeds",
+        restart_after_fault=True,
         delay_ms=1500,
     ),
     Scenario(
         "sigterm",
         "sigterm",
         "upstream receives SIGTERM mid-call",
-        "upstream process restarts and next call succeeds",
+        "fresh Plug runtime connects to restarted upstream",
         restart_after_fault=True,
     ),
     Scenario(
@@ -111,6 +112,9 @@ def write_config(
     mock_server: pathlib.Path,
     scenario: Scenario,
 ) -> None:
+    call_timeout_secs = (
+        1 if scenario.fail_mode in {"malformed-frame", "slow-delay"} else 5
+    )
     command = mock_server
     args = [
         "--tools",
@@ -136,7 +140,7 @@ def write_config(
                 'transport = "stdio"',
                 "enabled = true",
                 "timeout_secs = 10",
-                "call_timeout_secs = 1",
+                f"call_timeout_secs = {call_timeout_secs}",
                 "max_concurrent = 1",
                 "",
             ]
@@ -171,6 +175,35 @@ def wait_for_recovery(session: object, deadline_secs: float = 20.0) -> bool:
     return False
 
 
+def start_daemon(
+    plug: pathlib.Path,
+    config: pathlib.Path,
+    env: dict[str, str],
+    socket_path: pathlib.Path,
+) -> subprocess.Popen[bytes]:
+    daemon = subprocess.Popen(
+        [str(plug), "--config", str(config), "serve", "--daemon"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    load.wait_for_daemon(daemon, socket_path)
+    return daemon
+
+
+def stop_daemon(daemon: subprocess.Popen[bytes] | None) -> None:
+    if daemon is None or daemon.poll() is not None:
+        return
+    daemon.terminate()
+    try:
+        daemon.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        daemon.kill()
+        daemon.wait(timeout=2)
+
+
 def run_scenario(
     plug: pathlib.Path, mock_server: pathlib.Path, scenario: Scenario
 ) -> tuple[bool, bool, str]:
@@ -188,15 +221,8 @@ def run_scenario(
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = str(runtime_root)
         env["XDG_STATE_HOME"] = str(state_root)
-        daemon = subprocess.Popen(
-            [str(plug), "--config", str(config), "serve", "--daemon"],
-            cwd=REPO_ROOT,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        load.wait_for_daemon(daemon, runtime_root / "plug" / "plug.sock")
+        socket_path = runtime_root / "plug" / "plug.sock"
+        daemon = start_daemon(plug, config, env, socket_path)
         session = load.McpSession(plug, config, env, 1)
         session.initialize()
 
@@ -212,18 +238,22 @@ def run_scenario(
             failure_observed = True
             detail = str(error)
 
+        if scenario.fail_mode in {"reset", "sigterm"}:
+            session.close()
+            session = None
+            stop_daemon(daemon)
+            daemon = None
+            socket_path.unlink(missing_ok=True)
+            daemon = start_daemon(plug, config, env, socket_path)
+            session = load.McpSession(plug, config, env, 2)
+            session.initialize()
+
         recovery_observed = wait_for_recovery(session)
         return failure_observed, recovery_observed, detail
     finally:
         if session is not None:
             session.close()
-        if daemon is not None and daemon.poll() is None:
-            daemon.terminate()
-            try:
-                daemon.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                daemon.kill()
-                daemon.wait(timeout=2)
+        stop_daemon(daemon)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

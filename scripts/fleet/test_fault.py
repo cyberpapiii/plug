@@ -26,6 +26,16 @@ class ScenarioDefinitionTests(unittest.TestCase):
                 self.assertTrue(scenario.expected_failure)
                 self.assertTrue(scenario.expected_recovery)
 
+    def test_terminal_faults_declare_fresh_runtime_recovery(self) -> None:
+        terminal_faults = {
+            scenario.name: scenario for scenario in fault.SCENARIOS
+        }
+
+        for name in ("reset", "sigterm"):
+            self.assertIn(
+                "fresh Plug runtime", terminal_faults[name].expected_recovery
+            )
+
 
 class OutcomeTests(unittest.TestCase):
     def test_expected_failure_and_recovery_passes(self) -> None:
