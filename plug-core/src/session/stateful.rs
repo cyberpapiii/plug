@@ -435,10 +435,7 @@ impl SessionStore for StatefulSessionStore {
         entry.last_activity = Instant::now();
         entry.sse_sender = Some(sender);
         // Clone before mut borrow: send_replay_events may clear sse_sender on fail.
-        let active_sender = entry
-            .sse_sender
-            .clone()
-            .expect("sse sender just installed");
+        let active_sender = entry.sse_sender.clone().expect("sse sender just installed");
         Self::send_replay_events(&mut entry, &active_sender, last_event_id);
         Ok(())
     }

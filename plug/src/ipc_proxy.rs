@@ -376,8 +376,8 @@ impl IpcProxyHandler {
                     reconnectable: false,
                 })?;
             if frame_value.get("envelope").is_some() {
-                let daemon_msg: DaemonToProxyMessage =
-                    serde_json::from_value(frame_value).map_err(|e| TransportFailure {
+                let daemon_msg: DaemonToProxyMessage = serde_json::from_value(frame_value)
+                    .map_err(|e| TransportFailure {
                         message: format!("invalid envelope message: {e}"),
                         reconnectable: false,
                     })?;

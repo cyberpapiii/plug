@@ -1230,9 +1230,7 @@ async fn send_http_client_request(
     timeout: Option<Duration>,
 ) -> Result<ClientResult, McpError> {
     let id = i64::try_from(state.reverse_request_counter.fetch_add(1, Ordering::SeqCst))
-        .map_err(|_| {
-            McpError::internal_error("reverse request id overflow".to_string(), None)
-        })?;
+        .map_err(|_| McpError::internal_error("reverse request id overflow".to_string(), None))?;
     let request_id = RequestId::from(NumberOrString::Number(id));
     let message = ServerJsonRpcMessage::request(request, request_id);
     let message = serde_json::to_value(message)
