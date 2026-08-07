@@ -432,11 +432,14 @@ impl SessionStore for StatefulSessionStore {
             .sessions
             .get_mut(session_id)
             .ok_or(HttpError::SessionNotFound)?;
-        entry.sse_sender = Some(sender);
         entry.last_activity = Instant::now();
-        if let Some(active_sender) = entry.sse_sender.clone() {
-            Self::send_replay_events(&mut entry, &active_sender, last_event_id);
-        }
+        entry.sse_sender = Some(sender);
+        // Clone before mut borrow: send_replay_events may clear sse_sender on fail.
+        let active_sender = entry
+            .sse_sender
+            .clone()
+            .expect("sse sender just installed");
+        Self::send_replay_events(&mut entry, &active_sender, last_event_id);
         Ok(())
     }
 

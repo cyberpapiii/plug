@@ -334,7 +334,6 @@ impl ServerHandler for MockServer {
         async move {
             eprintln!("mock-mcp-server: call_tool {}", request.name);
 
-            // Handle fail modes
             match self.fail_mode.as_str() {
                 "crash" => {
                     eprintln!("mock-mcp-server: crash mode, exiting");
@@ -347,7 +346,6 @@ impl ServerHandler for MockServer {
                 _ => {}
             }
 
-            // Apply delay
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -409,7 +407,6 @@ impl ServerHandler for MockServer {
 
             let mut response_text = format!("Called {} with {}", request.name, args_str);
 
-            // Handle reverse requests
             match self.reverse_request.as_str() {
                 "elicitation" => {
                     eprintln!("mock-mcp-server: sending elicitation reverse request");
@@ -649,7 +646,6 @@ async fn main() -> anyhow::Result<()> {
         "--lifecycle must be rmcp, legacy-only, or modern-only"
     );
 
-    // Set up tracing to stderr
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

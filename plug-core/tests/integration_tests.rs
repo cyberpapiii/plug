@@ -1559,7 +1559,6 @@ async fn test_proxy_handler_refresh_tools_empty() {
     );
     handler.refresh_tools().await;
 
-    // Verify the handler still works (get_info returns valid info)
     let info = handler.get_info();
     assert!(info.capabilities.tools.is_none());
 }
@@ -1805,8 +1804,7 @@ async fn test_server_manager_tools_empty() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_resources_capability_present() {
-    // The ProxyHandler advertises resources capability (returns empty list, not error).
+fn test_resources_capability_omitted_until_upstream_support() {
     let sm = Arc::new(ServerManager::new());
     let handler = ProxyHandler::new(
         sm,
@@ -1832,8 +1830,6 @@ fn test_resources_capability_present() {
 
 #[test]
 fn test_prompts_not_advertised() {
-    // The ProxyHandler does not advertise prompts capability in server info,
-    // but the trait default returns Ok(empty) so it won't error if called.
     let sm = Arc::new(ServerManager::new());
     let handler = ProxyHandler::new(
         sm,
@@ -3554,41 +3550,37 @@ async fn test_upstream_http_sends_protocol_version_header() {
     let captured = mock_state.captured.lock().await;
 
     // initialize: should NOT have MCP-Protocol-Version (version unknown yet)
-    let init = captured.iter().find(|(m, _, _)| m == "initialize");
-    assert!(init.is_some(), "should have captured initialize request");
+    let init = captured
+        .iter()
+        .find(|(m, _, _)| m == "initialize")
+        .expect("should have captured initialize request");
     assert_eq!(
-        init.unwrap().1,
+        init.1,
         None,
         "initialize must not send MCP-Protocol-Version (version not yet negotiated)"
     );
     assert_eq!(
-        init.unwrap().2.as_deref(),
+        init.2.as_deref(),
         Some("Bearer oauth-access-token"),
         "initialize should send a single Bearer auth header"
     );
 
-    // notifications/initialized: SHOULD have MCP-Protocol-Version
     let initialized = captured
         .iter()
-        .find(|(m, _, _)| m == "notifications/initialized");
-    assert!(
-        initialized.is_some(),
-        "should have captured notifications/initialized"
-    );
+        .find(|(m, _, _)| m == "notifications/initialized")
+        .expect("should have captured notifications/initialized");
     assert_eq!(
-        initialized.unwrap().1,
+        initialized.1,
         Some("2025-11-25".to_string()),
         "notifications/initialized must include MCP-Protocol-Version from server's InitializeResult"
     );
 
-    // tools/list: SHOULD have MCP-Protocol-Version
-    let tools_list = captured.iter().find(|(m, _, _)| m == "tools/list");
-    assert!(
-        tools_list.is_some(),
-        "should have captured tools/list request"
-    );
+    let tools_list = captured
+        .iter()
+        .find(|(m, _, _)| m == "tools/list")
+        .expect("should have captured tools/list request");
     assert_eq!(
-        tools_list.unwrap().1,
+        tools_list.1,
         Some("2025-11-25".to_string()),
         "tools/list must include MCP-Protocol-Version"
     );

@@ -1,22 +1,6 @@
 #!/usr/bin/env bash
 #
-# setup-codesigning.sh — one-time, per-machine macOS code-signing setup for plug.
-#
-# Why: plug stores upstream OAuth credentials in the macOS login Keychain. A
-# locally-built Rust binary is ad-hoc signed, and its signature changes on every
-# `cargo install`, so the Keychain "Always Allow" ACL never persists and macOS
-# re-prompts constantly. Signing the binary with a STABLE self-signed identity
-# binds the ACL to the certificate (not the per-build hash), so the approval
-# sticks across rebuilds.
-#
-# This script is idempotent and safe to re-run:
-#   - no-ops on non-macOS
-#   - skips creation if a valid "Plug Local Signing" identity already exists
-#   - signs ~/.cargo/bin/plug if it is present
-#
-# The trust step (security add-trusted-cert) shows a GUI dialog asking for your
-# login password — that is expected and required to mark the cert trusted.
-#
+# Stable self-signed identity so Keychain "Always Allow" survives rebuilds.
 # See: docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md
 
 set -euo pipefail
@@ -47,7 +31,7 @@ sign_binary() {
 }
 
 if identity_is_valid; then
-  echo "✓ '$IDENTITY' is already a valid code-signing identity. Nothing to create."
+  echo "==> '$IDENTITY' is already a valid code-signing identity. Nothing to create."
   sign_binary
   echo
   echo "Done. Re-sign on every rebuild with ./scripts/dev-reinstall.sh (it signs automatically)."
@@ -95,7 +79,7 @@ if ! identity_is_valid; then
   echo "       Check: security find-identity -v -p codesigning" >&2
   exit 1
 fi
-echo "✓ '$IDENTITY' is now a valid code-signing identity."
+echo "==> '$IDENTITY' is now a valid code-signing identity."
 
 sign_binary
 

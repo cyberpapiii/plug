@@ -364,9 +364,8 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
                 }
             } else {
                 // Check PATH
-                match which(binary) {
-                    Some(_) => {}
-                    None => missing.push(format!("{server_name}: {binary}")),
+                if which(binary).is_none() {
+                    missing.push(format!("{server_name}: {binary}"));
                 }
             }
         }
@@ -525,8 +524,6 @@ async fn check_pid_staleness() -> CheckResult {
 fn is_process_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // kill(pid, 0) checks if the process exists without sending a signal
-        // SAFETY: This is a libc call but we use nix-free approach via std
         let result = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
@@ -1304,8 +1301,6 @@ command = "example-server"
     #[tokio::test]
     async fn port_available_on_random_port() {
         let mut config = test_config();
-        config.http.port = 0; // port 0 should always be bindable (OS picks)
-        // Actually port 0 fails our validation, use a high random port
         config.http.port = 49152 + (std::process::id() as u16 % 1000);
         let result = check_port_available(&config).await;
         // May or may not pass depending on port availability, just check it returns

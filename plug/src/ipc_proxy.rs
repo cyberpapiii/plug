@@ -97,15 +97,8 @@ struct CancellationIdentity {
     cancellation_capability: ipc::IpcCancellationCapability,
 }
 
-/// Client-negotiated session state that the daemon cannot recover on its
-/// own after a restart, tracked here so the proxy can replay it onto the
-/// fresh session (see plans/007-ipc-reconnect-state-replay-claude-fable.md).
-///
-/// IMPORTANT: any FUTURE IPC message that represents durable per-session
-/// negotiated client state (in the same family as `UpdateCapabilities`,
-/// `resources/subscribe`/`unsubscribe`, and `logging/setLevel`) must be
-/// added here and replayed in `replay_session_state_locked`, or it will be
-/// silently lost on daemon reconnect exactly like the bug this plan fixes.
+/// Client-negotiated session state replayed onto a fresh daemon session after
+/// reconnect (capabilities, subscriptions, log level).
 #[derive(Default)]
 struct ReplayState {
     client_capabilities: Option<ClientCapabilities>,
@@ -375,14 +368,16 @@ impl IpcProxyHandler {
                 }
             };
 
-            // Discriminate frame type by tag key: DaemonToProxyMessage uses
-            // `"envelope"`, plain IpcResponse uses `"type"`. Check for the
-            // envelope key first to avoid double-parsing on the hot path
-            // (normal frames like pings never contain `"envelope"`).
-            if frame.windows(10).any(|w| w == b"\"envelope\"") {
-                // Parse as DaemonToProxyMessage (envelope-wrapped)
+            // Discriminate by top-level tag: DaemonToProxyMessage uses
+            // `"envelope"`, plain IpcResponse uses `"type"`.
+            let frame_value: serde_json::Value =
+                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                    message: format!("invalid IPC frame: {e}"),
+                    reconnectable: false,
+                })?;
+            if frame_value.get("envelope").is_some() {
                 let daemon_msg: DaemonToProxyMessage =
-                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                    serde_json::from_value(frame_value).map_err(|e| TransportFailure {
                         message: format!("invalid envelope message: {e}"),
                         reconnectable: false,
                     })?;
@@ -477,9 +472,8 @@ impl IpcProxyHandler {
                 }
             }
 
-            // Plain IpcResponse (no envelope key)
             let response: IpcResponse =
-                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                serde_json::from_value(frame_value).map_err(|e| TransportFailure {
                     message: format!("invalid IPC response: {e}"),
                     reconnectable: false,
                 })?;
@@ -672,22 +666,9 @@ impl IpcProxyHandler {
         Ok(())
     }
 
-    /// Best-effort replay of client-negotiated session state that the fresh
-    /// daemon session lost in the restart (see `ReplayState`). Called from
-    /// `refresh_session_locked`/`refresh_session` immediately after the new
-    /// session has been installed into `conn`.
-    ///
-    /// CRITICAL: the caller already holds the `shared.conn` lock (`conn` is
-    /// a reborrow of that guard), so every round trip here MUST use the
-    /// locked path (`try_round_trip_locked` via `send_replay_request`), never
-    /// `session_round_trip` — that would try to re-acquire `shared.conn` and
-    /// deadlock. `replay` is locked strictly after `conn` here, matching the
-    /// ordering documented on `SharedConnection::replay`.
-    ///
-    /// A replay failure (transport or daemon-rejected) is logged and does
-    /// NOT fail the reconnect, and does NOT trigger a recursive reconnect —
-    /// a degraded session beats no session, and beats today's silently
-    /// degraded session because it's now logged.
+    /// Replay `ReplayState` onto a fresh session. Caller already holds
+    /// `shared.conn`; use locked round trips only (see `SharedConnection::replay`).
+    /// Replay failures are logged and do not fail reconnect.
     async fn replay_session_state_locked(
         shared: &Arc<SharedConnection>,
         conn: &mut crate::runtime::DaemonProxySession,
@@ -3093,42 +3074,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
-    // ── Fake-daemon harness for reconnect / retry-policy / frame-handling
-    // characterization tests (plan 006) ────────────────────────────────────
-    //
-    // The harness above (`spawn_test_daemon`) runs a REAL `Engine` +
-    // `run_daemon` in-process against an actual upstream mock MCP server —
-    // the right tool for end-to-end behavior (tool listing, task lifecycle,
-    // artifact spilling), but it gives no way to inspect exactly which wire
-    // requests a reconnect sends (the daemon's `ClientRegistry` and its
-    // capability tracking are private to `daemon.rs`, invisible from this
-    // module) or to make the daemon emit a malformed frame, a precisely
-    // timed interleaved notification, or an indefinite stall — none of
-    // which the real `Engine` exposes a test hook for, and adding one is
-    // out of scope for this plan. The tests below instead speak
-    // `plug_core::ipc`'s wire protocol directly against a hand-rolled
-    // `UnixListener` bound at the same (test-scoped) `daemon::socket_path()`
-    // used everywhere else in this file, giving full control over
-    // daemon-side responses while exercising the real client-side code
-    // (`session_round_trip`, `try_round_trip_locked`, `reconnect_locked`,
-    // and — where a downstream peer matters — the full `IpcProxyHandler` +
-    // `.serve()` path) completely unmodified. `fake_daemon_handshake`
-    // performs the Register+Capabilities pair that `establish_daemon_proxy_
-    // session` sends on the initial connect AND on every reconnect;
-    // `drive_fake_daemon_initialize` additionally answers the three extra
-    // round trips (`UpdateSession`, `UpdateCapabilities`, a `Capabilities`
-    // refresh) that `IpcProxyHandler::initialize` performs only the first
-    // time a downstream MCP client connects — matching production, this is
-    // also the point at which `shared.peer` becomes populated. Because
-    // `establish_daemon_proxy_session` only touches `config_path` when it
-    // has to auto-spawn a daemon (never true here, since our listener is
-    // already bound), these tests pass `None` for it throughout. All tests
-    // below abort the handler's background heartbeat task right after
-    // construction, before it can independently race a scripted disconnect
-    // against the test's own explicit round trip (`DAEMON_PING_INTERVAL` is
-    // only ~1s, which is not a safe margin under this repo's noted CI
-    // contention). Like the rest of this module they serialize on
-    // `daemon_test_lock()` since they touch the global runtime-paths slot.
+    // Fake-daemon harness: hand-rolled UnixListener speaking plug_core::ipc
+    // so reconnect/frame tests control wire responses without Engine hooks.
+    // Tests abort the handler heartbeat after construction (avoids racing
+    // DAEMON_PING_INTERVAL) and take `daemon_test_lock()` for socket paths.
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

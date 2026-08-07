@@ -1544,19 +1544,6 @@ mod tests {
         assert!(token.is_none());
     }
 
-    // NOTE: Auto + loopback bind + non-loopback public_base_url (the tunnel
-    // topology this fix targets) is *not* exercised here with an assertion on
-    // the returned token, because that path calls
-    // `plug_core::auth::load_or_generate_token`, which writes under the real
-    // user config dir (`plug_core::config::config_dir()`) — there is no
-    // temp-dir override in this codebase for that path, and no existing test
-    // in this module exercises the Bearer/token-write branch either. The
-    // exposure-detection logic itself (bind-or-public_base_url) is covered by
-    // the `validate_none_on_tunneled_loopback_bind_is_rejected` and
-    // `validate_none_on_loopback_without_public_base_url_is_valid` tests in
-    // `plug-core/src/config/mod.rs`, which exercise the same
-    // `http_public_base_url_is_non_loopback` predicate this function uses.
-
     #[test]
     fn resolve_downstream_bearer_token_none_disables_auth() {
         let http = plug_core::config::HttpConfig {
@@ -2109,11 +2096,7 @@ mod tests {
         engine.shutdown().await;
     }
 
-    /// Minimal stdio mock-upstream `ServerConfig` exposing an `echo` tool, so
-    /// a real routable tool exists for `enqueue_tool_task` to create a task
-    /// against. Self-contained rather than reusing daemon.rs's private IPC
-    /// harness helper (`ipc_harness_mock_config`), which lives in a sibling
-    /// module's `#[cfg(test)] mod tests` and is out of scope for this plan.
+    /// Minimal stdio mock-upstream `ServerConfig` with an `echo` tool.
     fn task_test_mock_config() -> plug_core::config::ServerConfig {
         plug_core::config::ServerConfig {
             command: Some(

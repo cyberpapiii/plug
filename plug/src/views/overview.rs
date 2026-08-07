@@ -335,7 +335,6 @@ pub(crate) async fn cmd_status(
     let started = false;
     let daemon_running = daemon_running().await;
 
-    // Load config to check HTTP auth status
     let config = plug_core::config::load_config(config_path).ok();
     let linked_clients = linked_client_targets()
         .into_iter()
@@ -476,22 +475,19 @@ pub(crate) async fn cmd_status(
                 }
             }
 
-            // Show HTTP auth status
             if let Some((token_exists, token)) = &http_auth_info {
-                if *token_exists {
-                    if let Some(t) = token {
-                        print_label_value(
-                            "HTTP Auth",
-                            style(format!("enabled | Token: {t}")).green().bold(),
-                        );
-                    } else {
-                        print_label_value(
-                            "HTTP Auth",
-                            style("enabled (use --show-token to reveal)").green().bold(),
-                        );
+                match (*token_exists, token) {
+                    (true, Some(t)) => print_label_value(
+                        "HTTP Auth",
+                        style(format!("enabled | Token: {t}")).green().bold(),
+                    ),
+                    (true, None) => print_label_value(
+                        "HTTP Auth",
+                        style("enabled (use --show-token to reveal)").green().bold(),
+                    ),
+                    (false, _) => {
+                        print_label_value("HTTP Auth", style("NOT CONFIGURED").red().bold())
                     }
-                } else {
-                    print_label_value("HTTP Auth", style("NOT CONFIGURED").red().bold());
                 }
             }
 

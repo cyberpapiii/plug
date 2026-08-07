@@ -1,7 +1,6 @@
 //! Config import: scan AI client config files and extract MCP server definitions.
 //!
-//! Supports 12 clients: Claude Desktop, Claude Code, Cursor, Windsurf,
-//! VS Code Copilot, Gemini CLI, Codex CLI, OpenCode, Zed, Cline, Factory, Nanobot.
+//! Scans AI client config files for MCP server definitions.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -162,16 +161,13 @@ pub fn scan_all() -> Vec<ScanResult> {
 pub fn import(existing: &HashMap<String, ServerConfig>, sources: &[ClientSource]) -> ImportReport {
     let scanned: Vec<ScanResult> = sources.iter().map(|s| scan_client(*s)).collect();
 
-    // Collect all discovered servers
     let mut all_discovered: Vec<DiscoveredServer> =
         scanned.iter().flat_map(|r| r.servers.clone()).collect();
 
-    // Deduplicate by (command, args) signature
     let duplicates_before = all_discovered.len();
     dedup_servers(&mut all_discovered);
     let duplicates_merged = duplicates_before - all_discovered.len();
 
-    // Filter out servers already in existing config (match by command+args)
     let new_servers: Vec<DiscoveredServer> = all_discovered
         .into_iter()
         .filter(|d| !is_existing_server(d, existing))

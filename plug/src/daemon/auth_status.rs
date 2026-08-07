@@ -19,7 +19,6 @@ pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse
         }
     };
 
-    // Get runtime health from server manager
     let statuses = ctx.server_manager.server_statuses();
     let status_map: std::collections::HashMap<&str, &plug_core::types::ServerStatus> =
         statuses.iter().map(|s| (s.server_id.as_str(), s)).collect();

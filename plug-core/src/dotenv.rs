@@ -1,8 +1,8 @@
 //! Minimal `.env` file loader for plug.
 //!
-//! Reads `KEY=VALUE` lines from `<config_dir>/.env` and sets them as
-//! environment variables. This ensures secrets are available regardless of
-//! how plug was launched (terminal, launchd, GUI app, etc.).
+//! Reads `KEY=VALUE` lines from `<config_dir>/.env` and returns variables that
+//! are not already set. Caller applies them via `std::env::set_var` so secrets
+//! can load regardless of how plug was launched (terminal, launchd, GUI app).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -62,12 +62,10 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
     for line in content.lines() {
         let trimmed = line.trim();
 
-        // Skip empty lines and comments
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Skip lines without '='
         let Some(eq_pos) = trimmed.find('=') else {
             continue;
         };
@@ -75,7 +73,6 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
         let key = trimmed[..eq_pos].trim();
         let mut value = trimmed[eq_pos + 1..].trim();
 
-        // Skip invalid keys (must be non-empty, no spaces)
         if key.is_empty() || key.contains(' ') {
             continue;
         }

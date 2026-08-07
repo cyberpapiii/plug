@@ -64,7 +64,13 @@ impl ArtifactStore {
         let base_dir = ProjectDirs::from("", "", "plug")
             .map(|dirs| dirs.cache_dir().join("artifacts"))
             .unwrap_or_else(|| std::env::temp_dir().join("plug-artifacts"));
-        std::fs::create_dir_all(&base_dir).ok();
+        if let Err(error) = std::fs::create_dir_all(&base_dir) {
+            tracing::warn!(
+                path = %base_dir.display(),
+                %error,
+                "failed to create artifact cache directory"
+            );
+        }
         let store = Self {
             base_dir,
             records: DashMap::new(),

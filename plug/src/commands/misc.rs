@@ -442,7 +442,7 @@ fn synthesize_doctor_interpretation(
                 "Use `plug status` for the failing servers, then compare with `plug doctor` to separate runtime failures from cold connectivity.".to_string(),
             ),
         ),
-        (Pass, _, Some(Warn), true) | (Pass, _, Some(Warn), false) => (
+        (Pass, _, Some(Warn), _) => (
             Warn,
             "Basic connectivity checks pass, but the running daemon still has degraded or auth-required servers.".to_string(),
             Some(

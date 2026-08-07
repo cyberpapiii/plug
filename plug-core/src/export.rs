@@ -1,6 +1,6 @@
 //! Config export: generate client-specific MCP config pointing at plug.
 //!
-//! Supports 12 target clients with both stdio and HTTP transport options.
+//! Supports target clients with both stdio and HTTP transport options.
 
 use serde::Serialize;
 

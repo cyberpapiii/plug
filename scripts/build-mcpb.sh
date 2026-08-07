@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$ROOT/packaging/mcpb/manifest.json"
-ASSETS_DIR="$ROOT/docs/assets"
 MCPB_ASSETS_DIR="$ROOT/packaging/mcpb/assets"
 BUILD_DIR="$ROOT/target/mcpb/plug"
 OUT_DIR="$ROOT/target/dist"
@@ -67,7 +66,6 @@ validate_manifest() {
 
 require_file "$MANIFEST"
 for size in 16 32 64 128 256 512; do
-  require_file "$ASSETS_DIR/plug-icon-${size}.png"
   require_file "$MCPB_ASSETS_DIR/plug-icon-${size}.png"
 done
 

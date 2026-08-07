@@ -121,11 +121,12 @@ pub async fn dispatch_tools_call(
             .input_responses
             .as_ref()
             .is_some_and(|responses| responses.len() > MRTR_MAX_ITEMS)
-        || params
-            .input_responses
-            .as_ref()
-            .and_then(|responses| serde_json::to_vec(responses).ok())
-            .is_some_and(|encoded| encoded.len() > MRTR_MAX_BYTES)
+        || params.input_responses.as_ref().is_some_and(|responses| {
+            match serde_json::to_vec(responses) {
+                Ok(encoded) => encoded.len() > MRTR_MAX_BYTES,
+                Err(_) => true,
+            }
+        })
     {
         return Err(McpError::invalid_params(
             "multi-round tool input exceeds Plug's bounded continuation limits".to_string(),

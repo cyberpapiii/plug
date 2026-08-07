@@ -531,7 +531,6 @@ impl super::ToolRouter {
                 .map(|(s, _)| s.clone())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            // Return tool with wire name intact (CLI handles display)
             result.push((server_id, tool.clone()));
         }
         result

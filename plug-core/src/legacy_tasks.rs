@@ -94,7 +94,10 @@ impl From<&rmcp::model::Task> for Task {
                 rmcp::model::TaskStatus::Completed => TaskStatus::Completed,
                 rmcp::model::TaskStatus::Failed => TaskStatus::Failed,
                 rmcp::model::TaskStatus::Cancelled => TaskStatus::Cancelled,
-                _ => TaskStatus::Failed,
+                other => {
+                    tracing::warn!(?other, "unknown rmcp TaskStatus; coercing to Failed");
+                    TaskStatus::Failed
+                }
             },
             status_message: value.status_message.clone(),
             created_at: value.created_at.clone(),

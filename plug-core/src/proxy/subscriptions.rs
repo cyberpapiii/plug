@@ -1136,7 +1136,6 @@ impl super::ToolRouter {
         })?;
         drop(snapshot);
 
-        // Check upstream supports subscriptions
         let upstream = self
             .server_manager
             .get_upstream(&server_id)

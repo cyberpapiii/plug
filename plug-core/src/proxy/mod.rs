@@ -1048,13 +1048,11 @@ impl ToolRouter {
         server_id: &str,
         mut params: LoggingMessageNotificationParam,
     ) {
-        // Filter by effective log level
         let effective = **self.effective_log_level.load();
         if Self::level_severity(params.level) < Self::level_severity(effective) {
             return;
         }
 
-        // Prefix logger with server_id for disambiguation
         let original_logger = params.logger.as_deref().unwrap_or("default");
         params.logger = Some(format!("{server_id}:{original_logger}"));
 
@@ -2642,7 +2640,6 @@ impl ToolRouter {
                 }
             }
 
-            // Look up the server and original name for this exposed tool name
             let cache = self.cache.load_full();
             let (server_id, original_name) = cache
                 .routes
@@ -2708,7 +2705,6 @@ impl ToolRouter {
                 .and_then(|context| context.extension_envelope.as_ref())
                 .and_then(ExtensionEnvelope::to_meta);
 
-            // Build the upstream call with the original (unprefixed) tool name
             let mut upstream_params = CallToolRequestParams::new(original_name.clone());
             if let Some(ref args) = round.arguments {
                 upstream_params = upstream_params.with_arguments(args.clone());
@@ -3016,7 +3012,6 @@ impl ToolRouter {
                         }
                     }
 
-                    // Retry the tool call exactly once
                     self.call_tool_inner(
                         tool_name,
                         round,
@@ -3691,15 +3686,6 @@ mod lifecycle_regression_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------------
-
-/// Sanitize and optionally truncate tool descriptions for token efficiency.
-///
-/// Preserves `outputSchema` (structured output), `title` (human-friendly
-/// display name), and `annotations` (readOnlyHint, etc.).
-/// `inputSchema` is REQUIRED per MCP spec (ADR-003) — never stripped.
 mod catalog;
 mod completion;
 pub mod continuations;

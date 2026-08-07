@@ -1169,20 +1169,21 @@ fn case_insensitive_route_lookup() {
     }));
 
     let snapshot = router.cache.load();
-    // Exact match works
     assert!(snapshot.routes.contains_key("Slack__search_messages"));
-    // Case-insensitive fallback works
     let lower = "slack__search_messages";
-    let found = snapshot.routes.get(lower).or_else(|| {
-        snapshot
-            .routes
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(lower))
-            .map(|(_, v)| v)
-    });
-    assert!(found.is_some());
-    assert_eq!(found.unwrap().0, "slack");
-    assert_eq!(found.unwrap().1, "conversations_search_messages");
+    let found = snapshot
+        .routes
+        .get(lower)
+        .or_else(|| {
+            snapshot
+                .routes
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(lower))
+                .map(|(_, v)| v)
+        })
+        .expect("case-insensitive route lookup");
+    assert_eq!(found.0, "slack");
+    assert_eq!(found.1, "conversations_search_messages");
 }
 
 #[tokio::test(start_paused = true)]

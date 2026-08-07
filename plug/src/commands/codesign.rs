@@ -185,7 +185,6 @@ fn create_identity() -> anyhow::Result<()> {
         .args(["delete-identity", "-c", IDENTITY])
         .output();
 
-    // 3. Import cert+key, granting codesign access to the key.
     let mut c = Command::new("security");
     c.arg("import")
         .arg(&p12)

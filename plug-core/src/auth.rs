@@ -27,7 +27,6 @@ pub fn verify_auth_token(provided: &str, expected: &str) -> bool {
 /// If the file exists with correct permissions (0600 on Unix), its contents are reused.
 /// Otherwise a fresh token is generated, written with 0600 permissions, and returned.
 pub fn load_or_generate_token(path: &Path) -> anyhow::Result<String> {
-    // Try to load from existing file (open once to avoid TOCTOU race)
     if let Ok(token) = try_load_token(path) {
         return Ok(token);
     }

@@ -2,19 +2,14 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::response::sse::{Event, Sse};
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::SseEvent;
 
-/// Create an SSE stream from an mpsc receiver with disconnect detection.
-///
-/// - Sends a priming event as the first event (SHOULD per MCP spec 2025-11-25)
-/// - Uses CancellationToken for graceful shutdown
-/// - Uses `biased` select to prioritize shutdown over messages
-/// - KeepAlive sends SSE comments (not events) to avoid confusing MCP clients
+/// SSE stream from an mpsc receiver with priming event, keepalive comments, and cancel.
 pub fn sse_stream(
     rx: mpsc::Receiver<SseEvent>,
     cancel: CancellationToken,
@@ -25,14 +20,12 @@ pub fn sse_stream(
 pub fn sse_stream_with_heartbeat<F>(
     rx: mpsc::Receiver<SseEvent>,
     cancel: CancellationToken,
-    mut on_keepalive: F,
+    on_keepalive: F,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
 where
     F: FnMut() + Send + 'static,
 {
-    sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), move || {
-        on_keepalive();
-    })
+    sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), on_keepalive)
 }
 
 fn sse_stream_with_heartbeat_interval<F>(
@@ -45,12 +38,9 @@ where
     F: FnMut() + Send + 'static,
 {
     let stream = async_stream::stream! {
-        // SSE priming event (SHOULD per spec 2025-11-25):
-        // Empty data with event ID so clients know the stream is alive.
         yield Ok(Event::default().id("0").data(""));
 
         let mut rx = ReceiverStream::new(rx);
-        use futures::StreamExt;
 
         let mut keepalive = tokio::time::interval(keepalive_interval);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

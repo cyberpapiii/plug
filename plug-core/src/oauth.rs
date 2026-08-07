@@ -171,7 +171,7 @@ pub fn tokens_dir() -> PathBuf {
     config::config_dir().join("tokens")
 }
 
-/// Normalise an `expires_in` value: apply defaults and clamping.
+/// Normalize an `expires_in` value: apply defaults and clamping.
 fn effective_expires_in(expires_in: Option<u64>) -> u64 {
     match expires_in {
         Some(0) | None => DEFAULT_TOKEN_LIFETIME_SECS,
@@ -295,10 +295,8 @@ struct CachedCredentials {
     credentials: StoredCredentials,
     access_token: String,
     /// Epoch seconds when the token was received. Used by refresh checks.
-    #[allow(dead_code)]
     token_received_at: u64,
     /// Token lifetime in seconds. Used by refresh checks.
-    #[allow(dead_code)]
     expires_in: Option<u64>,
 }
 
@@ -483,7 +481,6 @@ pub struct CompositeCredentialStore {
 }
 
 impl CompositeCredentialStore {
-    /// Create a new store for `server_name`.
     pub fn new(server_name: String) -> Self {
         Self {
             server_name,
@@ -1018,9 +1015,6 @@ impl CompositeCredentialStore {
 
     fn update_cache(&self, creds: &StoredCredentials) {
         let cached = creds.token_response.as_ref().map(|tr| {
-            // Access the access token via the oauth2 TokenResponse trait.
-            // OAuthTokenResponse = StandardTokenResponse which has .access_token() -> &AccessToken
-            // and .expires_in() -> Option<Duration>.
             use oauth2::TokenResponse;
             let access_token = tr.access_token().secret().to_string();
             let expires_in = tr.expires_in().map(|d| d.as_secs());
@@ -1457,7 +1451,6 @@ pub struct CompositeStateStore {
 }
 
 impl CompositeStateStore {
-    /// Create a new state store for `server_name`.
     pub fn new(server_name: String) -> Self {
         Self { server_name }
     }
@@ -1467,8 +1460,6 @@ impl CompositeStateStore {
             config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
                 AuthError::InternalError(format!("invalid server name for state path: {e}"))
             })?;
-        // Sanitise the CSRF token for use in filenames — replace non-alphanumeric
-        // chars to avoid path injection.
         let safe_csrf: String = csrf_token
             .chars()
             .map(|c| {
@@ -1704,12 +1695,10 @@ pub async fn refresh_access_token(
         "loaded OAuth credentials for refresh"
     );
 
-    // 3. Injected tokens have no real OAuth client — cannot refresh.
     if creds.client_id == "injected" {
         return RefreshResult::InjectedToken;
     }
 
-    // 4. A refresh_token must be present.
     let has_refresh = creds.token_response.as_ref().is_some_and(|tr| {
         use oauth2::TokenResponse;
         tr.refresh_token().is_some()
@@ -1718,7 +1707,6 @@ pub async fn refresh_access_token(
         return RefreshResult::NoRefreshToken;
     }
 
-    // 5. Configure the OAuth client.
     let client_id = oauth_client_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| creds.client_id.clone());
@@ -1740,7 +1728,6 @@ pub async fn refresh_access_token(
         return RefreshResult::TransientError(format!("failed to configure client: {e}"));
     }
 
-    // 6. Exchange refresh_token for a new access_token.
     match auth_manager.refresh_token().await {
         Ok(_) => {
             // rmcp's refresh_token() saves via the refresh store and updates its
@@ -1942,11 +1929,6 @@ mod tests {
     async fn test_file_store_round_trip() {
         use rmcp::transport::auth::StoredCredentials;
 
-        let dir = std::env::temp_dir().join(format!("plug_oauth_test_{}", std::process::id()));
-        // Override tokens_dir by using the store's internal file path method
-        // indirectly — we test via a store with a simple server name and
-        // verify the file-level round trip.
-
         let server_name = format!("test-server-{}", std::process::id());
         let store = CompositeCredentialStore::new(server_name.clone());
 
@@ -1957,11 +1939,9 @@ mod tests {
             Some(1234567890),
         );
 
-        // Save to file (keyring may or may not work in CI).
         let save_result = store.file_save(&creds);
         assert!(save_result.is_ok(), "file_save failed: {save_result:?}");
 
-        // Load back from file.
         let loaded = store.file_load();
         assert!(loaded.is_some(), "file_load returned None");
         let loaded = loaded.unwrap();
@@ -1969,7 +1949,6 @@ mod tests {
         assert_eq!(loaded.granted_scopes, vec!["read", "write"]);
         assert_eq!(loaded.token_received_at, Some(1234567890));
 
-        // Verify file permissions on Unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1979,12 +1958,8 @@ mod tests {
             assert_eq!(mode, 0o600, "token file should have 0600 permissions");
         }
 
-        // Clean up.
         store.file_clear();
         assert!(store.file_load().is_none());
-
-        // Clean up directory.
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

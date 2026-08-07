@@ -27,7 +27,7 @@ fi
 info()    { printf "${CYAN}info${RESET}  %s\n" "$*"; }
 success() { printf "${GREEN}ok${RESET}    %s\n" "$*"; }
 warn()    { printf "${YELLOW}warn${RESET}  %s\n" "$*"; }
-error()   { printf "${RED}error${RESET} %s\n" "$*" >&2; exit 1; }
+error()   { printf "${RED}error${RESET} %b\n" "$*" >&2; exit 1; }
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -182,7 +182,7 @@ choose_install_dir() {
         return
     fi
 
-    # Prefer ~/.local/bin if it exists or HOME is writable
+    # Prefer ~/.local/bin when it exists and is writable
     LOCAL_BIN="$HOME/.local/bin"
     if [ -d "$LOCAL_BIN" ] && [ -w "$LOCAL_BIN" ]; then
         echo "$LOCAL_BIN"
@@ -195,13 +195,13 @@ choose_install_dir() {
         return
     fi
 
-    # Fall back to /usr/local/bin (may require sudo)
+    # Fall back to /usr/local/bin when writable
     if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
         echo "/usr/local/bin"
         return
     fi
 
-    # Last resort: create ~/.local/bin with user confirmation
+    # Last resort: create ~/.local/bin
     warn "/usr/local/bin is not writable. Installing to ~/.local/bin"
     mkdir -p "$LOCAL_BIN"
     echo "$LOCAL_BIN"
@@ -278,7 +278,7 @@ main() {
     fi
 
     if [ -z "$BIN_FILE" ]; then
-        error "Binary not found in archive. Archive contents:"
+        error "Binary not found in archive.\nArchive contents:\n$(find "$TMP_DIR" -type f | sed 's/^/  /')"
     fi
 
     # Install

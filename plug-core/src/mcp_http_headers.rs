@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::{Engine, prelude::BASE64_STANDARD};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::ClientJsonRpcMessage;
 use serde_json::Value;
@@ -167,7 +168,6 @@ fn require_and_validate(
 }
 
 fn decode_standard_header_value(value: &str) -> Option<String> {
-    use base64::{Engine, prelude::BASE64_STANDARD};
     const PREFIX: &str = "=?base64?";
     const SUFFIX: &str = "?=";
     match value

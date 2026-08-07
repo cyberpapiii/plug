@@ -51,24 +51,20 @@ async fn run_reload_start_actions(
         .map(move |action| {
             let server_manager = server_manager.clone();
             async move {
-                let action_for_result = action.clone();
-                let result = async move {
-                    match action.kind {
-                        ReloadStartKind::Restart => {
-                            tracing::info!(server = %action.name, "starting replacement for changed server");
-                        }
-                        ReloadStartKind::Start => {
-                            tracing::info!(server = %action.name, "starting new server");
-                        }
+                match action.kind {
+                    ReloadStartKind::Restart => {
+                        tracing::info!(server = %action.name, "starting replacement for changed server");
                     }
-
-                    server_manager
-                        .start_and_register(&action.name, &action.config)
-                        .await
-                        .map_err(|e| e.to_string())
+                    ReloadStartKind::Start => {
+                        tracing::info!(server = %action.name, "starting new server");
+                    }
                 }
-                .await;
-                (action_for_result, result)
+
+                let result = server_manager
+                    .start_and_register(&action.name, &action.config)
+                    .await
+                    .map_err(|e| e.to_string());
+                (action, result)
             }
         })
         .buffer_unordered(concurrency_limit.max(1))
@@ -108,7 +104,6 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         }
     }
 
-    // Check non-server settings
     let mut restart_required = Vec::new();
     note_restart_required(
         &mut restart_required,
@@ -217,8 +212,7 @@ pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> b
         || old.timeout_secs != new.timeout_secs
         || old.call_timeout_secs != new.call_timeout_secs
         || old.enabled != new.enabled
-        || old.auth_token.as_ref().map(|t| t.as_str())
-            != new.auth_token.as_ref().map(|t| t.as_str())
+        || old.auth_token != new.auth_token
         || old.auth != new.auth
         || old.oauth_client_id != new.oauth_client_id
         || old.oauth_scopes != new.oauth_scopes
@@ -229,11 +223,12 @@ pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> b
 ///
 /// Steps:
 /// 1. Stop removed servers
-/// 2. Restart changed servers
-/// 3. Start added servers
-/// 4. Refresh tool cache
-/// 5. Swap config via ArcSwap
-/// 6. Emit ConfigReloaded event
+/// 2. Stop changed servers
+/// 3. Batch-start changed and added servers
+/// 4. Swap config via ArcSwap
+/// 5. Spawn background tasks for successful starts
+/// 6. Refresh tool cache
+/// 7. Emit ConfigReloaded event
 pub async fn apply_reload(
     engine: &std::sync::Arc<crate::engine::Engine>,
     new_config: Config,
@@ -258,7 +253,6 @@ pub async fn apply_reload(
     server_manager.set_modern_upstream_enabled(new_config.modern_upstream_enabled);
     let mut spawn_after_swap: Vec<(String, ServerConfig)> = Vec::new();
 
-    // 1. Stop removed servers
     for name in &diff.removed {
         tracing::info!(server = %name, "stopping removed server");
         server_manager.stop_server(name).await;
@@ -270,7 +264,7 @@ pub async fn apply_reload(
         engine.reset_supervision(name);
     }
 
-    // 2. Stop changed servers before their replacement startup batch begins.
+    // Stop changed servers before their replacement startup batch begins.
     for (name, _new_cfg) in &diff.changed {
         tracing::info!(server = %name, "restarting changed server");
         server_manager.stop_server(name).await;
@@ -296,7 +290,7 @@ pub async fn apply_reload(
     )
     .await;
 
-    // 3. Record startup outcomes after the batch completes so config swap and
+    // Record startup outcomes after the batch completes so config swap and
     // downstream refresh happen once for the whole reload.
     for (action, result) in start_results {
         match result {
@@ -322,7 +316,7 @@ pub async fn apply_reload(
         }
     }
 
-    // 4. Swap config atomically before spawning background tasks so new tasks
+    // Swap config atomically before spawning background tasks so new tasks
     // observe the updated server set immediately.
     engine.store_config(new_config);
 
@@ -330,13 +324,10 @@ pub async fn apply_reload(
         engine.spawn_background_tasks_for_server(name, cfg);
     }
 
-    // 5. Refresh tool cache
     engine.tool_router().refresh_tools().await;
 
-    // 6. Emit event
     let _ = engine.event_sender().send(EngineEvent::ConfigReloaded);
 
-    // Log restart-required warnings
     for warning in &diff.restart_required {
         tracing::warn!("{warning}");
     }

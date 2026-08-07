@@ -288,16 +288,13 @@ async fn cmd_downstream_oauth_clients(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // login
-// ---------------------------------------------------------------------------
 
 async fn cmd_auth_login(
     config_path: Option<&PathBuf>,
     server_name: &str,
     no_browser: bool,
 ) -> anyhow::Result<()> {
-    // 1. Load and validate config ----------------------------------------
     let cfg = config::load_config(config_path)?;
     let server_config = cfg
         .servers
@@ -319,7 +316,6 @@ async fn cmd_auth_login(
         "Starting OAuth login for server '{server_name}'..."
     ));
 
-    // 2. Build an AuthorizationManager with our persistent stores --------
     use rmcp::transport::auth::AuthorizationManager;
 
     let mut auth_manager = AuthorizationManager::new(url)
@@ -335,7 +331,6 @@ async fn cmd_auth_login(
     auth_manager.set_credential_store(cred_store.clone());
     auth_manager.set_state_store(state_store);
 
-    // 3. Discover authorization server metadata --------------------------
     ui::print_info_line("Discovering authorization server metadata...");
     let metadata = auth_manager
         .resolve_metadata()
@@ -348,7 +343,6 @@ async fn cmd_auth_login(
         .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
     auth_manager.set_metadata(metadata.metadata);
 
-    // 4. Configure or register client ------------------------------------
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
     let PersistedOauthClientState {
@@ -427,14 +421,12 @@ async fn cmd_auth_login(
             .map_err(|e| anyhow::anyhow!("failed to persist OAuth client registration: {e}"))?;
     }
 
-    // 5. Generate the authorization URL ----------------------------------
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let auth_url = auth_manager
         .get_authorization_url(&scope_refs)
         .await
         .map_err(|e| anyhow::anyhow!("failed to get authorization URL: {e}"))?;
 
-    // 6. Present to user -------------------------------------------------
     if no_browser {
         println!();
         println!("Open this URL in your browser to authorize:");
@@ -453,7 +445,6 @@ async fn cmd_auth_login(
         }
     }
 
-    // 7. Collect the callback parameters ---------------------------------
     let (code, csrf_state, callback_issuer) = if let Some(listener) = callback_listener {
         // Localhost callback: wait for the OAuth redirect with a 120s timeout.
         ui::print_info_line("Waiting for OAuth callback on localhost...");
@@ -490,7 +481,6 @@ async fn cmd_auth_login(
         .validate_callback_issuer(callback_issuer.as_deref())
         .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
 
-    // 8. Exchange code for token -----------------------------------------
     ui::print_info_line("Exchanging authorization code for token...");
     auth_manager
         .exchange_code_for_token(&code, &csrf_state)
@@ -515,9 +505,7 @@ async fn cmd_auth_login(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // complete (non-interactive code exchange)
-// ---------------------------------------------------------------------------
 
 /// Non-interactive OAuth code exchange for agents that obtained an authorization
 /// code through an external mechanism (e.g. a separate browser step orchestrated
@@ -530,7 +518,6 @@ async fn cmd_auth_complete(
     csrf_state: &str,
     callback_issuer: Option<&str>,
 ) -> anyhow::Result<()> {
-    // 1. Load and validate config ----------------------------------------
     let cfg = config::load_config(config_path)?;
     let server_config = cfg
         .servers
@@ -548,7 +535,6 @@ async fn cmd_auth_complete(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
 
-    // 2. Build an AuthorizationManager with persistent stores ------------
     use rmcp::transport::auth::AuthorizationManager;
 
     let mut auth_manager = AuthorizationManager::new(url)
@@ -560,7 +546,6 @@ async fn cmd_auth_complete(
     auth_manager.set_credential_store(cred_store.clone());
     auth_manager.set_state_store(state_store);
 
-    // 3. Discover metadata and configure client --------------------------
     let metadata = auth_manager
         .resolve_metadata()
         .await
@@ -609,7 +594,6 @@ async fn cmd_auth_complete(
         );
     }
 
-    // 4. Exchange code for token -----------------------------------------
     ui::print_info_line("Exchanging authorization code for token...");
     auth_manager
         .exchange_code_for_token(code, csrf_state)
@@ -634,9 +618,7 @@ async fn cmd_auth_complete(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // inject
-// ---------------------------------------------------------------------------
 
 async fn cmd_auth_inject(
     config_path: Option<&PathBuf>,
@@ -722,9 +704,7 @@ async fn cmd_auth_inject(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // status
-// ---------------------------------------------------------------------------
 
 async fn cmd_auth_status(
     config_path: Option<&PathBuf>,
@@ -915,9 +895,7 @@ async fn cmd_auth_status(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // localhost callback listener
-// ---------------------------------------------------------------------------
 
 /// Accepts a single GET request to `/callback`, extracts `code` and `state`
 /// query parameters, returns a success page to the browser, and shuts down.
@@ -973,7 +951,6 @@ async fn await_oauth_callback_inner(
     }
     let request = String::from_utf8_lossy(&buf[..total]);
 
-    // Parse the request line: "GET /callback?code=...&state=... HTTP/1.1"
     let request_line = request.lines().next().unwrap_or("");
     let path = request_line
         .split_whitespace()
@@ -991,7 +968,6 @@ async fn await_oauth_callback_inner(
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
 
-    // Check for an error response from the authorization server.
     if let Some(err) = params.get("error") {
         let desc = params
             .get("error_description")
@@ -1045,9 +1021,7 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-// ---------------------------------------------------------------------------
 // logout
-// ---------------------------------------------------------------------------
 
 async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
     let store = oauth::get_or_create_store(server_name);
@@ -1310,7 +1284,6 @@ mod tests {
         assert_eq!(json["servers"].as_array().unwrap().len(), 0);
     }
 
-    /// Simulates a browser redirect delivering code and state to the callback
     /// listener. Proves the happy path extracts both parameters correctly.
     #[tokio::test]
     async fn callback_extracts_code_and_state() {
@@ -1338,7 +1311,6 @@ mod tests {
         assert_eq!(issuer.as_deref(), Some("https://auth.example"));
     }
 
-    /// Proves that percent-encoded callback parameters are decoded before
     /// token exchange.
     #[tokio::test]
     async fn callback_decodes_percent_encoded_code_and_state() {
@@ -1366,7 +1338,6 @@ mod tests {
         assert_eq!(issuer, None);
     }
 
-    /// Proves that the listener returns an error when the authorization server
     /// redirects with an error parameter instead of a code.
     #[tokio::test]
     async fn callback_returns_error_on_oauth_error() {
@@ -1393,7 +1364,6 @@ mod tests {
         assert!(msg.contains("access_denied"), "got: {msg}");
     }
 
-    /// Proves that missing `code` parameter is rejected.
     #[tokio::test]
     async fn callback_rejects_missing_code() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1416,7 +1386,6 @@ mod tests {
         assert!(err.to_string().contains("missing 'code'"), "got: {}", err);
     }
 
-    /// Proves that the listener times out if no connection arrives.
     #[tokio::test]
     async fn callback_times_out() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -48,7 +48,6 @@ async fn run_watcher(
         .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?
         .to_path_buf();
 
-    // Ensure the directory exists
     if !watch_dir.exists() {
         tracing::debug!(
             path = %watch_dir.display(),
@@ -98,7 +97,6 @@ async fn run_watcher(
             biased;
             _ = cancel.cancelled() => break,
             Some(changed_path) = rx.recv() => {
-                // Only react to changes to the config file itself
                 let filename = changed_path
                     .file_name()
                     .unwrap_or_default()
@@ -108,24 +106,24 @@ async fn run_watcher(
                 }
 
                 tracing::info!("config file changed — reloading");
-                match config::load_config(Some(&config_path)) {
-                    Ok(new_config) => {
-                        match engine.reload_config(new_config).await {
-                            Ok(report) => {
-                                tracing::info!(
-                                    added = report.added.len(),
-                                    removed = report.removed.len(),
-                                    changed = report.changed.len(),
-                                    "config reloaded via file watcher"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "config reload failed — keeping current config");
-                            }
-                        }
-                    }
+                let new_config = match config::load_config(Some(&config_path)) {
+                    Ok(config) => config,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to parse changed config — keeping current config");
+                        continue;
+                    }
+                };
+                match engine.reload_config(new_config).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            added = report.added.len(),
+                            removed = report.removed.len(),
+                            changed = report.changed.len(),
+                            "config reloaded via file watcher"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "config reload failed — keeping current config");
                     }
                 }
             }
@@ -282,10 +280,8 @@ mod tests {
         }
 
         /// Write `config` to the watched file and wait for the watcher to
-        /// pick it up. The watcher arms asynchronously and there is no
-        /// readiness signal, so the FIRST mutation gets a bounded retry: if
-        /// 5s of polling sees no reload, rewrite the same content (up to 2
-        /// more times) rather than assuming failure.
+        /// pick it up. Fixture awaits the watcher ready oneshot before mutate;
+        /// bounded rewrite retry covers FSEvents lag after arm.
         async fn mutate_and_await_reload(&mut self, config: &Config) -> bool {
             for _ in 0..3 {
                 write_config(&self.config_path, config);

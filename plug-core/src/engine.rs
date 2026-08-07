@@ -194,7 +194,6 @@ impl Engine {
         // Wire up the Engine reference for session recovery in ToolRouter
         self.tool_router.set_engine(Arc::downgrade(self));
 
-        // Start all upstream servers
         self.server_manager.start_all(&config).await?;
 
         // Startup failures are currently non-fatal. Preserve them in daemon
@@ -216,7 +215,6 @@ impl Engine {
             }
         }
 
-        // Refresh tool cache after startup
         self.tool_router.refresh_tools().await;
         self.tool_router.prune_artifacts();
 
@@ -225,7 +223,6 @@ impl Engine {
             .event_tx
             .send(EngineEvent::ToolCacheRefreshed { tool_count });
 
-        // Emit ServerStarted events for each running server
         for status in self.server_manager.server_statuses() {
             let _ = self.event_tx.send(EngineEvent::ServerStarted {
                 server_id: Arc::from(status.server_id.as_str()),
@@ -243,7 +240,6 @@ impl Engine {
             &self.tracker,
         );
 
-        // Spawn OAuth token refresh loops
         spawn_refresh_loops(
             Arc::clone(self),
             self.cancel.clone(),
@@ -881,7 +877,6 @@ async fn run_refresh_loop(
 ) {
     use crate::oauth;
 
-    // Get the credential store for cache access
     let store = oauth::get_or_create_store(server_name);
 
     let mut next_check = Duration::from_secs(30);
@@ -915,7 +910,6 @@ async fn run_refresh_loop(
                 // If a prior iteration already refreshed the token but
                 // reconnect failed, skip the refresh and retry reconnect.
                 if !reconnect_pending {
-                    // Read the cached credentials to check expiry
                     let (received_at, expires_in) = match store.cached_expiry() {
                         Some(t) => t,
                         None => {
@@ -935,9 +929,6 @@ async fn run_refresh_loop(
 
                     tracing::info!(server = %server_name, "token refresh due, attempting OAuth token refresh");
 
-                    // --- Step 1: Refresh the OAuth token at the token endpoint ---
-                    //
-                    // Load the server config to get the URL and client_id.
                     let (server_url, oauth_client_id) = {
                         let cfg = engine.config();
                         match cfg.servers.get(server_name) {
@@ -1025,8 +1016,6 @@ async fn run_refresh_loop(
                         "retrying reconnect with already-refreshed token"
                     );
                 }
-
-                // --- Step 2: Reconnect with the fresh token ---
                 match engine.reconnect_server(server_name).await {
                     Ok(()) => {
                         reconnect_pending = false;

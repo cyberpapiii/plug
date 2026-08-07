@@ -57,7 +57,6 @@ pub struct Config {
     /// until explicit shutdown.
     #[serde(default = "default_grace_period")]
     pub daemon_grace_period_secs: u64,
-    /// Upstream server definitions.
     /// Active upstream supervision policy (item 2b): bounded restart of an
     /// upstream that stays degraded past a threshold.
     #[serde(default)]
@@ -407,7 +406,7 @@ pub struct ServerConfig {
     /// Tool call timeout in seconds (default: 300). Set higher for slow tools.
     #[serde(default = "default_call_timeout")]
     pub call_timeout_secs: u64,
-    /// Max concurrent requests to this server (default: 1 for stdio, 10 for HTTP).
+    /// Max concurrent requests to this server (default: 1).
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Health check interval in seconds (default: 60).
@@ -727,12 +726,10 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             ));
         }
 
-        // Server name must be filesystem-safe for token storage
         if let Err(e) = sanitize_server_name_for_path(name) {
             errors.push(format!("server '{name}': {e}"));
         }
 
-        // OAuth validation
         if server.auth.as_deref() == Some("oauth") {
             if server.auth_token.is_some() {
                 errors.push(format!(

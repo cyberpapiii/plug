@@ -1041,7 +1041,6 @@ impl ServerManager {
             "starting upstream servers"
         );
 
-        // Process servers in batches of startup_concurrency
         for chunk in enabled.chunks(config.startup_concurrency) {
             let mut join_set = tokio::task::JoinSet::new();
 
@@ -1087,7 +1086,6 @@ impl ServerManager {
                             }
                         }
 
-                        // Clone current map, insert new server, swap
                         let max_concurrent = upstream.config.max_concurrent;
                         let cb_enabled = upstream.config.circuit_breaker_enabled;
                         self.configured_auth.insert(
@@ -1096,7 +1094,6 @@ impl ServerManager {
                         );
                         self.insert_upstream(name.clone(), Arc::new(upstream));
 
-                        // Initialize resilience state for this server
                         self.health.insert(name.clone(), HealthState::new());
                         self.semaphores.insert(
                             name.clone(),
@@ -1114,7 +1111,6 @@ impl ServerManager {
                         if let Some(server_config) = config.servers.get(&name) {
                             self.record_start_failure(&name, server_config, &e);
                         }
-                        // One server failing should not prevent others from starting
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "server start task panicked");
@@ -2081,12 +2077,10 @@ impl ServerManager {
     pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
         let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
 
-        // Reset circuit breaker on successful reconnection
         if let Some(cb) = self.circuit_breakers.get(name) {
             cb.reset();
         }
 
-        // Reset health state on successful reconnection
         if let Some(mut entry) = self.health.get_mut(name) {
             *entry = HealthState::new();
         }

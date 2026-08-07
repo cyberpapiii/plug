@@ -331,42 +331,6 @@ impl ServerHandler for ProxyHandler {
         }
     }
 
-    /*fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
-        let router = Arc::clone(&self.router);
-        let progress_token = request.progress_token();
-        let tool_name = request.name.to_string();
-        let arguments = request.arguments;
-        let client_type = self
-            .client_type
-            .read()
-            .map(|ct| *ct)
-            .unwrap_or(ClientType::Unknown);
-        let downstream = DownstreamCallContext::stdio_for_client(
-            Arc::clone(&self.client_id),
-            context.id.clone(),
-            client_type,
-        );
-        async move {
-            router
-                .enqueue_tool_task(
-                    &tool_name,
-                    arguments,
-                    progress_token,
-                    owner,
-                    // stdio has no teardown path that calls task cleanup, so
-                    // the owner is always live — nothing to probe.
-                    None,
-                    Some(downstream),
-                )
-                .await
-        }
-    }*/
-
     fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -394,7 +358,6 @@ impl ServerHandler for ProxyHandler {
                 "client connected"
             );
 
-            // Store client type for list_tools filtering
             match self.client_type.write() {
                 Ok(mut ct) => *ct = client_type,
                 Err(e) => tracing::warn!("client_type lock poisoned: {e}"),
@@ -402,8 +365,9 @@ impl ServerHandler for ProxyHandler {
 
             self.roots_supported
                 .store(request.capabilities.roots.is_some(), Ordering::SeqCst);
-            if let Ok(mut caps) = self.client_capabilities.write() {
-                *caps = request.capabilities.clone();
+            match self.client_capabilities.write() {
+                Ok(mut caps) => *caps = request.capabilities.clone(),
+                Err(e) => tracing::warn!("client_capabilities lock poisoned: {e}"),
             }
             let _ = self.downstream_peer.set(context.peer.clone());
 
@@ -419,8 +383,6 @@ impl ServerHandler for ProxyHandler {
                 let router = Arc::clone(&self.router);
                 let mut rx = self.router.subscribe_notifications();
                 let shutdown = self.shutdown.clone();
-                // This connection's own identity, for fanout::resolve()'s
-                // target match — see plug-core/src/notifications.rs::fanout.
                 let identity = NotificationTarget::Stdio {
                     client_id: Arc::clone(&client_id),
                 };
@@ -433,11 +395,6 @@ impl ServerHandler for ProxyHandler {
                         };
                         match msg {
                             Ok(notification) => {
-                                // classify -> resolve -> (per-notification-kind delivery below).
-                                // deliver_to() collapses the four `matches!(target,
-                                // NotificationTarget::Stdio {..} if ..)` checks this block used
-                                // to repeat into one shared comparison; it's a no-op (always
-                                // true) for broadcast-shaped notifications.
                                 let deliver = crate::notifications::fanout::resolve(
                                     crate::notifications::fanout::classify(&notification),
                                 )
@@ -521,7 +478,6 @@ impl ServerHandler for ProxyHandler {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    // Clean up resource subscriptions and roots cache for this disconnected client
                     let target = NotificationTarget::Stdio {
                         client_id: Arc::clone(&client_id),
                     };
@@ -565,7 +521,6 @@ impl ServerHandler for ProxyHandler {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    // Clean up per-client log level on disconnect
                     log_router.remove_client_log_level(&log_client_id);
                 });
             }
@@ -679,16 +634,6 @@ impl ServerHandler for ProxyHandler {
                 .list_tools_page_for_client_session(ct, Some(&session_key), request))
         }
     }
-
-    /*fn list_tasks(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
-        let router = Arc::clone(&self.router);
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
-        async move { router.list_tasks_for_owner(&owner, request).await }
-    }*/
 
     fn call_tool(
         &self,
@@ -809,44 +754,6 @@ impl ServerHandler for ProxyHandler {
             Ok(())
         }
     }
-
-    /*fn get_task_info(
-        &self,
-        request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
-        let router = Arc::clone(&self.router);
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
-        async move {
-            router
-                .get_task_info_for_owner(&owner, &request.task_id)
-                .await
-        }
-    }*/
-
-    /*fn get_task_result(
-        &self,
-        request: GetTaskPayloadParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
-        let router = Arc::clone(&self.router);
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
-        async move {
-            router
-                .get_task_result_for_owner(&owner, &request.task_id)
-                .await
-        }
-    }*/
-
-    /*fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
-        let router = Arc::clone(&self.router);
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
-        async move { router.cancel_task_for_owner(&owner, &request.task_id).await }
-    }*/
 
     fn on_custom_request(
         &self,

@@ -1229,23 +1229,10 @@ async fn send_http_client_request(
     request: ServerRequest,
     timeout: Option<Duration>,
 ) -> Result<ClientResult, McpError> {
-    let has_live_sse_sender = state
-        .sessions
-        .has_live_sse_sender(session_id)
+    let id = i64::try_from(state.reverse_request_counter.fetch_add(1, Ordering::SeqCst))
         .map_err(|_| {
-            McpError::internal_error(
-                "HTTP client has no live SSE stream for reverse requests".to_string(),
-                None,
-            )
+            McpError::internal_error("reverse request id overflow".to_string(), None)
         })?;
-    if !has_live_sse_sender {
-        return Err(McpError::internal_error(
-            "HTTP client has no live SSE stream for reverse requests".to_string(),
-            None,
-        ));
-    }
-
-    let id = state.reverse_request_counter.fetch_add(1, Ordering::SeqCst) as i64;
     let request_id = RequestId::from(NumberOrString::Number(id));
     let message = ServerJsonRpcMessage::request(request, request_id);
     let message = serde_json::to_value(message)
@@ -1300,7 +1287,6 @@ async fn send_http_client_request(
                 None,
             )),
             Err(_) => {
-                // Clean up the pending request on timeout
                 state
                     .pending_client_requests
                     .remove(&(session_id.to_string(), id));
@@ -2198,7 +2184,11 @@ async fn handle_request(
                         .and_then(json_task_value),
                     Err(e) => Err(e),
                 },
-                _ => unreachable!(),
+                _ => Err(ErrorData::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    "method not supported",
+                    None,
+                )),
             };
             match result {
                 Ok(value) => Ok(axum::Json(
