@@ -123,10 +123,9 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **resilience**: exponential backoff with jitter on transient failures
 - **resilience**: health checks with configurable intervals
 - **config**: TOML configuration with layered overrides (file → env → CLI)
-- **tui**: real-time Ratatui dashboard with server health, tool counts, event log
 - **daemon**: headless daemon mode with PID file and lock management
 - **http**: `GET /.well-known/mcp.json` server discovery card endpoint
-- **cli**: `plug connect`, `plug status`, `plug tui` commands
+- **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
 [Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.3.0...HEAD

@@ -1099,42 +1099,6 @@ impl ServerHandler for IpcProxyHandler {
         }
     }
 
-    /*fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
-        async move {
-            let params = serde_json::to_value(&request)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
-                .mcp_round_trip(
-                    RetryPolicy::UnsafeToRetry,
-                    "tools/call",
-                    Some(params),
-                    &context,
-                )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("unexpected task enqueue response: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
-        }
-    }*/
-
     fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -1148,10 +1112,9 @@ impl ServerHandler for IpcProxyHandler {
                 .contains_key(plug_core::protocol::LEGACY_TASK_REQUEST_KEY);
 
             // Serialize the full request so `_meta` (including
-            // `progressToken`) survives to the daemon — matching
-            // `enqueue_task`. A hand-built `{name, arguments}` object drops
-            // the progress token and silently disables progress on the
-            // default `plug connect` path.
+            // `progressToken`) survives to the daemon. A hand-built
+            // `{name, arguments}` object drops the progress token and
+            // silently disables progress on the default `plug connect` path.
             let mut params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             if !context.meta.is_empty()
@@ -1224,140 +1187,6 @@ impl ServerHandler for IpcProxyHandler {
             }
         }
     }
-
-    /*fn list_tasks(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
-        async move {
-            let params = request
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
-                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
-                    IpcRequest::McpRequest {
-                        session_id: session_id.to_string(),
-                        method: "tasks/list".to_string(),
-                        params: params.clone(),
-                    }
-                })
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse tasks/list: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
-        }
-    }*/
-
-    /*fn get_task_info(
-        &self,
-        request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
-        async move {
-            let params = serde_json::to_value(&request)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
-                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
-                    IpcRequest::McpRequest {
-                        session_id: session_id.to_string(),
-                        method: "tasks/get".to_string(),
-                        params: Some(params.clone()),
-                    }
-                })
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse tasks/get: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
-        }
-    }*/
-
-    /*fn get_task_result(
-        &self,
-        request: GetTaskPayloadParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
-        async move {
-            let params = serde_json::to_value(&request)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
-                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
-                    IpcRequest::McpRequest {
-                        session_id: session_id.to_string(),
-                        method: "tasks/result".to_string(),
-                        params: Some(params.clone()),
-                    }
-                })
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => Ok(GetTaskPayloadResult::new(payload)),
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
-        }
-    }*/
-
-    /*fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
-        async move {
-            let params = serde_json::to_value(&request)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
-                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
-                    IpcRequest::McpRequest {
-                        session_id: session_id.to_string(),
-                        method: "tasks/cancel".to_string(),
-                        params: Some(params.clone()),
-                    }
-                })
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse tasks/cancel: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
-        }
-    }*/
 
     fn on_custom_request(
         &self,
