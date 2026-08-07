@@ -2,6 +2,13 @@
 title: HTTP SSE fanout now reuses pre-serialized payloads
 date: 2026-03-18
 category: integration-issues
+module: plug-core/http
+problem_type: integration_issue
+summary: The HTTP/SSE notification path was doing extra work for every connected session
+tags:
+- sse
+- http
+- integration-issues
 status: completed
 ---
 
@@ -14,23 +21,23 @@ session:
 
 - notifications were carried as raw `serde_json::Value`
 - the SSE stream serialized the same payload once per client stream
-- broadcast fanout first collected session IDs, then did another map lookup per
-  target before attempting delivery
+- broadcast fanout held map locks across delivery work in a way that made
+  noisy global notifications more expensive than they needed to be
 
 That made noisy global notifications more CPU- and allocation-heavy than they
 needed to be.
 
 ## Solution
 
-- SSE messages are now stored as a pre-serialized shared payload type instead
-  of raw JSON values
+- SSE messages are now stored as a pre-serialized shared payload type
+  (`SseMessage` with `Arc<str>`) instead of raw JSON values
 - the HTTP notification fanout path serializes a notification once when it is
   enqueued, then clones the shared payload handle during broadcast
 - the SSE stream now writes the already-serialized payload directly instead of
   calling `serde_json::to_string()` for every client
-- session broadcast fanout now walks the live session map once and records the
-  minimal follow-up work needed for expired, delivered, queued, or disconnected
-  sessions
+- session broadcast snapshots session IDs first, then takes a short per-session
+  write lock for delivery / enqueue / expire accounting so DashMap shards are
+  not held across the whole fanout
 
 ## Key decisions
 

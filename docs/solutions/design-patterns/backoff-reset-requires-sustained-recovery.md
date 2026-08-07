@@ -18,6 +18,7 @@ tags:
   - circuit-breaker
   - health-check
   - flapping
+summary: "The `plug` daemon (an MCP multiplexer) added active upstream supervision (item 2b): if an upstream MCP server stays degraded past a threshold, the supervisor restarts it. To stop a perpetually-failing upstream from storming with restarts, e..."
 ---
 
 # Backoff is defeated if you reset it on transient health — gate the reset on sustained recovery

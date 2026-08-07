@@ -36,6 +36,8 @@ related:
   - plug-core/src/http/server.rs
   - plug-core/src/http/session.rs
   - plug-core/src/notifications.rs
+problem_type: integration_issue
+summary: Phase 2A solved global notification plumbing, but it did not yet solve request-scoped control flow.
 ---
 
 # Phase 2B progress and cancellation routing across stdio and HTTP

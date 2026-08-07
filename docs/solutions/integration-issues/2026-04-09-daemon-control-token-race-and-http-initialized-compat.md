@@ -4,6 +4,9 @@ date: 2026-04-09
 category: integration-issues
 status: implemented
 tags: [daemon, ipc, oauth, http, krisp, todoist, supabase, compatibility]
+module: plug/ipc
+problem_type: integration_issue
+summary: Two separate issues combined into one misleading operator experience
 ---
 
 # Daemon control-token race and HTTP initialized-notification compatibility

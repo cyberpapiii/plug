@@ -2,21 +2,32 @@
 title: Resource subscribe parity and cleanup closeout
 date: 2026-03-07
 category: integration-issues
+module: plug/ipc
+problem_type: integration_issue
+summary: Finished the roadmap tail by adding `resources/subscribe` and `resources/unsubscribe`
+  with targeted `notifications/resources/updated`, including daemon-backed `plug connect`
+  parity via interleaved IPC notifications and reconnect subscription restore, plus
+  dead dependency cleanup.
+tags:
+- ipc
+- integration-issues
 components:
-  - plug-core/src/proxy/mod.rs
-  - plug-core/src/http/server.rs
-  - plug-core/src/session/stateful.rs
-  - plug-core/src/ipc.rs
-  - plug/src/daemon/mod.rs
-  - plug/src/ipc_proxy.rs
-  - plug/src/runtime.rs
-problem_type: protocol-parity-closeout
-summary: Finished the roadmap tail by adding `resources/subscribe` and `resources/unsubscribe` with targeted `notifications/resources/updated`, including daemon-backed `plug connect` parity via daemon IPC notification delivery, plus dead dependency cleanup.
+- plug-core/src/proxy/subscriptions.rs
+- plug-core/src/proxy/mod.rs
+- plug-core/src/http/server.rs
+- plug-core/src/session/stateful.rs
+- plug-core/src/ipc.rs
+- plug/src/daemon/mod.rs
+- plug/src/daemon/notify.rs
+- plug/src/daemon/mcp_dispatch.rs
+- plug/src/ipc_proxy.rs
+- plug/src/runtime.rs
 related:
-  - docs/brainstorms/2026-03-07-roadmap-tail-closeout-brainstorm.md
-  - docs/plans/2026-03-07-feat-roadmap-tail-closeout-plan.md
-  - docs/solutions/integration-issues/phase2c-resources-prompts-pagination-20260307.md
-  - docs/solutions/integration-issues/downstream-https-serving-20260307.md
+- docs/brainstorms/2026-03-07-roadmap-tail-closeout-brainstorm.md
+- docs/plans/2026-03-07-feat-roadmap-tail-closeout-plan.md
+- docs/solutions/architecture-patterns/resource-subscription-transitions-and-owner-reconciliation.md
+- docs/solutions/integration-issues/phase2c-resources-prompts-pagination-20260307.md
+- docs/solutions/integration-issues/downstream-https-serving-20260307.md
 ---
 
 # Resource Subscribe Parity And Cleanup Closeout
@@ -43,19 +54,13 @@ At the same time, the repo still carried dead TUI dependencies (`ratatui`, `cros
 
 ## Solution
 
-### 1. Add subscription bookkeeping to `ToolRouter`
+### 1. Subscription bookkeeping lives in `SubscriptionRegistry`
 
-Historically, [`plug-core/src/proxy/mod.rs`](../../../plug-core/src/proxy/mod.rs) introduced subscription bookkeeping. Its current concurrency and ownership model is documented in [Resource subscription transitions and owner reconciliation](../architecture-patterns/resource-subscription-transitions-and-owner-reconciliation.md).
+Current concurrency and ownership rules are documented in [Resource subscription transitions and owner reconciliation](../architecture-patterns/resource-subscription-transitions-and-owner-reconciliation.md).
 
-- canonical resource URI -> downstream subscriber targets
-- downstream target -> subscribed resource URIs
+Live state is URI-keyed (`entries: DashMap`) with per-entry downstream `members`, generation, `Pending`/`Active`/`Draining`, and confirmed `owner_server_id`. There is no separate reverse index of target → URIs; membership lives on the URI entry.
 
-That lets `plug`:
-- call upstream `subscribe` only on the first local subscriber
-- call upstream `unsubscribe` only when the last local subscriber goes away
-- route `notifications/resources/updated` only to the subscribing targets
-
-The downstream target model now includes daemon-backed sessions too:
+Downstream targets include daemon-backed sessions:
 
 - `NotificationTarget::Stdio`
 - `NotificationTarget::Http`
@@ -70,41 +75,30 @@ They only:
 - forward `resources/unsubscribe`
 - deliver targeted resource-update notifications using the same internal notification bus already used for tool-list changes, progress, and cancellation
 
-That keeps the router as the only place that knows about reference counting and upstream transition rules.
+That keeps the registry as the only place that knows about reference counting and upstream transition rules.
 
-### 3. Add daemon-backed parity with a daemon notification channel
+### 3. Daemon-backed parity uses the control channel, not a second attach socket
 
 Daemon-backed `plug connect` needed real push delivery, not capability masking.
 
-The fix was:
+Current shape:
 
-- extend [`plug-core/src/ipc.rs`](../../../plug-core/src/ipc.rs) with:
-  - `AttachNotifications`
-  - `McpNotification`
-  - protocol version bump to `3`
-- add a daemon-side notification hub in [`plug/src/daemon/`](../../../plug/src/daemon/)
-- allow `IpcProxyHandler` to attach a dedicated daemon notification stream in [`plug/src/runtime.rs`](../../../plug/src/runtime.rs)
-- run a self-healing notification supervisor in [`plug/src/ipc_proxy.rs`](../../../plug/src/ipc_proxy.rs) that forwards MCP notifications back to the downstream stdio client
+- daemon IPC protocol version is `3` (`IPC_PROTOCOL_VERSION`)
+- push notifications are typed `IpcResponse` variants interleaved on the proxy connection (`ResourceUpdatedNotification`, list-changed, progress, cancelled, logging, auth-state, …)
+- `plug/src/daemon/notify.rs` fans those control notifications to the owning IPC writer
+- the proxy read loop peeks `"envelope"` when discriminating `DaemonToProxyMessage` vs plain `IpcResponse`
 
-This preserved product parity without rewriting the primary IPC request path.
+There is no separate `AttachNotifications` / `McpNotification` attach stream. Identity for targeted IPC delivery uses `NotificationTarget::Ipc` with the session id as `client_id`.
 
-### 4. Bind notification attach to the owning client
-
-`AttachNotifications` now requires both:
-- `session_id`
-- `client_id`
-
-The daemon verifies the session belongs to that client before replacing the notification sink. That prevents another IPC connection from stealing a live client’s notification stream just by knowing the session UUID.
-
-### 5. Replay subscriptions after daemon session replacement
+### 4. Replay subscriptions after daemon session replacement
 
 Daemon reconnects replace the logical session ID.
 
 Without extra work, that would silently drop all resource subscriptions because the daemon cleans up subscriptions when the old session disappears.
 
-`IpcProxyHandler` now keeps a local set of subscribed resource URIs and replays them onto the replacement session after reconnect, before restarting the notification attachment.
+`IpcProxyHandler` keeps a local `ReplayState.subscriptions` set and restores it after reconnect with one `IpcRequest::RestoreResourceSubscriptions` round-trip (daemon applies the set with bounded concurrency) before continuing the retried request.
 
-### 6. Clean up HTTP expiry correctly
+### 5. Clean up HTTP expiry correctly
 
 The original HTTP teardown only handled:
 - explicit `DELETE /mcp`
@@ -112,22 +106,14 @@ The original HTTP teardown only handled:
 
 That still leaked subscriptions for naturally expired sessions.
 
-[`plug-core/src/session/stateful.rs`](../../../plug-core/src/session/stateful.rs) supports a removal hook, and the HTTP runtime registers router cleanup once when it constructs the session store. That means:
+[`plug-core/src/session/stateful.rs`](../../../plug-core/src/session/stateful.rs) supports `with_expiry_notifier`, and the HTTP runtime registers router cleanup once when it constructs the session store. Explicit delete, validation-time expiry, and background cleanup expiry converge on the same subscription teardown path.
 
-- explicit delete
-- validation-time expiry
-- background cleanup expiry
-
-all converge on the same router subscription teardown path.
-
-### 7. Remove dead TUI dependencies
+### 6. Remove dead TUI dependencies
 
 The workspace manifest no longer carries:
 - `ratatui`
 - `crossterm`
 - `color-eyre`
-
-The local review context and crate-stack doc were updated to match the live codebase instead of the old planned TUI surface.
 
 ## Verification
 
@@ -151,5 +137,5 @@ Additional focused coverage now proves:
 1. Do not accept transport splits casually. If a feature is user-visible, verify whether daemon-backed `plug connect`, direct stdio, and HTTP all need the same behavior.
 2. If a session-based transport reconnects by replacing session identity, replay any stateful protocol surface tied to that identity.
 3. Session cleanup should not rely on “future notifications might eventually notice.” Add a real teardown hook.
-4. When adding notification delivery to an existing IPC protocol, tie attachment to the owner identity, not just a bare session UUID.
+4. When adding notification delivery to an existing IPC protocol, bind delivery to the owning session identity, not an unauthenticated attach path.
 5. Remove dead dependencies once a planned product surface is no longer in live code. Otherwise docs and reviews will keep reasoning about ghosts.

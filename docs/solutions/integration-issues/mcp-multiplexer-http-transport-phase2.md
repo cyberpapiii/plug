@@ -27,6 +27,8 @@ related:
   - docs/PLAN.md
   - docs/ARCHITECTURE.md
 pr: "https://github.com/cyberpapiii/plug/pull/2"
+problem_type: integration_issue
+summary: Phase 1 of plug delivered a working stdio-only MCP multiplexer. Phase 2 required adding HTTP transport support for both inbound (web clients connecting to plug) and outbound (plug connecting to remote upstream MCP servers). This involved si...
 ---
 
 # Phase 2: HTTP Transport Implementation for plug MCP Multiplexer

@@ -3,6 +3,14 @@ title: Doctor now points missing-config recovery to plug setup
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug/cli
+problem_type: integration_issue
+summary: "`plug doctor` still suggested `plug init` when the config file was missing, even though the supported onboarding flow is `plug setup`."
+tags:
+  - config
+  - doctor
+  - recovery
+  - integration-issues
 ---
 
 # Doctor now points missing-config recovery to plug setup

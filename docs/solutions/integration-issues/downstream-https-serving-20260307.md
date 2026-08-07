@@ -12,6 +12,12 @@ summary: Added optional HTTPS termination to `plug serve` with cert/key configur
 related:
   - docs/brainstorms/2026-03-07-downstream-https-serving-brainstorm.md
   - docs/plans/2026-03-07-feat-downstream-https-serving-plan.md
+module: plug-core/http
+problem_type: security_issue
+tags:
+  - http
+  - https
+  - integration-issues
 ---
 
 # Downstream HTTPS Serving

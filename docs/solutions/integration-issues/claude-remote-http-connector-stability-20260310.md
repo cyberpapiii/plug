@@ -17,6 +17,11 @@ related:
   - docs/solutions/integration-issues/downstream-https-serving-20260307.md
   - docs/solutions/integration-issues/phase2c-resources-prompts-pagination-20260307.md
   - docs/solutions/integration-issues/review-fixes-critical-http-auth-ipc-parity-20260307.md
+module: plug-core
+problem_type: integration_issue
+tags:
+  - http
+  - integration-issues
 ---
 
 # Claude Remote HTTP Connector Stability

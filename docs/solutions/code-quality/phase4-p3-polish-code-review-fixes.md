@@ -21,6 +21,9 @@ root_cause: |
   #019: Manual field-by-field RouterConfig in two places with no shared From impl.
   #020: main() initialized stderr tracing before command dispatch, preventing daemon's
         setup_file_logging() from installing its own subscriber (single-init constraint).
+module: plug/cli
+problem_type: best_practice
+summary: "Phase 4 P3 Polish: TUI dirty flag, RouterConfig DRY, and tracing split"
 ---
 
 # Phase 4 P3 Polish: Code Review Fixes

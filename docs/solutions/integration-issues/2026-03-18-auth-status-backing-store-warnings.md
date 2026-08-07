@@ -3,6 +3,12 @@ title: Auth status now surfaces keyring and token-file backing store drift
 date: 2026-03-18
 category: integration-issues
 status: completed
+module: plug-core/oauth
+problem_type: integration_issue
+summary: Credential persistence drift had become visible in logs, but not to operators
+tags:
+  - auth
+  - integration-issues
 ---
 
 # Auth status now surfaces keyring and token-file backing store drift

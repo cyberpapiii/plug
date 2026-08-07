@@ -23,6 +23,7 @@ tags:
   - non-exhaustive
   - proxy-architecture
 note: "Historical integration report from the early rmcp 1.0.0 adoption phase. Useful as implementation archaeology, not as current-state truth."
+summary: Historical RMCP SDK integration patterns
 ---
 
 # rmcp SDK Integration Patterns for MCP Proxy Development

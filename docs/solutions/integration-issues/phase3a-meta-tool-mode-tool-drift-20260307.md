@@ -34,6 +34,8 @@ related:
   - plug-core/src/proxy/mod.rs
   - plug-core/src/server/mod.rs
   - plug-core/src/http/server.rs
+problem_type: integration_issue
+summary: The shared router already knew how to merge and route tools, but it still assumed every client should see the whole tool catalog up front. That caused two product gaps
 ---
 
 # Phase 3A meta-tool mode with routed invocation and tool-definition drift detection

@@ -13,6 +13,8 @@ root_cause: "The former TUI was removed, but its workspace dependencies remained
 date: 2026-03-07
 pr: "#29"
 phase: "Roadmap Tail Closeout"
+problem_type: build_error
+summary: Dead TUI Dependencies in Workspace Manifest
 ---
 
 # Dead TUI Dependencies in Workspace Manifest

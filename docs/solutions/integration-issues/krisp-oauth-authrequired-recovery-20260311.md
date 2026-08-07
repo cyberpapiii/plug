@@ -10,6 +10,8 @@ branch: fix/claude-remote-protocol-version
 status: stale
 stale_date: 2026-07-13
 stale_reason: "Incident archaeology only; current OAuth recovery uses unified credential snapshots, refresh exchange, reconnect, and daemon auth-state signaling that this document does not cover."
+problem_type: integration_issue
+summary: Krisp was configured as an upstream HTTP MCP server with OAuth
 ---
 
 # Krisp OAuth AuthRequired Recovery Gap

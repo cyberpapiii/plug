@@ -40,6 +40,8 @@ related:
   - plug-core/src/http/session.rs
   - plug-core/src/notifications.rs
   - plug/src/runtime.rs
+problem_type: integration_issue
+summary: "`plug` had a working tool-call path but no end-to-end server-notification path."
 ---
 
 # Phase 2A notification infrastructure: upstream tools/list_changed fan-out

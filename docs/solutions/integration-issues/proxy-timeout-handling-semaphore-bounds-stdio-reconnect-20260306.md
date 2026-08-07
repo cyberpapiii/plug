@@ -28,6 +28,8 @@ related:
   - plug-core/src/proxy/mod.rs
   - plug-core/src/error.rs
   - plug-core/tests/integration_tests.rs
+problem_type: integration_issue
+summary: Two coupled resilience bugs existed in the stdio tool-call path
 ---
 
 # Stdio tool-call timeout and reconnect semantics under contention
