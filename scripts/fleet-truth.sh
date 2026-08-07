@@ -5,16 +5,18 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 conformance_check="$repo_root/scripts/check-mcp-conformance.sh"
 golden_replayer="$repo_root/scripts/fleet/golden.py"
+contract_checker="$repo_root/scripts/fleet/contract.py"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden]
+Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract]
 
 Stages:
   conformance        Fast gate: MCP inventory plus selector self-test
   conformance-local  Full local MCP protocol-pair regressions (runs Cargo)
   golden             Replay normalized MCP JSON-RPC golden transcripts
-  all                Run conformance and golden; report later stages as SKIP (default)
+  contract           Check mock MCP list responses against committed contracts
+  all                Run conformance, golden, and contract (default)
 EOF
 }
 
@@ -95,10 +97,33 @@ run_golden() {
   return 1
 }
 
+run_contract() {
+  printf '%-16s %s\n' 'stage' 'contract'
+  printf '%-16s %s\n' 'scope' 'mock tools/resources/templates/prompts lists (normalized diff)'
+  if [ ! -f "$contract_checker" ]; then
+    printf 'fleet-truth: missing contract checker: %s\n' "$contract_checker" >&2
+    printf '%s\n' 'STAGE contract FAIL'
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'fleet-truth: python3 is required for contract checks' >&2
+    printf '%s\n' 'STAGE contract FAIL'
+    return 1
+  fi
+  if python3 "$contract_checker" check; then
+    printf '%s\n' 'STAGE contract PASS'
+    return 0
+  fi
+
+  printf '%s\n' 'STAGE contract FAIL'
+  return 1
+}
+
 run_all() {
   local result=0
   run_conformance || result=$?
   run_golden || result=$?
+  run_contract || result=$?
   printf '%s\n' 'STAGE fleet-runtime SKIP (not implemented)'
   printf '%s\n' 'STAGE fleet-official SKIP (opt-in only)'
   return "$result"
@@ -110,6 +135,7 @@ case "$mode" in
   conformance) run_conformance ;;
   conformance-local) run_conformance_local ;;
   golden) run_golden ;;
+  contract) run_contract ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
