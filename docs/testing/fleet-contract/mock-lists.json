@@ -1,0 +1,106 @@
+{
+  "name": "mock MCP list contracts",
+  "responses": [
+    {
+      "method": "tools/list",
+      "response": {
+        "id": "<masked:id>",
+        "jsonrpc": "2.0",
+        "result": {
+          "tools": [
+            {
+              "description": "Mock tool: echo",
+              "inputSchema": {
+                "properties": {
+                  "input": {
+                    "description": "Input argument",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "name": "echo"
+            },
+            {
+              "description": "Mock tool: greet",
+              "inputSchema": {
+                "properties": {
+                  "input": {
+                    "description": "Input argument",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "name": "greet"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "resources/list",
+      "response": {
+        "id": "<masked:id>",
+        "jsonrpc": "2.0",
+        "result": {
+          "resources": [
+            {
+              "description": "Subscribable mock resource",
+              "mimeType": "text/plain",
+              "name": "mock-resource.txt",
+              "title": "Mock Resource",
+              "uri": "file:///tmp/mock-resource.txt"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "resources/templates/list",
+      "response": {
+        "id": "<masked:id>",
+        "jsonrpc": "2.0",
+        "result": {
+          "resourceTemplates": [
+            {
+              "description": "Mock resource template",
+              "mimeType": "text/plain",
+              "name": "mock_template",
+              "title": "Mock Template",
+              "uriTemplate": "file:///tmp/mock-templates/{id}.txt"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "prompts/list",
+      "response": {
+        "id": "<masked:id>",
+        "jsonrpc": "2.0",
+        "result": {
+          "prompts": [
+            {
+              "arguments": [
+                {
+                  "description": "Topic to expand",
+                  "name": "topic"
+                }
+              ],
+              "description": "Mock prompt fixture",
+              "name": "mock_prompt"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "serverArgs": [
+    "--tools",
+    "echo,greet",
+    "--resources",
+    "--resource-templates",
+    "--prompts"
+  ]
+}

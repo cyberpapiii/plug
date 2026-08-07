@@ -1,0 +1,121 @@
+{
+  "exchanges": [
+    {
+      "request": {
+        "id": "recording-discover-1",
+        "jsonrpc": "2.0",
+        "method": "server/discover",
+        "params": {}
+      },
+      "response": {
+        "id": "recording-discover-1",
+        "jsonrpc": "2.0",
+        "result": {
+          "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+              "name": "mock-modern-only",
+              "version": "0.1.0"
+            }
+          },
+          "cacheScope": "private",
+          "capabilities": {
+            "tools": {
+              "listChanged": false
+            }
+          },
+          "resultType": "complete",
+          "supportedVersions": [
+            "2026-07-28"
+          ],
+          "ttlMs": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "id": "recording-tools-2",
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "params": {}
+      },
+      "response": {
+        "id": "recording-tools-2",
+        "jsonrpc": "2.0",
+        "result": {
+          "cacheScope": "private",
+          "resultType": "complete",
+          "tools": [
+            {
+              "_meta": {
+                "example.test/typed": {
+                  "array": [
+                    null,
+                    "value"
+                  ],
+                  "boolean": true,
+                  "number": 7
+                },
+                "io.modelcontextprotocol/deferredFixture": true,
+                "io.modelcontextprotocol/ui": {
+                  "resourceUri": "ui://plug/fixture"
+                }
+              },
+              "description": "echo",
+              "inputSchema": {
+                "type": "object"
+              },
+              "name": "echo",
+              "outputSchema": {
+                "properties": {
+                  "echoed": {
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          ],
+          "ttlMs": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "id": "recording-call-3",
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+          "arguments": {
+            "input": "golden"
+          },
+          "name": "echo"
+        }
+      },
+      "response": {
+        "id": "recording-call-3",
+        "jsonrpc": "2.0",
+        "result": {
+          "_meta": {
+            "example.test/result": {
+              "boolean": true,
+              "number": 7
+            }
+          },
+          "content": [
+            {
+              "text": "lifecycle fixture echo",
+              "type": "text"
+            }
+          ],
+          "isError": false,
+          "resultType": "complete"
+        }
+      }
+    }
+  ],
+  "name": "modern lifecycle discovery and tool call",
+  "serverArgs": [
+    "--lifecycle",
+    "modern-only"
+  ]
+}
