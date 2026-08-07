@@ -158,7 +158,7 @@ run_fault() {
     printf '%s\n' 'STAGE fault FAIL'
     return 1
   fi
-  if python3 "$fault_runner"; then
+  if PYTHONDONTWRITEBYTECODE=1 python3 "$fault_runner"; then
     printf '%s\n' 'STAGE fault PASS'
     return 0
   fi
