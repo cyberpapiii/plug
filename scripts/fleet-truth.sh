@@ -6,17 +6,19 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 conformance_check="$repo_root/scripts/check-mcp-conformance.sh"
 golden_replayer="$repo_root/scripts/fleet/golden.py"
 contract_checker="$repo_root/scripts/fleet/contract.py"
+load_runner="$repo_root/scripts/fleet/load.py"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract]
+Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract|load]
 
 Stages:
   conformance        Fast gate: MCP inventory plus selector self-test
   conformance-local  Full local MCP protocol-pair regressions (runs Cargo)
   golden             Replay normalized MCP JSON-RPC golden transcripts
   contract           Check mock MCP list responses against committed contracts
-  all                Run conformance, golden, and contract (default)
+  load               Concurrent sessions against a mock upstream (default: 2 x 5m)
+  all                Run fast stages; the five-minute load stage remains opt-in (default)
 EOF
 }
 
@@ -119,11 +121,34 @@ run_contract() {
   return 1
 }
 
+run_load() {
+  printf '%-16s %s\n' 'stage' 'load'
+  printf '%-16s %s\n' 'scope' 'concurrent Plug sessions + mock stdio upstream'
+  if [ ! -f "$load_runner" ]; then
+    printf 'fleet-truth: missing load runner: %s\n' "$load_runner" >&2
+    printf '%s\n' 'STAGE load FAIL'
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'fleet-truth: python3 is required for load checks' >&2
+    printf '%s\n' 'STAGE load FAIL'
+    return 1
+  fi
+  if python3 "$load_runner"; then
+    printf '%s\n' 'STAGE load PASS'
+    return 0
+  fi
+
+  printf '%s\n' 'STAGE load FAIL'
+  return 1
+}
+
 run_all() {
   local result=0
   run_conformance || result=$?
   run_golden || result=$?
   run_contract || result=$?
+  printf '%s\n' 'STAGE load SKIP (opt-in: scripts/fleet-truth.sh load)'
   printf '%s\n' 'STAGE fleet-runtime SKIP (not implemented)'
   printf '%s\n' 'STAGE fleet-official SKIP (opt-in only)'
   return "$result"
@@ -136,6 +161,7 @@ case "$mode" in
   conformance-local) run_conformance_local ;;
   golden) run_golden ;;
   contract) run_contract ;;
+  load) run_load ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
