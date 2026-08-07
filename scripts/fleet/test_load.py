@@ -59,5 +59,20 @@ class ThresholdTests(unittest.TestCase):
         )
 
 
+class ResultAggregationTests(unittest.TestCase):
+    def test_failed_responses_count_once_in_total_calls(self) -> None:
+        result = load.SessionResult()
+        result.calls = 2
+        result.errors = 1
+        result.latencies_ms = [1.0, 2.0]
+
+        latencies, calls, errors, fatal_errors = load.aggregate_results([result])
+
+        self.assertEqual(latencies, [1.0, 2.0])
+        self.assertEqual(calls, 2)
+        self.assertEqual(errors, 1)
+        self.assertEqual(fatal_errors, [])
+
+
 if __name__ == "__main__":
     unittest.main()

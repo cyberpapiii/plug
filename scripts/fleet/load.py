@@ -224,6 +224,7 @@ class McpSession:
 class SessionResult:
     def __init__(self) -> None:
         self.latencies_ms: list[float] = []
+        self.calls = 0
         self.errors = 0
         self.fatal_error: str | None = None
 
@@ -239,6 +240,7 @@ def run_calls(
         deadline = time.monotonic() + duration_secs
         while time.monotonic() < deadline:
             began = time.perf_counter()
+            result.calls += 1
             try:
                 succeeded = session.call_echo()
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
@@ -250,6 +252,20 @@ def run_calls(
                 result.errors += 1
     except threading.BrokenBarrierError:
         result.fatal_error = "load start barrier broke"
+
+
+def aggregate_results(
+    results: list[SessionResult],
+) -> tuple[list[float], int, int, list[str]]:
+    latencies = [latency for result in results for latency in result.latencies_ms]
+    calls = sum(result.calls for result in results)
+    errors = sum(result.errors for result in results)
+    fatal_errors = [
+        f"session {index}: {result.fatal_error}"
+        for index, result in enumerate(results, start=1)
+        if result.fatal_error is not None
+    ]
+    return latencies, calls, errors, fatal_errors
 
 
 def wait_for_daemon(
@@ -266,7 +282,9 @@ def wait_for_daemon(
     raise RuntimeError("timed out waiting for Plug daemon")
 
 
-def execute(duration_secs: int, session_count: int) -> tuple[list[float], int, list[str]]:
+def execute(
+    duration_secs: int, session_count: int
+) -> tuple[list[float], int, int, list[str]]:
     plug, mock_server = build_binaries()
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="plug-fleet-load-"))
     daemon: subprocess.Popen[bytes] | None = None
@@ -313,16 +331,7 @@ def execute(duration_secs: int, session_count: int) -> tuple[list[float], int, l
         for thread in threads:
             thread.join()
 
-        latencies = [
-            latency for result in results for latency in result.latencies_ms
-        ]
-        errors = sum(result.errors for result in results)
-        fatal_errors = [
-            f"session {index}: {result.fatal_error}"
-            for index, result in enumerate(results, start=1)
-            if result.fatal_error is not None
-        ]
-        return latencies, errors, fatal_errors
+        return aggregate_results(results)
     finally:
         for session in sessions:
             session.close()
@@ -354,13 +363,14 @@ def main() -> int:
             f"p95<={max_p95_ms:.2f}ms p99<={max_p99_ms:.2f}ms "
             f"errors<={max_error_rate_pct:.3f}%"
         )
-        latencies, errors, fatal_errors = execute(duration_secs, session_count)
-        total = len(latencies) + errors
+        latencies, total, errors, fatal_errors = execute(
+            duration_secs, session_count
+        )
         error_rate_pct = (errors / total * 100) if total else 100.0
         p50_ms = percentile(latencies, 50) if latencies else math.inf
         p95_ms = percentile(latencies, 95) if latencies else math.inf
         p99_ms = percentile(latencies, 99) if latencies else math.inf
-        print(f"calls            {total} (success={len(latencies)} errors={errors})")
+        print(f"calls            {total} (success={total - errors} errors={errors})")
         print(f"latency          p50={p50_ms:.2f}ms p95={p95_ms:.2f}ms p99={p99_ms:.2f}ms")
         print(f"error rate       {error_rate_pct:.3f}%")
         for fatal_error in fatal_errors:
