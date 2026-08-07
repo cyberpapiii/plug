@@ -24,6 +24,14 @@ class DurationTests(unittest.TestCase):
             load.parse_duration("0s")
 
 
+class TimeoutTests(unittest.TestCase):
+    def test_startup_timeout_allows_initial_cargo_build(self) -> None:
+        self.assertGreater(
+            load.STARTUP_TIMEOUT_SECONDS,
+            load.RESPONSE_TIMEOUT_SECONDS,
+        )
+
+
 class PercentileTests(unittest.TestCase):
     def test_uses_nearest_rank(self) -> None:
         samples = list(range(1, 101))
@@ -34,6 +42,14 @@ class PercentileTests(unittest.TestCase):
 
     def test_single_sample_is_every_percentile(self) -> None:
         self.assertEqual(load.percentile([7.5], 99), 7.5)
+
+    def test_calculates_requested_percentiles_together(self) -> None:
+        samples = list(range(100, 0, -1))
+
+        self.assertEqual(
+            load.percentiles(samples, (50, 95, 99)),
+            (50, 95, 99),
+        )
 
 
 class ThresholdTests(unittest.TestCase):

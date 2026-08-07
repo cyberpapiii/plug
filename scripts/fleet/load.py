@@ -21,6 +21,7 @@ DEFAULT_SESSIONS = 2
 DEFAULT_MAX_P99_MS = 250.0
 DEFAULT_MAX_ERROR_RATE = 0.01
 RESPONSE_TIMEOUT_SECONDS = 10.0
+STARTUP_TIMEOUT_SECONDS = 120.0
 
 
 def parse_duration(value: str) -> float:
@@ -63,11 +64,21 @@ def error_rate_limit(value: str) -> float:
 
 def percentile(samples: list[float], percentage: int) -> float:
     """Return a nearest-rank percentile from one or more samples."""
+    return percentiles(samples, (percentage,))[0]
+
+
+def percentiles(
+    samples: list[float], requested: tuple[int, ...]
+) -> tuple[float, ...]:
+    """Return nearest-rank percentiles after sorting the samples once."""
     if not samples:
         raise ValueError("cannot calculate a percentile without samples")
     ordered = sorted(samples)
-    rank = math.ceil((percentage / 100) * len(ordered))
-    return ordered[max(rank - 1, 0)]
+    values = []
+    for percentage in requested:
+        rank = math.ceil((percentage / 100) * len(ordered))
+        values.append(ordered[max(rank - 1, 0)])
+    return tuple(values)
 
 
 def threshold_breaches(
@@ -115,9 +126,27 @@ class MockSession:
             text=True,
             bufsize=1,
         )
-        self.request("server/discover", {})
+        try:
+            self.request(
+                "server/discover",
+                {},
+                timeout_seconds=STARTUP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            raise
 
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout_seconds: float = RESPONSE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         request_id = f"load-{self.session_id}-{self.next_request_id}"
         self.next_request_id += 1
         request = {
@@ -130,7 +159,7 @@ class MockSession:
             raise RuntimeError("mock stdin is unavailable")
         self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
         self.process.stdin.flush()
-        response = self.read_response()
+        response = self.read_response(timeout_seconds)
         if response.get("id") != request_id:
             raise RuntimeError(
                 f"response id mismatch: expected {request_id}, got {response.get('id')}"
@@ -152,13 +181,13 @@ class MockSession:
             and result.get("isError") is False
         )
 
-    def read_response(self) -> dict[str, Any]:
+    def read_response(self, timeout_seconds: float) -> dict[str, Any]:
         if self.process.stdout is None:
             raise RuntimeError("mock stdout is unavailable")
         selector = selectors.DefaultSelector()
         try:
             selector.register(self.process.stdout, selectors.EVENT_READ)
-            if not selector.select(timeout=RESPONSE_TIMEOUT_SECONDS):
+            if not selector.select(timeout=timeout_seconds):
                 raise RuntimeError("timed out waiting for mock response")
         finally:
             selector.close()
@@ -312,9 +341,7 @@ def main() -> int:
         print("LOAD FAIL: no tool calls completed", file=sys.stderr)
         return 1
 
-    p50_ms = percentile(latencies_ms, 50)
-    p95_ms = percentile(latencies_ms, 95)
-    p99_ms = percentile(latencies_ms, 99)
+    p50_ms, p95_ms, p99_ms = percentiles(latencies_ms, (50, 95, 99))
     error_rate = len(errors) / total_calls
     print(
         f"LOAD metrics total_calls={total_calls} errors={len(errors)} "
