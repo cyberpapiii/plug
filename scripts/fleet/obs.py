@@ -35,6 +35,12 @@ ERROR_CLASSES = (
     "transport_error",
     "runtime_error",
 )
+STDERR_CRASH_SIGNATURES = (
+    " panicked at ",
+    "fatal error",
+    "segmentation fault",
+    "stack backtrace",
+)
 REQUIRED_SIGNALS = (
     "latency_histogram",
     "error_taxonomy",
@@ -54,6 +60,7 @@ class ObsResult(NamedTuple):
     rss_samples_kib: list[int]
     fd_samples: list[int]
     stderr_bytes: int
+    stderr_violations: list[str]
 
 
 class InFlight:
@@ -98,6 +105,14 @@ def classify_error(error: BaseException | None, succeeded: bool) -> str:
 
 def missing_required_signals(signals: dict[str, bool]) -> list[str]:
     return [name for name in REQUIRED_SIGNALS if not signals.get(name, False)]
+
+
+def stderr_violations(stderr: str) -> list[str]:
+    return [
+        line
+        for line in stderr.splitlines()
+        if any(signature in line.lower() for signature in STDERR_CRASH_SIGNATURES)
+    ]
 
 
 def process_resources(pids: list[int]) -> tuple[int, int] | None:
@@ -273,6 +288,9 @@ def execute(duration_secs: int, session_count: int) -> ObsResult:
 
     try:
         stderr_bytes = sum(path.stat().st_size for path in stderr_paths)
+        violations = stderr_violations(
+            "\n".join(path.read_text(errors="replace") for path in stderr_paths)
+        )
         return ObsResult(
             latencies_ms,
             taxonomy,
@@ -282,6 +300,7 @@ def execute(duration_secs: int, session_count: int) -> ObsResult:
             rss_samples,
             fd_samples,
             stderr_bytes,
+            violations,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -321,11 +340,13 @@ def main() -> int:
                 f"count={len(result.fd_samples)} "
                 f"min={min(result.fd_samples)} max={max(result.fd_samples)}"
             )
-        stderr_ok = result.stderr_bytes == 0
+        stderr_ok = not result.stderr_violations
         print(
             f"stderr assert   {'PASS' if stderr_ok else 'FAIL'} "
-            f"bytes={result.stderr_bytes}"
+            f"bytes={result.stderr_bytes} crash-signatures={len(result.stderr_violations)}"
         )
+        for violation in result.stderr_violations:
+            print(f"STDERR violation: {violation}", file=sys.stderr)
 
         signals = {
             "latency_histogram": bool(result.latencies_ms),

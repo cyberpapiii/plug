@@ -13,11 +13,14 @@ requires every run to emit:
 - an error taxonomy;
 - maximum, final, and sampled in-flight counts;
 - aggregate RSS and file-descriptor samples for the Plug daemon and clients;
-- a zero-byte stderr assertion.
+- a captured-stderr assertion that rejects panic, fatal-error, segmentation
+  fault, and stack-backtrace signatures.
 
-The stage fails when any signal is absent, stderr is non-empty, or the workload
-records an error. Linux `/proc` is intentionally required for RSS and FD
-sampling; an environment that cannot expose those measurements fails closed.
+The mock server and Plug clients emit expected diagnostics on stderr, so byte
+count alone is not an error signal. The stage prints that count for context and
+fails when any required signal is absent, a crash signature appears, or the
+workload records an error. Linux `/proc` is intentionally required for RSS and
+FD sampling; an environment that cannot expose those measurements fails closed.
 
 Defaults are two sessions for five seconds. Override them with
 `FLEET_OBS_SESSIONS` and `FLEET_OBS_DURATION_SECS`.

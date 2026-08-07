@@ -78,5 +78,23 @@ class RequiredSignalTests(unittest.TestCase):
         self.assertEqual(obs.missing_required_signals(signals), ["fd_samples"])
 
 
+class StderrAssertionTests(unittest.TestCase):
+    def test_allows_expected_diagnostics(self) -> None:
+        stderr = (
+            "INFO mock_mcp_server: starting mock MCP server\n"
+            "WARN rmcp::service: response error id=2\n"
+        )
+
+        self.assertEqual(obs.stderr_violations(stderr), [])
+
+    def test_rejects_crash_signatures(self) -> None:
+        stderr = "thread 'tokio-runtime-worker' panicked at src/main.rs:1\n"
+
+        self.assertEqual(
+            obs.stderr_violations(stderr),
+            ["thread 'tokio-runtime-worker' panicked at src/main.rs:1"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
