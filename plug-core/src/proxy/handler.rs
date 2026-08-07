@@ -9,6 +9,55 @@ fn selected_protocol_for_log(protocol: &ProtocolVersion) -> &str {
     protocol.as_str()
 }
 
+fn is_modern_protocol(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version == ProtocolVersion::V_2026_07_28)
+}
+
+/// Legacy stdio must match HTTP/IPC: strip modern catalog cache directives.
+fn strip_legacy_catalog_cache<T>(mut result: T, modern: bool) -> T
+where
+    T: CatalogCacheDirectives,
+{
+    if !modern {
+        result.clear_catalog_cache();
+    }
+    result
+}
+
+trait CatalogCacheDirectives {
+    fn clear_catalog_cache(&mut self);
+}
+
+impl CatalogCacheDirectives for ListToolsResult {
+    fn clear_catalog_cache(&mut self) {
+        self.ttl_ms = None;
+        self.cache_scope = None;
+    }
+}
+
+impl CatalogCacheDirectives for ListResourcesResult {
+    fn clear_catalog_cache(&mut self) {
+        self.ttl_ms = None;
+        self.cache_scope = None;
+    }
+}
+
+impl CatalogCacheDirectives for ListResourceTemplatesResult {
+    fn clear_catalog_cache(&mut self) {
+        self.ttl_ms = None;
+        self.cache_scope = None;
+    }
+}
+
+impl CatalogCacheDirectives for ListPromptsResult {
+    fn clear_catalog_cache(&mut self) {
+        self.ttl_ms = None;
+        self.cache_scope = None;
+    }
+}
+
 struct StdioDownstreamContext {
     client_id: Arc<str>,
     request_id: RequestId,
@@ -619,7 +668,7 @@ impl ServerHandler for ProxyHandler {
     fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
             let ct = self
@@ -629,9 +678,12 @@ impl ServerHandler for ProxyHandler {
                 .unwrap_or(ClientType::Unknown);
             let session_key =
                 ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
-            Ok(self
-                .router
-                .list_tools_page_for_client_session(ct, Some(&session_key), request))
+            let modern = is_modern_protocol(&context);
+            Ok(strip_legacy_catalog_cache(
+                self.router
+                    .list_tools_page_for_client_session(ct, Some(&session_key), request),
+                modern,
+            ))
         }
     }
 
@@ -853,17 +905,27 @@ impl ServerHandler for ProxyHandler {
     fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async move { Ok(self.router.list_resources_page(request)) }
+        async move {
+            Ok(strip_legacy_catalog_cache(
+                self.router.list_resources_page(request),
+                is_modern_protocol(&context),
+            ))
+        }
     }
 
     fn list_resource_templates(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
-        async move { Ok(self.router.list_resource_templates_page(request)) }
+        async move {
+            Ok(strip_legacy_catalog_cache(
+                self.router.list_resource_templates_page(request),
+                is_modern_protocol(&context),
+            ))
+        }
     }
 
     fn read_resource(
@@ -882,9 +944,14 @@ impl ServerHandler for ProxyHandler {
     fn list_prompts(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
-        async move { Ok(self.router.list_prompts_page(request)) }
+        async move {
+            Ok(strip_legacy_catalog_cache(
+                self.router.list_prompts_page(request),
+                is_modern_protocol(&context),
+            ))
+        }
     }
 
     fn get_prompt(
