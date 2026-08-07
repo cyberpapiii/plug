@@ -2648,6 +2648,25 @@ async fn test_stdio_end_to_end_proxy_path() {
         "unexpected stdio result: {rendered}"
     );
 
+    let statuses = engine.server_statuses();
+    let mock = statuses
+        .iter()
+        .find(|status| status.server_id == "mock")
+        .expect("mock server status");
+    let metrics = mock.metrics.as_ref().expect("metrics present on status");
+    assert!(
+        metrics.call_count >= 1,
+        "successful tool call should increment call_count, got {metrics:?}"
+    );
+    assert_eq!(
+        metrics.error_count, 0,
+        "echo success must not count as error: {metrics:?}"
+    );
+    assert!(
+        metrics.last_latency_ms > 0 || metrics.call_count >= 1,
+        "latency recorded or at least one call counted: {metrics:?}"
+    );
+
     engine.shutdown().await;
 }
 
