@@ -2,9 +2,11 @@
 
 This document captures the MCP protocol details that directly affect Plug's implementation. It is not a full spec reproduction -- it is a focused reference for implementors.
 
-**Current spec version**: 2025-11-25
-**Spec URL**: https://modelcontextprotocol.io/specification/2025-11-25
-**Rust SDK**: RMCP 2.2.0 (exactly pinned)
+**Default negotiated wire revision**: 2025-11-25 (legacy path; production clients)
+**Modern revision**: 2026-07-28 (gated dual-era path; opt-in)
+**Legacy spec URL**: https://modelcontextprotocol.io/specification/2025-11-25
+**Modern spec URL**: https://modelcontextprotocol.io/specification/2026-07-28
+**Rust SDK**: RMCP 3.1.0 (exactly pinned)
 
 ---
 
@@ -16,8 +18,9 @@ This document captures the MCP protocol details that directly affect Plug's impl
 | 2025-03-26 | Mar 2025 | Streamable HTTP introduced. SSE deprecated. |
 | 2025-06-18 | Jun 2025 | Structured Output. Resource Links in tool results. JSON-RPC batching REMOVED. `MCP-Protocol-Version` header required. |
 | 2025-11-25 | Nov 2025 | Tasks (experimental). OAuth 2.1 + PKCE. OIDC Discovery. CIMD. Icons metadata. Elicitation URL mode. Sampling with tool calling. M2M client-credentials. |
+| 2026-07-28 | Jul 2026 | Stateless core: `server/discover`, per-request `_meta`, no initialize/sessions/GET SSE; MRTR; required `resultType` and cache directives; Tasks as extension. |
 
-**Next announced revision**: 2026-07-28. It is not stable or implemented here yet; upgrading the SDK does not opt Plug into that revision.
+**Dual-era posture (PR #68):** Plug speaks both `2025-11-25` and gated `2026-07-28`. Global gates `http.modern_downstream_enabled` and `modern_upstream_enabled` default **off**. See `docs/testing/MCP-CONFORMANCE.md` and `docs/PROJECT-STATE-SNAPSHOT.md`.
 
 ---
 

@@ -110,9 +110,10 @@ OAuth issuer binding, and secure native modern-to-modern multi-round tool calls.
 
 The release is intentionally fail-closed beyond its proven matrix. Both global
 modern gates remain off by default. Modern `subscriptions/listen`, mixed-era
-multi-round translation, task-plus-multi-round calls, Apps/UI capability
-advertisement, and synthesized cache directives for Plug's combined catalog
-remain optional future work and are not advertised.
+multi-round translation, task-plus-multi-round calls, and Apps/UI capability
+advertisement remain optional future work and are not advertised. Synthesized
+catalog list pages now emit conservative modern cache directives
+(`ttlMs: 0`, `cacheScope: private`); legacy responses strip those fields.
 
 The 2026-06-10 operability/hardening program (`docs/plans/2026-06-10-002-feat-operability-hardening-program-plan.md`) scoped PR #60 to a bounded tranche and deliberately deferred larger items. Sequenced **item 3 → item 1 → item 2b**, plus the independent test-infra work:
 

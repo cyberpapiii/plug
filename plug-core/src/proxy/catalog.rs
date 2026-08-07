@@ -254,6 +254,20 @@ pub(crate) fn paginated_result<T: Clone, R>(
     build(items[start..end].to_vec(), next_cursor)
 }
 
+/// Cache directives for Plug's synthesized multi-upstream catalog pages.
+///
+/// Modern MCP requires `ttlMs` and `cacheScope` on cacheable complete list
+/// results. Plug's merged view is not a pass-through of any single upstream
+/// page, so it must not advertise a longer TTL or a public scope. `ttl_ms = 0`
+/// means clients must revalidate; `private` keeps principal-filtered catalogs
+/// out of shared caches. Legacy responses strip these fields in
+/// [`crate::protocol::rewrite_legacy_result`].
+pub(crate) const SYNTHESIZED_CATALOG_TTL_MS: u64 = 0;
+
+pub(crate) fn synthesized_catalog_cache_scope() -> rmcp::model::CacheScope {
+    rmcp::model::CacheScope::Private
+}
+
 pub(crate) fn detect_tool_definition_drift(
     previous: &HashMap<String, u64>,
     current: &HashMap<String, u64>,
@@ -511,15 +525,11 @@ impl super::ToolRouter {
     ) -> ListToolsResult {
         let tools = self.list_tools_for_client_session(client_type, session_key);
         paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
-            // This is a synthesized, shared multi-upstream view. RMCP's
-            // list_all_tools discards per-page directive provenance, so Plug
-            // must not copy a private, zero/negative, or short upstream TTL
-            // onto this different response. Keep cache directives absent
-            // until the catalog has principal-scoped directive sidecars and a
-            // conservative aggregation rule (never lengthen upstream TTLs).
             meta: None,
             next_cursor,
             tools,
+            ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
+            cache_scope: Some(synthesized_catalog_cache_scope()),
             ..Default::default()
         })
     }
@@ -737,6 +747,8 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 resources,
+                ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
+                cache_scope: Some(synthesized_catalog_cache_scope()),
                 ..Default::default()
             }
         })
@@ -758,6 +770,8 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 resource_templates,
+                ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
+                cache_scope: Some(synthesized_catalog_cache_scope()),
                 ..Default::default()
             },
         )
@@ -774,6 +788,8 @@ impl super::ToolRouter {
                 meta: None,
                 next_cursor,
                 prompts,
+                ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
+                cache_scope: Some(synthesized_catalog_cache_scope()),
                 ..Default::default()
             }
         })
