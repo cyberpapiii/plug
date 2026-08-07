@@ -968,10 +968,8 @@ impl ToolRouter {
             .continuation_registry
             .capture_with_global_generation(|| -> Result<_, McpError> {
                 let cache = self.cache.load_full();
-                let (server_id, original_name) = cache
-                    .resolve_route(tool_name)
-                    .cloned()
-                    .ok_or_else(|| {
+                let (server_id, original_name) =
+                    cache.resolve_route(tool_name).cloned().ok_or_else(|| {
                         McpError::from(ProtocolError::ToolNotFound {
                             tool_name: tool_name.to_string(),
                         })
@@ -1820,7 +1818,7 @@ impl ToolRouter {
         let mut classified: Vec<Classified> = Vec::new();
         let mut catalog_metadata_budget = CatalogMetadataBudget::default();
         let resolve_server_icons = |server_ctx: &HashMap<String, ServerRefreshCtx>,
-                                   server_name: &str|
+                                    server_name: &str|
          -> Option<Vec<Icon>> {
             server_ctx
                 .get(server_name)

@@ -1595,11 +1595,7 @@ impl ServerManager {
             }
             let tools = upstream.tools.load();
             result.reserve(tools.len());
-            result.extend(
-                tools
-                    .iter()
-                    .map(|tool| (server_name.clone(), tool.clone())),
-            );
+            result.extend(tools.iter().map(|tool| (server_name.clone(), tool.clone())));
         }
         result
     }

@@ -1664,7 +1664,8 @@ mod tests {
                 enrichment_servers: std::collections::HashSet::new(),
             },
         ));
-        router.replace_snapshot(crate::proxy::RouterSnapshot {            routes_lower: HashMap::new(),
+        router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes_lower: HashMap::new(),
             tools_by_name: HashMap::new(),
             tools_by_name_lower: HashMap::new(),
 

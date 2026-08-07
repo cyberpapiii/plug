@@ -435,10 +435,7 @@ impl SessionStore for StatefulSessionStore {
         entry.last_activity = Instant::now();
         entry.sse_sender = Some(sender);
         // Clone before mut borrow: send_replay_events may clear sse_sender on fail.
-        let active_sender = entry
-            .sse_sender
-            .clone()
-            .expect("sse sender just installed");
+        let active_sender = entry.sse_sender.clone().expect("sse sender just installed");
         Self::send_replay_events(&mut entry, &active_sender, last_event_id);
         Ok(())
     }
@@ -475,7 +472,11 @@ impl SessionStore for StatefulSessionStore {
     fn broadcast(&self, message: SseMessage) {
         // Snapshot keys first so shard write locks are not held across every
         // try_send (DashMap `iter_mut` would pin the shard for the whole loop).
-        let session_ids: Vec<String> = self.sessions.iter().map(|entry| entry.key().clone()).collect();
+        let session_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
         let mut expired = Vec::new();
         for session_id in session_ids {
             let Some(mut entry) = self.sessions.get_mut(&session_id) else {

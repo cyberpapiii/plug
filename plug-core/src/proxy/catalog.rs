@@ -276,9 +276,7 @@ pub(crate) fn fingerprint_tool_definition(tool: &Tool) -> u64 {
     tool.name.hash(&mut hasher);
     tool.description.as_deref().unwrap_or("").hash(&mut hasher);
     tool.title.as_deref().unwrap_or("").hash(&mut hasher);
-    hasher.write(
-        &serde_json::to_vec(&tool.input_schema).expect("tool input schema serializes"),
-    );
+    hasher.write(&serde_json::to_vec(&tool.input_schema).expect("tool input schema serializes"));
     hasher.write(&serde_json::to_vec(&tool.annotations).expect("tool annotations serialize"));
     hasher.finish()
 }

@@ -1543,7 +1543,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             while let Some(joined) = join_set.join_next().await {
                 match joined {
                     Ok(Err(failure)) => failures.push(failure),
-                    Err(join_error) => failures.push(format!("subscribe task failed: {join_error}")),
+                    Err(join_error) => {
+                        failures.push(format!("subscribe task failed: {join_error}"))
+                    }
                     Ok(Ok(())) => {}
                 }
             }

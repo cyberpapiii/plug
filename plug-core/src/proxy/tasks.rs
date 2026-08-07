@@ -186,11 +186,12 @@ impl super::ToolRouter {
         }
 
         let cache = self.cache.load();
-        let (server_id, original_name) = cache.resolve_route(tool_name).cloned().ok_or_else(|| {
-            McpError::from(ProtocolError::ToolNotFound {
-                tool_name: tool_name.to_string(),
-            })
-        })?;
+        let (server_id, original_name) =
+            cache.resolve_route(tool_name).cloned().ok_or_else(|| {
+                McpError::from(ProtocolError::ToolNotFound {
+                    tool_name: tool_name.to_string(),
+                })
+            })?;
         drop(cache);
 
         self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;

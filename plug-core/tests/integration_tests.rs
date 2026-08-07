@@ -3555,8 +3555,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
         .find(|(m, _, _)| m == "initialize")
         .expect("should have captured initialize request");
     assert_eq!(
-        init.1,
-        None,
+        init.1, None,
         "initialize must not send MCP-Protocol-Version (version not yet negotiated)"
     );
     assert_eq!(
