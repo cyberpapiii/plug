@@ -7,10 +7,11 @@ conformance_check="$repo_root/scripts/check-mcp-conformance.sh"
 golden_replayer="$repo_root/scripts/fleet/golden.py"
 contract_checker="$repo_root/scripts/fleet/contract.py"
 load_runner="$repo_root/scripts/fleet/load.py"
+fault_runner="$repo_root/scripts/fleet/fault.py"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract|load]
+Usage: scripts/fleet-truth.sh [all|conformance|conformance-local|golden|contract|load|fault]
 
 Stages:
   conformance        Fast gate: MCP inventory plus selector self-test
@@ -18,7 +19,8 @@ Stages:
   golden             Replay normalized MCP JSON-RPC golden transcripts
   contract           Check mock MCP list responses against committed contracts
   load               Concurrent sessions against a mock upstream (default: 2 x 5m)
-  all                Run fast stages; the five-minute load stage remains opt-in (default)
+  fault              Expected failure/recovery checks against mock upstream faults
+  all                Run fast stages; load and fault stages remain opt-in (default)
 EOF
 }
 
@@ -143,12 +145,35 @@ run_load() {
   return 1
 }
 
+run_fault() {
+  printf '%-16s %s\n' 'stage' 'fault'
+  printf '%-16s %s\n' 'scope' 'mock malformed/reset/delay/SIGTERM/auth-expiry failures + recovery'
+  if [ ! -f "$fault_runner" ]; then
+    printf 'fleet-truth: missing fault runner: %s\n' "$fault_runner" >&2
+    printf '%s\n' 'STAGE fault FAIL'
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'fleet-truth: python3 is required for fault checks' >&2
+    printf '%s\n' 'STAGE fault FAIL'
+    return 1
+  fi
+  if PYTHONDONTWRITEBYTECODE=1 python3 "$fault_runner"; then
+    printf '%s\n' 'STAGE fault PASS'
+    return 0
+  fi
+
+  printf '%s\n' 'STAGE fault FAIL'
+  return 1
+}
+
 run_all() {
   local result=0
   run_conformance || result=$?
   run_golden || result=$?
   run_contract || result=$?
   printf '%s\n' 'STAGE load SKIP (opt-in: scripts/fleet-truth.sh load)'
+  printf '%s\n' 'STAGE fault SKIP (opt-in: scripts/fleet-truth.sh fault)'
   printf '%s\n' 'STAGE fleet-runtime SKIP (not implemented)'
   printf '%s\n' 'STAGE fleet-official SKIP (opt-in only)'
   return "$result"
@@ -162,6 +187,7 @@ case "$mode" in
   golden) run_golden ;;
   contract) run_contract ;;
   load) run_load ;;
+  fault) run_fault ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

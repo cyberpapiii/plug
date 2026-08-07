@@ -19,6 +19,7 @@ use rmcp::ServiceExt as _;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 #[derive(Parser)]
 #[command(name = "mock-mcp-server")]
@@ -31,7 +32,8 @@ struct Args {
     #[arg(long, default_value = "0")]
     delay_ms: u64,
 
-    /// Fail mode: "none", "timeout" (hang forever), "crash" (exit immediately)
+    /// Fail mode: "none", "timeout", "crash", "malformed-frame", "reset",
+    /// "slow-delay", "sigterm", or "auth-expiry"
     #[arg(long, default_value = "none")]
     fail_mode: String,
 
@@ -100,7 +102,6 @@ struct Args {
 }
 
 async fn append_request_log(path: Option<&str>, method: &str) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
     let Some(path) = path else {
         return Ok(());
     };
@@ -115,8 +116,6 @@ async fn append_request_log(path: Option<&str>, method: &str) -> anyhow::Result<
 }
 
 async fn serve_lifecycle_stdio(mode: &str, request_log_file: Option<&str>) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
@@ -191,8 +190,6 @@ async fn serve_lifecycle_stdio(mode: &str, request_log_file: Option<&str>) -> an
 }
 
 async fn serve_legacy_tasks_stdio() -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     let mut next_id = 0usize;
@@ -256,6 +253,97 @@ async fn serve_legacy_tasks_stdio() -> anyhow::Result<()> {
         stdout.flush().await?;
     }
     Ok(())
+}
+
+async fn serve_fault_stdio(mode: &str, delay_ms: u64) -> anyhow::Result<()> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut fault_pending = true;
+    while let Some(line) = lines.next_line().await? {
+        let request: serde_json::Value = serde_json::from_str(&line)?;
+        let Some(id) = request.get("id").cloned() else {
+            continue;
+        };
+        let method = request["method"].as_str().unwrap_or_default();
+        let response = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": {"name": "mock-mcp-server", "version": "0.1.0"}
+                }
+            }),
+            "tools/list" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Mock tool: echo",
+                        "inputSchema": {"type": "object"}
+                    }]
+                }
+            }),
+            "tools/call" if fault_pending => {
+                fault_pending = false;
+                match mode {
+                    "malformed-frame" => {
+                        stdout.write_all(b"{malformed-json-rpc\n").await?;
+                        stdout.flush().await?;
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                    "reset" => return Ok(()),
+                    "slow-delay" => {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        success_call_response(id)
+                    }
+                    "sigterm" => {
+                        let pid = std::process::id().to_string();
+                        std::process::Command::new("kill")
+                            .args(["-TERM", &pid])
+                            .spawn()?;
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                    "auth-expiry" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32001,
+                            "message": "simulated upstream authentication expired"
+                        }
+                    }),
+                    _ => unreachable!("validated fault mode"),
+                }
+            }
+            "tools/call" => success_call_response(id),
+            _ => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": method}
+            }),
+        };
+        stdout
+            .write_all(serde_json::to_string(&response)?.as_bytes())
+            .await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+    }
+    Ok(())
+}
+
+fn success_call_response(id: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": "fault fixture recovered"}],
+            "isError": false
+        }
+    })
 }
 
 struct MockServer {
@@ -968,6 +1056,12 @@ async fn main() -> anyhow::Result<()> {
         let service = OfficialModernFixture.serve(transport).await?;
         service.waiting().await?;
         return Ok(());
+    }
+    if matches!(
+        args.fail_mode.as_str(),
+        "malformed-frame" | "reset" | "slow-delay" | "sigterm" | "auth-expiry"
+    ) {
+        return serve_fault_stdio(&args.fail_mode, args.delay_ms).await;
     }
     if matches!(args.lifecycle.as_str(), "legacy-only" | "modern-only") {
         return serve_lifecycle_stdio(&args.lifecycle, args.request_log_file.as_deref()).await;
