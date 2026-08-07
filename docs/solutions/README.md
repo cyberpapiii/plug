@@ -2,7 +2,7 @@
 
 Documented solutions and patterns for this repo, organized by category.
 Each learning has YAML frontmatter (`module`, `tags`, `problem_type`, `summary`) for search.
-See `CONCEPTS.md` for shared domain vocabulary and `AGENTS.md` for how this store fits Compound Engineering.
+See [`CONCEPTS.md`](../../CONCEPTS.md) for shared domain vocabulary and [`AGENTS.md`](../../AGENTS.md) for how this store fits Compound Engineering.
 
 Plans and audits are not current truth; these files are historical compound knowledge.
 

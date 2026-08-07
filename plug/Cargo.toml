@@ -32,7 +32,6 @@ base64.workspace = true
 tracing-appender.workspace = true
 fs4.workspace = true
 subtle.workspace = true
-hex.workspace = true
 directories.workspace = true
 uuid.workspace = true
 dashmap.workspace = true

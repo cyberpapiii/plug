@@ -556,10 +556,9 @@ pub fn rewrite_legacy_result(value: &mut serde_json::Value, task_response: bool)
     }
 }
 
-/// Reject the announced future revision that RMCP 2.2 knows how to name but
-/// Plug does not implement yet. Older and unknown versions retain RMCP's
-/// existing negotiation behavior; only the known-unimplemented revision is
-/// blocked before RMCP can echo it as accepted.
+/// Reject MCP `2026-07-28` on the legacy admission path. RMCP 3.1 can name
+/// that revision, but Plug only accepts it through the gated modern
+/// downstream path. Older and unknown versions retain RMCP negotiation.
 pub fn ensure_supported_downstream_protocol(requested: &ProtocolVersion) -> Result<(), McpError> {
     if requested.as_str() == ANNOUNCED_FUTURE_PROTOCOL_VERSION {
         return Err(McpError::invalid_params(

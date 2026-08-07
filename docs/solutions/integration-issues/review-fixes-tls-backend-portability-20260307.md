@@ -6,14 +6,13 @@ components:
   - plug-core/src/server/mod.rs
   - Cargo.toml
   - deny.toml
-problem_type: dependency-runtime-portability
+problem_type: build_error
 summary: Replaced rmcp's default rustls/aws-lc HTTP client path with rustls-no-provider plus an explicit ring provider install so PR 21 could pass license and cross-target CI without reintroducing OpenSSL.
 related:
   - docs/brainstorms/2026-03-07-review-fixes-tls-backend-portability-brainstorm.md
   - docs/plans/2026-03-07-fix-review-fixes-tls-backend-portability-plan.md
   - https://github.com/cyberpapiii/plug/pull/21
 module: plug-core/http
-problem_type: build_error
 tags:
   - tls
   - integration-issues

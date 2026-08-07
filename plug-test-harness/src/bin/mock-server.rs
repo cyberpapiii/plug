@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-// Exercise the complete MCP 2025-11-25 surface even where RMCP 2.2 marks
+// Exercise the complete MCP 2025-11-25 surface even where RMCP 3.1 marks
 // features deprecated toward future SEP-2577.
 #![allow(deprecated)]
 

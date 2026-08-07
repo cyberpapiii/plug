@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-// Preserve integration coverage for MCP 2025-11-25 features that RMCP 2.2
+// Preserve integration coverage for MCP 2025-11-25 features that RMCP 3.1
 // deprecates only in anticipation of future SEP-2577.
 #![allow(deprecated)]
 

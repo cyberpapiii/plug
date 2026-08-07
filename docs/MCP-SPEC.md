@@ -180,7 +180,7 @@ Client confirms:
 - Server responds with same version (if supported) or its own latest
 - If incompatible: client SHOULD disconnect
 
-**Plug**: Advertise `2025-11-25`. RMCP 2.2.0 supplies the Rust protocol models and transport implementation, but does not change Plug's negotiated wire revision. The current downstream HTTP policy is strict after initialization: non-initialize HTTP requests must include `MCP-Protocol-Version: 2025-11-25`. The HTTP initialize response body is set through typed `InitializeResult` construction, not JSON body mutation. Revisit this only when the 2026-07-28 stateless/per-request protocol work is stable and deliberately implemented.
+**Plug**: Default wire era is MCP `2025-11-25`. Exact RMCP `3.1.0` supplies the Rust protocol models and transports. Legacy downstream HTTP stays strict after initialization (`MCP-Protocol-Version: 2025-11-25`). Gated MCP `2026-07-28` paths (`http.modern_downstream_enabled`, `modern_upstream_enabled`, both default off) add discovery/sessionless modern HTTP and modern upstream negotiation without a hard cutover. Initialize responses use typed `InitializeResult` construction, not JSON body mutation.
 
 ### Phase 2: Operation
 
@@ -322,7 +322,7 @@ Normal request/response/notification flow.
 - Plug still serves the current stateful Streamable HTTP model today, with bounded SSE replay for stateful sessions.
 - Do not deepen session-bound public semantics unless the accepted stateless/sessionless model requires it.
 
-**Plug preparation**: Keep session state behind internal session stores so a future stateless mode can be added without rewriting routing, capability synthesis, or reverse-request ownership.
+**Plug**: Stateful Streamable HTTP remains the default. Gated modern downstream already supports sessionless HTTP for `2026-07-28` peers. Session state stays behind internal session stores so routing, capability synthesis, and reverse-request ownership do not depend on transport session shape.
 
 ### Server Cards
 

@@ -9,7 +9,7 @@ components:
   - plug-core/src/server/mod.rs
   - plug/src/ipc_proxy.rs
   - plug/src/runtime.rs
-problem_type: remote-mcp-connector-instability
+problem_type: integration_issue
 summary: Fixed a cluster of Claude remote-connector failures by debouncing downstream list-changed notifications, adding explicit HTTP origin allowlisting for Claude-hosted connectors, aligning stdio protocol advertisement to 2025-11-25, and documenting that the remote connector must target the full `/mcp` endpoint rather than the tunnel root.
 related:
   - docs/bug-reports/claude-remote-mcp-no-tools-when-initialize-body-advertises-2025-06-18.md
@@ -18,7 +18,6 @@ related:
   - docs/solutions/integration-issues/phase2c-resources-prompts-pagination-20260307.md
   - docs/solutions/integration-issues/review-fixes-critical-http-auth-ipc-parity-20260307.md
 module: plug-core
-problem_type: integration_issue
 tags:
   - http
   - integration-issues

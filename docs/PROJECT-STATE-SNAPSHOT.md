@@ -35,7 +35,7 @@ Implemented on `main`:
 - sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
 - legacy SSE upstream transport with HTTP→SSE auto-fallback, SSRF hardening, and auth support
 - OAuth 2.1 + PKCE upstream auth with credential storage, background token refresh, CLI auth commands, doctor checks, and correct HTTP auth header construction (PR #36, PR #47)
-- static-token Streamable HTTP auth passes raw token material to RMCP 2.2 so the transport emits exactly one Bearer prefix, protected by a wire-level regression
+- static-token Streamable HTTP auth passes raw token material to RMCP 3.1 so the transport emits exactly one Bearer prefix, protected by a wire-level regression
 - mock OAuth provider integration coverage for metadata discovery, auth-code exchange persistence with state cleanup, token refresh persistence, and reconnect using refreshed credentials (PR #51)
 - daemon IPC notification parity: progress, cancelled, list_changed, resource subscribe/unsubscribe, and targeted resource update forwarding
 - localhost OAuth callback listener for `plug auth login` with `--no-browser` manual fallback (PR #39)

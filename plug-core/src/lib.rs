@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-// RMCP 2.2 deprecates these APIs toward future SEP-2577. Plug intentionally
-// retains them while MCP 2025-11-25 remains the negotiated stable revision.
+// RMCP 3.1 deprecates some APIs toward future SEP-2577. Plug intentionally
+// retains them while MCP 2025-11-25 remains the default negotiated revision.
 #![allow(deprecated)]
 
 pub mod artifacts;
