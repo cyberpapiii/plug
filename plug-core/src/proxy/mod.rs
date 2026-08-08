@@ -2313,6 +2313,9 @@ impl ToolRouter {
         .await;
     }
 
+    /// Execute the `Rebind` and `Resubscribe` decisions from a
+    /// reconciliation pass. `Prune` is handled separately by the caller,
+    /// before the new snapshot is published.
     async fn rebind_reconciled_routes<'a, I>(
         server_manager: &Arc<ServerManager>,
         registry: &Arc<subscriptions::SubscriptionRegistry>,
@@ -2324,29 +2327,43 @@ impl ToolRouter {
         let rebind_futs: Vec<_> = items
             .into_iter()
             .filter_map(|item| {
-                let subscriptions::RouteReconciliation::Rebind {
-                    uri,
-                    old_server_id,
-                    new_server_id,
-                } = item
-                else {
-                    return None;
+                let (uri, old_server_id, new_server_id) = match item {
+                    subscriptions::RouteReconciliation::Rebind {
+                        uri,
+                        old_server_id,
+                        new_server_id,
+                    } => (uri, Some(old_server_id), new_server_id),
+                    // Same server, new connection: no old owner to release.
+                    subscriptions::RouteReconciliation::Resubscribe { uri, server_id } => {
+                        (uri, None, server_id)
+                    }
+                    subscriptions::RouteReconciliation::Prune { .. } => return None,
                 };
                 let server_manager = Arc::clone(server_manager);
                 let registry = Arc::clone(registry);
                 let uri = uri.clone();
-                let old_server_id = old_server_id.clone();
+                let old_server_id = old_server_id.cloned();
                 let new_server_id = new_server_id.clone();
                 Some(async move {
-                    if let Err(error) = Self::rebind_subscription_route_with(
-                        &server_manager,
-                        &registry,
-                        &uri,
-                        &old_server_id,
-                        &new_server_id,
-                    )
-                    .await
-                    {
+                    let new_owner = Self::resolve_rebind_owner(&server_manager, &new_server_id);
+                    let outcome = match old_server_id {
+                        Some(old_server_id) => {
+                            let old_upstream = server_manager
+                                .get_upstream(&old_server_id)
+                                .map(subscriptions::as_upstream_ops);
+                            registry
+                                .rebind(
+                                    &uri,
+                                    &old_server_id,
+                                    old_upstream,
+                                    &new_server_id,
+                                    new_owner,
+                                )
+                                .await
+                        }
+                        None => registry.resubscribe(&uri, &new_server_id, new_owner).await,
+                    };
+                    if let Err(error) = outcome {
                         tracing::warn!(uri = %uri, error = %error, "{failure_message}");
                     }
                 })
@@ -2391,7 +2408,19 @@ impl ToolRouter {
         let old_upstream = server_manager
             .get_upstream(old_server_id)
             .map(subscriptions::as_upstream_ops);
-        let new_owner = match server_manager.get_upstream(new_server_id) {
+        let new_owner = Self::resolve_rebind_owner(server_manager, new_server_id);
+        registry
+            .rebind(uri, old_server_id, old_upstream, new_server_id, new_owner)
+            .await
+    }
+
+    /// Resolve a destination server into the handle a rebind or resubscribe
+    /// should subscribe on, or the reason it isn't usable.
+    fn resolve_rebind_owner(
+        server_manager: &Arc<ServerManager>,
+        server_id: &str,
+    ) -> Result<Arc<dyn subscriptions::UpstreamResourceOps>, subscriptions::RebindSkipReason> {
+        match server_manager.get_upstream(server_id) {
             None => Err(subscriptions::RebindSkipReason::NewOwnerMissing),
             Some(upstream) => {
                 let supports_subscribe = upstream
@@ -2406,10 +2435,7 @@ impl ToolRouter {
                     Err(subscriptions::RebindSkipReason::NewOwnerNoSubscribeSupport)
                 }
             }
-        };
-        registry
-            .rebind(uri, old_server_id, old_upstream, new_server_id, new_owner)
-            .await
+        }
     }
 
     /// Call a tool by its prefixed name, routing to the correct upstream server.

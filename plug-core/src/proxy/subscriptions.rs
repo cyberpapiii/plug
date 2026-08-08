@@ -99,6 +99,13 @@ struct Entry {
     /// preference to any route-cache-derived handle, so an unsubscribe
     /// racing a route refresh can never be sent to the wrong upstream.
     owner_server_id: Option<String>,
+    /// The `connection_generation` of the handle that confirmed this entry's
+    /// subscription. `None` until the first upstream confirmation, and reset
+    /// to `None` whenever the owner is. Compared against the owning server's
+    /// *current* connection generation to detect a same-id reconnect, which
+    /// leaves the entry looking `Active` while the upstream subscription it
+    /// names no longer exists anywhere.
+    owner_connection_generation: Option<u64>,
 }
 
 enum EntryState {
@@ -159,6 +166,16 @@ impl Entry {
 /// transport. Production always resolves this from `Arc<UpstreamServer>`
 /// (see `as_upstream_ops`); tests substitute a controllable mock.
 pub(super) trait UpstreamResourceOps: Send + Sync {
+    /// Monotonic identity of the concrete connection behind this handle.
+    ///
+    /// A resource subscription lives on a connection, not on a server id. When
+    /// an upstream drops and redials under the same id, the new connection has
+    /// no `resources/subscribe` registered even though every route and every
+    /// server id is unchanged — so the id alone cannot distinguish "still
+    /// subscribed" from "silently lost it". Entries record this alongside the
+    /// owning server id and reconcile when it moves.
+    fn connection_generation(&self) -> u64;
+
     fn subscribe_resource<'a>(
         &'a self,
         uri: &'a str,
@@ -171,6 +188,10 @@ pub(super) trait UpstreamResourceOps: Send + Sync {
 }
 
 impl UpstreamResourceOps for crate::server::UpstreamServer {
+    fn connection_generation(&self) -> u64 {
+        self.generation
+    }
+
     fn subscribe_resource<'a>(
         &'a self,
         uri: &'a str,
@@ -233,6 +254,15 @@ pub(super) enum RouteReconciliation {
         uri: String,
         old_server_id: Option<String>,
     },
+    /// The URI still routes to the same server, but that server has
+    /// reconnected since the entry's subscription was confirmed, so the
+    /// upstream `resources/subscribe` went away with the old connection.
+    /// Re-issue it on the current connection. Distinct from `Rebind` because
+    /// there is no old owner to release: the connection that held the
+    /// subscription is gone, and sending `resources/unsubscribe` to the new
+    /// one — which is what a same-id rebind would do — asks it to drop a
+    /// subscription it never had.
+    Resubscribe { uri: String, server_id: String },
 }
 
 /// Why a rebind's new-owner resolution wasn't a usable upstream handle.
@@ -483,6 +513,7 @@ impl SubscriptionRegistry {
                         intended_owner_server_id: owner_server_id.to_string(),
                     },
                     owner_server_id: None,
+                    owner_connection_generation: None,
                 });
                 Action::Start {
                     generation,
@@ -499,10 +530,28 @@ impl SubscriptionRegistry {
                 // reassign `*entry` below.
                 enum Current {
                     Active,
+                    /// `Active`, but the connection that confirmed the
+                    /// subscription has been replaced. See the arm below.
+                    ActiveOnDeadConnection,
                     Pending(watch::Receiver<TransitionSignal>),
                     Draining(Option<String>),
                 }
+                // Same server id, different connection: the upstream
+                // subscription this entry names died with the old connection,
+                // so treating the entry as already-active would return `Ok` to
+                // a subscriber that will never receive a notification. This is
+                // the one place a downstream re-subscribe can heal a
+                // reconnect that the route diff cannot see (the route is
+                // unchanged), so it must not short-circuit.
+                let owner_connection_replaced = entry.owner_server_id.as_deref()
+                    == Some(owner_server_id)
+                    && entry
+                        .owner_connection_generation
+                        .is_some_and(|recorded| recorded != upstream.connection_generation());
                 let current = match &entry.state {
+                    EntryState::Active if owner_connection_replaced => {
+                        Current::ActiveOnDeadConnection
+                    }
                     EntryState::Active => Current::Active,
                     EntryState::Pending { rx, .. } => Current::Pending(rx.clone()),
                     EntryState::Draining {
@@ -511,6 +560,31 @@ impl SubscriptionRegistry {
                 };
                 match current {
                     Current::Active => Action::AlreadyActive,
+                    Current::ActiveOnDeadConnection => {
+                        // Start a fresh transition over the existing member
+                        // set — every member is still subscribed downstream
+                        // and every one of them needs the upstream
+                        // subscription re-established. No `displaced_owner`:
+                        // the connection that held it is gone, so there is
+                        // nothing to release, and naming the server id here
+                        // would send `resources/unsubscribe` to the live
+                        // replacement connection instead.
+                        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                        let (tx, rx) = watch::channel(None);
+                        entry.generation = generation;
+                        entry.state = EntryState::Pending {
+                            rx: rx.clone(),
+                            intended_owner_server_id: owner_server_id.to_string(),
+                        };
+                        entry.owner_server_id = None;
+                        entry.owner_connection_generation = None;
+                        Action::Start {
+                            generation,
+                            tx,
+                            rx,
+                            displaced_owner: None,
+                        }
+                    }
                     Current::Pending(rx) => Action::Piggyback(rx),
                     Current::Draining(displaced_owner) => {
                         // A drain is in flight for this URI. Replace the
@@ -532,6 +606,7 @@ impl SubscriptionRegistry {
                                 intended_owner_server_id: owner_server_id.to_string(),
                             },
                             owner_server_id: None,
+                            owner_connection_generation: None,
                         };
                         // The drain we just superseded will make no upstream
                         // call, so releasing its owner becomes our job.
@@ -638,6 +713,7 @@ impl SubscriptionRegistry {
                         && entry.generation == generation
                     {
                         entry.owner_server_id = Some(owner_server_id.clone());
+                        entry.owner_connection_generation = Some(upstream.connection_generation());
                         if matches!(entry.state, EntryState::Pending { .. }) {
                             entry.state = EntryState::Active;
                         }
@@ -840,6 +916,29 @@ impl SubscriptionRegistry {
         let _ = tx.send(Some(Ok(())));
     }
 
+    /// Whether `entry`'s confirmed subscription belongs to a connection that
+    /// `server_id` has since replaced.
+    ///
+    /// Only a settled `Active` entry with a confirmed owner qualifies. A
+    /// `Pending` or `Draining` entry has a transition of its own in flight
+    /// that owns the outcome, and an entry with no recorded owner has nothing
+    /// upstream to have lost. Returns false when the owner cannot be resolved
+    /// at all — no resolver wired, or the server is gone — since neither says
+    /// anything about a *replacement* connection.
+    fn owner_connection_is_stale(&self, entry: &Entry, server_id: &str) -> bool {
+        if !matches!(entry.state, EntryState::Active) {
+            return false;
+        }
+        if entry.owner_server_id.as_deref() != Some(server_id) {
+            return false;
+        }
+        let Some(recorded) = entry.owner_connection_generation else {
+            return false;
+        };
+        self.drain_handle(Some(server_id), None)
+            .is_some_and(|current| current.connection_generation() != recorded)
+    }
+
     /// Classify every currently-tracked URI against an old/new route
     /// snapshot pair. Pure decision pass — no registry mutation, no
     /// upstream calls. Emits the same debug logs the old inline `retain`
@@ -885,6 +984,16 @@ impl SubscriptionRegistry {
                             uri: uri.clone(),
                             old_server_id: old_server_id.clone(),
                             new_server_id: new_server_id.clone(),
+                        });
+                    } else if self.owner_connection_is_stale(item.value(), new_server_id) {
+                        tracing::debug!(
+                            uri = %uri,
+                            server = %new_server_id,
+                            "resubscribing resource on a reconnected upstream"
+                        );
+                        out.push(RouteReconciliation::Resubscribe {
+                            uri: uri.clone(),
+                            server_id: new_server_id.clone(),
                         });
                     }
                 }
@@ -985,6 +1094,50 @@ impl SubscriptionRegistry {
         new_server_id: &str,
         new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
     ) -> Result<(), McpError> {
+        self.migrate(
+            uri,
+            old_server_id,
+            old_upstream,
+            new_server_id,
+            new_owner,
+            true,
+        )
+        .await
+    }
+
+    /// Execute a `Resubscribe` decision: re-issue `resources/subscribe` on a
+    /// server that has reconnected since this entry's subscription was
+    /// confirmed.
+    ///
+    /// Structurally a rebind from a server to itself, with one deliberate
+    /// difference: the old owner is not released. The connection that held
+    /// the subscription is gone, so there is nothing to unsubscribe, and the
+    /// only handle that resolves for that server id now is the *replacement*
+    /// connection — which never had the subscription. Sending it an
+    /// `unsubscribe` would at best be a no-op and at worst fail, and a failed
+    /// old-owner release makes a rebind prune the entry's local subscribers.
+    /// That would turn a recoverable reconnect into the exact data loss this
+    /// path exists to prevent.
+    pub(super) async fn resubscribe(
+        self: &Arc<Self>,
+        uri: &str,
+        server_id: &str,
+        new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
+    ) -> Result<(), McpError> {
+        self.migrate(uri, server_id, None, server_id, new_owner, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn migrate(
+        self: &Arc<Self>,
+        uri: &str,
+        old_server_id: &str,
+        old_upstream: Option<Arc<dyn UpstreamResourceOps>>,
+        new_server_id: &str,
+        new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
+        release_old_owner: bool,
+    ) -> Result<(), McpError> {
         enum Decision {
             Piggyback(watch::Receiver<TransitionSignal>),
             Migrate {
@@ -1066,6 +1219,7 @@ impl SubscriptionRegistry {
                             old_upstream,
                             new_server_id,
                             new_owner,
+                            release_old_owner,
                             tx,
                         )
                         .await;
@@ -1084,6 +1238,7 @@ impl SubscriptionRegistry {
         old_upstream: Option<Arc<dyn UpstreamResourceOps>>,
         new_server_id: String,
         new_owner: Result<Arc<dyn UpstreamResourceOps>, RebindSkipReason>,
+        release_old_owner: bool,
         tx: watch::Sender<TransitionSignal>,
     ) {
         let lock = self.transition_lock(&uri);
@@ -1123,17 +1278,21 @@ impl SubscriptionRegistry {
 
         let mut failed = false;
 
-        let old_upstream = self.drain_handle(recorded_owner.as_deref(), old_upstream);
-        if let Some(old_upstream) = &old_upstream
-            && let Err(error) = old_upstream.unsubscribe_resource(&uri).await
-        {
-            tracing::warn!(
-                uri = %uri,
-                server_id = %old_server_id,
-                error = %error,
-                "failed to unsubscribe old resource owner during route refresh; skipping rebind to avoid dual subscription"
-            );
-            failed = true;
+        // Skipped for a resubscribe — see `resubscribe` for why releasing a
+        // reconnected server's "old" owner is both meaningless and harmful.
+        if release_old_owner {
+            let old_upstream = self.drain_handle(recorded_owner.as_deref(), old_upstream);
+            if let Some(old_upstream) = &old_upstream
+                && let Err(error) = old_upstream.unsubscribe_resource(&uri).await
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    server_id = %old_server_id,
+                    error = %error,
+                    "failed to unsubscribe old resource owner during route refresh; skipping rebind to avoid dual subscription"
+                );
+                failed = true;
+            }
         }
 
         if !failed {
@@ -1186,6 +1345,10 @@ impl SubscriptionRegistry {
                 && entry.generation == generation
             {
                 entry.owner_server_id = Some(new_server_id.clone());
+                entry.owner_connection_generation = new_owner
+                    .as_ref()
+                    .ok()
+                    .map(|new| new.connection_generation());
                 if matches!(entry.state, EntryState::Pending { .. }) {
                     entry.state = EntryState::Active;
                 }
@@ -1211,6 +1374,7 @@ impl SubscriptionRegistry {
                 members,
                 state: EntryState::Active,
                 owner_server_id: None,
+                owner_connection_generation: None,
             },
         );
     }
@@ -1403,7 +1567,7 @@ impl super::ToolRouter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     use tokio::sync::Notify;
 
@@ -1461,6 +1625,8 @@ mod tests {
         unsubscribe_result: std::sync::Mutex<Result<(), McpError>>,
         subscribe_calls: AtomicUsize,
         unsubscribe_calls: AtomicUsize,
+        /// Connection identity, bumped by `simulate_reconnect`.
+        connection_generation: AtomicU64,
         log: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -1500,6 +1666,7 @@ mod tests {
                 unsubscribe_result: std::sync::Mutex::new(Ok(())),
                 subscribe_calls: AtomicUsize::new(0),
                 unsubscribe_calls: AtomicUsize::new(0),
+                connection_generation: AtomicU64::new(1),
                 log: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -1510,6 +1677,12 @@ mod tests {
 
         fn unsubscribe_call_count(&self) -> usize {
             self.unsubscribe_calls.load(Ordering::SeqCst)
+        }
+
+        /// Stand in for the same upstream having dropped and redialed: same
+        /// server id, new connection identity.
+        fn simulate_reconnect(&self) {
+            self.connection_generation.fetch_add(1, Ordering::SeqCst);
         }
 
         fn set_subscribe_result(&self, result: Result<(), McpError>) {
@@ -1528,6 +1701,10 @@ mod tests {
     }
 
     impl UpstreamResourceOps for MockUpstream {
+        fn connection_generation(&self) -> u64 {
+            self.connection_generation.load(Ordering::SeqCst)
+        }
+
         fn subscribe_resource<'a>(
             &'a self,
             _uri: &'a str,
@@ -1554,6 +1731,15 @@ mod tests {
                 self.log.lock().unwrap().push("unsubscribe");
                 result
             })
+        }
+    }
+
+    /// Variant name of a reconciliation item, for assertion failure messages.
+    fn reconciliation_kind(item: &RouteReconciliation) -> &'static str {
+        match item {
+            RouteReconciliation::Rebind { .. } => "Rebind",
+            RouteReconciliation::Prune { .. } => "Prune",
+            RouteReconciliation::Resubscribe { .. } => "Resubscribe",
         }
     }
 
@@ -2556,6 +2742,169 @@ mod tests {
         registry
     }
 
+    /// Registry with one confirmed subscription on `owner`, plus an owner
+    /// resolver wired to the same mock — so `classify_route_changes` can see
+    /// the owning server's current connection identity, which is what the
+    /// same-id reconnect check compares against.
+    async fn registry_with_resolvable_owner(
+        uri: &str,
+        owner: &str,
+    ) -> (Arc<SubscriptionRegistry>, Arc<MockUpstream>) {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::new();
+        let resolver_mock = Arc::clone(&mock);
+        let owner_id = owner.to_string();
+        registry.set_owner_resolver(Arc::new(move |server_id: &str| {
+            (server_id == owner_id)
+                .then(|| Arc::clone(&resolver_mock) as Arc<dyn UpstreamResourceOps>)
+        }));
+        registry
+            .subscribe(
+                uri,
+                client("a"),
+                owner,
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        (registry, mock)
+    }
+
+    /// An upstream that drops and redials under the same server id leaves
+    /// every route unchanged, so the old-vs-new route diff sees nothing --
+    /// but the new connection has no `resources/subscribe` registered. The
+    /// entry's recorded connection generation is the only thing that can
+    /// tell the two situations apart.
+    #[tokio::test]
+    async fn classify_resubscribes_after_a_same_id_reconnect() {
+        let (registry, mock) = registry_with_resolvable_owner("file:///x", "server-a").await;
+        let routes = HashMap::from([("file:///x".to_string(), "server-a".to_string())]);
+
+        assert!(
+            registry.classify_route_changes(&routes, &routes).is_empty(),
+            "a live connection must not reconcile"
+        );
+
+        mock.simulate_reconnect();
+
+        let items = registry.classify_route_changes(&routes, &routes);
+        assert_eq!(items.len(), 1, "exactly one reconciliation item");
+        match &items[0] {
+            RouteReconciliation::Resubscribe { uri, server_id } => {
+                assert_eq!(uri, "file:///x");
+                assert_eq!(server_id, "server-a");
+            }
+            other => panic!("expected Resubscribe, got {}", reconciliation_kind(other)),
+        }
+    }
+
+    /// Executing the decision must re-issue `subscribe` and must NOT send
+    /// `unsubscribe` first: the connection that held the old subscription is
+    /// gone, and the only handle resolving for that id is the replacement,
+    /// which never had it. A failed old-owner release prunes the entry's
+    /// local subscribers, so a spurious unsubscribe here would destroy
+    /// exactly what the resubscribe exists to save.
+    #[tokio::test]
+    async fn resubscribe_reissues_subscribe_without_unsubscribing() {
+        let (registry, mock) = registry_with_resolvable_owner("file:///x", "server-a").await;
+        let routes = HashMap::from([("file:///x".to_string(), "server-a".to_string())]);
+        mock.simulate_reconnect();
+        mock.clear_log();
+
+        registry
+            .resubscribe(
+                "file:///x",
+                "server-a",
+                Ok(Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mock.log(), vec!["subscribe"]);
+        assert_eq!(mock.unsubscribe_call_count(), 0);
+        assert_eq!(
+            registry.members_snapshot("file:///x"),
+            Some(HashSet::from([client("a")])),
+            "the downstream subscriber must survive the reconnect"
+        );
+        assert!(
+            registry.classify_route_changes(&routes, &routes).is_empty(),
+            "the new connection generation must be recorded, or every later \
+             refresh resubscribes again"
+        );
+    }
+
+    /// A second downstream subscriber arriving after a same-id reconnect
+    /// must not be answered from the entry's stale `Active` state: doing so
+    /// returns success for a subscription that no upstream is holding.
+    #[tokio::test]
+    async fn subscribe_after_reconnect_does_not_short_circuit_on_active() {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::new();
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "server-a",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        mock.clear_log();
+        mock.simulate_reconnect();
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("b"),
+                "server-a",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mock.log(), vec!["subscribe"]);
+        assert_eq!(
+            registry.members_snapshot("file:///x"),
+            Some(HashSet::from([client("a"), client("b")])),
+            "the first subscriber must be carried through the new transition"
+        );
+    }
+
+    /// The same second subscriber on a connection that has NOT been replaced
+    /// still short-circuits -- the reconnect check must not turn every
+    /// piggybacking subscribe into a redundant upstream round trip.
+    #[tokio::test]
+    async fn subscribe_on_a_live_connection_still_short_circuits() {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::new();
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "server-a",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        mock.clear_log();
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("b"),
+                "server-a",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            mock.log().is_empty(),
+            "no upstream call for an active entry"
+        );
+    }
+
     /// Arm-1 core: an entry whose confirmed owner is A while BOTH route
     /// snapshots agree the URI belongs to B (the skew left behind by a
     /// subscribe landing inside a refresh's classify->publish window) must
@@ -2579,7 +2928,7 @@ mod tests {
                 assert_eq!(old_server_id, "server-a");
                 assert_eq!(new_server_id, "server-b");
             }
-            RouteReconciliation::Prune { .. } => panic!("expected Rebind, got Prune"),
+            other => panic!("expected Rebind, got {}", reconciliation_kind(other)),
         }
     }
 
@@ -2624,7 +2973,7 @@ mod tests {
                 assert_eq!(old_server_id, "server-a");
                 assert_eq!(new_server_id, "server-c");
             }
-            RouteReconciliation::Prune { .. } => panic!("expected Rebind, got Prune"),
+            other => panic!("expected Rebind, got {}", reconciliation_kind(other)),
         }
     }
 
@@ -2650,7 +2999,7 @@ mod tests {
                 assert_eq!(uri, "file:///x");
                 assert_eq!(old_server_id.as_deref(), Some("server-a"));
             }
-            RouteReconciliation::Rebind { .. } => panic!("expected Prune, got Rebind"),
+            other => panic!("expected Prune, got {}", reconciliation_kind(other)),
         }
     }
 }
