@@ -2210,13 +2210,13 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
 //   test-local restartable mock: bind port 0 once, capture the port, then
 //   re-bind the SAME captured port for the restart. If the port is racily
 //   stolen between drop and re-bind, the whole scenario retries (bounded).
-// - DEFERRED: plan 013 step 2's companion test
-//   (`test_oauth_refresh_under_load_no_auth_errors`) is deferred pending
-//   time-control work (plan 014). `MIN_EXPIRES_IN` (60s) in
+// - Plan 013 step 2's companion test
+//   (`test_oauth_refresh_under_load_no_auth_errors`) now lives at the bottom
+//   of this file. It drives refresh cycles through `oauth::advance_test_clock`
+//   rather than real time, because `MIN_EXPIRES_IN` (60s) in
 //   `plug-core/src/oauth.rs` clamps every provider-supplied `expires_in`
-//   upward, and the short-lived 50%-of-lifetime rule floors the first
-//   background refresh at ~30s of real time per cycle — two observed refresh
-//   windows cannot fit an integration-test budget without production changes.
+//   upward and the short-lived 50%-of-lifetime rule floors the first
+//   background refresh at ~30s per cycle.
 
 /// Per-incarnation state for the restartable mock HTTP upstream.
 ///
@@ -5315,4 +5315,350 @@ async fn test_http_sampling_reverse_request_round_trip() {
     );
 
     engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// OAuth refresh under load (plan 013 step 2, unblocked by the oauth clock seam)
+// ---------------------------------------------------------------------------
+//
+// This test needs two things real wall time cannot give it. The background
+// refresh loop in `engine.rs` polls on a 30-second cadence, so observing two of
+// its cycles costs a minute of real time; and token expiry is measured against
+// `SystemTime`, which `tokio::time::pause()` does not touch, so virtual time
+// alone leaves a token that never comes due.
+//
+// So the test runs on a paused Tokio clock and drives `oauth::advance_test_clock`
+// in step with it, keeping the OAuth wall clock and the virtual clock in sync.
+// The per-request timeouts in the server config are set far above the refresh
+// cadence on purpose: under a paused clock Tokio jumps straight to the earliest
+// pending deadline whenever the runtime is idle, so a short call timeout would
+// fire the instant a loopback request had to wait for a byte.
+
+#[derive(Default)]
+struct RefreshUnderLoadShared {
+    /// Every access token this provider has ever issued. A real authorization
+    /// server does not invalidate an access token when a refresh mints the next
+    /// one — the old token stays good until its own expiry. The other mocks in
+    /// this file are stricter than that, which would turn every refresh into a
+    /// guaranteed 401 window and make this test assert a property no real
+    /// provider requires.
+    issued_access_tokens: std::collections::HashSet<String>,
+    current_access_token: String,
+    current_refresh_token: String,
+    refresh_grants: usize,
+    unauthorized_calls: usize,
+    tool_calls: usize,
+}
+
+#[derive(Clone)]
+struct RefreshUnderLoadState {
+    base_url: String,
+    shared: Arc<Mutex<RefreshUnderLoadShared>>,
+}
+
+struct MockRefreshUnderLoadProvider {
+    base_url: String,
+    shared: Arc<Mutex<RefreshUnderLoadShared>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockRefreshUnderLoadProvider {
+    async fn start() -> Self {
+        let shared = Arc::new(Mutex::new(RefreshUnderLoadShared {
+            issued_access_tokens: std::collections::HashSet::from([
+                "load-access-token-1".to_string()
+            ]),
+            current_access_token: "load-access-token-1".to_string(),
+            current_refresh_token: "load-refresh-token-1".to_string(),
+            ..Default::default()
+        }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind refresh-under-load provider");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider local addr")
+        );
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(refresh_under_load_metadata_handler),
+            )
+            .route(
+                "/token",
+                axum::routing::post(refresh_under_load_token_handler),
+            )
+            .route("/mcp", axum::routing::post(refresh_under_load_mcp_handler))
+            .with_state(RefreshUnderLoadState {
+                base_url: base_url.clone(),
+                shared: Arc::clone(&shared),
+            });
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve refresh-under-load provider");
+        });
+
+        Self {
+            base_url,
+            shared,
+            handle,
+        }
+    }
+
+    fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.base_url)
+    }
+}
+
+async fn refresh_under_load_metadata_handler(
+    State(state): State<RefreshUnderLoadState>,
+) -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "issuer": state.base_url,
+        "authorization_endpoint": format!("{}/authorize", state.base_url),
+        "token_endpoint": format!("{}/token", state.base_url)
+    }))
+}
+
+async fn refresh_under_load_token_handler(
+    State(state): State<RefreshUnderLoadState>,
+    Form(params): Form<HashMap<String, String>>,
+) -> Response {
+    if params.get("grant_type").map(String::as_str) != Some("refresh_token") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut shared = state.shared.lock().await;
+    if params.get("refresh_token").map(String::as_str)
+        != Some(shared.current_refresh_token.as_str())
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    shared.refresh_grants += 1;
+    let generation = shared.refresh_grants + 1;
+    let access = format!("load-access-token-{generation}");
+    let refresh = format!("load-refresh-token-{generation}");
+    shared.issued_access_tokens.insert(access.clone());
+    shared.current_access_token = access.clone();
+    shared.current_refresh_token = refresh.clone();
+
+    axum::Json(serde_json::json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "read"
+    }))
+    .into_response()
+}
+
+async fn refresh_under_load_mcp_handler(
+    State(state): State<RefreshUnderLoadState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string);
+
+    let json_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let method = json_body
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    {
+        let mut shared = state.shared.lock().await;
+        let accepted = bearer
+            .as_deref()
+            .is_some_and(|token| shared.issued_access_tokens.contains(token));
+        if !accepted {
+            shared.unauthorized_calls += 1;
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if method == "tools/call" {
+            shared.tool_calls += 1;
+        }
+    }
+
+    let session_headers = [
+        (
+            axum::http::HeaderName::from_static("mcp-session-id"),
+            "refresh-under-load-session",
+        ),
+        (axum::http::header::CONTENT_TYPE, "application/json"),
+    ];
+
+    let payload = match method {
+        "initialize" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "refresh-under-load", "version": "0.1.0" }
+            }
+        }),
+        "notifications/initialized" => {
+            return (StatusCode::ACCEPTED, session_headers, String::new()).into_response();
+        }
+        "tools/list" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": { "tools": [{
+                "name": "echo",
+                "description": "echo",
+                "inputSchema": { "type": "object", "properties": {} }
+            }] }
+        }),
+        "tools/call" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_body.get("id"),
+            "result": { "content": [{ "type": "text", "text": "ok" }], "isError": false }
+        }),
+        _ => return (StatusCode::BAD_REQUEST, session_headers, String::new()).into_response(),
+    };
+
+    (StatusCode::OK, session_headers, payload.to_string()).into_response()
+}
+
+#[tokio::test]
+async fn test_oauth_refresh_under_load_no_auth_errors() {
+    let _guard = oauth_integration_test_lock().lock().await;
+    let provider = MockRefreshUnderLoadProvider::start().await;
+    let server_name = format!("oauth-refresh-load-{}", std::process::id());
+    let store = oauth::get_or_create_store(&server_name);
+    store.clear().await.expect("clear OAuth store before test");
+    plug_core::tls::ensure_rustls_provider_installed();
+    save_bound_oauth_test_credentials(
+        &store,
+        &provider.base_url,
+        &provider.mcp_url(),
+        "load-access-token-1",
+        "load-refresh-token-1",
+    )
+    .await;
+
+    let mut engine: Option<Arc<Engine>> = None;
+    let result = AssertUnwindSafe(async {
+        let mut config = Config::default();
+        config.servers.insert(
+            server_name.clone(),
+            ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: true,
+                transport: TransportType::Http,
+                protocol_mode: Default::default(),
+                url: Some(provider.mcp_url()),
+                auth_token: None,
+                auth: Some("oauth".to_string()),
+                oauth_client_id: Some("test-client".to_string()),
+                oauth_scopes: Some(vec!["read".to_string()]),
+                // Far above the 30s refresh cadence so a paused-clock jump to
+                // the refresh deadline never trips a request timeout.
+                timeout_secs: 3600,
+                call_timeout_secs: 3600,
+                max_concurrent: 4,
+                health_check_interval_secs: 3600,
+                circuit_breaker_enabled: false,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+
+                sandbox: None,
+            },
+        );
+
+        let started_engine = Arc::new(Engine::new(config));
+        started_engine.start().await.expect("engine start");
+        engine = Some(Arc::clone(&started_engine));
+
+        let tool_name = started_engine
+            .tool_router()
+            .list_tools()
+            .iter()
+            .find(|tool| tool.name.ends_with("__echo"))
+            .expect("upstream tool routed")
+            .name
+            .to_string();
+
+        // Startup runs on the real clock — dialing the upstream involves real
+        // loopback I/O, and a paused clock would jump to the first pending
+        // deadline the moment the runtime went idle waiting for a byte. Only the
+        // refresh cadence needs to be virtualized, so pause after the engine is
+        // up and every connect-path timer has already fired.
+        tokio::time::pause();
+
+        // Keeps the OAuth wall clock in step with Tokio's virtual clock, so a
+        // token minted at virtual T comes due at virtual T + its refresh window
+        // exactly as it would in real time.
+        let clock = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                oauth::advance_test_clock(1);
+            }
+        });
+
+        let mut call_failures: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4 * 3600);
+        loop {
+            let outcome = started_engine
+                .tool_router()
+                .call_tool(&tool_name, None)
+                .await;
+            if let Err(error) = outcome {
+                call_failures.push(error.to_string());
+            }
+            let grants = provider.shared.lock().await.refresh_grants;
+            if grants >= 2 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        clock.abort();
+
+        let shared = provider.shared.lock().await;
+        assert!(
+            shared.refresh_grants >= 2,
+            "expected at least two background refresh cycles, saw {}",
+            shared.refresh_grants
+        );
+        assert!(
+            shared.tool_calls > 0,
+            "the load loop must have reached the upstream at least once"
+        );
+        assert_eq!(
+            shared.unauthorized_calls, 0,
+            "no call may be rejected as unauthorized while refreshes run"
+        );
+        assert!(
+            call_failures.is_empty(),
+            "tool calls must not fail across refresh cycles: {call_failures:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
+
+    if let Some(engine) = engine {
+        tokio::time::timeout(Duration::from_secs(60), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+    }
+    store.clear().await.expect("clear OAuth store after test");
+    provider.handle.abort();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
