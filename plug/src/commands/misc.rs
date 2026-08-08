@@ -252,6 +252,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         servers,
         clients,
         uptime_secs,
+        ..
     }) = status_response
     {
         let mut healthy = 0usize;

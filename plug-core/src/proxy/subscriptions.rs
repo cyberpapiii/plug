@@ -189,7 +189,7 @@ pub(super) trait UpstreamResourceOps: Send + Sync {
 
 impl UpstreamResourceOps for crate::server::UpstreamServer {
     fn connection_generation(&self) -> u64 {
-        self.generation
+        self.generation()
     }
 
     fn subscribe_resource<'a>(

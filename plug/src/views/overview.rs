@@ -110,6 +110,7 @@ fn status_json(
     runtime_available: bool,
     status_source: &str,
     daemon_running: bool,
+    resource_subscriptions: usize,
 ) -> serde_json::Value {
     serde_json::json!({
         "uptime": uptime_secs,
@@ -125,7 +126,8 @@ fn status_json(
         "live_client_scope": inventory.scope,
         "inventory_partial": inventory.availability.partial,
         "inventory_unavailable_sources": inventory.availability.unavailable_sources,
-        "http_sessions_included": inventory.http_sessions_included
+        "http_sessions_included": inventory.http_sessions_included,
+        "resource_subscriptions": resource_subscriptions
     })
 }
 
@@ -402,13 +404,14 @@ pub(crate) async fn cmd_status(
                 servers,
                 clients,
                 uptime_secs,
-            } => Some((servers, clients, uptime_secs)),
+                resource_subscriptions,
+            } => Some((servers, clients, uptime_secs, resource_subscriptions)),
             _ => None,
         },
     )
     .await;
 
-    if let Some((servers, clients, uptime_secs)) = live_status {
+    if let Some((servers, clients, uptime_secs, resource_subscriptions)) = live_status {
         let (live_sessions, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live_sessions, live_inventory_scope);
@@ -447,6 +450,14 @@ pub(crate) async fn cmd_status(
                     print_label_value("Daemon Proxy Clients", style(clients.to_string()).bold());
                 }
             }
+            // Resource subscriptions are held by the runtime on behalf of
+            // downstream clients and are otherwise invisible from the CLI, so
+            // there is no way to tell a client that subscribed and went quiet
+            // from one that never subscribed at all.
+            print_label_value(
+                "Resource Subscriptions",
+                style(resource_subscriptions.to_string()).bold(),
+            );
             if !linked_clients.is_empty() {
                 print_label_value("Linked Clients", style(linked_clients.len()).bold());
                 print_label_value(
@@ -577,6 +588,7 @@ pub(crate) async fn cmd_status(
                 true,
                 "live_daemon",
                 daemon_running,
+                resource_subscriptions,
             );
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
@@ -779,9 +791,11 @@ mod tests {
             true,
             "live_daemon",
             true,
+            4,
         );
 
         assert_eq!(json["clients"], 3);
+        assert_eq!(json["resource_subscriptions"], 4);
         assert_eq!(json["daemon_proxy_client_count"], 3);
         assert_eq!(json["live_session_count"], 1);
         assert_eq!(json["live_session_transports"]["http"], 1);
@@ -837,6 +851,7 @@ mod tests {
             true,
             "live_daemon",
             true,
+            0,
         );
 
         let m = &json["servers"][0]["metrics"];
