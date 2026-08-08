@@ -21,6 +21,17 @@ current state by any future reader.
 **Scope note**: this document is read-only research output. No code changed to produce it —
 `git status` at the end of this branch's work shows only this new file.
 
+**Correction 2026-08-08 (`ping`, §1 and §4)**: this document repeatedly calls the IPC `ping`
+gap something "an MCP client that sends JSON-RPC `ping` over the IPC proxy" hits today. That
+overstates the reach. A downstream client's `ping` is answered locally by RMCP's default
+handler inside `plug connect` and never travels to the daemon, so the dispatch-table hole was
+reachable only through the `plug/legacy/` escape hatch or a process speaking raw IPC to the
+socket. The hole was real and is now closed — `plug/src/daemon/mcp_dispatch.rs` has a `ping`
+arm, pinned by `parity_ping_matches_across_transports` — but the severity framing below
+("the behavior itself is wrong on one transport today", "worse than the others") should be
+read as applying to the raw-IPC surface, not to any shipping client. Tracked in
+`todos/071-*`.
+
 ---
 
 ## §0. What's already shared vs. what's duplicated (grounding correction)

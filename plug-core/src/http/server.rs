@@ -900,7 +900,10 @@ async fn post_mcp(
     // 2. Parse JSON-RPC message
     let mut raw_message: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
-        HttpError::BadRequest("invalid JSON-RPC message".into())
+        HttpError::MalformedJsonRpc {
+            code: -32700,
+            message: "Parse error",
+        }
     })?;
     let header_version = headers
         .get(PROTOCOL_VERSION_HEADER)
@@ -937,7 +940,10 @@ async fn post_mcp(
     }
     let message: ClientJsonRpcMessage = serde_json::from_value(raw_message).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
-        HttpError::BadRequest("invalid JSON-RPC message".into())
+        HttpError::MalformedJsonRpc {
+            code: -32600,
+            message: "Invalid Request",
+        }
     })?;
 
     validate_protocol_version_for_post(&headers, &message, era)?;
@@ -1881,8 +1887,13 @@ async fn handle_request(
 
     match req.request {
         ClientRequest::DiscoverRequest(_) if modern => {
+            // Reaching this arm means the modern gate is already open (the
+            // fail-closed check above rejects `2026-07-28` otherwise), so the
+            // list is the full dual-era set — the same one stdio and IPC return
+            // from `supported_protocol_versions`. Legacy belongs in it: the same
+            // port still serves `2025-11-25` via `initialize`.
             let mut result = DiscoverResult::new(
-                vec![ProtocolVersion::V_2026_07_28],
+                crate::protocol::supported_downstream_protocol_versions(true),
                 projected_modern_capabilities(state.router.as_ref(), &policy_context),
             );
             result.set_server_info(crate::branding::plug_implementation(env!(
@@ -3083,7 +3094,13 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["result"]["resultType"], "complete");
-        assert_eq!(value["result"]["supportedVersions"][0], "2026-07-28");
+        // Both revisions, matching what stdio and IPC advertise: the same port
+        // still serves `2025-11-25` through `initialize`, so omitting it would
+        // tell a modern client that legacy support had been dropped.
+        assert_eq!(
+            value["result"]["supportedVersions"],
+            json!([PROTOCOL_VERSION, "2026-07-28"])
+        );
         assert!(value["result"]["capabilities"]["extensions"].is_null());
         assert!(value["result"]["capabilities"]["experimental"].is_null());
         assert!(value["result"]["capabilities"]["logging"].is_null());
@@ -4289,6 +4306,46 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    /// A body that was meant to be JSON-RPC gets a JSON-RPC error back, not the
+    /// plain-text 400 this path used to return. `-32700` for malformed JSON,
+    /// `-32600` for well-formed JSON of the wrong shape, `id: null` for both
+    /// (there is no id to echo). Other 400s — session, header, metadata
+    /// rejections — deliberately keep their plain-text bodies.
+    #[tokio::test]
+    async fn malformed_body_returns_jsonrpc_error_envelope() {
+        for (raw, expected_code) in [
+            (r#"{"jsonrpc": "2.0", "#, -32700),
+            (r#"{"not": "json-rpc at all"}"#, -32600),
+        ] {
+            let app = build_router(test_state());
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(raw))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "input: {raw}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json"),
+                "input: {raw}"
+            );
+
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("body was not JSON for input {raw}: {e}"));
+            assert_eq!(json["jsonrpc"], "2.0", "input: {raw}");
+            assert_eq!(json["error"]["code"], expected_code, "input: {raw}");
+            assert!(json["id"].is_null(), "input: {raw}");
+        }
     }
 
     #[tokio::test]

@@ -419,6 +419,21 @@ pub fn supported_protocol_version() -> ProtocolVersion {
     .expect("Plug's supported protocol version must parse")
 }
 
+/// Every downstream protocol revision Plug will speak, oldest first.
+///
+/// All three downstream transports answer version queries from this one list:
+/// stdio and IPC through `ServerHandler::supported_protocol_versions`, HTTP
+/// through the `server/discover` result. They diverged once — HTTP advertised
+/// only `2026-07-28` — which told a modern client that Plug had dropped the
+/// legacy revision it still serves on the very same port.
+pub fn supported_downstream_protocol_versions(modern_enabled: bool) -> Vec<ProtocolVersion> {
+    let mut versions = vec![supported_protocol_version()];
+    if modern_enabled {
+        versions.push(ProtocolVersion::V_2026_07_28);
+    }
+    versions
+}
+
 pub const LEGACY_TASKS_CAPABILITY_KEY: &str = "plug.dev/legacy-tasks";
 pub const LEGACY_TASK_REQUEST_KEY: &str = "plug.dev/legacy-task";
 
@@ -556,40 +571,11 @@ pub fn rewrite_legacy_result(value: &mut serde_json::Value, task_response: bool)
     }
 }
 
-/// Reject MCP `2026-07-28` on the legacy admission path. RMCP 3.1 can name
-/// that revision, but Plug only accepts it through the gated modern
-/// downstream path. Older and unknown versions retain RMCP negotiation.
-pub fn ensure_supported_downstream_protocol(requested: &ProtocolVersion) -> Result<(), McpError> {
-    if requested.as_str() == ANNOUNCED_FUTURE_PROTOCOL_VERSION {
-        return Err(McpError::invalid_params(
-            format!(
-                "MCP protocol version {ANNOUNCED_FUTURE_PROTOCOL_VERSION} is not supported; latest supported version is {SUPPORTED_PROTOCOL_VERSION}"
-            ),
-            None,
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::PrincipalId;
     use uuid::Uuid;
-
-    #[test]
-    fn rejects_announced_revision_before_rmcp_can_echo_it() {
-        let error = ensure_supported_downstream_protocol(&ProtocolVersion::V_2026_07_28)
-            .expect_err("future protocol must be rejected");
-        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains(SUPPORTED_PROTOCOL_VERSION));
-    }
-
-    #[test]
-    fn accepts_current_stable_revision() {
-        ensure_supported_downstream_protocol(&ProtocolVersion::V_2025_11_25)
-            .expect("current stable protocol must be accepted");
-    }
 
     #[test]
     fn parsed_supported_version_matches_policy_literal() {

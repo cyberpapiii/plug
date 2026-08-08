@@ -41,6 +41,15 @@ pub enum HttpError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// A request body that is not parseable as JSON-RPC. Distinct from
+    /// [`HttpError::BadRequest`] because it answers with a JSON-RPC error
+    /// envelope rather than a plain-text body: the client sent something that
+    /// was *meant* to be JSON-RPC, so it can parse a JSON-RPC reply. Carries the
+    /// standard code — `-32700` for malformed JSON, `-32600` for well-formed
+    /// JSON of the wrong shape.
+    #[error("malformed JSON-RPC request")]
+    MalformedJsonRpc { code: i32, message: &'static str },
+
     #[error("too many sessions")]
     TooManySessions,
 
@@ -135,6 +144,14 @@ impl IntoResponse for HttpError {
                     format!("unsupported MCP-Protocol-Version: {version}"),
                 )
                     .into_response();
+            }
+            HttpError::MalformedJsonRpc { code, message } => {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": code, "message": message },
+                    "id": null
+                });
+                return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
             }
             HttpError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
             HttpError::TooManySessions => (StatusCode::TOO_MANY_REQUESTS, "too many sessions"),

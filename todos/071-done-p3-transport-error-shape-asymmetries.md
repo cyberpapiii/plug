@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 priority: p3
 issue_id: "071"
 tags: [http, ipc, stdio, protocol, error-handling, parity]
@@ -126,11 +126,11 @@ comment `ensure_supported_downstream_protocol`.
 
 ## Acceptance Criteria
 
-- [ ] HTTP malformed-body response shape is pinned by a test, whichever option is chosen
-- [ ] IPC dispatch handles `ping`, with a parity test alongside the existing `tools/call` ones
-- [ ] Modern-era `initialize` handling and advertised-version lists are either converged or
+- [x] HTTP malformed-body response shape is pinned by a test, whichever option is chosen
+- [x] IPC dispatch handles `ping`, with a parity test alongside the existing `tools/call` ones
+- [x] Modern-era `initialize` handling and advertised-version lists are either converged or
       documented as intentional
-- [ ] `plans/README-claude-fable.md:51` and the dispatch-unification design doc are corrected
+- [x] `plans/README-claude-fable.md:51` and the dispatch-unification design doc are corrected
       to say the IPC `ping` gap is not client-reachable
 
 ## Resources
@@ -148,3 +148,48 @@ comment `ensure_supported_downstream_protocol`.
 Re-verified two improve-program residuals and gave them a tracked home; added finding 3
 from the protocol-era verification pass. No code change made — finding 1 needs an operator
 decision on whether to change an externally visible response shape.
+
+### 2026-08-08 - Resolved
+
+**By:** Claude Fable 5
+
+All three findings closed on `main`.
+
+**Finding 1 — Option A.** Added `HttpError::MalformedJsonRpc { code, message }` to
+`plug-core/src/http/error.rs`, which renders a JSON-RPC error envelope with `id: null`
+instead of a plain-text body. Both parse sites in `plug-core/src/http/server.rs` now use
+it: `-32700 Parse error` for malformed JSON, `-32600 Invalid Request` for well-formed JSON
+of the wrong shape. `HttpError::BadRequest` is untouched, so every other 400 keeps its
+existing plain-text body. Pinned by `malformed_body_returns_jsonrpc_error_envelope`.
+
+This is an externally visible contract change for remote HTTP clients and wants a release
+note: a body that used to come back as `text/plain` now comes back as
+`application/json`. The status code is unchanged at 400.
+
+**Finding 2.** Added a `ping` arm to `plug/src/daemon/mcp_dispatch.rs` returning an empty
+result in the legacy era and `UNSUPPORTED_METHOD` in the modern era, matching both the HTTP
+adapter and the MCP 2026-07-28 removal of the method. Added a `ping` arm to the stdio
+parity driver (it had none and panicked) and the parity test
+`parity_ping_matches_across_transports`. No client-visible behavior changed, since the arm
+was only reachable through `plug/legacy/` or a raw IPC speaker.
+
+**Finding 3.** The advertised-version lists are now converged: all three transports derive
+theirs from the new `plug_core::protocol::supported_downstream_protocol_versions`, so
+HTTP's `server/discover` reports `["2025-11-25", "2026-07-28"]` like stdio and IPC. Legacy
+belongs in that list — the same port still serves it through `initialize`, and omitting it
+told a modern client that support had been dropped.
+
+The modern-`initialize` difference is documented as intentional rather than converged, with
+comments at both stdio and IPC `initialize` sites. HTTP classifies an era from the
+`MCP-Protocol-Version` header and can honestly answer `method_not_found` for a method the
+modern revision deleted. Stdio and IPC have no era to classify — RMCP's stdio service only
+knows the initialize lifecycle — so rejecting a `2026-07-28` initialize there would leave a
+modern-aware local client with no way to connect at all.
+
+`ensure_supported_downstream_protocol` and its two tests were deleted from
+`plug-core/src/protocol.rs`, and the now-redundant `else` nesting was flattened at both
+call sites.
+
+The overstated `ping` claims in `plans/README-claude-fable.md` and
+`docs/plans/2026-07-dispatch-unification-design-claude-fable.md` were corrected in place
+with dated notes rather than rewritten, since both are historical records.

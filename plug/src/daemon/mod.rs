@@ -3692,6 +3692,24 @@ mod tests {
             "resources/unsubscribe" => {
                 outcome_unit!(client.unsubscribe(serde_json::from_value(params).unwrap()))
             }
+            // `ping` has no typed helper on the rmcp client, so drive the raw
+            // request and normalize the EmptyResult to the canonical empty-ok
+            // ({}) that HTTP and IPC also produce.
+            "ping" => match client
+                .send_request(rmcp::model::ClientRequest::PingRequest(
+                    rmcp::model::PingRequest::default(),
+                ))
+                .await
+            {
+                Ok(rmcp::model::ServerResult::EmptyResult(_)) => {
+                    MethodOutcome::Result(serde_json::json!({}))
+                }
+                Ok(other) => panic!("unexpected stdio ping result: {other:?}"),
+                Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
+                    code: m.code.0 as i64,
+                },
+                Err(other) => panic!("unexpected stdio service error: {other:?}"),
+            },
             other => panic!("unsupported parity method for stdio: {other}"),
         };
 
@@ -3888,6 +3906,25 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// `ping` returns an empty result on every downstream transport. IPC used to
+    /// be the odd one out: its MCP dispatch table had no `ping` arm, so the
+    /// method fell through to UNSUPPORTED_METHOD. That was only reachable via the
+    /// `plug/legacy/` escape hatch or a raw IPC speaker — a downstream client's
+    /// ping is answered by RMCP's default handler inside `plug connect` and never
+    /// reaches the daemon — but the hole is closed and pinned here.
+    #[tokio::test]
+    async fn parity_ping_matches_across_transports() {
+        match assert_parity("ping", serde_json::json!({})).await {
+            MethodOutcome::Result(json) => {
+                assert!(
+                    json.as_object().is_some_and(|obj| obj.is_empty()),
+                    "ping must return an empty result, got {json}"
+                );
+            }
+            other => panic!("expected empty ping result, got {other:?}"),
+        }
     }
 
     #[tokio::test]

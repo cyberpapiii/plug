@@ -846,15 +846,11 @@ impl Drop for IpcProxyHandler {
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for IpcProxyHandler {
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        let mut versions = vec![plug_core::protocol::supported_protocol_version()];
-        if self
-            .shared
-            .modern_downstream_enabled
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            versions.push(ProtocolVersion::V_2026_07_28);
-        }
-        std::borrow::Cow::Owned(versions)
+        std::borrow::Cow::Owned(plug_core::protocol::supported_downstream_protocol_versions(
+            self.shared
+                .modern_downstream_enabled
+                .load(std::sync::atomic::Ordering::Acquire),
+        ))
     }
     fn get_info(&self) -> ServerInfo {
         let capabilities = self
@@ -876,17 +872,19 @@ impl ServerHandler for IpcProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
-            if request.protocol_version == ProtocolVersion::V_2026_07_28 {
-                if !self.refresh_modern_gate().await? {
-                    return Err(McpError::unsupported_protocol_version(
-                        ProtocolVersion::V_2026_07_28,
-                        &self.supported_protocol_versions(),
-                    ));
-                }
-            } else {
-                plug_core::protocol::ensure_supported_downstream_protocol(
-                    &request.protocol_version,
-                )?;
+            // Same deliberate leniency as the stdio handler: `plug connect`
+            // speaks RMCP's initialize lifecycle and has no era header to
+            // classify, so a `2026-07-28` initialize is the only way a
+            // modern-aware local client can connect. The HTTP adapter, which
+            // does classify eras, still answers `initialize` with
+            // METHOD_NOT_FOUND in the modern era.
+            if request.protocol_version == ProtocolVersion::V_2026_07_28
+                && !self.refresh_modern_gate().await?
+            {
+                return Err(McpError::unsupported_protocol_version(
+                    ProtocolVersion::V_2026_07_28,
+                    &self.supported_protocol_versions(),
+                ));
             }
 
             let client_name = request.client_info.name.to_string();
