@@ -83,23 +83,84 @@ happens, do **Option 1** for the GitHub-release and Homebrew channels, and keep
 `plug codesign-setup` + the doctor nudge as the answer for source (`cargo install`)
 installs.
 
-## Triage 2026-08-08
+## Triage 2026-08-08 — superseded, see Retriage below
 
 **By:** Claude Fable 5
 
-Confirmed blocked, and the todo's own recommendation (defer) still holds. Nothing was
-implemented.
+Originally concluded the work was blocked on a paid Apple Developer account. That framing
+was too narrow and is corrected in the next section. The two verified facts from it stand:
 
-- Option 1 requires a **paid Apple Developer account** and a Developer ID Application
-  certificate in CI secrets. That is a purchase and an account action only Rob can take;
-  no amount of code work substitutes for it.
-- `.github/workflows/release.yml` exists but has no signing step, and a grep across
-  `.github/` and `scripts/` for `notarytool`, `APPLE_ID`, or `DEVELOPER_ID` returns
-  nothing — so there is no half-finished pipeline to complete.
+- `.github/workflows/release.yml` has no signing step, and a grep across `.github/` and
+  `scripts/` for `notarytool`, `APPLE_ID`, or `DEVELOPER_ID` returns nothing, so there is
+  no half-finished pipeline to complete.
 - The local fallback is verified working on this machine: `plug doctor` reports
   `● codesign_identity  plug has a stable code-signing identity; Keychain approvals
   persist`.
 
-**Unblock condition:** Rob buys/assigns an Apple Developer account and adds the
-Developer ID cert plus notarization credentials as CI secrets. Until then this stays
-`pending` by choice, not by neglect.
+## Retriage 2026-08-08 — an Apple Developer account is not required
+
+**By:** Claude Fable 5
+
+The original problem statement conflated two separate macOS mechanisms and let the harder
+one set the bar for both.
+
+**Keychain ACL persistence.** The "Always Allow" grant binds to the binary's designated
+requirement, which for a signed binary is essentially "this identifier, signed by this leaf
+certificate." Any *stable* certificate satisfies that. Nothing in the mechanism asks whether
+the certificate chains to Apple. A self-signed identity fixes the recurring prompts exactly
+as well as a Developer ID would — this is not a degraded workaround, it is a complete fix
+for this problem. `plug codesign-setup` already implements it end to end: it creates the
+identity on first run and signs whatever `plug` binary is executing, so it works the same
+for `cargo install`, Homebrew, and release downloads.
+
+**Gatekeeper.** Notarization is what a Developer ID buys, and it only matters for artifacts
+carrying the `com.apple.quarantine` attribute. None of plug's current channels set it:
+`curl` does not apply quarantine, Homebrew formula bottles are fetched the same way, and
+`cargo install` compiles locally. (On Apple Silicon every binary must carry at least an
+ad-hoc signature to execute at all, which the toolchain already produces, so nothing is
+blocked from running.) The one channel where quarantine is plausible is the `.mcpb` bundle
+from `scripts/build-mcpb.sh`, since a browser download would quarantine it and Claude
+Desktop then launches the embedded binary.
+
+So the correct split is: self-signing solves the problem this todo was actually opened for,
+and Developer ID is a separate, smaller question scoped to browser-downloaded bundles.
+
+### Option D (recommended): per-machine self-signed identity, surfaced at install time
+
+Keep `plug codesign-setup` as the mechanism and fix the discovery gap, which was the real
+complaint in the problem statement — not the absence of an Apple account. `install.sh` now
+prints a macOS-specific line pointing at the command, alongside the existing `plug doctor`
+`codesign_identity` nudge.
+
+The installer only *suggests* the command rather than running it. `plug codesign-setup`
+adds a code-signing trust root to the user's login keychain and pops a password dialog;
+a piped `curl | sh` installer must not do either silently, and a password dialog the user
+cannot attribute to anything is exactly the shape of a phishing prompt.
+
+Cost: nothing. No account, no CI secret, no key to leak or rotate.
+
+### Option E (rejected): sign in CI with a shared self-signed certificate
+
+Technically this would work — a self-signed leaf produces a stable designated requirement
+for every user without anyone running a setup step. It should still not be done.
+
+The private key would have to live in repository secrets, where it is extractable by anyone
+who can run a workflow or read the secret. A stolen key is worse here than in the usual
+supply-chain case: an attacker could sign a malicious binary with the same identity, match
+the designated requirement, and inherit every user's existing "Always Allow" grant for
+plug's Keychain items — reading upstream OAuth credentials with no prompt at all. Unlike a
+Developer ID certificate, a self-signed one has no revocation path that user machines
+would honor, so there would be no way to invalidate it after the fact.
+
+The per-machine identity in Option D has no such exposure: each key never leaves the
+machine that generated it.
+
+### Developer ID: still open, but rescoped
+
+Option 1 above remains the answer *only* for quarantined artifacts, which today means the
+`.mcpb` bundle if it is ever distributed as a browser download. It is no longer a
+prerequisite for anything in this todo's problem statement. Revisit if a `.mcpb`, `.pkg`,
+or GUI surface starts shipping.
+
+**Status:** the discovery fix is implemented; the todo stays open only to track the
+rescoped Developer ID question, which is deferred by choice.

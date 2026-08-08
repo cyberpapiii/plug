@@ -295,6 +295,20 @@ main() {
     # Check PATH
     check_path "$INSTALL_DIR"
 
+    # Released binaries are ad-hoc signed, and an ad-hoc signature changes with
+    # every build. The macOS Keychain "Always Allow" ACL binds to the signature,
+    # so without a stable identity every update re-prompts for each OAuth
+    # upstream. `plug codesign-setup` fixes that with a per-machine self-signed
+    # identity. Only suggest it — the command adds a code-signing trust root to
+    # the login keychain and pops a password dialog, which must be a deliberate,
+    # informed choice rather than something a piped installer does silently.
+    if [ "$OS" = "macos" ]; then
+        printf "\n"
+        printf "macOS: if you use OAuth upstreams, run this once so Keychain\n"
+        printf "approvals persist across updates instead of re-prompting:\n"
+        printf "  plug codesign-setup\n"
+    fi
+
     # Show next steps
     printf "\n"
     printf "Get started:\n"
