@@ -417,42 +417,101 @@ async fn check_tool_collisions(config: &Config) -> CheckResult {
     }
 }
 
+/// A published ceiling on how many MCP tools one client will accept at once.
+struct ClientToolLimit {
+    client: &'static str,
+    limit: usize,
+    /// Date this entry was last checked against `source`, `YYYY-MM-DD`.
+    verified: &'static str,
+    /// The page that was read. Primary vendor documentation where one exists.
+    source: &'static str,
+}
+
+/// Known per-client tool ceilings.
+///
+/// These are other products' limits, not plug's. They move when those products
+/// move, and a number compiled in here goes stale silently — nothing fails, the
+/// check just starts asserting something untrue. That already happened once:
+/// the table shipped on 2026-03-04 with `("Cursor", 40)` and was still claiming
+/// it five months later, long after Cursor had dropped the cap.
+///
+/// So every entry carries the date it was last checked and the page that was
+/// read. Re-verify before trusting one, and move `verified` when you do. A
+/// client that publishes no fixed ceiling does not belong in this table —
+/// omitting it is the accurate answer, and inventing a number to fill the row
+/// is how the Cursor entry got there.
+///
+/// Deliberately absent, each confirmed 2026-08-08:
+/// - **Cursor.** Older versions warned above roughly 40-50 tools. Current
+///   versions use Dynamic Context Discovery and publish no ceiling;
+///   <https://cursor.com/docs/context/mcp> states no limit.
+/// - **Claude Code, Codex CLI.** No published ceiling.
+const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[
+    ClientToolLimit {
+        client: "Windsurf",
+        limit: 100,
+        verified: "2026-08-08",
+        // "Cascade has a limit of 100 total tools that it has access to at any
+        // given time." (docs.windsurf.com now redirects here.)
+        source: "https://docs.devin.ai/desktop/cascade/mcp",
+    },
+    ClientToolLimit {
+        client: "VS Code Copilot",
+        limit: 128,
+        verified: "2026-08-08",
+        // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
+        // itself caps at 128, and extra tools are deferred behind `activate_*` stubs.
+        source: "https://github.com/microsoft/vscode/issues/290356",
+    },
+];
+
+/// Tools per server assumed when estimating a total from config alone.
+///
+/// A blunt guess, and often a large undercount — this check runs against config
+/// without connecting to anything, so it cannot see that one stdio server might
+/// expose 118 tools by itself. Treat a pass as "no obvious problem", never as
+/// "measured and fine"; `plug status` reports the real total.
+const ASSUMED_TOOLS_PER_SERVER: usize = 10;
+
 /// Check 7: warn if total tool count might exceed known client limits.
 async fn check_client_limits(config: &Config) -> CheckResult {
     let name = "client_limits".to_string();
     let server_count = config.servers.values().filter(|s| s.enabled).count();
 
-    // We can't know exact tool counts without starting servers, but we can
-    // warn about the number of servers vs known limits.
-    let known_limits: &[(&str, usize)] =
-        &[("Cursor", 40), ("Windsurf", 100), ("VS Code Copilot", 128)];
-
-    // Rough heuristic: assume ~10 tools per server
-    let estimated_tools = server_count * 10;
-    let mut warnings: Vec<String> = Vec::new();
-
-    for (client, limit) in known_limits {
-        if estimated_tools > *limit {
-            warnings.push(format!(
-                "{client} limit is {limit} tools (estimated ~{estimated_tools} from {server_count} servers)"
-            ));
-        }
-    }
+    let estimated_tools = server_count * ASSUMED_TOOLS_PER_SERVER;
+    let warnings: Vec<String> = KNOWN_CLIENT_TOOL_LIMITS
+        .iter()
+        .filter(|entry| estimated_tools > entry.limit)
+        .map(|entry| {
+            // Printing the source alongside the number is the whole
+            // anti-rot mechanism: a reader who doubts the figure can check it
+            // without going and finding this table first.
+            format!(
+                "{} limit is {} tools (verified {}, {})",
+                entry.client, entry.limit, entry.verified, entry.source
+            )
+        })
+        .collect();
 
     if warnings.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: format!("{server_count} servers configured — within known client limits",),
+            message: format!(
+                "{server_count} servers configured — no known client limit exceeded by the ~{estimated_tools}-tool estimate"
+            ),
             fix_suggestion: None,
         }
     } else {
         CheckResult {
             name,
             status: CheckStatus::Warn,
-            message: format!("May exceed client tool limits: {}", warnings.join("; ")),
+            message: format!(
+                "Estimated ~{estimated_tools} tools from {server_count} servers may exceed: {}",
+                warnings.join("; ")
+            ),
             fix_suggestion: Some(
-                "Use tool_filter_enabled and priority_tools to stay within limits".to_string(),
+                "Only affects clients with a published ceiling; run `plug status` for the real tool count, and use tool_filter_enabled and priority_tools if a linked client needs fewer".to_string(),
             ),
         }
     }
@@ -1508,17 +1567,56 @@ command = "example-server"
     }
 
     #[tokio::test]
-    async fn client_limits_warns_with_many_servers() {
+    async fn client_limits_warns_only_past_the_lowest_published_ceiling() {
+        let lowest = KNOWN_CLIENT_TOOL_LIMITS
+            .iter()
+            .map(|entry| entry.limit)
+            .min()
+            .expect("at least one known client limit");
+
+        // Exactly at the lowest ceiling is still fine — the check warns on
+        // strictly exceeding it, not on reaching it.
         let mut config = test_config();
-        // 5 servers * 10 estimated tools = 50, exceeds Cursor's 40
-        for i in 0..5 {
+        for i in 0..(lowest / ASSUMED_TOOLS_PER_SERVER) {
             config
                 .servers
                 .insert(format!("server_{i}"), stdio_server("echo"));
         }
+        assert_eq!(check_client_limits(&config).await.status, CheckStatus::Pass);
+
+        config
+            .servers
+            .insert("one_more".to_string(), stdio_server("echo"));
         let result = check_client_limits(&config).await;
         assert_eq!(result.status, CheckStatus::Warn);
-        assert!(result.message.contains("Cursor"));
+        assert!(
+            KNOWN_CLIENT_TOOL_LIMITS
+                .iter()
+                .any(|entry| result.message.contains(entry.client)),
+            "warning should name the client it applies to: {}",
+            result.message
+        );
+    }
+
+    /// Guards the rule the Cursor entry broke: a client with no published
+    /// ceiling must not be given an invented one.
+    #[tokio::test]
+    async fn no_client_limit_is_asserted_without_a_dated_source() {
+        for entry in KNOWN_CLIENT_TOOL_LIMITS {
+            assert!(
+                entry.source.starts_with("https://"),
+                "{} needs a source URL that can be re-checked",
+                entry.client
+            );
+            let parts: Vec<&str> = entry.verified.split('-').collect();
+            assert!(
+                parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+                "{} needs a YYYY-MM-DD verified date, got {:?}",
+                entry.client,
+                entry.verified
+            );
+            assert!(entry.limit > 0, "{} has a meaningless limit", entry.client);
+        }
     }
 
     // -- check_pid_staleness --
