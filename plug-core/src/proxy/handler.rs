@@ -308,11 +308,9 @@ impl ProxyHandler {
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for ProxyHandler {
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        let mut versions = vec![crate::protocol::supported_protocol_version()];
-        if self.modern_downstream_enabled() {
-            versions.push(ProtocolVersion::V_2026_07_28);
-        }
-        std::borrow::Cow::Owned(versions)
+        std::borrow::Cow::Owned(crate::protocol::supported_downstream_protocol_versions(
+            self.modern_downstream_enabled(),
+        ))
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -386,15 +384,20 @@ impl ServerHandler for ProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
-            if request.protocol_version == ProtocolVersion::V_2026_07_28 {
-                if !self.modern_downstream_enabled() {
-                    return Err(McpError::unsupported_protocol_version(
-                        request.protocol_version,
-                        &self.supported_protocol_versions(),
-                    ));
-                }
-            } else {
-                crate::protocol::ensure_supported_downstream_protocol(&request.protocol_version)?;
+            // Deliberately more lenient than the HTTP adapter, which answers
+            // `initialize` in the modern era with METHOD_NOT_FOUND because
+            // `2026-07-28` deleted the method. Stdio has no era to classify:
+            // RMCP's stdio service only knows the initialize lifecycle, so
+            // rejecting a `2026-07-28` initialize here would leave a
+            // modern-aware stdio client with no way to connect at all. Accept
+            // it when the gate is open and reject it when the gate is shut.
+            if request.protocol_version == ProtocolVersion::V_2026_07_28
+                && !self.modern_downstream_enabled()
+            {
+                return Err(McpError::unsupported_protocol_version(
+                    request.protocol_version,
+                    &self.supported_protocol_versions(),
+                ));
             }
 
             let selected_protocol = request.protocol_version.clone();

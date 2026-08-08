@@ -299,6 +299,26 @@ pub(super) async fn dispatch_mcp_request(
             ipc_ok!(serde_json::json!({}))
         }
 
+        // A downstream client's `ping` is normally answered locally by RMCP's
+        // default handler in `plug connect` and never reaches this dispatcher.
+        // It arrives here only via the `plug/legacy/` escape hatch or a process
+        // speaking raw IPC to the socket, both of which used to get
+        // UNSUPPORTED_METHOD while stdio and HTTP answered successfully.
+        // MCP 2026-07-28 removes `ping`, so the modern era still declines it —
+        // matching the downstream HTTP adapter.
+        "ping" => {
+            if request_context.is_some_and(|context| {
+                context.protocol_version == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+            }) {
+                return IpcResponse::Error {
+                    code: "UNSUPPORTED_METHOD".to_string(),
+                    message: "MCP method 'ping' was removed in protocol revision 2026-07-28"
+                        .to_string(),
+                };
+            }
+            ipc_ok!(serde_json::json!({}))
+        }
+
         "tools/call" => {
             let call_params = match params.map(|params| {
                 let mut params = params.clone();
