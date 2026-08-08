@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 priority: p3
 issue_id: "055"
 tags: [code-review, http, protocol, simplicity, testing]
@@ -57,9 +57,9 @@ ad hoc JSON-value responses go through one shared implementation.
 
 ## Acceptance Criteria
 
-- [ ] The initialize response override no longer requires parallel helper
+- [x] The initialize response override no longer requires parallel helper
       functions with duplicated header/body setup
-- [ ] One regression test asserts both:
+- [x] One regression test asserts both:
       - `MCP-Protocol-Version` header
       - `result.protocolVersion` body field
       on the same initialize response
@@ -68,6 +68,30 @@ ad hoc JSON-value responses go through one shared implementation.
 
 - 2026-03-10: Added from CE review of the downstream HTTP connector
   compatibility fix. No functional blocker; follow-up only.
+
+### 2026-08-08 - Closed
+
+**By:** Claude Fable 5
+
+**Criterion 1 was already satisfied before this pass** — resolved incidentally by
+the dual-era protocol work rather than by a dedicated refactor. `json_value_response`
+and `json_value_response_with_session` no longer exist; `plug-core/src/http/server.rs`
+now has a single response path, `json_response_for_era`, where the legacy body
+override happens inline via `crate::protocol::rewrite_legacy_response(&mut value, false)`.
+`json_response` and `json_response_with_session` are thin wrappers over it, not a
+parallel helper stack. This is effectively Option B, reached through the era work.
+
+**Criterion 2 was still unmet** — the header and body assertions were split across
+`post_initialize_returns_session_id` (header only) and
+`initialize_response_contains_server_info` (body only), so nothing pinned the two
+to the *same* response. That pairing is the actual regression from the original bug
+report: the remote Claude connector showed no tools when the header and body
+advertised different versions. Added the header assertion to
+`initialize_response_contains_server_info` and replaced the hardcoded `"2025-11-25"`
+body literal with the `PROTOCOL_VERSION` constant so the two can no longer drift apart
+in the test itself.
+
+**Verification:** `cargo test -p plug-core initialize` (3 passed).
 
 ## Resources
 

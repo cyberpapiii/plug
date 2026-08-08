@@ -4315,11 +4315,21 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // Header and body must advertise the same version on one response. A
+        // remote Claude connector saw no tools when they disagreed, so pin the
+        // pair together rather than in two separate tests.
+        assert_eq!(
+            resp.headers()
+                .get(PROTOCOL_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROTOCOL_VERSION)
+        );
+
         let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-        assert_eq!(json["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(json["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(json["result"]["serverInfo"]["name"], "plug");
         assert_initialize_icons_sequence(&json["result"]["serverInfo"]["icons"]);
         assert!(json["result"]["capabilities"]["tools"].is_null());

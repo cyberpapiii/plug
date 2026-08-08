@@ -31,10 +31,12 @@ Use this tracker for issues like:
 
 ## Task List
 
-- [ ] Task 1: capture real usage findings as they occur
-- [ ] Task 2: group findings into copy, UX, auth/recovery, or runtime buckets
-- [ ] Task 3: execute small fixes in narrow, well-verified slices
-- [ ] Verification: each landed fix has focused tests or live smoke evidence
+This is a standing lane, not a finite checklist — the boxes stay open while dogfooding continues.
+
+- [ ] Task 1: capture real usage findings as they occur (1 logged: 2026-08-08)
+- [ ] Task 2: group findings into copy, UX, auth/recovery, or runtime buckets (1 bucketed: auth/recovery)
+- [ ] Task 3: execute small fixes in narrow, well-verified slices (1 fixed: finding 1)
+- [ ] Verification: each landed fix has focused tests or live smoke evidence (finding 1: regression test + live repro)
 
 ## Intake Notes
 
@@ -54,3 +56,38 @@ exact command output over general impressions.
 **Learnings:**
 - The system is now clean enough that the highest-value remaining work is best discovered through
   actual daily use.
+
+### 2026-08-08 - Finding 1: disabled OAuth servers reported as degraded (auth/recovery bucket)
+
+**By:** Claude Fable 5
+
+**Repro (live `main` build, plug 0.3.0, daemon PID 49739):**
+
+`plug doctor` reported `! runtime_auth_degraded  degraded auth/runtime: supabase` and escalated
+`doctor_interpretation` to a warning. `plug auth status` reported
+`! supabase (authenticated, degraded)` with `Token expires in: 0s` and the hint
+"compare `plug status` and `plug doctor`". But `plug status` lists 12 servers and does **not**
+include `supabase` — because `[servers.supabase]` has `enabled = false`. The suggested recovery
+step therefore led to a server that is not in the output being compared against.
+
+The same `plug doctor` run was internally inconsistent: its `oauth_tokens` check listed only
+krisp/notion/todoist (it already filters on `enabled`), while `runtime_auth_degraded` listed
+supabase.
+
+**Root cause:** `plug/src/daemon/auth_status.rs` selected OAuth servers with
+`filter(|(_, sc)| sc.auth.as_deref() == Some("oauth"))`, with no `&& sc.enabled`. A disabled
+server has no runtime status entry, so the health fallback in the same function classified it
+`Degraded` whenever stored credentials existed — permanently, since a disabled server is never
+refreshed. Every sibling OAuth surface already filtered on `enabled`
+(`plug-core/src/doctor.rs:1029`, `:1099`; `plug-core/src/engine.rs:481`, `:829`, `:906`), so this
+was an isolated omission rather than a deliberate difference.
+
+**Fix:** added `&& sc.enabled` to match the siblings, plus regression test
+`auth_status_omits_disabled_servers_with_stored_credentials`.
+
+**Learnings:**
+- The health fallback "credentials exist but no runtime status ⇒ Degraded" is only correct for
+  servers that are *supposed* to have a runtime presence. Any surface using that fallback has to
+  filter disabled servers first or it manufactures a permanent false warning.
+- A recovery hint that says "compare with `plug status`" is only safe when the two commands share
+  a server-selection rule.
