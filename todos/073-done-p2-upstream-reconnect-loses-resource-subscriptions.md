@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 priority: p2
 issue_id: "073"
 tags: [subscriptions, resources, upstream, reconnect, correctness]
@@ -124,10 +124,11 @@ owner connection is newer than the entry.
 
 ## Acceptance Criteria
 
-- [ ] A same-id upstream reconnect re-issues `resources/subscribe` for entries it still owns
-- [ ] Regression test driving a reconnect and asserting the upstream sees a fresh subscribe
-- [ ] The SSE-layer silent-reconnect case is traced and either covered or ruled out
-- [ ] `AlreadyActive` no longer masks a connection that has forgotten the subscription
+- [x] A same-id upstream reconnect re-issues `resources/subscribe` for entries it still owns
+- [x] Regression test driving a reconnect and asserting the upstream sees a fresh subscribe
+- [x] The SSE-layer silent-reconnect case is traced — it is **not** covered by this fix, and is
+      tracked separately as `todos/074`
+- [x] `AlreadyActive` no longer masks a connection that has forgotten the subscription
 
 ## Resources
 
@@ -143,3 +144,50 @@ owner connection is newer than the entry.
 
 Confirmed the observation carried forward from `todos/070` by tracing the reconnect path end
 to end. No code change made.
+
+### 2026-08-08 - Resolved (engine-level reconnects)
+
+**By:** Claude Fable 5
+
+Took Option A. The connection epoch it proposed already existed: `UpstreamServer.generation`
+(`plug-core/src/server/mod.rs:602-605`), assigned by `next_upstream_generation()` and already
+covered by `reconnect_publishes_a_new_monotonic_connection_generation`. The work was plumbing it
+into the subscription registry, not inventing it.
+
+**What changed.**
+
+- `UpstreamResourceOps` gained `connection_generation()`; the production impl returns
+  `UpstreamServer.generation`.
+- `Entry` gained `owner_connection_generation`, stamped from the handle that actually confirmed
+  the subscription — in both `run_subscribe_transition` and the rebind transition — and cleared
+  whenever the owner is.
+- `classify_route_changes` emits a new `RouteReconciliation::Resubscribe` when the URI still
+  routes to the same server but that server's current connection generation differs from the one
+  recorded. Only settled `Active` entries with a confirmed owner qualify; `Pending` and `Draining`
+  entries have their own transition in flight that owns the outcome.
+- `SubscriptionRegistry::resubscribe` executes it through the same generation-and-lock machinery
+  as `rebind` (both now call a shared `migrate`), with one deliberate difference: it does not
+  release the old owner. That is the subtle part. A same-id rebind would resolve "the old owner"
+  to the *replacement* connection and send it `resources/unsubscribe` for a subscription it never
+  had; a failure there sets `failed = true`, which prunes the entry's local subscribers. The
+  reconnect fix would then cause precisely the loss it exists to prevent.
+- `subscribe()` no longer answers `AlreadyActive` when the recorded connection generation differs
+  from the live handle's. It starts a fresh transition over the existing member set instead, so a
+  downstream re-subscribe can heal a reconnect on its own. Members are carried through, and no
+  `displaced_owner` is set — there is nothing to release.
+
+Both detection paths were verified to be load-bearing: with `owner_connection_is_stale` forced to
+`false` and the `subscribe()` check disabled, `classify_resubscribes_after_a_same_id_reconnect` and
+`subscribe_after_reconnect_does_not_short_circuit_on_active` both fail.
+
+**Scope — read this before assuming the class is closed.** This covers reconnects that go through
+`Engine::reconnect_server` (health monitor, reactive transport-error recovery, OAuth refresh), which
+is what the original trace found. It does **not** cover a reconnect that happens *below*
+`UpstreamServer` inside the transport, because `generation` does not move there. Traced on 2026-08-08:
+the legacy SSE client's retry loop (`plug-core/src/transport/sse_client.rs:306-347`) reopens the
+stream and adopts a new POST endpoint in a task that never re-runs the `initialize` at `:182-220`,
+and rmcp's streamable-HTTP client performs a full re-`initialize` with a brand-new `Mcp-Session-Id`
+on an HTTP 404 (`reinit_on_expired_session` defaults to true and plug never overrides it). Neither
+rebuilds `UpstreamServer`, so the registry sees an unchanged generation and stays `Active`. The HTTP
+404 case is strictly worse in kind than the bug fixed here: it is a genuinely new upstream MCP
+session on which no earlier `resources/subscribe` can possibly exist. Tracked as `todos/074`.
