@@ -119,8 +119,38 @@ enum EntryState {
     /// generation rather than trying to interrupt the drain in place. No
     /// caller ever needs to recover a `watch::Receiver` for an in-flight
     /// drain from the map (each drain initiator awaits its own locally-held
-    /// receiver), so unlike `Pending` this variant carries no data.
-    Draining,
+    /// receiver).
+    Draining {
+        /// The upstream that will still be holding this URI's subscription
+        /// if a new subscriber supersedes this drain before it reaches the
+        /// transition lock. The superseding subscribe inherits this and
+        /// releases that server itself, because the drain will find its
+        /// generation replaced and make no upstream call at all. Without it
+        /// the old owner keeps a `resources/subscribe` that nothing can ever
+        /// release — see `subscribe`'s `Current::Draining` arm.
+        prior_owner_server_id: Option<String>,
+    },
+}
+
+impl Entry {
+    /// The upstream a supersede should release on this entry's behalf.
+    ///
+    /// Prefers the *confirmed* owner, since that is the server the
+    /// subscription demonstrably lives on. Falls back to a `Pending` entry's
+    /// intended owner: a subscribe in flight when the drain was marked may
+    /// land after its generation is replaced, in which case it subscribes and
+    /// then declines to record anything. Releasing a server that never got
+    /// subscribed is harmless — the drain path already treats a failed
+    /// unsubscribe as best-effort — whereas skipping it leaks.
+    fn owner_to_release(&self) -> Option<String> {
+        self.owner_server_id.clone().or_else(|| match &self.state {
+            EntryState::Pending {
+                intended_owner_server_id,
+                ..
+            } => Some(intended_owner_server_id.clone()),
+            _ => None,
+        })
+    }
 }
 
 /// Narrow abstraction over "the upstream connection able to perform
@@ -433,6 +463,9 @@ impl SubscriptionRegistry {
                 generation: u64,
                 tx: watch::Sender<TransitionSignal>,
                 rx: watch::Receiver<TransitionSignal>,
+                /// The upstream a superseded drain left holding this URI, if
+                /// any. `None` for a fresh entry.
+                displaced_owner: Option<String>,
             },
         }
 
@@ -451,7 +484,12 @@ impl SubscriptionRegistry {
                     },
                     owner_server_id: None,
                 });
-                Action::Start { generation, tx, rx }
+                Action::Start {
+                    generation,
+                    tx,
+                    rx,
+                    displaced_owner: None,
+                }
             }
             DashEntry::Occupied(mut o) => {
                 let entry = o.get_mut();
@@ -462,17 +500,19 @@ impl SubscriptionRegistry {
                 enum Current {
                     Active,
                     Pending(watch::Receiver<TransitionSignal>),
-                    Draining,
+                    Draining(Option<String>),
                 }
                 let current = match &entry.state {
                     EntryState::Active => Current::Active,
                     EntryState::Pending { rx, .. } => Current::Pending(rx.clone()),
-                    EntryState::Draining => Current::Draining,
+                    EntryState::Draining {
+                        prior_owner_server_id,
+                    } => Current::Draining(prior_owner_server_id.clone()),
                 };
                 match current {
                     Current::Active => Action::AlreadyActive,
                     Current::Pending(rx) => Action::Piggyback(rx),
-                    Current::Draining => {
+                    Current::Draining(displaced_owner) => {
                         // A drain is in flight for this URI. Replace the
                         // slot with a fresh generation — the drain, when it
                         // finishes, will see its generation no longer
@@ -493,7 +533,14 @@ impl SubscriptionRegistry {
                             },
                             owner_server_id: None,
                         };
-                        Action::Start { generation, tx, rx }
+                        // The drain we just superseded will make no upstream
+                        // call, so releasing its owner becomes our job.
+                        Action::Start {
+                            generation,
+                            tx,
+                            rx,
+                            displaced_owner,
+                        }
                     }
                 }
             }
@@ -502,7 +549,12 @@ impl SubscriptionRegistry {
         match action {
             Action::AlreadyActive => Ok(()),
             Action::Piggyback(rx) => Self::await_transition(rx).await,
-            Action::Start { generation, tx, rx } => {
+            Action::Start {
+                generation,
+                tx,
+                rx,
+                displaced_owner,
+            } => {
                 let registry = Arc::clone(self);
                 let uri_owned = uri.to_string();
                 let owner_server_id = owner_server_id.to_string();
@@ -512,6 +564,7 @@ impl SubscriptionRegistry {
                             uri_owned,
                             generation,
                             owner_server_id,
+                            displaced_owner,
                             upstream,
                             tx,
                         )
@@ -527,6 +580,7 @@ impl SubscriptionRegistry {
         uri: String,
         generation: u64,
         owner_server_id: String,
+        displaced_owner: Option<String>,
         upstream: Arc<dyn UpstreamResourceOps>,
         tx: watch::Sender<TransitionSignal>,
     ) {
@@ -534,6 +588,30 @@ impl SubscriptionRegistry {
         // Hold the per-URI transition mutex across the upstream RTT on purpose:
         // it serializes subscribe/drain/rebind for one URI (see module invariants).
         let _guard = lock.lock().await;
+
+        // We superseded a drain, so that drain will find its generation
+        // replaced and make no upstream call. If it was draining a *different*
+        // server than the one we are about to subscribe, releasing it is our
+        // responsibility — the entry no longer records that server anywhere, so
+        // nothing else will ever be able to. Runs before the check below on
+        // purpose: our own generation may in turn have been superseded, and the
+        // obligation does not transfer.
+        //
+        // Same-owner supersedes skip this. The drain and the new subscribe
+        // target the same upstream, and unsubscribing only to immediately
+        // resubscribe would open a window where a failed resubscribe leaves the
+        // client worse off than the one redundant `subscribe` it costs instead.
+        if let Some(previous) = displaced_owner.filter(|previous| *previous != owner_server_id)
+            && let Some(handle) = self.drain_handle(Some(previous.as_str()), None)
+            && let Err(error) = handle.unsubscribe_resource(&uri).await
+        {
+            tracing::warn!(
+                uri = %uri,
+                server_id = %previous,
+                error = %error,
+                "failed to release superseded owner's resource subscription"
+            );
+        }
 
         let still_current = self
             .entries
@@ -622,7 +700,9 @@ impl SubscriptionRegistry {
                 if now_empty {
                     let generation = entry.generation;
                     let (tx, _rx) = watch::channel(None);
-                    entry.state = EntryState::Draining;
+                    entry.state = EntryState::Draining {
+                        prior_owner_server_id: entry.owner_to_release(),
+                    };
                     Some((generation, tx))
                 } else {
                     None
@@ -666,7 +746,9 @@ impl SubscriptionRegistry {
             if now_empty {
                 let generation = entry.generation;
                 let (tx, _rx) = watch::channel(None);
-                entry.state = EntryState::Draining;
+                entry.state = EntryState::Draining {
+                    prior_owner_server_id: entry.owner_to_release(),
+                };
                 drains.push((uri, generation, tx));
             }
         }
@@ -849,7 +931,9 @@ impl SubscriptionRegistry {
             Some(mut entry) => {
                 let generation = entry.generation;
                 let (tx, rx) = watch::channel(None);
-                entry.state = EntryState::Draining;
+                entry.state = EntryState::Draining {
+                    prior_owner_server_id: entry.owner_to_release(),
+                };
                 Some((generation, tx, rx))
             }
         }) else {
@@ -939,7 +1023,9 @@ impl SubscriptionRegistry {
                     let (tx, rx) = watch::channel(None);
                     entry.generation = generation;
                     if entry.members.is_empty() {
-                        entry.state = EntryState::Draining;
+                        entry.state = EntryState::Draining {
+                            prior_owner_server_id: entry.owner_to_release(),
+                        };
                         Decision::DrainEmpty { generation, tx, rx }
                     } else {
                         entry.state = EntryState::Pending {
@@ -1015,6 +1101,22 @@ impl SubscriptionRegistry {
             .and_then(|e| (e.generation == generation).then(|| e.owner_server_id.clone()));
 
         let Some(recorded_owner) = still_current else {
+            // Superseded: a newer transition to a different destination bumped
+            // the generation, so this rebind does no upstream work and yet
+            // reports success to whoever was waiting on it. That `Ok` is
+            // deliberate and internal-only. It cannot reach a client as a false
+            // success — `ToolRouter::subscribe_resource` re-verifies against the
+            // registry afterwards (`proxy/mod.rs`) and returns "resource
+            // subscription lost during route reconciliation; retry subscribe"
+            // unless `member_active_on_owner` holds — and the alternative, an
+            // `Err`, would be equally wrong: the newer transition may well
+            // succeed, so failing here would report a loss that did not happen.
+            //
+            // The *equivalent* same-destination case is different and is fixed
+            // rather than tolerated: those piggyback on one generation and share
+            // one authoritative outcome (see
+            // `equivalent_concurrent_rebinds_share_authoritative_failure`), so a
+            // real failure is never laundered into a success.
             let _ = tx.send(Some(Ok(())));
             return;
         };
@@ -2269,6 +2371,127 @@ mod tests {
             2,
             "routeless drain must unsubscribe via the recorded owner"
         );
+    }
+
+    /// Two upstreams, one URI. A drain is marked for `s1` and a new subscriber
+    /// lands before the drain task is ever polled, so the drain finds its
+    /// generation replaced and makes no upstream call. If the new subscriber
+    /// resolves to `s2`, nothing else records `s1` anywhere — the superseding
+    /// subscribe has to release it or `s1` keeps a `resources/subscribe`
+    /// forever.
+    ///
+    /// The race is deterministic here rather than timing-dependent: the
+    /// Draining classification and entry replacement inside `subscribe` are
+    /// synchronous, so they complete before the detached drain task gets its
+    /// first poll.
+    #[tokio::test]
+    async fn different_owner_supersede_releases_the_displaced_upstream() {
+        let registry = SubscriptionRegistry::new();
+        let s1 = MockUpstream::new();
+        let s2 = MockUpstream::new();
+
+        let resolver_s1 = Arc::clone(&s1);
+        let resolver_s2 = Arc::clone(&s2);
+        registry.set_owner_resolver(Arc::new(move |server_id: &str| match server_id {
+            "s1" => Some(Arc::clone(&resolver_s1) as Arc<dyn UpstreamResourceOps>),
+            "s2" => Some(Arc::clone(&resolver_s2) as Arc<dyn UpstreamResourceOps>),
+            _ => None,
+        }));
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "s1",
+                Arc::clone(&s1) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s1.subscribe_call_count(), 1);
+
+        // Marks the entry Draining and spawns the drain, which has not run yet.
+        registry
+            .unsubscribe(
+                "file:///x",
+                &client("a"),
+                Some(Arc::clone(&s1) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await;
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("b"),
+                "s2",
+                Arc::clone(&s2) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s1.unsubscribe_call_count(),
+            1,
+            "the displaced owner's subscription must be released exactly once"
+        );
+        assert_eq!(s2.subscribe_call_count(), 1);
+        assert_eq!(s2.unsubscribe_call_count(), 0);
+        assert_eq!(
+            registry.members_snapshot("file:///x").unwrap(),
+            HashSet::from([client("b")])
+        );
+
+        // Let the superseded drain finish; it must not double-release.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(s1.unsubscribe_call_count(), 1);
+    }
+
+    /// The same-owner variant deliberately does not release: the drain and the
+    /// new subscribe target the same upstream, so dropping the subscription
+    /// only to immediately re-add it would risk a failed resubscribe for no
+    /// gain. One redundant `subscribe` is the accepted cost.
+    #[tokio::test]
+    async fn same_owner_supersede_does_not_release_the_upstream() {
+        let registry = SubscriptionRegistry::new();
+        let mock = MockUpstream::new();
+
+        let resolver_mock = Arc::clone(&mock);
+        registry.set_owner_resolver(Arc::new(move |server_id: &str| {
+            (server_id == "s1").then(|| Arc::clone(&resolver_mock) as Arc<dyn UpstreamResourceOps>)
+        }));
+
+        registry
+            .subscribe(
+                "file:///x",
+                client("a"),
+                "s1",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+        registry
+            .unsubscribe(
+                "file:///x",
+                &client("a"),
+                Some(Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>),
+            )
+            .await;
+        registry
+            .subscribe(
+                "file:///x",
+                client("b"),
+                "s1",
+                Arc::clone(&mock) as Arc<dyn UpstreamResourceOps>,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(mock.unsubscribe_call_count(), 0);
+        assert_eq!(mock.subscribe_call_count(), 2);
     }
 
     #[tokio::test]

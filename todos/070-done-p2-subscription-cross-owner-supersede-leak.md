@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 priority: p2
 issue_id: "070"
 tags: [subscriptions, resources, upstream, leak, correctness]
@@ -117,11 +117,11 @@ Track upstream subscriptions per server and sweep any not backed by a registry e
 
 ## Acceptance Criteria
 
-- [ ] A different-owner supersede releases the original upstream's subscription
-- [ ] Regression test covering the different-owner variant specifically (none exists today)
-- [ ] Residual 2 either fixed or its internal `Ok` documented as intentional at the
+- [x] A different-owner supersede releases the original upstream's subscription
+- [x] Regression test covering the different-owner variant specifically (none exists today)
+- [x] Residual 2 either fixed or its internal `Ok` documented as intentional at the
       send site, given the caller-side re-verification already prevents client-visible harm
-- [ ] The upstream-reconnect observation is confirmed or ruled out
+- [x] The upstream-reconnect observation is confirmed or ruled out
 
 ## Resources
 
@@ -139,3 +139,52 @@ Re-verified the residual against `main` and gave it a tracked home. Corrected th
 "cross-owner" terminology, which had been read as downstream-client-vs-downstream-client;
 downstream client sequences (A/B subscribe, duplicate subscribe, disconnect cleanup,
 successful rebind) were audited and are safe. No code change made.
+
+### 2026-08-08 - Resolved
+
+**By:** Claude Fable 5
+
+Fixed with Option A, plus the two documentation criteria.
+
+**The leak.** `EntryState::Draining` now carries `prior_owner_server_id`, populated at all
+four mark sites (`unsubscribe`, `cleanup_target`, `prune`, and `rebind`'s empty-entry drain)
+from a new `Entry::owner_to_release`. A subscriber that supersedes a drain inherits that
+value and, in `run_subscribe_transition`, releases the displaced upstream itself before
+doing anything else — the superseded drain will find its generation replaced and make no
+upstream call, so the obligation has to move with the entry.
+
+Three details worth keeping in mind when reading it:
+
+- The release runs *before* the `still_current` check, because this transition's own
+  generation may in turn have been superseded and the obligation does not transfer a second
+  time.
+- Same-owner supersedes deliberately skip the release. Dropping the subscription only to
+  immediately re-add it on the same server would open a window where a failed resubscribe
+  leaves the client worse off than the one redundant `subscribe` it costs instead.
+- `owner_to_release` prefers the confirmed `owner_server_id` but falls back to a `Pending`
+  entry's intended owner. A subscribe in flight when the drain was marked can land after its
+  generation is replaced, subscribe successfully, and then decline to record anything.
+  Releasing a server that turned out never to be subscribed is harmless — the drain path
+  already treats a failed unsubscribe as best-effort — whereas skipping it leaks.
+
+**Regression tests.** `different_owner_supersede_releases_the_displaced_upstream` and
+`same_owner_supersede_does_not_release_the_upstream`. The race is deterministic rather than
+timing-dependent: the Draining classification and entry replacement inside `subscribe` are
+synchronous, so they complete before the detached drain task gets its first poll. Verified
+the first test genuinely catches the defect by disabling the release and watching it fail
+with `left: 0, right: 1`.
+
+**Residual 2.** Documented as intentional at the send site in `run_rebind_transition`. An
+`Err` there would be equally wrong — the newer transition may well succeed, so failing would
+report a loss that did not happen — and `ToolRouter::subscribe_resource` already re-verifies
+against the registry, so no client sees a false success. The comment also contrasts the
+equivalent same-destination case, which is fixed rather than tolerated.
+
+**Upstream reconnect: confirmed, not ruled out.** There is no re-subscribe path for a
+same-id upstream reconnect. `replace_server` swaps the handle without replaying
+subscriptions, and `classify_route_changes` emits nothing because the server id and URI set
+are unchanged — the last-known-good catalog carry-forward actively guarantees that. The
+registry keeps the entry `Active`, and a later downstream re-subscribe short-circuits on
+`AlreadyActive` without any upstream call, so it cannot self-heal. Tracked separately as
+`todos/073`, since fixing it needs a connection epoch on the entry rather than anything in
+this todo's supersede path.
