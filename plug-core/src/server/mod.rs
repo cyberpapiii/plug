@@ -122,13 +122,68 @@ async fn restore_legacy_task_capability(
 struct InitializedNotificationCompatHttpClient {
     inner: reqwest::Client,
     server_name: Arc<str>,
+    /// Shared with the `UpstreamServer` this client backs.
+    connection: ConnectionGeneration,
+    /// Weak so a client outliving the router cannot keep it alive.
+    tool_router: std::sync::Weak<ToolRouter>,
+    /// The `Mcp-Session-Id` most recently seen on the wire.
+    ///
+    /// rmcp keeps the live session id private to its transport worker and
+    /// offers no accessor or event for it, but it passes the id into every
+    /// client call — so this wrapper is the one place in the process that can
+    /// watch it. When it changes, the upstream session was replaced (rmcp
+    /// re-runs `initialize` and takes a new id when a server answers an
+    /// expired session with 404), and every subscription the old session held
+    /// is gone.
+    last_session_id: Arc<std::sync::Mutex<Option<Arc<str>>>>,
 }
 
 impl InitializedNotificationCompatHttpClient {
-    fn new(server_name: Arc<str>) -> Self {
+    fn new(
+        server_name: Arc<str>,
+        connection: ConnectionGeneration,
+        tool_router: std::sync::Weak<ToolRouter>,
+    ) -> Self {
         Self {
             inner: reqwest::Client::new(),
             server_name,
+            connection,
+            tool_router,
+            last_session_id: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Record the session id carried by an outbound call and advance the
+    /// connection generation if it differs from the last one seen.
+    ///
+    /// Deliberately ignores `None`. A missing id means either a
+    /// pre-session call (the `initialize` that is about to establish one) or a
+    /// stateless server that never issues one; treating either as a change
+    /// would advance the generation on every stateless request forever.
+    fn observe_session(&self, session_id: Option<&Arc<str>>) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let mut last = match self.last_session_id.lock() {
+            Ok(last) => last,
+            // A poisoned lock here would mean a panic inside this tiny
+            // critical section. Session tracking is an observation, never a
+            // correctness gate, so recover rather than propagate.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match last.as_ref() {
+            Some(previous) if previous == session_id => {}
+            Some(previous) => {
+                tracing::info!(
+                    server = %self.server_name,
+                    previous_session = %previous,
+                    new_session = %session_id,
+                    "upstream HTTP session replaced; treating as a new connection"
+                );
+                *last = Some(Arc::clone(session_id));
+                on_upstream_session_replaced(&self.connection, &self.tool_router);
+            }
+            None => *last = Some(Arc::clone(session_id)),
         }
     }
 }
@@ -256,6 +311,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         auth_header: Option<String>,
         mut custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        self.observe_session(session_id.as_ref());
         let is_initialized = is_initialized_notification_message(&message);
         custom_headers.extend(crate::mcp_http_headers::mirrored_headers_for_message(
             &message,
@@ -323,6 +379,10 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        // Also observed here, not just on POST: after rmcp re-initializes it
+        // respawns the GET stream with the new session id, and that can reach
+        // the wire before any request does.
+        self.observe_session(session_id.as_ref());
         <reqwest::Client as StreamableHttpClient>::get_stream(
             &self.inner,
             uri,
@@ -601,9 +661,82 @@ pub struct UpstreamServer {
     pub(crate) protocol_gate_state: u64,
     /// Monotonic identity of this concrete connection. Unlike an `Arc`
     /// address, this cannot be recycled after a reconnect and is stable for
-    /// every clone of the published connection.
-    pub(crate) generation: u64,
+    /// every clone of the published connection. Read it with
+    /// [`UpstreamServer::generation`] — it moves without the `UpstreamServer`
+    /// being rebuilt when a transport re-establishes the upstream session
+    /// underneath us. See [`ConnectionGeneration`].
+    pub(crate) connection: ConnectionGeneration,
     pub health: ServerHealth,
+}
+
+impl UpstreamServer {
+    /// Current identity of the connection behind this handle.
+    ///
+    /// Not a constant for the lifetime of the `UpstreamServer`: a transport
+    /// that re-establishes the upstream session on its own advances this
+    /// without anything above it being rebuilt. Always read it fresh rather
+    /// than caching it alongside the handle.
+    pub(crate) fn generation(&self) -> u64 {
+        self.connection.get()
+    }
+}
+
+/// The identity of one concrete upstream connection, as a value that can be
+/// advanced in place.
+///
+/// It exists because "the connection" is not the same thing as "the
+/// `UpstreamServer`". Both upstream transports can re-establish the underlying
+/// MCP session by themselves — rmcp's streamable-HTTP client re-runs
+/// `initialize` and takes a new `Mcp-Session-Id` when a server answers 404, and
+/// the legacy SSE client reopens its stream and adopts whatever POST endpoint
+/// the server then advertises. Neither rebuilds `UpstreamServer`, so anything
+/// keyed to the handle's identity would never notice that every piece of
+/// session-scoped state the upstream was holding — `resources/subscribe` above
+/// all — had just been discarded.
+///
+/// Sharing this `Arc` with the transport client lets the layer that *sees* the
+/// session change tell the layers that *own* state established on it.
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectionGeneration(Arc<AtomicU64>);
+
+impl ConnectionGeneration {
+    /// A fresh connection identity, distinct from every one issued before it.
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(next_upstream_generation())))
+    }
+
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Publish a brand-new identity for the same `UpstreamServer`, because the
+    /// session underneath it was replaced. Takes a fresh value from the same
+    /// global counter as `new()`, so an advanced generation can never collide
+    /// with another connection's.
+    pub(crate) fn advance(&self) {
+        self.0.store(next_upstream_generation(), Ordering::Relaxed);
+    }
+}
+
+/// React to a transport that replaced the upstream session underneath us.
+///
+/// Two things have to happen, and only the first is obvious. Advancing the
+/// generation is what lets the subscription registry *recognize* that the
+/// upstream `resources/subscribe` went away with the old session. But nothing
+/// re-examines the registry on its own — route reconciliation is purely
+/// event-driven, so on an otherwise quiet system the stale entry would sit
+/// unnoticed until some unrelated refresh happened to run. Kicking a resource
+/// refresh runs the post-publish sweep, which classifies entries against the
+/// current snapshot and re-issues the subscribe. The scheduler coalesces, so a
+/// flapping upstream costs one refresh, not one per flap.
+fn on_upstream_session_replaced(
+    connection: &ConnectionGeneration,
+    tool_router: &std::sync::Weak<ToolRouter>,
+) {
+    connection.advance();
+    if let Some(router) = tool_router.upgrade() {
+        router.schedule_resource_list_changed_refresh();
+    }
 }
 
 static NEXT_UPSTREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1275,7 +1408,7 @@ impl ServerManager {
                         protocol_era,
                         selected_protocol_version,
                         protocol_gate_state: modern_upstream_gate_state,
-                        generation: next_upstream_generation(),
+                        connection: ConnectionGeneration::new(),
                         health: ServerHealth::Healthy,
                     })
                 }
@@ -1334,8 +1467,17 @@ impl ServerManager {
                         "connecting to HTTP upstream"
                     );
 
+                    // Created before the transport so the client wrapper and
+                    // the eventual `UpstreamServer` share one identity: the
+                    // wrapper is the only thing that ever sees rmcp swap the
+                    // upstream session, and it has to be able to say so.
+                    let connection = ConnectionGeneration::new();
                     let transport = StreamableHttpClientTransport::with_client(
-                        InitializedNotificationCompatHttpClient::new(Arc::from(name)),
+                        InitializedNotificationCompatHttpClient::new(
+                            Arc::from(name),
+                            connection.clone(),
+                            tool_router.clone(),
+                        ),
                         transport_config,
                     );
 
@@ -1363,6 +1505,7 @@ impl ServerManager {
                                 tools,
                                 "HTTP upstream",
                                 modern_upstream_gate_state,
+                                connection,
                             ).await
                         }
                         Err(e) => {
@@ -1477,6 +1620,17 @@ impl ServerManager {
             "connecting to legacy SSE upstream"
         );
 
+        // Created before the transport so the retry loop and the eventual
+        // `UpstreamServer` share one identity: the loop reconnects underneath
+        // without anything above it being rebuilt, and advancing the shared
+        // value is the only way that reaches the subscription registry.
+        let connection = ConnectionGeneration::new();
+        let transport_config = transport_config.session_observer({
+            let connection = connection.clone();
+            let tool_router = tool_router.clone();
+            Arc::new(move || on_upstream_session_replaced(&connection, &tool_router))
+        });
+
         let transport = LegacySseClientTransport::from_config(transport_config);
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
@@ -1500,6 +1654,7 @@ impl ServerManager {
             tools,
             "legacy SSE upstream",
             modern_upstream_gate_state,
+            connection,
         )
         .await
     }
@@ -1512,6 +1667,7 @@ impl ServerManager {
         tools: Arc<ArcSwap<Vec<Tool>>>,
         transport_label: &str,
         modern_upstream_gate_state: u64,
+        connection: ConnectionGeneration,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let tools_result = client
             .peer()
@@ -1575,7 +1731,7 @@ impl ServerManager {
             protocol_era,
             selected_protocol_version,
             protocol_gate_state: modern_upstream_gate_state,
-            generation: next_upstream_generation(),
+            connection,
             health: ServerHealth::Healthy,
         })
     }
@@ -2221,6 +2377,86 @@ mod tests {
     use super::*;
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
+
+    fn session_watcher() -> (
+        InitializedNotificationCompatHttpClient,
+        ConnectionGeneration,
+    ) {
+        // The wrapper builds a `reqwest::Client`, which panics without one.
+        crate::tls::ensure_rustls_provider_installed();
+        let connection = ConnectionGeneration::new();
+        let client = InitializedNotificationCompatHttpClient::new(
+            Arc::from("watched"),
+            connection.clone(),
+            // Dangling: these tests exercise the generation half of the
+            // reaction, and a router that cannot be upgraded simply skips the
+            // refresh kick.
+            std::sync::Weak::new(),
+        );
+        (client, connection)
+    }
+
+    #[test]
+    fn the_first_observed_session_is_not_a_replacement() {
+        let (client, connection) = session_watcher();
+        let before = connection.get();
+
+        client.observe_session(Some(&Arc::from("session-a")));
+
+        assert_eq!(
+            connection.get(),
+            before,
+            "establishing the initial session must not look like losing one"
+        );
+    }
+
+    #[test]
+    fn repeating_a_session_id_leaves_the_connection_generation_alone() {
+        let (client, connection) = session_watcher();
+        client.observe_session(Some(&Arc::from("session-a")));
+        let before = connection.get();
+
+        for _ in 0..5 {
+            client.observe_session(Some(&Arc::from("session-a")));
+        }
+
+        assert_eq!(connection.get(), before);
+    }
+
+    #[test]
+    fn a_new_session_id_advances_the_connection_generation() {
+        let (client, connection) = session_watcher();
+        client.observe_session(Some(&Arc::from("session-a")));
+        let before = connection.get();
+
+        client.observe_session(Some(&Arc::from("session-b")));
+
+        let after = connection.get();
+        assert_ne!(
+            after, before,
+            "rmcp re-initialized under us; the subscriptions the old session held are gone"
+        );
+
+        // And the replacement is itself a stable identity, not a value that
+        // keeps moving on every subsequent call.
+        client.observe_session(Some(&Arc::from("session-b")));
+        assert_eq!(connection.get(), after);
+    }
+
+    #[test]
+    fn a_missing_session_id_is_never_a_replacement() {
+        let (client, connection) = session_watcher();
+        client.observe_session(Some(&Arc::from("session-a")));
+        let before = connection.get();
+
+        // Stateless upstreams answer without a session id forever. Treating
+        // that as a change would resubscribe on every single request.
+        for _ in 0..5 {
+            client.observe_session(None);
+        }
+
+        assert_eq!(connection.get(), before);
+    }
 
     #[test]
     fn availability_for_defaults_by_health_then_prefers_recorded_state() {
@@ -2934,7 +3170,7 @@ mod tests {
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
-            generation: next_upstream_generation(),
+            connection: ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
         }
     }
@@ -2984,7 +3220,7 @@ mod tests {
                 protocol_era: crate::protocol::ProtocolEra::Legacy,
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
-                generation: next_upstream_generation(),
+                connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
             },
             result_request_count,
@@ -3178,19 +3414,19 @@ mod tests {
     async fn reconnect_publishes_a_new_monotonic_connection_generation() {
         let mgr = ServerManager::new();
         let first = make_connected_test_upstream("generation-test").await;
-        let first_generation = first.generation;
+        let first_generation = first.generation();
         mgr.replace_server("generation-test", first).await;
         assert_eq!(
-            mgr.get_upstream("generation-test").unwrap().generation,
+            mgr.get_upstream("generation-test").unwrap().generation(),
             first_generation
         );
 
         let replacement = make_connected_test_upstream("generation-test").await;
-        let replacement_generation = replacement.generation;
+        let replacement_generation = replacement.generation();
         assert!(replacement_generation > first_generation);
         mgr.replace_server("generation-test", replacement).await;
         assert_eq!(
-            mgr.get_upstream("generation-test").unwrap().generation,
+            mgr.get_upstream("generation-test").unwrap().generation(),
             replacement_generation
         );
     }
@@ -3319,7 +3555,7 @@ mod tests {
                 protocol_era: crate::protocol::ProtocolEra::Legacy,
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
-                generation: next_upstream_generation(),
+                connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
             },
         )
@@ -3376,7 +3612,7 @@ mod tests {
                 protocol_era: crate::protocol::ProtocolEra::Legacy,
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
-                generation: next_upstream_generation(),
+                connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
             },
         )
@@ -3680,7 +3916,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
-                    generation: next_upstream_generation(),
+                    connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -3787,7 +4023,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
-                    generation: next_upstream_generation(),
+                    connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4119,7 +4355,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
-                    generation: next_upstream_generation(),
+                    connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4241,7 +4477,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
-                    generation: next_upstream_generation(),
+                    connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                 },
             )
@@ -4385,7 +4621,7 @@ mod tests {
                     selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
                         .to_string(),
                     protocol_gate_state: 0,
-                    generation: next_upstream_generation(),
+                    connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                 },
             )

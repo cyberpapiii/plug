@@ -173,6 +173,7 @@ mod tests {
                 servers: vec![],
                 clients: 2,
                 uptime_secs: 100,
+                resource_subscriptions: 0,
             };
             ipc::send_response(&mut w_server, &response).await.unwrap();
         });
@@ -185,6 +186,7 @@ mod tests {
                 servers,
                 clients,
                 uptime_secs,
+                ..
             } => {
                 assert!(servers.is_empty());
                 assert_eq!(clients, 2);

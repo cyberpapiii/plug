@@ -982,7 +982,7 @@ impl ToolRouter {
                             server_id: server_id.clone(),
                         })
                     })?;
-                Ok((server_id, original_name, upstream.generation))
+                Ok((server_id, original_name, upstream.generation()))
             });
         let (server_id, original_name, upstream_generation) = resolved?;
         Ok((
@@ -1011,7 +1011,7 @@ impl ToolRouter {
                 let upstream_generation = self
                     .server_manager
                     .get_upstream(server_id)
-                    .map(|upstream| upstream.generation);
+                    .map(|upstream| upstream.generation());
                 (
                     name.clone(),
                     MaterialToolRoute {
@@ -2666,7 +2666,7 @@ impl ToolRouter {
         let upstream = self
             .server_manager
             .get_upstream(&route.server_id)
-            .filter(|upstream| upstream.generation == route.upstream_generation)
+            .filter(|upstream| upstream.generation() == route.upstream_generation)
             .ok_or_else(|| {
                 crate::protocol::ProtocolOutcome::ExpiredContinuation
                     .into_error(context.protocol_era)

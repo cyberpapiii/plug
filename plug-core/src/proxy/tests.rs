@@ -2801,7 +2801,7 @@ async fn connect_subscribable_upstream(
         protocol_era: crate::protocol::ProtocolEra::Legacy,
         selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
-        generation: crate::server::next_upstream_generation(),
+        connection: crate::server::ConnectionGeneration::new(),
         health: ServerHealth::Healthy,
     }
 }
@@ -2839,7 +2839,7 @@ async fn connect_modern_tool_upstream(
         protocol_era: crate::protocol::ProtocolEra::Modern,
         selected_protocol_version: crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
-        generation: crate::server::next_upstream_generation(),
+        connection: crate::server::ConnectionGeneration::new(),
         health: ServerHealth::Healthy,
     }
 }

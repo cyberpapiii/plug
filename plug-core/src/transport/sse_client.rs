@@ -54,6 +54,16 @@ pub struct LegacySseTransportConfig {
     pub channel_buffer_capacity: usize,
     pub endpoint_wait_timeout: Duration,
     pub retry_policy: Arc<dyn SseRetryPolicy>,
+    /// Called when the server re-advertises a *different* POST endpoint after a
+    /// stream reconnect.
+    ///
+    /// The retry loop reconnects on its own and never rebuilds anything above
+    /// it, so without this the layers that hold per-session state — resource
+    /// subscriptions above all — have no way to learn the session they
+    /// registered against is gone. An unchanged endpoint is left silent on
+    /// purpose: `last-event-id` is sent on every redial, and a server that
+    /// answers with the same endpoint is resuming, not minting a new session.
+    pub session_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LegacySseTransportConfig {
@@ -81,7 +91,13 @@ impl LegacySseTransportConfig {
             channel_buffer_capacity: 16,
             endpoint_wait_timeout: Duration::from_secs(5),
             retry_policy: Arc::new(retry_policy),
+            session_observer: None,
         }
+    }
+
+    pub fn session_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.session_observer = Some(observer);
+        self
     }
 
     pub fn auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
@@ -292,6 +308,31 @@ fn deliver_notification_best_effort(
     }
 }
 
+/// Publish a newly advertised POST endpoint, notifying the session observer if
+/// it replaced a different one.
+///
+/// A changed endpoint is the only evidence this transport gets that a reconnect
+/// produced a new server session rather than a resumed one. The first endpoint
+/// of a connection replaces nothing and is therefore never a replacement, and a
+/// redial answered with the same endpoint is treated as a resume — the redial
+/// carries `last-event-id`, so a server that meant to start over would have to
+/// say so by moving the endpoint.
+fn publish_endpoint(
+    endpoint_tx: &tokio::sync::watch::Sender<Option<Arc<str>>>,
+    endpoint: Arc<str>,
+    session_observer: Option<&Arc<dyn Fn() + Send + Sync>>,
+) {
+    let previous = endpoint_tx.send_replace(Some(endpoint.clone()));
+    if let (Some(previous), Some(observer)) = (previous, session_observer)
+        && previous != endpoint
+    {
+        tracing::info!(
+            "legacy SSE server re-advertised a new POST endpoint; treating as a new connection"
+        );
+        observer();
+    }
+}
+
 async fn run_sse_loop(
     client: reqwest::Client,
     config: LegacySseTransportConfig,
@@ -343,7 +384,7 @@ async fn run_sse_loop(
                                 };
                                 let endpoint = resolve_endpoint(config.uri.as_ref(), data)
                                     .map_err(WorkerQuitReason::fatal_context("resolve endpoint event"))?;
-                                endpoint_tx.send_replace(Some(endpoint));
+                                publish_endpoint(&endpoint_tx, endpoint, config.session_observer.as_ref());
                                 continue;
                             }
                             let is_message_event = matches!(event.event.as_deref(), None | Some("") | Some("message"));
@@ -938,6 +979,82 @@ mod tests {
             }
         }
         StatusCode::ACCEPTED
+    }
+
+    /// Counts how many times the session observer fired.
+    fn counting_observer() -> (
+        Arc<dyn Fn() + Send + Sync>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer_calls = Arc::clone(&calls);
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            observer_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        (observer, calls)
+    }
+
+    #[test]
+    fn first_endpoint_of_a_connection_is_not_a_session_replacement() {
+        let (endpoint_tx, _rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
+        let (observer, calls) = counting_observer();
+
+        publish_endpoint(&endpoint_tx, Arc::from("http://host/post"), Some(&observer));
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            endpoint_tx.borrow().as_deref(),
+            Some("http://host/post"),
+            "the endpoint is still published even though nothing was replaced"
+        );
+    }
+
+    #[test]
+    fn re_advertising_the_same_endpoint_is_treated_as_a_resume() {
+        let (endpoint_tx, _rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
+        let (observer, calls) = counting_observer();
+
+        publish_endpoint(&endpoint_tx, Arc::from("http://host/post"), Some(&observer));
+        publish_endpoint(&endpoint_tx, Arc::from("http://host/post"), Some(&observer));
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an unchanged endpoint must not force a resubscribe"
+        );
+    }
+
+    #[test]
+    fn a_changed_endpoint_reports_a_replaced_session() {
+        let (endpoint_tx, _rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
+        let (observer, calls) = counting_observer();
+
+        publish_endpoint(
+            &endpoint_tx,
+            Arc::from("http://host/post?s=1"),
+            Some(&observer),
+        );
+        publish_endpoint(
+            &endpoint_tx,
+            Arc::from("http://host/post?s=2"),
+            Some(&observer),
+        );
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            endpoint_tx.borrow().as_deref(),
+            Some("http://host/post?s=2")
+        );
+    }
+
+    #[test]
+    fn endpoint_changes_are_published_without_an_observer() {
+        let (endpoint_tx, _rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
+
+        publish_endpoint(&endpoint_tx, Arc::from("http://host/a"), None);
+        publish_endpoint(&endpoint_tx, Arc::from("http://host/b"), None);
+
+        assert_eq!(endpoint_tx.borrow().as_deref(), Some("http://host/b"));
     }
 
     fn event_to_axum(event: sse_stream::Sse) -> Event {

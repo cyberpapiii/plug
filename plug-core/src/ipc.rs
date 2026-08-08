@@ -522,6 +522,12 @@ pub enum IpcResponse {
         servers: Vec<ServerStatus>,
         clients: usize,
         uptime_secs: u64,
+        /// Resource URIs with at least one downstream subscriber.
+        ///
+        /// Defaulted so a newer CLI still reads an older daemon's response,
+        /// where the count reads as zero rather than failing the whole query.
+        #[serde(default)]
+        resource_subscriptions: usize,
     },
     /// List of all tools available.
     Tools { tools: Vec<IpcToolInfo> },
@@ -892,6 +898,7 @@ mod tests {
                 servers: vec![],
                 clients: 0,
                 uptime_secs: 42,
+                resource_subscriptions: 3,
             },
             IpcResponse::Tools {
                 tools: vec![IpcToolInfo {
