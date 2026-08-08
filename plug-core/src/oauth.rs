@@ -46,6 +46,40 @@ const MAX_EXPIRES_IN: u64 = 86400;
 /// Short-lived threshold: if `expires_in < 600`, use the 50% rule.
 const SHORT_LIVED_THRESHOLD: u64 = 600;
 
+/// Seconds added to every wall-clock read in the token-expiry and
+/// refresh-scheduling paths. Always zero outside a test that opts in.
+static TEST_CLOCK_SKEW_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Seconds since the Unix epoch, as every OAuth expiry and refresh-scheduling
+/// decision sees them.
+///
+/// Token lifetimes are measured against the wall clock, which
+/// `tokio::time::pause()` does not touch, so a test that only advances Tokio's
+/// timer sits forever at a token that never expires. This is the one seam that
+/// lets such a test move token expiry forward.
+///
+/// The skew is deliberately additive and forward-only: it can only make a token
+/// look *older* than it is, so the worst a stuck or malicious value could do is
+/// refresh earlier than necessary. Nothing can use it to make an expired token
+/// look fresh.
+fn unix_now() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_add(TEST_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Move the OAuth clock forward by `secs` for the rest of this process.
+///
+/// Public only so workspace integration tests can drive a background token
+/// refresh without sleeping through a real token lifetime. Forward-only by
+/// construction — see [`unix_now`].
+#[doc(hidden)]
+pub fn advance_test_clock(secs: u64) {
+    TEST_CLOCK_SKEW_SECS.fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_os = "linux")]
 const LINUX_KEYRING_PREFIX: &str = "keyring-rs:";
 
@@ -194,12 +228,7 @@ pub fn token_needs_refresh(received_at: u64, expires_in: Option<u64>) -> bool {
         effective.saturating_sub(TOKEN_REFRESH_WINDOW_SECS)
     };
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let elapsed = now.saturating_sub(received_at);
+    let elapsed = unix_now().saturating_sub(received_at);
     elapsed >= refresh_at
 }
 
@@ -214,12 +243,7 @@ pub fn time_until_refresh_window(received_at: u64, expires_in: Option<u64>) -> D
         effective.saturating_sub(TOKEN_REFRESH_WINDOW_SECS)
     };
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let elapsed = now.saturating_sub(received_at);
+    let elapsed = unix_now().saturating_sub(received_at);
     if elapsed >= refresh_at {
         Duration::ZERO
     } else {
@@ -1018,12 +1042,7 @@ impl CompositeCredentialStore {
             use oauth2::TokenResponse;
             let access_token = tr.access_token().secret().to_string();
             let expires_in = tr.expires_in().map(|d| d.as_secs());
-            let token_received_at = creds.token_received_at.unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            });
+            let token_received_at = creds.token_received_at.unwrap_or_else(unix_now);
             CachedCredentials {
                 credentials: creds.clone(),
                 access_token,
@@ -1091,10 +1110,7 @@ impl CompositeCredentialStore {
             .expires_in()
             .map(|d| d.as_secs())
             .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = unix_now();
         let received_at = creds.token_received_at.unwrap_or(now);
 
         Some(effective.saturating_sub(now.saturating_sub(received_at)))
