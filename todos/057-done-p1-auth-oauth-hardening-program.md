@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 priority: p1
 issue_id: "057"
 tags: [auth, oauth, ux, config, doctor, repair, status, transport, standards]
@@ -89,7 +89,7 @@ Execute the full hardening plan from [docs/plans/2026-03-16-auth-oauth-hardening
 - [x] Final verification complete: `cargo test` passes
 - [x] Final verification complete: `cargo build --release` passes
 - [x] Final verification complete: `plug status`, `plug auth status`, and `plug doctor` tell a coherent story on healthy, auth-required, and failed server cases
-- [ ] Follow-up tracked: true downstream HTTP live-session parity is handled as a separate architecture task, not misrepresented as complete
+- [x] Follow-up tracked: true downstream HTTP live-session parity is handled as a separate architecture task, not misrepresented as complete (delivered; see 2026-08-08 entry)
 
 ## Technical Details
 
@@ -1061,3 +1061,68 @@ findings-doc-and-todo-note-only change).
 
 **Status:** program stays `ready` — this spike produced input for the next planning round, it did
 not close any acceptance criteria itself.
+
+### 2026-08-08 - Spike findings re-verified against current `main`; program closed
+
+**By:** Claude Fable 5
+
+Re-checked all three plan-018 spike gaps against `main` at `e3b562e`. Commit `e0aaff7`
+(`feat(oauth): add multi-client MCP authorization`) landed after the spike and resolved
+most of what the spike found. The spike's own caveat — that plan 020 might change these
+answers — is now moot; the answers changed for a different reason.
+
+**Gap 1 (redirect URI scheme validation): FIXED.** The vulnerable construct no longer
+exists — `e0aaff7` deleted the `oauth_redirect_uri_allowlist` config field outright, so
+there is no operator-supplied redirect list to under-validate. Every redirect URI now
+comes from client registration or a Client ID Metadata Document and passes
+`valid_redirect_uri` (`plug-core/src/downstream_oauth/mod.rs:1003-1025`), which permits
+`https` plus `http` only for loopback hosts (`:1027-1033`), with one exact-match
+`cursor://anysphere.cursor-mcp/oauth/callback` exception (`:39`, `:1007`). Validation
+happens at registration/parse time (`:489`, `:492`, `:913`, `:959-986`), and the
+authorize endpoint only exact-matches the stored set (`:603-609`). Covered by
+`redirect_validation_accepts_web_loopback_and_exact_cursor_native_callback` (`:1379-1396`),
+which asserts the exact spike case `!valid_redirect_uri("http://client.example/callback")`.
+
+**Gap 2 (RFC 8707 `resource`): FIXED**, and required rather than optional. Non-`Option`
+field at `plug-core/src/http/server.rs:749` so a missing value is an extractor rejection;
+validated against the canonical identifier at `downstream_oauth/mod.rs:610-612`; carried
+through consent and code (`:637`, `:647`, `:682`); re-checked at the token endpoint
+against both the canonical identifier and the stored value (`:711-713`, `:722`,
+`:753-755`, `:763`); bound into the issued token (`:1158-1176`); and checked at `/mcp`
+request time (`server.rs:789`, `mod.rs:791-796`). End-to-end coverage at
+`plug-core/tests/integration_tests.rs:4555-4749`. One untested edge remains: RFC 8707
+permits a repeated `resource` parameter, and the single-`String` field silently keeps
+one value with no explicit handling.
+
+**Gap 3 (scope enforcement): PARTIALLY FIXED — the remaining half is now documented
+rather than closed.** Issuance-side validation is real (`validate_scopes`,
+`mod.rs:847-865`). Request-time enforcement at `/mcp` applies only in the gated modern
+era; the default legacy era gives the OAuth principal `local_trust`, which short-circuits
+the required-scope check at `plug-core/src/protocol.rs:202-204`. That bypass is
+deliberate and pinned by
+`legacy_tools_read_oauth_principal_keeps_pre_scope_method_compatibility`
+(`server.rs:3013-3056`), so it is not something to silently "fix". The `insufficient_scope`
+challenge is implemented correctly (`http/error.rs:39`, `:97-116`) but unreachable in
+production, because the only production call site passes an empty `required_scopes`
+slice (`server.rs:789`).
+
+**Actions:**
+- Corrected `docs/PROJECT-STATE-SNAPSHOT.md`, which claimed flat "`tools:read` enforcement".
+  That was true only for the gated modern era.
+- Recorded the remaining gap, its rationale, and three options at
+  [docs/bug-reports/downstream-oauth-scope-enforcement-legacy-era-bypass.md](../docs/bug-reports/downstream-oauth-scope-enforcement-legacy-era-bypass.md).
+  Recommended shape if picked up: a default-off `http.enforce_oauth_scopes` flag, which
+  also forces a decision on whether scope denial should return the RFC 6750 403 or stay a
+  JSON-RPC `-32005` inside a 200.
+
+**Remaining acceptance criterion resolved.** "Follow-up tracked: true downstream HTTP
+live-session parity is handled as a separate architecture task" — the follow-up was
+tracked in `docs/plans/2026-03-17-http-session-parity-architecture.md` and has since been
+delivered: the snapshot lists daemon-owned downstream HTTP/HTTPS and transport-complete
+live session inventory, and a live `plug status` on this machine reports
+`Live Inventory transport-complete` with `Live Transports daemon_proxy=7 http=0 sse=0`,
+replacing the old `daemon_proxy_only` scope. Nothing is misrepresented as complete.
+
+**Status:** `done`. Every acceptance criterion is checked. The one open item this program
+surfaced but does not own — legacy-era scope enforcement — is an intentional compatibility
+decision now recorded as a known gap with options, not unfinished hardening work.

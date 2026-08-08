@@ -82,3 +82,24 @@ Defer until plug has a real macOS install audience beyond local dev. When that
 happens, do **Option 1** for the GitHub-release and Homebrew channels, and keep
 `plug codesign-setup` + the doctor nudge as the answer for source (`cargo install`)
 installs.
+
+## Triage 2026-08-08
+
+**By:** Claude Fable 5
+
+Confirmed blocked, and the todo's own recommendation (defer) still holds. Nothing was
+implemented.
+
+- Option 1 requires a **paid Apple Developer account** and a Developer ID Application
+  certificate in CI secrets. That is a purchase and an account action only Rob can take;
+  no amount of code work substitutes for it.
+- `.github/workflows/release.yml` exists but has no signing step, and a grep across
+  `.github/` and `scripts/` for `notarytool`, `APPLE_ID`, or `DEVELOPER_ID` returns
+  nothing — so there is no half-finished pipeline to complete.
+- The local fallback is verified working on this machine: `plug doctor` reports
+  `● codesign_identity  plug has a stable code-signing identity; Keychain approvals
+  persist`.
+
+**Unblock condition:** Rob buys/assigns an Apple Developer account and adds the
+Developer ID cert plus notarization credentials as CI secrets. Until then this stays
+`pending` by choice, not by neglect.

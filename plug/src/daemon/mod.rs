@@ -2011,6 +2011,14 @@ mod tests {
     }
 
     pub(super) fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
+        write_oauth_config_with_enabled(path, servers, true);
+    }
+
+    pub(super) fn write_oauth_config_with_enabled(
+        path: &std::path::Path,
+        servers: &[&str],
+        enabled: bool,
+    ) {
         let mut config = plug_core::config::Config::default();
         for name in servers {
             config.servers.insert(
@@ -2019,7 +2027,7 @@ mod tests {
                     command: None,
                     args: Vec::new(),
                     env: HashMap::new(),
-                    enabled: true,
+                    enabled,
                     transport: plug_core::config::TransportType::Http,
                     protocol_mode: Default::default(),
                     url: Some("https://example.com/mcp".to_string()),

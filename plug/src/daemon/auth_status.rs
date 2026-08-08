@@ -23,10 +23,15 @@ pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse
     let status_map: std::collections::HashMap<&str, &plug_core::types::ServerStatus> =
         statuses.iter().map(|s| (s.server_id.as_str(), s)).collect();
 
+    // Disabled servers have no runtime presence, so the health fallback below
+    // would report them as degraded forever. Every other OAuth surface
+    // (`doctor`'s oauth_config/oauth_tokens checks, the engine's auth wiring)
+    // already filters on `enabled`; matching them keeps `auth status`, `doctor`,
+    // and `status` from contradicting each other.
     let mut oauth_servers: Vec<_> = config
         .servers
         .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth"))
+        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
         .collect();
     oauth_servers.sort_by_key(|(name, _)| (*name).clone());
 
@@ -66,7 +71,7 @@ mod tests {
     use super::*;
     use crate::daemon::tests::{
         auth_status_test_context, cleanup_temp_config, clear_store, seeded_credentials,
-        temp_config_path, write_oauth_config,
+        temp_config_path, write_oauth_config, write_oauth_config_with_enabled,
     };
     use rmcp::transport::auth::CredentialStore;
 
@@ -152,6 +157,35 @@ mod tests {
 
         let recovery = plug_core::oauth::get_or_create_store(&server_name).fallback_auth_snapshot();
         assert_eq!(recovery.source, Some("keyring"));
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&ctx.config_path);
+    }
+
+    /// A disabled OAuth server never gets a runtime status entry, so before
+    /// this filter existed the `has_creds` fallback reported it as `Degraded`
+    /// forever — `auth status` and `doctor` flagged a server `plug status` did
+    /// not even list.
+    #[tokio::test]
+    async fn auth_status_omits_disabled_servers_with_stored_credentials() {
+        let config_path = temp_config_path("auth-status-disabled");
+        let server_name = format!("oauth-disabled-{}", std::process::id());
+        write_oauth_config_with_enabled(&config_path, &[server_name.as_str()], false);
+
+        let store = plug_core::oauth::get_or_create_store(&server_name);
+        clear_store(&server_name).await;
+        store.save(seeded_credentials()).await.unwrap();
+
+        let ctx = auth_status_test_context(config_path);
+        let response = dispatch_auth_status(&ctx).await;
+        let IpcResponse::AuthStatus { servers } = response else {
+            panic!("expected auth status response");
+        };
+
+        assert!(
+            servers.is_empty(),
+            "disabled server leaked into auth status: {servers:?}"
+        );
 
         clear_store(&server_name).await;
         cleanup_temp_config(&ctx.config_path);
