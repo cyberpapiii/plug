@@ -1840,13 +1840,35 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
 
 fn accepts_html(headers: &HeaderMap) -> bool {
     headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|item| item.trim().starts_with("text/html"))
-        })
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(html_media_range_is_acceptable)
+}
+
+fn html_media_range_is_acceptable(value: &str) -> bool {
+    let mut parts = value.split(';');
+    if !parts
+        .next()
+        .is_some_and(|media_range| media_range.trim().eq_ignore_ascii_case("text/html"))
+    {
+        return false;
+    }
+
+    let mut quality = 1.0;
+    for parameter in parts {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("q") {
+            quality = match value.trim().parse::<f32>() {
+                Ok(quality) if (0.0..=1.0).contains(&quality) => quality,
+                _ => return false,
+            };
+        }
+    }
+    quality > 0.0
 }
 
 fn oauth_authorization_error_response(error: &DownstreamOauthError) -> Response {
@@ -5536,6 +5558,45 @@ mod tests {
         assert!(body.contains("<title>Plug authorization failed</title>"));
         assert!(body.contains("invalid_client"));
         assert!(body.contains("Try connecting again"));
+    }
+
+    #[test]
+    fn oauth_error_html_accept_rejects_zero_quality() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/html; q=0"),
+        );
+
+        assert!(!accepts_html(&headers));
+    }
+
+    #[test]
+    fn oauth_error_html_accept_rejects_lookalike_subtype() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_static("text/htmlx; q=1"));
+
+        assert!(!accepts_html(&headers));
+    }
+
+    #[test]
+    fn oauth_error_html_accept_matches_case_insensitively() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("Text/HTML; Charset=utf-8; Q=0.7"),
+        );
+
+        assert!(accepts_html(&headers));
+    }
+
+    #[test]
+    fn oauth_error_html_accept_checks_repeated_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::ACCEPT, HeaderValue::from_static("application/json"));
+        headers.append(header::ACCEPT, HeaderValue::from_static("text/html; q=0.5"));
+
+        assert!(accepts_html(&headers));
     }
 
     #[tokio::test]
