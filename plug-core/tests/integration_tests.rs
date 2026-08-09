@@ -4571,6 +4571,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         std::env::temp_dir().join(format!("plug-oauth-e2e-{}.json", uuid::Uuid::new_v4())),
     )
     .expect("isolated OAuth manager");
+    let approval_manager = manager.clone();
     let app = build_router(Arc::new(HttpState {
         router: engine.tool_router().clone(),
         sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
@@ -4661,27 +4662,18 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         .unwrap();
     let consent_html = String::from_utf8(consent_body.to_vec()).unwrap();
     let consent_id = consent_html
-        .split("name=\"consent_id\" value=\"")
+        .split("data-consent-id=\"")
         .nth(1)
         .and_then(|value| value.split('\"').next())
         .expect("consent ID");
-    let consent_req = HttpRequest::builder()
-        .method("POST")
-        .uri("/_plug/oauth/authorize")
-        .header(header::HOST, "127.0.0.1:3282")
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(Body::from(format!(
-            "consent_id={consent_id}&decision=approve"
-        )))
-        .unwrap();
-    let consent_resp = app.clone().oneshot(consent_req).await.unwrap();
-    assert!(consent_resp.status().is_redirection());
-    let redirect = consent_resp
-        .headers()
-        .get(header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .expect("redirect location");
-    let redirect = reqwest::Url::parse(redirect).expect("parse redirect URL");
+    // Public WebAuthn ceremony coverage lives in server router tests. This
+    // integration test continues from a manager-level grant to focus on the
+    // protected discovery and MCP-token boundary it owns.
+    let redirect = approval_manager
+        .decide_consent(consent_id, true)
+        .await
+        .expect("approve integration-test consent");
+    let redirect = reqwest::Url::parse(&redirect.location).expect("parse redirect URL");
     let code = redirect
         .query_pairs()
         .find(|(key, _)| key == "code")

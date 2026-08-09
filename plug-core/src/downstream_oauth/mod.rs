@@ -634,13 +634,6 @@ impl DownstreamOauthManager {
         format!("{}/oauth/register", self.base_url())
     }
 
-    pub fn local_consent_endpoint(&self) -> String {
-        format!(
-            "http://127.0.0.1:{}/_plug/oauth/authorize",
-            self.config.local_port
-        )
-    }
-
     #[cfg(test)]
     async fn persisted_state_version_for_tests(&self) -> u8 {
         self.state.lock().await.version
@@ -1088,28 +1081,6 @@ impl DownstreamOauthManager {
 
     pub async fn owner_enrolled(&self) -> bool {
         !self.state.lock().await.owner_credentials.is_empty()
-    }
-
-    pub fn local_approval_request_allowed(&self, headers: &axum::http::HeaderMap) -> bool {
-        if self.durability_degraded() {
-            return false;
-        }
-        if headers.contains_key("cf-connecting-ip")
-            || headers.contains_key("x-forwarded-for")
-            || headers.contains_key("forwarded")
-        {
-            return false;
-        }
-        let Some(host) = headers
-            .get(axum::http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-        else {
-            return false;
-        };
-        let expected_port = self.config.local_port.to_string();
-        host == format!("127.0.0.1:{expected_port}")
-            || host == format!("localhost:{expected_port}")
-            || host == format!("[::1]:{expected_port}")
     }
 
     pub async fn register_client(

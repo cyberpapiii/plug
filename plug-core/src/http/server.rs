@@ -27,7 +27,7 @@ use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_oauth::{
     AccessTokenClaims, AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest,
-    DownstreamOauthError, resource_scopes,
+    DownstreamOauthError, PublicKeyCredential, RegisterPublicKeyCredential, resource_scopes,
 };
 use crate::mcp_http_headers::{
     HEADER_MISMATCH_CODE, HeaderMismatch, inject_trace_context, validate_mirrored_headers,
@@ -691,7 +691,19 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         )
         .route("/oauth/register", post(oauth_register))
         .route("/oauth/authorize", get(oauth_authorize))
-        .route("/_plug/oauth/authorize", post(oauth_authorize_decision))
+        .route("/oauth/assets/consent.js", get(oauth_consent_javascript))
+        .route("/oauth/consent/challenge", post(oauth_consent_challenge))
+        .route("/oauth/consent/decision", post(oauth_consent_decision))
+        .route("/oauth/owner/enroll", get(oauth_owner_enroll))
+        .route("/oauth/assets/enroll.js", get(oauth_enroll_javascript))
+        .route(
+            "/oauth/owner/enroll/challenge",
+            post(oauth_owner_enroll_challenge),
+        )
+        .route(
+            "/oauth/owner/enroll/complete",
+            post(oauth_owner_enroll_complete),
+        )
         .route("/oauth/token", post(oauth_token))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state.clone());
@@ -751,9 +763,32 @@ struct OAuthAuthorizeParams {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct OAuthConsentDecision {
+struct OAuthConsentChallengeRequest {
     consent_id: String,
-    decision: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum OAuthConsentDecision {
+    Approve {
+        ceremony_id: String,
+        credential: PublicKeyCredential,
+    },
+    Deny {
+        consent_id: String,
+        csrf_token: String,
+    },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OAuthOwnerEnrollmentChallengeRequest {
+    bootstrap: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OAuthOwnerEnrollmentCompleteRequest {
+    ceremony_id: String,
+    credential: RegisterPublicKeyCredential,
 }
 
 /// Validate bearer token for non-loopback HTTP servers.
@@ -1624,41 +1659,7 @@ async fn oauth_authorize(
         })
         .await
     {
-        Ok(consent) => {
-            let scopes = html_escape(&consent.scopes.join(" "));
-            let local_consent_endpoint = manager.local_consent_endpoint();
-            let html = format!(
-                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Authorize Plug</title></head><body><main><h1>Authorize {}</h1><p><strong>{}</strong> wants access to Plug tools at <strong>{}</strong>.</p><p>Scope: <code>{}</code></p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"consent_id\" value=\"{}\"><button type=\"submit\" name=\"decision\" value=\"approve\">Allow</button><button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form><p><small>Approval is submitted directly to Plug on this Mac. Remote requests cannot approve access.</small></p></main></body></html>",
-                html_escape(&consent.client_name),
-                html_escape(&consent.client_name),
-                html_escape(&consent.redirect_host),
-                scopes,
-                html_escape(&local_consent_endpoint),
-                html_escape(&consent.consent_id),
-            );
-            let mut response = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                html,
-            )
-                .into_response();
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response.headers_mut().insert(
-                "X-Content-Type-Options",
-                HeaderValue::from_static("nosniff"),
-            );
-            if let Ok(csp) = HeaderValue::from_str(&format!(
-                "default-src 'none'; form-action {}; base-uri 'none'; frame-ancestors 'none'",
-                local_consent_endpoint
-            )) {
-                response
-                    .headers_mut()
-                    .insert("Content-Security-Policy", csp);
-            }
-            response
-        }
+        Ok(consent) => super::oauth_ui::consent_page(&consent, manager.owner_enrolled().await),
         Err(error) => {
             if !matches!(
                 error,
@@ -1687,49 +1688,142 @@ async fn oauth_authorize(
     }
 }
 
-async fn oauth_authorize_decision(
+async fn oauth_consent_javascript(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
-    decision: Result<Form<OAuthConsentDecision>, FormRejection>,
 ) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !manager.local_approval_request_allowed(&headers) {
-        return StatusCode::FORBIDDEN.into_response();
+    if !public_browser_request_allowed(manager, &headers, false) {
+        return oauth_forbidden_response();
     }
-    let Form(decision) = match decision {
+    super::oauth_ui::javascript_asset(super::oauth_ui::CONSENT_JAVASCRIPT)
+}
+
+async fn oauth_enroll_javascript(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !public_browser_request_allowed(manager, &headers, false) {
+        return oauth_forbidden_response();
+    }
+    super::oauth_ui::javascript_asset(super::oauth_ui::ENROLL_JAVASCRIPT)
+}
+
+async fn oauth_owner_enroll(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !public_browser_request_allowed(manager, &headers, false) {
+        return oauth_forbidden_response();
+    }
+    super::oauth_ui::enrollment_page()
+}
+
+async fn oauth_consent_challenge(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    request: Result<Json<OAuthConsentChallengeRequest>, JsonRejection>,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !public_browser_request_allowed(manager, &headers, true) {
+        return oauth_forbidden_response();
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
+    };
+    match manager.start_owner_approval(&request.consent_id).await {
+        Ok(challenge) => oauth_json_response(StatusCode::OK, challenge),
+        Err(error) => oauth_error_response(&error),
+    }
+}
+
+async fn oauth_consent_decision(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    decision: Result<Json<OAuthConsentDecision>, JsonRejection>,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !public_browser_request_allowed(manager, &headers, true) {
+        return oauth_forbidden_response();
+    }
+    let Json(decision) = match decision {
         Ok(decision) => decision,
-        Err(_) => {
-            return oauth_authorization_error_response(
-                &DownstreamOauthError::InvalidAuthorizationRequest,
-            );
-        }
+        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
     };
-    let approved = match decision.decision.as_str() {
-        "approve" => true,
-        "deny" => false,
-        _ => {
-            return oauth_authorization_error_response(
-                &DownstreamOauthError::InvalidAuthorizationRequest,
-            );
+    let result = match decision {
+        OAuthConsentDecision::Approve {
+            ceremony_id,
+            credential,
+        } => {
+            manager
+                .finish_owner_approval(&ceremony_id, credential)
+                .await
         }
+        OAuthConsentDecision::Deny {
+            consent_id,
+            csrf_token,
+        } => manager.deny_consent(&consent_id, &csrf_token).await,
     };
-    match manager.decide_consent(&decision.consent_id, approved).await {
-        Ok(redirect) => match HeaderValue::from_str(&redirect.location) {
-            Ok(location) => {
-                let mut response = StatusCode::FOUND.into_response();
-                response.headers_mut().insert(header::LOCATION, location);
-                response
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                response
-            }
-            Err(_) => oauth_authorization_error_response(&DownstreamOauthError::Persistence(
-                "invalid authorization redirect".to_string(),
-            )),
-        },
-        Err(error) => oauth_authorization_error_response(&error),
+    match result {
+        Ok(redirect) => {
+            oauth_json_response(StatusCode::OK, json!({ "redirect_uri": redirect.location }))
+        }
+        Err(error) => oauth_error_response(&error),
+    }
+}
+
+async fn oauth_owner_enroll_challenge(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    request: Result<Json<OAuthOwnerEnrollmentChallengeRequest>, JsonRejection>,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !public_browser_request_allowed(manager, &headers, true) {
+        return oauth_forbidden_response();
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidOwnerBootstrap),
+    };
+    match manager.start_owner_registration(&request.bootstrap).await {
+        Ok(challenge) => oauth_json_response(StatusCode::OK, challenge),
+        Err(error) => oauth_error_response(&error),
+    }
+}
+
+async fn oauth_owner_enroll_complete(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    request: Result<Json<OAuthOwnerEnrollmentCompleteRequest>, JsonRejection>,
+) -> Response {
+    let Some(manager) = &state.downstream_oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !public_browser_request_allowed(manager, &headers, true) {
+        return oauth_forbidden_response();
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidOwnerAssertion),
+    };
+    match manager
+        .finish_owner_registration(&request.ceremony_id, request.credential)
+        .await
+    {
+        Ok(credential) => oauth_json_response(StatusCode::OK, credential),
+        Err(error) => oauth_error_response(&error),
     }
 }
 
@@ -1796,17 +1890,18 @@ async fn oauth_token(
 
 fn oauth_error_response(error: &DownstreamOauthError) -> Response {
     let (status, code, description) = oauth_public_error(error);
-    let mut response = (
+    oauth_json_response(
         status,
-        Json(json!({
+        json!({
             "error": code,
             "error_description": description,
-        })),
+        }),
     )
-        .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+}
+
+fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
+    let mut response = (status, Json(payload)).into_response();
+    super::oauth_ui::apply_oauth_json_security_headers(&mut response);
     response
 }
 
@@ -1857,15 +1952,39 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
             "temporarily_unavailable",
             "The client registration limit was reached. Remove an unused connection, then try connecting again.",
         ),
+        DownstreamOauthError::OwnerNotEnrolled => (
+            StatusCode::BAD_REQUEST,
+            "owner_not_enrolled",
+            "Plug needs an owner passkey before it can approve connections. On the Mac running Plug, run `plug auth owner enroll`.",
+        ),
+        DownstreamOauthError::InvalidOwnerBootstrap => (
+            StatusCode::BAD_REQUEST,
+            "invalid_owner_bootstrap",
+            "This owner enrollment link is invalid, expired, or already used. On the Mac running Plug, run `plug auth owner enroll` again.",
+        ),
+        DownstreamOauthError::OwnerChallengeExpired => (
+            StatusCode::BAD_REQUEST,
+            "owner_challenge_expired",
+            "The passkey check expired. Try the approval once more while this connection request is open.",
+        ),
+        DownstreamOauthError::InvalidOwnerAssertion => (
+            StatusCode::BAD_REQUEST,
+            "owner_verification_failed",
+            "Plug could not verify that passkey. Try again with an enrolled owner passkey.",
+        ),
+        DownstreamOauthError::OwnerCredentialLimit => (
+            StatusCode::BAD_REQUEST,
+            "owner_credential_limit",
+            "Plug already has five owner passkeys. Remove one locally before enrolling another.",
+        ),
+        DownstreamOauthError::OwnerCredentialNotFound => (
+            StatusCode::BAD_REQUEST,
+            "owner_credential_not_found",
+            "That owner passkey is no longer enrolled. Try another owner passkey.",
+        ),
         DownstreamOauthError::InvalidResource
         | DownstreamOauthError::InvalidAuthorizationRequest
-        | DownstreamOauthError::MetadataFetch
-        | DownstreamOauthError::OwnerNotEnrolled
-        | DownstreamOauthError::InvalidOwnerBootstrap
-        | DownstreamOauthError::OwnerChallengeExpired
-        | DownstreamOauthError::InvalidOwnerAssertion
-        | DownstreamOauthError::OwnerCredentialLimit
-        | DownstreamOauthError::OwnerCredentialNotFound => (
+        | DownstreamOauthError::MetadataFetch => (
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "The authorization request could not be completed. Try connecting again from your MCP client.",
@@ -1913,29 +2032,48 @@ fn html_media_range_is_acceptable(value: &str) -> bool {
 
 fn oauth_authorization_error_response(error: &DownstreamOauthError) -> Response {
     let (status, code, description) = oauth_public_error(error);
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Plug authorization failed</title></head><body><main><h1>Plug authorization failed</h1><p><strong>Error: <code>{}</code></strong></p><p>{}</p></main></body></html>",
-        html_escape(code),
-        html_escape(description),
-    );
-    let mut response = (
-        status,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response();
+    super::oauth_ui::authorization_error_page(status, code, description)
+}
+
+fn oauth_forbidden_response() -> Response {
+    let mut response = StatusCode::FORBIDDEN.into_response();
+    super::oauth_ui::apply_oauth_json_security_headers(&mut response);
     response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        "X-Content-Type-Options",
-        HeaderValue::from_static("nosniff"),
-    );
-    response.headers_mut().insert(
-        "Content-Security-Policy",
-        HeaderValue::from_static("default-src 'none'; base-uri 'none'; frame-ancestors 'none'"),
-    );
-    response
+}
+
+fn public_browser_request_allowed(
+    manager: &crate::downstream_oauth::DownstreamOauthManager,
+    headers: &HeaderMap,
+    require_origin: bool,
+) -> bool {
+    if manager.durability_degraded() {
+        return false;
+    }
+    let Ok(base_url) = url::Url::parse(manager.base_url()) else {
+        return false;
+    };
+    let Some(host) = base_url.host_str() else {
+        return false;
+    };
+    let expected_host = match base_url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let mut hosts = headers.get_all(header::HOST).iter();
+    if hosts.next().and_then(|value| value.to_str().ok()) != Some(expected_host.as_str())
+        || hosts.next().is_some()
+    {
+        return false;
+    }
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let origin = origins.next().and_then(|value| value.to_str().ok());
+    if origins.next().is_some() {
+        return false;
+    }
+    if !require_origin && origin.is_none() {
+        return true;
+    }
+    origin == Some(base_url.origin().ascii_serialization().as_str())
 }
 
 fn registration_rate_key(headers: &HeaderMap) -> String {
@@ -1965,15 +2103,6 @@ fn oauth_authorization_error_redirect(
         "{redirect_uri}{}{query}",
         if redirect_uri.contains('?') { '&' } else { '?' }
     )
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 fn protected_resource_metadata_url(base_url: &str) -> String {
@@ -2838,6 +2967,7 @@ fn json_response_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
     use crate::proxy::RouterSnapshot;
     use axum::body::Body;
     use http::Request as HttpRequest;
@@ -2900,6 +3030,85 @@ mod tests {
             reverse_request_counter: AtomicU64::new(1),
             client_capabilities: DashMap::new(),
         })
+    }
+
+    async fn oauth_test_client(
+        manager: &crate::downstream_oauth::DownstreamOauthManager,
+        client_name: &str,
+    ) -> crate::downstream_oauth::ClientRegistrationResponse {
+        let redirect_uri = "https://client.example.com/callback";
+        manager
+            .register_client(
+                ClientRegistrationRequest {
+                    redirect_uris: vec![redirect_uri.to_string()],
+                    client_name: Some(client_name.to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "public-ui-test",
+            )
+            .await
+            .expect("register test client")
+    }
+
+    async fn oauth_test_consent(
+        manager: &crate::downstream_oauth::DownstreamOauthManager,
+        client_name: &str,
+    ) -> crate::downstream_oauth::ConsentRequest {
+        let redirect_uri = "https://client.example.com/callback";
+        let registration = oauth_test_client(manager, client_name).await;
+        manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &registration.client_id,
+                redirect_uri,
+                state: "public-ui-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: &manager.resource(),
+            })
+            .await
+            .expect("begin test authorization")
+    }
+
+    fn oauth_authorize_request(client_id: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("GET")
+            .uri(format!(
+                "/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=public-ui-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
+            ))
+            .header(header::HOST, "plug.example.com")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("authorization request")
+    }
+
+    async fn enroll_test_owner(
+        manager: &crate::downstream_oauth::DownstreamOauthManager,
+    ) -> BrowserAuthenticator {
+        let authenticator = BrowserAuthenticator::new();
+        let bootstrap = manager
+            .create_owner_bootstrap()
+            .await
+            .expect("create owner bootstrap");
+        let challenge = manager
+            .start_owner_registration(&bootstrap)
+            .await
+            .expect("start owner registration");
+        let response = authenticator.registration_response(
+            &challenge.public_key.challenge,
+            "plug.example.com",
+            "https://plug.example.com",
+            true,
+        );
+        manager
+            .finish_owner_registration(&challenge.ceremony_id, response)
+            .await
+            .expect("finish owner registration");
+        authenticator
     }
 
     fn oauth_tools_list_request(access_token: &str, session_id: &str) -> HttpRequest<Body> {
@@ -5631,12 +5840,555 @@ mod tests {
                 .headers()
                 .get("Content-Security-Policy")
                 .and_then(|value| value.to_str().ok()),
-            Some("default-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+            Some(
+                "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            )
         );
         let body = axum::body::to_bytes(response.into_body(), 10_000)
             .await
             .expect("OAuth error body");
         String::from_utf8(body.to_vec()).expect("OAuth error HTML")
+    }
+
+    fn assert_oauth_html_security_headers(response: &Response) {
+        for (name, expected) in [
+            (header::CACHE_CONTROL.as_str(), "no-store"),
+            (
+                "content-security-policy",
+                "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+            ("referrer-policy", "no-referrer"),
+            ("x-content-type-options", "nosniff"),
+            ("x-frame-options", "DENY"),
+        ] {
+            assert_eq!(
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "missing or wrong {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn consent_page_never_references_loopback_approval() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        enroll_test_owner(&manager).await;
+        let registration = oauth_test_client(&manager, "Matrix <Owner>").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+
+        let response = app
+            .oneshot(oauth_authorize_request(&registration.client_id))
+            .await
+            .expect("consent response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_oauth_html_security_headers(&response);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("consent body");
+        let body = String::from_utf8(body.to_vec()).expect("consent HTML");
+        assert!(!body.contains("127.0.0.1"));
+        assert!(!body.contains("localhost"));
+        assert!(!body.contains("/_plug/oauth/authorize"));
+        assert!(body.contains("/oauth/consent/challenge"));
+        assert!(body.contains("Allow Matrix &lt;Owner&gt; to use Plug?"));
+        assert!(body.contains("Unverified dynamically registered client"));
+        assert!(body.contains("https://client.example.com/callback"));
+        assert!(body.contains("https://plug.example.com/mcp"));
+        assert!(body.contains("tools:read"));
+        assert!(body.contains("This request expires in 5 minutes."));
+        assert!(body.contains("Allow with Touch ID or passkey"));
+    }
+
+    #[tokio::test]
+    async fn consent_page_without_owner_explains_setup_and_has_no_allow_action() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let registration = oauth_test_client(&manager, "Setup client").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+
+        let response = app
+            .oneshot(oauth_authorize_request(&registration.client_id))
+            .await
+            .expect("consent response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("consent body");
+        let body = String::from_utf8(body.to_vec()).expect("consent HTML");
+        assert!(body.contains("plug auth owner enroll"));
+        assert!(!body.contains("Allow with Touch ID or passkey"));
+    }
+
+    #[tokio::test]
+    async fn consent_page_shows_local_callback_hostname_and_port() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let redirect_uri = "http://127.0.0.1:8787/callback";
+        let registration = manager
+            .register_client(
+                ClientRegistrationRequest {
+                    redirect_uris: vec![redirect_uri.to_string()],
+                    client_name: Some("Local callback test".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "local-callback-ui-test",
+            )
+            .await
+            .expect("register local callback client");
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri(format!(
+                "/oauth/authorize?response_type=code&client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Fcallback&state=local-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp",
+                registration.client_id
+            ))
+            .header(header::HOST, "plug.example.com")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("local callback authorization request");
+        let response = build_router(oauth_test_state_with_manager(manager))
+            .oneshot(request)
+            .await
+            .expect("consent response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("consent body");
+        let body = String::from_utf8(body.to_vec()).expect("consent HTML");
+        assert!(body.contains("Callback: <strong>127.0.0.1:8787</strong>"));
+        assert!(body.contains("Local app callback:"));
+        assert!(body.contains("returns to <code>127.0.0.1:8787</code>"));
+    }
+
+    #[tokio::test]
+    async fn public_approval_requires_exact_origin_and_owner_assertion() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        enroll_test_owner(&manager).await;
+        let consent = oauth_test_consent(&manager, "Origin test").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+
+        for (host, origin) in [
+            ("plug.example.com", None),
+            ("plug.example.com", Some("https://evil.example.com")),
+            ("evil.example.com", Some("https://plug.example.com")),
+        ] {
+            let mut request = HttpRequest::builder()
+                .method("POST")
+                .uri("/oauth/consent/challenge")
+                .header(header::HOST, host)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            json!({"consent_id": consent.consent_id}).to_string(),
+                        ))
+                        .expect("challenge request"),
+                )
+                .await
+                .expect("challenge response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_post_rejects_duplicate_host_or_origin_headers() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        enroll_test_owner(&manager).await;
+        let consent = oauth_test_consent(&manager, "Duplicate header test").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+
+        for duplicate in [header::HOST, header::ORIGIN] {
+            let mut request = HttpRequest::builder()
+                .method("POST")
+                .uri("/oauth/consent/challenge")
+                .header(header::HOST, "plug.example.com")
+                .header(header::ORIGIN, "https://plug.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"consent_id": consent.consent_id}).to_string(),
+                ))
+                .expect("challenge request");
+            let duplicate_value = if duplicate == header::HOST {
+                "plug.example.com"
+            } else {
+                "https://plug.example.com"
+            };
+            request
+                .headers_mut()
+                .append(duplicate, HeaderValue::from_static(duplicate_value));
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("challenge response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_consent_challenge_uses_exact_same_origin_json_contract() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        enroll_test_owner(&manager).await;
+        let consent = oauth_test_consent(&manager, "Challenge test").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/challenge")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"consent_id": consent.consent_id}).to_string(),
+            ))
+            .expect("challenge request");
+
+        let response = app.oneshot(request).await.expect("challenge response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_oauth_html_security_headers(&response);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("challenge body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("challenge JSON");
+        assert!(
+            body["ceremony_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(body["public_key"]["challenge"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn public_denial_is_same_origin_json_and_idempotent() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let consent = oauth_test_consent(&manager, "Denial test").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let body = json!({
+            "decision": "deny",
+            "consent_id": consent.consent_id,
+            "csrf_token": consent.csrf_token,
+        })
+        .to_string();
+
+        let mut locations = Vec::new();
+        for _ in 0..2 {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/oauth/consent/decision")
+                .header(header::HOST, "plug.example.com")
+                .header(header::ORIGIN, "https://plug.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.clone()))
+                .expect("denial request");
+            let response = app.clone().oneshot(request).await.expect("denial response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("denial body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("denial JSON");
+            locations.push(
+                body["redirect_uri"]
+                    .as_str()
+                    .expect("redirect URI")
+                    .to_string(),
+            );
+        }
+        assert_eq!(locations[0], locations[1]);
+        assert!(locations[0].contains("error=access_denied"));
+        assert!(locations[0].contains("state=public-ui-state"));
+    }
+
+    #[tokio::test]
+    async fn public_approval_verifies_owner_and_replays_exact_redirect() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let mut authenticator = enroll_test_owner(&manager).await;
+        let consent = oauth_test_consent(&manager, "Approval test").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .expect("owner approval challenge");
+        let credential = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            "plug.example.com",
+            "https://plug.example.com",
+            true,
+        );
+        let body = json!({
+            "decision": "approve",
+            "ceremony_id": challenge.ceremony_id,
+            "credential": {
+                "id": credential.id,
+                "authenticatorData": credential.authenticator_data,
+                "signature": credential.signature,
+                "clientDataJSON": credential.client_data_json,
+                "userHandle": credential.user_handle,
+            },
+        })
+        .to_string();
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let mut locations = Vec::new();
+        for _ in 0..2 {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/oauth/consent/decision")
+                .header(header::HOST, "plug.example.com")
+                .header(header::ORIGIN, "https://plug.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.clone()))
+                .expect("approval request");
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("approval response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("approval body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("approval JSON");
+            locations.push(
+                body["redirect_uri"]
+                    .as_str()
+                    .expect("redirect URI")
+                    .to_string(),
+            );
+        }
+        assert_eq!(locations[0], locations[1]);
+        assert!(locations[0].starts_with("https://client.example.com/callback?code="));
+        assert!(locations[0].contains("state=public-ui-state"));
+    }
+
+    #[tokio::test]
+    async fn public_approval_challenge_survives_manager_restart() {
+        let state_path = std::env::temp_dir().join(format!(
+            "plug-oauth-public-restart-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let config = crate::downstream_oauth::DownstreamOauthConfig {
+            public_base_url: "https://plug.example.com".to_string(),
+            oauth_scopes: vec!["tools:read".to_string()],
+            local_port: 3282,
+        };
+        let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            config.clone(),
+            state_path.clone(),
+        )
+        .expect("restart test manager");
+        let mut authenticator = enroll_test_owner(&manager).await;
+        let consent = oauth_test_consent(&manager, "Restart test").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .expect("owner approval challenge");
+        let credential = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            "plug.example.com",
+            "https://plug.example.com",
+            true,
+        );
+        drop(manager);
+
+        let restarted = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            config,
+            state_path.clone(),
+        )
+        .expect("restarted manager");
+        let app = build_router(oauth_test_state_with_manager(restarted));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/decision")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "decision": "approve",
+                    "ceremony_id": challenge.ceremony_id,
+                    "credential": {
+                        "id": credential.id,
+                        "authenticatorData": credential.authenticator_data,
+                        "signature": credential.signature,
+                        "clientDataJSON": credential.client_data_json,
+                        "userHandle": credential.user_handle,
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("approval request");
+        let response = app.oneshot(request).await.expect("approval response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("approval body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("approval JSON");
+        assert!(
+            body["redirect_uri"]
+                .as_str()
+                .is_some_and(|uri| uri.starts_with("https://client.example.com/callback?code="))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn public_enrollment_routes_complete_signed_registration() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let bootstrap = manager
+            .create_owner_bootstrap()
+            .await
+            .expect("owner bootstrap");
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let page = HttpRequest::builder()
+            .method("GET")
+            .uri("/oauth/owner/enroll")
+            .header(header::HOST, "plug.example.com")
+            .body(Body::empty())
+            .expect("enrollment page request");
+        let page = app.clone().oneshot(page).await.expect("enrollment page");
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_oauth_html_security_headers(&page);
+        let page_body = axum::body::to_bytes(page.into_body(), 64 * 1024)
+            .await
+            .expect("enrollment page body");
+        assert!(!String::from_utf8_lossy(&page_body).contains(&bootstrap));
+
+        let challenge_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/owner/enroll/challenge")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"bootstrap": bootstrap}).to_string()))
+            .expect("registration challenge request");
+        let challenge_response = app
+            .clone()
+            .oneshot(challenge_request)
+            .await
+            .expect("registration challenge response");
+        assert_eq!(challenge_response.status(), StatusCode::OK);
+        let challenge_body = axum::body::to_bytes(challenge_response.into_body(), 64 * 1024)
+            .await
+            .expect("registration challenge body");
+        let challenge: serde_json::Value =
+            serde_json::from_slice(&challenge_body).expect("registration challenge JSON");
+        let ceremony_id = challenge["ceremony_id"].as_str().expect("ceremony ID");
+        let challenge_value = challenge["public_key"]["challenge"]
+            .as_str()
+            .expect("registration challenge");
+        let authenticator = BrowserAuthenticator::new();
+        let credential = authenticator.registration_response(
+            challenge_value,
+            "plug.example.com",
+            "https://plug.example.com",
+            true,
+        );
+        let credential = json!({
+            "id": credential.id,
+            "transports": credential.transports,
+            "attestationObject": credential.attestation_object,
+            "clientDataJSON": credential.client_data_json,
+        });
+        let complete_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/owner/enroll/complete")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"ceremony_id": ceremony_id, "credential": credential}).to_string(),
+            ))
+            .expect("registration complete request");
+        let complete_response = app
+            .oneshot(complete_request)
+            .await
+            .expect("registration complete response");
+        assert_eq!(complete_response.status(), StatusCode::OK);
+        let complete_body = axum::body::to_bytes(complete_response.into_body(), 64 * 1024)
+            .await
+            .expect("registration complete body");
+        let complete: serde_json::Value =
+            serde_json::from_slice(&complete_body).expect("registration complete JSON");
+        assert!(complete["credential_id"].as_str().is_some());
+        assert!(complete.get("passkey").is_none());
+    }
+
+    #[tokio::test]
+    async fn oauth_assets_are_first_party_immutable_and_legacy_route_is_gone() {
+        let app = build_router(oauth_test_state());
+        for path in ["/oauth/assets/consent.js", "/oauth/assets/enroll.js"] {
+            let request = HttpRequest::builder()
+                .method("GET")
+                .uri(path)
+                .header(header::HOST, "plug.example.com")
+                .body(Body::empty())
+                .expect("asset request");
+            let response = app.clone().oneshot(request).await.expect("asset response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/javascript; charset=utf-8")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=31536000, immutable")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok()),
+                Some(concat!("\"plug-", env!("CARGO_PKG_VERSION"), "\""))
+            );
+            for (name, expected) in [
+                (
+                    "content-security-policy",
+                    "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                ),
+                ("referrer-policy", "no-referrer"),
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+            ] {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "missing or wrong {name}"
+                );
+            }
+            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .expect("asset body");
+            let body = String::from_utf8(body.to_vec()).expect("JavaScript asset");
+            assert!(body.contains("navigator.credentials"));
+            assert!(!body.contains("operator_token"));
+            assert!(!body.contains("127.0.0.1"));
+            assert!(!body.contains("localhost"));
+        }
+
+        let legacy = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "127.0.0.1:3282")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("consent_id=unknown&decision=approve"))
+            .expect("legacy request");
+        let legacy = app.oneshot(legacy).await.expect("legacy response");
+        assert_eq!(legacy.status(), StatusCode::UNAUTHORIZED);
+        assert!(legacy.headers().get(header::LOCATION).is_none());
     }
 
     #[tokio::test]
@@ -5705,47 +6457,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_and_unknown_local_consent_use_hardened_html_but_remote_stays_forbidden() {
+    async fn malformed_and_unknown_public_consent_are_safe_and_wrong_origin_is_forbidden() {
         let app = build_router(oauth_test_state());
-        let malformed_local = HttpRequest::builder()
+        let malformed = HttpRequest::builder()
             .method("POST")
-            .uri("/_plug/oauth/authorize")
-            .header(header::HOST, "127.0.0.1:3282")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("consent_id=missing-decision"))
-            .unwrap();
-        let malformed_local = app.clone().oneshot(malformed_local).await.unwrap();
-        assert_eq!(malformed_local.status(), StatusCode::BAD_REQUEST);
-        let malformed_local = oauth_error_html(malformed_local).await;
-        assert!(malformed_local.contains("invalid_request"));
-        assert!(!malformed_local.contains("missing field"));
-
-        let unknown_local = HttpRequest::builder()
-            .method("POST")
-            .uri("/_plug/oauth/authorize")
-            .header(header::HOST, "127.0.0.1:3282")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("consent_id=unknown&decision=approve"))
-            .unwrap();
-        let unknown_local = app.clone().oneshot(unknown_local).await.unwrap();
-        assert_eq!(unknown_local.status(), StatusCode::BAD_REQUEST);
-        let unknown_local = oauth_error_html(unknown_local).await;
-        assert!(unknown_local.contains("invalid_request"));
-
-        let malformed_remote = HttpRequest::builder()
-            .method("POST")
-            .uri("/_plug/oauth/authorize")
+            .uri("/oauth/consent/decision")
             .header(header::HOST, "plug.example.com")
-            .header("cf-connecting-ip", "203.0.113.10")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("consent_id=missing-decision"))
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{not-json"))
             .unwrap();
-        let malformed_remote = app.oneshot(malformed_remote).await.unwrap();
-        assert_eq!(malformed_remote.status(), StatusCode::FORBIDDEN);
+        let malformed = app.clone().oneshot(malformed).await.unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let malformed = oauth_error_json(malformed).await;
+        assert_eq!(malformed["error"], "invalid_request");
+        assert!(!malformed.to_string().contains("not-json"));
+
+        let unknown = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/challenge")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"consent_id":"unknown"}"#))
+            .unwrap();
+        let unknown = app.clone().oneshot(unknown).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        let unknown = oauth_error_json(unknown).await;
+        assert_eq!(unknown["error"], "owner_not_enrolled");
+
+        let wrong_origin = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/decision")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://evil.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{not-json"))
+            .unwrap();
+        let wrong_origin = app.oneshot(wrong_origin).await.unwrap();
+        assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn local_consent_persistence_failure_is_hardened_and_nondisclosing() {
+    async fn public_consent_persistence_failure_is_hardened_and_nondisclosing() {
         let state_path = std::env::temp_dir().join(format!(
             "plug-oauth-http-persistence-test-{}.json",
             uuid::Uuid::new_v4()
@@ -5759,6 +6513,7 @@ mod tests {
             state_path.clone(),
         )
         .expect("isolated OAuth manager");
+        let mut authenticator = enroll_test_owner(&manager).await;
         let registration = manager
             .register_client(
                 ClientRegistrationRequest {
@@ -5786,26 +6541,51 @@ mod tests {
             })
             .await
             .expect("begin authorization");
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .expect("start owner approval");
+        let credential = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            "plug.example.com",
+            "https://plug.example.com",
+            true,
+        );
         std::fs::remove_file(&state_path).expect("remove state file");
         std::fs::create_dir(&state_path).expect("block state-file rename");
         let app = build_router(oauth_test_state_with_manager(manager));
         let request = HttpRequest::builder()
             .method("POST")
-            .uri("/_plug/oauth/authorize")
-            .header(header::HOST, "127.0.0.1:3282")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(format!(
-                "consent_id={}&decision=approve",
-                consent.consent_id
-            )))
+            .uri("/oauth/consent/decision")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "decision": "approve",
+                    "ceremony_id": challenge.ceremony_id,
+                    "credential": {
+                        "id": credential.id,
+                        "authenticatorData": credential.authenticator_data,
+                        "signature": credential.signature,
+                        "clientDataJSON": credential.client_data_json,
+                        "userHandle": credential.user_handle,
+                    }
+                })
+                .to_string(),
+            ))
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = oauth_error_html(response).await;
-        assert!(body.contains("server_error"));
-        assert!(!body.contains(state_path.to_string_lossy().as_ref()));
-        assert!(!body.contains("OAuth state persistence failed"));
+        let body = oauth_error_json(response).await;
+        assert_eq!(body["error"], "server_error");
+        assert!(
+            !body
+                .to_string()
+                .contains(state_path.to_string_lossy().as_ref())
+        );
+        assert!(!body.to_string().contains("OAuth state persistence failed"));
         std::fs::remove_dir(&state_path).expect("remove state blocker");
         let _ = std::fs::remove_file(state_path.with_extension("json.tmp"));
     }
@@ -6100,6 +6880,7 @@ mod tests {
             state_path.clone(),
         )
         .expect("lifecycle OAuth manager");
+        let mut authenticator = enroll_test_owner(&manager).await;
         let http_state = oauth_test_state_with_manager(manager.clone());
         let app = build_router(http_state.clone());
 
@@ -6126,6 +6907,7 @@ mod tests {
         let authorize_req = HttpRequest::builder()
             .method("GET")
             .uri(format!("/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=matrix-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp"))
+            .header(header::HOST, "plug.example.com")
             .body(Body::empty())
             .unwrap();
         let authorize_resp = app.clone().oneshot(authorize_req).await.unwrap();
@@ -6135,47 +6917,74 @@ mod tests {
             .expect("consent body");
         let consent_html = String::from_utf8(consent_body.to_vec()).expect("consent html");
         let consent_id = consent_html
-            .split("name=\"consent_id\" value=\"")
+            .split("data-consent-id=\"")
             .nth(1)
             .and_then(|value| value.split('\"').next())
             .expect("consent id");
-        let remote_approval = HttpRequest::builder()
+
+        let challenge_request = HttpRequest::builder()
             .method("POST")
-            .uri("/_plug/oauth/authorize")
+            .uri("/oauth/consent/challenge")
             .header(header::HOST, "plug.example.com")
-            .header("cf-connecting-ip", "203.0.113.10")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(Body::from(format!(
-                "consent_id={consent_id}&decision=approve"
-            )))
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"consent_id": consent_id}).to_string()))
             .unwrap();
-        let remote_response = app.clone().oneshot(remote_approval).await.unwrap();
-        assert_eq!(remote_response.status(), StatusCode::FORBIDDEN);
-        drop(remote_response);
+        let challenge_response = app.clone().oneshot(challenge_request).await.unwrap();
+        assert_eq!(challenge_response.status(), StatusCode::OK);
+        let challenge_body = axum::body::to_bytes(challenge_response.into_body(), 20_000)
+            .await
+            .expect("approval challenge body");
+        let challenge: serde_json::Value =
+            serde_json::from_slice(&challenge_body).expect("approval challenge JSON");
+        let ceremony_id = challenge["ceremony_id"]
+            .as_str()
+            .expect("approval ceremony ID");
+        let challenge_value = challenge["public_key"]["challenge"]
+            .as_str()
+            .expect("approval challenge");
+        let credential = authenticator.authentication_response(
+            challenge_value,
+            "plug.example.com",
+            "https://plug.example.com",
+            true,
+        );
 
         let consent_req = HttpRequest::builder()
             .method("POST")
-            .uri("/_plug/oauth/authorize")
-            .header(header::HOST, "127.0.0.1:3282")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(Body::from(format!(
-                "consent_id={consent_id}&decision=approve"
-            )))
+            .uri("/oauth/consent/decision")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "decision": "approve",
+                    "ceremony_id": ceremony_id,
+                    "credential": {
+                        "id": credential.id,
+                        "authenticatorData": credential.authenticator_data,
+                        "signature": credential.signature,
+                        "clientDataJSON": credential.client_data_json,
+                        "userHandle": credential.user_handle,
+                    }
+                })
+                .to_string(),
+            ))
             .unwrap();
         let consent_resp = app.clone().oneshot(consent_req).await.unwrap();
-        assert_eq!(consent_resp.status(), StatusCode::FOUND);
-        let location = consent_resp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .expect("redirect location");
+        assert_eq!(consent_resp.status(), StatusCode::OK);
+        let consent_body = axum::body::to_bytes(consent_resp.into_body(), 20_000)
+            .await
+            .expect("approval decision body");
+        let consent: serde_json::Value =
+            serde_json::from_slice(&consent_body).expect("approval decision JSON");
+        let location = consent["redirect_uri"].as_str().expect("redirect location");
         let code = location
             .split("code=")
             .nth(1)
             .and_then(|v| v.split('&').next())
             .expect("authorization code")
             .to_string();
-        drop(consent_resp);
 
         let token_req = HttpRequest::builder()
             .method("POST")
