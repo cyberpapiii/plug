@@ -496,6 +496,15 @@ impl DownstreamOauthManager {
         state_path: PathBuf,
         state_lock: std::fs::File,
     ) -> Result<Self, DownstreamOauthError> {
+        let state_dir = state_path
+            .parent()
+            .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
+        sync_parent_dir_with_retry(state_dir).map_err(|error| {
+            DownstreamOauthError::Persistence(format!(
+                "downstream OAuth startup directory sync failed for {}: {error}",
+                state_dir.display()
+            ))
+        })?;
         let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
         let state = load_persisted_state(&state_path)?;
         let principal_lifecycles = state
@@ -1449,7 +1458,8 @@ struct LegacyV2Lineage {
     version: u8,
     phase: LineagePhase,
     full_digest: String,
-    non_revocation_digest: String,
+    global_digest: String,
+    client_material_digests: HashMap<String, String>,
     revoked_client_ids: Vec<String>,
 }
 
@@ -1531,7 +1541,18 @@ fn reconcile_legacy_state(
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>();
-            if snapshot.lineage.non_revocation_digest != lineage.non_revocation_digest
+            let added_revocations = current_revoked
+                .difference(&baseline_revoked)
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut baseline_material = lineage.client_material_digests.clone();
+            let mut current_material = snapshot.lineage.client_material_digests.clone();
+            for client_id in &added_revocations {
+                baseline_material.remove(client_id);
+                current_material.remove(client_id);
+            }
+            if snapshot.lineage.global_digest != lineage.global_digest
+                || current_material != baseline_material
                 || !current_revoked.is_superset(&baseline_revoked)
             {
                 return Err(DownstreamOauthError::Persistence(
@@ -1541,13 +1562,14 @@ fn reconcile_legacy_state(
             }
 
             let mut current = load_persisted_state(current_path)?;
-            for client_id in current_revoked.difference(&baseline_revoked) {
+            for client_id in &added_revocations {
                 current.remove_client_material(client_id);
                 current.revoked_client_ids.insert(client_id.clone());
             }
             require_durable(persist_state(current_path, &current)?, current_path)?;
             lineage.full_digest = snapshot.lineage.full_digest;
-            lineage.non_revocation_digest = snapshot.lineage.non_revocation_digest;
+            lineage.global_digest = snapshot.lineage.global_digest;
+            lineage.client_material_digests = snapshot.lineage.client_material_digests;
             lineage.revoked_client_ids = snapshot.lineage.revoked_client_ids;
             require_durable(persist_lineage(&lineage_path, &lineage)?, &lineage_path)
         }
@@ -1562,7 +1584,7 @@ fn load_lineage(path: &std::path::Path) -> Result<Option<LegacyV2Lineage>, Downs
     };
     let lineage: LegacyV2Lineage = serde_json::from_slice(&data)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    if lineage.version != 1 {
+    if lineage.version != 2 {
         return Err(DownstreamOauthError::Persistence(
             "unsupported downstream OAuth migration lineage version".to_string(),
         ));
@@ -1600,18 +1622,84 @@ fn legacy_v2_snapshot(path: &std::path::Path) -> Result<LegacyV2Snapshot, Downst
     revoked_client_ids.sort();
     revoked_client_ids.dedup();
     let full_digest = canonical_json_digest(&value)?;
-    let mut without_revocations = value;
-    without_revocations["revoked_client_ids"] = serde_json::json!([]);
-    let non_revocation_digest = canonical_json_digest(&without_revocations)?;
+    let (global_digest, client_material_digests) = legacy_v2_material_digests(&value)?;
     Ok(LegacyV2Snapshot {
         lineage: LegacyV2Lineage {
-            version: 1,
+            version: 2,
             phase: LineagePhase::Complete,
             full_digest,
-            non_revocation_digest,
+            global_digest,
+            client_material_digests,
             revoked_client_ids,
         },
     })
+}
+
+fn legacy_v2_material_digests(
+    value: &serde_json::Value,
+) -> Result<(String, HashMap<String, String>), DownstreamOauthError> {
+    const MATERIAL_FIELDS: [&str; 6] = [
+        "clients",
+        "pending_consents",
+        "completed_consents",
+        "pending_codes",
+        "access_tokens",
+        "refresh_tokens",
+    ];
+
+    let mut client_ids = HashSet::new();
+    for field in MATERIAL_FIELDS {
+        let Some(records) = value.get(field).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        if field == "clients" {
+            client_ids.extend(records.keys().cloned());
+        } else {
+            client_ids.extend(records.values().filter_map(|record| {
+                record
+                    .get("client_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            }));
+        }
+    }
+
+    let mut global = value.clone();
+    global["revoked_client_ids"] = serde_json::json!([]);
+    for field in MATERIAL_FIELDS {
+        if global.get(field).is_some() {
+            global[field] = serde_json::json!({});
+        }
+    }
+
+    let mut client_material_digests = HashMap::new();
+    for client_id in client_ids {
+        let mut material = serde_json::Map::new();
+        for field in MATERIAL_FIELDS {
+            let Some(records) = value.get(field).and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            let records = records
+                .iter()
+                .filter(|(record_id, record)| {
+                    if field == "clients" {
+                        record_id.as_str() == client_id
+                    } else {
+                        record.get("client_id").and_then(serde_json::Value::as_str)
+                            == Some(client_id.as_str())
+                    }
+                })
+                .map(|(key, record)| (key.clone(), record.clone()))
+                .collect();
+            material.insert(field.to_string(), serde_json::Value::Object(records));
+        }
+        client_material_digests.insert(
+            client_id,
+            canonical_json_digest(&serde_json::Value::Object(material))?,
+        );
+    }
+
+    Ok((canonical_json_digest(&global)?, client_material_digests))
 }
 
 fn canonical_json_digest(value: &serde_json::Value) -> Result<String, DownstreamOauthError> {
@@ -2005,8 +2093,23 @@ mod tests {
                     "expires_at": now + 3600
                 }
             },
-            "access_tokens": {},
-            "refresh_tokens": {},
+            "access_tokens": {
+                "access-existing": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "issued_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "refresh_tokens": {
+                "refresh-existing": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "expires_at": now + 3600
+                }
+            },
             "revoked_client_ids": []
         });
         std::fs::write(
@@ -2038,6 +2141,18 @@ mod tests {
             .and_then(|metadata| metadata.modified())
             .expect("version 3 modification time");
 
+        rollback_state["clients"]
+            .as_object_mut()
+            .expect("version 2 clients")
+            .remove("plug_existing");
+        rollback_state["access_tokens"]
+            .as_object_mut()
+            .expect("version 2 access tokens")
+            .remove("access-existing");
+        rollback_state["refresh_tokens"]
+            .as_object_mut()
+            .expect("version 2 refresh tokens")
+            .remove("refresh-existing");
         rollback_state["revoked_client_ids"] = serde_json::json!(["plug_existing"]);
         std::fs::write(
             &legacy_path,
@@ -2343,6 +2458,13 @@ mod tests {
         let disk = load_persisted_state(&path).expect("read committed revocation");
         assert!(disk.revoked_client_ids.contains(&client.client_id));
         drop(manager);
+
+        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        let restart_error =
+            DownstreamOauthManager::new_with_state_path(test_config(), path.clone()).expect_err(
+                "restart must refuse service while directory durability remains uncertain",
+            );
+        assert!(restart_error.to_string().contains("startup directory sync"));
 
         let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
             .expect("restart from committed revocation");

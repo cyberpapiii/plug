@@ -6100,7 +6100,8 @@ mod tests {
             state_path.clone(),
         )
         .expect("lifecycle OAuth manager");
-        let app = build_router(oauth_test_state_with_manager(manager.clone()));
+        let http_state = oauth_test_state_with_manager(manager.clone());
+        let app = build_router(http_state.clone());
 
         let registration_req = HttpRequest::builder()
             .method("POST")
@@ -6150,6 +6151,7 @@ mod tests {
             .unwrap();
         let remote_response = app.clone().oneshot(remote_approval).await.unwrap();
         assert_eq!(remote_response.status(), StatusCode::FORBIDDEN);
+        drop(remote_response);
 
         let consent_req = HttpRequest::builder()
             .method("POST")
@@ -6171,7 +6173,9 @@ mod tests {
             .split("code=")
             .nth(1)
             .and_then(|v| v.split('&').next())
-            .expect("authorization code");
+            .expect("authorization code")
+            .to_string();
+        drop(consent_resp);
 
         let token_req = HttpRequest::builder()
             .method("POST")
@@ -6223,6 +6227,7 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("session ID")
             .to_string();
+        drop(initialize_resp);
 
         let list_req = oauth_tools_list_request(&access_token, &session_id);
         let list_resp = app.clone().oneshot(list_req).await.unwrap();
@@ -6278,13 +6283,23 @@ mod tests {
         assert_eq!(replayed_value["error"], "invalid_grant");
 
         drop(app);
+        http_state.cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&http_state) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial HTTP state fan-out tasks stop");
+        drop(http_state);
         drop(manager);
         let restarted = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),
             state_path.clone(),
         )
         .expect("restarted OAuth manager");
-        let restarted_app = build_router(oauth_test_state_with_manager(restarted.clone()));
+        let restarted_http_state = oauth_test_state_with_manager(restarted.clone());
+        let restarted_app = build_router(restarted_http_state.clone());
 
         let restarted_initialize = HttpRequest::builder()
             .method("POST")
@@ -6305,6 +6320,7 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("restarted session ID")
             .to_string();
+        drop(restarted_initialize);
         let restarted_list = restarted_app
             .clone()
             .oneshot(oauth_tools_list_request(
@@ -6314,6 +6330,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restarted_list.status(), StatusCode::OK);
+        drop(restarted_list);
 
         let refresh_after_restart = HttpRequest::builder()
             .method("POST")
@@ -6369,6 +6386,15 @@ mod tests {
             serde_json::from_slice(&revoked_body).expect("revoked access JSON");
         assert_eq!(revoked_value["error"]["code"], -32001);
 
+        restarted_http_state.cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&restarted_http_state) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restarted HTTP state fan-out tasks stop");
+        drop(restarted_http_state);
         drop(restarted);
         let after_revoke = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config,
