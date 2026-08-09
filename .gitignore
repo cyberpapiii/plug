@@ -5,3 +5,4 @@
 .DS_Store
 .continues-handoff.md
 .compound-engineering/*.local.yaml
+/.worktrees/
