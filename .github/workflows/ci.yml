@@ -50,6 +50,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  browser-oauth:
+    name: Browser OAuth
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p plug-mcp -p plug-test-harness --bins
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium webkit
+      - run: npm run test:e2e
+
   test-macos:
     name: Test (macos)
     needs: check
