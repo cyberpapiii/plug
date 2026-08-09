@@ -1,19 +1,32 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::OutputFormat;
 use crate::daemon;
 use crate::ui::{print_banner, print_info_line, print_success_line};
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{delete, get};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
+use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA, REFERRER_POLICY};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use tokio_util::sync::CancellationToken;
 
 const OPERATOR_LIVE_SESSIONS_PATH: &str = "/_plug/live-sessions";
 const OPERATOR_OAUTH_CLIENTS_PATH: &str = "/_plug/oauth/clients";
+const OPERATOR_OWNER_BOOTSTRAP_PATH: &str = "/_plug/oauth/owner/bootstrap";
+const OPERATOR_OWNER_CREDENTIALS_PATH: &str = "/_plug/oauth/owner/credentials";
+const OPERATOR_PROOF_PATH: &str = "/_plug/operator/proof";
+#[cfg(test)]
 const OPERATOR_TOKEN_HEADER: &str = "x-plug-operator-token";
+const OPERATOR_CLIENT_NONCE_HEADER: &str = "x-plug-operator-client-nonce";
+const OPERATOR_SERVER_NONCE_HEADER: &str = "x-plug-operator-server-nonce";
+const OPERATOR_PROOF_HEADER: &str = "x-plug-operator-proof";
+const OPERATOR_ALLOW_EMPTY_HEADER: &str = "x-plug-operator-allow-empty";
+const OPERATOR_PROOF_LIFETIME: Duration = Duration::from_secs(10);
+const MAX_OPERATOR_PROOFS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonQueryAvailability {
@@ -146,23 +159,46 @@ struct OperatorLiveSessionsResponse {
     sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
 }
 
-#[derive(Clone)]
 struct OperatorHttpState {
     http_state: Arc<plug_core::http::server::HttpState>,
     operator_token: Arc<str>,
+    loopback_authority: Arc<str>,
+    proofs: tokio::sync::Mutex<std::collections::HashMap<String, PendingOperatorProof>>,
+}
+
+struct PendingOperatorProof {
+    client_nonce: String,
+    method: String,
+    path: String,
+    allow_empty: bool,
+    expires_at: Instant,
+}
+
+#[derive(serde::Deserialize)]
+struct OperatorProofRequest {
+    client_nonce: String,
+    method: String,
+    path: String,
+    #[serde(default)]
+    allow_empty: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OperatorProofResponse {
+    server_nonce: String,
+    proof: String,
+}
+
+#[derive(serde::Serialize)]
+struct OwnerBootstrapResponse {
+    enrollment_url: String,
 }
 
 async fn operator_live_sessions(
     State(state): State<Arc<OperatorHttpState>>,
     headers: HeaderMap,
 ) -> Result<Json<OperatorLiveSessionsResponse>, StatusCode> {
-    let provided = headers
-        .get(OPERATOR_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !plug_core::auth::verify_auth_token(provided, &state.operator_token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    operator_proof_authorized(&state, &headers, "GET", OPERATOR_LIVE_SESSIONS_PATH, false).await?;
 
     let sessions = state
         .http_state
@@ -190,20 +226,297 @@ async fn operator_live_sessions(
     Ok(Json(OperatorLiveSessionsResponse { sessions }))
 }
 
-fn operator_authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(OPERATOR_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|provided| plug_core::auth::verify_auth_token(provided, expected))
+fn operator_hmac(token: &str, domain: &[u8], fields: &[&str]) -> String {
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac as _};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
+        .expect("HMAC accepts operator token of any size");
+    mac.update(&(domain.len() as u64).to_be_bytes());
+    mac.update(domain);
+    for field in fields {
+        mac.update(&(field.len() as u64).to_be_bytes());
+        mac.update(field.as_bytes());
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn operator_challenge_proof(
+    token: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    method: &str,
+    path: &str,
+    allow_empty: bool,
+) -> String {
+    let empty_intent = if allow_empty {
+        "allow-empty"
+    } else {
+        "preserve-one"
+    };
+    operator_hmac(
+        token,
+        b"plug-operator-server-proof-v1",
+        &[client_nonce, server_nonce, method, path, empty_intent],
+    )
+}
+
+fn operator_request_proof(
+    token: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    method: &str,
+    path: &str,
+    allow_empty: bool,
+) -> String {
+    let empty_intent = if allow_empty {
+        "allow-empty"
+    } else {
+        "preserve-one"
+    };
+    operator_hmac(
+        token,
+        b"plug-operator-request-proof-v1",
+        &[client_nonce, server_nonce, method, path, empty_intent],
+    )
+}
+
+fn operator_intent_allowed(method: &str, path: &str) -> bool {
+    match (method, path) {
+        ("GET", OPERATOR_LIVE_SESSIONS_PATH)
+        | ("GET", OPERATOR_OAUTH_CLIENTS_PATH)
+        | ("POST", OPERATOR_OWNER_BOOTSTRAP_PATH)
+        | ("GET", OPERATOR_OWNER_CREDENTIALS_PATH) => true,
+        ("DELETE", path) => [OPERATOR_OAUTH_CLIENTS_PATH, OPERATOR_OWNER_CREDENTIALS_PATH]
+            .iter()
+            .any(|prefix| {
+                path.strip_prefix(prefix)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .is_some_and(|segment| !segment.is_empty() && !segment.contains('/'))
+            }),
+        _ => false,
+    }
+}
+
+fn exact_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn operator_local_boundary_allowed(headers: &HeaderMap, expected_authority: &str) -> bool {
+    let host_matches = exact_header(headers, HOST.as_str()) == Some(expected_authority);
+    let forwarded = headers.contains_key("forwarded")
+        || headers.contains_key("x-forwarded-for")
+        || headers.contains_key("cf-connecting-ip");
+    host_matches && !forwarded
+}
+
+async fn operator_proof(
+    State(state): State<Arc<OperatorHttpState>>,
+    headers: HeaderMap,
+    Json(request): Json<OperatorProofRequest>,
+) -> Result<Response, StatusCode> {
+    if !operator_local_boundary_allowed(&headers, &state.loopback_authority) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if request.client_nonce.len() != 64
+        || !request
+            .client_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !operator_intent_allowed(&request.method, &request.path)
+        || (request.allow_empty
+            && !(request.method == "DELETE"
+                && request
+                    .path
+                    .starts_with(&format!("{OPERATOR_OWNER_CREDENTIALS_PATH}/"))))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let server_nonce = plug_core::auth::generate_auth_token();
+    let proof = operator_challenge_proof(
+        &state.operator_token,
+        &request.client_nonce,
+        &server_nonce,
+        &request.method,
+        &request.path,
+        request.allow_empty,
+    );
+    let now = Instant::now();
+    let mut proofs = state.proofs.lock().await;
+    proofs.retain(|_, pending| pending.expires_at > now);
+    if proofs.len() >= MAX_OPERATOR_PROOFS
+        && let Some(oldest) = proofs
+            .iter()
+            .min_by_key(|(_, pending)| pending.expires_at)
+            .map(|(nonce, _)| nonce.clone())
+    {
+        proofs.remove(&oldest);
+    }
+    proofs.insert(
+        server_nonce.clone(),
+        PendingOperatorProof {
+            client_nonce: request.client_nonce,
+            method: request.method,
+            path: request.path,
+            allow_empty: request.allow_empty,
+            expires_at: now + OPERATOR_PROOF_LIFETIME,
+        },
+    );
+    drop(proofs);
+    Ok(sensitive_json(OperatorProofResponse {
+        server_nonce,
+        proof,
+    }))
+}
+
+async fn operator_proof_authorized(
+    state: &OperatorHttpState,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    allow_empty: bool,
+) -> Result<(), StatusCode> {
+    if !operator_local_boundary_allowed(headers, &state.loopback_authority) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let client_nonce =
+        exact_header(headers, OPERATOR_CLIENT_NONCE_HEADER).ok_or(StatusCode::UNAUTHORIZED)?;
+    let server_nonce =
+        exact_header(headers, OPERATOR_SERVER_NONCE_HEADER).ok_or(StatusCode::UNAUTHORIZED)?;
+    let provided = exact_header(headers, OPERATOR_PROOF_HEADER).ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let pending = state
+        .proofs
+        .lock()
+        .await
+        .remove(server_nonce)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if pending.expires_at <= Instant::now()
+        || pending.client_nonce != client_nonce
+        || pending.method != method
+        || pending.path != path
+        || pending.allow_empty != allow_empty
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let expected = operator_request_proof(
+        &state.operator_token,
+        client_nonce,
+        server_nonce,
+        method,
+        path,
+        allow_empty,
+    );
+    if !plug_core::auth::verify_auth_token(provided, &expected) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+fn sensitive_json<T: serde::Serialize>(value: T) -> Response {
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    response
+}
+
+async fn operator_owner_bootstrap(
+    State(state): State<Arc<OperatorHttpState>>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    operator_proof_authorized(
+        &state,
+        &headers,
+        "POST",
+        OPERATOR_OWNER_BOOTSTRAP_PATH,
+        false,
+    )
+    .await?;
+    let manager = state
+        .http_state
+        .downstream_oauth
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let bootstrap = manager
+        .create_owner_bootstrap()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let enrollment_url = format!(
+        "{}/oauth/owner/enroll#bootstrap={bootstrap}",
+        manager.base_url()
+    );
+    Ok(sensitive_json(OwnerBootstrapResponse { enrollment_url }))
+}
+
+async fn operator_owner_credentials(
+    State(state): State<Arc<OperatorHttpState>>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    operator_proof_authorized(
+        &state,
+        &headers,
+        "GET",
+        OPERATOR_OWNER_CREDENTIALS_PATH,
+        false,
+    )
+    .await?;
+    let manager = state
+        .http_state
+        .downstream_oauth
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(sensitive_json(manager.list_owner_credentials().await))
+}
+
+async fn operator_remove_owner_credential(
+    State(state): State<Arc<OperatorHttpState>>,
+    AxumPath(credential_id): AxumPath<String>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> StatusCode {
+    let path = original_uri.path();
+    let allow_empty = exact_header(&headers, OPERATOR_ALLOW_EMPTY_HEADER) == Some("true");
+    if let Err(status) =
+        operator_proof_authorized(&state, &headers, "DELETE", &path, allow_empty).await
+    {
+        return status;
+    }
+    let Some(manager) = state.http_state.downstream_oauth.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
+    match manager
+        .remove_owner_credential(&credential_id, allow_empty)
+        .await
+    {
+        Ok(plug_core::downstream_oauth::RemoveOwnerCredentialOutcome::Removed) => {
+            StatusCode::NO_CONTENT
+        }
+        Ok(plug_core::downstream_oauth::RemoveOwnerCredentialOutcome::NotFound) => {
+            StatusCode::NOT_FOUND
+        }
+        Ok(
+            plug_core::downstream_oauth::RemoveOwnerCredentialOutcome::FinalCredentialConfirmationRequired,
+        ) => StatusCode::CONFLICT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 async fn operator_oauth_clients(
     State(state): State<Arc<OperatorHttpState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<plug_core::downstream_oauth::RegisteredClientSummary>>, StatusCode> {
-    if !operator_authorized(&headers, &state.operator_token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    operator_proof_authorized(&state, &headers, "GET", OPERATOR_OAUTH_CLIENTS_PATH, false).await?;
     let manager = state
         .http_state
         .downstream_oauth
@@ -215,10 +528,12 @@ async fn operator_oauth_clients(
 async fn operator_revoke_oauth_client(
     State(state): State<Arc<OperatorHttpState>>,
     AxumPath(client_id): AxumPath<String>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
 ) -> StatusCode {
-    if !operator_authorized(&headers, &state.operator_token) {
-        return StatusCode::UNAUTHORIZED;
+    let path = original_uri.path();
+    if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", &path, false).await {
+        return status;
     }
     let Some(manager) = state.http_state.downstream_oauth.as_ref() else {
         return StatusCode::NOT_FOUND;
@@ -249,21 +564,130 @@ async fn operator_revoke_oauth_client(
 fn build_runtime_router(
     http_state: Arc<plug_core::http::server::HttpState>,
     operator_token: Arc<str>,
+    loopback_authority: Arc<str>,
 ) -> Router {
     let operator_state = Arc::new(OperatorHttpState {
         http_state: http_state.clone(),
         operator_token,
+        loopback_authority,
+        proofs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let operator_router = Router::new()
         .route(OPERATOR_LIVE_SESSIONS_PATH, get(operator_live_sessions))
+        .route(OPERATOR_PROOF_PATH, post(operator_proof))
         .route(OPERATOR_OAUTH_CLIENTS_PATH, get(operator_oauth_clients))
+        .route(
+            OPERATOR_OWNER_BOOTSTRAP_PATH,
+            post(operator_owner_bootstrap),
+        )
+        .route(
+            OPERATOR_OWNER_CREDENTIALS_PATH,
+            get(operator_owner_credentials),
+        )
+        .route(
+            &format!("{OPERATOR_OWNER_CREDENTIALS_PATH}/{{credential_id}}"),
+            delete(operator_remove_owner_credential),
+        )
         .route(
             &format!("{OPERATOR_OAUTH_CLIENTS_PATH}/{{client_id}}"),
             delete(operator_revoke_oauth_client),
         )
+        .layer(DefaultBodyLimit::max(4 * 1024))
         .with_state(operator_state);
 
     plug_core::http::server::build_router(http_state).merge(operator_router)
+}
+
+pub(crate) fn local_operator_authority(bind_address: &str, port: u16) -> String {
+    if matches!(bind_address, "::1" | "[::1]" | "::" | "[::]") {
+        format!("[::1]:{port}")
+    } else {
+        format!("127.0.0.1:{port}")
+    }
+}
+
+pub(crate) fn local_operator_connection_authority(bind_address: &str, port: u16) -> String {
+    match bind_address {
+        "0.0.0.0" => format!("127.0.0.1:{port}"),
+        "::" | "[::]" => format!("[::1]:{port}"),
+        address if address.contains(':') => {
+            format!("[{}]:{port}", address.trim_matches(['[', ']']))
+        }
+        address => format!("{address}:{port}"),
+    }
+}
+
+pub(crate) async fn send_authenticated_operator_request(
+    client: &reqwest::Client,
+    endpoint: reqwest::Url,
+    host_authority: &str,
+    operator_token: &str,
+    method: reqwest::Method,
+    allow_empty: bool,
+) -> anyhow::Result<reqwest::Response> {
+    let method_name = method.as_str();
+    let path = endpoint.path().to_string();
+    if !operator_intent_allowed(method_name, &path) {
+        anyhow::bail!("invalid local operator request intent");
+    }
+    let client_nonce = plug_core::auth::generate_auth_token();
+    let mut proof_url = endpoint.clone();
+    proof_url.set_path(OPERATOR_PROOF_PATH);
+    proof_url.set_query(None);
+    proof_url.set_fragment(None);
+    let proof_response = client
+        .post(proof_url)
+        .header(reqwest::header::HOST, host_authority)
+        .json(&serde_json::json!({
+            "client_nonce": client_nonce,
+            "method": method_name,
+            "path": path.as_str(),
+            "allow_empty": allow_empty,
+        }))
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("could not authenticate local Plug service"))?;
+    if !proof_response.status().is_success() {
+        anyhow::bail!("could not authenticate local Plug service");
+    }
+    let proof_bytes = proof_response
+        .bytes()
+        .await
+        .map_err(|_| anyhow::anyhow!("could not authenticate local Plug service"))?;
+    if proof_bytes.len() > 4 * 1024 {
+        anyhow::bail!("could not authenticate local Plug service");
+    }
+    let challenge: OperatorProofResponse = serde_json::from_slice(&proof_bytes)
+        .map_err(|_| anyhow::anyhow!("could not authenticate local Plug service"))?;
+    let expected = operator_challenge_proof(
+        operator_token,
+        &client_nonce,
+        &challenge.server_nonce,
+        method_name,
+        &path,
+        allow_empty,
+    );
+    if !plug_core::auth::verify_auth_token(&challenge.proof, &expected) {
+        anyhow::bail!("could not authenticate local Plug service");
+    }
+    let request_proof = operator_request_proof(
+        operator_token,
+        &client_nonce,
+        &challenge.server_nonce,
+        method_name,
+        &path,
+        allow_empty,
+    );
+    let mut request = client
+        .request(method, endpoint)
+        .header(reqwest::header::HOST, host_authority)
+        .header(OPERATOR_CLIENT_NONCE_HEADER, client_nonce)
+        .header(OPERATOR_SERVER_NONCE_HEADER, challenge.server_nonce)
+        .header(OPERATOR_PROOF_HEADER, request_proof);
+    if allow_empty {
+        request = request.header(OPERATOR_ALLOW_EMPTY_HEADER, "true");
+    }
+    request.send().await.map_err(Into::into)
 }
 
 struct ConfiguredHttpRuntime {
@@ -341,7 +765,14 @@ fn build_configured_http_runtime(
     });
 
     Ok(ConfiguredHttpRuntime {
-        router: build_runtime_router(http_state, operator_token),
+        router: build_runtime_router(
+            http_state,
+            operator_token,
+            Arc::from(local_operator_authority(
+                &config.http.bind_address,
+                config.http.port,
+            )),
+        ),
         sessions,
     })
 }
@@ -383,15 +814,8 @@ fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
     } else {
         "http"
     };
-    let host = match http.bind_address.as_str() {
-        "0.0.0.0" | "::" | "[::]" => "localhost",
-        bind if plug_core::config::http_bind_is_loopback(bind) => "localhost",
-        bind => bind,
-    };
-    format!(
-        "{scheme}://{host}:{}{}",
-        http.port, OPERATOR_LIVE_SESSIONS_PATH
-    )
+    let authority = local_operator_connection_authority(&http.bind_address, http.port);
+    format!("{scheme}://{authority}{OPERATOR_LIVE_SESSIONS_PATH}")
 }
 
 async fn fetch_http_live_sessions(config_path: Option<&PathBuf>) -> LiveSessionSourceState {
@@ -400,11 +824,17 @@ async fn fetch_http_live_sessions(config_path: Option<&PathBuf>) -> LiveSessionS
         Err(_) => return LiveSessionSourceState::Unavailable,
     };
     let token_path = plug_core::auth::http_operator_token_path(config.http.port);
-    fetch_http_live_sessions_from(local_http_inventory_url(&config.http), &token_path).await
+    fetch_http_live_sessions_from(
+        local_http_inventory_url(&config.http),
+        local_operator_authority(&config.http.bind_address, config.http.port),
+        &token_path,
+    )
+    .await
 }
 
 async fn fetch_http_live_sessions_from(
     url: String,
+    host_authority: String,
     token_path: &std::path::Path,
 ) -> LiveSessionSourceState {
     let token = match std::fs::read_to_string(token_path) {
@@ -420,16 +850,26 @@ async fn fetch_http_live_sessions_from(
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(2))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build();
     let client = match client {
         Ok(client) => client,
         Err(_) => return LiveSessionSourceState::Unavailable,
     };
-    let response = client
-        .get(url)
-        .header(OPERATOR_TOKEN_HEADER, token)
-        .send()
-        .await;
+    let endpoint = match reqwest::Url::parse(&url) {
+        Ok(endpoint) => endpoint,
+        Err(_) => return LiveSessionSourceState::Unavailable,
+    };
+    let response = send_authenticated_operator_request(
+        &client,
+        endpoint,
+        &host_authority,
+        &token,
+        reqwest::Method::GET,
+        false,
+    )
+    .await;
     let response = match response {
         Ok(response) => response,
         Err(_) => return LiveSessionSourceState::Unavailable,
@@ -879,6 +1319,14 @@ pub(crate) async fn connect_via_daemon(
 pub(crate) fn auto_start_daemon(
     config_path: Option<&std::path::PathBuf>,
 ) -> anyhow::Result<std::process::Child> {
+    let mut cmd = daemon_start_command(config_path)?;
+    cmd.stderr(std::process::Stdio::null());
+    Ok(cmd.spawn()?)
+}
+
+fn daemon_start_command(
+    config_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<std::process::Command> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve").arg("--daemon");
@@ -892,10 +1340,36 @@ pub(crate) fn auto_start_daemon(
     }
 
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
 
-    Ok(cmd.spawn()?)
+    Ok(cmd)
+}
+
+async fn start_daemon_with_error_output(
+    config_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<bool> {
+    if daemon::connect_to_daemon().await.is_some() {
+        return Ok(false);
+    }
+    let mut command = daemon_start_command(config_path)?;
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    if let Err(startup_error) = wait_for_daemon_ready(Some(&mut child)).await {
+        use std::io::Read as _;
+        let mut stderr = String::new();
+        if let Some(mut stream) = child.stderr.take() {
+            let _ = stream.read_to_string(&mut stderr);
+        }
+        let stderr = stderr
+            .trim()
+            .strip_prefix("Error: ")
+            .unwrap_or(stderr.trim());
+        if !stderr.is_empty() {
+            anyhow::bail!(stderr.to_string());
+        }
+        return Err(startup_error);
+    }
+    Ok(true)
 }
 
 pub(crate) async fn wait_for_daemon_ready(
@@ -1027,7 +1501,7 @@ pub(crate) async fn cmd_start(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    let started = ensure_daemon_with_feedback(config_path, false).await?;
+    let started = start_daemon_with_error_output(config_path).await?;
 
     if matches!(output, OutputFormat::Json) {
         println!(
@@ -1214,6 +1688,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn local_operator_authority_matches_loopback_listener_family() {
+        assert_eq!(
+            local_operator_authority("127.0.0.1", 3282),
+            "127.0.0.1:3282"
+        );
+        assert_eq!(local_operator_authority("0.0.0.0", 3282), "127.0.0.1:3282");
+        assert_eq!(local_operator_authority("::1", 3282), "[::1]:3282");
+        assert_eq!(local_operator_authority("::", 3282), "[::1]:3282");
+        assert_eq!(
+            local_operator_connection_authority("192.0.2.10", 3282),
+            "192.0.2.10:3282"
+        );
+        assert_eq!(
+            local_operator_connection_authority("127.0.0.2", 3282),
+            "127.0.0.2:3282"
+        );
+        assert_eq!(
+            local_operator_connection_authority("2001:db8::10", 3282),
+            "[2001:db8::10]:3282"
+        );
     }
 
     #[test]
@@ -1425,7 +1922,11 @@ mod tests {
             reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
             client_capabilities: dashmap::DashMap::new(),
         });
-        let router = build_runtime_router(state, Arc::from("test-operator-token"));
+        let router = build_runtime_router(
+            state,
+            Arc::from("test-operator-token"),
+            Arc::from("127.0.0.1:3282"),
+        );
 
         let (addr, cancel, cert_der) = spawn_https_test_server(router)
             .await
@@ -2023,11 +2524,16 @@ mod tests {
             client_capabilities: dashmap::DashMap::new(),
         });
 
-        let app = build_runtime_router(state, Arc::from("expected-token"));
+        let app = build_runtime_router(
+            state,
+            Arc::from("expected-token"),
+            Arc::from("127.0.0.1:3282"),
+        );
         let response = app
             .oneshot(
                 Request::builder()
                     .uri(OPERATOR_LIVE_SESSIONS_PATH)
+                    .header("host", "127.0.0.1:3282")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -2066,17 +2572,19 @@ mod tests {
             client_capabilities: dashmap::DashMap::new(),
         });
 
-        let app = build_runtime_router(state, Arc::from("expected-token"));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(OPERATOR_LIVE_SESSIONS_PATH)
-                    .header(OPERATOR_TOKEN_HEADER, "expected-token")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let app = build_runtime_router(
+            state,
+            Arc::from("expected-token"),
+            Arc::from("127.0.0.1:3282"),
+        );
+        let response = proof_authenticated_request(
+            &app,
+            "GET",
+            OPERATOR_LIVE_SESSIONS_PATH,
+            "expected-token",
+            false,
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -2094,6 +2602,577 @@ mod tests {
             plug_core::types::ClientType::ClaudeDesktop
         );
         engine.shutdown().await;
+    }
+
+    async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
+        let engine = Arc::new(plug_core::engine::Engine::new(
+            plug_core::config::Config::default(),
+        ));
+        engine.start().await.expect("engine start");
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let state_path = unique_temp_dir("owner-operator").join("oauth.json");
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            plug_core::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: vec!["tools:read".to_string()],
+                local_port: 3282,
+            },
+            state_path.clone(),
+        )
+        .expect("OAuth manager");
+        let state = Arc::new(plug_core::http::server::HttpState {
+            router: engine.tool_router().clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(manager),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        (
+            build_runtime_router(state, Arc::from("operator-secret"), authority),
+            state_path,
+        )
+    }
+
+    async fn owner_operator_test_router() -> (Router, PathBuf) {
+        owner_operator_test_router_with_authority(Arc::from("127.0.0.1:3282")).await
+    }
+
+    async fn proof_authenticated_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        token: &str,
+        allow_empty: bool,
+    ) -> axum::response::Response {
+        let client_nonce = plug_core::auth::generate_auth_token();
+        let challenge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_PROOF_PATH)
+                    .header("host", "127.0.0.1:3282")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_nonce": client_nonce,
+                            "method": method,
+                            "path": path,
+                            "allow_empty": allow_empty,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("challenge request"),
+            )
+            .await
+            .expect("challenge response");
+        assert_eq!(challenge.status(), StatusCode::OK);
+        let challenge = serde_json::from_slice::<OperatorProofResponse>(
+            &to_bytes(challenge.into_body(), usize::MAX)
+                .await
+                .expect("challenge body"),
+        )
+        .expect("challenge JSON");
+        let proof = operator_request_proof(
+            token,
+            &client_nonce,
+            &challenge.server_nonce,
+            method,
+            path,
+            allow_empty,
+        );
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "127.0.0.1:3282")
+            .header(OPERATOR_CLIENT_NONCE_HEADER, client_nonce)
+            .header(OPERATOR_SERVER_NONCE_HEADER, challenge.server_nonce)
+            .header(OPERATOR_PROOF_HEADER, proof);
+        if allow_empty {
+            request = request.header(OPERATOR_ALLOW_EMPTY_HEADER, "true");
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).expect("operator request"))
+            .await
+            .expect("operator response")
+    }
+
+    #[tokio::test]
+    async fn owner_bootstrap_rejects_public_forwarded_request() {
+        let (app, state_path) = owner_operator_test_router().await;
+        for forwarded_header in ["forwarded", "x-forwarded-for", "cf-connecting-ip"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
+                        .header("host", "127.0.0.1:3282")
+                        .header(OPERATOR_TOKEN_HEADER, "operator-secret")
+                        .header(forwarded_header, "203.0.113.4")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn operator_request_proof_is_bound_to_nonce_intent_and_single_use() {
+        let (app, state_path) = owner_operator_test_router().await;
+        let client_nonce = "11".repeat(32);
+        let method = "POST";
+        let path = OPERATOR_OWNER_BOOTSTRAP_PATH;
+        let challenge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_PROOF_PATH)
+                    .header("host", "127.0.0.1:3282")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_nonce": client_nonce,
+                            "method": method,
+                            "path": path,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(challenge.status(), StatusCode::OK);
+        let body = to_bytes(challenge.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let challenge: OperatorProofResponse = serde_json::from_slice(&body).expect("proof JSON");
+        assert!(plug_core::auth::verify_auth_token(
+            &challenge.proof,
+            &operator_challenge_proof(
+                "operator-secret",
+                &client_nonce,
+                &challenge.server_nonce,
+                method,
+                path,
+                false,
+            )
+        ));
+
+        let request_proof = operator_request_proof(
+            "operator-secret",
+            &client_nonce,
+            &challenge.server_nonce,
+            method,
+            path,
+            false,
+        );
+        let authenticated = || {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "127.0.0.1:3282")
+                .header(OPERATOR_CLIENT_NONCE_HEADER, &client_nonce)
+                .header(OPERATOR_SERVER_NONCE_HEADER, &challenge.server_nonce)
+                .header(OPERATOR_PROOF_HEADER, &request_proof)
+                .body(Body::empty())
+                .expect("request")
+        };
+        let first = app
+            .clone()
+            .oneshot(authenticated())
+            .await
+            .expect("response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let replay = app.oneshot(authenticated()).await.expect("response");
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn operator_final_removal_intent_is_bound_into_request_proof() {
+        let (app, state_path) = owner_operator_test_router().await;
+        let client_nonce = "33".repeat(32);
+        let method = "DELETE";
+        let path = format!("{OPERATOR_OWNER_CREDENTIALS_PATH}/missing");
+        let challenge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_PROOF_PATH)
+                    .header("host", "127.0.0.1:3282")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_nonce": client_nonce,
+                            "method": method,
+                            "path": path,
+                            "allow_empty": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let challenge: OperatorProofResponse =
+            serde_json::from_slice(&to_bytes(challenge.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let proof = operator_request_proof(
+            "operator-secret",
+            &client_nonce,
+            &challenge.server_nonce,
+            method,
+            &path,
+            false,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("host", "127.0.0.1:3282")
+                    .header(OPERATOR_CLIENT_NONCE_HEADER, client_nonce)
+                    .header(OPERATOR_SERVER_NONCE_HEADER, challenge.server_nonce)
+                    .header(OPERATOR_PROOF_HEADER, proof)
+                    .header(OPERATOR_ALLOW_EMPTY_HEADER, "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn auth_owner_operator_http_e2e_bootstraps_and_lists_without_token_disclosure() {
+        plug_core::tls::ensure_rustls_provider_installed();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let authority = addr.to_string();
+        let (app, state_path) =
+            owner_operator_test_router_with_authority(Arc::from(authority.as_str())).await;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve operator router");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("HTTP client");
+
+        let bootstrap = send_authenticated_operator_request(
+            &client,
+            reqwest::Url::parse(&format!("http://{addr}{OPERATOR_OWNER_BOOTSTRAP_PATH}")).unwrap(),
+            &authority,
+            "operator-secret",
+            reqwest::Method::POST,
+            false,
+        )
+        .await
+        .expect("authenticated bootstrap");
+        assert_eq!(bootstrap.status(), reqwest::StatusCode::OK);
+        let bootstrap: serde_json::Value = bootstrap.json().await.expect("bootstrap JSON");
+        assert!(
+            bootstrap["enrollment_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://plug.example.com/oauth/owner/enroll#bootstrap=")
+        );
+
+        let list = send_authenticated_operator_request(
+            &client,
+            reqwest::Url::parse(&format!("http://{addr}{OPERATOR_OWNER_CREDENTIALS_PATH}"))
+                .unwrap(),
+            &authority,
+            "operator-secret",
+            reqwest::Method::GET,
+            false,
+        )
+        .await
+        .expect("authenticated list");
+        assert_eq!(list.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            list.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+
+        server.abort();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn operator_http_e2e_revokes_url_valued_metadata_client_and_its_token() {
+        plug_core::tls::ensure_rustls_provider_installed();
+        let state_path = unique_temp_dir("operator-cimd-revoke").join("oauth.json");
+        let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
+            public_base_url: "https://plug.example.com".to_string(),
+            oauth_scopes: vec!["tools:read".to_string()],
+            local_port: 3282,
+        };
+        let initial = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config.clone(),
+            state_path.clone(),
+        )
+        .expect("OAuth manager");
+        let registered = initial
+            .register_client(
+                plug_core::downstream_oauth::ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example/callback".to_string()],
+                    client_name: Some("metadata client".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "operator-cimd-revoke",
+            )
+            .await
+            .expect("register fixture client");
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let consent = initial
+            .begin_authorization(plug_core::downstream_oauth::AuthorizationRequest {
+                response_type: "code",
+                client_id: &registered.client_id,
+                redirect_uri: &registered.redirect_uris[0],
+                state: "operator-cimd-revoke-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = initial
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve fixture consent");
+        let code = reqwest::Url::parse(&redirect.location)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        let tokens = initial
+            .exchange_authorization_code(
+                &registered.client_id,
+                &code,
+                &registered.redirect_uris[0],
+                verifier,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("issue fixture token");
+        drop(initial);
+
+        let cimd_client_id = "https://client.example/oauth/metadata.json";
+        let persisted = std::fs::read_to_string(&state_path)
+            .expect("read persisted OAuth fixture")
+            .replace(&registered.client_id, cimd_client_id)
+            .replace("dynamic_registration", "metadata_document");
+        std::fs::write(&state_path, persisted).expect("write CIMD fixture");
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config,
+            state_path.clone(),
+        )
+        .expect("reopen CIMD fixture");
+
+        let engine = Arc::new(plug_core::engine::Engine::new(
+            plug_core::config::Config::default(),
+        ));
+        engine.start().await.expect("engine start");
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let state = Arc::new(plug_core::http::server::HttpState {
+            router: engine.tool_router().clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(manager.clone()),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind operator listener");
+        let addr = listener.local_addr().unwrap();
+        let authority = addr.to_string();
+        let app = build_runtime_router(
+            state,
+            Arc::from("operator-secret"),
+            Arc::from(authority.as_str()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut endpoint =
+            reqwest::Url::parse(&format!("http://{addr}{OPERATOR_OAUTH_CLIENTS_PATH}")).unwrap();
+        endpoint.path_segments_mut().unwrap().push(cimd_client_id);
+
+        let response = send_authenticated_operator_request(
+            &client,
+            endpoint,
+            &authority,
+            "operator-secret",
+            reqwest::Method::DELETE,
+            false,
+        )
+        .await
+        .expect("authenticated CIMD revocation");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(matches!(
+            manager
+                .validate_access_token_for(
+                    &tokens.access_token,
+                    &["tools:read".to_string()],
+                    &manager.resource(),
+                )
+                .await,
+            plug_core::downstream_oauth::AccessTokenValidation::Invalid
+        ));
+
+        server.abort();
+        engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(state_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn operator_owner_boundary_rejects_missing_token_and_non_loopback_host() {
+        let (app, state_path) = owner_operator_test_router().await;
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
+                    .header("host", "127.0.0.1:3282")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
+                    .header("host", "127.0.0.1:3282")
+                    .header(OPERATOR_TOKEN_HEADER, "wrong-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let public_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
+                    .header("host", "plug.example.com")
+                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(public_host.status(), StatusCode::FORBIDDEN);
+
+        let duplicate_host = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
+                    .header("host", "127.0.0.1:3282")
+                    .header("host", "127.0.0.1:3282")
+                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(duplicate_host.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn operator_owner_bootstrap_list_and_remove() {
+        let (app, state_path) = owner_operator_test_router().await;
+        let bootstrap = proof_authenticated_request(
+            &app,
+            "POST",
+            OPERATOR_OWNER_BOOTSTRAP_PATH,
+            "operator-secret",
+            false,
+        )
+        .await;
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+        assert_eq!(bootstrap.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(bootstrap.headers()[PRAGMA], "no-cache");
+        assert_eq!(bootstrap.headers()[REFERRER_POLICY], "no-referrer");
+        let body = to_bytes(bootstrap.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let enrollment_url = json["enrollment_url"].as_str().expect("enrollment URL");
+        assert!(
+            enrollment_url.starts_with("https://plug.example.com/oauth/owner/enroll#bootstrap=")
+        );
+        assert!(!enrollment_url.contains('?'));
+        assert!(!enrollment_url.contains("operator-secret"));
+
+        let list = proof_authenticated_request(
+            &app,
+            "GET",
+            OPERATOR_OWNER_CREDENTIALS_PATH,
+            "operator-secret",
+            false,
+        )
+        .await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = to_bytes(list.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!([])
+        );
+
+        let remove_path = format!("{OPERATOR_OWNER_CREDENTIALS_PATH}/missing");
+        let remove =
+            proof_authenticated_request(&app, "DELETE", &remove_path, "operator-secret", false)
+                .await;
+        assert_eq!(remove.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_file(state_path);
     }
 
     /// Minimal stdio mock-upstream `ServerConfig` with an `echo` tool.
@@ -2243,21 +3322,15 @@ mod tests {
             reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
             client_capabilities: dashmap::DashMap::new(),
         });
-        let app = build_runtime_router(http_state, Arc::from("operator-secret"));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!(
-                        "{OPERATOR_OAUTH_CLIENTS_PATH}/{}",
-                        client.client_id
-                    ))
-                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
-                    .body(Body::empty())
-                    .expect("revoke request"),
-            )
-            .await
-            .expect("revoke response");
+        let app = build_runtime_router(
+            http_state,
+            Arc::from("operator-secret"),
+            Arc::from("127.0.0.1:3282"),
+        );
+        let revoke_path = format!("{OPERATOR_OAUTH_CLIENTS_PATH}/{}", client.client_id);
+        let response =
+            proof_authenticated_request(&app, "DELETE", &revoke_path, "operator-secret", false)
+                .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let error = tool_router
@@ -2330,9 +3403,12 @@ mod tests {
         let dir = unique_temp_dir("missing-token");
         let token_path = dir.join("operator.token");
 
-        let state =
-            fetch_http_live_sessions_from("http://127.0.0.1:9/nowhere".to_string(), &token_path)
-                .await;
+        let state = fetch_http_live_sessions_from(
+            "http://127.0.0.1:9/nowhere".to_string(),
+            "127.0.0.1:9".to_string(),
+            &token_path,
+        )
+        .await;
 
         assert!(matches!(state, LiveSessionSourceState::Unavailable));
         std::fs::remove_dir_all(dir).expect("cleanup temp dir");
@@ -2344,9 +3420,12 @@ mod tests {
         let token_path = dir.join("operator.token");
         std::fs::write(&token_path, "\n").expect("write empty token");
 
-        let state =
-            fetch_http_live_sessions_from("http://127.0.0.1:9/nowhere".to_string(), &token_path)
-                .await;
+        let state = fetch_http_live_sessions_from(
+            "http://127.0.0.1:9/nowhere".to_string(),
+            "127.0.0.1:9".to_string(),
+            &token_path,
+        )
+        .await;
 
         assert!(matches!(state, LiveSessionSourceState::Unavailable));
         std::fs::remove_dir_all(dir).expect("cleanup temp dir");
@@ -2363,7 +3442,9 @@ mod tests {
         );
         let (url, handle) = spawn_http_test_server(app).await;
 
-        let state = fetch_http_live_sessions_from(url, &token_path).await;
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let authority = format!("127.0.0.1:{}", parsed.port().unwrap());
+        let state = fetch_http_live_sessions_from(url, authority, &token_path).await;
 
         handle.abort();
         assert!(matches!(state, LiveSessionSourceState::Unavailable));
@@ -2378,7 +3459,9 @@ mod tests {
         let app = Router::new().route(OPERATOR_LIVE_SESSIONS_PATH, get(|| async { "not-json" }));
         let (url, handle) = spawn_http_test_server(app).await;
 
-        let state = fetch_http_live_sessions_from(url, &token_path).await;
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let authority = format!("127.0.0.1:{}", parsed.port().unwrap());
+        let state = fetch_http_live_sessions_from(url, authority, &token_path).await;
 
         handle.abort();
         assert!(matches!(state, LiveSessionSourceState::Unavailable));

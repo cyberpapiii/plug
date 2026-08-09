@@ -1077,6 +1077,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 servers,
                 clients: ctx.client_registry.count(),
                 uptime_secs: ctx.started_at.elapsed().as_secs(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                 resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
             }
         }

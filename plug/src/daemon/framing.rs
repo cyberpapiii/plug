@@ -173,6 +173,7 @@ mod tests {
                 servers: vec![],
                 clients: 2,
                 uptime_secs: 100,
+                runtime_version: "test-version".to_string(),
                 resource_subscriptions: 0,
             };
             ipc::send_response(&mut w_server, &response).await.unwrap();

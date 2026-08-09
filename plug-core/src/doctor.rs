@@ -60,6 +60,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         pid,
         clients,
         http_auth,
+        downstream_oauth_owner,
         oauth_config,
         oauth_tokens,
         codesign,
@@ -74,6 +75,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_pid_staleness(),
         check_client_configs(),
         check_http_auth(config),
+        check_downstream_oauth_owner(config),
         check_oauth_config(config),
         check_oauth_tokens(config),
         check_codesign_identity(config),
@@ -94,12 +96,76 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         clients,
         connectivity,
         http_auth,
+        downstream_oauth_owner,
         oauth_config,
         oauth_tokens,
         codesign,
     ];
 
     DoctorReport::from_checks(checks)
+}
+
+async fn check_downstream_oauth_owner(config: &Config) -> CheckResult {
+    let state_dir = crate::config::config_dir().join("downstream_oauth");
+    check_downstream_oauth_owner_with_state_dir(config, &state_dir).await
+}
+
+async fn check_downstream_oauth_owner_with_state_dir(
+    config: &Config,
+    state_dir: &Path,
+) -> CheckResult {
+    let name = "downstream_oauth_owner".to_string();
+    let Some(oauth) =
+        crate::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
+    else {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "Downstream OAuth owner approval is not required".to_string(),
+            fix_suggestion: None,
+        };
+    };
+
+    match crate::downstream_oauth::inspect_owner_enrollment_in_dir(&oauth, state_dir) {
+        crate::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message:
+                "Downstream OAuth owner credential missing. Run `plug auth owner enroll`."
+                    .to_string(),
+            fix_suggestion: None,
+        },
+        crate::downstream_oauth::OwnerEnrollmentStatus::Enrolled { credential_count } => {
+            CheckResult {
+                name,
+                status: CheckStatus::Pass,
+                message: format!(
+                    "Downstream OAuth owner approval is ready ({credential_count} enrolled credentials)"
+                ),
+                fix_suggestion: None,
+            }
+        }
+        crate::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions => {
+            let path = crate::downstream_oauth::owner_enrollment_state_path_in_dir(&oauth, state_dir);
+            CheckResult {
+                name,
+                status: CheckStatus::Fail,
+                message: "Downstream OAuth owner state is visible to other local users. Plug will not treat owner approval as ready."
+                    .to_string(),
+                fix_suggestion: Some(format!("Run: chmod 600 {}", path.display())),
+            }
+        }
+        crate::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: "Downstream OAuth owner state could not be read safely. No new access can be approved."
+                .to_string(),
+            fix_suggestion: Some(
+                "Run `plug auth owner list`. If it fails, stop Plug and restore the downstream OAuth state from a trusted backup."
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 /// Check 1: config file exists and is valid TOML.
@@ -1457,6 +1523,122 @@ command = "example-server"
         );
     }
 
+    #[tokio::test]
+    async fn oauth_without_owner_credential_is_blocking() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "plug-doctor-owner-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
+        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
+
+        let result = check_downstream_oauth_owner_with_state_dir(&config, &state_dir).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.message,
+            "Downstream OAuth owner credential missing. Run `plug auth owner enroll`."
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn owner_credential_is_not_required_when_downstream_oauth_is_disabled() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "plug-doctor-owner-disabled-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let config = test_config();
+
+        let result = check_downstream_oauth_owner_with_state_dir(&config, &state_dir).await;
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(
+            result.message,
+            "Downstream OAuth owner approval is not required"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn corrupt_owner_state_fails_without_disclosing_state_contents() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "plug-doctor-owner-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
+        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
+        let oauth = crate::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
+            .expect("OAuth config");
+        let path = crate::downstream_oauth::owner_enrollment_state_path_in_dir(&oauth, &state_dir);
+        let secret = "refresh-token-that-must-not-appear";
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":3,"owner_credentials":{secret}}}"#),
+        )
+        .expect("write corrupt state");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("set owner-only permissions");
+        }
+
+        let result = check_downstream_oauth_owner_with_state_dir(&config, &state_dir).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.message,
+            "Downstream OAuth owner state could not be read safely. No new access can be approved."
+        );
+        assert!(!result.message.contains(secret));
+        assert!(
+            result
+                .fix_suggestion
+                .as_deref()
+                .is_some_and(|suggestion| suggestion.contains("plug auth owner list"))
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_state_permissions_have_an_exact_safe_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "plug-doctor-owner-permissions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
+        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
+        let oauth = crate::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
+            .expect("OAuth config");
+        let path = crate::downstream_oauth::owner_enrollment_state_path_in_dir(&oauth, &state_dir);
+        std::fs::write(&path, r#"{"version":3,"owner_credentials":{}}"#).expect("write state");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("weaken permissions");
+
+        let result = check_downstream_oauth_owner_with_state_dir(&config, &state_dir).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.fix_suggestion,
+            Some(format!("Run: chmod 600 {}", path.display()))
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     // -- check_oauth_tokens --
 
     #[tokio::test]
@@ -1776,6 +1958,6 @@ command = "example-server"
     async fn run_doctor_returns_all_checks() {
         let config = test_config();
         let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 14);
+        assert_eq!(report.checks.len(), 15);
     }
 }

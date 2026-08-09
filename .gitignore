@@ -5,3 +5,8 @@
 .DS_Store
 .continues-handoff.md
 .compound-engineering/*.local.yaml
+/.worktrees/
+/node_modules/
+/test-results/
+/playwright-report/
+/blob-report/

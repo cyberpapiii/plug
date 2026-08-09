@@ -122,7 +122,37 @@ refresh tokens. The former single-client `oauth_client_id`,
 `oauth_client_secret`, and shared redirect allowlist settings are intentionally
 unsupported; remove them and authorize each remote client again after upgrade.
 
-Operator endpoints use a separate `x-plug-operator-token` and are not protected by downstream MCP bearer/OAuth tokens. Treat the operator token as an administrative secret.
+### Owner passkeys — off-main candidate
+
+The owner-passkey workflow in this section `exists off-main` on
+`codex/oauth-owner-passkey-implementation`; use it only after that work merges
+and a signed build is installed. OAuth mode must have a public HTTPS
+`public_base_url` whose origin and hostname are the WebAuthn origin and RP ID.
+
+Enroll, inspect, or remove owner passkeys from the machine running Plug:
+
+```sh
+plug auth owner enroll
+plug auth owner enroll --no-browser
+plug auth owner list
+plug auth owner remove <credential-id>
+```
+
+Enrollment creates a single-use, five-minute bootstrap and normally opens the
+public HTTPS enrollment page. `--no-browser` prints that URL for manual opening;
+the bootstrap is carried in the URL fragment so it is not sent in the HTTP
+request. The passkey private key remains in the platform authenticator. Plug
+stores at most five owner public credentials. Removing the final credential
+requires explicit confirmation and leaves new downstream OAuth grants blocked
+until another owner passkey is enrolled.
+
+The candidate's operator endpoints are separate from downstream MCP
+bearer/OAuth authentication. Local CLI requests use a reusable owner-only token
+to calculate short-lived, single-use HMAC proofs bound to the exact method,
+path, nonces, and final-credential-removal intent. The reusable token is never
+sent in an HTTP request or URL and is not printed or logged. Operator requests
+also require Plug's exact local listener authority and reject forwarded
+requests.
 
 ## Upstream OAuth
 
@@ -177,7 +207,7 @@ Operator inventory:
 
 - `plug tools --output json` includes source metadata, trust boundary, upstream-declared annotations, Plug-inferred annotations, and effective annotations.
 - `plug servers --output json` includes configured transport/auth/trust metadata without serializing secrets.
-- `/_plug/live-sessions` exposes active session inventory for local operator tooling and requires `x-plug-operator-token`.
+- `/_plug/live-sessions` exposes active session inventory for local operator tooling. On the off-main owner-passkey candidate it requires the local HMAC request-proof exchange described above; current `main` uses its existing operator-token contract.
 
 ## Stdio Upstream Sandboxing
 

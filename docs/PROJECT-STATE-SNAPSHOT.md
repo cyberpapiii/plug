@@ -104,13 +104,22 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-No roadmap-relevant cross-client downstream OAuth work currently exists
-off-main. PR #83 merged the reliability work into `main`, including
-capability-superset CIMD compatibility, retry-safe local consent, actionable
-OAuth errors, and full automated DCR lifecycle coverage. Focused coverage keeps
-remote consent POST forbidden and authorization-code replay at `invalid_grant`.
-Live HTTPS CIMD client certification remains a manual pending gate; it is not
-part of the automated lifecycle proof.
+`exists off-main`: branch `codex/oauth-owner-passkey-implementation` adds public
+HTTPS owner-passkey verification to downstream OAuth consent and persists the
+authorization request, passkey ceremony, and completed decision so approval is
+restart-safe and replay-safe. Owner enrollment and credential administration
+run through local-only, proof-authenticated operator requests. The reviewed
+implementation head is `07c5c14`.
+
+The real-process Playwright suite proves the full Chromium path through owner
+enrollment, passkey approval, PKCE exchange, MCP use, refresh rotation, restart,
+and revocation. Chromium and WebKit both prove the shared public-HTTPS page,
+origin, security-header, denial, expiry, restart, error, and redaction behavior.
+Playwright WebKit does not expose a virtual authenticator, so a real WebKit
+platform-passkey ceremony remains a manual signed-build gate. Live certification
+also remains pending for each named client; this branch does not claim current
+Claude, ChatGPT, Codex, Cursor, or OpenCode approval. No signed build from this
+branch has been installed.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era
@@ -120,6 +129,16 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 (`ttlMs: 0`, `cacheScope: private`) for modern peers; legacy responses strip them.
 
 ## Release Status
+
+The owner-verified downstream OAuth candidate `exists off-main`; it is not a
+current release. Fresh implementation-head verification passed 1,101 serial
+workspace tests, formatting, clippy, Rust 1.88 MSRV compilation, dependency
+policy and advisory checks, secret/SAST/vulnerability scans, both Linux CI
+target checks, 5 real-process browser tests with 1 intentional WebKit
+virtual-authenticator skip, and the release binary size gate. It still requires
+exact-head CI, manual WebKit platform-passkey proof in a signed build, live
+named-client certification, merge to `main`, and signed installation before it
+can be described as released.
 
 The cross-client downstream OAuth reliability work is done on `main` through
 PR #83. Its automated release gates passed: 1,021 workspace tests, clippy, and

@@ -93,6 +93,18 @@ Live HTTPS CIMD client certification remains a manual pending gate. It is not
 part of the automated lifecycle proof and is complete only when a live remote
 client finishes consent, callback, token exchange, and MCP connection.
 
+`exists off-main`: `codex/oauth-owner-passkey-implementation` adds public HTTPS
+owner-passkey consent, durable authorization transactions, and local
+proof-authenticated owner administration. Its implementation head passed the
+full Rust, browser, security, MSRV, cross-target, dependency-policy, and binary
+size gates. Chromium has complete automated enrollment-to-revocation proof;
+WebKit shares automated rendering, origin, header, denial, expiry, restart,
+error, and redaction coverage, but Playwright WebKit cannot automate a platform
+passkey ceremony. Remaining release work is exact-head CI, a signed-build WebKit
+platform-passkey check, live certification of each named client, merge to
+`main`, and signed installation. Until those gates pass, this work is not done
+on `main` and no vendor client is certified.
+
 The July 17 downstream OAuth cutover supersedes the older single-client
 allowlist and secretless-client guard described in the historical entries
 below. Current behavior is dynamic multi-client registration plus Client ID

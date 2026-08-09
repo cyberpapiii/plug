@@ -522,6 +522,9 @@ pub enum IpcResponse {
         servers: Vec<ServerStatus>,
         clients: usize,
         uptime_secs: u64,
+        /// Version of the binary hosting this daemon process.
+        #[serde(default)]
+        runtime_version: String,
         /// Resource URIs with at least one downstream subscriber.
         ///
         /// Defaulted so a newer CLI still reads an older daemon's response,
@@ -898,6 +901,7 @@ mod tests {
                 servers: vec![],
                 clients: 0,
                 uptime_secs: 42,
+                runtime_version: "0.3.0".to_string(),
                 resource_subscriptions: 3,
             },
             IpcResponse::Tools {

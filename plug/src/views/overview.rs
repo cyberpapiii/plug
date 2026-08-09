@@ -71,6 +71,82 @@ fn live_inventory_summary(inventory: &crate::runtime::LiveInventoryMetadata) -> 
     }
 }
 
+fn owner_approval_state(
+    config: &plug_core::config::Config,
+) -> Option<plug_core::downstream_oauth::OwnerEnrollmentStatus> {
+    plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
+        .map(|oauth| plug_core::downstream_oauth::inspect_owner_enrollment(&oauth))
+}
+
+fn owner_approval_summary(
+    status: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
+) -> Option<String> {
+    match status {
+        None => None,
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled) => {
+            Some("setup required".to_string())
+        }
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::Enrolled { credential_count }) => {
+            Some(format!("enrolled ({credential_count} credentials)"))
+        }
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions) => {
+            Some("unsafe state permissions".to_string())
+        }
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable) => {
+            Some("state unavailable".to_string())
+        }
+    }
+}
+
+fn owner_approval_json(
+    status: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
+) -> serde_json::Value {
+    match status {
+        None => serde_json::Value::Null,
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled) => {
+            serde_json::json!({"status": "setup_required", "credential_count": 0})
+        }
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::Enrolled { credential_count }) => {
+            serde_json::json!({
+                "status": "enrolled",
+                "credential_count": credential_count,
+            })
+        }
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions) => {
+            serde_json::json!({"status": "unsafe_state_permissions", "credential_count": null})
+        }
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable) => {
+            serde_json::json!({"status": "state_unavailable", "credential_count": null})
+        }
+    }
+}
+
+fn overview_next_actions(
+    config_exists: bool,
+    linked_clients_empty: bool,
+    daemon_running: bool,
+    owner_approval: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
+) -> Vec<&'static str> {
+    if !config_exists {
+        vec!["plug setup"]
+    } else {
+        match owner_approval {
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled) => {
+                vec!["plug auth owner enroll", "plug doctor"]
+            }
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable) => {
+                vec!["plug doctor", "plug auth owner list"]
+            }
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions) => {
+                vec!["plug doctor"]
+            }
+            _ if linked_clients_empty => vec!["plug link", "plug status"],
+            _ if daemon_running => vec!["plug status", "plug doctor"],
+            _ => vec!["plug status", "plug doctor", "plug repair"],
+        }
+    }
+}
+
 fn overview_json(
     config_exists: bool,
     config_path: &std::path::Path,
@@ -79,6 +155,7 @@ fn overview_json(
     linked_clients: &[String],
     inventory: &crate::runtime::LiveInventoryMetadata,
     live_client_support: LiveClientSupport,
+    owner_approval: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
     next_actions: &[&str],
 ) -> serde_json::Value {
     serde_json::json!({
@@ -97,6 +174,7 @@ fn overview_json(
         "inventory_partial": inventory.availability.partial,
         "inventory_unavailable_sources": inventory.availability.unavailable_sources,
         "http_sessions_included": inventory.http_sessions_included,
+        "owner_approval": owner_approval_json(owner_approval),
         "next_actions": next_actions,
     })
 }
@@ -153,6 +231,13 @@ pub(crate) async fn cmd_overview(
             None
         };
         let server_count = config.as_ref().map(|c| c.servers.len()).unwrap_or(0);
+        let owner_approval = config.as_ref().and_then(owner_approval_state);
+        let next_actions = overview_next_actions(
+            config_exists,
+            linked_clients.is_empty(),
+            daemon_running,
+            owner_approval,
+        );
         println!(
             "{}",
             serde_json::to_string_pretty(&overview_json(
@@ -163,15 +248,8 @@ pub(crate) async fn cmd_overview(
                 &linked_clients,
                 &inventory,
                 live_client_support,
-                if !config_exists {
-                    &["plug setup"]
-                } else if linked_clients.is_empty() {
-                    &["plug link", "plug status"]
-                } else if daemon_running {
-                    &["plug status", "plug doctor"]
-                } else {
-                    &["plug status", "plug doctor", "plug repair"]
-                },
+                owner_approval,
+                &next_actions,
             ))?
         );
         return Ok(());
@@ -205,6 +283,7 @@ pub(crate) async fn cmd_overview(
                 acc
             });
     let downstream_auth_mode = config.http.auth_mode.label();
+    let owner_approval = owner_approval_state(&config);
     let downstream_http_endpoint = configured_http_export_url(Some(&config_path))
         .unwrap_or_else(|| format!("http://localhost:{}/mcp", config.http.port));
     let downstream_auth_summary = match config.http.auth_mode {
@@ -270,6 +349,24 @@ pub(crate) async fn cmd_overview(
     if let Some(public_base_url) = &config.http.public_base_url {
         print_label_value("Public URL", public_base_url);
     }
+    if let Some(summary) = owner_approval_summary(owner_approval) {
+        let value = match owner_approval {
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::Enrolled { .. }) => {
+                style(summary).green().bold()
+            }
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled) => {
+                style(summary).yellow().bold()
+            }
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable) => {
+                style(summary).red().bold()
+            }
+            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions) => {
+                style(summary).red().bold()
+            }
+            None => unreachable!("summary exists only for downstream OAuth"),
+        };
+        print_label_value("Owner approval", value);
+    }
 
     if !linked_clients.is_empty() {
         let linked_transport_summary = linked_clients
@@ -315,7 +412,30 @@ pub(crate) async fn cmd_overview(
 
     println!();
     print_heading("Next");
-    if linked_clients.is_empty() {
+    if matches!(
+        owner_approval,
+        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled)
+    ) {
+        print_next_action(
+            1,
+            "plug auth owner enroll",
+            "Finish owner setup before connecting",
+        );
+        print_next_action(2, "plug doctor", "Verify connection prerequisites");
+    } else if matches!(
+        owner_approval,
+        Some(
+            plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable
+                | plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions
+        )
+    ) {
+        print_next_action(1, "plug doctor", "Inspect owner state safely");
+        print_next_action(
+            2,
+            "plug auth owner list",
+            "Confirm whether owner passkeys can be read",
+        );
+    } else if linked_clients.is_empty() {
         print_next_action(1, "plug link", "Link plug to your AI clients");
         print_next_action(2, "plug status", "Check runtime health");
     } else if daemon_running {
@@ -404,14 +524,23 @@ pub(crate) async fn cmd_status(
                 servers,
                 clients,
                 uptime_secs,
+                runtime_version,
                 resource_subscriptions,
-            } => Some((servers, clients, uptime_secs, resource_subscriptions)),
+            } => Some((
+                servers,
+                clients,
+                uptime_secs,
+                runtime_version,
+                resource_subscriptions,
+            )),
             _ => None,
         },
     )
     .await;
 
-    if let Some((servers, clients, uptime_secs, resource_subscriptions)) = live_status {
+    if let Some((servers, clients, uptime_secs, runtime_version, resource_subscriptions)) =
+        live_status
+    {
         let (live_sessions, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live_sessions, live_inventory_scope);
@@ -590,6 +719,7 @@ pub(crate) async fn cmd_status(
                 daemon_running,
                 resource_subscriptions,
             );
+            json_obj["runtime_version"] = serde_json::json!(runtime_version);
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
                     linked_clients
@@ -711,7 +841,7 @@ pub(crate) async fn cmd_status(
 mod tests {
     use super::{
         live_client_count_scope_text, live_inventory_scope_label, live_inventory_summary,
-        overview_json, status_json,
+        overview_json, overview_next_actions, owner_approval_summary, status_json,
     };
     use crate::runtime::{
         LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts,
@@ -743,6 +873,11 @@ mod tests {
             &linked,
             &inventory,
             crate::runtime::LiveClientSupport::Supported,
+            Some(
+                plug_core::downstream_oauth::OwnerEnrollmentStatus::Enrolled {
+                    credential_count: 2,
+                },
+            ),
             &["plug status"],
         );
 
@@ -752,6 +887,49 @@ mod tests {
         assert_eq!(json["live_client_scope"], "transport_complete");
         assert_eq!(json["inventory_partial"], false);
         assert_eq!(json["http_sessions_included"], true);
+        assert_eq!(json["owner_approval"]["status"], "enrolled");
+        assert_eq!(json["owner_approval"]["credential_count"], 2);
+    }
+
+    #[test]
+    fn owner_approval_summary_is_actionable_without_exposing_credentials() {
+        assert_eq!(
+            owner_approval_summary(Some(
+                plug_core::downstream_oauth::OwnerEnrollmentStatus::Enrolled {
+                    credential_count: 3,
+                }
+            )),
+            Some("enrolled (3 credentials)".to_string())
+        );
+        assert_eq!(
+            owner_approval_summary(Some(
+                plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled
+            )),
+            Some("setup required".to_string())
+        );
+        assert_eq!(owner_approval_summary(None), None);
+    }
+
+    #[test]
+    fn owner_readiness_blocks_less_useful_overview_actions() {
+        assert_eq!(
+            overview_next_actions(
+                true,
+                false,
+                true,
+                Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled),
+            ),
+            vec!["plug auth owner enroll", "plug doctor"]
+        );
+        assert_eq!(
+            overview_next_actions(
+                true,
+                false,
+                true,
+                Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable),
+            ),
+            vec!["plug doctor", "plug auth owner list"]
+        );
     }
 
     #[test]

@@ -178,14 +178,64 @@ pub(crate) async fn cmd_auth(
         crate::AuthCommands::Clients { command } => {
             cmd_downstream_oauth_clients(config_path, command, output).await
         }
+        crate::AuthCommands::Owner { command } => {
+            cmd_downstream_oauth_owner(config_path, command, output).await
+        }
     }
 }
 
-async fn cmd_downstream_oauth_clients(
+struct LocalOperatorClient {
+    client: reqwest::Client,
+    endpoint: reqwest::Url,
+    host_authority: String,
+    operator_token: String,
+    public_base_url: String,
+}
+
+impl LocalOperatorClient {
+    fn child_endpoint(&self, segment: &str) -> anyhow::Result<reqwest::Url> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid local operator URL"))?
+            .push(segment);
+        Ok(url)
+    }
+
+    async fn send_authenticated(
+        &self,
+        method: reqwest::Method,
+        child_segment: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.send_authenticated_with_allow_empty(method, child_segment, false)
+            .await
+    }
+
+    async fn send_authenticated_with_allow_empty(
+        &self,
+        method: reqwest::Method,
+        child_segment: Option<&str>,
+        allow_empty: bool,
+    ) -> anyhow::Result<reqwest::Response> {
+        let endpoint = match child_segment {
+            Some(segment) => self.child_endpoint(segment)?,
+            None => self.endpoint.clone(),
+        };
+        crate::runtime::send_authenticated_operator_request(
+            &self.client,
+            endpoint,
+            &self.host_authority,
+            &self.operator_token,
+            method,
+            allow_empty,
+        )
+        .await
+    }
+}
+
+fn local_operator_client(
     config_path: Option<&PathBuf>,
-    command: crate::DownstreamOauthClientCommands,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
+    endpoint_path: &str,
+) -> anyhow::Result<LocalOperatorClient> {
     let cfg = config::load_config(config_path)?;
     if cfg.http.auth_mode != plug_core::config::DownstreamAuthMode::Oauth {
         anyhow::bail!("downstream OAuth is not enabled");
@@ -193,7 +243,7 @@ async fn cmd_downstream_oauth_clients(
     let token_path = plug_core::auth::http_operator_token_path(cfg.http.port);
     let operator_token = std::fs::read_to_string(&token_path)
         .map_err(|error| anyhow::anyhow!("cannot read the local operator token: {error}"))?;
-    let operator_token = operator_token.trim();
+    let operator_token = operator_token.trim().to_string();
     if operator_token.is_empty() {
         anyhow::bail!("the local operator token is empty");
     }
@@ -202,29 +252,45 @@ async fn cmd_downstream_oauth_clients(
     } else {
         "http"
     };
-    let host = match cfg.http.bind_address.as_str() {
-        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
-        bind => bind,
-    };
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    let base = format!("{scheme}://{host}:{}/_plug/oauth/clients", cfg.http.port);
+    let host_authority =
+        crate::runtime::local_operator_authority(&cfg.http.bind_address, cfg.http.port);
+    let connection_authority =
+        crate::runtime::local_operator_connection_authority(&cfg.http.bind_address, cfg.http.port);
+    let endpoint =
+        reqwest::Url::parse(&format!("{scheme}://{connection_authority}{endpoint_path}"))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        // This connection never leaves the configured local listener. Public
-        // hostname certificates commonly do not contain its bind address.
+        // Never let proxy configuration or redirects carry operator headers
+        // outside the loopback request boundary.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        // Operator requests terminate on Plug's local listener. Public TLS
+        // certificates commonly omit its numeric loopback address.
         .danger_accept_invalid_certs(scheme == "https")
         .build()?;
+    Ok(LocalOperatorClient {
+        client,
+        endpoint,
+        host_authority,
+        operator_token,
+        public_base_url: cfg
+            .http
+            .public_base_url
+            .ok_or_else(|| anyhow::anyhow!("downstream OAuth public base URL is missing"))?,
+    })
+}
+
+async fn cmd_downstream_oauth_clients(
+    config_path: Option<&PathBuf>,
+    command: crate::DownstreamOauthClientCommands,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    let operator = local_operator_client(config_path, "/_plug/oauth/clients")?;
 
     match command {
         crate::DownstreamOauthClientCommands::List => {
-            let response = client
-                .get(&base)
-                .header("x-plug-operator-token", operator_token)
-                .send()
+            let response = operator
+                .send_authenticated(reqwest::Method::GET, None)
                 .await?;
             if !response.status().is_success() {
                 anyhow::bail!(
@@ -265,14 +331,8 @@ async fn cmd_downstream_oauth_clients(
                 ui::print_info_line("Revocation cancelled");
                 return Ok(());
             }
-            let mut url = reqwest::Url::parse(&base)?;
-            url.path_segments_mut()
-                .map_err(|_| anyhow::anyhow!("invalid local operator URL"))?
-                .push(&client_id);
-            let response = client
-                .delete(url)
-                .header("x-plug-operator-token", operator_token)
-                .send()
+            let response = operator
+                .send_authenticated(reqwest::Method::DELETE, Some(&client_id))
                 .await?;
             match response.status() {
                 reqwest::StatusCode::NO_CONTENT => ui::print_success_line(format!(
@@ -282,6 +342,250 @@ async fn cmd_downstream_oauth_clients(
                 status => {
                     anyhow::bail!("the running Plug service rejected the revocation ({status})")
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct OwnerBootstrapResponse {
+    enrollment_url: String,
+}
+
+fn owner_credentials_json(
+    credentials: &[plug_core::downstream_oauth::OwnerCredentialSummary],
+) -> serde_json::Value {
+    serde_json::to_value(credentials).expect("owner credential summaries serialize")
+}
+
+fn owner_enrollment_manual_url(
+    enrollment_url: &str,
+    no_browser: bool,
+    browser_opened: bool,
+) -> Option<&str> {
+    (no_browser || !browser_opened).then_some(enrollment_url)
+}
+
+fn validate_owner_enrollment_url<'a>(
+    public_base_url: &str,
+    enrollment_url: &'a str,
+) -> anyhow::Result<&'a str> {
+    let expected = reqwest::Url::parse(public_base_url)?;
+    let candidate = reqwest::Url::parse(enrollment_url).map_err(|_| {
+        anyhow::anyhow!("the local Plug service returned an invalid enrollment URL")
+    })?;
+    let fragment = candidate.fragment().unwrap_or_default();
+    let bootstrap = fragment.strip_prefix("bootstrap=").unwrap_or_default();
+    let valid_bootstrap = bootstrap.len() == 43
+        && bootstrap
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if candidate.scheme() != "https"
+        || candidate.origin() != expected.origin()
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.path() != "/oauth/owner/enroll"
+        || candidate.query().is_some()
+        || !valid_bootstrap
+    {
+        anyhow::bail!("the local Plug service returned an invalid enrollment URL");
+    }
+    Ok(enrollment_url)
+}
+
+fn owner_removal_prompt(label: &str, removing_final: bool) -> String {
+    if removing_final {
+        format!(
+            "Remove final owner passkey {label}? New downstream OAuth grants will fail until another passkey is enrolled."
+        )
+    } else {
+        format!("Remove owner passkey {label}?")
+    }
+}
+
+async fn fetch_owner_credentials(
+    operator: &LocalOperatorClient,
+) -> anyhow::Result<Vec<plug_core::downstream_oauth::OwnerCredentialSummary>> {
+    let response = operator
+        .send_authenticated(reqwest::Method::GET, None)
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "the running Plug service rejected the owner credential request ({})",
+            response.status()
+        );
+    }
+    Ok(response.json().await?)
+}
+
+async fn cmd_downstream_oauth_owner(
+    config_path: Option<&PathBuf>,
+    command: crate::OwnerCommands,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    match command {
+        crate::OwnerCommands::Enroll { no_browser } => {
+            let operator = local_operator_client(config_path, "/_plug/oauth/owner/bootstrap")?;
+            let response = operator
+                .send_authenticated(reqwest::Method::POST, None)
+                .await?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "the running Plug service rejected owner enrollment ({})",
+                    response.status()
+                );
+            }
+            let response: OwnerBootstrapResponse = response.json().await?;
+            validate_owner_enrollment_url(&operator.public_base_url, &response.enrollment_url)?;
+            let browser_opened = if no_browser {
+                false
+            } else {
+                match open::that(&response.enrollment_url) {
+                    Ok(()) => true,
+                    Err(_) => {
+                        eprintln!("Could not open browser. Open enrollment URL manually.");
+                        false
+                    }
+                }
+            };
+
+            match output {
+                OutputFormat::Json => {
+                    let manual_url = owner_enrollment_manual_url(
+                        &response.enrollment_url,
+                        no_browser,
+                        browser_opened,
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "browser_opened": browser_opened,
+                            "enrollment_url": manual_url,
+                        }))?
+                    );
+                }
+                OutputFormat::Text => {
+                    if let Some(url) = owner_enrollment_manual_url(
+                        &response.enrollment_url,
+                        no_browser,
+                        browser_opened,
+                    ) {
+                        println!("Open this URL in your browser to enroll an owner passkey:\n");
+                        println!("  {url}");
+                    } else {
+                        ui::print_success_line("Opened owner passkey enrollment in your browser");
+                    }
+                }
+            }
+        }
+        crate::OwnerCommands::List => {
+            let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
+            let credentials = fetch_owner_credentials(&operator).await?;
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&owner_credentials_json(&credentials))?
+                ),
+                OutputFormat::Text => {
+                    if credentials.is_empty() {
+                        ui::print_info_line("No owner passkeys are enrolled");
+                    } else {
+                        println!("{}", style("Enrolled owner passkeys").bold());
+                        for credential in credentials {
+                            println!("  {}", style(&credential.label).bold());
+                            println!("    ID: {}", credential.credential_id);
+                            println!("    Created: {}", credential.created_at);
+                            if let Some(last_used_at) = credential.last_used_at {
+                                println!("    Last used: {last_used_at}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        crate::OwnerCommands::Remove { credential_id, yes } => {
+            let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
+            let credentials = fetch_owner_credentials(&operator).await?;
+            let Some(credential) = credentials
+                .iter()
+                .find(|credential| credential.credential_id == credential_id)
+            else {
+                anyhow::bail!("owner credential not found");
+            };
+            let removing_final = credentials.len() == 1;
+            let prompt = owner_removal_prompt(&credential.label, removing_final);
+            if !yes
+                && !dialoguer::Confirm::new()
+                    .with_prompt(prompt)
+                    .default(false)
+                    .interact()?
+            {
+                match output {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({"credential_id": credential_id, "removed": false})
+                    ),
+                    OutputFormat::Text => ui::print_info_line("Owner passkey removal cancelled"),
+                }
+                return Ok(());
+            }
+
+            let mut allow_empty = yes || removing_final;
+            let mut response = operator
+                .send_authenticated_with_allow_empty(
+                    reqwest::Method::DELETE,
+                    Some(&credential_id),
+                    allow_empty,
+                )
+                .await?;
+            if response.status() == reqwest::StatusCode::CONFLICT && !allow_empty {
+                let current = fetch_owner_credentials(&operator).await?;
+                if !current
+                    .iter()
+                    .any(|credential| credential.credential_id == credential_id)
+                {
+                    anyhow::bail!("owner credential not found");
+                }
+                if !dialoguer::Confirm::new()
+                    .with_prompt(owner_removal_prompt(&credential.label, true))
+                    .default(false)
+                    .interact()?
+                {
+                    match output {
+                        OutputFormat::Json => println!(
+                            "{}",
+                            serde_json::json!({"credential_id": credential_id, "removed": false})
+                        ),
+                        OutputFormat::Text => {
+                            ui::print_info_line("Owner passkey removal cancelled")
+                        }
+                    }
+                    return Ok(());
+                }
+                allow_empty = true;
+                response = operator
+                    .send_authenticated_with_allow_empty(
+                        reqwest::Method::DELETE,
+                        Some(&credential_id),
+                        allow_empty,
+                    )
+                    .await?;
+            }
+            match response.status() {
+                reqwest::StatusCode::NO_CONTENT => match output {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({"credential_id": credential_id, "removed": true})
+                    ),
+                    OutputFormat::Text => {
+                        ui::print_success_line(format!("Removed owner passkey {credential_id}"))
+                    }
+                },
+                reqwest::StatusCode::NOT_FOUND => anyhow::bail!("owner credential not found"),
+                status => anyhow::bail!(
+                    "the running Plug service rejected owner credential removal ({status})"
+                ),
             }
         }
     }
@@ -1282,6 +1586,120 @@ mod tests {
         assert_eq!(json["status_scope"], "stored_credentials_only");
         assert!(json["servers"].as_array().is_some());
         assert_eq!(json["servers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn auth_owner_json_contains_summaries_only() {
+        let credentials = vec![plug_core::downstream_oauth::OwnerCredentialSummary {
+            credential_id: "credential-1".to_string(),
+            label: "Plug owner passkey".to_string(),
+            created_at: 1,
+            last_used_at: None,
+        }];
+
+        let json = owner_credentials_json(&credentials);
+        let item = &json.as_array().expect("array")[0];
+        assert_eq!(item["credential_id"], "credential-1");
+        assert!(item.get("passkey").is_none());
+        assert!(item.get("public_key").is_none());
+        assert!(item.get("ceremony").is_none());
+    }
+
+    #[test]
+    fn auth_owner_browser_failure_returns_manual_fragment_url() {
+        let url = "https://plug.example.com/oauth/owner/enroll#bootstrap=secret";
+        assert_eq!(owner_enrollment_manual_url(url, false, false), Some(url));
+        assert_eq!(owner_enrollment_manual_url(url, true, false), Some(url));
+        assert_eq!(owner_enrollment_manual_url(url, false, true), None);
+    }
+
+    #[test]
+    fn auth_owner_remove_warns_when_removing_final_credential() {
+        let final_prompt = owner_removal_prompt("MacBook passkey", true);
+        assert!(final_prompt.contains("final owner passkey"));
+        assert!(final_prompt.contains("New downstream OAuth grants will fail"));
+
+        let ordinary_prompt = owner_removal_prompt("iPhone passkey", false);
+        assert_eq!(ordinary_prompt, "Remove owner passkey iPhone passkey?");
+    }
+
+    #[test]
+    fn auth_owner_enrollment_url_requires_exact_public_fragment_contract() {
+        let valid = "https://plug.example.com/oauth/owner/enroll#bootstrap=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(
+            validate_owner_enrollment_url("https://plug.example.com", valid).unwrap(),
+            valid
+        );
+        for invalid in [
+            "http://plug.example.com/oauth/owner/enroll#bootstrap=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "https://evil.example/oauth/owner/enroll#bootstrap=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "https://plug.example.com/oauth/owner/enroll?bootstrap=x#bootstrap=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "https://plug.example.com/other#bootstrap=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "https://plug.example.com/oauth/owner/enroll#bootstrap=short",
+            "https://user@plug.example.com/oauth/owner/enroll#bootstrap=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(
+                validate_owner_enrollment_url("https://plug.example.com", invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_owner_rogue_listener_never_receives_reusable_operator_token() {
+        plug_core::tls::ensure_rustls_provider_installed();
+        let protected_route_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let protected_route_state = protected_route_hit.clone();
+        let app = axum::Router::new()
+            .route(
+                "/_plug/operator/proof",
+                axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                    assert!(!headers.contains_key("x-plug-operator-token"));
+                    axum::Json(serde_json::json!({
+                        "server_nonce": "22".repeat(32),
+                        "proof": "00".repeat(32),
+                    }))
+                }),
+            )
+            .route(
+                "/_plug/oauth/owner/credentials",
+                axum::routing::get(move |headers: axum::http::HeaderMap| {
+                    let protected_route_state = protected_route_state.clone();
+                    async move {
+                        protected_route_state.store(true, std::sync::atomic::Ordering::SeqCst);
+                        assert!(!headers.contains_key("x-plug-operator-token"));
+                        axum::Json(serde_json::json!([]))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let operator = LocalOperatorClient {
+            client,
+            endpoint: reqwest::Url::parse(&format!("http://{addr}/_plug/oauth/owner/credentials"))
+                .unwrap(),
+            host_authority: addr.to_string(),
+            operator_token: "operator-secret".to_string(),
+            public_base_url: "https://plug.example.com".to_string(),
+        };
+
+        let error = operator
+            .send_authenticated(reqwest::Method::GET, None)
+            .await
+            .expect_err("rogue proof must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticate local Plug service")
+        );
+        assert!(!protected_route_hit.load(std::sync::atomic::Ordering::SeqCst));
+        server.abort();
     }
 
     /// listener. Proves the happy path extracts both parameters correctly.

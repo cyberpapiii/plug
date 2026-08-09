@@ -220,6 +220,91 @@ check_path() {
     esac
 }
 
+restore_previous_service() {
+    INSTALLED_PLUG="$1"
+    PREVIOUS_PLUG="$2"
+    [ -n "$PREVIOUS_PLUG" ] && [ -f "$PREVIOUS_PLUG" ] || return 1
+
+    "$INSTALLED_PLUG" stop >/dev/null 2>&1 || true
+    RESTORE_TMP="${INSTALLED_PLUG}.restore.$$"
+    if ! cp "$PREVIOUS_PLUG" "$RESTORE_TMP" || ! chmod +x "$RESTORE_TMP" || ! mv "$RESTORE_TMP" "$INSTALLED_PLUG"; then
+        rm -f "$RESTORE_TMP"
+        return 1
+    fi
+    if ! "$INSTALLED_PLUG" start --output json >/dev/null 2>&1; then
+        return 1
+    fi
+    RESTORED_STATUS=$("$INSTALLED_PLUG" status --output json 2>/dev/null || true)
+    printf '%s' "$RESTORED_STATUS" | grep -Eq '"runtime_available"[[:space:]]*:[[:space:]]*true'
+}
+
+post_install_owner_setup() {
+    INSTALLED_PLUG="$1"
+    PREVIOUS_PLUG="${2:-}"
+    if ! RESOLVED_CONFIG=$("$INSTALLED_PLUG" config resolved --output json 2>&1); then
+        error "Plug could not resolve the current configuration:\n${RESOLVED_CONFIG}"
+    fi
+    if ! printf '%s' "$RESOLVED_CONFIG" | grep -Eq '"downstream_auth_mode"[[:space:]]*:[[:space:]]*"oauth"'; then
+        return 0
+    fi
+
+    EXPECTED_VERSION=$(printf '%s' "$RESOLVED_CONFIG" | sed -n 's/.*"binary_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    if [ -z "$EXPECTED_VERSION" ]; then
+        error "Plug could not prove the installed binary version.\n  Run: plug start\n  Then run: plug auth owner enroll"
+    fi
+
+    WAS_RUNNING=false
+    CURRENT_STATUS=$("$INSTALLED_PLUG" status --output json 2>/dev/null || true)
+    if printf '%s' "$CURRENT_STATUS" | grep -Eq '"daemon_running"[[:space:]]*:[[:space:]]*true'; then
+        WAS_RUNNING=true
+        info "Restarting the Plug service with the newly installed binary..."
+        if ! STOP_OUTPUT=$("$INSTALLED_PLUG" stop 2>&1); then
+            error "Plug could not stop the previous service:\n${STOP_OUTPUT}\n  Run: plug stop\n  Then run: plug start"
+        fi
+    fi
+
+    info "Starting the newly installed Plug service..."
+    if ! START_OUTPUT=$("$INSTALLED_PLUG" start --output json 2>&1); then
+        if [ "$WAS_RUNNING" = true ] && restore_previous_service "$INSTALLED_PLUG" "$PREVIOUS_PLUG"; then
+            error "Plug could not start the configured service:\n${START_OUTPUT}\nPrevious Plug service restored and running."
+        fi
+        error "Plug could not start the configured service:\n${START_OUTPUT}\n  Fix the reported configuration or bind error, then run: plug start"
+    fi
+
+    if ! STATUS_JSON=$("$INSTALLED_PLUG" status --output json 2>&1); then
+        if [ "$WAS_RUNNING" = true ] && restore_previous_service "$INSTALLED_PLUG" "$PREVIOUS_PLUG"; then
+            error "Plug started, but service readiness could not be checked:\n${STATUS_JSON}\nPrevious Plug service restored and running."
+        fi
+        error "Plug started, but service readiness could not be checked:\n${STATUS_JSON}\n  Run: plug status"
+    fi
+    if ! printf '%s' "$STATUS_JSON" | grep -Eq '"runtime_available"[[:space:]]*:[[:space:]]*true'; then
+        if [ "$WAS_RUNNING" = true ] && restore_previous_service "$INSTALLED_PLUG" "$PREVIOUS_PLUG"; then
+            error "The newly installed Plug service is not ready.\n${STATUS_JSON}\nPrevious Plug service restored and running."
+        fi
+        error "The newly installed Plug service is not ready.\n${STATUS_JSON}\n  Run: plug status"
+    fi
+    if ! printf '%s' "$STATUS_JSON" | grep -Eq '"runtime_version"[[:space:]]*:[[:space:]]*"'"$EXPECTED_VERSION"'"'; then
+        if [ "$WAS_RUNNING" = true ] && restore_previous_service "$INSTALLED_PLUG" "$PREVIOUS_PLUG"; then
+            error "Plug is running, but it is not the newly installed version ${EXPECTED_VERSION}.\nPrevious Plug service restored and running."
+        fi
+        error "Plug is running, but it is not the newly installed version ${EXPECTED_VERSION}.\n  Run: plug stop\n  Then run: plug start"
+    fi
+
+    if ! OWNER_JSON=$("$INSTALLED_PLUG" auth owner list --output json 2>&1); then
+        error "Downstream OAuth owner setup could not be checked:\n${OWNER_JSON}\n  Run: plug auth owner enroll"
+    fi
+    OWNER_JSON_COMPACT=$(printf '%s' "$OWNER_JSON" | tr -d '[:space:]')
+    if [ "$OWNER_JSON_COMPACT" = "[]" ]; then
+        info "Downstream OAuth needs one owner passkey. Opening setup..."
+        if ! "$INSTALLED_PLUG" auth owner enroll; then
+            error "Owner passkey setup could not be opened.\n  Run: plug auth owner enroll"
+        fi
+        info "Finish owner passkey setup in the browser before connecting a client."
+    else
+        success "Downstream OAuth owner passkey already enrolled"
+    fi
+}
+
 main() {
     info "Installing plug — MCP multiplexer"
 
@@ -287,6 +372,12 @@ main() {
     DEST="${INSTALL_DIR}/${BIN_DEST_NAME}"
 
     info "Installing to $DEST"
+    PREVIOUS_PLUG=""
+    if [ -f "$DEST" ]; then
+        PREVIOUS_PLUG="$TMP_DIR/previous-${BIN_DEST_NAME}"
+        cp "$DEST" "$PREVIOUS_PLUG"
+        chmod +x "$PREVIOUS_PLUG"
+    fi
     cp "$BIN_FILE" "$DEST"
     chmod +x "$DEST"
 
@@ -294,6 +385,11 @@ main() {
 
     # Check PATH
     check_path "$INSTALL_DIR"
+
+    # Owner setup is required only for configurations that explicitly enable
+    # downstream OAuth. Existing credentials are inspected through the local
+    # authenticated operator API and are never rotated or replaced here.
+    post_install_owner_setup "$DEST" "$PREVIOUS_PLUG"
 
     # Released binaries are ad-hoc signed, and an ad-hoc signature changes with
     # every build. The macOS Keychain "Always Allow" ACL binds to the signature,
