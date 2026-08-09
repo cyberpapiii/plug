@@ -43,6 +43,7 @@ const MAX_PENDING_CONSENTS_PER_CLIENT: usize = 5;
 const MAX_ACCESS_TOKENS_PER_CLIENT: usize = 10;
 const MAX_REGISTRATION_RATE_KEYS: usize = 10_000;
 const MAX_METADATA_DOCUMENT_BYTES: usize = 64 * 1024;
+const PARENT_DIR_SYNC_ATTEMPTS: usize = 3;
 const CURSOR_NATIVE_REDIRECT: &str = "cursor://anysphere.cursor-mcp/oauth/callback";
 
 #[derive(Debug, Clone)]
@@ -73,6 +74,8 @@ pub struct DownstreamOauthManager {
     principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
     registration_rate: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
     state_path: Arc<PathBuf>,
+    durability_degraded: Arc<AtomicBool>,
+    _state_lock: Arc<std::fs::File>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -474,28 +477,24 @@ impl DownstreamOauthManager {
     ) -> Result<Self, DownstreamOauthError> {
         let path = state_file_path_in_dir(&config, state_dir, STATE_VERSION);
         let legacy_path = state_file_path_in_dir(&config, state_dir, 2);
-        if path.exists() && legacy_path.exists() {
-            let current_modified = state_modified(&path)?;
-            let legacy_modified = state_modified(&legacy_path)?;
-            if legacy_modified > current_modified {
-                return Err(DownstreamOauthError::Persistence(format!(
-                    "downstream OAuth version 2 state is newer than version {STATE_VERSION}; reconcile {} with {} before starting",
-                    legacy_path.display(),
-                    path.display()
-                )));
-            }
-        }
-        if !path.exists() && legacy_path.exists() {
-            let migrated = load_persisted_state(&legacy_path)?;
-            persist_state(&path, &migrated)?.report(&path);
-        }
-        Self::new_with_state_path(config, path)
+        let state_lock = acquire_state_lock(&path)?;
+        reconcile_legacy_state(&config, state_dir, &path, &legacy_path)?;
+        Self::new_with_state_path_and_lock(config, path, state_lock)
     }
 
     #[doc(hidden)]
     pub fn new_with_state_path(
         config: DownstreamOauthConfig,
         state_path: PathBuf,
+    ) -> Result<Self, DownstreamOauthError> {
+        let state_lock = acquire_state_lock(&state_path)?;
+        Self::new_with_state_path_and_lock(config, state_path, state_lock)
+    }
+
+    fn new_with_state_path_and_lock(
+        config: DownstreamOauthConfig,
+        state_path: PathBuf,
+        state_lock: std::fs::File,
     ) -> Result<Self, DownstreamOauthError> {
         let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
         let state = load_persisted_state(&state_path)?;
@@ -516,7 +515,48 @@ impl DownstreamOauthManager {
             principal_lifecycles: Arc::new(principal_lifecycles),
             registration_rate: Arc::new(Mutex::new(HashMap::new())),
             state_path: Arc::new(state_path),
+            durability_degraded: Arc::new(AtomicBool::new(false)),
+            _state_lock: Arc::new(state_lock),
         })
+    }
+
+    pub fn durability_degraded(&self) -> bool {
+        self.durability_degraded.load(Ordering::SeqCst)
+    }
+
+    fn ensure_durable(&self) -> Result<(), DownstreamOauthError> {
+        if self.durability_degraded() {
+            Err(DownstreamOauthError::Persistence(
+                "downstream OAuth durability is uncertain; restart and reconcile persisted state"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn commit_state(
+        &self,
+        live: &mut DownstreamOauthState,
+        next: DownstreamOauthState,
+    ) -> Result<(), DownstreamOauthError> {
+        self.ensure_durable()?;
+        let outcome = persist_state(&self.state_path, &next)?;
+        *live = next;
+        match outcome {
+            PersistOutcome::Durable => Ok(()),
+            PersistOutcome::CommittedDurabilityUncertain(error) => {
+                self.durability_degraded.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    state_path = %self.state_path.display(),
+                    %error,
+                    "downstream OAuth entered fail-closed durability-degraded state"
+                );
+                Err(DownstreamOauthError::Persistence(format!(
+                    "state rename committed but parent directory durability remains uncertain after {PARENT_DIR_SYNC_ATTEMPTS} attempts: {error}"
+                )))
+            }
+        }
     }
 
     pub fn base_url(&self) -> &str {
@@ -561,6 +601,9 @@ impl DownstreamOauthManager {
     }
 
     pub fn local_approval_request_allowed(&self, headers: &axum::http::HeaderMap) -> bool {
+        if self.durability_degraded() {
+            return false;
+        }
         if headers.contains_key("cf-connecting-ip")
             || headers.contains_key("x-forwarded-for")
             || headers.contains_key("forwarded")
@@ -584,6 +627,7 @@ impl DownstreamOauthManager {
         mut request: ClientRegistrationRequest,
         rate_key: &str,
     ) -> Result<ClientRegistrationResponse, DownstreamOauthError> {
+        self.ensure_durable()?;
         request.redirect_uris.retain(|uri| valid_redirect_uri(uri));
         request.redirect_uris.sort();
         request.redirect_uris.dedup();
@@ -611,12 +655,11 @@ impl DownstreamOauthManager {
         };
         next.clients.insert(client_id.clone(), client);
         self.deactivate_principal_lifecycles(&expired);
-        persist_state(&self.state_path, &next)?.report(&self.state_path);
+        self.commit_state(&mut guard, next)?;
         self.principal_lifecycles.insert(
             client_id.clone(),
             Arc::new(PrincipalLifecycleState::active()),
         );
-        *guard = next;
         self.remove_principal_lifecycles(&expired);
 
         Ok(ClientRegistrationResponse {
@@ -651,6 +694,7 @@ impl DownstreamOauthManager {
     }
 
     pub async fn revoke_client(&self, client_id: &str) -> Result<bool, DownstreamOauthError> {
+        self.ensure_durable()?;
         let mut guard = self.state.lock().await;
         let existed = guard.clients.contains_key(client_id);
         if !existed {
@@ -665,8 +709,7 @@ impl DownstreamOauthManager {
         let mut next = guard.clone();
         next.remove_client_material(client_id);
         next.revoked_client_ids.insert(client_id.to_string());
-        persist_state(&self.state_path, &next)?.report(&self.state_path);
-        *guard = next;
+        self.commit_state(&mut guard, next)?;
         self.principal_lifecycles.remove(client_id);
         Ok(existed)
     }
@@ -675,6 +718,7 @@ impl DownstreamOauthManager {
         &self,
         request: AuthorizationRequest<'_>,
     ) -> Result<ConsentRequest, DownstreamOauthError> {
+        self.ensure_durable()?;
         if request.response_type != "code"
             || request.state.is_empty()
             || request.code_challenge.is_empty()
@@ -744,8 +788,7 @@ impl DownstreamOauthManager {
             },
         );
         self.deactivate_principal_lifecycles(&expired);
-        persist_state(&self.state_path, &next)?.report(&self.state_path);
-        *guard = next;
+        self.commit_state(&mut guard, next)?;
         self.remove_principal_lifecycles(&expired);
         Ok(ConsentRequest {
             consent_id,
@@ -766,6 +809,7 @@ impl DownstreamOauthManager {
         consent_id: &str,
         approved: bool,
     ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
+        self.ensure_durable()?;
         let mut guard = self.state.lock().await;
         let now = epoch_secs();
         guard
@@ -782,8 +826,7 @@ impl DownstreamOauthManager {
         if consent.expires_at <= now {
             let mut next = guard.clone();
             next.pending_consents.remove(consent_id);
-            persist_state(&self.state_path, &next)?.report(&self.state_path);
-            *guard = next;
+            self.commit_state(&mut guard, next)?;
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
         }
         if !approved {
@@ -803,8 +846,7 @@ impl DownstreamOauthManager {
                     expires_at: now + AUTH_CODE_LIFETIME_SECS,
                 },
             );
-            persist_state(&self.state_path, &next)?.report(&self.state_path);
-            *guard = next;
+            self.commit_state(&mut guard, next)?;
             return Ok(redirect);
         }
 
@@ -840,8 +882,7 @@ impl DownstreamOauthManager {
                 expires_at: now + AUTH_CODE_LIFETIME_SECS,
             },
         );
-        persist_state(&self.state_path, &next)?.report(&self.state_path);
-        *guard = next;
+        self.commit_state(&mut guard, next)?;
         Ok(redirect)
     }
 
@@ -853,6 +894,7 @@ impl DownstreamOauthManager {
         code_verifier: &str,
         resource: &str,
     ) -> Result<TokenResponsePayload, DownstreamOauthError> {
+        self.ensure_durable()?;
         self.validate_public_client(client_id).await?;
         if resource != self.resource() {
             return Err(DownstreamOauthError::InvalidResource);
@@ -878,14 +920,8 @@ impl DownstreamOauthManager {
 
         let mut next = guard.clone();
         next.pending_codes.remove(code);
-        let token = issue_token_pair(
-            &self.state_path,
-            &mut next,
-            client_id,
-            &pending.scopes,
-            resource,
-        )?;
-        *guard = next;
+        let token = issue_token_pair(&mut next, client_id, &pending.scopes, resource);
+        self.commit_state(&mut guard, next)?;
         Ok(token)
     }
 
@@ -895,6 +931,7 @@ impl DownstreamOauthManager {
         refresh_token: &str,
         resource: &str,
     ) -> Result<TokenResponsePayload, DownstreamOauthError> {
+        self.ensure_durable()?;
         self.validate_public_client(client_id).await?;
         if resource != self.resource() {
             return Err(DownstreamOauthError::InvalidResource);
@@ -913,14 +950,8 @@ impl DownstreamOauthManager {
         }
         let mut next = guard.clone();
         next.refresh_tokens.remove(refresh_token);
-        let token = issue_token_pair(
-            &self.state_path,
-            &mut next,
-            client_id,
-            &refresh.scopes,
-            resource,
-        )?;
-        *guard = next;
+        let token = issue_token_pair(&mut next, client_id, &refresh.scopes, resource);
+        self.commit_state(&mut guard, next)?;
         Ok(token)
     }
 
@@ -930,6 +961,9 @@ impl DownstreamOauthManager {
         required_scopes: &[String],
         resource: &str,
     ) -> AccessTokenValidation {
+        if self.durability_degraded() {
+            return AccessTokenValidation::Invalid;
+        }
         let guard = self.state.lock().await;
         let Some(record) = guard.access_tokens.get(token) else {
             return AccessTokenValidation::Invalid;
@@ -968,6 +1002,9 @@ impl DownstreamOauthManager {
     }
 
     pub async fn client_redirect_allowed(&self, client_id: &str, redirect_uri: &str) -> bool {
+        if self.durability_degraded() {
+            return false;
+        }
         self.state
             .lock()
             .await
@@ -1078,8 +1115,7 @@ impl DownstreamOauthManager {
         }
         next.clients.insert(client_id.to_string(), client);
         self.deactivate_principal_lifecycles(&expired);
-        persist_state(&self.state_path, &next)?.report(&self.state_path);
-        *guard = next;
+        self.commit_state(&mut guard, next)?;
         self.remove_principal_lifecycles(&expired);
         self.principal_lifecycles
             .entry(client_id.to_string())
@@ -1295,12 +1331,11 @@ fn forbidden_metadata_ip(ip: IpAddr) -> bool {
 }
 
 fn issue_token_pair(
-    state_path: &std::path::Path,
     state: &mut DownstreamOauthState,
     client_id: &str,
     scopes: &[String],
     resource: &str,
-) -> Result<TokenResponsePayload, DownstreamOauthError> {
+) -> TokenResponsePayload {
     let access_token = opaque_value();
     let refresh_token = opaque_value();
     let now = epoch_secs();
@@ -1336,13 +1371,12 @@ fn issue_token_pair(
             expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
         },
     );
-    persist_state(state_path, state)?.report(state_path);
-    Ok(TokenResponsePayload {
+    TokenResponsePayload {
         access_token,
         refresh_token: Some(refresh_token),
         expires_in: ACCESS_TOKEN_LIFETIME_SECS,
         scope: (!scopes.is_empty()).then(|| scopes.join(" ")),
-    })
+    }
 }
 
 fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
@@ -1396,15 +1430,230 @@ fn state_file_path_in_dir(
     ))
 }
 
-fn state_modified(path: &std::path::Path) -> Result<std::time::SystemTime, DownstreamOauthError> {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .map_err(|error| {
-            DownstreamOauthError::Persistence(format!(
-                "failed to read downstream OAuth state modification time for {}: {error}",
+fn lineage_file_path_in_dir(
+    config: &DownstreamOauthConfig,
+    state_dir: &std::path::Path,
+) -> PathBuf {
+    state_file_path_in_dir(config, state_dir, STATE_VERSION).with_extension("lineage.json")
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LineagePhase {
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyV2Lineage {
+    version: u8,
+    phase: LineagePhase,
+    full_digest: String,
+    non_revocation_digest: String,
+    revoked_client_ids: Vec<String>,
+}
+
+struct LegacyV2Snapshot {
+    lineage: LegacyV2Lineage,
+}
+
+fn reconcile_legacy_state(
+    config: &DownstreamOauthConfig,
+    state_dir: &std::path::Path,
+    current_path: &std::path::Path,
+    legacy_path: &std::path::Path,
+) -> Result<(), DownstreamOauthError> {
+    let lineage_path = lineage_file_path_in_dir(config, state_dir);
+    let lineage = load_lineage(&lineage_path)?;
+    match lineage {
+        None if !legacy_path.exists() => Ok(()),
+        None if current_path.exists() => Err(DownstreamOauthError::Persistence(format!(
+            "version 2 and version {STATE_VERSION} state exist without durable lineage; reconcile {} and {} before starting",
+            legacy_path.display(),
+            current_path.display()
+        ))),
+        None => {
+            let snapshot = legacy_v2_snapshot(legacy_path)?;
+            let mut pending = snapshot.lineage.clone();
+            pending.phase = LineagePhase::Pending;
+            require_durable(persist_lineage(&lineage_path, &pending)?, &lineage_path)?;
+            let migrated = load_persisted_state(legacy_path)?;
+            require_durable(persist_state(current_path, &migrated)?, current_path)?;
+            let mut complete = snapshot.lineage;
+            complete.phase = LineagePhase::Complete;
+            require_durable(persist_lineage(&lineage_path, &complete)?, &lineage_path)
+        }
+        Some(lineage) if lineage.phase == LineagePhase::Pending => {
+            if !legacy_path.exists() {
+                return Err(DownstreamOauthError::Persistence(format!(
+                    "pending version 2 migration is missing its source file: {}",
+                    legacy_path.display()
+                )));
+            }
+            let snapshot = legacy_v2_snapshot(legacy_path)?;
+            if snapshot.lineage.full_digest != lineage.full_digest {
+                return Err(DownstreamOauthError::Persistence(
+                    "version 2 state changed during pending migration; explicit reconciliation is required"
+                        .to_string(),
+                ));
+            }
+            if !current_path.exists() {
+                let migrated = load_persisted_state(legacy_path)?;
+                require_durable(persist_state(current_path, &migrated)?, current_path)?;
+            }
+            let mut complete = lineage;
+            complete.phase = LineagePhase::Complete;
+            require_durable(persist_lineage(&lineage_path, &complete)?, &lineage_path)
+        }
+        Some(mut lineage) => {
+            if !current_path.exists() {
+                return Err(DownstreamOauthError::Persistence(format!(
+                    "version {STATE_VERSION} state is missing while completed migration lineage exists; restore or reconcile {} instead of reimporting stale {}",
+                    current_path.display(),
+                    legacy_path.display()
+                )));
+            }
+            if !legacy_path.exists() {
+                return Ok(());
+            }
+            let snapshot = legacy_v2_snapshot(legacy_path)?;
+            if snapshot.lineage.full_digest == lineage.full_digest {
+                return Ok(());
+            }
+            let baseline_revoked = lineage
+                .revoked_client_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let current_revoked = snapshot
+                .lineage
+                .revoked_client_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            if snapshot.lineage.non_revocation_digest != lineage.non_revocation_digest
+                || !current_revoked.is_superset(&baseline_revoked)
+            {
+                return Err(DownstreamOauthError::Persistence(
+                    "ambiguous version 2 changes include more than added revocations; explicit non-destructive reconciliation is required"
+                        .to_string(),
+                ));
+            }
+
+            let mut current = load_persisted_state(current_path)?;
+            for client_id in current_revoked.difference(&baseline_revoked) {
+                current.remove_client_material(client_id);
+                current.revoked_client_ids.insert(client_id.clone());
+            }
+            require_durable(persist_state(current_path, &current)?, current_path)?;
+            lineage.full_digest = snapshot.lineage.full_digest;
+            lineage.non_revocation_digest = snapshot.lineage.non_revocation_digest;
+            lineage.revoked_client_ids = snapshot.lineage.revoked_client_ids;
+            require_durable(persist_lineage(&lineage_path, &lineage)?, &lineage_path)
+        }
+    }
+}
+
+fn load_lineage(path: &std::path::Path) -> Result<Option<LegacyV2Lineage>, DownstreamOauthError> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DownstreamOauthError::Persistence(error.to_string())),
+    };
+    let lineage: LegacyV2Lineage = serde_json::from_slice(&data)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    if lineage.version != 1 {
+        return Err(DownstreamOauthError::Persistence(
+            "unsupported downstream OAuth migration lineage version".to_string(),
+        ));
+    }
+    Ok(Some(lineage))
+}
+
+fn persist_lineage(
+    path: &std::path::Path,
+    lineage: &LegacyV2Lineage,
+) -> Result<PersistOutcome, DownstreamOauthError> {
+    let json = serde_json::to_vec_pretty(lineage)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    persist_bytes(path, &json)
+}
+
+fn legacy_v2_snapshot(path: &std::path::Path) -> Result<LegacyV2Snapshot, DownstreamOauthError> {
+    let data = std::fs::read(path)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(&data)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+        return Err(DownstreamOauthError::Persistence(
+            "legacy downstream OAuth state must have version 2".to_string(),
+        ));
+    }
+    let mut revoked_client_ids = value
+        .get("revoked_client_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    revoked_client_ids.sort();
+    revoked_client_ids.dedup();
+    let full_digest = canonical_json_digest(&value)?;
+    let mut without_revocations = value;
+    without_revocations["revoked_client_ids"] = serde_json::json!([]);
+    let non_revocation_digest = canonical_json_digest(&without_revocations)?;
+    Ok(LegacyV2Snapshot {
+        lineage: LegacyV2Lineage {
+            version: 1,
+            phase: LineagePhase::Complete,
+            full_digest,
+            non_revocation_digest,
+            revoked_client_ids,
+        },
+    })
+}
+
+fn canonical_json_digest(value: &serde_json::Value) -> Result<String, DownstreamOauthError> {
+    use sha2::Digest as _;
+    let canonical = canonical_json_value(value);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical_json_value(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn require_durable(
+    outcome: PersistOutcome,
+    path: &std::path::Path,
+) -> Result<(), DownstreamOauthError> {
+    match outcome {
+        PersistOutcome::Durable => Ok(()),
+        PersistOutcome::CommittedDurabilityUncertain(error) => {
+            Err(DownstreamOauthError::Persistence(format!(
+                "{} was renamed but directory durability remains uncertain after {PARENT_DIR_SYNC_ATTEMPTS} attempts: {error}",
                 path.display()
-            ))
-        })
+            )))
+        }
+    }
 }
 
 fn load_persisted_state(
@@ -1436,31 +1685,25 @@ enum PersistOutcome {
     CommittedDurabilityUncertain(std::io::Error),
 }
 
-impl PersistOutcome {
-    fn report(self, path: &std::path::Path) {
-        if let Self::CommittedDurabilityUncertain(error) = self {
-            tracing::warn!(
-                state_path = %path.display(),
-                %error,
-                "downstream OAuth state rename committed but parent directory sync failed"
-            );
-        }
-    }
-}
-
 fn persist_state(
     path: &std::path::Path,
     state: &DownstreamOauthState,
+) -> Result<PersistOutcome, DownstreamOauthError> {
+    let json = serde_json::to_vec_pretty(state)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    persist_bytes(path, &json)
+}
+
+fn persist_bytes(
+    path: &std::path::Path,
+    bytes: &[u8],
 ) -> Result<PersistOutcome, DownstreamOauthError> {
     let dir = path
         .parent()
         .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
     crate::fs_perm::ensure_dir_0700(dir)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    let json = serde_json::to_vec_pretty(state)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = temporary_state_path(path);
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1470,16 +1713,30 @@ fn persist_state(
         let mut file = options
             .open(&tmp)
             .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-        file.write_all(&json)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+        let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(DownstreamOauthError::Persistence(error.to_string()));
+        }
     }
     #[cfg(unix)]
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    Ok(match sync_parent_dir(dir) {
+    if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DownstreamOauthError::Persistence(error.to_string()));
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_STATE_RENAME.replace(false) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DownstreamOauthError::Persistence(
+            "injected state rename failure".to_string(),
+        ));
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DownstreamOauthError::Persistence(error.to_string()));
+    }
+    Ok(match sync_parent_dir_with_retry(dir) {
         Ok(()) => PersistOutcome::Durable,
         Err(error) => PersistOutcome::CommittedDurabilityUncertain(error),
     })
@@ -1487,20 +1744,78 @@ fn persist_state(
 
 #[cfg(test)]
 std::thread_local! {
-    static FAIL_NEXT_PARENT_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_PARENT_DIR_SYNC_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_STATE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
-fn fail_next_parent_dir_sync_for_tests() {
-    FAIL_NEXT_PARENT_DIR_SYNC.set(true);
+fn fail_next_parent_dir_sync_attempts_for_tests(attempts: usize) {
+    FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(attempts);
+}
+
+#[cfg(test)]
+fn fail_next_state_rename_for_tests() {
+    FAIL_NEXT_STATE_RENAME.set(true);
+}
+
+fn temporary_state_path(path: &std::path::Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.json");
+    path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, DownstreamOauthError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
+    crate::fs_perm::ensure_dir_0700(dir)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    let lock_path = path.with_extension("lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    fs4::FileExt::try_lock(&file).map_err(|error| {
+        DownstreamOauthError::Persistence(format!(
+            "downstream OAuth issuer state writer is already active for {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(file)
+}
+
+fn sync_parent_dir_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..PARENT_DIR_SYNC_ATTEMPTS {
+        match sync_parent_dir(dir) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < PARENT_DIR_SYNC_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("directory sync was not attempted")))
 }
 
 fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_PARENT_DIR_SYNC.replace(false) {
-        return Err(std::io::Error::other(
-            "injected parent directory sync failure",
-        ));
+    {
+        let remaining = FAIL_PARENT_DIR_SYNC_ATTEMPTS.get();
+        if remaining > 0 {
+            FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(remaining - 1);
+            return Err(std::io::Error::other(
+                "injected parent directory sync failure",
+            ));
+        }
     }
 
     #[cfg(unix)]
@@ -1669,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn roll_forward_rejects_newer_v2_until_operator_reconciles_v3() {
+    async fn roll_forward_merges_rollback_revocation_by_digest_and_preserves_owner_state() {
         let temp = tempfile::tempdir().expect("state tempdir");
         let state_dir = temp.path().join("downstream_oauth");
         std::fs::create_dir_all(&state_dir).expect("state directory");
@@ -1702,52 +2017,134 @@ mod tests {
 
         let initial = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
             .expect("initial roll-forward migration");
+        {
+            let mut live = initial.state.lock().await;
+            let mut next = live.clone();
+            next.owner_bootstraps.insert(
+                "owner-only-v3".to_string(),
+                OwnerBootstrap {
+                    secret_hash: "owner-secret-hash".to_string(),
+                    expires_at: now + 3600,
+                },
+            );
+            assert!(matches!(
+                persist_state(&current_path, &next).expect("persist v3 owner state"),
+                PersistOutcome::Durable
+            ));
+            *live = next;
+        }
         drop(initial);
         let v3_modified = std::fs::metadata(&current_path)
             .and_then(|metadata| metadata.modified())
             .expect("version 3 modification time");
 
-        rollback_state["revoked_client_ids"] = serde_json::json!(["plug_revoked_during_rollback"]);
-        for _ in 0..20 {
-            std::fs::write(
-                &legacy_path,
-                serde_json::to_vec_pretty(&rollback_state).expect("serialize rollback mutation"),
-            )
-            .expect("write rollback mutation");
-            if std::fs::metadata(&legacy_path)
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| modified > v3_modified)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            std::fs::metadata(&legacy_path)
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| modified > v3_modified),
-            "test setup requires rollback v2 to be newer than migrated v3"
-        );
+        rollback_state["revoked_client_ids"] = serde_json::json!(["plug_existing"]);
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&rollback_state).expect("serialize rollback mutation"),
+        )
+        .expect("write rollback mutation");
+        filetime::set_file_mtime(
+            &legacy_path,
+            filetime::FileTime::from_system_time(
+                v3_modified
+                    .checked_sub(std::time::Duration::from_secs(60))
+                    .expect("clock-skewed timestamp"),
+            ),
+        )
+        .expect("set rollback file time behind version 3");
 
-        let error = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
-            .expect_err("newer rollback state must not be ignored");
-        let message = error.to_string();
-        assert!(
-            message.contains("version 2") && message.contains("reconcile"),
-            "{message}"
-        );
+        let reconciled = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
+            .expect("digest lineage merges rollback revocation despite backward clock");
+        let state = reconciled.state.lock().await;
+        assert!(state.revoked_client_ids.contains("plug_existing"));
+        assert!(!state.clients.contains_key("plug_existing"));
+        assert!(state.owner_bootstraps.contains_key("owner-only-v3"));
+        drop(state);
+        drop(reconciled);
 
-        std::fs::remove_file(&current_path).expect("operator removes stale version 3 snapshot");
-        let reconciled = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
-            .expect("explicit reconciliation migrates rollback state");
+        rollback_state["revoked_client_ids"] =
+            serde_json::json!(["plug_existing", "plug_equal_clock_revocation"]);
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&rollback_state).expect("serialize equal-clock rollback"),
+        )
+        .expect("write equal-clock rollback");
+        let current_mtime = std::fs::metadata(&current_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("current v3 modification time");
+        filetime::set_file_mtime(
+            &legacy_path,
+            filetime::FileTime::from_system_time(current_mtime),
+        )
+        .expect("set equal version 2 and version 3 timestamps");
+        let equal_clock =
+            DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
+                .expect("digest lineage merges revocation with equal clocks");
+        let equal_clock_state = equal_clock.state.lock().await;
         assert!(
-            reconciled
-                .state
-                .lock()
-                .await
+            equal_clock_state
                 .revoked_client_ids
-                .contains("plug_revoked_during_rollback")
+                .contains("plug_equal_clock_revocation")
         );
+        assert!(
+            equal_clock_state
+                .owner_bootstraps
+                .contains_key("owner-only-v3")
+        );
+        drop(equal_clock_state);
+        drop(equal_clock);
+
+        assert!(lineage_file_path_in_dir(&config, &state_dir).exists());
+        std::fs::remove_file(&current_path).expect("simulate lost version 3 file");
+        let error = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
+            .expect_err("completed lineage must block stale v2 reimport when v3 is missing");
+        assert!(error.to_string().contains("version 3 state is missing"));
+    }
+
+    #[test]
+    fn roll_forward_blocks_ambiguous_rollback_grant_changes() {
+        let temp = tempfile::tempdir().expect("state tempdir");
+        let state_dir = temp.path().join("downstream_oauth");
+        std::fs::create_dir_all(&state_dir).expect("state directory");
+        let config = test_config();
+        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
+        let now = epoch_secs();
+        let mut rollback_state = serde_json::json!({
+            "version": 2,
+            "clients": {},
+            "access_tokens": {},
+            "refresh_tokens": {},
+            "revoked_client_ids": []
+        });
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&rollback_state).expect("serialize initial v2"),
+        )
+        .expect("write initial v2");
+        drop(
+            DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
+                .expect("initial migration"),
+        );
+
+        rollback_state["clients"]["plug_rollback_grant"] = serde_json::json!({
+            "client_id": "plug_rollback_grant",
+            "client_name": "Rollback grant",
+            "redirect_uris": ["https://client.example/callback"],
+            "source": "dynamic_registration",
+            "created_at": now,
+            "last_used_at": now,
+            "expires_at": now + 3600
+        });
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&rollback_state).expect("serialize ambiguous rollback"),
+        )
+        .expect("write ambiguous rollback");
+
+        let error = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
+            .expect_err("rollback grants require explicit operator reconciliation");
+        assert!(error.to_string().contains("ambiguous version 2 changes"));
     }
 
     #[tokio::test]
@@ -1780,12 +2177,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn authorization_start_sync_failure_keeps_disk_memory_and_restart_aligned() {
+    async fn authorization_start_sync_failure_fails_closed_with_aligned_recovery() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_for_tests();
+        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
 
-        let consent = manager
+        let result = manager
             .begin_authorization(AuthorizationRequest {
                 response_type: "code",
                 client_id: &client.client_id,
@@ -1796,18 +2193,28 @@ mod tests {
                 scope: Some("tools:read"),
                 resource: "https://plug.example.com/mcp",
             })
-            .await
-            .expect("rename committed consent despite uncertain directory durability");
+            .await;
 
+        assert!(matches!(result, Err(DownstreamOauthError::Persistence(_))));
+        assert!(manager.durability_degraded());
+        let consent_id = manager
+            .state
+            .lock()
+            .await
+            .pending_consents
+            .keys()
+            .next()
+            .cloned()
+            .expect("renamed consent remains published internally");
         let disk = load_persisted_state(&path).expect("read renamed state");
-        assert!(disk.pending_consents.contains_key(&consent.consent_id));
+        assert!(disk.pending_consents.contains_key(&consent_id));
         assert!(
             manager
                 .state
                 .lock()
                 .await
                 .pending_consents
-                .contains_key(&consent.consent_id)
+                .contains_key(&consent_id)
         );
         drop(manager);
 
@@ -1819,7 +2226,7 @@ mod tests {
                 .lock()
                 .await
                 .pending_consents
-                .contains_key(&consent.consent_id)
+                .contains_key(&consent_id)
         );
     }
 
@@ -1829,25 +2236,51 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let original = issue_tokens(&manager, &client).await;
         let original_refresh = original.refresh_token.expect("original refresh token");
-        fail_next_parent_dir_sync_for_tests();
+        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
 
-        let rotated = manager
+        let result = manager
             .exchange_refresh_token(
                 &client.client_id,
                 &original_refresh,
                 "https://plug.example.com/mcp",
             )
-            .await
-            .expect("rename committed rotation despite uncertain directory durability");
-        let rotated_refresh = rotated.refresh_token.expect("rotated refresh token");
+            .await;
+        assert!(matches!(result, Err(DownstreamOauthError::Persistence(_))));
+        assert!(manager.durability_degraded());
 
         let disk = load_persisted_state(&path).expect("read renamed rotation");
         assert!(!disk.refresh_tokens.contains_key(&original_refresh));
+        let rotated_refresh = disk
+            .refresh_tokens
+            .keys()
+            .find(|token| token.as_str() != original_refresh)
+            .cloned()
+            .expect("committed replacement remains on disk");
         assert!(disk.refresh_tokens.contains_key(&rotated_refresh));
         let memory = manager.state.lock().await;
         assert!(!memory.refresh_tokens.contains_key(&original_refresh));
         assert!(memory.refresh_tokens.contains_key(&rotated_refresh));
         drop(memory);
+        assert_eq!(
+            manager
+                .validate_access_token_for(
+                    &original.access_token,
+                    &["tools:read".to_string()],
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            AccessTokenValidation::Invalid
+        );
+        assert!(matches!(
+            manager
+                .exchange_refresh_token(
+                    &client.client_id,
+                    &rotated_refresh,
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            Err(DownstreamOauthError::Persistence(_))
+        ));
         drop(manager);
 
         let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
@@ -1863,6 +2296,167 @@ mod tests {
                 .refresh_tokens
                 .contains_key(&rotated_refresh)
         );
+        drop(restarted_state);
+        restarted
+            .exchange_refresh_token(
+                &client.client_id,
+                &rotated_refresh,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("restart can rotate the committed replacement token");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoke_sync_failure_degrades_lifecycle_and_restart_stays_revoked() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let lease = match manager
+            .validate_access_token_for(
+                &tokens.access_token,
+                &["tools:read".to_string()],
+                "https://plug.example.com/mcp",
+            )
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            other => panic!("expected valid token before revoke, got {other:?}"),
+        };
+        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+
+        let result = manager.revoke_client(&client.client_id).await;
+
+        assert!(matches!(result, Err(DownstreamOauthError::Persistence(_))));
+        assert!(manager.durability_degraded());
+        assert!(!lease.is_active());
+        assert_eq!(
+            manager
+                .validate_access_token_for(
+                    &tokens.access_token,
+                    &["tools:read".to_string()],
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            AccessTokenValidation::Invalid
+        );
+        let disk = load_persisted_state(&path).expect("read committed revocation");
+        assert!(disk.revoked_client_ids.contains(&client.client_id));
+        drop(manager);
+
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("restart from committed revocation");
+        assert!(
+            restarted
+                .state
+                .lock()
+                .await
+                .revoked_client_ids
+                .contains(&client.client_id)
+        );
+        assert_eq!(
+            restarted
+                .validate_access_token_for(
+                    &tokens.access_token,
+                    &["tools:read".to_string()],
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            AccessTokenValidation::Invalid
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_rename_failure_publishes_nothing_and_restart_matches() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        fail_next_state_rename_for_tests();
+
+        let result = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "pre-rename-failure",
+                code_challenge: "failure-challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await;
+
+        assert!(matches!(result, Err(DownstreamOauthError::Persistence(_))));
+        assert!(!manager.durability_degraded());
+        assert!(manager.state.lock().await.pending_consents.is_empty());
+        assert!(
+            load_persisted_state(&path)
+                .expect("read unchanged disk state")
+                .pending_consents
+                .is_empty()
+        );
+        drop(manager);
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("restart unchanged state");
+        assert!(restarted.state.lock().await.pending_consents.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parent_directory_sync_retry_can_recover_without_degrading() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        fail_next_parent_dir_sync_attempts_for_tests(1);
+
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "retry-recovers",
+                code_challenge: "retry-challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("second directory sync attempt succeeds");
+
+        assert!(!manager.durability_degraded());
+        assert!(
+            manager
+                .state
+                .lock()
+                .await
+                .pending_consents
+                .contains_key(&consent.consent_id)
+        );
+    }
+
+    #[test]
+    fn persistence_temp_paths_are_unique_per_writer() {
+        let path = temp_state_path();
+        let first = temporary_state_path(&path);
+        let second = temporary_state_path(&path);
+
+        assert_eq!(first.parent(), path.parent());
+        assert_eq!(second.parent(), path.parent());
+        assert_ne!(first, second);
+        assert_ne!(first, path.with_extension("json.tmp"));
+        assert_ne!(second, path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn issuer_state_allows_only_one_live_writer() {
+        let path = temp_state_path();
+        let first = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect("first writer acquires issuer lock");
+
+        let error = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect_err("second writer must fail instead of racing state publication");
+        assert!(error.to_string().contains("already active"));
+
+        drop(first);
+        DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("writer lock is released with manager");
     }
 
     #[tokio::test]
@@ -2544,6 +3138,7 @@ mod tests {
                 .await
                 .expect("revoke")
         );
+        drop(restarted);
         let after_revoke = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("restart after revoke");
         assert!(after_revoke.list_clients().await.is_empty());
