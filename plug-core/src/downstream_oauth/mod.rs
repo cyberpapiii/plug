@@ -116,6 +116,13 @@ pub struct RegisteredClientSummary {
     pub expires_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOwnerCredentialOutcome {
+    Removed,
+    NotFound,
+    FinalCredentialConfirmationRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSource {
@@ -1065,18 +1072,22 @@ impl DownstreamOauthManager {
     pub async fn remove_owner_credential(
         &self,
         credential_id: &str,
-    ) -> Result<bool, DownstreamOauthError> {
+        allow_empty: bool,
+    ) -> Result<RemoveOwnerCredentialOutcome, DownstreamOauthError> {
         self.ensure_durable()?;
         let mut guard = self.state.lock().await;
         if !guard.owner_credentials.contains_key(credential_id) {
-            return Ok(false);
+            return Ok(RemoveOwnerCredentialOutcome::NotFound);
+        }
+        if guard.owner_credentials.len() == 1 && !allow_empty {
+            return Ok(RemoveOwnerCredentialOutcome::FinalCredentialConfirmationRequired);
         }
         let mut next = guard.clone();
         next.owner_credentials.remove(credential_id);
         next.owner_authentication_ceremonies
             .retain(|_, ceremony| !ceremony.credential_ids.iter().any(|id| id == credential_id));
         self.commit_state(&mut guard, next)?;
-        Ok(true)
+        Ok(RemoveOwnerCredentialOutcome::Removed)
     }
 
     pub async fn owner_enrolled(&self) -> bool {
@@ -3157,11 +3168,12 @@ mod tests {
             .start_owner_approval(&consent.consent_id)
             .await
             .unwrap();
-        assert!(
+        assert_eq!(
             manager
-                .remove_owner_credential(&summary.credential_id)
+                .remove_owner_credential(&summary.credential_id, true)
                 .await
-                .unwrap()
+                .unwrap(),
+            RemoveOwnerCredentialOutcome::Removed
         );
         assert!(!manager.owner_enrolled().await);
         assert!(manager.list_owner_credentials().await.is_empty());
@@ -3173,12 +3185,62 @@ mod tests {
                 .owner_authentication_ceremonies
                 .is_empty()
         );
-        assert!(
-            !manager
-                .remove_owner_credential(&summary.credential_id)
+        assert_eq!(
+            manager
+                .remove_owner_credential(&summary.credential_id, true)
                 .await
-                .unwrap()
+                .unwrap(),
+            RemoveOwnerCredentialOutcome::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn final_owner_credential_requires_atomic_explicit_allow_empty() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        let summary = enroll_owner(&manager, &authenticator).await;
+
+        assert_eq!(
+            manager
+                .remove_owner_credential(&summary.credential_id, false)
+                .await
+                .unwrap(),
+            RemoveOwnerCredentialOutcome::FinalCredentialConfirmationRequired
+        );
+        assert!(manager.owner_enrolled().await);
+        assert_eq!(
+            manager
+                .remove_owner_credential(&summary.credential_id, true)
+                .await
+                .unwrap(),
+            RemoveOwnerCredentialOutcome::Removed
+        );
+        assert!(!manager.owner_enrolled().await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ordinary_owner_removals_cannot_remove_every_credential() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        let first = enroll_owner(&manager, &authenticator).await;
+        let second_id = "second-owner-credential".to_string();
+        {
+            let mut state = manager.state.lock().await;
+            let mut second = state.owner_credentials[&first.credential_id].clone();
+            second.id = second_id.clone();
+            state.owner_credentials.insert(second_id.clone(), second);
+        }
+
+        let (first_result, second_result) = tokio::join!(
+            manager.remove_owner_credential(&first.credential_id, false),
+            manager.remove_owner_credential(&second_id, false),
+        );
+        let outcomes = [first_result.unwrap(), second_result.unwrap()];
+        assert!(outcomes.contains(&RemoveOwnerCredentialOutcome::Removed));
+        assert!(
+            outcomes.contains(&RemoveOwnerCredentialOutcome::FinalCredentialConfirmationRequired)
+        );
+        assert_eq!(manager.list_owner_credentials().await.len(), 1);
     }
 
     #[tokio::test]
