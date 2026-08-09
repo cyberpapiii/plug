@@ -103,7 +103,27 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-No roadmap-relevant implementation is currently classified as `exists off-main`.
+Cross-client downstream OAuth reliability work exists off-main on
+`codex/fix-cimd-client-compatibility`; it is not done on `main`. The branch
+adds:
+
+- Client ID Metadata Document capability-superset compatibility: Plug requires
+  the authorization-code flow it uses, while allowing unrelated client
+  capabilities that apply to other authorization servers. Dynamic Client
+  Registration remains strict for Plug's own registration contract.
+- retry-safe local consent decisions: repeated approval or denial replays the
+  first redirect, rather than minting another authorization code or changing
+  the redirect outcome.
+- safe, actionable OAuth error descriptions for JSON, authorization-page, and
+  redirect responses.
+- a full automated DCR lifecycle covering registration, local consent,
+  authorization-code exchange, refresh rotation, and replay rejection.
+- deterministic CIMD validation fixtures covering capability-superset
+  acceptance and rejection. Live HTTPS CIMD client certification remains a
+  manual pending gate; it is not part of the automated lifecycle proof.
+
+Focused coverage on that branch keeps remote consent POST forbidden and keeps
+authorization-code replay at `invalid_grant`.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era
@@ -114,9 +134,10 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-The current roadmap is complete on `main`.
-No required roadmap items remain for the current production-ready bar.
-Any further work is optional future scope rather than a blocker.
+The current production release remains on `main`. The cross-client downstream
+OAuth reliability work above is `exists off-main`; merge, release verification,
+and live HTTPS CIMD client certification remain pending. Do not treat it as
+released until current `main` contains the branch and those checks pass.
 
 On 2026-07-17, downstream OAuth moved from one manually configured client to
 a standards-based public-client service. A remote MCP client now starts with

@@ -300,6 +300,13 @@ struct PendingConsent {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CompletedConsent {
+    client_id: String,
+    redirect: AuthorizationRedirect,
+    expires_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingAuthorizationCode {
     client_id: String,
@@ -335,6 +342,8 @@ struct DownstreamOauthState {
     #[serde(skip)]
     pending_consents: HashMap<String, PendingConsent>,
     #[serde(skip)]
+    completed_consents: HashMap<String, CompletedConsent>,
+    #[serde(skip)]
     pending_codes: HashMap<String, PendingAuthorizationCode>,
     #[serde(default)]
     access_tokens: HashMap<String, IssuedAccessToken>,
@@ -350,6 +359,7 @@ impl Default for DownstreamOauthState {
             version: STATE_VERSION,
             clients: HashMap::new(),
             pending_consents: HashMap::new(),
+            completed_consents: HashMap::new(),
             pending_codes: HashMap::new(),
             access_tokens: HashMap::new(),
             refresh_tokens: HashMap::new(),
@@ -369,6 +379,8 @@ impl DownstreamOauthState {
         self.clients.retain(|id, _| !expired.contains(id));
         self.pending_consents
             .retain(|_, item| item.expires_at > now);
+        self.completed_consents
+            .retain(|_, item| item.expires_at > now);
         self.pending_codes.retain(|_, item| item.expires_at > now);
         self.access_tokens
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
@@ -380,6 +392,8 @@ impl DownstreamOauthState {
     fn remove_client_material(&mut self, client_id: &str) {
         self.clients.remove(client_id);
         self.pending_consents
+            .retain(|_, item| item.client_id != client_id);
+        self.completed_consents
             .retain(|_, item| item.client_id != client_id);
         self.pending_codes
             .retain(|_, item| item.client_id != client_id);
@@ -592,9 +606,9 @@ impl DownstreamOauthManager {
         if !expired.is_empty() {
             self.deactivate_principal_lifecycles(&expired);
             persist_state(&self.state_path, &next)?;
-            *guard = next;
-            self.remove_principal_lifecycles(&expired);
         }
+        *guard = next;
+        self.remove_principal_lifecycles(&expired);
         let client = guard
             .clients
             .get(request.client_id)
@@ -611,11 +625,22 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidResource);
         }
         let scopes = self.validate_scopes(request.scope)?;
-        if guard.pending_consents.len() >= MAX_PENDING_CONSENTS
+        if guard
+            .pending_consents
+            .len()
+            .saturating_add(guard.completed_consents.len())
+            >= MAX_PENDING_CONSENTS
             || guard
                 .pending_consents
                 .values()
-                .filter(|pending| pending.client_id == request.client_id)
+                .map(|pending| &pending.client_id)
+                .chain(
+                    guard
+                        .completed_consents
+                        .values()
+                        .map(|completed| &completed.client_id),
+                )
+                .filter(|client_id| client_id.as_str() == request.client_id)
                 .count()
                 >= MAX_PENDING_CONSENTS_PER_CLIENT
         {
@@ -654,23 +679,43 @@ impl DownstreamOauthManager {
         approved: bool,
     ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
         let mut guard = self.state.lock().await;
+        let now = epoch_secs();
+        guard
+            .completed_consents
+            .retain(|_, completed| completed.expires_at > now);
+        if let Some(completed) = guard.completed_consents.get(consent_id) {
+            return Ok(completed.redirect.clone());
+        }
         let consent = guard
             .pending_consents
-            .remove(consent_id)
+            .get(consent_id)
+            .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
-        if consent.expires_at <= epoch_secs() {
+        if consent.expires_at <= now {
+            guard.pending_consents.remove(consent_id);
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
         }
         if !approved {
-            return Ok(AuthorizationRedirect {
+            let redirect = AuthorizationRedirect {
                 location: redirect_with_params(
                     &consent.redirect_uri,
                     &[("error", "access_denied"), ("state", &consent.state)],
                 ),
-            });
+            };
+            guard.pending_consents.remove(consent_id);
+            guard.completed_consents.insert(
+                consent_id.to_string(),
+                CompletedConsent {
+                    client_id: consent.client_id,
+                    redirect: redirect.clone(),
+                    expires_at: now + AUTH_CODE_LIFETIME_SECS,
+                },
+            );
+            return Ok(redirect);
         }
 
         let mut next = guard.clone();
+        next.pending_consents.remove(consent_id);
         let code = opaque_value();
         next.pending_codes.insert(
             code.clone(),
@@ -680,23 +725,32 @@ impl DownstreamOauthManager {
                 code_challenge: consent.code_challenge,
                 scopes: consent.scopes,
                 resource: consent.resource,
-                expires_at: epoch_secs() + AUTH_CODE_LIFETIME_SECS,
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
             },
         );
         if let Some(client) = next.clients.get_mut(&consent.client_id) {
-            client.last_used_at = Some(epoch_secs());
-            client.expires_at = epoch_secs() + REGISTRATION_LIFETIME_SECS;
+            client.last_used_at = Some(now);
+            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
         }
-        // Codes are intentionally memory-only, but persisting the client use
-        // timestamp must succeed before the code is handed out.
-        persist_state(&self.state_path, &next)?;
-        *guard = next;
-        Ok(AuthorizationRedirect {
+        let redirect = AuthorizationRedirect {
             location: redirect_with_params(
                 &consent.redirect_uri,
                 &[("code", &code), ("state", &consent.state)],
             ),
-        })
+        };
+        // Codes are intentionally memory-only, but persisting the client use
+        // timestamp must succeed before the code is handed out.
+        persist_state(&self.state_path, &next)?;
+        next.completed_consents.insert(
+            consent_id.to_string(),
+            CompletedConsent {
+                client_id: consent.client_id,
+                redirect: redirect.clone(),
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
+            },
+        );
+        *guard = next;
+        Ok(redirect)
     }
 
     pub async fn exchange_authorization_code(
@@ -1036,18 +1090,34 @@ fn validate_metadata_document(
     expected_client_id: &str,
     document: &ClientMetadataDocument,
 ) -> Result<(), DownstreamOauthError> {
-    let request = ClientRegistrationRequest {
-        redirect_uris: document.redirect_uris.clone(),
-        client_name: document.client_name.clone(),
-        token_endpoint_auth_method: document.token_endpoint_auth_method.clone(),
-        grant_types: document.grant_types.clone(),
-        response_types: document.response_types.clone(),
-        scope: None,
-    };
-    if document.client_id != expected_client_id {
+    // A metadata document describes the client's capabilities across every
+    // authorization server it can use. Require the flow Plug will select, but
+    // do not reject unrelated extension capabilities. Dynamic registration is
+    // authorization-server-specific and intentionally remains stricter.
+    if document.client_id != expected_client_id
+        || document.redirect_uris.is_empty()
+        || document.redirect_uris.len() > 10
+        || document
+            .redirect_uris
+            .iter()
+            .any(|uri| !valid_redirect_uri(uri))
+        || document
+            .token_endpoint_auth_method
+            .as_deref()
+            .unwrap_or("none")
+            != "none"
+        || document
+            .grant_types
+            .as_ref()
+            .is_some_and(|items| !items.iter().any(|item| item == "authorization_code"))
+        || document
+            .response_types
+            .as_ref()
+            .is_some_and(|items| !items.iter().any(|item| item == "code"))
+    {
         return Err(DownstreamOauthError::InvalidClientMetadata);
     }
-    validate_registration_request(&request)
+    Ok(())
 }
 
 async fn fetch_client_metadata_document(
@@ -1250,6 +1320,7 @@ fn load_persisted_state(
         ));
     }
     state.pending_consents.clear();
+    state.completed_consents.clear();
     state.pending_codes.clear();
     let _ = state.evict_expired(epoch_secs());
     Ok(state)
@@ -1376,6 +1447,230 @@ mod tests {
             .expect("exchange code")
     }
 
+    #[derive(Clone, Copy)]
+    enum CapabilityFixtureKind {
+        DynamicRegistration,
+        MetadataDocument(&'static str),
+    }
+
+    fn validate_recorded_capability_fixture(
+        kind: CapabilityFixtureKind,
+        document: &str,
+    ) -> Result<(), DownstreamOauthError> {
+        match kind {
+            CapabilityFixtureKind::DynamicRegistration => {
+                let request: ClientRegistrationRequest =
+                    serde_json::from_str(document).expect("recorded DCR fixture");
+                validate_registration_request(&request)
+            }
+            CapabilityFixtureKind::MetadataDocument(client_id) => {
+                let document: ClientMetadataDocument =
+                    serde_json::from_str(document).expect("recorded CIMD fixture");
+                validate_metadata_document(client_id, &document)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_consent_approval_replays_first_redirect_and_mints_one_code() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+
+        let first = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let repeated = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("repeat approval");
+        let later_denial = manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("later denial");
+
+        assert_eq!(repeated.location, first.location);
+        assert_eq!(later_denial.location, first.location);
+        assert_eq!(manager.state.lock().await.pending_codes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_consent_denial_replays_first_access_denied_redirect() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+
+        let first = manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("deny consent");
+        let repeated = manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("repeat denial");
+
+        assert_eq!(repeated.location, first.location);
+        assert_eq!(
+            first.location,
+            "http://localhost:8787/callback?error=access_denied&state=state-123"
+        );
+        assert!(manager.state.lock().await.pending_codes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_denials_count_toward_outstanding_consent_cap() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+
+        for index in 0..MAX_PENDING_CONSENTS_PER_CLIENT {
+            let consent = manager
+                .begin_authorization(AuthorizationRequest {
+                    response_type: "code",
+                    client_id: &client.client_id,
+                    redirect_uri: &client.redirect_uris[0],
+                    state: &format!("state-{index}"),
+                    code_challenge: "challenge",
+                    code_challenge_method: "S256",
+                    scope: Some("tools:read"),
+                    resource: "https://plug.example.com/mcp",
+                })
+                .await
+                .expect("begin authorization within cap");
+            manager
+                .decide_consent(&consent.consent_id, false)
+                .await
+                .expect("deny consent");
+        }
+
+        let limited = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-over-cap",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await;
+
+        assert_eq!(
+            limited.expect_err("completed decisions must keep capacity reserved"),
+            DownstreamOauthError::RateLimited
+        );
+        let state = manager.state.lock().await;
+        assert!(state.pending_consents.is_empty());
+        assert_eq!(
+            state.completed_consents.len(),
+            MAX_PENDING_CONSENTS_PER_CLIENT
+        );
+        drop(state);
+
+        for completed in manager.state.lock().await.completed_consents.values_mut() {
+            completed.expires_at = 0;
+        }
+        let after_expiry = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-after-expiry",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await;
+        assert!(
+            after_expiry.is_ok(),
+            "expired completed decisions must release capacity: {after_expiry:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_consents_expire_stay_memory_only_and_clear_on_revocation() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("deny consent");
+
+        let loaded = load_persisted_state(&path).expect("reload persisted state");
+        assert!(loaded.pending_consents.is_empty());
+        assert!(loaded.completed_consents.is_empty());
+
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .completed_consents
+                .get_mut(&consent.consent_id)
+                .expect("completed consent")
+                .expires_at = 0;
+            state.evict_expired(epoch_secs());
+            assert!(state.completed_consents.is_empty());
+        }
+
+        let second = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-456",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin second authorization");
+        manager
+            .decide_consent(&second.consent_id, false)
+            .await
+            .expect("deny second consent");
+        assert!(manager.revoke_client(&client.client_id).await.unwrap());
+        assert!(manager.state.lock().await.completed_consents.is_empty());
+    }
+
     #[test]
     fn redirect_validation_accepts_web_loopback_and_exact_cursor_native_callback() {
         assert!(valid_redirect_uri("https://client.example/callback"));
@@ -1393,6 +1688,133 @@ mod tests {
         assert!(!valid_redirect_uri(
             "https://client.example/callback#fragment"
         ));
+    }
+
+    #[test]
+    fn recorded_metadata_document_accepts_known_extension_superset() {
+        let document: ClientMetadataDocument = serde_json::from_str(
+            r#"{
+                "client_id": "https://claude.ai/oauth/mcp-oauth-client-metadata",
+                "client_name": "Claude",
+                "client_uri": "https://claude.ai",
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+                "grant_types": [
+                    "authorization_code",
+                    "refresh_token",
+                    "urn:ietf:params:oauth:grant-type:jwt-bearer"
+                ],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"
+            }"#,
+        )
+        .expect("known metadata document fixture");
+
+        assert_eq!(
+            validate_metadata_document(
+                "https://claude.ai/oauth/mcp-oauth-client-metadata",
+                &document,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn client_neutral_capability_fixture_matrix() {
+        for (class, kind, document, expected) in [
+            (
+                "strict DCR",
+                CapabilityFixtureKind::DynamicRegistration,
+                r#"{
+                    "client_name": "Strict public client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"]
+                }"#,
+                Ok(()),
+            ),
+            (
+                "baseline CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Baseline metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"]
+                }"#,
+                Ok(()),
+            ),
+            (
+                "extension-rich CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Extension-rich metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": [
+                        "authorization_code",
+                        "refresh_token",
+                        "urn:example:grant-type:future"
+                    ],
+                    "response_types": ["code", "future"]
+                }"#,
+                Ok(()),
+            ),
+            (
+                "missing authorization-code grant CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Missing code grant metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["urn:example:grant-type:future"],
+                    "response_types": ["code"]
+                }"#,
+                Err(DownstreamOauthError::InvalidClientMetadata),
+            ),
+            (
+                "missing code response type CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Missing code response metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code"],
+                    "response_types": ["future"]
+                }"#,
+                Err(DownstreamOauthError::InvalidClientMetadata),
+            ),
+        ] {
+            assert_eq!(
+                validate_recorded_capability_fixture(kind, document),
+                expected,
+                "{class}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_registration_does_not_adopt_unimplemented_grants() {
+        let request = ClientRegistrationRequest {
+            redirect_uris: vec!["https://client.example/callback".to_string()],
+            client_name: Some("Client".to_string()),
+            token_endpoint_auth_method: Some("none".to_string()),
+            grant_types: Some(vec![
+                "authorization_code".to_string(),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+            ]),
+            response_types: Some(vec!["code".to_string()]),
+            scope: None,
+        };
+        assert_eq!(
+            validate_registration_request(&request),
+            Err(DownstreamOauthError::InvalidClientMetadata)
+        );
     }
 
     #[test]
