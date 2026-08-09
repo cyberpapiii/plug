@@ -607,14 +607,14 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             match url::Url::parse(public_base_url) {
                 Ok(url)
                     if url.scheme() == "https"
-                        && url.host_str().is_some()
+                        && matches!(url.host(), Some(url::Host::Domain(_)))
                         && url.username().is_empty()
                         && url.password().is_none()
                         && url.path() == "/"
                         && url.query().is_none()
                         && url.fragment().is_none() => {}
                 _ => errors.push(
-                    "http.public_base_url must be an HTTPS origin without a path, credentials, query, or fragment when http.auth_mode = \"oauth\""
+                    "http.public_base_url must be an HTTPS origin with a domain hostname and without a path, credentials, query, or fragment when http.auth_mode = \"oauth\""
                         .to_string(),
                 ),
             }
@@ -1753,6 +1753,38 @@ mod tests {
             errors.iter().any(|e| e.contains("HTTPS origin")),
             "expected oauth HTTPS issuer validation error, got {errors:?}"
         );
+    }
+
+    #[test]
+    fn load_config_rejects_oauth_ip_literal_public_base_urls_before_startup() {
+        for (label, public_base_url) in [
+            ("ipv4", "https://127.0.0.1:3282"),
+            ("ipv6", "https://[::1]:3282"),
+        ] {
+            let temp = unique_temp_dir(label);
+            let path = temp.join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+                    [http]
+                    auth_mode = "oauth"
+                    public_base_url = "{public_base_url}"
+                    oauth_scopes = ["tools:read"]
+                    "#
+                ),
+            )
+            .expect("write config fixture");
+
+            let error = load_config(Some(&path)).expect_err("IP issuer must fail config loading");
+            let message = error.to_string();
+            assert!(
+                message.contains("http.public_base_url") && message.contains("domain hostname"),
+                "invalid setting must be named for {label}: {message}"
+            );
+
+            std::fs::remove_dir_all(temp).expect("remove config fixture");
+        }
     }
 
     #[test]

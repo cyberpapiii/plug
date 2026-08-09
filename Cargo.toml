@@ -68,7 +68,7 @@ sha2 = "0.10"
 
 # URL parsing + form encoding (downstream OAuth redirect handling)
 url = "2"
-webauthn-rs = { version = "=0.5.3", default-features = false, features = ["danger-allow-state-serialisation", "resident-key-support"] }
+passkey-auth = "=0.1.3"
 
 # Paths
 directories = "6"

@@ -464,9 +464,17 @@ impl DownstreamOauthManager {
     }
 
     pub fn try_new(config: DownstreamOauthConfig) -> Result<Self, DownstreamOauthError> {
-        let path = state_file_path(&config);
+        let state_dir = crate::config::config_dir().join("downstream_oauth");
+        Self::try_new_with_state_dir(config, &state_dir)
+    }
+
+    fn try_new_with_state_dir(
+        config: DownstreamOauthConfig,
+        state_dir: &std::path::Path,
+    ) -> Result<Self, DownstreamOauthError> {
+        let path = state_file_path_in_dir(&config, state_dir, STATE_VERSION);
         if !path.exists() {
-            let legacy_path = state_file_path_for_version(&config, 2);
+            let legacy_path = state_file_path_in_dir(&config, state_dir, 2);
             if legacy_path.exists() {
                 let migrated = load_persisted_state(&legacy_path)?;
                 persist_state(&path, &migrated)?;
@@ -1366,19 +1374,17 @@ pub fn resource_scopes(scopes: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn state_file_path(config: &DownstreamOauthConfig) -> PathBuf {
-    state_file_path_for_version(config, STATE_VERSION)
-}
-
-fn state_file_path_for_version(config: &DownstreamOauthConfig, version: u8) -> PathBuf {
+fn state_file_path_in_dir(
+    config: &DownstreamOauthConfig,
+    state_dir: &std::path::Path,
+    version: u8,
+) -> PathBuf {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(config.public_base_url.trim_end_matches('/').as_bytes());
-    crate::config::config_dir()
-        .join("downstream_oauth")
-        .join(format!(
-            "issuer-v{version}-{}.json",
-            hex::encode(&digest[..8])
-        ))
+    state_dir.join(format!(
+        "issuer-v{version}-{}.json",
+        hex::encode(&digest[..8])
+    ))
 }
 
 fn load_persisted_state(
@@ -1401,7 +1407,6 @@ fn load_persisted_state(
         ));
     }
     let _ = state.evict_expired(epoch_secs());
-    persist_state(path, &state)?;
     Ok(state)
 }
 
@@ -1436,7 +1441,37 @@ fn persist_state(
     #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    sync_parent_dir(dir).map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_PARENT_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_parent_dir_sync_for_tests() {
+    FAIL_NEXT_PARENT_DIR_SYNC.set(true);
+}
+
+fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_PARENT_DIR_SYNC.replace(false) {
+        return Err(std::io::Error::other(
+            "injected parent directory sync failure",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1523,6 +1558,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_new_migrates_into_v3_without_mutating_v2_source() {
+        let temp = tempfile::tempdir().expect("state tempdir");
+        let state_dir = temp.path().join("downstream_oauth");
+        std::fs::create_dir_all(&state_dir).expect("state directory");
+        let config = test_config();
+        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
+        let current_path = state_file_path_in_dir(&config, &state_dir, STATE_VERSION);
+        let now = epoch_secs();
+        let fixture = serde_json::json!({
+            "version": 2,
+            "clients": {
+                "plug_existing": {
+                    "client_id": "plug_existing",
+                    "client_name": "Existing client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "source": "dynamic_registration",
+                    "created_at": now,
+                    "last_used_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "access_tokens": {
+                "access-existing": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "issued_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "refresh_tokens": {
+                "refresh-existing": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "expires_at": now + 3600
+                }
+            },
+            "revoked_client_ids": ["plug_revoked"]
+        });
+        let legacy_bytes = serde_json::to_vec_pretty(&fixture).expect("serialize fixture");
+        std::fs::write(&legacy_path, &legacy_bytes).expect("write legacy fixture");
+
+        let manager = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
+            .expect("migrate production state paths");
+
+        assert_eq!(
+            std::fs::read(&legacy_path).expect("read legacy source"),
+            legacy_bytes,
+            "version 2 rollback source must remain byte-for-byte unchanged"
+        );
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current_path).expect("read version 3 target"))
+                .expect("parse version 3 target");
+        assert_eq!(current["version"], 3);
+        assert!(current["clients"].get("plug_existing").is_some());
+        assert!(current["access_tokens"].get("access-existing").is_some());
+        assert!(current["refresh_tokens"].get("refresh-existing").is_some());
+        assert_eq!(
+            current["revoked_client_ids"],
+            serde_json::json!(["plug_revoked"])
+        );
+
+        let state = manager.state.lock().await;
+        assert!(state.clients.contains_key("plug_existing"));
+        assert!(state.access_tokens.contains_key("access-existing"));
+        assert!(state.refresh_tokens.contains_key("refresh-existing"));
+        assert!(state.revoked_client_ids.contains("plug_revoked"));
+    }
+
+    #[tokio::test]
     async fn pending_authorization_survives_restart() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
@@ -1549,6 +1655,29 @@ mod tests {
                 .pending_consent_exists_for_tests(&consent.consent_id)
                 .await
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authorization_start_sync_failure_does_not_publish_consent() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        fail_next_parent_dir_sync_for_tests();
+
+        let result = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "failure-state",
+                code_challenge: "failure-challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await;
+
+        assert!(matches!(result, Err(DownstreamOauthError::Persistence(_))));
+        assert!(manager.state.lock().await.pending_consents.is_empty());
     }
 
     #[tokio::test]

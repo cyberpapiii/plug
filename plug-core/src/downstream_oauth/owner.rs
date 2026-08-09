@@ -1,13 +1,15 @@
+use passkey_auth::{AuthenticationState, PasskeyCredential, RegistrationState, Webauthn};
 use serde::{Deserialize, Serialize};
-use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, Webauthn, WebauthnBuilder,
-};
 
 use super::DownstreamOauthError;
 
 pub const MAX_OWNER_CREDENTIALS: usize = 5;
 pub const MAX_OWNER_CHALLENGES: usize = 10;
 pub const OWNER_CEREMONY_LIFETIME_SECS: u64 = 300;
+
+pub type Passkey = PasskeyCredential;
+pub type PasskeyRegistration = RegistrationState;
+pub type PasskeyAuthentication = AuthenticationState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnerCredential {
@@ -66,11 +68,9 @@ impl OwnerSecurity {
                 return Err(DownstreamOauthError::InvalidAuthorizationRequest);
             }
         };
-        let webauthn = WebauthnBuilder::new(&rp_id, &origin)
-            .map_err(|_| DownstreamOauthError::InvalidAuthorizationRequest)?
-            .rp_name("Plug")
-            .build()
-            .map_err(|_| DownstreamOauthError::InvalidAuthorizationRequest)?;
+        let webauthn = Webauthn::new(&rp_id, "Plug", origin.as_str())
+            .require_user_verification(true)
+            .strict_base64(true);
         Ok(Self {
             webauthn,
             rp_id,
