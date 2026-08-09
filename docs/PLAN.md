@@ -81,25 +81,17 @@ The current product shape is:
 
 ## Remaining Work
 
-The current production release is on `main`. The following work exists
-off-main on `codex/fix-cimd-client-compatibility`; it is not done on `main`:
+Cross-client downstream OAuth reliability is done on `main` through PR #83.
+That release includes capability-superset CIMD compatibility, retry-safe local
+consent, actionable OAuth errors, full automated DCR lifecycle coverage, and
+deterministic CIMD validation fixtures. Its automated gates passed, and a signed
+local build from current `main` is installed and running. Remote consent POST
+remains forbidden, and authorization-code replay remains `invalid_grant` in
+focused coverage.
 
-- Client ID Metadata Document capability-superset compatibility: require the
-  authorization-code flow selected by Plug, but accept unrelated client
-  extension capabilities. Dynamic Client Registration remains strict.
-- retry-safe local consent: repeat submissions replay the original redirect and
-  never mint a second authorization code or change the recorded decision.
-- safe, actionable OAuth errors across JSON, authorization-page, and redirect
-  responses.
-- a full automated DCR lifecycle covering registration, local consent,
-  authorization-code exchange, refresh rotation, and replay rejection.
-- deterministic CIMD validation fixtures covering capability-superset
-  acceptance and rejection. Live HTTPS CIMD client certification remains a
-  manual pending gate; it is not part of the automated lifecycle proof.
-
-The branch still needs merge, release verification, and live HTTPS CIMD client
-certification. Remote consent POST remains forbidden, and authorization-code
-replay remains `invalid_grant` in its focused coverage.
+Live HTTPS CIMD client certification remains a manual pending gate. It is not
+part of the automated lifecycle proof and is complete only when a live remote
+client finishes consent, callback, token exchange, and MCP connection.
 
 The July 17 downstream OAuth cutover supersedes the older single-client
 allowlist and secretless-client guard described in the historical entries
