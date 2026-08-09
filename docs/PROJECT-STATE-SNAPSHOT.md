@@ -51,6 +51,7 @@ Implemented on `main`:
 - standards-based multi-client downstream OAuth: RFC 7591 Dynamic Client Registration for Cursor and other public clients, SSRF-hardened OAuth Client ID Metadata Documents, explicit consent, PKCE S256, exact HTTPS/loopback redirects, RFC 8707 resource-bound tokens, issuance-time scope validation against configured `http.oauth_scopes`, rotating refresh tokens, and cross-client grant isolation
   - scope enforcement is asymmetric by era and this is deliberate: requested scopes are validated at `/oauth/authorize` and `/oauth/token` on every path, but per-request scope checks at `/mcp` apply only in the gated modern era. The default legacy era grants the OAuth principal `local_trust`, which short-circuits the required-scope check, so a legacy token reaches every method family regardless of its scopes. See [`docs/bug-reports/downstream-oauth-scope-enforcement-legacy-era-bypass.md`](bug-reports/downstream-oauth-scope-enforcement-legacy-era-bypass.md)
 - issuer-wide owner-only OAuth persistence with registration rate limits, quotas, unused-client expiry, restart recovery, and fail-closed writes; `plug auth clients list/revoke` provides bounded administration without exposing credentials
+- cross-client OAuth reliability hardening: Client ID Metadata Documents accept unrelated extension capabilities while enforcing Plug's authorization-code requirements; local consent decisions are retry-safe and replay their first result; JSON, authorization-page, and redirect errors are actionable; automated DCR lifecycle coverage proves registration, consent, code exchange, refresh rotation, and replay rejection (PR #83)
 - per-upstream operability metrics in `plug status --output json`: call/error counts, last-latency, degraded-since epoch, and circuit-state label per upstream, with a stable always-present schema (zero-filled for known servers) (PR #60)
 - first-class upstream catalog availability (`healthy | degraded | absent`), distinct from connection health, surfaced additively on `ServerStatus` JSON: a transient listing failure (timeout/error) on a routable upstream is `degraded` and serves its last-known-good resources/prompts (preserving active resource subscriptions instead of pruning them); genuine removal still prunes. Closes the PR #58 subscription-rebind residual (PR #61)
 - clearer operator auth/runtime UX across `plug status`, `plug doctor`, `plug auth status`, `plug clients`, and `plug servers`
@@ -103,27 +104,13 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-Cross-client downstream OAuth reliability work exists off-main on
-`codex/fix-cimd-client-compatibility`; it is not done on `main`. The branch
-adds:
-
-- Client ID Metadata Document capability-superset compatibility: Plug requires
-  the authorization-code flow it uses, while allowing unrelated client
-  capabilities that apply to other authorization servers. Dynamic Client
-  Registration remains strict for Plug's own registration contract.
-- retry-safe local consent decisions: repeated approval or denial replays the
-  first redirect, rather than minting another authorization code or changing
-  the redirect outcome.
-- safe, actionable OAuth error descriptions for JSON, authorization-page, and
-  redirect responses.
-- a full automated DCR lifecycle covering registration, local consent,
-  authorization-code exchange, refresh rotation, and replay rejection.
-- deterministic CIMD validation fixtures covering capability-superset
-  acceptance and rejection. Live HTTPS CIMD client certification remains a
-  manual pending gate; it is not part of the automated lifecycle proof.
-
-Focused coverage on that branch keeps remote consent POST forbidden and keeps
-authorization-code replay at `invalid_grant`.
+No roadmap-relevant cross-client downstream OAuth work currently exists
+off-main. PR #83 merged the reliability work into `main`, including
+capability-superset CIMD compatibility, retry-safe local consent, actionable
+OAuth errors, and full automated DCR lifecycle coverage. Focused coverage keeps
+remote consent POST forbidden and authorization-code replay at `invalid_grant`.
+Live HTTPS CIMD client certification remains a manual pending gate; it is not
+part of the automated lifecycle proof.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era
@@ -134,10 +121,13 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-The current production release remains on `main`. The cross-client downstream
-OAuth reliability work above is `exists off-main`; merge, release verification,
-and live HTTPS CIMD client certification remain pending. Do not treat it as
-released until current `main` contains the branch and those checks pass.
+The cross-client downstream OAuth reliability work is done on `main` through
+PR #83. Its automated release gates passed: 1,021 workspace tests, clippy, and
+formatting. A signed local build from current `main` is installed and running as
+the shared daemon with all 12 configured upstreams healthy. Live HTTPS CIMD
+client certification remains a manual pending gate; do not treat that manual
+client proof as complete until the post-consent callback succeeds in a live
+remote client.
 
 On 2026-07-17, downstream OAuth moved from one manually configured client to
 a standards-based public-client service. A remote MCP client now starts with
