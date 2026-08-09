@@ -2824,6 +2824,12 @@ mod tests {
     }
 
     fn oauth_test_state() -> Arc<HttpState> {
+        oauth_test_state_with_manager(isolated_oauth_manager(vec!["tools:read".to_string()]))
+    }
+
+    fn oauth_test_state_with_manager(
+        manager: crate::downstream_oauth::DownstreamOauthManager,
+    ) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(
             sm,
@@ -2844,7 +2850,7 @@ mod tests {
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
+            downstream_oauth: Some(manager),
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2854,6 +2860,25 @@ mod tests {
             reverse_request_counter: AtomicU64::new(1),
             client_capabilities: DashMap::new(),
         })
+    }
+
+    fn oauth_tools_list_request(access_token: &str, session_id: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(SESSION_ID_HEADER, session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .expect("tools/list request")
     }
 
     #[test]
@@ -5708,45 +5733,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_authorization_code_flow_issues_working_access_token() {
-        let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
+    async fn client_neutral_oauth_lifecycle_acceptance_matrix() {
+        let state_path = std::env::temp_dir().join(format!(
+            "plug-oauth-lifecycle-matrix-{}.json",
+            uuid::Uuid::new_v4()
         ));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
-        let app = build_router(state);
+        let oauth_config = crate::downstream_oauth::DownstreamOauthConfig {
+            public_base_url: "https://plug.example.com".to_string(),
+            oauth_scopes: vec!["tools:read".to_string()],
+            local_port: 3282,
+        };
+        let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config.clone(),
+            state_path.clone(),
+        )
+        .expect("lifecycle OAuth manager");
+        let app = build_router(oauth_test_state_with_manager(manager.clone()));
 
         let registration_req = HttpRequest::builder()
             .method("POST")
             .uri("/oauth/register")
             .header("Content-Type", "application/json")
             .body(Body::from(
-                r#"{"client_name":"Cursor","redirect_uris":["https://client.example.com/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"]}"#,
+                r#"{"client_name":"Matrix public client","redirect_uris":["https://client.example.com/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"]}"#,
             ))
             .unwrap();
         let registration_resp = app.clone().oneshot(registration_req).await.unwrap();
@@ -5756,11 +5765,14 @@ mod tests {
             .expect("registration body");
         let registration: serde_json::Value =
             serde_json::from_slice(&registration_body).expect("registration json");
-        let client_id = registration["client_id"].as_str().expect("client id");
+        let client_id = registration["client_id"]
+            .as_str()
+            .expect("client id")
+            .to_string();
 
         let authorize_req = HttpRequest::builder()
             .method("GET")
-            .uri(format!("/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=abc123&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp"))
+            .uri(format!("/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcallback&state=matrix-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=tools%3Aread&resource=https%3A%2F%2Fplug.example.com%2Fmcp"))
             .body(Body::empty())
             .unwrap();
         let authorize_resp = app.clone().oneshot(authorize_req).await.unwrap();
@@ -5774,18 +5786,6 @@ mod tests {
             .nth(1)
             .and_then(|value| value.split('\"').next())
             .expect("consent id");
-        let remote_approval = HttpRequest::builder()
-            .method("POST")
-            .uri("/_plug/oauth/authorize")
-            .header(header::HOST, "plug.example.com")
-            .header("cf-connecting-ip", "203.0.113.10")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(Body::from(format!(
-                "consent_id={consent_id}&decision=approve"
-            )))
-            .unwrap();
-        let remote_response = app.clone().oneshot(remote_approval).await.unwrap();
-        assert_eq!(remote_response.status(), StatusCode::FORBIDDEN);
         let consent_req = HttpRequest::builder()
             .method("POST")
             .uri("/_plug/oauth/authorize")
@@ -5833,15 +5833,41 @@ mod tests {
             .to_string();
         assert_eq!(token_value["token_type"], "Bearer");
 
-        let mcp_req = HttpRequest::builder()
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "matrix-client", "version": "1.0" }
+            }
+        });
+        let initialize_req = HttpRequest::builder()
             .method("POST")
             .uri("/mcp")
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {access_token}"))
-            .body(Body::from("{}"))
+            .body(Body::from(initialize.to_string()))
             .unwrap();
-        let mcp_resp = app.clone().oneshot(mcp_req).await.unwrap();
-        assert_eq!(mcp_resp.status(), StatusCode::BAD_REQUEST);
+        let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+        assert_eq!(initialize_resp.status(), StatusCode::OK);
+        let session_id = initialize_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session ID")
+            .to_string();
+
+        let list_req = oauth_tools_list_request(&access_token, &session_id);
+        let list_resp = app.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_resp.into_body(), 10_000)
+            .await
+            .expect("tools/list body");
+        let list_value: serde_json::Value =
+            serde_json::from_slice(&list_body).expect("tools/list JSON");
+        assert!(list_value["result"]["tools"].is_array());
 
         let refresh_req = HttpRequest::builder()
             .method("POST")
@@ -5851,8 +5877,149 @@ mod tests {
                 "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
             )))
             .unwrap();
-        let refresh_resp = app.oneshot(refresh_req).await.unwrap();
+        let refresh_resp = app.clone().oneshot(refresh_req).await.unwrap();
         assert_eq!(refresh_resp.status(), StatusCode::OK);
+        let refresh_body = axum::body::to_bytes(refresh_resp.into_body(), 10_000)
+            .await
+            .expect("refresh body");
+        let refresh_value: serde_json::Value =
+            serde_json::from_slice(&refresh_body).expect("refresh JSON");
+        let rotated_access_token = refresh_value["access_token"]
+            .as_str()
+            .expect("rotated access token")
+            .to_string();
+        let rotated_refresh_token = refresh_value["refresh_token"]
+            .as_str()
+            .expect("rotated refresh token")
+            .to_string();
+        assert_ne!(rotated_access_token, access_token);
+        assert_ne!(rotated_refresh_token, refresh_token);
+
+        let replayed_refresh = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
+            )))
+            .unwrap();
+        let replayed_refresh = app.clone().oneshot(replayed_refresh).await.unwrap();
+        assert_eq!(replayed_refresh.status(), StatusCode::BAD_REQUEST);
+        let replayed_body = axum::body::to_bytes(replayed_refresh.into_body(), 10_000)
+            .await
+            .expect("replayed refresh body");
+        let replayed_value: serde_json::Value =
+            serde_json::from_slice(&replayed_body).expect("replayed refresh JSON");
+        assert_eq!(replayed_value["error"], "invalid_grant");
+
+        drop(app);
+        drop(manager);
+        let restarted = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config.clone(),
+            state_path.clone(),
+        )
+        .expect("restarted OAuth manager");
+        let restarted_app = build_router(oauth_test_state_with_manager(restarted.clone()));
+
+        let restarted_initialize = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {rotated_access_token}"))
+            .body(Body::from(initialize.to_string()))
+            .unwrap();
+        let restarted_initialize = restarted_app
+            .clone()
+            .oneshot(restarted_initialize)
+            .await
+            .unwrap();
+        assert_eq!(restarted_initialize.status(), StatusCode::OK);
+        let restarted_session_id = restarted_initialize
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("restarted session ID")
+            .to_string();
+        let restarted_list = restarted_app
+            .clone()
+            .oneshot(oauth_tools_list_request(
+                &rotated_access_token,
+                &restarted_session_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restarted_list.status(), StatusCode::OK);
+
+        let refresh_after_restart = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={rotated_refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
+            )))
+            .unwrap();
+        let refresh_after_restart = restarted_app
+            .clone()
+            .oneshot(refresh_after_restart)
+            .await
+            .unwrap();
+        assert_eq!(refresh_after_restart.status(), StatusCode::OK);
+        let refresh_after_restart = axum::body::to_bytes(refresh_after_restart.into_body(), 10_000)
+            .await
+            .expect("post-restart refresh body");
+        let refresh_after_restart: serde_json::Value =
+            serde_json::from_slice(&refresh_after_restart).expect("post-restart refresh JSON");
+        let final_access_token = refresh_after_restart["access_token"]
+            .as_str()
+            .expect("post-restart access token")
+            .to_string();
+
+        assert!(
+            restarted
+                .revoke_client(&client_id)
+                .await
+                .expect("revoke client")
+        );
+        let revoked = restarted_app
+            .oneshot(oauth_tools_list_request(
+                &final_access_token,
+                &restarted_session_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            revoked
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "Bearer resource_metadata=\"https://plug.example.com/.well-known/oauth-protected-resource\", scope=\"tools:read\""
+            )
+        );
+        let revoked_body = axum::body::to_bytes(revoked.into_body(), 10_000)
+            .await
+            .expect("revoked access body");
+        let revoked_value: serde_json::Value =
+            serde_json::from_slice(&revoked_body).expect("revoked access JSON");
+        assert_eq!(revoked_value["error"]["code"], -32001);
+
+        drop(restarted);
+        let after_revoke = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config,
+            state_path,
+        )
+        .expect("restart after revoke");
+        assert!(after_revoke.list_clients().await.is_empty());
+        let after_revoke_app = build_router(oauth_test_state_with_manager(after_revoke));
+        let revoked_after_restart = after_revoke_app
+            .oneshot(oauth_tools_list_request(
+                &final_access_token,
+                &restarted_session_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked_after_restart.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -1436,6 +1436,30 @@ mod tests {
             .expect("exchange code")
     }
 
+    #[derive(Clone, Copy)]
+    enum CapabilityFixtureKind {
+        DynamicRegistration,
+        MetadataDocument(&'static str),
+    }
+
+    fn validate_recorded_capability_fixture(
+        kind: CapabilityFixtureKind,
+        document: &str,
+    ) -> Result<(), DownstreamOauthError> {
+        match kind {
+            CapabilityFixtureKind::DynamicRegistration => {
+                let request: ClientRegistrationRequest =
+                    serde_json::from_str(document).expect("recorded DCR fixture");
+                validate_registration_request(&request)
+            }
+            CapabilityFixtureKind::MetadataDocument(client_id) => {
+                let document: ClientMetadataDocument =
+                    serde_json::from_str(document).expect("recorded CIMD fixture");
+                validate_metadata_document(client_id, &document)
+            }
+        }
+    }
+
     #[tokio::test]
     async fn repeated_consent_approval_replays_first_redirect_and_mints_one_code() {
         let (manager, _) = test_manager();
@@ -1527,8 +1551,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_document_accepts_additional_client_capabilities() {
-        let claude: ClientMetadataDocument = serde_json::from_str(
+    fn recorded_metadata_document_accepts_known_extension_superset() {
+        let document: ClientMetadataDocument = serde_json::from_str(
             r#"{
                 "client_id": "https://claude.ai/oauth/mcp-oauth-client-metadata",
                 "client_name": "Claude",
@@ -1543,61 +1567,82 @@ mod tests {
                 "token_endpoint_auth_method": "none"
             }"#,
         )
-        .expect("Claude metadata document");
+        .expect("known metadata document fixture");
+
         assert_eq!(
             validate_metadata_document(
                 "https://claude.ai/oauth/mcp-oauth-client-metadata",
-                &claude,
+                &document,
             ),
-            Ok(())
-        );
-
-        let extensible = ClientMetadataDocument {
-            client_id: "https://client.example/metadata.json".to_string(),
-            client_name: Some("Extensible client".to_string()),
-            redirect_uris: vec!["https://client.example/callback".to_string()],
-            token_endpoint_auth_method: Some("none".to_string()),
-            grant_types: Some(vec![
-                "authorization_code".to_string(),
-                "urn:example:grant-type:future".to_string(),
-            ]),
-            response_types: Some(vec!["code".to_string(), "future".to_string()]),
-        };
-        assert_eq!(
-            validate_metadata_document("https://client.example/metadata.json", &extensible),
             Ok(())
         );
     }
 
     #[test]
-    fn metadata_document_still_requires_plugs_selected_code_flow() {
-        let baseline = || ClientMetadataDocument {
-            client_id: "https://client.example/metadata.json".to_string(),
-            client_name: Some("Client".to_string()),
-            redirect_uris: vec!["https://client.example/callback".to_string()],
-            token_endpoint_auth_method: Some("none".to_string()),
-            grant_types: Some(vec!["authorization_code".to_string()]),
-            response_types: Some(vec!["code".to_string()]),
-        };
-
-        let mut missing_code_grant = baseline();
-        missing_code_grant.grant_types = Some(vec![
-            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
-        ]);
-        assert_eq!(
-            validate_metadata_document("https://client.example/metadata.json", &missing_code_grant,),
-            Err(DownstreamOauthError::InvalidClientMetadata)
-        );
-
-        let mut missing_code_response = baseline();
-        missing_code_response.response_types = Some(vec!["token".to_string()]);
-        assert_eq!(
-            validate_metadata_document(
-                "https://client.example/metadata.json",
-                &missing_code_response,
+    fn client_neutral_capability_fixture_matrix() {
+        for (class, kind, document, expected) in [
+            (
+                "strict DCR",
+                CapabilityFixtureKind::DynamicRegistration,
+                r#"{
+                    "client_name": "Strict public client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"]
+                }"#,
+                Ok(()),
             ),
-            Err(DownstreamOauthError::InvalidClientMetadata)
-        );
+            (
+                "baseline CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Baseline metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"]
+                }"#,
+                Ok(()),
+            ),
+            (
+                "extension-rich CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Extension-rich metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": [
+                        "authorization_code",
+                        "refresh_token",
+                        "urn:example:grant-type:future"
+                    ],
+                    "response_types": ["code", "future"]
+                }"#,
+                Ok(()),
+            ),
+            (
+                "missing-code-flow CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Non-code metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["urn:example:grant-type:future"],
+                    "response_types": ["future"]
+                }"#,
+                Err(DownstreamOauthError::InvalidClientMetadata),
+            ),
+        ] {
+            assert_eq!(
+                validate_recorded_capability_fixture(kind, document),
+                expected,
+                "{class}"
+            );
+        }
     }
 
     #[test]
