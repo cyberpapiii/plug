@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` after PR #68 merged the 2026-08-04 dual-era MCP modernization.
+Baseline: `main` at merge commit `8adbcd1` on 2026-08-09.
 
 This is the canonical current-state doc for the project.
 
@@ -52,6 +52,8 @@ Implemented on `main`:
   - scope enforcement is asymmetric by era and this is deliberate: requested scopes are validated at `/oauth/authorize` and `/oauth/token` on every path, but per-request scope checks at `/mcp` apply only in the gated modern era. The default legacy era grants the OAuth principal `local_trust`, which short-circuits the required-scope check, so a legacy token reaches every method family regardless of its scopes. See [`docs/bug-reports/downstream-oauth-scope-enforcement-legacy-era-bypass.md`](bug-reports/downstream-oauth-scope-enforcement-legacy-era-bypass.md)
 - issuer-wide owner-only OAuth persistence with registration rate limits, quotas, unused-client expiry, restart recovery, and fail-closed writes; `plug auth clients list/revoke` provides bounded administration without exposing credentials
 - cross-client OAuth reliability hardening: Client ID Metadata Documents accept unrelated extension capabilities while enforcing Plug's authorization-code requirements; local consent decisions are retry-safe and replay their first result; JSON, authorization-page, and redirect errors are actionable; automated DCR lifecycle coverage proves registration, consent, code exchange, refresh rotation, and replay rejection (PR #83)
+- public HTTPS owner-passkey approval for downstream OAuth, with durable authorization transactions, restart-safe and replay-safe decisions, local proof-authenticated owner enrollment/administration, exact-origin WebAuthn verification, and bounded non-evicting approval ceremonies
+- real-process browser coverage for owner enrollment, public consent, PKCE exchange, authenticated MCP use, refresh rotation, restart, denial, expiry, revocation, origin/security headers, error behavior, and redaction
 - per-upstream operability metrics in `plug status --output json`: call/error counts, last-latency, degraded-since epoch, and circuit-state label per upstream, with a stable always-present schema (zero-filled for known servers) (PR #60)
 - first-class upstream catalog availability (`healthy | degraded | absent`), distinct from connection health, surfaced additively on `ServerStatus` JSON: a transient listing failure (timeout/error) on a routable upstream is `degraded` and serves its last-known-good resources/prompts (preserving active resource subscriptions instead of pruning them); genuine removal still prunes. Closes the PR #58 subscription-rebind residual (PR #61)
 - clearer operator auth/runtime UX across `plug status`, `plug doctor`, `plug auth status`, `plug clients`, and `plug servers`
@@ -104,22 +106,9 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-`exists off-main`: branch `codex/oauth-owner-passkey-implementation` adds public
-HTTPS owner-passkey verification to downstream OAuth consent and persists the
-authorization request, passkey ceremony, and completed decision so approval is
-restart-safe and replay-safe. Owner enrollment and credential administration
-run through local-only, proof-authenticated operator requests. The reviewed
-implementation head is `07c5c14`.
-
-The real-process Playwright suite proves the full Chromium path through owner
-enrollment, passkey approval, PKCE exchange, MCP use, refresh rotation, restart,
-and revocation. Chromium and WebKit both prove the shared public-HTTPS page,
-origin, security-header, denial, expiry, restart, error, and redaction behavior.
-Playwright WebKit does not expose a virtual authenticator, so a real WebKit
-platform-passkey ceremony remains a manual signed-build gate. Live certification
-also remains pending for each named client; this branch does not claim current
-Claude, ChatGPT, Codex, Cursor, or OpenCode approval. No signed build from this
-branch has been installed.
+No roadmap-relevant downstream OAuth work currently exists only off-main. The
+owner-passkey implementation was merged by `8adbcd1`, pushed to `origin/main`,
+installed as a signed local binary, and started as the shared daemon.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era
@@ -130,23 +119,29 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-The owner-verified downstream OAuth candidate `exists off-main`; it is not a
-current release. Fresh implementation-head verification passed 1,101 serial
-workspace tests, formatting, clippy, Rust 1.88 MSRV compilation, dependency
-policy and advisory checks, secret/SAST/vulnerability scans, both Linux CI
-target checks, 5 real-process browser tests with 1 intentional WebKit
-virtual-authenticator skip, and the release binary size gate. It still requires
-exact-head CI, manual WebKit platform-passkey proof in a signed build, live
-named-client certification, merge to `main`, and signed installation before it
-can be described as released.
+Owner-verified downstream OAuth is done on `main` through merge commit
+`8adbcd1`. Fresh merged-main verification passed 1,106 workspace tests and 5
+real-process browser tests with 1 intentional WebKit virtual-authenticator skip.
+The exact source head is installed with the stable `Plug Local Signing`
+identity, the shared daemon is running with one enrolled owner passkey, and all
+12 configured upstreams are healthy.
+
+Live Claude Desktop certification passed on 2026-08-09: Claude discovered Plug
+from only `https://plug.plugtunnel.com/mcp`, used its official Client ID Metadata
+Document and hosted callback, displayed the public Plug approval page, completed
+owner-passkey approval without a localhost hop, exchanged the grant, and showed
+the connector as connected. Plug recorded the Claude client as recently used
+and reported active downstream HTTP sessions. ChatGPT, Codex, Cursor, OpenCode,
+and a real WebKit platform-passkey ceremony remain separate manual compatibility
+gates; no claim is made for those clients from the Claude result.
 
 The cross-client downstream OAuth reliability work is done on `main` through
 PR #83. Its automated release gates passed: 1,021 workspace tests, clippy, and
 formatting. A signed local build from current `main` is installed and running as
 the shared daemon with all 12 configured upstreams healthy. Live HTTPS CIMD
-client certification remains a manual pending gate; do not treat that manual
-client proof as complete until the post-consent callback succeeds in a live
-remote client.
+certification is complete for Claude Desktop. Other named clients remain manual
+gates; do not infer their compatibility from Claude's successful post-consent
+callback and live MCP connection.
 
 On 2026-07-17, downstream OAuth moved from one manually configured client to
 a standards-based public-client service. A remote MCP client now starts with
