@@ -1036,18 +1036,34 @@ fn validate_metadata_document(
     expected_client_id: &str,
     document: &ClientMetadataDocument,
 ) -> Result<(), DownstreamOauthError> {
-    let request = ClientRegistrationRequest {
-        redirect_uris: document.redirect_uris.clone(),
-        client_name: document.client_name.clone(),
-        token_endpoint_auth_method: document.token_endpoint_auth_method.clone(),
-        grant_types: document.grant_types.clone(),
-        response_types: document.response_types.clone(),
-        scope: None,
-    };
-    if document.client_id != expected_client_id {
+    // A metadata document describes the client's capabilities across every
+    // authorization server it can use. Require the flow Plug will select, but
+    // do not reject unrelated extension capabilities. Dynamic registration is
+    // authorization-server-specific and intentionally remains stricter.
+    if document.client_id != expected_client_id
+        || document.redirect_uris.is_empty()
+        || document.redirect_uris.len() > 10
+        || document
+            .redirect_uris
+            .iter()
+            .any(|uri| !valid_redirect_uri(uri))
+        || document
+            .token_endpoint_auth_method
+            .as_deref()
+            .unwrap_or("none")
+            != "none"
+        || document
+            .grant_types
+            .as_ref()
+            .is_some_and(|items| !items.iter().any(|item| item == "authorization_code"))
+        || document
+            .response_types
+            .as_ref()
+            .is_some_and(|items| !items.iter().any(|item| item == "code"))
+    {
         return Err(DownstreamOauthError::InvalidClientMetadata);
     }
-    validate_registration_request(&request)
+    Ok(())
 }
 
 async fn fetch_client_metadata_document(
@@ -1393,6 +1409,99 @@ mod tests {
         assert!(!valid_redirect_uri(
             "https://client.example/callback#fragment"
         ));
+    }
+
+    #[test]
+    fn metadata_document_accepts_additional_client_capabilities() {
+        let claude: ClientMetadataDocument = serde_json::from_str(
+            r#"{
+                "client_id": "https://claude.ai/oauth/mcp-oauth-client-metadata",
+                "client_name": "Claude",
+                "client_uri": "https://claude.ai",
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+                "grant_types": [
+                    "authorization_code",
+                    "refresh_token",
+                    "urn:ietf:params:oauth:grant-type:jwt-bearer"
+                ],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"
+            }"#,
+        )
+        .expect("Claude metadata document");
+        assert_eq!(
+            validate_metadata_document(
+                "https://claude.ai/oauth/mcp-oauth-client-metadata",
+                &claude,
+            ),
+            Ok(())
+        );
+
+        let extensible = ClientMetadataDocument {
+            client_id: "https://client.example/metadata.json".to_string(),
+            client_name: Some("Extensible client".to_string()),
+            redirect_uris: vec!["https://client.example/callback".to_string()],
+            token_endpoint_auth_method: Some("none".to_string()),
+            grant_types: Some(vec![
+                "authorization_code".to_string(),
+                "urn:example:grant-type:future".to_string(),
+            ]),
+            response_types: Some(vec!["code".to_string(), "future".to_string()]),
+        };
+        assert_eq!(
+            validate_metadata_document("https://client.example/metadata.json", &extensible),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn metadata_document_still_requires_plugs_selected_code_flow() {
+        let baseline = || ClientMetadataDocument {
+            client_id: "https://client.example/metadata.json".to_string(),
+            client_name: Some("Client".to_string()),
+            redirect_uris: vec!["https://client.example/callback".to_string()],
+            token_endpoint_auth_method: Some("none".to_string()),
+            grant_types: Some(vec!["authorization_code".to_string()]),
+            response_types: Some(vec!["code".to_string()]),
+        };
+
+        let mut missing_code_grant = baseline();
+        missing_code_grant.grant_types = Some(vec![
+            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+        ]);
+        assert_eq!(
+            validate_metadata_document("https://client.example/metadata.json", &missing_code_grant,),
+            Err(DownstreamOauthError::InvalidClientMetadata)
+        );
+
+        let mut missing_code_response = baseline();
+        missing_code_response.response_types = Some(vec!["token".to_string()]);
+        assert_eq!(
+            validate_metadata_document(
+                "https://client.example/metadata.json",
+                &missing_code_response,
+            ),
+            Err(DownstreamOauthError::InvalidClientMetadata)
+        );
+    }
+
+    #[test]
+    fn dynamic_registration_does_not_adopt_unimplemented_grants() {
+        let request = ClientRegistrationRequest {
+            redirect_uris: vec!["https://client.example/callback".to_string()],
+            client_name: Some("Client".to_string()),
+            token_endpoint_auth_method: Some("none".to_string()),
+            grant_types: Some(vec![
+                "authorization_code".to_string(),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+            ]),
+            response_types: Some(vec!["code".to_string()]),
+            scope: None,
+        };
+        assert_eq!(
+            validate_registration_request(&request),
+            Err(DownstreamOauthError::InvalidClientMetadata)
+        );
     }
 
     #[test]

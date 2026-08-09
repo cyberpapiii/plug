@@ -46,6 +46,12 @@ therefore cannot produce a token that disappears on restart.
 - Metadata-document fetching disables redirects, pins public DNS resolution,
   rejects local/private addresses, and limits connect time, total time, and
   response size.
+- Metadata-document capability lists are client-wide, not a request to enable
+  every listed capability in Plug. Require the authorization-code flow Plug
+  selects, accept unrelated extension grant and response types, and continue
+  rejecting those extensions if a client actually requests them at Plug's
+  token endpoint. Do not reuse the stricter dynamic-registration validator for
+  metadata documents.
 - Registration is rate-limited, quota-limited, and expired when unused.
 
 ## Operational lesson
