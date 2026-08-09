@@ -7,8 +7,9 @@
 pub mod owner;
 
 pub use owner::{
-    OwnerAuthenticationCeremony, OwnerBootstrap, OwnerCredential, OwnerRegistrationCeremony,
-    OwnerSecurity,
+    OwnerApprovalChallenge, OwnerAuthenticationCeremony, OwnerBootstrap, OwnerCredential,
+    OwnerCredentialSummary, OwnerRegistrationCeremony, OwnerRegistrationChallenge, OwnerSecurity,
+    PublicKeyCredential, RegisterPublicKeyCredential,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -334,6 +335,8 @@ struct CompletedConsent {
     client_id: String,
     redirect: AuthorizationRedirect,
     expires_at: u64,
+    #[serde(default)]
+    approval_ceremony_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +413,15 @@ impl Default for DownstreamOauthState {
 }
 
 impl DownstreamOauthState {
+    fn evict_expired_owner_records(&mut self, now: u64) {
+        self.owner_bootstraps
+            .retain(|_, item| item.expires_at > now);
+        self.owner_registration_ceremonies
+            .retain(|_, item| item.expires_at > now);
+        self.owner_authentication_ceremonies
+            .retain(|_, item| item.expires_at > now);
+    }
+
     fn evict_expired(&mut self, now: u64) -> HashSet<String> {
         let expired: HashSet<String> = self
             .clients
@@ -607,6 +619,436 @@ impl DownstreamOauthManager {
             .await
             .pending_consents
             .contains_key(consent_id)
+    }
+
+    pub async fn create_owner_bootstrap(&self) -> Result<String, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let secret = opaque_value();
+        let secret_hash = owner::owner_binding_hash(&[b"owner-bootstrap", secret.as_bytes()]);
+        let mut guard = self.state.lock().await;
+        let mut next = guard.clone();
+        next.evict_expired_owner_records(epoch_secs());
+        next.owner_bootstraps.clear();
+        next.owner_bootstraps.insert(
+            secret_hash.clone(),
+            OwnerBootstrap {
+                secret_hash,
+                expires_at: epoch_secs() + owner::OWNER_CEREMONY_LIFETIME_SECS,
+            },
+        );
+        self.commit_state(&mut guard, next)?;
+        Ok(secret)
+    }
+
+    pub async fn start_owner_registration(
+        &self,
+        bootstrap: &str,
+    ) -> Result<OwnerRegistrationChallenge, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let now = epoch_secs();
+        let bootstrap_hash = owner::owner_binding_hash(&[b"owner-bootstrap", bootstrap.as_bytes()]);
+        let issuer_hash = owner::owner_binding_hash(&[self.base_url().as_bytes()]);
+        let mut guard = self.state.lock().await;
+        let mut next = guard.clone();
+        next.evict_expired_owner_records(now);
+        let valid_bootstrap = next.owner_bootstraps.values().any(|record| {
+            record.expires_at > now
+                && crate::auth::verify_auth_token(&bootstrap_hash, &record.secret_hash)
+        });
+        if !valid_bootstrap {
+            return Err(DownstreamOauthError::InvalidOwnerBootstrap);
+        }
+        if next.owner_credentials.len() >= owner::MAX_OWNER_CREDENTIALS {
+            return Err(DownstreamOauthError::OwnerCredentialLimit);
+        }
+        if next
+            .owner_registration_ceremonies
+            .len()
+            .saturating_add(next.owner_authentication_ceremonies.len())
+            >= owner::MAX_OWNER_CHALLENGES
+        {
+            return Err(DownstreamOauthError::RateLimited);
+        }
+        let excluded = next
+            .owner_credentials
+            .values()
+            .map(|credential| credential.passkey.id.clone())
+            .collect::<Vec<_>>();
+        let user_id = owner::owner_user_id(self.base_url());
+        let (public_key, registration_state) = self.owner_security.webauthn.start_registration(
+            &user_id,
+            "plug-owner",
+            "Plug owner",
+            &excluded,
+        );
+        let ceremony_id = opaque_value();
+        next.owner_bootstraps.clear();
+        next.owner_registration_ceremonies.insert(
+            ceremony_id.clone(),
+            OwnerRegistrationCeremony {
+                id: ceremony_id.clone(),
+                bootstrap_hash,
+                issuer_hash,
+                state: registration_state,
+                expires_at: now + owner::OWNER_CEREMONY_LIFETIME_SECS,
+            },
+        );
+        self.commit_state(&mut guard, next)?;
+        Ok(OwnerRegistrationChallenge {
+            ceremony_id,
+            public_key,
+        })
+    }
+
+    pub async fn finish_owner_registration(
+        &self,
+        ceremony_id: &str,
+        response: RegisterPublicKeyCredential,
+    ) -> Result<OwnerCredentialSummary, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let now = epoch_secs();
+        let issuer_hash = owner::owner_binding_hash(&[self.base_url().as_bytes()]);
+        let mut guard = self.state.lock().await;
+        let ceremony = guard
+            .owner_registration_ceremonies
+            .get(ceremony_id)
+            .cloned()
+            .ok_or(DownstreamOauthError::InvalidOwnerAssertion)?;
+        let mut next = guard.clone();
+        next.owner_registration_ceremonies.remove(ceremony_id);
+        if ceremony.expires_at <= now {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::OwnerChallengeExpired);
+        }
+        if !crate::auth::verify_auth_token(&issuer_hash, &ceremony.issuer_hash) {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidOwnerAssertion);
+        }
+        let passkey = match self
+            .owner_security
+            .webauthn
+            .finish_registration(&ceremony.state, &response)
+        {
+            Ok(passkey) => passkey,
+            Err(_) => {
+                self.commit_state(&mut guard, next)?;
+                return Err(DownstreamOauthError::InvalidOwnerAssertion);
+            }
+        };
+        let credential_id = passkey.id.to_b64url();
+        if next.owner_credentials.contains_key(&credential_id) {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidOwnerAssertion);
+        }
+        if next.owner_credentials.len() >= owner::MAX_OWNER_CREDENTIALS {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::OwnerCredentialLimit);
+        }
+        let credential = OwnerCredential {
+            id: credential_id.clone(),
+            label: format!("Passkey {}", next.owner_credentials.len() + 1),
+            passkey,
+            created_at: now,
+            last_used_at: None,
+        };
+        let summary = OwnerCredentialSummary::from(&credential);
+        next.owner_credentials.insert(credential_id, credential);
+        self.commit_state(&mut guard, next)?;
+        Ok(summary)
+    }
+
+    pub async fn start_owner_approval(
+        &self,
+        consent_id: &str,
+    ) -> Result<OwnerApprovalChallenge, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let now = epoch_secs();
+        let mut guard = self.state.lock().await;
+        let mut next = guard.clone();
+        next.evict_expired_owner_records(now);
+        if next.owner_credentials.is_empty() {
+            return Err(DownstreamOauthError::OwnerNotEnrolled);
+        }
+        let consent = next
+            .pending_consents
+            .get(consent_id)
+            .cloned()
+            .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
+        if consent.expires_at <= now {
+            next.pending_consents.remove(consent_id);
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+        }
+        if next
+            .owner_registration_ceremonies
+            .len()
+            .saturating_add(next.owner_authentication_ceremonies.len())
+            >= owner::MAX_OWNER_CHALLENGES
+        {
+            return Err(DownstreamOauthError::RateLimited);
+        }
+        let credentials = next
+            .owner_credentials
+            .values()
+            .map(|credential| credential.passkey.clone())
+            .collect::<Vec<_>>();
+        let credential_ids = next.owner_credentials.keys().cloned().collect::<Vec<_>>();
+        let user_id = owner::owner_user_id(self.base_url());
+        let (public_key, authentication_state) = self
+            .owner_security
+            .webauthn
+            .start_authentication_with_creds_for_user(&user_id, &credentials);
+        let consent_bytes = serde_json::to_vec(&consent)
+            .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+        let issuer_hash = owner::owner_binding_hash(&[self.base_url().as_bytes()]);
+        let consent_binding = owner::owner_binding_hash(&[
+            self.base_url().as_bytes(),
+            b"approve",
+            consent_id.as_bytes(),
+            &consent_bytes,
+        ]);
+        let ceremony_id = opaque_value();
+        next.owner_authentication_ceremonies.insert(
+            ceremony_id.clone(),
+            OwnerAuthenticationCeremony {
+                id: ceremony_id.clone(),
+                consent_id: consent_id.to_string(),
+                issuer_hash,
+                consent_binding,
+                decision: "approve".to_string(),
+                credential_ids,
+                state: authentication_state,
+                expires_at: now + owner::OWNER_CEREMONY_LIFETIME_SECS,
+            },
+        );
+        self.commit_state(&mut guard, next)?;
+        Ok(OwnerApprovalChallenge {
+            ceremony_id,
+            public_key,
+        })
+    }
+
+    pub async fn finish_owner_approval(
+        &self,
+        ceremony_id: &str,
+        response: PublicKeyCredential,
+    ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let now = epoch_secs();
+        let mut guard = self.state.lock().await;
+        let Some(ceremony) = guard
+            .owner_authentication_ceremonies
+            .get(ceremony_id)
+            .cloned()
+        else {
+            return guard
+                .completed_consents
+                .values()
+                .find(|completed| {
+                    completed.expires_at > now
+                        && completed.approval_ceremony_id.as_deref() == Some(ceremony_id)
+                })
+                .map(|completed| completed.redirect.clone())
+                .ok_or(DownstreamOauthError::InvalidOwnerAssertion);
+        };
+        let mut next = guard.clone();
+        next.completed_consents
+            .retain(|_, completed| completed.expires_at > now);
+        next.owner_authentication_ceremonies.remove(ceremony_id);
+        if ceremony.expires_at <= now {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::OwnerChallengeExpired);
+        }
+        let Some(consent) = next.pending_consents.get(&ceremony.consent_id).cloned() else {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidOwnerAssertion);
+        };
+        if consent.expires_at <= now {
+            next.pending_consents.remove(&ceremony.consent_id);
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+        }
+        let consent_bytes = serde_json::to_vec(&consent)
+            .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+        let expected_issuer_hash = owner::owner_binding_hash(&[self.base_url().as_bytes()]);
+        let expected_consent_binding = owner::owner_binding_hash(&[
+            self.base_url().as_bytes(),
+            b"approve",
+            ceremony.consent_id.as_bytes(),
+            &consent_bytes,
+        ]);
+        if ceremony.decision != "approve"
+            || !crate::auth::verify_auth_token(&expected_issuer_hash, &ceremony.issuer_hash)
+            || !crate::auth::verify_auth_token(&expected_consent_binding, &ceremony.consent_binding)
+        {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidOwnerAssertion);
+        }
+        let asserted_id = match passkey_auth::CredentialId::from_b64url(&response.id) {
+            Ok(id) => id,
+            Err(_) => {
+                self.commit_state(&mut guard, next)?;
+                return Err(DownstreamOauthError::InvalidOwnerAssertion);
+            }
+        };
+        let asserted_id_string = asserted_id.to_b64url();
+        if !ceremony
+            .credential_ids
+            .iter()
+            .any(|id| id == &asserted_id_string)
+        {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidOwnerAssertion);
+        }
+        let Some(stored) = next.owner_credentials.get(&asserted_id_string).cloned() else {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::OwnerCredentialNotFound);
+        };
+        let success = match self.owner_security.webauthn.finish_authentication(
+            &ceremony.state,
+            &response,
+            &stored.passkey,
+        ) {
+            Ok(success) if success.user_verified => success,
+            Ok(_) | Err(_) => {
+                self.commit_state(&mut guard, next)?;
+                return Err(DownstreamOauthError::InvalidOwnerAssertion);
+            }
+        };
+        let Some(owner_credential) = next.owner_credentials.get_mut(&asserted_id_string) else {
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::OwnerCredentialNotFound);
+        };
+        owner_credential.passkey.counter = success.new_counter;
+        owner_credential.last_used_at = Some(now);
+        next.pending_consents.remove(&ceremony.consent_id);
+        next.owner_authentication_ceremonies
+            .retain(|_, pending| pending.consent_id != ceremony.consent_id);
+        let code = opaque_value();
+        next.pending_codes.insert(
+            code.clone(),
+            PendingAuthorizationCode {
+                client_id: consent.client_id.clone(),
+                redirect_uri: consent.redirect_uri.clone(),
+                code_challenge: consent.code_challenge,
+                scopes: consent.scopes,
+                resource: consent.resource,
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
+            },
+        );
+        if let Some(client) = next.clients.get_mut(&consent.client_id) {
+            client.last_used_at = Some(now);
+            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
+        }
+        let redirect = AuthorizationRedirect {
+            location: redirect_with_params(
+                &consent.redirect_uri,
+                &[("code", &code), ("state", &consent.state)],
+            ),
+        };
+        next.completed_consents.insert(
+            ceremony.consent_id,
+            CompletedConsent {
+                client_id: consent.client_id,
+                redirect: redirect.clone(),
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
+                approval_ceremony_id: Some(ceremony_id.to_string()),
+            },
+        );
+        self.commit_state(&mut guard, next)?;
+        Ok(redirect)
+    }
+
+    pub async fn deny_consent(
+        &self,
+        consent_id: &str,
+        csrf_token: &str,
+    ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let now = epoch_secs();
+        let mut guard = self.state.lock().await;
+        if let Some(completed) = guard
+            .completed_consents
+            .get(consent_id)
+            .filter(|completed| completed.expires_at > now)
+        {
+            return Ok(completed.redirect.clone());
+        }
+        let consent = guard
+            .pending_consents
+            .get(consent_id)
+            .cloned()
+            .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
+        if consent.expires_at <= now {
+            let mut next = guard.clone();
+            next.pending_consents.remove(consent_id);
+            self.commit_state(&mut guard, next)?;
+            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+        }
+        if !crate::auth::verify_auth_token(csrf_token, &consent.csrf_token) {
+            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+        }
+        let redirect = AuthorizationRedirect {
+            location: redirect_with_params(
+                &consent.redirect_uri,
+                &[("error", "access_denied"), ("state", &consent.state)],
+            ),
+        };
+        let mut next = guard.clone();
+        next.completed_consents
+            .retain(|_, completed| completed.expires_at > now);
+        next.pending_consents.remove(consent_id);
+        next.owner_authentication_ceremonies
+            .retain(|_, pending| pending.consent_id != consent_id);
+        next.completed_consents.insert(
+            consent_id.to_string(),
+            CompletedConsent {
+                client_id: consent.client_id,
+                redirect: redirect.clone(),
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
+                approval_ceremony_id: None,
+            },
+        );
+        self.commit_state(&mut guard, next)?;
+        Ok(redirect)
+    }
+
+    pub async fn list_owner_credentials(&self) -> Vec<OwnerCredentialSummary> {
+        let mut credentials = self
+            .state
+            .lock()
+            .await
+            .owner_credentials
+            .values()
+            .map(OwnerCredentialSummary::from)
+            .collect::<Vec<_>>();
+        credentials.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.credential_id.cmp(&right.credential_id))
+        });
+        credentials
+    }
+
+    pub async fn remove_owner_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<bool, DownstreamOauthError> {
+        self.ensure_durable()?;
+        let mut guard = self.state.lock().await;
+        if !guard.owner_credentials.contains_key(credential_id) {
+            return Ok(false);
+        }
+        let mut next = guard.clone();
+        next.owner_credentials.remove(credential_id);
+        next.owner_authentication_ceremonies
+            .retain(|_, ceremony| !ceremony.credential_ids.iter().any(|id| id == credential_id));
+        self.commit_state(&mut guard, next)?;
+        Ok(true)
+    }
+
+    pub async fn owner_enrolled(&self) -> bool {
+        !self.state.lock().await.owner_credentials.is_empty()
     }
 
     pub fn local_approval_request_allowed(&self, headers: &axum::http::HeaderMap) -> bool {
@@ -853,6 +1295,7 @@ impl DownstreamOauthManager {
                     client_id: consent.client_id,
                     redirect: redirect.clone(),
                     expires_at: now + AUTH_CODE_LIFETIME_SECS,
+                    approval_ceremony_id: None,
                 },
             );
             self.commit_state(&mut guard, next)?;
@@ -889,6 +1332,7 @@ impl DownstreamOauthManager {
                 client_id: consent.client_id,
                 redirect: redirect.clone(),
                 expires_at: now + AUTH_CODE_LIFETIME_SECS,
+                approval_ceremony_id: None,
             },
         );
         self.commit_state(&mut guard, next)?;
@@ -1920,6 +2364,7 @@ fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
 
     fn temp_state_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1951,6 +2396,609 @@ mod tests {
         let manager = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("test manager");
         (manager, path)
+    }
+
+    async fn enroll_owner(
+        manager: &DownstreamOauthManager,
+        authenticator: &BrowserAuthenticator,
+    ) -> OwnerCredentialSummary {
+        let bootstrap = manager
+            .create_owner_bootstrap()
+            .await
+            .expect("owner bootstrap");
+        let challenge = manager
+            .start_owner_registration(&bootstrap)
+            .await
+            .expect("start owner registration");
+        let response = authenticator.registration_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        manager
+            .finish_owner_registration(&challenge.ceremony_id, response)
+            .await
+            .expect("finish owner registration")
+    }
+
+    async fn begin_test_authorization(
+        manager: &DownstreamOauthManager,
+        state: &str,
+    ) -> ConsentRequest {
+        let client = register(manager, state, &format!("https://{state}.example/callback")).await;
+        manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state,
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin test authorization")
+    }
+
+    #[tokio::test]
+    async fn owner_bootstrap_is_single_use() {
+        let (manager, _) = test_manager();
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        manager.start_owner_registration(&bootstrap).await.unwrap();
+        assert_eq!(
+            manager
+                .start_owner_registration(&bootstrap)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerBootstrap
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_challenge_is_bound_to_original_consent() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let first = begin_test_authorization(&manager, "first-state").await;
+        let second = begin_test_authorization(&manager, "second-state").await;
+        let challenge = manager
+            .start_owner_approval(&first.consent_id)
+            .await
+            .unwrap();
+        let assertion = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        let redirect = manager
+            .finish_owner_approval(&challenge.ceremony_id, assertion)
+            .await
+            .unwrap();
+        assert!(redirect.location.contains("state=first-state"));
+        assert!(
+            manager
+                .pending_consent_exists_for_tests(&second.consent_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_bootstrap_expiry_is_rejected_without_creating_ceremony() {
+        let (manager, _) = test_manager();
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .owner_bootstraps
+                .values_mut()
+                .for_each(|record| record.expires_at = 0);
+        }
+        assert_eq!(
+            manager
+                .start_owner_registration(&bootstrap)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerBootstrap
+        );
+        assert!(
+            manager
+                .state
+                .lock()
+                .await
+                .owner_registration_ceremonies
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_registration_requires_uv_and_consumes_failed_challenge() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        let challenge = manager.start_owner_registration(&bootstrap).await.unwrap();
+        let response = authenticator.registration_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            false,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_registration(&challenge.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+        let valid_replay = authenticator.registration_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_registration(&challenge.ceremony_id, valid_replay)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+        assert!(!manager.owner_enrolled().await);
+    }
+
+    #[tokio::test]
+    async fn owner_registration_rejects_wrong_origin_and_survives_restart() {
+        let path = temp_state_path();
+        let manager = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect("test manager");
+        let authenticator = BrowserAuthenticator::new();
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        let wrong_origin = manager.start_owner_registration(&bootstrap).await.unwrap();
+        let response = authenticator.registration_response(
+            &wrong_origin.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://evil.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_registration(&wrong_origin.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        let wrong_rp = manager.start_owner_registration(&bootstrap).await.unwrap();
+        let response = authenticator.registration_response(
+            &wrong_rp.public_key.challenge,
+            "evil.example.com",
+            "https://plug.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_registration(&wrong_rp.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        let challenge = manager.start_owner_registration(&bootstrap).await.unwrap();
+        drop(manager);
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect("restart manager");
+        let response = authenticator.registration_response(
+            &challenge.public_key.challenge,
+            &restarted.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        restarted
+            .finish_owner_registration(&challenge.ceremony_id, response)
+            .await
+            .expect("finish after restart");
+        drop(restarted);
+        let reloaded = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("reload manager");
+        assert!(reloaded.owner_enrolled().await);
+        assert_eq!(reloaded.list_owner_credentials().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_approval_requires_uv_consumes_failure_and_preserves_consent() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let consent = begin_test_authorization(&manager, "uv-state").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .unwrap();
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            false,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+        assert!(
+            manager
+                .pending_consent_exists_for_tests(&consent.consent_id)
+                .await
+        );
+        let replay = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, replay)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_approval_survives_restart_persists_counter_and_is_idempotent() {
+        let path = temp_state_path();
+        let manager = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect("test manager");
+        let mut authenticator = BrowserAuthenticator::new();
+        let summary = enroll_owner(&manager, &authenticator).await;
+        let consent = begin_test_authorization(&manager, "restart-state").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .unwrap();
+        drop(manager);
+
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect("restart manager");
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &restarted.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        let redirect = restarted
+            .finish_owner_approval(&challenge.ceremony_id, response)
+            .await
+            .expect("finish owner approval after restart");
+        assert!(redirect.location.contains("state=restart-state"));
+        let replay = PublicKeyCredential {
+            id: "malformed".to_string(),
+            authenticator_data: "malformed".to_string(),
+            signature: "malformed".to_string(),
+            client_data_json: "malformed".to_string(),
+            user_handle: None,
+        };
+        assert_eq!(
+            restarted
+                .finish_owner_approval(&challenge.ceremony_id, replay)
+                .await
+                .unwrap()
+                .location,
+            redirect.location
+        );
+        assert_eq!(
+            restarted
+                .state
+                .lock()
+                .await
+                .owner_credentials
+                .get(&summary.credential_id)
+                .unwrap()
+                .passkey
+                .counter,
+            1
+        );
+        drop(restarted);
+        let reloaded = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("reload manager");
+        assert_eq!(
+            reloaded
+                .state
+                .lock()
+                .await
+                .owner_credentials
+                .get(&summary.credential_id)
+                .unwrap()
+                .passkey
+                .counter,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_write_failure_publishes_nothing_and_can_retry() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        let summary = enroll_owner(&manager, &authenticator).await;
+        let consent = begin_test_authorization(&manager, "atomic-state").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .unwrap();
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        fail_next_state_rename_for_tests();
+        assert!(matches!(
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, response)
+                .await,
+            Err(DownstreamOauthError::Persistence(_))
+        ));
+        {
+            let state = manager.state.lock().await;
+            assert!(state.pending_consents.contains_key(&consent.consent_id));
+            assert!(
+                state
+                    .owner_authentication_ceremonies
+                    .contains_key(&challenge.ceremony_id)
+            );
+            assert!(state.pending_codes.is_empty());
+            assert_eq!(
+                state
+                    .owner_credentials
+                    .get(&summary.credential_id)
+                    .unwrap()
+                    .passkey
+                    .counter,
+                0
+            );
+        }
+        let retry = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        manager
+            .finish_owner_approval(&challenge.ceremony_id, retry)
+            .await
+            .expect("retry approval after pre-rename failure");
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .owner_credentials
+                .get(&summary.credential_id)
+                .unwrap()
+                .passkey
+                .counter,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_substitution_and_denial_csrf_fail_closed() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let first = begin_test_authorization(&manager, "bound-first").await;
+        let second = begin_test_authorization(&manager, "bound-second").await;
+        let challenge = manager
+            .start_owner_approval(&first.consent_id)
+            .await
+            .unwrap();
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .owner_authentication_ceremonies
+                .get_mut(&challenge.ceremony_id)
+                .unwrap()
+                .consent_id = second.consent_id.clone();
+        }
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+        assert!(
+            manager
+                .pending_consent_exists_for_tests(&first.consent_id)
+                .await
+        );
+        assert!(
+            manager
+                .pending_consent_exists_for_tests(&second.consent_id)
+                .await
+        );
+
+        assert_eq!(
+            manager
+                .deny_consent(&first.consent_id, "wrong-csrf")
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidAuthorizationRequest
+        );
+        let denied = manager
+            .deny_consent(&first.consent_id, &first.csrf_token)
+            .await
+            .expect("deny consent");
+        assert!(denied.location.contains("error=access_denied"));
+        assert!(manager.state.lock().await.pending_codes.is_empty());
+        assert_eq!(
+            manager
+                .deny_consent(&first.consent_id, "conflicting-replay")
+                .await
+                .unwrap()
+                .location,
+            denied.location
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_owner_credential_removes_tied_approval_ceremonies() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        let summary = enroll_owner(&manager, &authenticator).await;
+        let consent = begin_test_authorization(&manager, "remove-state").await;
+        manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .remove_owner_credential(&summary.credential_id)
+                .await
+                .unwrap()
+        );
+        assert!(!manager.owner_enrolled().await);
+        assert!(manager.list_owner_credentials().await.is_empty());
+        assert!(
+            manager
+                .state
+                .lock()
+                .await
+                .owner_authentication_ceremonies
+                .is_empty()
+        );
+        assert!(
+            !manager
+                .remove_owner_credential(&summary.credential_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_approval_challenge_is_consumed_without_approving() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let consent = begin_test_authorization(&manager, "expired-approval").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .unwrap();
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .owner_authentication_ceremonies
+                .get_mut(&challenge.ceremony_id)
+                .unwrap()
+                .expires_at = 0;
+        }
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::OwnerChallengeExpired
+        );
+        let state = manager.state.lock().await;
+        assert!(state.pending_consents.contains_key(&consent.consent_id));
+        assert!(state.pending_codes.is_empty());
+        assert!(
+            !state
+                .owner_authentication_ceremonies
+                .contains_key(&challenge.ceremony_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_counter_regression_fails_closed_and_keeps_durable_counter() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        let summary = enroll_owner(&manager, &authenticator).await;
+        for state_value in ["counter-one", "counter-two"] {
+            let consent = begin_test_authorization(&manager, state_value).await;
+            let challenge = manager
+                .start_owner_approval(&consent.consent_id)
+                .await
+                .unwrap();
+            let response = authenticator.authentication_response(
+                &challenge.public_key.challenge,
+                &manager.owner_security.rp_id,
+                "https://plug.example.com",
+                true,
+            );
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, response)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .owner_credentials
+                .get(&summary.credential_id)
+                .unwrap()
+                .passkey
+                .counter,
+            2
+        );
+
+        let consent = begin_test_authorization(&manager, "counter-regression").await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .unwrap();
+        authenticator.set_counter(0);
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        assert_eq!(
+            manager
+                .finish_owner_approval(&challenge.ceremony_id, response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+        let state = manager.state.lock().await;
+        assert_eq!(
+            state
+                .owner_credentials
+                .get(&summary.credential_id)
+                .unwrap()
+                .passkey
+                .counter,
+            2
+        );
+        assert!(state.pending_consents.contains_key(&consent.consent_id));
+        assert!(
+            !state
+                .owner_authentication_ceremonies
+                .contains_key(&challenge.ceremony_id)
+        );
     }
 
     #[tokio::test]

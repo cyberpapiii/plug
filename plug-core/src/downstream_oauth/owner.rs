@@ -1,5 +1,9 @@
-use passkey_auth::{AuthenticationState, PasskeyCredential, RegistrationState, Webauthn};
+use passkey_auth::{
+    AuthenticationChallenge, AuthenticationResponse, AuthenticationState, PasskeyCredential,
+    RegistrationChallenge, RegistrationResponse, RegistrationState, Webauthn,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::DownstreamOauthError;
 
@@ -10,6 +14,28 @@ pub const OWNER_CEREMONY_LIFETIME_SECS: u64 = 300;
 pub type Passkey = PasskeyCredential;
 pub type PasskeyRegistration = RegistrationState;
 pub type PasskeyAuthentication = AuthenticationState;
+pub type RegisterPublicKeyCredential = RegistrationResponse;
+pub type PublicKeyCredential = AuthenticationResponse;
+
+#[derive(Debug, Serialize)]
+pub struct OwnerRegistrationChallenge {
+    pub ceremony_id: String,
+    pub public_key: RegistrationChallenge,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OwnerApprovalChallenge {
+    pub ceremony_id: String,
+    pub public_key: AuthenticationChallenge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerCredentialSummary {
+    pub credential_id: String,
+    pub label: String,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnerCredential {
@@ -30,6 +56,8 @@ pub struct OwnerBootstrap {
 pub struct OwnerRegistrationCeremony {
     pub id: String,
     pub bootstrap_hash: String,
+    #[serde(default)]
+    pub issuer_hash: String,
     pub state: PasskeyRegistration,
     pub expires_at: u64,
 }
@@ -38,8 +66,45 @@ pub struct OwnerRegistrationCeremony {
 pub struct OwnerAuthenticationCeremony {
     pub id: String,
     pub consent_id: String,
+    #[serde(default)]
+    pub issuer_hash: String,
+    #[serde(default)]
+    pub consent_binding: String,
+    #[serde(default)]
+    pub decision: String,
+    #[serde(default)]
+    pub credential_ids: Vec<String>,
     pub state: PasskeyAuthentication,
     pub expires_at: u64,
+}
+
+impl From<&OwnerCredential> for OwnerCredentialSummary {
+    fn from(value: &OwnerCredential) -> Self {
+        Self {
+            credential_id: value.id.clone(),
+            label: value.label.clone(),
+            created_at: value.created_at,
+            last_used_at: value.last_used_at,
+        }
+    }
+}
+
+pub(crate) fn owner_user_id(issuer: &str) -> [u8; 16] {
+    let digest = Sha256::digest(issuer.as_bytes());
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id[6] = (id[6] & 0x0f) | 0x80;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    id
+}
+
+pub(crate) fn owner_binding_hash(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug)]
@@ -81,7 +146,7 @@ impl OwnerSecurity {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use base64::Engine as _;
     use ciborium::value::Value as CborValue;
@@ -90,20 +155,20 @@ mod tests {
         AuthenticationResponse, RegistrationResponse, error::Error as PasskeyError,
     };
     use rand::RngExt as _;
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     const FLAG_UP: u8 = 1 << 0;
     const FLAG_UV: u8 = 1 << 2;
     const FLAG_AT: u8 = 1 << 6;
 
-    struct BrowserAuthenticator {
+    pub(crate) struct BrowserAuthenticator {
         signing_key: SigningKey,
         credential_id: Vec<u8>,
         counter: u32,
     }
 
     impl BrowserAuthenticator {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut seed = [0u8; 32];
             rand::rng().fill(&mut seed);
             Self {
@@ -179,6 +244,74 @@ mod tests {
             let mut message = authenticator_data.to_vec();
             message.extend_from_slice(&Sha256::digest(client_data));
             self.signing_key.sign(&message).to_bytes().to_vec()
+        }
+
+        pub(crate) fn registration_response(
+            &self,
+            challenge: &str,
+            rp_id: &str,
+            origin: &str,
+            user_verified: bool,
+        ) -> RegistrationResponse {
+            let (client_data_raw, client_data_json) =
+                browser_client_data("webauthn.create", challenge, origin);
+            let _ = client_data_raw;
+            let mut authenticator_data = self.registration_authenticator_data(rp_id);
+            if !user_verified {
+                authenticator_data[32] &= !FLAG_UV;
+            }
+            let attestation = CborValue::Map(vec![
+                (
+                    CborValue::Text("fmt".to_string()),
+                    CborValue::Text("none".to_string()),
+                ),
+                (
+                    CborValue::Text("attStmt".to_string()),
+                    CborValue::Map(Vec::new()),
+                ),
+                (
+                    CborValue::Text("authData".to_string()),
+                    CborValue::Bytes(authenticator_data),
+                ),
+            ]);
+            let mut attestation_object = Vec::new();
+            ciborium::ser::into_writer(&attestation, &mut attestation_object)
+                .expect("serialize attestation");
+            RegistrationResponse {
+                id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.credential_id),
+                transports: vec!["internal".to_string()],
+                attestation_object: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(attestation_object),
+                client_data_json,
+            }
+        }
+
+        pub(crate) fn authentication_response(
+            &mut self,
+            challenge: &str,
+            rp_id: &str,
+            origin: &str,
+            user_verified: bool,
+        ) -> AuthenticationResponse {
+            let mut authenticator_data = self.authentication_data(rp_id);
+            if !user_verified {
+                authenticator_data[32] &= !FLAG_UV;
+            }
+            let (client_data_raw, client_data_json) =
+                browser_client_data("webauthn.get", challenge, origin);
+            let signature = self.sign(&authenticator_data, &client_data_raw);
+            AuthenticationResponse {
+                id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.credential_id),
+                authenticator_data: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(authenticator_data),
+                signature: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature),
+                client_data_json,
+                user_handle: None,
+            }
+        }
+
+        pub(crate) fn set_counter(&mut self, counter: u32) {
+            self.counter = counter;
         }
     }
 
