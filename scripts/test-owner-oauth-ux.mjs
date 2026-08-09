@@ -131,6 +131,67 @@ async function expiredAssertionRetriesOnce() {
   assert.deepEqual(assigned, ["https://client.example/callback"]);
 }
 
+async function expiredChallengeNavigatesTopLevelToValidatedCallback() {
+  const callback = "https://client.example/callback?error=authorization_expired&state=state-123";
+  const page = element({ dataset: { consentId: "consent", csrfToken: "csrf" } });
+  const allow = element();
+  const deny = element();
+  const status = element();
+  const elements = { consent: page, allow, deny, status };
+  const assigned = [];
+  const context = browserGlobals({
+    document: { getElementById: id => elements[id] },
+    navigator: {
+      credentials: {
+        get: async () => {
+          throw new Error("an expired consent must navigate before requesting a passkey");
+        },
+      },
+    },
+    window: {
+      PublicKeyCredential: function PublicKeyCredential() {},
+      location: { assign: value => assigned.push(value) },
+    },
+    fetch: async () => ({
+      ok: true,
+      async json() {
+        return { redirect_uri: callback };
+      },
+    }),
+  });
+
+  vm.runInNewContext(consentSource, context, { filename: "consent.js" });
+  await allow.listeners.click();
+
+  assert.deepEqual(assigned, [callback]);
+}
+
+async function expiredDenialNavigatesTopLevelToValidatedCallback() {
+  const callback = "https://client.example/callback?error=authorization_expired&state=state-123";
+  const page = element({ dataset: { consentId: "consent", csrfToken: "csrf" } });
+  const allow = element();
+  const deny = element();
+  const status = element();
+  const elements = { consent: page, allow, deny, status };
+  const assigned = [];
+  const context = browserGlobals({
+    document: { getElementById: id => elements[id] },
+    navigator: {},
+    window: { location: { assign: value => assigned.push(value) } },
+    fetch: async () => ({
+      ok: true,
+      async json() {
+        return { redirect_uri: callback };
+      },
+    }),
+  });
+
+  vm.runInNewContext(consentSource, context, { filename: "consent.js" });
+  await deny.listeners.click();
+
+  assert.deepEqual(assigned, [callback]);
+}
+
 async function unsupportedEnrollmentExplainsRecovery() {
   const enroll = element();
   const status = element();
@@ -162,4 +223,6 @@ async function unsupportedEnrollmentExplainsRecovery() {
 
 await unsupportedConsentExplainsRecovery();
 await expiredAssertionRetriesOnce();
+await expiredChallengeNavigatesTopLevelToValidatedCallback();
+await expiredDenialNavigatesTopLevelToValidatedCallback();
 await unsupportedEnrollmentExplainsRecovery();

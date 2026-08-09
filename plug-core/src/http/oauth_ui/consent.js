@@ -80,6 +80,10 @@ async function approve() {
       const challenge = await postJson("/oauth/consent/challenge", {
         consent_id: page.dataset.consentId,
       });
+      if (challenge.redirect_uri) {
+        window.location.assign(challenge.redirect_uri);
+        return;
+      }
       const credential = await navigator.credentials.get({
         publicKey: requestOptions(challenge.public_key),
       });

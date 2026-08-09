@@ -1918,10 +1918,10 @@ fn oauth_validated_callback_error_response(error: &DownstreamOauthError) -> Opti
     };
     let location =
         oauth_authorization_error_redirect(&callback.redirect_uri, &callback.state, error);
-    let location = HeaderValue::from_str(&location).ok()?;
-    let mut response = StatusCode::FOUND.into_response();
-    response.headers_mut().insert(header::LOCATION, location);
-    Some(response)
+    Some(oauth_json_response(
+        StatusCode::OK,
+        json!({ "redirect_uri": location }),
+    ))
 }
 
 fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
@@ -6153,7 +6153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_validated_consent_redirects_to_exact_registered_callback() {
+    async fn expired_validated_consent_returns_exact_callback_for_browser_navigation() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         enroll_test_owner(&manager).await;
         let consent = oauth_test_consent(&manager, "Expired route test").await;
@@ -6173,20 +6173,20 @@ mod tests {
             .expect("challenge request");
 
         let response = app.oneshot(request).await.expect("challenge response");
-        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::LOCATION).is_none());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("challenge callback body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("callback JSON");
         assert_eq!(
-            response
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|value| value.to_str().ok()),
-            Some(
-                "https://client.example.com/callback?error=authorization_expired&error_description=This+connection+request+expired.+Return+to+your+MCP+client+and+select+Connect+again.&state=public-ui-state"
-            )
+            body["redirect_uri"],
+            "https://client.example.com/callback?error=authorization_expired&error_description=This+connection+request+expired.+Return+to+your+MCP+client+and+select+Connect+again.&state=public-ui-state"
         );
     }
 
     #[tokio::test]
-    async fn expired_validated_denial_redirects_to_exact_registered_callback() {
+    async fn expired_validated_denial_returns_exact_callback_for_browser_navigation() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let consent = oauth_test_consent(&manager, "Expired denial test").await;
         manager
@@ -6210,15 +6210,15 @@ mod tests {
             .expect("denial request");
 
         let response = app.oneshot(request).await.expect("denial response");
-        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::LOCATION).is_none());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("denial callback body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("callback JSON");
         assert_eq!(
-            response
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|value| value.to_str().ok()),
-            Some(
-                "https://client.example.com/callback?error=authorization_expired&error_description=This+connection+request+expired.+Return+to+your+MCP+client+and+select+Connect+again.&state=public-ui-state"
-            )
+            body["redirect_uri"],
+            "https://client.example.com/callback?error=authorization_expired&error_description=This+connection+request+expired.+Return+to+your+MCP+client+and+select+Connect+again.&state=public-ui-state"
         );
     }
 
@@ -6237,6 +6237,11 @@ mod tests {
         let response = app.oneshot(request).await.expect("challenge response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers().get(header::LOCATION).is_none());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("unknown consent body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("OAuth error JSON");
+        assert!(body.get("redirect_uri").is_none());
     }
 
     #[tokio::test]
