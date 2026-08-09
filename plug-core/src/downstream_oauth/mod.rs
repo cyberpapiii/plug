@@ -300,6 +300,13 @@ struct PendingConsent {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CompletedConsent {
+    client_id: String,
+    redirect: AuthorizationRedirect,
+    expires_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingAuthorizationCode {
     client_id: String,
@@ -335,6 +342,8 @@ struct DownstreamOauthState {
     #[serde(skip)]
     pending_consents: HashMap<String, PendingConsent>,
     #[serde(skip)]
+    completed_consents: HashMap<String, CompletedConsent>,
+    #[serde(skip)]
     pending_codes: HashMap<String, PendingAuthorizationCode>,
     #[serde(default)]
     access_tokens: HashMap<String, IssuedAccessToken>,
@@ -350,6 +359,7 @@ impl Default for DownstreamOauthState {
             version: STATE_VERSION,
             clients: HashMap::new(),
             pending_consents: HashMap::new(),
+            completed_consents: HashMap::new(),
             pending_codes: HashMap::new(),
             access_tokens: HashMap::new(),
             refresh_tokens: HashMap::new(),
@@ -369,6 +379,8 @@ impl DownstreamOauthState {
         self.clients.retain(|id, _| !expired.contains(id));
         self.pending_consents
             .retain(|_, item| item.expires_at > now);
+        self.completed_consents
+            .retain(|_, item| item.expires_at > now);
         self.pending_codes.retain(|_, item| item.expires_at > now);
         self.access_tokens
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
@@ -380,6 +392,8 @@ impl DownstreamOauthState {
     fn remove_client_material(&mut self, client_id: &str) {
         self.clients.remove(client_id);
         self.pending_consents
+            .retain(|_, item| item.client_id != client_id);
+        self.completed_consents
             .retain(|_, item| item.client_id != client_id);
         self.pending_codes
             .retain(|_, item| item.client_id != client_id);
@@ -654,23 +668,43 @@ impl DownstreamOauthManager {
         approved: bool,
     ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
         let mut guard = self.state.lock().await;
+        let now = epoch_secs();
+        guard
+            .completed_consents
+            .retain(|_, completed| completed.expires_at > now);
+        if let Some(completed) = guard.completed_consents.get(consent_id) {
+            return Ok(completed.redirect.clone());
+        }
         let consent = guard
             .pending_consents
-            .remove(consent_id)
+            .get(consent_id)
+            .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
-        if consent.expires_at <= epoch_secs() {
+        if consent.expires_at <= now {
+            guard.pending_consents.remove(consent_id);
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
         }
         if !approved {
-            return Ok(AuthorizationRedirect {
+            let redirect = AuthorizationRedirect {
                 location: redirect_with_params(
                     &consent.redirect_uri,
                     &[("error", "access_denied"), ("state", &consent.state)],
                 ),
-            });
+            };
+            guard.pending_consents.remove(consent_id);
+            guard.completed_consents.insert(
+                consent_id.to_string(),
+                CompletedConsent {
+                    client_id: consent.client_id,
+                    redirect: redirect.clone(),
+                    expires_at: now + AUTH_CODE_LIFETIME_SECS,
+                },
+            );
+            return Ok(redirect);
         }
 
         let mut next = guard.clone();
+        next.pending_consents.remove(consent_id);
         let code = opaque_value();
         next.pending_codes.insert(
             code.clone(),
@@ -680,23 +714,32 @@ impl DownstreamOauthManager {
                 code_challenge: consent.code_challenge,
                 scopes: consent.scopes,
                 resource: consent.resource,
-                expires_at: epoch_secs() + AUTH_CODE_LIFETIME_SECS,
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
             },
         );
         if let Some(client) = next.clients.get_mut(&consent.client_id) {
-            client.last_used_at = Some(epoch_secs());
-            client.expires_at = epoch_secs() + REGISTRATION_LIFETIME_SECS;
+            client.last_used_at = Some(now);
+            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
         }
-        // Codes are intentionally memory-only, but persisting the client use
-        // timestamp must succeed before the code is handed out.
-        persist_state(&self.state_path, &next)?;
-        *guard = next;
-        Ok(AuthorizationRedirect {
+        let redirect = AuthorizationRedirect {
             location: redirect_with_params(
                 &consent.redirect_uri,
                 &[("code", &code), ("state", &consent.state)],
             ),
-        })
+        };
+        // Codes are intentionally memory-only, but persisting the client use
+        // timestamp must succeed before the code is handed out.
+        persist_state(&self.state_path, &next)?;
+        next.completed_consents.insert(
+            consent_id.to_string(),
+            CompletedConsent {
+                client_id: consent.client_id,
+                redirect: redirect.clone(),
+                expires_at: now + AUTH_CODE_LIFETIME_SECS,
+            },
+        );
+        *guard = next;
+        Ok(redirect)
     }
 
     pub async fn exchange_authorization_code(
@@ -1266,6 +1309,7 @@ fn load_persisted_state(
         ));
     }
     state.pending_consents.clear();
+    state.completed_consents.clear();
     state.pending_codes.clear();
     let _ = state.evict_expired(epoch_secs());
     Ok(state)
@@ -1390,6 +1434,77 @@ mod tests {
             )
             .await
             .expect("exchange code")
+    }
+
+    #[tokio::test]
+    async fn repeated_consent_approval_replays_first_redirect_and_mints_one_code() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+
+        let first = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let repeated = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("repeat approval");
+        let later_denial = manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("later denial");
+
+        assert_eq!(repeated.location, first.location);
+        assert_eq!(later_denial.location, first.location);
+        assert_eq!(manager.state.lock().await.pending_codes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_consent_denial_replays_first_access_denied_redirect() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+
+        let first = manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("deny consent");
+        let repeated = manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("repeat denial");
+
+        assert_eq!(repeated.location, first.location);
+        assert_eq!(
+            first.location,
+            "http://localhost:8787/callback?error=access_denied&state=state-123"
+        );
+        assert!(manager.state.lock().await.pending_codes.is_empty());
     }
 
     #[test]
