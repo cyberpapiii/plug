@@ -17,6 +17,7 @@ const CLIENT_ORIGIN = "https://client.test";
 const CALLBACK_URL = `${CLIENT_ORIGIN}/callback`;
 const RESOURCE = `${PUBLIC_ORIGIN}/mcp`;
 const PROTOCOL_VERSION = "2025-11-25";
+const OAUTH_CSP = "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 async function freePort() {
   return await new Promise((resolvePort, reject) => {
@@ -77,6 +78,31 @@ async function loopbackRequest(port, path, { method = "GET", headers = {}, body 
   });
 }
 
+async function processTable() {
+  const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,command="], {
+    maxBuffer: 1024 * 1024,
+  });
+  return stdout.split("\n").flatMap(line => {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    return match ? [{ pid: Number(match[1]), parentPid: Number(match[2]), command: match[3] }] : [];
+  });
+}
+
+async function processRunsCommand(pid, command) {
+  return (await processTable()).some(process => process.pid === pid && process.command.includes(command));
+}
+
+function sanitizeFailureOutput(output, sensitiveValues = []) {
+  let sanitized = String(output);
+  for (const value of sensitiveValues) {
+    if (typeof value === "string" && value.length > 0) sanitized = sanitized.replaceAll(value, "[REDACTED]");
+  }
+  return sanitized
+    .replace(/(\bBearer\s+)[A-Za-z0-9._~+\/-]+/gi, "$1[REDACTED]")
+    .replace(/(bootstrap=)[A-Za-z0-9_-]+/gi, "$1[REDACTED]")
+    .replace(/(["']?(?:access_token|refresh_token|code_verifier|code)["']?\s*[:=]\s*["']?)[A-Za-z0-9._~+\/-]+/gi, "$1[REDACTED]");
+}
+
 function formBody(fields) {
   return new URLSearchParams(fields).toString();
 }
@@ -101,6 +127,8 @@ class PlugProcess {
     this.configPath = configPath;
     this.environment = environment;
     this.children = [];
+    this.mockChildPids = new Set();
+    this.sensitiveValues = new Set();
     this.output = [];
     this.child = null;
   }
@@ -161,11 +189,18 @@ args = ["--tools", "echo"]
     child.stderr.on("data", chunk => this.output.push(chunk.toString()));
     await eventually(async () => {
       if (child.exitCode !== null) {
-        throw new Error(`Plug exited during startup (${child.exitCode}): ${this.output.join("")}`);
+        throw new Error(`Plug exited during startup (${child.exitCode}): ${this.sanitizedOutput()}`);
       }
       const response = await loopbackRequest(this.port, "/.well-known/oauth-authorization-server");
       if (!response.ok) throw new Error(`Plug not ready: HTTP ${response.status}`);
     });
+    const mockChildren = await eventually(async () => {
+      const children = (await processTable()).filter(process =>
+        process.parentPid === child.pid && process.command.includes(MOCK_BIN));
+      if (children.length === 0) throw new Error(`mock MCP child not found for Plug PID ${child.pid}`);
+      return children;
+    });
+    for (const mock of mockChildren) this.mockChildPids.add(mock.pid);
   }
 
   async stop() {
@@ -188,6 +223,12 @@ args = ["--tools", "echo"]
     for (const child of this.children) {
       expect(child.exitCode !== null || child.signalCode !== null, "every real Plug process must exit").toBe(true);
     }
+    for (const pid of this.mockChildPids) {
+      await expect.poll(
+        () => processRunsCommand(pid, MOCK_BIN),
+        { timeout: 5_000, message: `tracked mock MCP child ${pid} must exit` },
+      ).toBe(false);
+    }
     await rm(this.root, { recursive: true, force: true });
   }
 
@@ -198,6 +239,22 @@ args = ["--tools", "echo"]
       timeout: 15_000,
       maxBuffer: 1024 * 1024,
     });
+  }
+
+  trackSensitive(...values) {
+    for (const value of values) {
+      if (typeof value === "string" && value.length > 0) this.sensitiveValues.add(value);
+    }
+  }
+
+  sensitiveLeakLabels() {
+    const output = this.output.join("");
+    return [...this.sensitiveValues].flatMap((value, index) =>
+      output.includes(value) ? [`secret-${index + 1}`] : []);
+  }
+
+  sanitizedOutput() {
+    return sanitizeFailureOutput(this.output.join(""), this.sensitiveValues);
   }
 
   async request(path, { method = "GET", headers = {}, body } = {}) {
@@ -298,6 +355,16 @@ async function mcpRequest(plug, accessToken, message, sessionId) {
   });
 }
 
+test("failure log sanitizer removes known OAuth secrets", () => {
+  const secrets = ["bootstrap-secret-value", "access-token-value"];
+  const sanitized = sanitizeFailureOutput(
+    'bootstrap=bootstrap-secret-value Authorization: Bearer access-token-value "refresh_token":"other-token-value"',
+    secrets,
+  );
+  for (const secret of [...secrets, "other-token-value"]) expect(sanitized).not.toContain(secret);
+  expect(sanitized).toContain("[REDACTED]");
+});
+
 test.describe("downstream OAuth owner passkey", () => {
   let plug;
 
@@ -310,7 +377,7 @@ test.describe("downstream OAuth owner passkey", () => {
   test.afterEach(async ({}, testInfo) => {
     if (testInfo.status !== testInfo.expectedStatus) {
       await testInfo.attach("plug-process.log", {
-        body: Buffer.from(plug.output.join("")),
+        body: Buffer.from(plug.sanitizedOutput()),
         contentType: "text/plain",
       });
     }
@@ -319,6 +386,7 @@ test.describe("downstream OAuth owner passkey", () => {
 
   test("Chromium completes enrollment, approval, PKCE, MCP, rotation, restart, and revocation", async ({ browserName, context, page }) => {
     test.skip(browserName !== "chromium", "Chromium CDP provides virtual WebAuthn in CI");
+    expect(plug.mockChildPids.size, "real mock MCP child must be tracked").toBeGreaterThan(0);
 
     const cdp = await context.newCDPSession(page);
     await cdp.send("WebAuthn.enable");
@@ -338,6 +406,7 @@ test.describe("downstream OAuth owner passkey", () => {
     const enrollmentUrl = new URL(enrollmentPayload.enrollment_url);
     const bootstrap = new URLSearchParams(enrollmentUrl.hash.slice(1)).get("bootstrap");
     expect(bootstrap).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    plug.trackSensitive(bootstrap);
 
     await page.goto(enrollmentPayload.enrollment_url);
     await expect(page).toHaveURL(`${PUBLIC_ORIGIN}/oauth/owner/enroll`);
@@ -347,6 +416,7 @@ test.describe("downstream OAuth owner passkey", () => {
 
     const registration = await registerClient(plug);
     const proof = pkce();
+    plug.trackSensitive(proof.verifier);
     const oauthState = randomBytes(16).toString("hex");
     let callback;
     await context.unroute(`${CLIENT_ORIGIN}/callback**`);
@@ -369,6 +439,7 @@ test.describe("downstream OAuth owner passkey", () => {
     expect(callback.searchParams.get("state")).toBe(oauthState);
     const code = callback.searchParams.get("code");
     expect(code).toBeTruthy();
+    plug.trackSensitive(code);
 
     const tokenResponse = await exchangeToken(plug, {
       grant_type: "authorization_code",
@@ -384,6 +455,7 @@ test.describe("downstream OAuth owner passkey", () => {
     expect(tokens.token_type).toBe("Bearer");
     expect(tokens.access_token).toBeTruthy();
     expect(tokens.refresh_token).toBeTruthy();
+    plug.trackSensitive(tokens.access_token, tokens.refresh_token);
 
     const codeReplay = await exchangeToken(plug, {
       grant_type: "authorization_code",
@@ -436,6 +508,7 @@ test.describe("downstream OAuth owner passkey", () => {
     const rotated = await rotation.json();
     expect(rotated.access_token).not.toBe(tokens.access_token);
     expect(rotated.refresh_token).not.toBe(tokens.refresh_token);
+    plug.trackSensitive(rotated.access_token, rotated.refresh_token);
 
     const refreshReplay = await exchangeToken(plug, {
       grant_type: "refresh_token",
@@ -455,10 +528,7 @@ test.describe("downstream OAuth owner passkey", () => {
     expect(revoked.status).toBe(401);
     expect(revoked.headers.get("www-authenticate")).toContain("oauth-protected-resource");
 
-    const processOutput = plug.output.join("");
-    for (const secret of [bootstrap, proof.verifier, code, tokens.access_token, tokens.refresh_token, rotated.access_token, rotated.refresh_token]) {
-      expect(processOutput, `process output must redact ${secret.slice(0, 8)}…`).not.toContain(secret);
-    }
+    expect(plug.sensitiveLeakLabels(), "process output must not contain tracked OAuth secrets").toEqual([]);
   });
 
   test("Chromium and WebKit keep denial, expiry, restart, and errors on public HTTPS", async ({ browser, context, page }) => {
@@ -477,8 +547,9 @@ test.describe("downstream OAuth owner passkey", () => {
     const response = await page.goto(authorizationUrl(registration.client_id, firstProof.challenge, firstState));
     expect(response.status()).toBe(200);
     expect(response.headers()["cache-control"]).toBe("no-store");
-    expect(response.headers()["content-security-policy"]).toContain("connect-src 'self'");
+    expect(response.headers()["content-security-policy"]).toBe(OAUTH_CSP);
     expect(response.headers()["referrer-policy"]).toBe("no-referrer");
+    expect(response.headers()["x-content-type-options"]).toBe("nosniff");
     expect(response.headers()["x-frame-options"]).toBe("DENY");
     await expect(page.getByRole("heading", { name: "Allow Shared browser client to use Plug?" })).toBeVisible();
     await expect(page.getByText("Owner passkey required")).toBeVisible();
