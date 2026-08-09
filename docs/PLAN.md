@@ -81,8 +81,23 @@ The current product shape is:
 
 ## Remaining Work
 
-All major roadmap features are now implemented on `main`.
-No required roadmap work remains for the current production-ready bar.
+The current production release is on `main`. The following work exists
+off-main on `codex/fix-cimd-client-compatibility`; it is not done on `main`:
+
+- Client ID Metadata Document capability-superset compatibility: require the
+  authorization-code flow selected by Plug, but accept unrelated client
+  extension capabilities. Dynamic Client Registration remains strict.
+- retry-safe local consent: repeat submissions replay the original redirect and
+  never mint a second authorization code or change the recorded decision.
+- safe, actionable OAuth errors across JSON, authorization-page, and redirect
+  responses.
+- a client-neutral lifecycle matrix covering DCR and CIMD discovery or
+  registration, local consent, authorization-code exchange, refresh rotation,
+  and replay rejection.
+
+The branch still needs merge, release verification, and live-client
+certification. Remote consent POST remains forbidden, and authorization-code
+replay remains `invalid_grant` in its focused coverage.
 
 The July 17 downstream OAuth cutover supersedes the older single-client
 allowlist and secretless-client guard described in the historical entries
