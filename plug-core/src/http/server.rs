@@ -1882,10 +1882,21 @@ async fn oauth_token(
             if let Some(refresh_token) = token.refresh_token {
                 body["refresh_token"] = json!(refresh_token);
             }
-            (StatusCode::OK, Json(body)).into_response()
+            oauth_credential_response(body)
         }
         Err(error) => oauth_error_response(&error),
     }
+}
+
+fn oauth_credential_response<T: serde::Serialize>(payload: T) -> Response {
+    let mut response = oauth_json_response(StatusCode::OK, payload);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn oauth_error_response(error: &DownstreamOauthError) -> Response {
@@ -6320,8 +6331,19 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_assets_are_first_party_immutable_and_legacy_route_is_gone() {
+        use sha2::Digest as _;
+
         let app = build_router(oauth_test_state());
         for path in ["/oauth/assets/consent.js", "/oauth/assets/enroll.js"] {
+            let source = match path {
+                "/oauth/assets/consent.js" => crate::http::oauth_ui::CONSENT_JAVASCRIPT,
+                "/oauth/assets/enroll.js" => crate::http::oauth_ui::ENROLL_JAVASCRIPT,
+                _ => unreachable!("test only covers embedded OAuth assets"),
+            };
+            let expected_etag = format!(
+                "\"plug-{}\"",
+                hex::encode(sha2::Sha256::digest(source.as_bytes()))
+            );
             let request = HttpRequest::builder()
                 .method("GET")
                 .uri(path)
@@ -6349,7 +6371,7 @@ mod tests {
                     .headers()
                     .get(header::ETAG)
                     .and_then(|value| value.to_str().ok()),
-                Some(concat!("\"plug-", env!("CARGO_PKG_VERSION"), "\""))
+                Some(expected_etag.as_str())
             );
             for (name, expected) in [
                 (
@@ -6996,6 +7018,20 @@ mod tests {
             .unwrap();
         let token_resp = app.clone().oneshot(token_req).await.unwrap();
         assert_eq!(token_resp.status(), StatusCode::OK);
+        assert_eq!(
+            token_resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            token_resp
+                .headers()
+                .get(header::PRAGMA)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
         let token_body = axum::body::to_bytes(token_resp.into_body(), 10_000)
             .await
             .expect("token body");
@@ -7058,6 +7094,20 @@ mod tests {
             .unwrap();
         let refresh_resp = app.clone().oneshot(refresh_req).await.unwrap();
         assert_eq!(refresh_resp.status(), StatusCode::OK);
+        assert_eq!(
+            refresh_resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            refresh_resp
+                .headers()
+                .get(header::PRAGMA)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
         let refresh_body = axum::body::to_bytes(refresh_resp.into_body(), 10_000)
             .await
             .expect("refresh body");

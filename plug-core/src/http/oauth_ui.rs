@@ -1,5 +1,6 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use sha2::{Digest as _, Sha256};
 
 use crate::downstream_oauth::{ClientSource, ConsentRequest};
 
@@ -76,9 +77,12 @@ pub fn consent_page(consent: &ConsentRequest, owner_enrolled: bool) -> Response 
     } else {
         "<section aria-labelledby=\"setup-heading\"><h2 id=\"setup-heading\">Owner passkey required</h2><p>On the Mac running Plug, run <code>plug auth owner enroll</code>, then start this connection again.</p></section>"
     };
-    let script_version = html_escape(env!("CARGO_PKG_VERSION"));
+    let script_url = html_escape(&versioned_asset_url(
+        "/oauth/assets/consent.js",
+        CONSENT_JAVASCRIPT,
+    ));
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Allow {client_name} to use Plug?</title></head><body><main id=\"consent\" data-consent-id=\"{}\" data-csrf-token=\"{}\" data-challenge-endpoint=\"/oauth/consent/challenge\" data-decision-endpoint=\"/oauth/consent/decision\"><h1>Allow {client_name} to use Plug?</h1><p><strong>{client_name}</strong></p><p>{identity}</p><section aria-labelledby=\"destination-heading\"><h2 id=\"destination-heading\">Connection destination</h2><p>Callback: <strong>{}</strong></p><details><summary>Show full callback address</summary><code>{}</code></details>{callback_warning}</section><section aria-labelledby=\"resource-heading\"><h2 id=\"resource-heading\">Plug resource</h2><p>Plug MCP server</p><code>{}</code></section><section aria-labelledby=\"permissions-heading\"><h2 id=\"permissions-heading\">Permissions</h2><ul>{scopes}</ul></section><p>This request expires in 5 minutes.</p>{allow}<button id=\"deny\" type=\"button\">Deny</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to verify your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"/oauth/assets/consent.js?v={script_version}\"></script></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Allow {client_name} to use Plug?</title></head><body><main id=\"consent\" data-consent-id=\"{}\" data-csrf-token=\"{}\" data-challenge-endpoint=\"/oauth/consent/challenge\" data-decision-endpoint=\"/oauth/consent/decision\"><h1>Allow {client_name} to use Plug?</h1><p><strong>{client_name}</strong></p><p>{identity}</p><section aria-labelledby=\"destination-heading\"><h2 id=\"destination-heading\">Connection destination</h2><p>Callback: <strong>{}</strong></p><details><summary>Show full callback address</summary><code>{}</code></details>{callback_warning}</section><section aria-labelledby=\"resource-heading\"><h2 id=\"resource-heading\">Plug resource</h2><p>Plug MCP server</p><code>{}</code></section><section aria-labelledby=\"permissions-heading\"><h2 id=\"permissions-heading\">Permissions</h2><ul>{scopes}</ul></section><p>This request expires in 5 minutes.</p>{allow}<button id=\"deny\" type=\"button\">Deny</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to verify your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>",
         html_escape(&consent.consent_id),
         html_escape(&consent.csrf_token),
         html_escape(&callback_destination),
@@ -101,9 +105,12 @@ fn callback_authority(url: &url::Url) -> Option<String> {
 }
 
 pub fn enrollment_page() -> Response {
-    let script_version = html_escape(env!("CARGO_PKG_VERSION"));
+    let script_url = html_escape(&versioned_asset_url(
+        "/oauth/assets/enroll.js",
+        ENROLL_JAVASCRIPT,
+    ));
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Set up Plug owner passkey</title></head><body><main id=\"enrollment\"><h1>Set up your Plug owner passkey</h1><p>Use Touch ID or another passkey to approve future Plug connections.</p><button id=\"enroll\" type=\"button\">Create owner passkey</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to create your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"/oauth/assets/enroll.js?v={script_version}\"></script></body></html>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Set up Plug owner passkey</title></head><body><main id=\"enrollment\"><h1>Set up your Plug owner passkey</h1><p>Use Touch ID or another passkey to approve future Plug connections.</p><button id=\"enroll\" type=\"button\">Create owner passkey</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to create your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>"
     );
     html_response(StatusCode::OK, html)
 }
@@ -134,9 +141,18 @@ pub fn javascript_asset(source: &'static str) -> Response {
     );
     response.headers_mut().insert(
         header::ETAG,
-        HeaderValue::from_static(concat!("\"plug-", env!("CARGO_PKG_VERSION"), "\"")),
+        HeaderValue::from_str(&format!("\"plug-{}\"", asset_fingerprint(source)))
+            .expect("SHA-256 asset ETag is a valid header value"),
     );
     response
+}
+
+fn asset_fingerprint(source: &str) -> String {
+    hex::encode(Sha256::digest(source.as_bytes()))
+}
+
+fn versioned_asset_url(path: &str, source: &str) -> String {
+    format!("{path}?v={}", asset_fingerprint(source))
 }
 
 fn html_response(status: StatusCode, html: String) -> Response {
@@ -167,4 +183,20 @@ fn html_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::versioned_asset_url;
+
+    #[test]
+    fn asset_url_fingerprint_changes_with_content() {
+        let original = versioned_asset_url("/oauth/assets/consent.js", "const version = 1;");
+        let unchanged = versioned_asset_url("/oauth/assets/consent.js", "const version = 1;");
+        let updated = versioned_asset_url("/oauth/assets/consent.js", "const version = 2;");
+
+        assert_eq!(original, unchanged);
+        assert_ne!(original, updated);
+        assert!(original.starts_with("/oauth/assets/consent.js?v="));
+    }
 }
