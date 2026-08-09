@@ -1624,14 +1624,27 @@ mod tests {
                 Ok(()),
             ),
             (
-                "missing-code-flow CIMD",
+                "missing authorization-code grant CIMD",
                 CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
                 r#"{
                     "client_id": "https://client.example/metadata.json",
-                    "client_name": "Non-code metadata client",
+                    "client_name": "Missing code grant metadata client",
                     "redirect_uris": ["https://client.example/callback"],
                     "token_endpoint_auth_method": "none",
                     "grant_types": ["urn:example:grant-type:future"],
+                    "response_types": ["code"]
+                }"#,
+                Err(DownstreamOauthError::InvalidClientMetadata),
+            ),
+            (
+                "missing code response type CIMD",
+                CapabilityFixtureKind::MetadataDocument("https://client.example/metadata.json"),
+                r#"{
+                    "client_id": "https://client.example/metadata.json",
+                    "client_name": "Missing code response metadata client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code"],
                     "response_types": ["future"]
                 }"#,
                 Err(DownstreamOauthError::InvalidClientMetadata),

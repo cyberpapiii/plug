@@ -5786,6 +5786,19 @@ mod tests {
             .nth(1)
             .and_then(|value| value.split('\"').next())
             .expect("consent id");
+        let remote_approval = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "plug.example.com")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "consent_id={consent_id}&decision=approve"
+            )))
+            .unwrap();
+        let remote_response = app.clone().oneshot(remote_approval).await.unwrap();
+        assert_eq!(remote_response.status(), StatusCode::FORBIDDEN);
+
         let consent_req = HttpRequest::builder()
             .method("POST")
             .uri("/_plug/oauth/authorize")
