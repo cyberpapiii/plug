@@ -4,6 +4,13 @@
 //! in one owner-only file. There is deliberately no compatibility path for the
 //! former single configured client: upgrading is a clean security boundary.
 
+pub mod owner;
+
+pub use owner::{
+    OwnerAuthenticationCeremony, OwnerBootstrap, OwnerCredential, OwnerRegistrationCeremony,
+    OwnerSecurity,
+};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -21,7 +28,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 
 use crate::config::HttpConfig;
 
-const STATE_VERSION: u8 = 2;
+const STATE_VERSION: u8 = 3;
 const AUTH_REQUEST_LIFETIME_SECS: u64 = 300;
 const AUTH_CODE_LIFETIME_SECS: u64 = 300;
 const ACCESS_TOKEN_LIFETIME_SECS: u64 = 3600;
@@ -61,6 +68,7 @@ impl DownstreamOauthConfig {
 #[derive(Debug, Clone)]
 pub struct DownstreamOauthManager {
     pub config: DownstreamOauthConfig,
+    pub owner_security: Arc<OwnerSecurity>,
     state: Arc<Mutex<DownstreamOauthState>>,
     principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
     registration_rate: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
@@ -128,12 +136,16 @@ pub struct ConsentRequest {
     pub consent_id: String,
     pub client_id: String,
     pub client_name: String,
+    pub client_source: ClientSource,
+    pub redirect_uri: String,
     pub redirect_host: String,
     pub scopes: Vec<String>,
     pub resource: String,
+    pub csrf_token: String,
+    pub expires_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorizationRedirect {
     pub location: String,
 }
@@ -262,6 +274,18 @@ pub enum DownstreamOauthError {
     Persistence(String),
     #[error("client metadata document fetch failed")]
     MetadataFetch,
+    #[error("downstream OAuth owner is not enrolled")]
+    OwnerNotEnrolled,
+    #[error("invalid owner enrollment bootstrap")]
+    InvalidOwnerBootstrap,
+    #[error("owner passkey challenge expired")]
+    OwnerChallengeExpired,
+    #[error("invalid owner passkey assertion")]
+    InvalidOwnerAssertion,
+    #[error("owner credential limit exceeded")]
+    OwnerCredentialLimit,
+    #[error("owner credential not found")]
+    OwnerCredentialNotFound,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,7 +313,7 @@ impl From<&RegisteredClient> for RegisteredClientSummary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingConsent {
     client_id: String,
     redirect_uri: String,
@@ -297,10 +321,12 @@ struct PendingConsent {
     code_challenge: String,
     scopes: Vec<String>,
     resource: String,
+    #[serde(default)]
+    csrf_token: String,
     expires_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompletedConsent {
     client_id: String,
     redirect: AuthorizationRedirect,
@@ -339,11 +365,11 @@ struct DownstreamOauthState {
     version: u8,
     #[serde(default)]
     clients: HashMap<String, RegisteredClient>,
-    #[serde(skip)]
+    #[serde(default)]
     pending_consents: HashMap<String, PendingConsent>,
-    #[serde(skip)]
+    #[serde(default)]
     completed_consents: HashMap<String, CompletedConsent>,
-    #[serde(skip)]
+    #[serde(default)]
     pending_codes: HashMap<String, PendingAuthorizationCode>,
     #[serde(default)]
     access_tokens: HashMap<String, IssuedAccessToken>,
@@ -351,6 +377,14 @@ struct DownstreamOauthState {
     refresh_tokens: HashMap<String, IssuedRefreshToken>,
     #[serde(default)]
     revoked_client_ids: HashSet<String>,
+    #[serde(default)]
+    owner_credentials: HashMap<String, OwnerCredential>,
+    #[serde(default)]
+    owner_bootstraps: HashMap<String, OwnerBootstrap>,
+    #[serde(default)]
+    owner_registration_ceremonies: HashMap<String, OwnerRegistrationCeremony>,
+    #[serde(default)]
+    owner_authentication_ceremonies: HashMap<String, OwnerAuthenticationCeremony>,
 }
 
 impl Default for DownstreamOauthState {
@@ -364,6 +398,10 @@ impl Default for DownstreamOauthState {
             access_tokens: HashMap::new(),
             refresh_tokens: HashMap::new(),
             revoked_client_ids: HashSet::new(),
+            owner_credentials: HashMap::new(),
+            owner_bootstraps: HashMap::new(),
+            owner_registration_ceremonies: HashMap::new(),
+            owner_authentication_ceremonies: HashMap::new(),
         }
     }
 }
@@ -386,6 +424,12 @@ impl DownstreamOauthState {
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
         self.refresh_tokens
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
+        self.owner_bootstraps
+            .retain(|_, item| item.expires_at > now);
+        self.owner_registration_ceremonies
+            .retain(|_, item| item.expires_at > now);
+        self.owner_authentication_ceremonies
+            .retain(|_, item| item.expires_at > now);
         expired
     }
 
@@ -421,6 +465,13 @@ impl DownstreamOauthManager {
 
     pub fn try_new(config: DownstreamOauthConfig) -> Result<Self, DownstreamOauthError> {
         let path = state_file_path(&config);
+        if !path.exists() {
+            let legacy_path = state_file_path_for_version(&config, 2);
+            if legacy_path.exists() {
+                let migrated = load_persisted_state(&legacy_path)?;
+                persist_state(&path, &migrated)?;
+            }
+        }
         Self::new_with_state_path(config, path)
     }
 
@@ -429,6 +480,7 @@ impl DownstreamOauthManager {
         config: DownstreamOauthConfig,
         state_path: PathBuf,
     ) -> Result<Self, DownstreamOauthError> {
+        let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
         let state = load_persisted_state(&state_path)?;
         let principal_lifecycles = state
             .clients
@@ -442,6 +494,7 @@ impl DownstreamOauthManager {
             .collect();
         Ok(Self {
             config,
+            owner_security,
             state: Arc::new(Mutex::new(state)),
             principal_lifecycles: Arc::new(principal_lifecycles),
             registration_rate: Arc::new(Mutex::new(HashMap::new())),
@@ -474,6 +527,20 @@ impl DownstreamOauthManager {
             "http://127.0.0.1:{}/_plug/oauth/authorize",
             self.config.local_port
         )
+    }
+
+    #[cfg(test)]
+    async fn persisted_state_version_for_tests(&self) -> u8 {
+        self.state.lock().await.version
+    }
+
+    #[cfg(test)]
+    async fn pending_consent_exists_for_tests(&self, consent_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .pending_consents
+            .contains_key(consent_id)
     }
 
     pub fn local_approval_request_allowed(&self, headers: &axum::http::HeaderMap) -> bool {
@@ -603,13 +670,7 @@ impl DownstreamOauthManager {
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
         let expired = next.evict_expired(now);
-        if !expired.is_empty() {
-            self.deactivate_principal_lifecycles(&expired);
-            persist_state(&self.state_path, &next)?;
-        }
-        *guard = next;
-        self.remove_principal_lifecycles(&expired);
-        let client = guard
+        let client = next
             .clients
             .get(request.client_id)
             .cloned()
@@ -625,18 +686,17 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidResource);
         }
         let scopes = self.validate_scopes(request.scope)?;
-        if guard
+        if next
             .pending_consents
             .len()
-            .saturating_add(guard.completed_consents.len())
+            .saturating_add(next.completed_consents.len())
             >= MAX_PENDING_CONSENTS
-            || guard
+            || next
                 .pending_consents
                 .values()
                 .map(|pending| &pending.client_id)
                 .chain(
-                    guard
-                        .completed_consents
+                    next.completed_consents
                         .values()
                         .map(|completed| &completed.client_id),
                 )
@@ -651,7 +711,9 @@ impl DownstreamOauthManager {
             .and_then(|url| url.host_str().map(ToString::to_string))
             .ok_or(DownstreamOauthError::InvalidRedirectUri)?;
         let consent_id = opaque_value();
-        guard.pending_consents.insert(
+        let csrf_token = opaque_value();
+        let expires_at = now + AUTH_REQUEST_LIFETIME_SECS;
+        next.pending_consents.insert(
             consent_id.clone(),
             PendingConsent {
                 client_id: request.client_id.to_string(),
@@ -660,16 +722,25 @@ impl DownstreamOauthManager {
                 code_challenge: request.code_challenge.to_string(),
                 scopes: scopes.clone(),
                 resource: request.resource.to_string(),
-                expires_at: now + AUTH_REQUEST_LIFETIME_SECS,
+                csrf_token: csrf_token.clone(),
+                expires_at,
             },
         );
+        self.deactivate_principal_lifecycles(&expired);
+        persist_state(&self.state_path, &next)?;
+        *guard = next;
+        self.remove_principal_lifecycles(&expired);
         Ok(ConsentRequest {
             consent_id,
             client_id: request.client_id.to_string(),
             client_name: client.client_name,
+            client_source: client.source,
+            redirect_uri: request.redirect_uri.to_string(),
             redirect_host,
             scopes,
             resource: request.resource.to_string(),
+            csrf_token,
+            expires_at,
         })
     }
 
@@ -692,7 +763,10 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            guard.pending_consents.remove(consent_id);
+            let mut next = guard.clone();
+            next.pending_consents.remove(consent_id);
+            persist_state(&self.state_path, &next)?;
+            *guard = next;
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
         }
         if !approved {
@@ -702,8 +776,9 @@ impl DownstreamOauthManager {
                     &[("error", "access_denied"), ("state", &consent.state)],
                 ),
             };
-            guard.pending_consents.remove(consent_id);
-            guard.completed_consents.insert(
+            let mut next = guard.clone();
+            next.pending_consents.remove(consent_id);
+            next.completed_consents.insert(
                 consent_id.to_string(),
                 CompletedConsent {
                     client_id: consent.client_id,
@@ -711,6 +786,8 @@ impl DownstreamOauthManager {
                     expires_at: now + AUTH_CODE_LIFETIME_SECS,
                 },
             );
+            persist_state(&self.state_path, &next)?;
+            *guard = next;
             return Ok(redirect);
         }
 
@@ -738,9 +815,6 @@ impl DownstreamOauthManager {
                 &[("code", &code), ("state", &consent.state)],
             ),
         };
-        // Codes are intentionally memory-only, but persisting the client use
-        // timestamp must succeed before the code is handed out.
-        persist_state(&self.state_path, &next)?;
         next.completed_consents.insert(
             consent_id.to_string(),
             CompletedConsent {
@@ -749,6 +823,7 @@ impl DownstreamOauthManager {
                 expires_at: now + AUTH_CODE_LIFETIME_SECS,
             },
         );
+        persist_state(&self.state_path, &next)?;
         *guard = next;
         Ok(redirect)
     }
@@ -1292,12 +1367,16 @@ pub fn resource_scopes(scopes: &[String]) -> Vec<String> {
 }
 
 fn state_file_path(config: &DownstreamOauthConfig) -> PathBuf {
+    state_file_path_for_version(config, STATE_VERSION)
+}
+
+fn state_file_path_for_version(config: &DownstreamOauthConfig, version: u8) -> PathBuf {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(config.public_base_url.trim_end_matches('/').as_bytes());
     crate::config::config_dir()
         .join("downstream_oauth")
         .join(format!(
-            "issuer-v{STATE_VERSION}-{}.json",
+            "issuer-v{version}-{}.json",
             hex::encode(&digest[..8])
         ))
 }
@@ -1314,15 +1393,15 @@ fn load_persisted_state(
     };
     let mut state: DownstreamOauthState = serde_json::from_str(&data)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    if state.version != STATE_VERSION {
+    if state.version == 2 {
+        state.version = STATE_VERSION;
+    } else if state.version != STATE_VERSION {
         return Err(DownstreamOauthError::Persistence(
             "unsupported downstream OAuth state version".to_string(),
         ));
     }
-    state.pending_consents.clear();
-    state.completed_consents.clear();
-    state.pending_codes.clear();
     let _ = state.evict_expired(epoch_secs());
+    persist_state(path, &state)?;
     Ok(state)
 }
 
@@ -1364,6 +1443,23 @@ fn persist_state(
 mod tests {
     use super::*;
 
+    fn temp_state_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "plug-downstream-oauth-{}.json",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn write_state_fixture(fixture: serde_json::Value) -> PathBuf {
+        let path = temp_state_path();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
+        )
+        .expect("write state fixture");
+        path
+    }
+
     fn test_config() -> DownstreamOauthConfig {
         DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
@@ -1373,13 +1469,178 @@ mod tests {
     }
 
     fn test_manager() -> (DownstreamOauthManager, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "plug-downstream-oauth-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let path = temp_state_path();
         let manager = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("test manager");
         (manager, path)
+    }
+
+    #[tokio::test]
+    async fn v2_state_migrates_without_losing_grants() {
+        let now = epoch_secs();
+        let fixture = serde_json::json!({
+            "version": 2,
+            "clients": {
+                "plug_existing": {
+                    "client_id": "plug_existing",
+                    "client_name": "Existing client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "source": "dynamic_registration",
+                    "created_at": now,
+                    "last_used_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "access_tokens": {
+                "access-existing": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "issued_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "refresh_tokens": {
+                "refresh-existing": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "expires_at": now + 3600
+                }
+            },
+            "revoked_client_ids": []
+        });
+        let path = write_state_fixture(fixture);
+
+        let manager = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("migrate version 2 state");
+        assert_eq!(manager.persisted_state_version_for_tests().await, 3);
+        let state = manager.state.lock().await;
+
+        assert!(state.clients.contains_key("plug_existing"));
+        assert!(state.access_tokens.contains_key("access-existing"));
+        assert!(state.refresh_tokens.contains_key("refresh-existing"));
+    }
+
+    #[tokio::test]
+    async fn pending_authorization_survives_restart() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "restart-state",
+                code_challenge: "restart-challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        drop(manager);
+
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("restart manager");
+
+        assert!(
+            restarted
+                .pending_consent_exists_for_tests(&consent.consent_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_code_survives_restart() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "restart-state",
+                code_challenge: "restart-challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let code = url::Url::parse(&redirect.location)
+            .expect("redirect URL")
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization code");
+        drop(manager);
+
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("restart manager");
+
+        assert!(
+            restarted
+                .state
+                .lock()
+                .await
+                .pending_codes
+                .contains_key(&code)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_evicts_expired_short_lived_records() {
+        let now = epoch_secs();
+        let fixture = serde_json::json!({
+            "version": 3,
+            "clients": {},
+            "pending_consents": {
+                "expired-consent": {
+                    "client_id": "plug_expired",
+                    "redirect_uri": "https://client.example/callback",
+                    "state": "state",
+                    "code_challenge": "challenge",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "csrf_token": "expired-csrf",
+                    "expires_at": now
+                }
+            },
+            "completed_consents": {
+                "expired-completed": {
+                    "client_id": "plug_expired",
+                    "redirect": { "location": "https://client.example/callback" },
+                    "expires_at": now
+                }
+            },
+            "pending_codes": {
+                "expired-code": {
+                    "client_id": "plug_expired",
+                    "redirect_uri": "https://client.example/callback",
+                    "code_challenge": "challenge",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "expires_at": now
+                }
+            },
+            "access_tokens": {},
+            "refresh_tokens": {},
+            "revoked_client_ids": []
+        });
+        let path = write_state_fixture(fixture);
+
+        let manager = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("load version 3 state");
+        let state = manager.state.lock().await;
+
+        assert!(state.pending_consents.is_empty());
+        assert!(state.completed_consents.is_empty());
+        assert!(state.pending_codes.is_empty());
     }
 
     async fn register(
@@ -1614,7 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_consents_expire_stay_memory_only_and_clear_on_revocation() {
+    async fn completed_consents_persist_expire_and_clear_on_revocation() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let consent = manager
@@ -1637,7 +1898,7 @@ mod tests {
 
         let loaded = load_persisted_state(&path).expect("reload persisted state");
         assert!(loaded.pending_consents.is_empty());
-        assert!(loaded.completed_consents.is_empty());
+        assert!(loaded.completed_consents.contains_key(&consent.consent_id));
 
         {
             let mut state = manager.state.lock().await;

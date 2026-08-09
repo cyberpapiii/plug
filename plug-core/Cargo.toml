@@ -21,6 +21,7 @@ arc-swap.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 url.workspace = true
+webauthn-rs.workspace = true
 directories.workspace = true
 dashmap.workspace = true
 futures.workspace = true

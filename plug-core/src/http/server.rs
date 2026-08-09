@@ -1859,7 +1859,13 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
         ),
         DownstreamOauthError::InvalidResource
         | DownstreamOauthError::InvalidAuthorizationRequest
-        | DownstreamOauthError::MetadataFetch => (
+        | DownstreamOauthError::MetadataFetch
+        | DownstreamOauthError::OwnerNotEnrolled
+        | DownstreamOauthError::InvalidOwnerBootstrap
+        | DownstreamOauthError::OwnerChallengeExpired
+        | DownstreamOauthError::InvalidOwnerAssertion
+        | DownstreamOauthError::OwnerCredentialLimit
+        | DownstreamOauthError::OwnerCredentialNotFound => (
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "The authorization request could not be completed. Try connecting again from your MCP client.",
