@@ -535,8 +535,36 @@ impl DownstreamOauthState {
             .retain(|_, item| item.expires_at > now);
         self.owner_registration_ceremonies
             .retain(|_, item| item.expires_at > now);
+        let active_consents = self
+            .pending_consents
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         self.owner_authentication_ceremonies
-            .retain(|_, item| item.expires_at > now);
+            .retain(|_, item| item.expires_at > now && active_consents.contains(&item.consent_id));
+
+        // Public callers can replace only their own consent's challenge. Keep
+        // one deterministic live record per pending consent when loading older
+        // state that may contain duplicates. Pending consents are themselves
+        // bounded, so approval ceremony storage is bounded without eviction.
+        let mut newest_by_consent = HashMap::<String, (u64, String)>::new();
+        for (id, ceremony) in &self.owner_authentication_ceremonies {
+            let candidate = (ceremony.expires_at, id.clone());
+            newest_by_consent
+                .entry(ceremony.consent_id.clone())
+                .and_modify(|current| {
+                    if candidate > *current {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+        self.owner_authentication_ceremonies.retain(|id, ceremony| {
+            newest_by_consent
+                .get(&ceremony.consent_id)
+                .is_some_and(|(_, newest_id)| newest_id == id)
+        });
+        debug_assert!(self.owner_authentication_ceremonies.len() <= MAX_PENDING_CONSENTS);
     }
 
     fn evict_expired(&mut self, now: u64) -> HashSet<String> {
@@ -556,12 +584,7 @@ impl DownstreamOauthState {
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
         self.refresh_tokens
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
-        self.owner_bootstraps
-            .retain(|_, item| item.expires_at > now);
-        self.owner_registration_ceremonies
-            .retain(|_, item| item.expires_at > now);
-        self.owner_authentication_ceremonies
-            .retain(|_, item| item.expires_at > now);
+        self.evict_expired_owner_records(now);
         expired
     }
 
@@ -940,22 +963,17 @@ impl DownstreamOauthManager {
                 state: consent.state.clone(),
             };
             next.pending_consents.remove(consent_id);
+            next.owner_authentication_ceremonies
+                .retain(|_, ceremony| ceremony.consent_id != consent_id);
             self.commit_state(&mut guard, next)?;
             return Err(DownstreamOauthError::AuthorizationExpired(callback));
         }
         // One consent owns at most one live challenge. Repeated public calls
-        // replace it instead of consuming issuer-wide capacity.
+        // replace only that consent's challenge; another public caller can
+        // never evict an owner's in-progress ceremony.
         next.owner_authentication_ceremonies
             .retain(|_, ceremony| ceremony.consent_id != consent_id);
-        if next.owner_authentication_ceremonies.len() >= owner::MAX_OWNER_CHALLENGES
-            && let Some(oldest) = next
-                .owner_authentication_ceremonies
-                .iter()
-                .min_by_key(|(_, ceremony)| ceremony.expires_at)
-                .map(|(id, _)| id.clone())
-        {
-            next.owner_authentication_ceremonies.remove(&oldest);
-        }
+        debug_assert!(next.owner_authentication_ceremonies.len() < MAX_PENDING_CONSENTS);
         let credentials = next
             .owner_credentials
             .values()
@@ -2742,15 +2760,20 @@ mod tests {
                     .expect("distinct abusive consent cannot freeze challenge creation");
             }
         }
-        assert_eq!(
-            manager
-                .state
-                .lock()
-                .await
+        {
+            let state = manager.state.lock().await;
+            let ceremony_consents = state
                 .owner_authentication_ceremonies
-                .len(),
-            owner::MAX_OWNER_CHALLENGES
-        );
+                .values()
+                .map(|ceremony| ceremony.consent_id.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                ceremony_consents.len(),
+                state.owner_authentication_ceremonies.len()
+            );
+            assert!(state.owner_authentication_ceremonies.len() <= state.pending_consents.len());
+            assert!(state.owner_authentication_ceremonies.len() <= MAX_PENDING_CONSENTS);
+        }
 
         let legitimate = begin_test_authorization(&manager, "legitimate-challenge").await;
         manager
@@ -2763,6 +2786,179 @@ mod tests {
             .start_owner_registration(&bootstrap)
             .await
             .expect("approval challenge traffic cannot consume enrollment capacity");
+    }
+
+    #[tokio::test]
+    async fn pending_consent_bound_reserves_an_approval_slot_without_eviction() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let template_consent = begin_test_authorization(&manager, "bounded-template").await;
+        let template_challenge = manager
+            .start_owner_approval(&template_consent.consent_id)
+            .await
+            .unwrap();
+        {
+            let mut state = manager.state.lock().await;
+            let pending = state.pending_consents[&template_consent.consent_id].clone();
+            let ceremony =
+                state.owner_authentication_ceremonies[&template_challenge.ceremony_id].clone();
+            state.pending_consents.clear();
+            state.owner_authentication_ceremonies.clear();
+            for index in 0..MAX_PENDING_CONSENTS {
+                let consent_id = format!("bounded-consent-{index}");
+                state
+                    .pending_consents
+                    .insert(consent_id.clone(), pending.clone());
+                if index + 1 < MAX_PENDING_CONSENTS {
+                    let ceremony_id = format!("bounded-ceremony-{index}");
+                    state.owner_authentication_ceremonies.insert(
+                        ceremony_id.clone(),
+                        OwnerAuthenticationCeremony {
+                            id: ceremony_id,
+                            consent_id,
+                            ..ceremony.clone()
+                        },
+                    );
+                }
+            }
+        }
+
+        manager
+            .start_owner_approval(&format!("bounded-consent-{}", MAX_PENDING_CONSENTS - 1))
+            .await
+            .expect("every pending consent has a non-evicting approval slot");
+
+        let state = manager.state.lock().await;
+        assert_eq!(
+            state.owner_authentication_ceremonies.len(),
+            MAX_PENDING_CONSENTS
+        );
+        assert!(
+            state
+                .owner_authentication_ceremonies
+                .contains_key("bounded-ceremony-0")
+        );
+        assert_eq!(
+            state
+                .owner_authentication_ceremonies
+                .values()
+                .map(|ceremony| ceremony.consent_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            MAX_PENDING_CONSENTS
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_legitimate_approval_survives_continuous_distinct_consent_churn() {
+        let (manager, _) = test_manager();
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let mut attacker_consents = Vec::new();
+        for client_index in 0..2 {
+            let client = register(
+                &manager,
+                &format!("churn-client-{client_index}"),
+                &format!("https://churn-client-{client_index}.example/callback"),
+            )
+            .await;
+            for consent_index in 0..5 {
+                let state = format!("churn-{client_index}-{consent_index}");
+                let consent = manager
+                    .begin_authorization(AuthorizationRequest {
+                        response_type: "code",
+                        client_id: &client.client_id,
+                        redirect_uri: &client.redirect_uris[0],
+                        state: &state,
+                        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                        code_challenge_method: "S256",
+                        scope: Some("tools:read"),
+                        resource: "https://plug.example.com/mcp",
+                    })
+                    .await
+                    .expect("begin churn authorization");
+                manager
+                    .start_owner_approval(&consent.consent_id)
+                    .await
+                    .expect("start churn challenge");
+                attacker_consents.push(consent);
+            }
+        }
+
+        let legitimate = begin_test_authorization(&manager, "owner-in-progress").await;
+        let challenge = manager
+            .start_owner_approval(&legitimate.consent_id)
+            .await
+            .expect("start legitimate challenge");
+        let response = authenticator.authentication_response(
+            &challenge.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        let first_churn_consent = {
+            let mut state = manager.state.lock().await;
+            let legitimate_expiry =
+                state.owner_authentication_ceremonies[&challenge.ceremony_id].expires_at;
+            for ceremony in state.owner_authentication_ceremonies.values_mut() {
+                if ceremony.consent_id != legitimate.consent_id {
+                    ceremony.expires_at = legitimate_expiry + 1;
+                }
+            }
+            attacker_consents
+                .iter()
+                .find(|consent| {
+                    !state
+                        .owner_authentication_ceremonies
+                        .values()
+                        .any(|ceremony| ceremony.consent_id == consent.consent_id)
+                })
+                .unwrap_or(&attacker_consents[0])
+                .consent_id
+                .clone()
+        };
+
+        manager
+            .start_owner_approval(&first_churn_consent)
+            .await
+            .expect("resume the churn consent displaced by legitimate challenge");
+        for consent in &attacker_consents {
+            if consent.consent_id == first_churn_consent {
+                continue;
+            }
+            manager
+                .start_owner_approval(&consent.consent_id)
+                .await
+                .expect("continuous churn remains a valid public operation");
+        }
+
+        {
+            let state = manager.state.lock().await;
+            assert!(
+                state
+                    .owner_authentication_ceremonies
+                    .contains_key(&challenge.ceremony_id)
+            );
+            let ceremony_consents = state
+                .owner_authentication_ceremonies
+                .values()
+                .map(|ceremony| ceremony.consent_id.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                ceremony_consents.len(),
+                state.owner_authentication_ceremonies.len()
+            );
+            assert!(state.owner_authentication_ceremonies.len() <= state.pending_consents.len());
+            assert!(state.owner_authentication_ceremonies.len() <= MAX_PENDING_CONSENTS);
+        }
+
+        let redirect = manager
+            .finish_owner_approval(&challenge.ceremony_id, response)
+            .await
+            .expect("public churn cannot invalidate signed owner approval");
+        assert!(redirect.location.contains("state=owner-in-progress"));
+        assert_eq!(manager.state.lock().await.pending_codes.len(), 1);
     }
 
     fn malformed_owner_assertion() -> PublicKeyCredential {
