@@ -373,6 +373,11 @@ pub(crate) enum AuthCommands {
         #[command(subcommand)]
         command: DownstreamOauthClientCommands,
     },
+    /// Enroll or administer downstream OAuth owner passkeys
+    Owner {
+        #[command(subcommand)]
+        command: OwnerCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -384,6 +389,26 @@ pub(crate) enum DownstreamOauthClientCommands {
         /// Registered client ID
         client_id: String,
         /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OwnerCommands {
+    /// Enroll a new owner passkey
+    Enroll {
+        /// Print enrollment URL instead of opening browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// List enrolled owner passkeys
+    List,
+    /// Remove an enrolled owner passkey
+    Remove {
+        /// Owner credential ID
+        credential_id: String,
+        /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
     },
@@ -563,6 +588,46 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Serve { daemon: true })
+        ));
+    }
+
+    #[test]
+    fn auth_owner_commands_parse() {
+        let enroll = Cli::try_parse_from(["plug", "auth", "owner", "enroll", "--no-browser"])
+            .expect("owner enroll should parse");
+        assert!(matches!(
+            enroll.command,
+            Some(Commands::Auth {
+                command: AuthCommands::Owner {
+                    command: OwnerCommands::Enroll { no_browser: true }
+                }
+            })
+        ));
+
+        let list = Cli::try_parse_from(["plug", "--output", "json", "auth", "owner", "list"])
+            .expect("owner list should parse");
+        assert!(matches!(
+            list.command,
+            Some(Commands::Auth {
+                command: AuthCommands::Owner {
+                    command: OwnerCommands::List
+                }
+            })
+        ));
+
+        let remove =
+            Cli::try_parse_from(["plug", "auth", "owner", "remove", "credential-1", "--yes"])
+                .expect("owner remove should parse");
+        assert!(matches!(
+            remove.command,
+            Some(Commands::Auth {
+                command: AuthCommands::Owner {
+                    command: OwnerCommands::Remove {
+                        credential_id,
+                        yes: true
+                    }
+                }
+            }) if credential_id == "credential-1"
         ));
     }
 }
