@@ -68,7 +68,8 @@ impl OwnerSecurity {
                 return Err(DownstreamOauthError::InvalidAuthorizationRequest);
             }
         };
-        let webauthn = Webauthn::new(&rp_id, "Plug", origin.as_str())
+        let browser_origin = origin.origin().ascii_serialization();
+        let webauthn = Webauthn::new(&rp_id, "Plug", &browser_origin)
             .require_user_verification(true)
             .strict_base64(true);
         Ok(Self {
@@ -82,6 +83,8 @@ impl OwnerSecurity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use passkey_auth::{RegistrationResponse, error::Error as PasskeyError};
 
     #[test]
     fn owner_security_uses_https_hostname_as_rp_id() {
@@ -107,6 +110,48 @@ mod tests {
             assert!(
                 OwnerSecurity::new(invalid).is_err(),
                 "invalid owner origin accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_registration_accepts_browser_origin_form_for_default_and_custom_https_ports() {
+        for (configured, browser_origin) in [
+            ("https://plug.example.com", "https://plug.example.com"),
+            (
+                "https://plug.example.com:8443",
+                "https://plug.example.com:8443",
+            ),
+        ] {
+            let security = OwnerSecurity::new(configured).expect("valid owner origin");
+            let (challenge, state) = security.webauthn.start_registration(
+                b"owner",
+                "owner@plug.local",
+                "Plug owner",
+                &[],
+            );
+            let client_data = serde_json::json!({
+                "type": "webauthn.create",
+                "challenge": challenge.challenge,
+                "origin": browser_origin,
+                "crossOrigin": false
+            });
+            let response = RegistrationResponse {
+                id: "credential-id".to_string(),
+                transports: vec!["internal".to_string()],
+                attestation_object: "invalid-attestation".to_string(),
+                client_data_json: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&client_data).expect("serialize browser client data"),
+                ),
+            };
+
+            let error = security
+                .webauthn
+                .finish_registration(&state, &response)
+                .expect_err("invalid attestation must fail after browser origin validation");
+            assert!(
+                !matches!(error, PasskeyError::OriginMismatch { .. }),
+                "browser origin must match configured verifier for {configured}: {error:?}"
             );
         }
     }
