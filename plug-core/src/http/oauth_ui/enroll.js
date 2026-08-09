@@ -66,7 +66,7 @@ async function enrollOwner() {
     return;
   }
   if (!window.PublicKeyCredential || !navigator.credentials) {
-    status.textContent = "This browser or device cannot create a passkey. Open the enrollment link in a passkey-capable browser.";
+    status.textContent = "Passkeys are not available in this browser or device. Open this enrollment link in a browser that supports passkeys. No owner passkey was created.";
     return;
   }
   enroll.disabled = true;

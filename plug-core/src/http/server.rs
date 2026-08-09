@@ -1966,7 +1966,7 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
         DownstreamOauthError::OwnerNotEnrolled => (
             StatusCode::BAD_REQUEST,
             "owner_not_enrolled",
-            "Plug needs an owner passkey before it can approve connections. On the Mac running Plug, run `plug auth owner enroll`.",
+            "Finish Plug owner setup on the Mac running Plug.",
         ),
         DownstreamOauthError::InvalidOwnerBootstrap => (
             StatusCode::BAD_REQUEST,
@@ -1976,12 +1976,12 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
         DownstreamOauthError::OwnerChallengeExpired => (
             StatusCode::BAD_REQUEST,
             "owner_challenge_expired",
-            "The passkey check expired. Try the approval once more while this connection request is open.",
+            "Approval expired. Select Allow again.",
         ),
         DownstreamOauthError::InvalidOwnerAssertion => (
             StatusCode::BAD_REQUEST,
             "owner_verification_failed",
-            "Plug could not verify that passkey. Try again with an enrolled owner passkey.",
+            "Passkey verification failed. No access was granted.",
         ),
         DownstreamOauthError::OwnerCredentialLimit => (
             StatusCode::BAD_REQUEST,
@@ -2000,10 +2000,15 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
             "invalid_request",
             "The authorization request could not be completed. Try connecting again from your MCP client.",
         ),
+        DownstreamOauthError::AuthorizationExpired => (
+            StatusCode::BAD_REQUEST,
+            "authorization_expired",
+            "This connection request expired. Return to your MCP client and select Connect again.",
+        ),
         DownstreamOauthError::Persistence(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
-            "Plug could not save the authorization state. Try connecting again.",
+            "Plug could not save this authorization. No access was granted.",
         ),
     }
 }
@@ -5808,6 +5813,44 @@ mod tests {
                 .expect("error description")
                 .contains("Try connecting again")
         );
+    }
+
+    #[test]
+    fn owner_oauth_errors_have_stable_codes_and_fail_closed_messages() {
+        let cases = [
+            (
+                DownstreamOauthError::OwnerNotEnrolled,
+                "owner_not_enrolled",
+                "Finish Plug owner setup on the Mac running Plug.",
+            ),
+            (
+                DownstreamOauthError::OwnerChallengeExpired,
+                "owner_challenge_expired",
+                "Approval expired. Select Allow again.",
+            ),
+            (
+                DownstreamOauthError::InvalidOwnerAssertion,
+                "owner_verification_failed",
+                "Passkey verification failed. No access was granted.",
+            ),
+            (
+                DownstreamOauthError::AuthorizationExpired,
+                "authorization_expired",
+                "This connection request expired. Return to your MCP client and select Connect again.",
+            ),
+            (
+                DownstreamOauthError::Persistence("secret path and token".to_string()),
+                "server_error",
+                "Plug could not save this authorization. No access was granted.",
+            ),
+        ];
+
+        for (error, expected_code, expected_message) in cases {
+            let (_, code, message) = oauth_public_error(&error);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected_message);
+            assert!(!message.contains("secret path and token"));
+        }
     }
 
     async fn oauth_error_json(response: Response) -> serde_json::Value {

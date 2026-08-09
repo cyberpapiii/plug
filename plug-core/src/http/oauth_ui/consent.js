@@ -69,7 +69,7 @@ function showError(error) {
 
 async function approve() {
   if (!window.PublicKeyCredential || !navigator.credentials) {
-    status.textContent = "This browser or device cannot use passkeys. Open this page in a passkey-capable browser on your device.";
+    status.textContent = "Passkeys are not available in this browser or device. Open this page in a browser that supports passkeys. No access was granted.";
     return;
   }
   allow.disabled = true;

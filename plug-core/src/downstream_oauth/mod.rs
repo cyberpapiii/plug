@@ -67,6 +67,63 @@ impl DownstreamOauthConfig {
     }
 }
 
+/// Safe operator-facing view of downstream OAuth owner readiness.
+///
+/// This intentionally exposes only whether a valid persisted owner record can
+/// be read and how many credentials exist. OAuth grants, passkey public data,
+/// ceremony state, paths, and parse errors never cross this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerEnrollmentStatus {
+    NotEnrolled,
+    Enrolled { credential_count: usize },
+    UnsafePermissions,
+    StateUnavailable,
+}
+
+pub fn inspect_owner_enrollment(config: &DownstreamOauthConfig) -> OwnerEnrollmentStatus {
+    let state_dir = crate::config::config_dir().join("downstream_oauth");
+    inspect_owner_enrollment_in_dir(config, &state_dir)
+}
+
+#[doc(hidden)]
+pub fn inspect_owner_enrollment_in_dir(
+    config: &DownstreamOauthConfig,
+    state_dir: &std::path::Path,
+) -> OwnerEnrollmentStatus {
+    use std::io::Read as _;
+
+    let path = owner_enrollment_state_path_in_dir(config, state_dir);
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return OwnerEnrollmentStatus::NotEnrolled;
+        }
+        Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(metadata) = file.metadata() else {
+            return OwnerEnrollmentStatus::StateUnavailable;
+        };
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return OwnerEnrollmentStatus::UnsafePermissions;
+        }
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return OwnerEnrollmentStatus::StateUnavailable;
+    }
+    let state = match serde_json::from_slice::<DownstreamOauthState>(&bytes) {
+        Ok(state) if state.version == STATE_VERSION => state,
+        Ok(_) | Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
+    };
+    match state.owner_credentials.len() {
+        0 => OwnerEnrollmentStatus::NotEnrolled,
+        credential_count => OwnerEnrollmentStatus::Enrolled { credential_count },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownstreamOauthManager {
     pub config: DownstreamOauthConfig,
@@ -263,6 +320,8 @@ pub enum DownstreamOauthError {
     InvalidRedirectUri,
     #[error("invalid authorization request")]
     InvalidAuthorizationRequest,
+    #[error("authorization request expired")]
+    AuthorizationExpired,
     #[error("access denied")]
     AccessDenied,
     #[error("invalid grant")]
@@ -811,7 +870,7 @@ impl DownstreamOauthManager {
         if consent.expires_at <= now {
             next.pending_consents.remove(consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+            return Err(DownstreamOauthError::AuthorizationExpired);
         }
         if next
             .owner_registration_ceremonies
@@ -904,7 +963,7 @@ impl DownstreamOauthManager {
         if consent.expires_at <= now {
             next.pending_consents.remove(&ceremony.consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+            return Err(DownstreamOauthError::AuthorizationExpired);
         }
         let consent_bytes = serde_json::to_vec(&consent)
             .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
@@ -1021,7 +1080,7 @@ impl DownstreamOauthManager {
             let mut next = guard.clone();
             next.pending_consents.remove(consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+            return Err(DownstreamOauthError::AuthorizationExpired);
         }
         if !crate::auth::verify_auth_token(csrf_token, &consent.csrf_token) {
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
@@ -1299,7 +1358,7 @@ impl DownstreamOauthManager {
             let mut next = guard.clone();
             next.pending_consents.remove(consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::InvalidAuthorizationRequest);
+            return Err(DownstreamOauthError::AuthorizationExpired);
         }
         if !approved {
             let redirect = AuthorizationRedirect {
@@ -1902,6 +1961,14 @@ fn state_file_path_in_dir(
         "issuer-v{version}-{}.json",
         hex::encode(&digest[..8])
     ))
+}
+
+#[doc(hidden)]
+pub fn owner_enrollment_state_path_in_dir(
+    config: &DownstreamOauthConfig,
+    state_dir: &std::path::Path,
+) -> PathBuf {
+    state_file_path_in_dir(config, state_dir, STATE_VERSION)
 }
 
 fn lineage_file_path_in_dir(
@@ -3282,6 +3349,146 @@ mod tests {
                 .owner_authentication_ceremonies
                 .contains_key(&challenge.ceremony_id)
         );
+    }
+
+    #[tokio::test]
+    async fn expired_consent_has_a_distinct_recovery_outcome() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let challenge_consent =
+            begin_test_authorization(&manager, "expired-consent-challenge").await;
+        let assertion_consent =
+            begin_test_authorization(&manager, "expired-consent-assertion").await;
+        let assertion_challenge = manager
+            .start_owner_approval(&assertion_consent.consent_id)
+            .await
+            .expect("start owner approval");
+        let denial_consent = begin_test_authorization(&manager, "expired-consent-denial").await;
+        let legacy_consent = begin_test_authorization(&manager, "expired-consent-legacy").await;
+        {
+            let mut state = manager.state.lock().await;
+            for consent_id in [
+                &challenge_consent.consent_id,
+                &assertion_consent.consent_id,
+                &denial_consent.consent_id,
+                &legacy_consent.consent_id,
+            ] {
+                state
+                    .pending_consents
+                    .get_mut(consent_id)
+                    .expect("pending consent")
+                    .expires_at = 0;
+            }
+        }
+
+        assert_eq!(
+            manager
+                .start_owner_approval(&challenge_consent.consent_id)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::AuthorizationExpired
+        );
+        assert_eq!(
+            manager
+                .finish_owner_approval(
+                    &assertion_challenge.ceremony_id,
+                    malformed_owner_assertion(),
+                )
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::AuthorizationExpired
+        );
+        assert_eq!(
+            manager
+                .deny_consent(&denial_consent.consent_id, &denial_consent.csrf_token)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::AuthorizationExpired
+        );
+        assert_eq!(
+            manager
+                .decide_consent(&legacy_consent.consent_id, false)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::AuthorizationExpired
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_enrollment_probe_counts_only_valid_persisted_credentials() {
+        let state_dir =
+            std::env::temp_dir().join(format!("plug-owner-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let manager = DownstreamOauthManager::try_new_with_state_dir(test_config(), &state_dir)
+            .expect("manager");
+        let authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        drop(manager);
+
+        assert_eq!(
+            inspect_owner_enrollment_in_dir(&test_config(), &state_dir),
+            OwnerEnrollmentStatus::Enrolled {
+                credential_count: 1
+            }
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn owner_enrollment_probe_does_not_claim_readiness_for_corrupt_issuer_state() {
+        let state_dir =
+            std::env::temp_dir().join(format!("plug-owner-probe-corrupt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let config = test_config();
+        let manager = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
+            .expect("manager");
+        let authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        drop(manager);
+        let path = owner_enrollment_state_path_in_dir(&config, &state_dir);
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read state"))
+                .expect("valid state JSON");
+        state["access_tokens"] = serde_json::json!({"token": "malformed-record"});
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&state).expect("serialize corrupt state"),
+        )
+        .expect("write corrupt state");
+
+        assert_eq!(
+            inspect_owner_enrollment_in_dir(&config, &state_dir),
+            OwnerEnrollmentStatus::StateUnavailable
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_enrollment_probe_rejects_state_visible_to_other_users() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "plug-owner-probe-permissions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let config = test_config();
+        let manager = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
+            .expect("manager");
+        let authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        drop(manager);
+        let path = owner_enrollment_state_path_in_dir(&config, &state_dir);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("weaken state permissions");
+
+        assert_eq!(
+            inspect_owner_enrollment_in_dir(&config, &state_dir),
+            OwnerEnrollmentStatus::UnsafePermissions
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]

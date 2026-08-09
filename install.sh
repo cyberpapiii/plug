@@ -220,6 +220,48 @@ check_path() {
     esac
 }
 
+config_requests_downstream_oauth() {
+    CONFIG_PATH="$1"
+    [ -f "$CONFIG_PATH" ] || return 1
+    awk '
+        /^[[:space:]]*\[/ {
+            in_http = ($0 ~ /^[[:space:]]*\[http\][[:space:]]*(#.*)?$/)
+            next
+        }
+        in_http && $0 ~ /^[[:space:]]*auth_mode[[:space:]]*=[[:space:]]*["\047]oauth["\047][[:space:]]*(#.*)?$/ {
+            found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$CONFIG_PATH"
+}
+
+post_install_owner_setup() {
+    INSTALLED_PLUG="$1"
+    CONFIG_PATH=$("$INSTALLED_PLUG" config --path 2>/dev/null || true)
+    if ! config_requests_downstream_oauth "$CONFIG_PATH"; then
+        return 0
+    fi
+
+    STATUS_JSON=$("$INSTALLED_PLUG" status --output json 2>/dev/null || true)
+    if ! printf '%s' "$STATUS_JSON" | grep -Eq '"runtime_available"[[:space:]]*:[[:space:]]*true'; then
+        error "Downstream OAuth is enabled, but Plug service readiness could not be verified.\n  Run: plug start\n  Then run: plug auth owner enroll"
+    fi
+
+    if ! OWNER_JSON=$("$INSTALLED_PLUG" auth owner list --output json 2>/dev/null); then
+        error "Downstream OAuth is enabled, but owner setup could not be checked.\n  Run: plug auth owner enroll"
+    fi
+    OWNER_JSON_COMPACT=$(printf '%s' "$OWNER_JSON" | tr -d '[:space:]')
+    if [ "$OWNER_JSON_COMPACT" = "[]" ]; then
+        info "Downstream OAuth needs one owner passkey. Opening setup..."
+        if ! "$INSTALLED_PLUG" auth owner enroll; then
+            error "Owner passkey setup could not be opened.\n  Run: plug auth owner enroll"
+        fi
+        info "Finish owner passkey setup in the browser before connecting a client."
+    else
+        success "Downstream OAuth owner passkey already enrolled"
+    fi
+}
+
 main() {
     info "Installing plug — MCP multiplexer"
 
@@ -294,6 +336,11 @@ main() {
 
     # Check PATH
     check_path "$INSTALL_DIR"
+
+    # Owner setup is required only for configurations that explicitly enable
+    # downstream OAuth. Existing credentials are inspected through the local
+    # authenticated operator API and are never rotated or replaced here.
+    post_install_owner_setup "$DEST"
 
     # Released binaries are ad-hoc signed, and an ad-hoc signature changes with
     # every build. The macOS Keychain "Always Allow" ACL binds to the signature,
