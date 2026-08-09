@@ -116,9 +116,11 @@ adds:
   the redirect outcome.
 - safe, actionable OAuth error descriptions for JSON, authorization-page, and
   redirect responses.
-- a client-neutral lifecycle matrix covering DCR and CIMD clients through
-  registration or discovery, local consent, authorization-code exchange,
-  refresh rotation, and replay rejection.
+- a full automated DCR lifecycle covering registration, local consent,
+  authorization-code exchange, refresh rotation, and replay rejection.
+- deterministic CIMD validation fixtures covering capability-superset
+  acceptance and rejection. Live HTTPS CIMD client certification remains a
+  manual pending gate; it is not part of the automated lifecycle proof.
 
 Focused coverage on that branch keeps remote consent POST forbidden and keeps
 authorization-code replay at `invalid_grant`.
@@ -134,8 +136,8 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 The current production release remains on `main`. The cross-client downstream
 OAuth reliability work above is `exists off-main`; merge, release verification,
-and live-client certification remain pending. Do not treat it as released until
-current `main` contains the branch and those checks pass.
+and live HTTPS CIMD client certification remain pending. Do not treat it as
+released until current `main` contains the branch and those checks pass.
 
 On 2026-07-17, downstream OAuth moved from one manually configured client to
 a standards-based public-client service. A remote MCP client now starts with

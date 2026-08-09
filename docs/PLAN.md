@@ -91,11 +91,13 @@ off-main on `codex/fix-cimd-client-compatibility`; it is not done on `main`:
   never mint a second authorization code or change the recorded decision.
 - safe, actionable OAuth errors across JSON, authorization-page, and redirect
   responses.
-- a client-neutral lifecycle matrix covering DCR and CIMD discovery or
-  registration, local consent, authorization-code exchange, refresh rotation,
-  and replay rejection.
+- a full automated DCR lifecycle covering registration, local consent,
+  authorization-code exchange, refresh rotation, and replay rejection.
+- deterministic CIMD validation fixtures covering capability-superset
+  acceptance and rejection. Live HTTPS CIMD client certification remains a
+  manual pending gate; it is not part of the automated lifecycle proof.
 
-The branch still needs merge, release verification, and live-client
+The branch still needs merge, release verification, and live HTTPS CIMD client
 certification. Remote consent POST remains forbidden, and authorization-code
 replay remains `invalid_grant` in its focused coverage.
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
+use axum::extract::rejection::{FormRejection, JsonRejection, QueryRejection};
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -1575,10 +1576,14 @@ async fn get_oauth_protected_resource_metadata(
 async fn oauth_register(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
-    Json(request): Json<ClientRegistrationRequest>,
+    request: Result<Json<ClientRegistrationRequest>, JsonRejection>,
 ) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidClientMetadata),
     };
     let rate_key = registration_rate_key(&headers);
     match manager.register_client(request, &rate_key).await {
@@ -1590,10 +1595,21 @@ async fn oauth_register(
 async fn oauth_authorize(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
-    Query(params): Query<OAuthAuthorizeParams>,
+    params: Result<Query<OAuthAuthorizeParams>, QueryRejection>,
 ) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let Query(params) = match params {
+        Ok(params) => params,
+        Err(_) if accepts_html(&headers) => {
+            return oauth_authorization_error_response(
+                &DownstreamOauthError::InvalidAuthorizationRequest,
+            );
+        }
+        Err(_) => {
+            return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest);
+        }
     };
     match manager
         .begin_authorization(AuthorizationRequest {
@@ -1674,7 +1690,7 @@ async fn oauth_authorize(
 async fn oauth_authorize_decision(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
-    Form(decision): Form<OAuthConsentDecision>,
+    decision: Result<Form<OAuthConsentDecision>, FormRejection>,
 ) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1682,10 +1698,22 @@ async fn oauth_authorize_decision(
     if !manager.local_approval_request_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Form(decision) = match decision {
+        Ok(decision) => decision,
+        Err(_) => {
+            return oauth_authorization_error_response(
+                &DownstreamOauthError::InvalidAuthorizationRequest,
+            );
+        }
+    };
     let approved = match decision.decision.as_str() {
         "approve" => true,
         "deny" => false,
-        _ => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
+        _ => {
+            return oauth_authorization_error_response(
+                &DownstreamOauthError::InvalidAuthorizationRequest,
+            );
+        }
     };
     match manager.decide_consent(&decision.consent_id, approved).await {
         Ok(redirect) => match HeaderValue::from_str(&redirect.location) {
@@ -1697,18 +1725,24 @@ async fn oauth_authorize_decision(
                     .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
                 response
             }
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(_) => oauth_authorization_error_response(&DownstreamOauthError::Persistence(
+                "invalid authorization redirect".to_string(),
+            )),
         },
-        Err(error) => oauth_error_response(&error),
+        Err(error) => oauth_authorization_error_response(&error),
     }
 }
 
 async fn oauth_token(
     State(state): State<Arc<HttpState>>,
-    Form(params): Form<HashMap<String, String>>,
+    params: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let Form(params) = match params {
+        Ok(params) => params,
+        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
     };
     if params.contains_key("client_secret") {
         return oauth_error_response(&DownstreamOauthError::UnsupportedClientAuthMethod);
@@ -1816,7 +1850,7 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
         DownstreamOauthError::RateLimited => (
             StatusCode::TOO_MANY_REQUESTS,
             "temporarily_unavailable",
-            "There were too many registration attempts. Wait a moment, then try connecting again.",
+            "There were too many authorization attempts. Wait a moment, then try connecting again.",
         ),
         DownstreamOauthError::RegistrationQuotaExceeded => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -5550,6 +5584,318 @@ mod tests {
         );
     }
 
+    async fn oauth_error_json(response: Response) -> serde_json::Value {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 10_000)
+            .await
+            .expect("OAuth error body");
+        serde_json::from_slice(&body).expect("OAuth error JSON")
+    }
+
+    async fn oauth_error_html(response: Response) -> String {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Security-Policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("default-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 10_000)
+            .await
+            .expect("OAuth error body");
+        String::from_utf8(body.to_vec()).expect("OAuth error HTML")
+    }
+
+    #[tokio::test]
+    async fn malformed_authorization_query_uses_safe_negotiated_oauth_error() {
+        for (accept, expected_content_type) in [
+            ("text/html", "text/html; charset=utf-8"),
+            ("application/json", "application/json"),
+        ] {
+            let app = build_router(oauth_test_state());
+            let request = HttpRequest::builder()
+                .method("GET")
+                .uri("/oauth/authorize?response_type=code&client_id=missing-fields")
+                .header(header::ACCEPT, accept)
+                .body(Body::empty())
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_content_type)
+            );
+            if accept == "text/html" {
+                let body = oauth_error_html(response).await;
+                assert!(body.contains("invalid_request"));
+                assert!(!body.contains("missing field"));
+            } else {
+                let body = oauth_error_json(response).await;
+                assert_eq!(body["error"], "invalid_request");
+                assert!(!body.to_string().contains("missing field"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_registration_and_token_bodies_use_oauth_json_even_for_html_accept() {
+        let app = build_router(oauth_test_state());
+        let registration = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::from("{not-json"))
+            .unwrap();
+        let registration = app.clone().oneshot(registration).await.unwrap();
+        assert_eq!(registration.status(), StatusCode::BAD_REQUEST);
+        let registration = oauth_error_json(registration).await;
+        assert_eq!(registration["error"], "invalid_client_metadata");
+        assert!(!registration.to_string().contains("not-json"));
+
+        let token = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::from("{not-form"))
+            .unwrap();
+        let token = app.oneshot(token).await.unwrap();
+        assert_eq!(token.status(), StatusCode::BAD_REQUEST);
+        let token = oauth_error_json(token).await;
+        assert_eq!(token["error"], "invalid_request");
+        assert!(!token.to_string().contains("not-form"));
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_local_consent_use_hardened_html_but_remote_stays_forbidden() {
+        let app = build_router(oauth_test_state());
+        let malformed_local = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "127.0.0.1:3282")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("consent_id=missing-decision"))
+            .unwrap();
+        let malformed_local = app.clone().oneshot(malformed_local).await.unwrap();
+        assert_eq!(malformed_local.status(), StatusCode::BAD_REQUEST);
+        let malformed_local = oauth_error_html(malformed_local).await;
+        assert!(malformed_local.contains("invalid_request"));
+        assert!(!malformed_local.contains("missing field"));
+
+        let unknown_local = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "127.0.0.1:3282")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("consent_id=unknown&decision=approve"))
+            .unwrap();
+        let unknown_local = app.clone().oneshot(unknown_local).await.unwrap();
+        assert_eq!(unknown_local.status(), StatusCode::BAD_REQUEST);
+        let unknown_local = oauth_error_html(unknown_local).await;
+        assert!(unknown_local.contains("invalid_request"));
+
+        let malformed_remote = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "plug.example.com")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("consent_id=missing-decision"))
+            .unwrap();
+        let malformed_remote = app.oneshot(malformed_remote).await.unwrap();
+        assert_eq!(malformed_remote.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn local_consent_persistence_failure_is_hardened_and_nondisclosing() {
+        let state_path = std::env::temp_dir().join(format!(
+            "plug-oauth-http-persistence-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            crate::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: vec!["tools:read".to_string()],
+                local_port: 3282,
+            },
+            state_path.clone(),
+        )
+        .expect("isolated OAuth manager");
+        let registration = manager
+            .register_client(
+                ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example.com/callback".to_string()],
+                    client_name: Some("Persistence test".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "persistence-test",
+            )
+            .await
+            .expect("register client");
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &registration.client_id,
+                redirect_uri: &registration.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: &manager.resource(),
+            })
+            .await
+            .expect("begin authorization");
+        std::fs::remove_file(&state_path).expect("remove state file");
+        std::fs::create_dir(&state_path).expect("block state-file rename");
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/_plug/oauth/authorize")
+            .header(header::HOST, "127.0.0.1:3282")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "consent_id={}&decision=approve",
+                consent.consent_id
+            )))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = oauth_error_html(response).await;
+        assert!(body.contains("server_error"));
+        assert!(!body.contains(state_path.to_string_lossy().as_ref()));
+        assert!(!body.contains("OAuth state persistence failed"));
+        std::fs::remove_dir(&state_path).expect("remove state blocker");
+        let _ = std::fs::remove_file(state_path.with_extension("json.tmp"));
+    }
+
+    #[tokio::test]
+    async fn persistence_error_payloads_never_disclose_internal_text() {
+        let secret = "database password=correct-horse-battery-staple";
+        for response in [
+            oauth_error_response(&DownstreamOauthError::Persistence(secret.to_string())),
+            oauth_authorization_error_response(&DownstreamOauthError::Persistence(
+                secret.to_string(),
+            )),
+        ] {
+            let body = axum::body::to_bytes(response.into_body(), 10_000)
+                .await
+                .expect("OAuth error body");
+            assert!(!String::from_utf8_lossy(&body).contains(secret));
+        }
+        let (_, code, description) =
+            oauth_public_error(&DownstreamOauthError::Persistence(secret.to_string()));
+        assert_eq!(code, "server_error");
+        assert!(!description.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn authorization_code_http_replay_returns_invalid_grant() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let redirect_uri = "https://client.example.com/callback";
+        let registration = manager
+            .register_client(
+                ClientRegistrationRequest {
+                    redirect_uris: vec![redirect_uri.to_string()],
+                    client_name: Some("Replay test".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "replay-test",
+            )
+            .await
+            .expect("register client");
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &registration.client_id,
+                redirect_uri,
+                state: "state-123",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: &manager.resource(),
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let code = url::Url::parse(&redirect.location)
+            .expect("redirect URL")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+            .expect("authorization code");
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("grant_type", "authorization_code")
+            .append_pair("client_id", &registration.client_id)
+            .append_pair("code", &code)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair(
+                "code_verifier",
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            )
+            .append_pair("resource", "https://plug.example.com/mcp");
+        let form = form.finish();
+
+        for (attempt, expected_status) in [
+            ("first", StatusCode::OK),
+            ("replay", StatusCode::BAD_REQUEST),
+        ] {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form.clone()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected_status, "{attempt} exchange");
+            if attempt == "replay" {
+                let body = oauth_error_json(response).await;
+                assert_eq!(body["error"], "invalid_grant");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn oauth_error_authorization_html_is_readable_and_not_cached() {
         let app = build_router(oauth_test_state());
@@ -5733,7 +6079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_neutral_oauth_lifecycle_acceptance_matrix() {
+    async fn dcr_oauth_lifecycle_acceptance_matrix() {
         let state_path = std::env::temp_dir().join(format!(
             "plug-oauth-lifecycle-matrix-{}.json",
             uuid::Uuid::new_v4()

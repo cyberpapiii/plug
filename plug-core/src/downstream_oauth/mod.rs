@@ -606,9 +606,9 @@ impl DownstreamOauthManager {
         if !expired.is_empty() {
             self.deactivate_principal_lifecycles(&expired);
             persist_state(&self.state_path, &next)?;
-            *guard = next;
-            self.remove_principal_lifecycles(&expired);
         }
+        *guard = next;
+        self.remove_principal_lifecycles(&expired);
         let client = guard
             .clients
             .get(request.client_id)
@@ -625,11 +625,22 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidResource);
         }
         let scopes = self.validate_scopes(request.scope)?;
-        if guard.pending_consents.len() >= MAX_PENDING_CONSENTS
+        if guard
+            .pending_consents
+            .len()
+            .saturating_add(guard.completed_consents.len())
+            >= MAX_PENDING_CONSENTS
             || guard
                 .pending_consents
                 .values()
-                .filter(|pending| pending.client_id == request.client_id)
+                .map(|pending| &pending.client_id)
+                .chain(
+                    guard
+                        .completed_consents
+                        .values()
+                        .map(|completed| &completed.client_id),
+                )
+                .filter(|client_id| client_id.as_str() == request.client_id)
                 .count()
                 >= MAX_PENDING_CONSENTS_PER_CLIENT
         {
@@ -1529,6 +1540,135 @@ mod tests {
             "http://localhost:8787/callback?error=access_denied&state=state-123"
         );
         assert!(manager.state.lock().await.pending_codes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_denials_count_toward_outstanding_consent_cap() {
+        let (manager, _) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+
+        for index in 0..MAX_PENDING_CONSENTS_PER_CLIENT {
+            let consent = manager
+                .begin_authorization(AuthorizationRequest {
+                    response_type: "code",
+                    client_id: &client.client_id,
+                    redirect_uri: &client.redirect_uris[0],
+                    state: &format!("state-{index}"),
+                    code_challenge: "challenge",
+                    code_challenge_method: "S256",
+                    scope: Some("tools:read"),
+                    resource: "https://plug.example.com/mcp",
+                })
+                .await
+                .expect("begin authorization within cap");
+            manager
+                .decide_consent(&consent.consent_id, false)
+                .await
+                .expect("deny consent");
+        }
+
+        let limited = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-over-cap",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await;
+
+        assert_eq!(
+            limited.expect_err("completed decisions must keep capacity reserved"),
+            DownstreamOauthError::RateLimited
+        );
+        let state = manager.state.lock().await;
+        assert!(state.pending_consents.is_empty());
+        assert_eq!(
+            state.completed_consents.len(),
+            MAX_PENDING_CONSENTS_PER_CLIENT
+        );
+        drop(state);
+
+        for completed in manager.state.lock().await.completed_consents.values_mut() {
+            completed.expires_at = 0;
+        }
+        let after_expiry = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-after-expiry",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await;
+        assert!(
+            after_expiry.is_ok(),
+            "expired completed decisions must release capacity: {after_expiry:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_consents_expire_stay_memory_only_and_clear_on_revocation() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-123",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        manager
+            .decide_consent(&consent.consent_id, false)
+            .await
+            .expect("deny consent");
+
+        let loaded = load_persisted_state(&path).expect("reload persisted state");
+        assert!(loaded.pending_consents.is_empty());
+        assert!(loaded.completed_consents.is_empty());
+
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .completed_consents
+                .get_mut(&consent.consent_id)
+                .expect("completed consent")
+                .expires_at = 0;
+            state.evict_expired(epoch_secs());
+            assert!(state.completed_consents.is_empty());
+        }
+
+        let second = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "state-456",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin second authorization");
+        manager
+            .decide_consent(&second.consent_id, false)
+            .await
+            .expect("deny second consent");
+        assert!(manager.revoke_client(&client.client_id).await.unwrap());
+        assert!(manager.state.lock().await.completed_consents.is_empty());
     }
 
     #[test]
