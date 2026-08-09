@@ -1317,6 +1317,14 @@ pub(crate) async fn connect_via_daemon(
 pub(crate) fn auto_start_daemon(
     config_path: Option<&std::path::PathBuf>,
 ) -> anyhow::Result<std::process::Child> {
+    let mut cmd = daemon_start_command(config_path)?;
+    cmd.stderr(std::process::Stdio::null());
+    Ok(cmd.spawn()?)
+}
+
+fn daemon_start_command(
+    config_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<std::process::Command> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve").arg("--daemon");
@@ -1330,10 +1338,36 @@ pub(crate) fn auto_start_daemon(
     }
 
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
 
-    Ok(cmd.spawn()?)
+    Ok(cmd)
+}
+
+async fn start_daemon_with_error_output(
+    config_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<bool> {
+    if daemon::connect_to_daemon().await.is_some() {
+        return Ok(false);
+    }
+    let mut command = daemon_start_command(config_path)?;
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    if let Err(startup_error) = wait_for_daemon_ready(Some(&mut child)).await {
+        use std::io::Read as _;
+        let mut stderr = String::new();
+        if let Some(mut stream) = child.stderr.take() {
+            let _ = stream.read_to_string(&mut stderr);
+        }
+        let stderr = stderr
+            .trim()
+            .strip_prefix("Error: ")
+            .unwrap_or(stderr.trim());
+        if !stderr.is_empty() {
+            anyhow::bail!(stderr.to_string());
+        }
+        return Err(startup_error);
+    }
+    Ok(true)
 }
 
 pub(crate) async fn wait_for_daemon_ready(
@@ -1465,7 +1499,7 @@ pub(crate) async fn cmd_start(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    let started = ensure_daemon_with_feedback(config_path, false).await?;
+    let started = start_daemon_with_error_output(config_path).await?;
 
     if matches!(output, OutputFormat::Json) {
         println!(

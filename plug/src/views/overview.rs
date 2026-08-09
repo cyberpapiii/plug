@@ -524,14 +524,23 @@ pub(crate) async fn cmd_status(
                 servers,
                 clients,
                 uptime_secs,
+                runtime_version,
                 resource_subscriptions,
-            } => Some((servers, clients, uptime_secs, resource_subscriptions)),
+            } => Some((
+                servers,
+                clients,
+                uptime_secs,
+                runtime_version,
+                resource_subscriptions,
+            )),
             _ => None,
         },
     )
     .await;
 
-    if let Some((servers, clients, uptime_secs, resource_subscriptions)) = live_status {
+    if let Some((servers, clients, uptime_secs, runtime_version, resource_subscriptions)) =
+        live_status
+    {
         let (live_sessions, live_inventory_scope, live_client_support) =
             fetch_live_sessions(config_path).await;
         let inventory = live_inventory_metadata(&live_sessions, live_inventory_scope);
@@ -710,6 +719,7 @@ pub(crate) async fn cmd_status(
                 daemon_running,
                 resource_subscriptions,
             );
+            json_obj["runtime_version"] = serde_json::json!(runtime_version);
             if !linked_clients.is_empty() {
                 json_obj["linked_clients"] = serde_json::json!(
                     linked_clients

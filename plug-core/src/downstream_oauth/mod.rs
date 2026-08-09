@@ -218,6 +218,23 @@ pub struct AuthorizationRedirect {
     pub location: String,
 }
 
+/// Redirect authority retained only after client and callback validation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ValidatedAuthorizationCallback {
+    pub(crate) redirect_uri: String,
+    pub(crate) state: String,
+}
+
+impl std::fmt::Debug for ValidatedAuthorizationCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedAuthorizationCallback")
+            .field("redirect_uri", &"[REDACTED]")
+            .field("state", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenResponsePayload {
     pub access_token: String,
@@ -321,7 +338,7 @@ pub enum DownstreamOauthError {
     #[error("invalid authorization request")]
     InvalidAuthorizationRequest,
     #[error("authorization request expired")]
-    AuthorizationExpired,
+    AuthorizationExpired(ValidatedAuthorizationCallback),
     #[error("access denied")]
     AccessDenied,
     #[error("invalid grant")]
@@ -714,6 +731,17 @@ impl DownstreamOauthManager {
             .contains_key(consent_id)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn expire_pending_consent_for_tests(&self, consent_id: &str) {
+        self.state
+            .lock()
+            .await
+            .pending_consents
+            .get_mut(consent_id)
+            .expect("pending consent")
+            .expires_at = 0;
+    }
+
     pub async fn create_owner_bootstrap(&self) -> Result<String, DownstreamOauthError> {
         self.ensure_durable()?;
         let secret = opaque_value();
@@ -868,9 +896,13 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
+            let callback = ValidatedAuthorizationCallback {
+                redirect_uri: consent.redirect_uri.clone(),
+                state: consent.state.clone(),
+            };
             next.pending_consents.remove(consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired);
+            return Err(DownstreamOauthError::AuthorizationExpired(callback));
         }
         if next
             .owner_registration_ceremonies
@@ -961,9 +993,13 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidOwnerAssertion);
         };
         if consent.expires_at <= now {
+            let callback = ValidatedAuthorizationCallback {
+                redirect_uri: consent.redirect_uri.clone(),
+                state: consent.state.clone(),
+            };
             next.pending_consents.remove(&ceremony.consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired);
+            return Err(DownstreamOauthError::AuthorizationExpired(callback));
         }
         let consent_bytes = serde_json::to_vec(&consent)
             .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
@@ -1077,10 +1113,14 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
+            let callback = ValidatedAuthorizationCallback {
+                redirect_uri: consent.redirect_uri.clone(),
+                state: consent.state.clone(),
+            };
             let mut next = guard.clone();
             next.pending_consents.remove(consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired);
+            return Err(DownstreamOauthError::AuthorizationExpired(callback));
         }
         if !crate::auth::verify_auth_token(csrf_token, &consent.csrf_token) {
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
@@ -1355,10 +1395,14 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
+            let callback = ValidatedAuthorizationCallback {
+                redirect_uri: consent.redirect_uri.clone(),
+                state: consent.state.clone(),
+            };
             let mut next = guard.clone();
             next.pending_consents.remove(consent_id);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired);
+            return Err(DownstreamOauthError::AuthorizationExpired(callback));
         }
         if !approved {
             let redirect = AuthorizationRedirect {
@@ -3353,6 +3397,17 @@ mod tests {
 
     #[tokio::test]
     async fn expired_consent_has_a_distinct_recovery_outcome() {
+        fn assert_expired_callback(error: DownstreamOauthError, state: &str) {
+            let DownstreamOauthError::AuthorizationExpired(callback) = error else {
+                panic!("expected authorization expiration, got {error:?}");
+            };
+            assert_eq!(
+                callback.redirect_uri,
+                format!("https://{state}.example/callback")
+            );
+            assert_eq!(callback.state, state);
+        }
+
         let (manager, _) = test_manager();
         let authenticator = BrowserAuthenticator::new();
         enroll_owner(&manager, &authenticator).await;
@@ -3382,14 +3437,14 @@ mod tests {
             }
         }
 
-        assert_eq!(
+        assert_expired_callback(
             manager
                 .start_owner_approval(&challenge_consent.consent_id)
                 .await
                 .unwrap_err(),
-            DownstreamOauthError::AuthorizationExpired
+            "expired-consent-challenge",
         );
-        assert_eq!(
+        assert_expired_callback(
             manager
                 .finish_owner_approval(
                     &assertion_challenge.ceremony_id,
@@ -3397,21 +3452,21 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-            DownstreamOauthError::AuthorizationExpired
+            "expired-consent-assertion",
         );
-        assert_eq!(
+        assert_expired_callback(
             manager
                 .deny_consent(&denial_consent.consent_id, &denial_consent.csrf_token)
                 .await
                 .unwrap_err(),
-            DownstreamOauthError::AuthorizationExpired
+            "expired-consent-denial",
         );
-        assert_eq!(
+        assert_expired_callback(
             manager
                 .decide_consent(&legacy_consent.consent_id, false)
                 .await
                 .unwrap_err(),
-            DownstreamOauthError::AuthorizationExpired
+            "expired-consent-legacy",
         );
     }
 

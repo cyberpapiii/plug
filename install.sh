@@ -220,35 +220,45 @@ check_path() {
     esac
 }
 
-config_requests_downstream_oauth() {
-    CONFIG_PATH="$1"
-    [ -f "$CONFIG_PATH" ] || return 1
-    awk '
-        /^[[:space:]]*\[/ {
-            in_http = ($0 ~ /^[[:space:]]*\[http\][[:space:]]*(#.*)?$/)
-            next
-        }
-        in_http && $0 ~ /^[[:space:]]*auth_mode[[:space:]]*=[[:space:]]*["\047]oauth["\047][[:space:]]*(#.*)?$/ {
-            found = 1
-        }
-        END { exit(found ? 0 : 1) }
-    ' "$CONFIG_PATH"
-}
-
 post_install_owner_setup() {
     INSTALLED_PLUG="$1"
-    CONFIG_PATH=$("$INSTALLED_PLUG" config --path 2>/dev/null || true)
-    if ! config_requests_downstream_oauth "$CONFIG_PATH"; then
+    if ! RESOLVED_CONFIG=$("$INSTALLED_PLUG" config resolved --output json 2>&1); then
+        error "Plug could not resolve the current configuration:\n${RESOLVED_CONFIG}"
+    fi
+    if ! printf '%s' "$RESOLVED_CONFIG" | grep -Eq '"downstream_auth_mode"[[:space:]]*:[[:space:]]*"oauth"'; then
         return 0
     fi
 
-    STATUS_JSON=$("$INSTALLED_PLUG" status --output json 2>/dev/null || true)
-    if ! printf '%s' "$STATUS_JSON" | grep -Eq '"runtime_available"[[:space:]]*:[[:space:]]*true'; then
-        error "Downstream OAuth is enabled, but Plug service readiness could not be verified.\n  Run: plug start\n  Then run: plug auth owner enroll"
+    EXPECTED_VERSION=$(printf '%s' "$RESOLVED_CONFIG" | sed -n 's/.*"binary_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    if [ -z "$EXPECTED_VERSION" ]; then
+        error "Plug could not prove the installed binary version.\n  Run: plug start\n  Then run: plug auth owner enroll"
     fi
 
-    if ! OWNER_JSON=$("$INSTALLED_PLUG" auth owner list --output json 2>/dev/null); then
-        error "Downstream OAuth is enabled, but owner setup could not be checked.\n  Run: plug auth owner enroll"
+    CURRENT_STATUS=$("$INSTALLED_PLUG" status --output json 2>/dev/null || true)
+    if printf '%s' "$CURRENT_STATUS" | grep -Eq '"daemon_running"[[:space:]]*:[[:space:]]*true'; then
+        info "Restarting the Plug service with the newly installed binary..."
+        if ! STOP_OUTPUT=$("$INSTALLED_PLUG" stop 2>&1); then
+            error "Plug could not stop the previous service:\n${STOP_OUTPUT}\n  Run: plug stop\n  Then run: plug start"
+        fi
+    fi
+
+    info "Starting the newly installed Plug service..."
+    if ! START_OUTPUT=$("$INSTALLED_PLUG" start --output json 2>&1); then
+        error "Plug could not start the configured service:\n${START_OUTPUT}\n  Fix the reported configuration or bind error, then run: plug start"
+    fi
+
+    if ! STATUS_JSON=$("$INSTALLED_PLUG" status --output json 2>&1); then
+        error "Plug started, but service readiness could not be checked:\n${STATUS_JSON}\n  Run: plug status"
+    fi
+    if ! printf '%s' "$STATUS_JSON" | grep -Eq '"runtime_available"[[:space:]]*:[[:space:]]*true'; then
+        error "The newly installed Plug service is not ready.\n${STATUS_JSON}\n  Run: plug status"
+    fi
+    if ! printf '%s' "$STATUS_JSON" | grep -Eq '"runtime_version"[[:space:]]*:[[:space:]]*"'"$EXPECTED_VERSION"'"'; then
+        error "Plug is running, but it is not the newly installed version ${EXPECTED_VERSION}.\n  Run: plug stop\n  Then run: plug start"
+    fi
+
+    if ! OWNER_JSON=$("$INSTALLED_PLUG" auth owner list --output json 2>&1); then
+        error "Downstream OAuth owner setup could not be checked:\n${OWNER_JSON}\n  Run: plug auth owner enroll"
     fi
     OWNER_JSON_COMPACT=$(printf '%s' "$OWNER_JSON" | tr -d '[:space:]')
     if [ "$OWNER_JSON_COMPACT" = "[]" ]; then

@@ -241,6 +241,8 @@ enum Commands {
 pub(crate) enum ConfigCommands {
     Path,
     Check,
+    /// Print the resolved downstream configuration without secrets
+    Resolved,
 }
 
 #[derive(Subcommand)]

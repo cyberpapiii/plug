@@ -1741,7 +1741,8 @@ async fn oauth_consent_challenge(
     };
     match manager.start_owner_approval(&request.consent_id).await {
         Ok(challenge) => oauth_json_response(StatusCode::OK, challenge),
-        Err(error) => oauth_error_response(&error),
+        Err(error) => oauth_validated_callback_error_response(&error)
+            .unwrap_or_else(|| oauth_error_response(&error)),
     }
 }
 
@@ -1778,7 +1779,8 @@ async fn oauth_consent_decision(
         Ok(redirect) => {
             oauth_json_response(StatusCode::OK, json!({ "redirect_uri": redirect.location }))
         }
-        Err(error) => oauth_error_response(&error),
+        Err(error) => oauth_validated_callback_error_response(&error)
+            .unwrap_or_else(|| oauth_error_response(&error)),
     }
 }
 
@@ -1910,6 +1912,18 @@ fn oauth_error_response(error: &DownstreamOauthError) -> Response {
     )
 }
 
+fn oauth_validated_callback_error_response(error: &DownstreamOauthError) -> Option<Response> {
+    let DownstreamOauthError::AuthorizationExpired(callback) = error else {
+        return None;
+    };
+    let location =
+        oauth_authorization_error_redirect(&callback.redirect_uri, &callback.state, error);
+    let location = HeaderValue::from_str(&location).ok()?;
+    let mut response = StatusCode::FOUND.into_response();
+    response.headers_mut().insert(header::LOCATION, location);
+    Some(response)
+}
+
 fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
     let mut response = (status, Json(payload)).into_response();
     super::oauth_ui::apply_oauth_json_security_headers(&mut response);
@@ -2000,7 +2014,7 @@ fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str
             "invalid_request",
             "The authorization request could not be completed. Try connecting again from your MCP client.",
         ),
-        DownstreamOauthError::AuthorizationExpired => (
+        DownstreamOauthError::AuthorizationExpired(_) => (
             StatusCode::BAD_REQUEST,
             "authorization_expired",
             "This connection request expired. Return to your MCP client and select Connect again.",
@@ -5834,7 +5848,12 @@ mod tests {
                 "Passkey verification failed. No access was granted.",
             ),
             (
-                DownstreamOauthError::AuthorizationExpired,
+                DownstreamOauthError::AuthorizationExpired(
+                    crate::downstream_oauth::ValidatedAuthorizationCallback {
+                        redirect_uri: "https://client.example.com/callback".to_string(),
+                        state: "state".to_string(),
+                    },
+                ),
                 "authorization_expired",
                 "This connection request expired. Return to your MCP client and select Connect again.",
             ),
@@ -5851,6 +5870,20 @@ mod tests {
             assert_eq!(message, expected_message);
             assert!(!message.contains("secret path and token"));
         }
+    }
+
+    #[test]
+    fn authorization_expiration_debug_redacts_validated_callback() {
+        let error = DownstreamOauthError::AuthorizationExpired(
+            crate::downstream_oauth::ValidatedAuthorizationCallback {
+                redirect_uri: "https://client.example.com/private/callback".to_string(),
+                state: "secret-state-value".to_string(),
+            },
+        );
+
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("private/callback"));
+        assert!(!debug.contains("secret-state-value"));
     }
 
     async fn oauth_error_json(response: Response) -> serde_json::Value {
@@ -6117,6 +6150,93 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
         assert!(body["public_key"]["challenge"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_validated_consent_redirects_to_exact_registered_callback() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        enroll_test_owner(&manager).await;
+        let consent = oauth_test_consent(&manager, "Expired route test").await;
+        manager
+            .expire_pending_consent_for_tests(&consent.consent_id)
+            .await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/challenge")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"consent_id": consent.consent_id}).to_string(),
+            ))
+            .expect("challenge request");
+
+        let response = app.oneshot(request).await.expect("challenge response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "https://client.example.com/callback?error=authorization_expired&error_description=This+connection+request+expired.+Return+to+your+MCP+client+and+select+Connect+again.&state=public-ui-state"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_validated_denial_redirects_to_exact_registered_callback() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let consent = oauth_test_consent(&manager, "Expired denial test").await;
+        manager
+            .expire_pending_consent_for_tests(&consent.consent_id)
+            .await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/decision")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "decision": "deny",
+                    "consent_id": consent.consent_id,
+                    "csrf_token": consent.csrf_token,
+                })
+                .to_string(),
+            ))
+            .expect("denial request");
+
+        let response = app.oneshot(request).await.expect("denial response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "https://client.example.com/callback?error=authorization_expired&error_description=This+connection+request+expired.+Return+to+your+MCP+client+and+select+Connect+again.&state=public-ui-state"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_consent_never_redirects_to_an_unvalidated_callback() {
+        let app = build_router(oauth_test_state());
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/consent/challenge")
+            .header(header::HOST, "plug.example.com")
+            .header(header::ORIGIN, "https://plug.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"consent_id": "unknown"}).to_string()))
+            .expect("challenge request");
+
+        let response = app.oneshot(request).await.expect("challenge response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(header::LOCATION).is_none());
     }
 
     #[tokio::test]

@@ -193,6 +193,26 @@ pub(crate) fn cmd_config(
                 }
             }
         }
+        Some(ConfigCommands::Resolved) => {
+            let config = plug_core::config::load_config(Some(&path))?;
+            let result = serde_json::json!({
+                "path": path,
+                "downstream_auth_mode": config.http.auth_mode.label(),
+                "public_base_url": config.http.public_base_url,
+                "binary_version": env!("CARGO_PKG_VERSION"),
+            });
+            if matches!(output, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_banner("◆", "Resolved config", "Effective downstream settings");
+                print_label_value("Path", style(path.display()).dim());
+                print_label_value("Downstream Auth", config.http.auth_mode.label());
+                if let Some(public_base_url) = config.http.public_base_url {
+                    print_label_value("Public URL", public_base_url);
+                }
+                print_label_value("Binary Version", env!("CARGO_PKG_VERSION"));
+            }
+        }
         None => {
             if path.exists() {
                 open::that(&path)?;
