@@ -578,6 +578,48 @@ impl DownstreamOauthState {
         self.refresh_tokens
             .retain(|_, item| item.client_id != client_id);
     }
+
+    fn replace_client_material_from(&mut self, source: &Self, client_id: &str) {
+        self.remove_client_material(client_id);
+        if let Some(client) = source.clients.get(client_id) {
+            self.clients.insert(client_id.to_string(), client.clone());
+        }
+        self.pending_consents.extend(
+            source
+                .pending_consents
+                .iter()
+                .filter(|(_, item)| item.client_id == client_id)
+                .map(|(id, item)| (id.clone(), item.clone())),
+        );
+        self.completed_consents.extend(
+            source
+                .completed_consents
+                .iter()
+                .filter(|(_, item)| item.client_id == client_id)
+                .map(|(id, item)| (id.clone(), item.clone())),
+        );
+        self.pending_codes.extend(
+            source
+                .pending_codes
+                .iter()
+                .filter(|(_, item)| item.client_id == client_id)
+                .map(|(id, item)| (id.clone(), item.clone())),
+        );
+        self.access_tokens.extend(
+            source
+                .access_tokens
+                .iter()
+                .filter(|(_, item)| item.client_id == client_id)
+                .map(|(id, item)| (id.clone(), item.clone())),
+        );
+        self.refresh_tokens.extend(
+            source
+                .refresh_tokens
+                .iter()
+                .filter(|(_, item)| item.client_id == client_id)
+                .map(|(id, item)| (id.clone(), item.clone())),
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -782,12 +824,9 @@ impl DownstreamOauthManager {
         if next.owner_credentials.len() >= owner::MAX_OWNER_CREDENTIALS {
             return Err(DownstreamOauthError::OwnerCredentialLimit);
         }
-        if next
-            .owner_registration_ceremonies
-            .len()
-            .saturating_add(next.owner_authentication_ceremonies.len())
-            >= owner::MAX_OWNER_CHALLENGES
-        {
+        // Enrollment uses a locally authorized, single-use bootstrap. Public
+        // approval traffic must never consume its ceremony capacity.
+        if next.owner_registration_ceremonies.len() >= owner::MAX_OWNER_CHALLENGES {
             return Err(DownstreamOauthError::RateLimited);
         }
         let excluded = next
@@ -904,13 +943,18 @@ impl DownstreamOauthManager {
             self.commit_state(&mut guard, next)?;
             return Err(DownstreamOauthError::AuthorizationExpired(callback));
         }
-        if next
-            .owner_registration_ceremonies
-            .len()
-            .saturating_add(next.owner_authentication_ceremonies.len())
-            >= owner::MAX_OWNER_CHALLENGES
+        // One consent owns at most one live challenge. Repeated public calls
+        // replace it instead of consuming issuer-wide capacity.
+        next.owner_authentication_ceremonies
+            .retain(|_, ceremony| ceremony.consent_id != consent_id);
+        if next.owner_authentication_ceremonies.len() >= owner::MAX_OWNER_CHALLENGES
+            && let Some(oldest) = next
+                .owner_authentication_ceremonies
+                .iter()
+                .min_by_key(|(_, ceremony)| ceremony.expires_at)
+                .map(|(id, _)| id.clone())
         {
-            return Err(DownstreamOauthError::RateLimited);
+            next.owner_authentication_ceremonies.remove(&oldest);
         }
         let credentials = next
             .owner_credentials
@@ -2128,7 +2172,6 @@ fn reconcile_legacy_state(
                 current_material.remove(client_id);
             }
             if snapshot.lineage.global_digest != lineage.global_digest
-                || current_material != baseline_material
                 || !current_revoked.is_superset(&baseline_revoked)
             {
                 return Err(DownstreamOauthError::Persistence(
@@ -2137,11 +2180,42 @@ fn reconcile_legacy_state(
                 ));
             }
 
+            let changed_clients = baseline_material
+                .keys()
+                .chain(current_material.keys())
+                .filter(|client_id| {
+                    baseline_material.get(*client_id) != current_material.get(*client_id)
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            if changed_clients.iter().any(|client_id| {
+                !baseline_material.contains_key(client_id)
+                    || !current_material.contains_key(client_id)
+            }) {
+                return Err(DownstreamOauthError::Persistence(
+                    "ambiguous version 2 changes add or remove client grants; explicit non-destructive reconciliation is required"
+                        .to_string(),
+                ));
+            }
+
             let mut current = load_persisted_state(current_path)?;
+            let rollback = load_persisted_state(legacy_path)?;
+            for client_id in &changed_clients {
+                if current.revoked_client_ids.contains(client_id)
+                    || current_revoked.contains(client_id)
+                {
+                    current.remove_client_material(client_id);
+                } else {
+                    current.replace_client_material_from(&rollback, client_id);
+                }
+            }
             for client_id in &added_revocations {
                 current.remove_client_material(client_id);
                 current.revoked_client_ids.insert(client_id.clone());
             }
+            current
+                .revoked_client_ids
+                .extend(current_revoked.iter().cloned());
             require_durable(persist_state(current_path, &current)?, current_path)?;
             lineage.full_digest = snapshot.lineage.full_digest;
             lineage.global_digest = snapshot.lineage.global_digest;
@@ -2617,6 +2691,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repeated_public_challenges_cannot_exhaust_approval_or_enrollment_capacity() {
+        let (manager, _) = test_manager();
+        let authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let abusive = begin_test_authorization(&manager, "abusive-challenge").await;
+
+        for _ in 0..owner::MAX_OWNER_CHALLENGES * 2 {
+            manager
+                .start_owner_approval(&abusive.consent_id)
+                .await
+                .expect("same consent replaces its prior challenge");
+        }
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .owner_authentication_ceremonies
+                .len(),
+            1
+        );
+
+        for client_index in 0..2 {
+            let client = register(
+                &manager,
+                &format!("abuse-client-{client_index}"),
+                &format!("https://abuse-client-{client_index}.example/callback"),
+            )
+            .await;
+            for consent_index in 0..5 {
+                let state = format!("abuse-{client_index}-{consent_index}");
+                let consent = manager
+                    .begin_authorization(AuthorizationRequest {
+                        response_type: "code",
+                        client_id: &client.client_id,
+                        redirect_uri: &client.redirect_uris[0],
+                        state: &state,
+                        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                        code_challenge_method: "S256",
+                        scope: Some("tools:read"),
+                        resource: "https://plug.example.com/mcp",
+                    })
+                    .await
+                    .expect("begin abusive authorization");
+                manager
+                    .start_owner_approval(&consent.consent_id)
+                    .await
+                    .expect("distinct abusive consent cannot freeze challenge creation");
+            }
+        }
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .owner_authentication_ceremonies
+                .len(),
+            owner::MAX_OWNER_CHALLENGES
+        );
+
+        let legitimate = begin_test_authorization(&manager, "legitimate-challenge").await;
+        manager
+            .start_owner_approval(&legitimate.consent_id)
+            .await
+            .expect("another consent retains approval capacity");
+
+        let bootstrap = manager.create_owner_bootstrap().await.unwrap();
+        manager
+            .start_owner_registration(&bootstrap)
+            .await
+            .expect("approval challenge traffic cannot consume enrollment capacity");
+    }
+
     fn malformed_owner_assertion() -> PublicKeyCredential {
         PublicKeyCredential {
             id: "malformed".to_string(),
@@ -2628,7 +2776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_tied_approval_ceremonies_replay_first_approval() {
+    async fn replacement_approval_challenge_invalidates_prior_challenge() {
         let (manager, _) = test_manager();
         let mut authenticator = BrowserAuthenticator::new();
         enroll_owner(&manager, &authenticator).await;
@@ -2641,21 +2789,29 @@ mod tests {
             .start_owner_approval(&consent.consent_id)
             .await
             .unwrap();
-        let first_response = authenticator.authentication_response(
+        let replaced_response = authenticator.authentication_response(
             &first.public_key.challenge,
             &manager.owner_security.rp_id,
             "https://plug.example.com",
             true,
         );
-        let first_redirect = manager
-            .finish_owner_approval(&first.ceremony_id, first_response)
+        assert_eq!(
+            manager
+                .finish_owner_approval(&first.ceremony_id, replaced_response)
+                .await
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
+        );
+        let second_response = authenticator.authentication_response(
+            &second.public_key.challenge,
+            &manager.owner_security.rp_id,
+            "https://plug.example.com",
+            true,
+        );
+        manager
+            .finish_owner_approval(&second.ceremony_id, second_response)
             .await
             .unwrap();
-        let second_redirect = manager
-            .finish_owner_approval(&second.ceremony_id, malformed_owner_assertion())
-            .await
-            .unwrap();
-        assert_eq!(second_redirect.location, first_redirect.location);
         assert_eq!(manager.state.lock().await.pending_codes.len(), 1);
     }
 
@@ -2710,7 +2866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tied_approval_and_denial_replay_links_survive_restart() {
+    async fn replacement_approval_and_denial_replay_state_survives_restart() {
         let approval_path = temp_state_path();
         let approval_manager =
             DownstreamOauthManager::new_with_state_path(test_config(), approval_path.clone())
@@ -2728,13 +2884,13 @@ mod tests {
             .await
             .unwrap();
         let response = approval_authenticator.authentication_response(
-            &approval_first.public_key.challenge,
+            &approval_second.public_key.challenge,
             &approval_manager.owner_security.rp_id,
             "https://plug.example.com",
             true,
         );
         let approved = approval_manager
-            .finish_owner_approval(&approval_first.ceremony_id, response)
+            .finish_owner_approval(&approval_second.ceremony_id, response)
             .await
             .unwrap();
         drop(approval_manager);
@@ -2742,12 +2898,12 @@ mod tests {
             DownstreamOauthManager::new_with_state_path(test_config(), approval_path).unwrap();
         assert_eq!(
             approval_restarted
-                .finish_owner_approval(&approval_second.ceremony_id, malformed_owner_assertion())
+                .finish_owner_approval(&approval_first.ceremony_id, malformed_owner_assertion())
                 .await
-                .unwrap()
-                .location,
-            approved.location
+                .unwrap_err(),
+            DownstreamOauthError::InvalidOwnerAssertion
         );
+        assert!(approved.location.contains("approval-restart-race"));
         assert_eq!(approval_restarted.state.lock().await.pending_codes.len(), 1);
 
         let denial_path = temp_state_path();
@@ -3880,6 +4036,114 @@ mod tests {
         let error = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
             .expect_err("completed lineage must block stale v2 reimport when v3 is missing");
         assert!(error.to_string().contains("version 3 state is missing"));
+    }
+
+    #[tokio::test]
+    async fn roll_forward_reconciles_rollback_token_activity_and_preserves_v3_owner_state() {
+        let temp = tempfile::tempdir().expect("state tempdir");
+        let state_dir = temp.path().join("downstream_oauth");
+        std::fs::create_dir_all(&state_dir).expect("state directory");
+        let config = test_config();
+        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
+        let current_path = state_file_path_in_dir(&config, &state_dir, STATE_VERSION);
+        let now = epoch_secs();
+        let mut rollback_state = serde_json::json!({
+            "version": 2,
+            "clients": {
+                "plug_existing": {
+                    "client_id": "plug_existing",
+                    "client_name": "Existing client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "source": "dynamic_registration",
+                    "created_at": now,
+                    "last_used_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "access_tokens": {
+                "access-old": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "issued_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "refresh_tokens": {
+                "refresh-old": {
+                    "client_id": "plug_existing",
+                    "scopes": ["tools:read"],
+                    "resource": "https://plug.example.com/mcp",
+                    "expires_at": now + 3600
+                }
+            },
+            "revoked_client_ids": ["plug_revoked_in_v2"]
+        });
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&rollback_state).unwrap(),
+        )
+        .expect("write initial v2");
+
+        let initial = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
+            .expect("initial migration");
+        {
+            let mut live = initial.state.lock().await;
+            let mut next = live.clone();
+            next.owner_bootstraps.insert(
+                "owner-only-v3".to_string(),
+                OwnerBootstrap {
+                    secret_hash: "owner-secret-hash".to_string(),
+                    expires_at: now + 3600,
+                },
+            );
+            next.revoked_client_ids
+                .insert("plug_revoked_in_v3".to_string());
+            assert!(matches!(
+                persist_state(&current_path, &next).unwrap(),
+                PersistOutcome::Durable
+            ));
+            *live = next;
+        }
+        drop(initial);
+
+        rollback_state["access_tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("access-old");
+        rollback_state["refresh_tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("refresh-old");
+        rollback_state["access_tokens"]["access-rotated"] = serde_json::json!({
+            "client_id": "plug_existing",
+            "scopes": ["tools:read"],
+            "resource": "https://plug.example.com/mcp",
+            "issued_at": now + 1,
+            "expires_at": now + 3600
+        });
+        rollback_state["refresh_tokens"]["refresh-rotated"] = serde_json::json!({
+            "client_id": "plug_existing",
+            "scopes": ["tools:read"],
+            "resource": "https://plug.example.com/mcp",
+            "expires_at": now + 3600
+        });
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&rollback_state).unwrap(),
+        )
+        .expect("write rollback token activity");
+
+        let reconciled = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
+            .expect("re-upgrade reconciles rollback token activity");
+        let state = reconciled.state.lock().await;
+        assert!(state.access_tokens.contains_key("access-rotated"));
+        assert!(state.refresh_tokens.contains_key("refresh-rotated"));
+        assert!(!state.access_tokens.contains_key("access-old"));
+        assert!(!state.refresh_tokens.contains_key("refresh-old"));
+        assert!(state.owner_bootstraps.contains_key("owner-only-v3"));
+        assert!(state.revoked_client_ids.contains("plug_revoked_in_v2"));
+        assert!(state.revoked_client_ids.contains("plug_revoked_in_v3"));
     }
 
     #[test]

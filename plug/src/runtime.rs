@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::OutputFormat;
 use crate::daemon;
 use crate::ui::{print_banner, print_info_line, print_success_line};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
 use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA, REFERRER_POLICY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -482,9 +482,10 @@ async fn operator_owner_credentials(
 async fn operator_remove_owner_credential(
     State(state): State<Arc<OperatorHttpState>>,
     AxumPath(credential_id): AxumPath<String>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
 ) -> StatusCode {
-    let path = format!("{OPERATOR_OWNER_CREDENTIALS_PATH}/{credential_id}");
+    let path = original_uri.path();
     let allow_empty = exact_header(&headers, OPERATOR_ALLOW_EMPTY_HEADER) == Some("true");
     if let Err(status) =
         operator_proof_authorized(&state, &headers, "DELETE", &path, allow_empty).await
@@ -527,9 +528,10 @@ async fn operator_oauth_clients(
 async fn operator_revoke_oauth_client(
     State(state): State<Arc<OperatorHttpState>>,
     AxumPath(client_id): AxumPath<String>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
 ) -> StatusCode {
-    let path = format!("{OPERATOR_OAUTH_CLIENTS_PATH}/{client_id}");
+    let path = original_uri.path();
     if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", &path, false).await {
         return status;
     }
@@ -2916,6 +2918,146 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn operator_http_e2e_revokes_url_valued_metadata_client_and_its_token() {
+        plug_core::tls::ensure_rustls_provider_installed();
+        let state_path = unique_temp_dir("operator-cimd-revoke").join("oauth.json");
+        let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
+            public_base_url: "https://plug.example.com".to_string(),
+            oauth_scopes: vec!["tools:read".to_string()],
+            local_port: 3282,
+        };
+        let initial = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config.clone(),
+            state_path.clone(),
+        )
+        .expect("OAuth manager");
+        let registered = initial
+            .register_client(
+                plug_core::downstream_oauth::ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example/callback".to_string()],
+                    client_name: Some("metadata client".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "operator-cimd-revoke",
+            )
+            .await
+            .expect("register fixture client");
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let consent = initial
+            .begin_authorization(plug_core::downstream_oauth::AuthorizationRequest {
+                response_type: "code",
+                client_id: &registered.client_id,
+                redirect_uri: &registered.redirect_uris[0],
+                state: "operator-cimd-revoke-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        let redirect = initial
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve fixture consent");
+        let code = reqwest::Url::parse(&redirect.location)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        let tokens = initial
+            .exchange_authorization_code(
+                &registered.client_id,
+                &code,
+                &registered.redirect_uris[0],
+                verifier,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("issue fixture token");
+        drop(initial);
+
+        let cimd_client_id = "https://client.example/oauth/metadata.json";
+        let persisted = std::fs::read_to_string(&state_path)
+            .expect("read persisted OAuth fixture")
+            .replace(&registered.client_id, cimd_client_id)
+            .replace("dynamic_registration", "metadata_document");
+        std::fs::write(&state_path, persisted).expect("write CIMD fixture");
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config,
+            state_path.clone(),
+        )
+        .expect("reopen CIMD fixture");
+
+        let engine = Arc::new(plug_core::engine::Engine::new(
+            plug_core::config::Config::default(),
+        ));
+        engine.start().await.expect("engine start");
+        let sessions: Arc<dyn plug_core::session::SessionStore> =
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let state = Arc::new(plug_core::http::server::HttpState {
+            router: engine.tool_router().clone(),
+            sessions,
+            cancel: engine.cancel_token().clone(),
+            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
+            downstream_oauth: Some(manager.clone()),
+            sse_channel_capacity: 32,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: dashmap::DashMap::new(),
+            pending_client_requests: dashmap::DashMap::new(),
+            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
+            client_capabilities: dashmap::DashMap::new(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind operator listener");
+        let addr = listener.local_addr().unwrap();
+        let authority = addr.to_string();
+        let app = build_runtime_router(
+            state,
+            Arc::from("operator-secret"),
+            Arc::from(authority.as_str()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut endpoint =
+            reqwest::Url::parse(&format!("http://{addr}{OPERATOR_OAUTH_CLIENTS_PATH}")).unwrap();
+        endpoint.path_segments_mut().unwrap().push(cimd_client_id);
+
+        let response = send_authenticated_operator_request(
+            &client,
+            endpoint,
+            &authority,
+            "operator-secret",
+            reqwest::Method::DELETE,
+            false,
+        )
+        .await
+        .expect("authenticated CIMD revocation");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(matches!(
+            manager
+                .validate_access_token_for(
+                    &tokens.access_token,
+                    &["tools:read".to_string()],
+                    &manager.resource(),
+                )
+                .await,
+            plug_core::downstream_oauth::AccessTokenValidation::Invalid
+        ));
+
+        server.abort();
+        engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(state_path.parent().unwrap());
     }
 
     #[tokio::test]

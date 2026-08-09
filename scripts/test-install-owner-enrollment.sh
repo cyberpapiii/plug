@@ -190,6 +190,47 @@ assert_called "stop"
 assert_called "start --output json"
 assert_called "auth owner list --output json"
 
+# If the replacement cannot start after stopping a healthy daemon, installer
+# restores the previous binary and starts that service again before failing.
+RESTORE_HOME="$TEST_DIR/restore-home"
+TEST_HOMES="$TEST_HOMES $RESTORE_HOME"
+mkdir -p "$RESTORE_HOME"
+write_oauth_config "$RESTORE_HOME" "$(free_port)" >/dev/null
+plug_env "$RESTORE_HOME" "$REAL_PLUG" start --output json >/dev/null
+restore_old_pid=$(daemon_pid "$RESTORE_HOME")
+RESTORE_WRAPPER="$TEST_DIR/restore-plug"
+RESTORE_FAIL_MARKER="$TEST_DIR/restore-start-failed"
+export RESTORE_FAIL_MARKER
+cat > "$RESTORE_WRAPPER" <<'EOF'
+#!/usr/bin/env sh
+if [ "$*" = "start --output json" ] && [ ! -f "$RESTORE_FAIL_MARKER" ]; then
+    : > "$RESTORE_FAIL_MARKER"
+    printf 'injected replacement startup failure\n' >&2
+    exit 17
+fi
+exec "$REAL_PLUG" "$@"
+EOF
+chmod +x "$RESTORE_WRAPPER"
+if restore_output=$(
+    export HOME="$RESTORE_HOME"
+    export XDG_CONFIG_HOME="$RESTORE_HOME/config"
+    export XDG_RUNTIME_DIR="$RESTORE_HOME/runtime"
+    export XDG_STATE_HOME="$RESTORE_HOME/state"
+    post_install_owner_setup "$RESTORE_WRAPPER" "$REAL_PLUG" 2>&1
+); then
+    printf 'installer unexpectedly accepted failed replacement startup\n' >&2
+    exit 1
+fi
+printf '%s' "$restore_output" | grep -Fq 'Previous Plug service restored'
+restore_status=$(plug_env "$RESTORE_HOME" "$REAL_PLUG" status --output json)
+printf '%s' "$restore_status" | grep -Eq '"runtime_available"[[:space:]]*:[[:space:]]*true'
+restore_pid=$(daemon_pid "$RESTORE_HOME")
+[ "$restore_pid" != "$restore_old_pid" ] || {
+    printf 'restoration reused stopped daemon process %s\n' "$restore_old_pid" >&2
+    exit 1
+}
+cmp "$RESTORE_WRAPPER" "$REAL_PLUG"
+
 # Startup failures must retain the exact bind cause from the new daemon.
 BIND_HOME="$TEST_DIR/bind-home"
 TEST_HOMES="$TEST_HOMES $BIND_HOME"
