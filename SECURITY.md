@@ -25,7 +25,13 @@ long-term support branches.
 
 plug is a local MCP multiplexer. It holds credentials for upstream MCP servers
 and, optionally, acts as an OAuth 2.1 authorization server for downstream MCP
-clients. Two parts of it are security-relevant:
+clients. Three parts of it are security-relevant:
+
+**The configuration file.** plug launches the stdio commands named in your
+config, with your environment and your privileges. The config file is trusted
+operator input, equivalent to a shell script you run yourself. Sandboxing for
+stdio child processes is opt-in per server and is currently implemented only on
+macOS.
 
 **Upstream credentials.** OAuth tokens for upstream servers are stored in the
 operating system keychain where one is available, with a `0600` file mirror used
@@ -70,10 +76,13 @@ Out of scope:
   without authentication.
 - Findings that require the operator to configure something the documentation
   explicitly warns against.
+- The risk metadata plug reports for upstream tools. Those annotations are
+  advisory signals for the operator, partly self-declared by the upstream
+  server; they are not an enforcement boundary and are not claimed to be one.
 
-## Known gaps
+## Redacting your report
 
-Security work in progress is tracked in the repository's `todos/` directory.
-Where a weakness is known and not yet fixed, it is written down rather than left
-implicit. If you find something that is already tracked, the report is still
-welcome; a second opinion on severity is useful.
+Strip access and refresh tokens, bearer and API credentials, upstream server
+environment variables, and any local path you would rather not publish. Keep the
+shape of the request: header names, scope strings, error codes, and timing tell
+us far more than the secret values do.
