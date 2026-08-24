@@ -2312,7 +2312,7 @@ async fn handle_request(
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
 
             let mut result = build_initialize_result(state.router.as_ref(), client_type);
-            withhold_unscoped_logging_capability(&mut result, &policy_context);
+            project_legacy_capabilities(&mut result, &policy_context);
 
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
@@ -2951,15 +2951,51 @@ fn json_task_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, E
 /// Legacy still advertises the other families unconditionally — a wider
 /// advertisement/enforcement mismatch that predates the logging scope and is
 /// tracked separately.
-fn withhold_unscoped_logging_capability(
-    result: &mut InitializeResult,
-    context: &DownstreamCallContext,
-) {
-    if !context
-        .policy_decision(crate::protocol::MethodFamily::Logging)
-        .is_allowed()
-    {
-        result.capabilities.logging = None;
+/// Narrow the legacy `initialize` result to what this principal may actually use.
+///
+/// The modern era already does this in `projected_modern_capabilities`. Legacy
+/// built its result from the upstream capability union alone, with no reference
+/// to the caller's grant, while `/mcp` enforced per-request scopes — so a
+/// narrowed token was told that resources, prompts, and completion exist and was
+/// then denied the moment it used them.
+///
+/// Same policy source as every other gate: `decide_method` via
+/// `policy_decision`. This only reshapes the answer. The two projections differ
+/// in that legacy has no tasks extension to gate and does not run
+/// `suppress_unimplemented_modern_capabilities`, which is a modern-era concern.
+///
+/// A family is advertised only when every method behind it is allowed. The
+/// scopes are coarser than the families — one `resources:read` covers list,
+/// read, and subscribe — so in practice these checks move together; requiring
+/// all of them keeps the projection honest if that granularity ever splits.
+fn project_legacy_capabilities(result: &mut InitializeResult, context: &DownstreamCallContext) {
+    use crate::protocol::MethodFamily;
+
+    let allows = |families: &[MethodFamily]| {
+        families
+            .iter()
+            .all(|family| context.policy_decision(*family).is_allowed())
+    };
+    let capabilities = &mut result.capabilities;
+
+    if !allows(&[MethodFamily::ToolsList, MethodFamily::ToolsCall]) {
+        capabilities.tools = None;
+    }
+    if !allows(&[
+        MethodFamily::ResourcesList,
+        MethodFamily::ResourcesRead,
+        MethodFamily::ResourcesSubscribe,
+    ]) {
+        capabilities.resources = None;
+    }
+    if !allows(&[MethodFamily::PromptsList, MethodFamily::PromptsGet]) {
+        capabilities.prompts = None;
+    }
+    if !allows(&[MethodFamily::Completion]) {
+        capabilities.completions = None;
+    }
+    if !allows(&[MethodFamily::Logging]) {
+        capabilities.logging = None;
     }
 }
 
@@ -3909,42 +3945,82 @@ mod tests {
         );
     }
 
+    /// Everything the upstream union can offer, so the projection has something
+    /// to remove in every family.
+    fn every_legacy_capability() -> ServerCapabilities {
+        let mut capabilities = ServerCapabilities::default();
+        capabilities.tools = Some(Default::default());
+        capabilities.resources = Some(Default::default());
+        capabilities.prompts = Some(Default::default());
+        capabilities.completions = Some(Default::default());
+        capabilities.logging = Some(serde_json::Map::new());
+        capabilities
+    }
+
     #[test]
-    fn legacy_initialize_withholds_logging_capability_without_the_scope() {
-        fn advertised(scopes: [&str; 1]) -> bool {
-            let mut capabilities = ServerCapabilities::default();
-            capabilities.logging = Some(serde_json::Map::new());
-            let mut result = InitializeResult::new(capabilities);
+    fn legacy_initialize_projects_capabilities_through_the_principal_scopes() {
+        fn advertised(scopes: &[&str]) -> ServerCapabilities {
+            let mut result = InitializeResult::new(every_legacy_capability());
             let context = DownstreamCallContext::http("cap-session", RequestId::Number(1))
                 .with_authorization(
                     crate::types::PrincipalId::configured_credential("cap-test", 0),
-                    scopes.map(ToString::to_string),
+                    scopes.iter().map(ToString::to_string),
                 );
-            withhold_unscoped_logging_capability(&mut result, &context);
-            result.capabilities.logging.is_some()
+            project_legacy_capabilities(&mut result, &context);
+            result.capabilities
         }
 
-        // Telling a client the capability exists and then denying the only
-        // method behind it is the inaccuracy this guards against.
+        // Telling a client a capability exists and then denying every method
+        // behind it is the inaccuracy this guards against. Before this
+        // projection, legacy advertised the full upstream union to everyone.
+        let tools_only = advertised(&["tools:read"]);
+        assert!(tools_only.tools.is_some());
         assert!(
-            !advertised(["tools:read"]),
-            "a principal without logging:configure must not be offered the capability"
-        );
-        assert!(
-            advertised(["logging:configure"]),
-            "a principal holding the scope must still see the capability"
+            tools_only.resources.is_none()
+                && tools_only.prompts.is_none()
+                && tools_only.completions.is_none()
+                && tools_only.logging.is_none(),
+            "a tools-only grant must not be offered the other families"
         );
 
-        // A loopback listener that requires no auth keeps it.
-        let mut local_capabilities = ServerCapabilities::default();
-        local_capabilities.logging = Some(serde_json::Map::new());
-        let mut local = InitializeResult::new(local_capabilities);
-        withhold_unscoped_logging_capability(
+        let resources_only = advertised(&["resources:read"]);
+        assert!(resources_only.resources.is_some());
+        assert!(resources_only.tools.is_none() && resources_only.prompts.is_none());
+
+        // The scope that used to be the only one projected still is.
+        assert!(advertised(&["logging:configure"]).logging.is_some());
+        assert!(advertised(&["tools:read"]).logging.is_none());
+
+        // The full default grant sees the whole union, so this is not a
+        // behavior change for a client that consented to everything.
+        let full = advertised(&crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES);
+        assert_eq!(full, every_legacy_capability());
+
+        // The live deployment pins the six families that predate
+        // `logging:configure`; those clients keep everything they use.
+        let six: Vec<&str> = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            .iter()
+            .copied()
+            .filter(|scope| *scope != "logging:configure")
+            .collect();
+        let pinned = advertised(&six);
+        assert!(
+            pinned.tools.is_some()
+                && pinned.resources.is_some()
+                && pinned.prompts.is_some()
+                && pinned.completions.is_some(),
+            "the pinned six-family grant must keep every family it can exercise"
+        );
+        assert!(pinned.logging.is_none());
+
+        // A loopback listener that requires no auth keeps the whole union.
+        let mut local = InitializeResult::new(every_legacy_capability());
+        project_legacy_capabilities(
             &mut local,
             &DownstreamCallContext::http("loopback", RequestId::Number(2))
                 .with_local_principal(http_loopback_principal()),
         );
-        assert!(local.capabilities.logging.is_some());
+        assert_eq!(local.capabilities, every_legacy_capability());
     }
 
     #[tokio::test]
