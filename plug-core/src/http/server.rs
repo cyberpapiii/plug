@@ -3515,6 +3515,15 @@ mod tests {
         manager: &crate::downstream_oauth::DownstreamOauthManager,
         scope: &str,
     ) -> String {
+        issue_test_oauth_grant(manager, scope).await.1.access_token
+    }
+
+    /// Same flow as `issue_test_oauth_token`, but keeps the client id and the
+    /// refresh token, which rotation and reuse-detection tests need.
+    async fn issue_test_oauth_grant(
+        manager: &crate::downstream_oauth::DownstreamOauthManager,
+        scope: &str,
+    ) -> (String, crate::downstream_oauth::TokenResponsePayload) {
         let redirect_uri = "https://client.example.com/callback";
         let registration = manager
             .register_client(
@@ -3555,7 +3564,7 @@ mod tests {
             .query_pairs()
             .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
             .expect("authorization code");
-        manager
+        let tokens = manager
             .exchange_authorization_code(
                 &registration.client_id,
                 &code,
@@ -3564,8 +3573,8 @@ mod tests {
                 &manager.resource(),
             )
             .await
-            .expect("exchange authorization code")
-            .access_token
+            .expect("exchange authorization code");
+        (registration.client_id, tokens)
     }
 
     #[tokio::test]
@@ -7817,22 +7826,10 @@ mod tests {
         assert_ne!(rotated_access_token, access_token);
         assert_ne!(rotated_refresh_token, refresh_token);
 
-        let replayed_refresh = HttpRequest::builder()
-            .method("POST")
-            .uri("/oauth/token")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(Body::from(format!(
-                "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
-            )))
-            .unwrap();
-        let replayed_refresh = app.clone().oneshot(replayed_refresh).await.unwrap();
-        assert_eq!(replayed_refresh.status(), StatusCode::BAD_REQUEST);
-        let replayed_body = axum::body::to_bytes(replayed_refresh.into_body(), 10_000)
-            .await
-            .expect("replayed refresh body");
-        let replayed_value: serde_json::Value =
-            serde_json::from_slice(&replayed_body).expect("replayed refresh JSON");
-        assert_eq!(replayed_value["error"], "invalid_grant");
+        // Replaying `refresh_token` here would revoke the whole family and kill
+        // every token this test goes on to use. Reuse detection has its own
+        // end-to-end coverage in
+        // `replayed_refresh_token_returns_invalid_grant_and_kills_the_family`.
 
         drop(app);
         http_state.cancel.cancel();
@@ -7963,6 +7960,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked_after_restart.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// RFC 9700 section 4.14.2: a refresh token presented after it was already
+    /// spent means the chain leaked, so the whole rotation family dies — not
+    /// just the replayed token. Covered end to end here because the damage is
+    /// only visible through the resource endpoint, and it has to outlive a
+    /// restart to be worth anything.
+    #[tokio::test]
+    async fn replayed_refresh_token_returns_invalid_grant_and_kills_the_family() {
+        let state_path = std::env::temp_dir().join(format!(
+            "plug-oauth-refresh-replay-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let oauth_config = crate::downstream_oauth::DownstreamOauthConfig {
+            public_base_url: "https://plug.example.com".to_string(),
+            oauth_scopes: vec!["tools:read".to_string()],
+            local_port: 3282,
+            modern_downstream_enabled: false,
+        };
+        let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config.clone(),
+            state_path.clone(),
+        )
+        .expect("replay OAuth manager");
+        let (client_id, grant) = issue_test_oauth_grant(&manager, "tools:read").await;
+        let original_refresh_token = grant.refresh_token.expect("refresh token");
+        let http_state = oauth_test_state_with_manager(manager.clone());
+        let app = build_router(http_state.clone());
+
+        let rotate = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={original_refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
+            )))
+            .unwrap();
+        let rotate = app.clone().oneshot(rotate).await.unwrap();
+        assert_eq!(rotate.status(), StatusCode::OK);
+        let rotate = axum::body::to_bytes(rotate.into_body(), 10_000)
+            .await
+            .expect("rotation body");
+        let rotate: serde_json::Value = serde_json::from_slice(&rotate).expect("rotation JSON");
+        let rotated_access_token = rotate["access_token"]
+            .as_str()
+            .expect("rotated access token")
+            .to_string();
+        let rotated_refresh_token = rotate["refresh_token"]
+            .as_str()
+            .expect("rotated refresh token")
+            .to_string();
+
+        // The rotated pair works before the replay, so the assertions after it
+        // are measuring the replay and not some unrelated breakage.
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "replay-client", "version": "1.0" }
+            }
+        });
+        let initialize_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {rotated_access_token}"))
+            .body(Body::from(initialize.to_string()))
+            .unwrap();
+        let initialize_resp = app.clone().oneshot(initialize_req).await.unwrap();
+        assert_eq!(initialize_resp.status(), StatusCode::OK);
+        let session_id = initialize_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session ID")
+            .to_string();
+        drop(initialize_resp);
+        let before_replay = app
+            .clone()
+            .oneshot(oauth_tools_list_request(&rotated_access_token, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(before_replay.status(), StatusCode::OK);
+        drop(before_replay);
+
+        let replay = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={original_refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
+            )))
+            .unwrap();
+        let replay = app.clone().oneshot(replay).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        let replay_body = axum::body::to_bytes(replay.into_body(), 10_000)
+            .await
+            .expect("replay body");
+        let replay_value: serde_json::Value =
+            serde_json::from_slice(&replay_body).expect("replay JSON");
+        assert_eq!(replay_value["error"], "invalid_grant");
+
+        // The replayed token was already dead. What the replay buys the
+        // attacker's victim is the rest of the chain going with it.
+        let after_replay = app
+            .clone()
+            .oneshot(oauth_tools_list_request(&rotated_access_token, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(after_replay.status(), StatusCode::UNAUTHORIZED);
+        drop(after_replay);
+
+        let rotated_refresh_after_replay = HttpRequest::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={rotated_refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp"
+            )))
+            .unwrap();
+        let rotated_refresh_after_replay = app
+            .clone()
+            .oneshot(rotated_refresh_after_replay)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated_refresh_after_replay.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        drop(app);
+        http_state.cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&http_state) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP state fan-out tasks stop");
+        drop(http_state);
+        drop(manager);
+
+        // Revocation is only real if it is on disk: a restart must not resurrect
+        // the family.
+        let restarted = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            oauth_config,
+            state_path,
+        )
+        .expect("restarted OAuth manager");
+        let restarted_app = build_router(oauth_test_state_with_manager(restarted));
+        let after_restart = restarted_app
+            .oneshot(oauth_tools_list_request(&rotated_access_token, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(after_restart.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
