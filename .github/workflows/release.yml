@@ -60,6 +60,21 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} -p plug-mcp
 
+      # Signing happens before packaging so the archive carries the signed
+      # binary. The script fails when a secret is missing rather than emitting
+      # an unsigned artifact, so a release can never claim a signature it does
+      # not have.
+      - name: Sign and notarize (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASS: ${{ secrets.MACOS_CERTIFICATE_PASS }}
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./scripts/sign-macos-release.sh "target/${{ matrix.target }}/release/plug"
+
       - name: Package cargo-dist-compatible archive
         shell: bash
         run: |
@@ -71,6 +86,20 @@ jobs:
           cp README.md LICENSE CHANGELOG.md "${staging}/"
           tar czf "${archive}" "${staging}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      # The signature lives inside the Mach-O image, so archiving should carry
+      # it through. Verify rather than assume: a packaging change that strips it
+      # would otherwise only surface on a user's machine.
+      - name: Verify the signature survived packaging (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_dir="$(mktemp -d)"
+          tar xzf "${ARCHIVE}" -C "${check_dir}"
+          codesign --verify --strict --verbose=2 \
+            "${check_dir}/plug-mcp-${{ matrix.target }}/plug"
+          rm -rf "${check_dir}"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
