@@ -61,7 +61,12 @@ impl DownstreamOauthConfig {
         }
         Some(Self {
             public_base_url: http.public_base_url.clone()?,
-            oauth_scopes: http.oauth_scopes.clone().unwrap_or_default(),
+            oauth_scopes: http.oauth_scopes.clone().unwrap_or_else(|| {
+                crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            }),
             local_port: http.port,
         })
     }
@@ -4861,6 +4866,91 @@ mod tests {
             )
             .await
             .expect("exchange code")
+    }
+
+    #[test]
+    fn from_http_config_defaults_absent_scopes_to_full_grant() {
+        let http = crate::config::HttpConfig {
+            auth_mode: crate::config::DownstreamAuthMode::Oauth,
+            public_base_url: Some("https://plug.example.com".to_string()),
+            oauth_scopes: None,
+            ..crate::config::HttpConfig::default()
+        };
+        let config = DownstreamOauthConfig::from_http_config(&http).expect("oauth config");
+        assert_eq!(
+            config.oauth_scopes,
+            crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            "absent http.oauth_scopes must inherit the six-family default grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_grant_issuance_covers_all_six_scope_families() {
+        let manager = DownstreamOauthManager::new_with_state_path(
+            DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                local_port: 3282,
+            },
+            temp_state_path(),
+        )
+        .expect("default-grant manager");
+        let client = register(&manager, "Default grant", "https://client.example/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "default-grant-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: None,
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization without an explicit scope");
+        let mut expected = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            consent.scopes, expected,
+            "scopeless authorization must request the sorted default grant"
+        );
+        let redirect = manager
+            .decide_consent(&consent.consent_id, true)
+            .await
+            .expect("approve consent");
+        let code = url::Url::parse(&redirect.location)
+            .expect("redirect URL")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+            .expect("authorization code");
+        let token = manager
+            .exchange_authorization_code(
+                &client.client_id,
+                &code,
+                &client.redirect_uris[0],
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("exchange code");
+        let scope = token.scope.expect("token response scope");
+        let granted: HashSet<&str> = scope.split(' ').collect();
+        for required in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
+            assert!(
+                granted.contains(required),
+                "token scope string must grant {required}, got {scope:?}"
+            );
+        }
     }
 
     #[derive(Clone, Copy)]

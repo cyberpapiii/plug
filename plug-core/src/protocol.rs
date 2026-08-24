@@ -116,6 +116,17 @@ pub enum MethodFamily {
     Unknown,
 }
 
+/// Default downstream OAuth grant: the method families a normal MCP client
+/// exercises. Every entry must be a `MethodFamily::required_scope` string.
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 6] = [
+    "tools:read",
+    "resources:read",
+    "prompts:read",
+    "completion:use",
+    "tasks:use",
+    "subscriptions:listen",
+];
+
 impl MethodFamily {
     pub fn from_method(method: &str) -> Self {
         match method {
@@ -582,6 +593,33 @@ mod tests {
         assert_eq!(
             supported_protocol_version().as_str(),
             SUPPORTED_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn default_downstream_oauth_scopes_match_method_family_required_scopes() {
+        let expected = [
+            MethodFamily::ToolsList,
+            MethodFamily::ResourcesRead,
+            MethodFamily::PromptsGet,
+            MethodFamily::Completion,
+            MethodFamily::Tasks,
+            MethodFamily::Listeners,
+        ]
+        .map(|family| {
+            family
+                .required_scope()
+                .expect("default-grant families all require a scope")
+        });
+        assert_eq!(
+            DEFAULT_DOWNSTREAM_OAUTH_SCOPES, expected,
+            "default grant must track MethodFamily::required_scope"
+        );
+        let unique: BTreeSet<&str> = DEFAULT_DOWNSTREAM_OAUTH_SCOPES.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            DEFAULT_DOWNSTREAM_OAUTH_SCOPES.len(),
+            "default grant must not repeat a scope"
         );
     }
 

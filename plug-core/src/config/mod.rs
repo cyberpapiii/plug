@@ -620,11 +620,13 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             }
         }
 
-        if !config
+        // An absent list inherits the default downstream grant, which always
+        // contains tools:read; only an explicit list can drop it.
+        if config
             .http
             .oauth_scopes
             .as_ref()
-            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "tools:read"))
+            .is_some_and(|scopes| !scopes.iter().any(|scope| scope == "tools:read"))
         {
             errors.push(
                 "http.oauth_scopes must include \"tools:read\" when http.auth_mode = \"oauth\""
@@ -1733,12 +1735,26 @@ mod tests {
         let mut cfg = Config::default();
         cfg.http.auth_mode = DownstreamAuthMode::Oauth;
         cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        cfg.http.oauth_scopes = Some(vec!["resources:read".to_string()]);
         let errors = validate_config(&cfg);
         assert!(
             errors
                 .iter()
                 .any(|e| e.contains("oauth_scopes") && e.contains("tools:read")),
             "expected oauth tools:read validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth_accepts_absent_scope_list_as_default_grant() {
+        let mut cfg = Config::default();
+        cfg.http.auth_mode = DownstreamAuthMode::Oauth;
+        cfg.http.public_base_url = Some("https://plug.example.com".to_string());
+        cfg.http.oauth_scopes = None;
+        let errors = validate_config(&cfg);
+        assert!(
+            errors.is_empty(),
+            "expected absent oauth_scopes to inherit the default grant, got {errors:?}"
         );
     }
 
