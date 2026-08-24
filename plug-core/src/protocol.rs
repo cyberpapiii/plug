@@ -110,6 +110,7 @@ pub enum MethodFamily {
     Completion,
     Tasks,
     Listeners,
+    Logging,
     Continuations,
     Extensions,
     Administration,
@@ -118,13 +119,14 @@ pub enum MethodFamily {
 
 /// Default downstream OAuth grant: the method families a normal MCP client
 /// exercises. Every entry must be a `MethodFamily::required_scope` string.
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 6] = [
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 7] = [
     "tools:read",
     "resources:read",
     "prompts:read",
     "completion:use",
     "tasks:use",
     "subscriptions:listen",
+    "logging:configure",
 ];
 
 impl MethodFamily {
@@ -140,6 +142,7 @@ impl MethodFamily {
             "completion/complete" => Self::Completion,
             m if m.starts_with("tasks/") || m.starts_with("plug/legacy/tasks/") => Self::Tasks,
             "subscriptions/listen" => Self::Listeners,
+            "logging/setLevel" => Self::Logging,
             "tools/complete" => Self::Continuations,
             m if m.starts_with("extensions/") => Self::Extensions,
             m if m.starts_with("plug/admin/") => Self::Administration,
@@ -157,6 +160,7 @@ impl MethodFamily {
             Self::Completion => Some("completion:use"),
             Self::Tasks => Some("tasks:use"),
             Self::Listeners => Some("subscriptions:listen"),
+            Self::Logging => Some("logging:configure"),
             Self::Continuations => Some("continuations:complete"),
             Self::Extensions => Some("extensions:use"),
             Self::Administration => Some("plug:admin"),
@@ -605,6 +609,7 @@ mod tests {
             MethodFamily::Completion,
             MethodFamily::Tasks,
             MethodFamily::Listeners,
+            MethodFamily::Logging,
         ]
         .map(|family| {
             family

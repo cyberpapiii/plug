@@ -174,6 +174,7 @@ fn scope_description(scope: &str) -> &'static str {
         "completion:use" => "Use argument completion through Plug",
         "tasks:use" => "Run and manage long-running tasks through Plug",
         "subscriptions:listen" => "Receive change notifications from Plug",
+        "logging:configure" => "Change the log verbosity of Plug and its servers",
         "offline_access" => "Stay connected after this browser window closes",
         _ => "Use the requested Plug capability",
     }

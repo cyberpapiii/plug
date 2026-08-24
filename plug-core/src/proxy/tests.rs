@@ -36,6 +36,86 @@ fn trace_ids_are_w3c_sized_hex_values() {
 }
 
 #[test]
+fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
+    // HTTP is the internet-reachable transport. A context that reaches policy
+    // without an adapter having declared how the caller authenticated must be
+    // able to do nothing, not everything.
+    for context in [
+        DownstreamCallContext::http("bare-session", RequestId::Number(1)),
+        DownstreamCallContext::http_for_client(
+            "bare-session",
+            RequestId::Number(2),
+            ClientType::Unknown,
+        ),
+        DownstreamCallContext::http_for_client_with_trace(
+            "bare-session",
+            RequestId::Number(3),
+            ClientType::Unknown,
+            "0123456789abcdef0123456789abcdef",
+        ),
+    ] {
+        assert!(
+            !context.local_trust,
+            "HTTP contexts must not inherit local trust from the constructor"
+        );
+        assert!(
+            context
+                .authorize(crate::protocol::MethodFamily::ToolsList)
+                .is_err(),
+            "an unopted HTTP context must be denied, not allowed"
+        );
+    }
+
+    // The two explicit opt-ins still work, so no legitimate caller regresses.
+    let bearer = DownstreamCallContext::http("oauth-session", RequestId::Number(4))
+        .with_authorization(
+            crate::types::PrincipalId::configured_credential("test-bearer", 0),
+            ["tools:read".to_string()],
+        );
+    assert!(!bearer.local_trust);
+    assert!(
+        bearer
+            .authorize(crate::protocol::MethodFamily::ToolsList)
+            .is_ok()
+    );
+    assert!(
+        bearer
+            .authorize(crate::protocol::MethodFamily::PromptsGet)
+            .is_err(),
+        "an authorized context is still bounded by its scopes"
+    );
+
+    let loopback =
+        DownstreamCallContext::http("loopback-session", RequestId::Number(5)).with_local_principal(
+            crate::types::PrincipalId::configured_credential("downstream-http-loopback", 0),
+        );
+    assert!(loopback.local_trust);
+    assert!(
+        loopback
+            .authorize(crate::protocol::MethodFamily::PromptsGet)
+            .is_ok(),
+        "a loopback listener that requires no auth keeps full local access"
+    );
+
+    // Stdio and IPC are local by construction and must stay trusted.
+    for context in [
+        DownstreamCallContext::stdio("stdio-client", RequestId::Number(6)),
+        DownstreamCallContext::ipc_for_client(
+            "ipc-client",
+            RequestId::Number(7),
+            ClientType::Unknown,
+        ),
+    ] {
+        assert!(context.local_trust, "local transports keep local trust");
+        assert!(
+            context
+                .authorize(crate::protocol::MethodFamily::ToolsCall)
+                .is_ok()
+        );
+    }
+}
+
+#[test]
 fn downstream_context_preserves_supplied_http_trace_id() {
     let context = DownstreamCallContext::http_for_client_with_trace(
         "session-a",

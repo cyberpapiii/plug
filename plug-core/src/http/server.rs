@@ -110,6 +110,17 @@ fn http_principal(
     }
 }
 
+/// The principal for a request that arrived with no authentication at all.
+///
+/// `AuthStatus::NoAuthRequired` is produced only when `auth_mode` is not OAuth
+/// *and* no bearer token is configured, a combination config validation permits
+/// only for a loopback bind. The trust comes from the listener, not from
+/// anything the client sent, so these requests opt into local trust explicitly
+/// rather than inheriting it from a permissive constructor default.
+fn http_loopback_principal() -> crate::types::PrincipalId {
+    crate::types::PrincipalId::configured_credential("downstream-http-loopback", 0)
+}
+
 fn http_task_owner(
     session_id: &str,
     auth_status: &AuthStatus,
@@ -166,7 +177,8 @@ fn modern_http_call_context(
         (AuthStatus::Authenticated(None), Some(principal)) => {
             context.with_local_principal(principal)
         }
-        _ => context,
+        (AuthStatus::NoAuthRequired, _) => context.with_local_principal(http_loopback_principal()),
+        (AuthStatus::Authenticated(_), None) => context,
     }
 }
 
@@ -198,7 +210,8 @@ fn legacy_http_policy_context(
         (AuthStatus::Authenticated(None), Some(principal)) => {
             context.with_local_principal(principal)
         }
-        _ => context,
+        (AuthStatus::NoAuthRequired, _) => context.with_local_principal(http_loopback_principal()),
+        (AuthStatus::Authenticated(_), None) => context,
     }
 }
 
@@ -326,19 +339,14 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             (AuthStatus::Authenticated(None), Some(principal)) => {
                 context.with_local_principal(principal)
             }
-            (AuthStatus::NoAuthRequired, None)
-                if self.protocol_era == crate::protocol::ProtocolEra::Legacy =>
-            {
-                // Legacy loopback sessions retain their long-standing task
-                // behavior. The trust comes from the loopback-only listener,
-                // not from client-provided metadata; ownership remains scoped
-                // to the server-minted session id in `task_owner`.
-                context.with_local_principal(crate::types::PrincipalId::configured_credential(
-                    "downstream-http-loopback",
-                    0,
-                ))
+            (AuthStatus::NoAuthRequired, _) => {
+                // The trust comes from the loopback-only listener, not from
+                // client-provided metadata; ownership remains scoped to the
+                // server-minted session id in `task_owner`. Era-independent:
+                // a loopback listener is loopback in both revisions.
+                context.with_local_principal(http_loopback_principal())
             }
-            _ => context,
+            (AuthStatus::Authenticated(_), None) => context,
         }
     }
 
@@ -1607,6 +1615,7 @@ async fn get_oauth_protected_resource_metadata(
 
 async fn oauth_register(
     State(state): State<Arc<HttpState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     request: Result<Json<ClientRegistrationRequest>, JsonRejection>,
 ) -> Response {
@@ -1617,7 +1626,10 @@ async fn oauth_register(
         Ok(request) => request,
         Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidClientMetadata),
     };
-    let rate_key = registration_rate_key(&headers);
+    let rate_key = registration_rate_key(
+        peer.map(|axum::Extension(axum::extract::ConnectInfo(address))| address.ip()),
+        &headers,
+    );
     match manager.register_client(request, &rate_key).await {
         Ok(registration) => (StatusCode::CREATED, Json(registration)).into_response(),
         Err(error) => oauth_error_response(&error),
@@ -2103,16 +2115,46 @@ fn public_browser_request_allowed(
     origin == Some(base_url.origin().ascii_serialization().as_str())
 }
 
-fn registration_rate_key(headers: &HeaderMap) -> String {
-    headers
+/// Bucket a registration attempt by caller.
+///
+/// The forwarding headers are attacker-controlled unless something trustworthy
+/// wrote them, so they are consulted only when the request arrived from a
+/// same-host reverse proxy — a loopback peer. That is the deployment plug
+/// actually has: `cloudflared` runs beside the daemon and connects over
+/// loopback. A caller reaching the listener directly is bucketed by the address
+/// it connected from, which it cannot forge.
+///
+/// Within a trusted hop the two headers are read differently on purpose.
+/// `cf-connecting-ip` is written by the edge and overwrites whatever the client
+/// sent. `x-forwarded-for` is *appended* to, so the leftmost entry is the value
+/// the client supplied and the rightmost is the one the nearest proxy added;
+/// only the rightmost is worth anything.
+fn registration_rate_key(peer: Option<std::net::IpAddr>, headers: &HeaderMap) -> String {
+    let Some(peer) = peer else {
+        // No connection info means no way to tell a proxy from a client, so
+        // neither source is trustworthy. One shared bucket is a worse rate
+        // limit than a per-caller one, and a safer one.
+        return "unknown-peer".to_string();
+    };
+    if !peer.is_loopback() {
+        return peer.to_string();
+    }
+    let forwarded = headers
         .get("cf-connecting-ip")
-        .or_else(|| headers.get("x-forwarded-for"))
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
         .map(str::trim)
-        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
-        .map(|address| address.to_string())
-        .unwrap_or_else(|| "local-or-unknown".to_string())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.rsplit(',').next())
+                .map(str::trim)
+        })
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok());
+    match forwarded {
+        Some(address) => address.to_string(),
+        None => peer.to_string(),
+    }
 }
 
 fn oauth_authorization_error_redirect(
@@ -2241,7 +2283,8 @@ async fn handle_request(
                 .client_capabilities
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
 
-            let result = build_initialize_result(state.router.as_ref(), client_type);
+            let mut result = build_initialize_result(state.router.as_ref(), client_type);
+            withhold_unscoped_logging_capability(&mut result, &policy_context);
 
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
@@ -2805,6 +2848,16 @@ async fn handle_request(
         }
 
         ClientRequest::SetLevelRequest(set_level_req) => {
+            // Not a per-session preference in plug: the effective level is
+            // recalculated across every downstream client and forwarded to
+            // every upstream, so one principal moves the verbosity of the
+            // whole daemon. That is a shared-state write and needs a scope.
+            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::Logging) {
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(error, Some(request_id)),
+                    era,
+                );
+            }
             if modern {
                 return json_response_for_era(
                     &ServerJsonRpcMessage::error(
@@ -2859,6 +2912,27 @@ fn legacy_task_params(
 
 fn json_task_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, ErrorData> {
     serde_json::to_value(value).map_err(|error| ErrorData::internal_error(error.to_string(), None))
+}
+
+/// Drop the advertised `logging` capability for a principal that cannot use it.
+///
+/// `logging/setLevel` is scope-gated, and the legacy `initialize` result builds
+/// its capabilities from the upstream union with no reference to the caller, so
+/// without this a six-scope token is told logging exists and then denied when it
+/// tries. The modern era already projects every capability through policy.
+/// Legacy still advertises the other families unconditionally — a wider
+/// advertisement/enforcement mismatch that predates the logging scope and is
+/// tracked separately.
+fn withhold_unscoped_logging_capability(
+    result: &mut InitializeResult,
+    context: &DownstreamCallContext,
+) {
+    if !context
+        .policy_decision(crate::protocol::MethodFamily::Logging)
+        .is_allowed()
+    {
+        result.capabilities.logging = None;
+    }
 }
 
 /// Build the InitializeResult (same as ProxyHandler::get_info).
@@ -3650,6 +3724,185 @@ mod tests {
                 "default-grant token must get a {method} result, got {value}"
             );
         }
+    }
+
+    #[test]
+    fn registration_rate_key_ignores_forwarding_headers_from_untrusted_peers() {
+        use std::net::IpAddr;
+
+        fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            map
+        }
+
+        let remote: IpAddr = "203.0.113.7".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // A client connecting straight to the listener cannot buy itself a
+        // fresh budget by claiming an address, however it spells the claim.
+        for spoof in [
+            vec![("cf-connecting-ip", "198.51.100.1")],
+            vec![("x-forwarded-for", "198.51.100.1")],
+            vec![("x-forwarded-for", "198.51.100.1, 198.51.100.2")],
+        ] {
+            assert_eq!(
+                registration_rate_key(Some(remote), &headers(&spoof)),
+                "203.0.113.7",
+                "a non-loopback peer must be bucketed by its own address"
+            );
+        }
+
+        // Behind the same-host tunnel the edge-written header is the caller.
+        assert_eq!(
+            registration_rate_key(
+                Some(loopback),
+                &headers(&[("cf-connecting-ip", "198.51.100.1")])
+            ),
+            "198.51.100.1"
+        );
+
+        // `x-forwarded-for` is appended to, so the client's own value sits on
+        // the left and the nearest proxy's on the right. Only the right one is
+        // written by something we trust.
+        assert_eq!(
+            registration_rate_key(
+                Some(loopback),
+                &headers(&[("x-forwarded-for", "198.51.100.1, 203.0.113.9")])
+            ),
+            "203.0.113.9",
+            "the rightmost forwarded entry is the trusted one"
+        );
+
+        // Nothing usable to key on still has to produce a bucket.
+        assert_eq!(
+            registration_rate_key(
+                Some(loopback),
+                &headers(&[("x-forwarded-for", "not-an-ip")])
+            ),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            registration_rate_key(None, &headers(&[("cf-connecting-ip", "198.51.100.1")])),
+            "unknown-peer",
+            "without connection info no header is trustworthy"
+        );
+    }
+
+    #[test]
+    fn legacy_initialize_withholds_logging_capability_without_the_scope() {
+        fn advertised(scopes: [&str; 1]) -> bool {
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.logging = Some(serde_json::Map::new());
+            let mut result = InitializeResult::new(capabilities);
+            let context = DownstreamCallContext::http("cap-session", RequestId::Number(1))
+                .with_authorization(
+                    crate::types::PrincipalId::configured_credential("cap-test", 0),
+                    scopes.map(ToString::to_string),
+                );
+            withhold_unscoped_logging_capability(&mut result, &context);
+            result.capabilities.logging.is_some()
+        }
+
+        // Telling a client the capability exists and then denying the only
+        // method behind it is the inaccuracy this guards against.
+        assert!(
+            !advertised(["tools:read"]),
+            "a principal without logging:configure must not be offered the capability"
+        );
+        assert!(
+            advertised(["logging:configure"]),
+            "a principal holding the scope must still see the capability"
+        );
+
+        // A loopback listener that requires no auth keeps it.
+        let mut local_capabilities = ServerCapabilities::default();
+        local_capabilities.logging = Some(serde_json::Map::new());
+        let mut local = InitializeResult::new(local_capabilities);
+        withhold_unscoped_logging_capability(
+            &mut local,
+            &DownstreamCallContext::http("loopback", RequestId::Number(2))
+                .with_local_principal(http_loopback_principal()),
+        );
+        assert!(local.capabilities.logging.is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_set_level_requires_the_logging_scope() {
+        fn set_level_request(access_token: &str, session_id: &str) -> HttpRequest<Body> {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(SESSION_ID_HEADER, session_id)
+                .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 7,
+                        "method": "logging/setLevel",
+                        "params": { "level": "debug" }
+                    })
+                    .to_string(),
+                ))
+                .expect("setLevel request")
+        }
+
+        // `logging/setLevel` moves the effective level for every downstream
+        // client and forwards it to every upstream, so a principal without the
+        // scope must not reach it.
+        let narrow_scopes = vec!["tools:read".to_string()];
+        let narrow_manager = isolated_oauth_manager(narrow_scopes);
+        let narrow_token = issue_test_oauth_token(&narrow_manager, "tools:read").await;
+        let narrow_app = build_router(oauth_test_state_with_manager(narrow_manager));
+        let narrow_session = legacy_oauth_session(&narrow_app, &narrow_token).await;
+        let denied = narrow_app
+            .oneshot(set_level_request(&narrow_token, &narrow_session))
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status(),
+            StatusCode::OK,
+            "legacy denial stays inside an HTTP 200 envelope"
+        );
+        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let denied_value: serde_json::Value = serde_json::from_slice(&denied_body).unwrap();
+        assert_eq!(
+            denied_value["error"]["code"],
+            serde_json::json!(-32005),
+            "ungranted logging/setLevel must deny with -32005, got {denied_value}"
+        );
+
+        // The default grant carries the scope, so no ordinary client regresses.
+        let default_scopes: Vec<String> = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let manager = isolated_oauth_manager(default_scopes.clone());
+        let access_token = issue_test_oauth_token(&manager, &default_scopes.join(" ")).await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let session_id = legacy_oauth_session(&app, &access_token).await;
+        let allowed = app
+            .oneshot(set_level_request(&access_token, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let allowed_body = axum::body::to_bytes(allowed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let allowed_value: serde_json::Value = serde_json::from_slice(&allowed_body).unwrap();
+        assert!(
+            allowed_value.get("error").is_none(),
+            "default-grant token must not be denied logging/setLevel, got {allowed_value}"
+        );
     }
 
     #[tokio::test]

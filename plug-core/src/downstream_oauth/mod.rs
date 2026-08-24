@@ -13,7 +13,7 @@ pub use owner::{
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1969,7 +1969,39 @@ async fn fetch_client_metadata_document(
     serde_json::from_slice(&bytes).map_err(|_| DownstreamOauthError::InvalidClientMetadata)
 }
 
+/// IPv6 forms that carry an IPv4 address inside them and that no legitimate
+/// client metadata document is served from.
+///
+/// `to_canonical` unwraps only the IPv4-mapped form (`::ffff:a.b.c.d`). It
+/// leaves the deprecated IPv4-compatible form (`::a.b.c.d`), the 6to4 prefix
+/// (`2002::/16`), and the NAT64 translation prefixes (`64:ff9b::/96` and
+/// `64:ff9b:1::/48`) untouched, so each would sail past the IPv6 predicates
+/// below while a translating gateway delivered the traffic to the embedded
+/// IPv4 address. 6to4 is deprecated by RFC 7526 and the NAT64 prefixes are
+/// translation prefixes rather than destinations, so rejecting them outright
+/// costs nothing and avoids re-deriving the embedded address correctly.
+fn is_ipv4_bearing_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    // ::a.b.c.d, excluding :: and ::1, which the predicates below already cover.
+    let ipv4_compatible =
+        segments[..6] == [0, 0, 0, 0, 0, 0] && !ip.is_unspecified() && !ip.is_loopback();
+    let six_to_four = segments[0] == 0x2002;
+    let nat64_well_known =
+        segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0];
+    let nat64_local_use = segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001;
+    ipv4_compatible || six_to_four || nat64_well_known || nat64_local_use
+}
+
 fn forbidden_metadata_ip(ip: IpAddr) -> bool {
+    // An IPv4 address wearing an IPv6 costume is still that IPv4 address.
+    // `::ffff:127.0.0.1` matches none of the IPv6 predicates below, because
+    // `Ipv6Addr::is_loopback` only accepts `::1`. Canonicalizing first routes
+    // the IPv4-mapped form through the IPv4 arm.
+    let ip = match ip {
+        IpAddr::V6(v6) if is_ipv4_bearing_ipv6(v6) => return true,
+        IpAddr::V6(v6) => v6.to_canonical(),
+        v4 => v4,
+    };
     match ip {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
@@ -2690,6 +2722,46 @@ mod tests {
             "plug-downstream-oauth-{}.json",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn ipv6_wrapped_internal_addresses_are_forbidden_metadata_targets() {
+        // Each of these reaches an internal IPv4 address through an IPv6
+        // literal. Before canonicalization they matched none of the IPv6
+        // predicates and the metadata fetch would have been attempted.
+        for literal in [
+            "::ffff:127.0.0.1",       // IPv4-mapped loopback
+            "::ffff:169.254.169.254", // IPv4-mapped cloud metadata service
+            "::ffff:10.0.0.1",        // IPv4-mapped RFC 1918
+            "::ffff:192.168.1.1",
+            "::ffff:172.16.0.1",
+            "::127.0.0.1",       // deprecated IPv4-compatible
+            "64:ff9b::7f00:1",   // NAT64 well-known prefix
+            "64:ff9b:1::7f00:1", // NAT64 local-use prefix
+            "2002:7f00:1::",     // 6to4 wrapping 127.0.0.1
+        ] {
+            let ip: IpAddr = literal.parse().expect("parse IPv6 literal");
+            assert!(
+                forbidden_metadata_ip(ip),
+                "{literal} must be rejected as a metadata fetch target"
+            );
+        }
+
+        // Native IPv6 checks must still fire.
+        for literal in ["::1", "::", "fc00::1", "fe80::1", "ff02::1"] {
+            let ip: IpAddr = literal.parse().expect("parse IPv6 literal");
+            assert!(forbidden_metadata_ip(ip), "{literal} must stay rejected");
+        }
+
+        // A routable address must remain reachable, including one wearing the
+        // IPv4-mapped form, or the denylist would break real clients.
+        for literal in ["2606:4700:4700::1111", "::ffff:93.184.216.34"] {
+            let ip: IpAddr = literal.parse().expect("parse IPv6 literal");
+            assert!(
+                !forbidden_metadata_ip(ip),
+                "{literal} is public and must stay allowed"
+            );
+        }
     }
 
     fn write_state_fixture(fixture: serde_json::Value) -> PathBuf {
