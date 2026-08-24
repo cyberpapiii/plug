@@ -482,6 +482,11 @@ struct IssuedAccessToken {
     expires_at: u64,
     #[serde(default = "legacy_scope_model")]
     scope_model: u32,
+    /// Rotation lineage. Every pair minted from the same authorization code
+    /// shares one id, so a replayed refresh token can revoke the whole chain.
+    /// Empty on records written before families existed; backfilled at load.
+    #[serde(default)]
+    family_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +497,21 @@ struct IssuedRefreshToken {
     expires_at: u64,
     #[serde(default = "legacy_scope_model")]
     scope_model: u32,
+    /// See [`IssuedAccessToken::family_id`].
+    #[serde(default)]
+    family_id: String,
+}
+
+/// A refresh token that was already spent, kept only long enough to recognise a
+/// replay. RFC 9700 section 4.14.2: rotation alone lets an attacker who
+/// exfiltrated a refresh token keep a live chain while the legitimate client
+/// sees an unexplained failure. Detecting the second use is what makes rotation
+/// protective rather than merely tidy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsumedRefreshToken {
+    family_id: String,
+    client_id: String,
+    consumed_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +529,8 @@ struct DownstreamOauthState {
     access_tokens: HashMap<String, IssuedAccessToken>,
     #[serde(default)]
     refresh_tokens: HashMap<String, IssuedRefreshToken>,
+    #[serde(default)]
+    consumed_refresh_tokens: HashMap<String, ConsumedRefreshToken>,
     #[serde(default)]
     revoked_client_ids: HashSet<String>,
     #[serde(default)]
@@ -531,6 +553,7 @@ impl Default for DownstreamOauthState {
             pending_codes: HashMap::new(),
             access_tokens: HashMap::new(),
             refresh_tokens: HashMap::new(),
+            consumed_refresh_tokens: HashMap::new(),
             revoked_client_ids: HashSet::new(),
             owner_credentials: HashMap::new(),
             owner_bootstraps: HashMap::new(),
@@ -724,7 +747,10 @@ impl DownstreamOauthManager {
         })?;
         let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
         let mut state = load_persisted_state(&state_path)?;
-        if mark_pre_enforcement_grants(&mut state, &config) > 0 {
+        let mut migrated = mark_pre_enforcement_grants(&mut state, &config);
+        migrated += backfill_token_families(&mut state);
+        prune_consumed_refresh_tokens(&mut state);
+        if migrated > 0 {
             require_durable(persist_state(&state_path, &state)?, &state_path)?;
         }
         let principal_lifecycles = state
@@ -1585,7 +1611,13 @@ impl DownstreamOauthManager {
 
         let mut next = guard.clone();
         next.pending_codes.remove(code);
-        let token = issue_token_pair(&mut next, client_id, &pending.scopes, resource);
+        let token = issue_token_pair(
+            &mut next,
+            client_id,
+            &pending.scopes,
+            resource,
+            &opaque_value(),
+        );
         self.commit_state(&mut guard, next)?;
         Ok(token)
     }
@@ -1602,11 +1634,22 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidResource);
         }
         let mut guard = self.state.lock().await;
-        let refresh = guard
-            .refresh_tokens
-            .get(refresh_token)
-            .cloned()
-            .ok_or(DownstreamOauthError::InvalidGrant)?;
+        let Some(refresh) = guard.refresh_tokens.get(refresh_token).cloned() else {
+            // Not live. If it was spent earlier, this is a replay: the chain is
+            // in someone else's hands, and whichever side is legitimate, the
+            // family can no longer be trusted. RFC 9700 section 4.14.2.
+            if let Some(consumed) = guard.consumed_refresh_tokens.get(refresh_token).cloned() {
+                let mut next = guard.clone();
+                let revoked = revoke_token_family(&mut next, &consumed.family_id);
+                tracing::warn!(
+                    client_id = %consumed.client_id,
+                    revoked,
+                    "consumed refresh token replayed; revoking the token family"
+                );
+                self.commit_state(&mut guard, next)?;
+            }
+            return Err(DownstreamOauthError::InvalidGrant);
+        };
         if refresh.client_id != client_id
             || refresh.resource != resource
             || refresh.expires_at <= epoch_secs()
@@ -1615,7 +1658,24 @@ impl DownstreamOauthManager {
         }
         let mut next = guard.clone();
         next.refresh_tokens.remove(refresh_token);
-        let token = issue_token_pair(&mut next, client_id, &refresh.scopes, resource);
+        next.consumed_refresh_tokens.insert(
+            refresh_token.to_string(),
+            ConsumedRefreshToken {
+                family_id: refresh.family_id.clone(),
+                client_id: refresh.client_id.clone(),
+                consumed_at: epoch_secs(),
+            },
+        );
+        prune_consumed_refresh_tokens(&mut next);
+        // The rotated pair stays in the same family, so a replay of any link in
+        // the chain revokes every descendant of the original authorization.
+        let token = issue_token_pair(
+            &mut next,
+            client_id,
+            &refresh.scopes,
+            resource,
+            &refresh.family_id,
+        );
         self.commit_state(&mut guard, next)?;
         Ok(token)
     }
@@ -2032,6 +2092,7 @@ fn issue_token_pair(
     client_id: &str,
     scopes: &[String],
     resource: &str,
+    family_id: &str,
 ) -> TokenResponsePayload {
     let access_token = opaque_value();
     let refresh_token = opaque_value();
@@ -2058,6 +2119,7 @@ fn issue_token_pair(
             issued_at: now,
             expires_at: now + ACCESS_TOKEN_LIFETIME_SECS,
             scope_model: SCOPE_MODEL_ENFORCED,
+            family_id: family_id.to_string(),
         },
     );
     state.refresh_tokens.insert(
@@ -2068,6 +2130,7 @@ fn issue_token_pair(
             resource: resource.to_string(),
             expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
             scope_model: SCOPE_MODEL_ENFORCED,
+            family_id: family_id.to_string(),
         },
     );
     TokenResponsePayload {
@@ -2093,6 +2156,70 @@ fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
         "{base}{}{query}",
         if base.contains('?') { '&' } else { '?' }
     )
+}
+
+/// Drop every token descended from `family_id`, live and spent alike.
+///
+/// Returns how many records were removed. Access tokens go too: leaving them
+/// alive would let a stolen chain keep working for up to their remaining
+/// lifetime, which is the window the revocation exists to close.
+fn revoke_token_family(state: &mut DownstreamOauthState, family_id: &str) -> usize {
+    if family_id.is_empty() {
+        // A record predating families carries no lineage, and an empty id is
+        // not a family — treating it as one would revoke every legacy grant.
+        return 0;
+    }
+    let before = state.access_tokens.len()
+        + state.refresh_tokens.len()
+        + state.consumed_refresh_tokens.len();
+    state
+        .access_tokens
+        .retain(|_, token| token.family_id != family_id);
+    state
+        .refresh_tokens
+        .retain(|_, token| token.family_id != family_id);
+    state
+        .consumed_refresh_tokens
+        .retain(|_, token| token.family_id != family_id);
+    before.saturating_sub(
+        state.access_tokens.len()
+            + state.refresh_tokens.len()
+            + state.consumed_refresh_tokens.len(),
+    )
+}
+
+/// Forget spent refresh tokens once they are older than a refresh token can
+/// live. Past that point the token would be rejected as expired anyway, so
+/// keeping the tombstone buys no detection and only grows the state file.
+fn prune_consumed_refresh_tokens(state: &mut DownstreamOauthState) {
+    let now = epoch_secs();
+    state
+        .consumed_refresh_tokens
+        .retain(|_, token| now.saturating_sub(token.consumed_at) < REFRESH_TOKEN_LIFETIME_SECS);
+}
+
+/// Give every pre-family record its own lineage.
+///
+/// A shared placeholder would be worse than none: one replay would revoke every
+/// grant issued before this change. Distinct ids mean legacy tokens simply have
+/// no chain to revoke, which matches reality — nothing recorded their rotation.
+///
+/// Returns the number of records this pass changed.
+fn backfill_token_families(state: &mut DownstreamOauthState) -> usize {
+    let mut backfilled = 0;
+    for record in state.access_tokens.values_mut() {
+        if record.family_id.is_empty() {
+            record.family_id = opaque_value();
+            backfilled += 1;
+        }
+    }
+    for record in state.refresh_tokens.values_mut() {
+        if record.family_id.is_empty() {
+            record.family_id = opaque_value();
+            backfilled += 1;
+        }
+    }
+    backfilled
 }
 
 fn opaque_value() -> String {
@@ -4864,6 +4991,185 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn replaying_a_consumed_refresh_token_revokes_the_whole_family() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let original = issue_tokens(&manager, &client).await;
+        let original_refresh = original.refresh_token.expect("original refresh token");
+
+        let rotated = manager
+            .exchange_refresh_token(
+                &client.client_id,
+                &original_refresh,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("first rotation succeeds");
+        let rotated_refresh = rotated.refresh_token.expect("rotated refresh token");
+
+        // The rotated pair works before the replay.
+        assert!(matches!(
+            manager
+                .validate_access_token_for(
+                    &rotated.access_token,
+                    &[],
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            AccessTokenValidation::Valid(_)
+        ));
+
+        // Replay the token that was already spent.
+        assert!(matches!(
+            manager
+                .exchange_refresh_token(
+                    &client.client_id,
+                    &original_refresh,
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            Err(DownstreamOauthError::InvalidGrant)
+        ));
+
+        // Rejecting the replay is not enough: the chain the attacker did not
+        // present has to die too, or the stolen token keeps a live descendant.
+        assert_eq!(
+            manager
+                .validate_access_token_for(
+                    &rotated.access_token,
+                    &[],
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            AccessTokenValidation::Invalid,
+            "the descendant access token must not outlive the replay"
+        );
+        assert!(
+            matches!(
+                manager
+                    .exchange_refresh_token(
+                        &client.client_id,
+                        &rotated_refresh,
+                        "https://plug.example.com/mcp",
+                    )
+                    .await,
+                Err(DownstreamOauthError::InvalidGrant)
+            ),
+            "the descendant refresh token must not survive the replay"
+        );
+
+        let state = manager.state.lock().await;
+        assert!(state.refresh_tokens.is_empty(), "no refresh token survives");
+        assert!(state.access_tokens.is_empty(), "no access token survives");
+        assert!(
+            state.consumed_refresh_tokens.is_empty(),
+            "the family's tombstones are cleared with it"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoking_one_family_leaves_an_unrelated_authorization_alone() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let compromised = issue_tokens(&manager, &client).await;
+        let compromised_refresh = compromised.refresh_token.expect("refresh token");
+        // A second, independent authorization for the same client.
+        let bystander = issue_tokens(&manager, &client).await;
+
+        manager
+            .exchange_refresh_token(
+                &client.client_id,
+                &compromised_refresh,
+                "https://plug.example.com/mcp",
+            )
+            .await
+            .expect("rotation succeeds");
+        assert!(matches!(
+            manager
+                .exchange_refresh_token(
+                    &client.client_id,
+                    &compromised_refresh,
+                    "https://plug.example.com/mcp",
+                )
+                .await,
+            Err(DownstreamOauthError::InvalidGrant)
+        ));
+
+        assert!(
+            matches!(
+                manager
+                    .validate_access_token_for(
+                        &bystander.access_token,
+                        &[],
+                        "https://plug.example.com/mcp",
+                    )
+                    .await,
+                AccessTokenValidation::Valid(_)
+            ),
+            "an unrelated authorization for the same client must survive"
+        );
+    }
+
+    #[test]
+    fn pre_family_records_are_backfilled_with_distinct_lineages() {
+        let mut state = DownstreamOauthState::default();
+        for token in ["legacy-a", "legacy-b"] {
+            state.access_tokens.insert(
+                token.to_string(),
+                IssuedAccessToken {
+                    client_id: "client".to_string(),
+                    scopes: vec!["tools:read".to_string()],
+                    resource: "https://plug.example.com/mcp".to_string(),
+                    issued_at: 0,
+                    expires_at: u64::MAX,
+                    scope_model: SCOPE_MODEL_ENFORCED,
+                    family_id: String::new(),
+                },
+            );
+        }
+
+        assert_eq!(backfill_token_families(&mut state), 2);
+        let families: HashSet<&str> = state
+            .access_tokens
+            .values()
+            .map(|token| token.family_id.as_str())
+            .collect();
+        assert_eq!(
+            families.len(),
+            2,
+            "legacy records must not be collapsed into one revocable family"
+        );
+        assert!(families.iter().all(|family| !family.is_empty()));
+
+        // Backfilling is idempotent: a second pass changes nothing.
+        assert_eq!(backfill_token_families(&mut state), 0);
+    }
+
+    #[test]
+    fn an_empty_family_id_revokes_nothing() {
+        let mut state = DownstreamOauthState::default();
+        state.access_tokens.insert(
+            "token".to_string(),
+            IssuedAccessToken {
+                client_id: "client".to_string(),
+                scopes: Vec::new(),
+                resource: "https://plug.example.com/mcp".to_string(),
+                issued_at: 0,
+                expires_at: u64::MAX,
+                scope_model: SCOPE_MODEL_ENFORCED,
+                family_id: String::new(),
+            },
+        );
+
+        assert_eq!(revoke_token_family(&mut state, ""), 0);
+        assert_eq!(
+            state.access_tokens.len(),
+            1,
+            "an empty lineage is not a family to revoke"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn refresh_sync_failure_returns_committed_rotation_and_restart_matches() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
@@ -5766,6 +6072,17 @@ mod tests {
             .await
             .expect("rotate refresh token");
         assert_ne!(rotated.refresh_token, cursor_tokens.refresh_token);
+        // The original access token outlives the rotation itself.
+        assert!(matches!(
+            manager
+                .validate_access_token_for(
+                    &access,
+                    &["tools:read".to_string()],
+                    "https://plug.example.com/mcp"
+                )
+                .await,
+            AccessTokenValidation::Valid(_)
+        ));
         assert_eq!(
             manager
                 .exchange_refresh_token(
@@ -5776,10 +6093,28 @@ mod tests {
                 .await,
             Err(DownstreamOauthError::InvalidGrant)
         );
-        assert!(matches!(
+        // It does not outlive a replay of the token it was minted with: the
+        // replay revokes the family. This assertion was inverted when reuse
+        // detection landed (RFC 9700 section 4.14.2) -- before that, rejecting
+        // the replay was the whole response and the chain stayed live.
+        assert_eq!(
             manager
                 .validate_access_token_for(
                     &access,
+                    &["tools:read".to_string()],
+                    "https://plug.example.com/mcp"
+                )
+                .await,
+            AccessTokenValidation::Invalid
+        );
+        // Claude's earlier attempt with Cursor's live token did not revoke
+        // anything, so client isolation still holds: only reuse of a spent
+        // token trips the revocation.
+        let claude_tokens = issue_tokens(&manager, &claude).await;
+        assert!(matches!(
+            manager
+                .validate_access_token_for(
+                    &claude_tokens.access_token,
                     &["tools:read".to_string()],
                     "https://plug.example.com/mcp"
                 )
