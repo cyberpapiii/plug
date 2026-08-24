@@ -11,12 +11,13 @@ Shipped as honest issuance plus universal enforcement. None of the three
 options below was taken as written; the shipped model removes the reason the
 bypass existed instead of gating it.
 
-- An absent `http.oauth_scopes` under `auth_mode = "oauth"` now defaults to the
-  six-family grant `DEFAULT_DOWNSTREAM_OAUTH_SCOPES` in
-  `plug-core/src/protocol.rs` (`tools:read`, `resources:read`, `prompts:read`,
-  `completion:use`, `tasks:use`, `subscriptions:listen`), matching what a
-  normal MCP client actually does. An explicit list still must include
-  `tools:read`.
+- An absent `http.oauth_scopes` under `auth_mode = "oauth"` now defaults to
+  `DEFAULT_DOWNSTREAM_OAUTH_SCOPES` in `plug-core/src/protocol.rs`, matching
+  what a normal MCP client actually does. An explicit list still must include
+  `tools:read`. The grant shipped with six families (`tools:read`,
+  `resources:read`, `prompts:read`, `completion:use`, `tasks:use`,
+  `subscriptions:listen`) and gained a seventh, `logging:configure`, when
+  `logging/setLevel` was given a method family during pre-public hardening.
 - `legacy_http_policy_context` now builds OAuth principals with
   `.with_authorization(principal, claims.scopes)`, so `decide_method` enforces
   method-family scopes at `/mcp` in both eras. The pinned compatibility test

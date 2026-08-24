@@ -1647,13 +1647,13 @@ async fn serve_router(
         println!("serving on https://{addr}");
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
     } else {
         println!("serving on http://{addr}");
         axum_server::bind(addr)
             .handle(handle)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
     }
 

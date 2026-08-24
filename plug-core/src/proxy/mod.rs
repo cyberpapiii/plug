@@ -381,6 +381,12 @@ impl DownstreamCallContext {
         Self::http_for_client(session_id, request_id, ClientType::Unknown)
     }
 
+    /// HTTP is the only internet-reachable transport, so its contexts start
+    /// untrusted and an adapter opts in — `with_authorization` for a bearer
+    /// principal, `with_local_principal` for a loopback listener that requires
+    /// no auth. Stdio and IPC are local by construction and stay trusted.
+    /// An adapter that forgets to say which it is gets a context that can do
+    /// nothing, rather than one that can do everything.
     pub fn http_for_client(
         session_id: impl Into<Arc<str>>,
         request_id: RequestId,
@@ -398,7 +404,7 @@ impl DownstreamCallContext {
             modern_direction_enabled: false,
             principal: None,
             scopes: Arc::new(BTreeSet::new()),
-            local_trust: true,
+            local_trust: false,
             client_metadata: None,
             deadline: None,
             cancellation: CancellationToken::new(),
@@ -408,6 +414,7 @@ impl DownstreamCallContext {
         }
     }
 
+    /// Untrusted by default, for the reasons on [`Self::http_for_client`].
     pub fn http_for_client_with_trace(
         session_id: impl Into<Arc<str>>,
         request_id: RequestId,
@@ -426,7 +433,7 @@ impl DownstreamCallContext {
             modern_direction_enabled: false,
             principal: None,
             scopes: Arc::new(BTreeSet::new()),
-            local_trust: true,
+            local_trust: false,
             client_metadata: None,
             deadline: None,
             cancellation: CancellationToken::new(),
