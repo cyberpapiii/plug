@@ -515,7 +515,10 @@ impl HttpState {
                                         if let Some(message) = notification_to_sse_message(
                                             ProtocolNotification::ToolListChanged,
                                         ) {
-                                            state.sessions.broadcast(message);
+                                            state.sessions.broadcast(
+                                                message,
+                                                crate::session::BroadcastKind::ToolList,
+                                            );
                                         }
                                     }
                                     ProtocolNotification::ToolListChangedFor { .. } => {
@@ -536,14 +539,20 @@ impl HttpState {
                                         if let Some(message) = notification_to_sse_message(
                                             ProtocolNotification::ResourceListChanged,
                                         ) {
-                                            state.sessions.broadcast(message);
+                                            state.sessions.broadcast(
+                                                message,
+                                                crate::session::BroadcastKind::ResourceList,
+                                            );
                                         }
                                     }
                                     ProtocolNotification::PromptListChanged => {
                                         if let Some(message) = notification_to_sse_message(
                                             ProtocolNotification::PromptListChanged,
                                         ) {
-                                            state.sessions.broadcast(message);
+                                            state.sessions.broadcast(
+                                                message,
+                                                crate::session::BroadcastKind::PromptList,
+                                            );
                                         }
                                     }
                                     ProtocolNotification::Progress { params, .. } => {
@@ -600,7 +609,10 @@ impl HttpState {
                                             && let Some(message) = notification_to_sse_message(
                                                 ProtocolNotification::LoggingMessage { params },
                                             ) {
-                                                state.sessions.broadcast(message);
+                                                state.sessions.broadcast(
+                                                    message,
+                                                    crate::session::BroadcastKind::Unscoped,
+                                                );
                                             }
                                     }
                                 }
@@ -615,7 +627,10 @@ impl HttpState {
                                         ),
                                     },
                                 ) {
-                                    state.sessions.broadcast(message);
+                                    state.sessions.broadcast(
+                                        message,
+                                        crate::session::BroadcastKind::Unscoped,
+                                    );
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -637,7 +652,10 @@ impl HttpState {
                         match recv {
                             Ok(notif @ ProtocolNotification::LoggingMessage { .. }) => {
                                 if let Some(message) = notification_to_sse_message(notif) {
-                                    log_state.sessions.broadcast(message);
+                                    log_state.sessions.broadcast(
+                                        message,
+                                        crate::session::BroadcastKind::Unscoped,
+                                    );
                                 }
                             }
                             Ok(_) => {} // non-logging notifications on wrong channel
@@ -654,7 +672,10 @@ impl HttpState {
                                     .with_logger("plug"),
                                 };
                                 if let Some(message) = notification_to_sse_message(synthetic) {
-                                    log_state.sessions.broadcast(message);
+                                    log_state.sessions.broadcast(
+                                        message,
+                                        crate::session::BroadcastKind::Unscoped,
+                                    );
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -2273,6 +2294,13 @@ async fn handle_request(
             // Store client type in session
             let _ = state.sessions.set_client_type(&session_id, client_type);
 
+            // Record what this principal may observe on the shared SSE fan-out.
+            // Not ignorable: until this lands the session denies every
+            // broadcast, so a failure here would silently mute the client.
+            state
+                .sessions
+                .set_broadcast_audience(&session_id, broadcast_audience_for(&policy_context))?;
+
             // Track roots capability for reverse-request roots fetching
             if init_req.params.capabilities.roots.is_some() {
                 state.roots_capable_sessions.insert(session_id.clone(), ());
@@ -2935,6 +2963,27 @@ fn withhold_unscoped_logging_capability(
     }
 }
 
+/// Resolve which broadcast notifications this principal may observe.
+///
+/// The SSE fan-out task is shared by every HTTP session and holds no request
+/// context, so the decision has to be made here, at `initialize`, while the
+/// full policy input is still in hand. `decide_method` stays the single source
+/// of policy; this only records its verdict per session.
+fn broadcast_audience_for(context: &DownstreamCallContext) -> crate::session::BroadcastAudience {
+    use crate::protocol::MethodFamily;
+    crate::session::BroadcastAudience {
+        tools: context
+            .policy_decision(MethodFamily::ToolsList)
+            .is_allowed(),
+        resources: context
+            .policy_decision(MethodFamily::ResourcesList)
+            .is_allowed(),
+        prompts: context
+            .policy_decision(MethodFamily::PromptsList)
+            .is_allowed(),
+    }
+}
+
 /// Build the InitializeResult (same as ProxyHandler::get_info).
 fn build_initialize_result(
     router: &ToolRouter,
@@ -3582,6 +3631,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn broadcast_audience_follows_the_principal_scopes() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "tools:read").await;
+        let claims = match manager
+            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims,
+            other => panic!("issued token must validate, got {other:?}"),
+        };
+        let state = test_state();
+        let scoped = broadcast_audience_for(&legacy_http_policy_context(
+            &state,
+            &AuthStatus::Authenticated(Some(claims)),
+            RequestId::Number(92),
+            Arc::from("broadcast-audience-scoped"),
+        ));
+
+        assert!(scoped.tools, "tools:read admits tool list notifications");
+        assert!(
+            !scoped.resources,
+            "a token without resources:read must not observe resource list changes"
+        );
+        assert!(
+            !scoped.prompts,
+            "a token without prompts:read must not observe prompt list changes"
+        );
+
+        // A loopback listener that requires no auth keeps the full audience,
+        // so turning auth off does not silence notifications.
+        let loopback = broadcast_audience_for(&legacy_http_policy_context(
+            &state,
+            &AuthStatus::NoAuthRequired,
+            RequestId::Number(93),
+            Arc::from("broadcast-audience-loopback"),
+        ));
+        assert_eq!(
+            loopback,
+            crate::session::BroadcastAudience::unrestricted(),
+            "a no-auth loopback listener has no scopes to narrow"
+        );
+
+        // The stored default must deny, because a session is visible to the
+        // fan-out task from `create_session` until initialize records the real
+        // audience, and anything delivered in that window is replayed later.
+        assert_eq!(
+            crate::session::BroadcastAudience::default(),
+            crate::session::BroadcastAudience {
+                tools: false,
+                resources: false,
+                prompts: false,
+            },
+            "an unresolved audience must not admit broadcasts"
+        );
+    }
+
     fn legacy_oauth_session_request(
         access_token: &str,
         session_id: &str,
@@ -4218,12 +4324,20 @@ mod tests {
             self.inner.get_client_type(session_id)
         }
 
+        fn set_broadcast_audience(
+            &self,
+            session_id: &str,
+            audience: crate::session::BroadcastAudience,
+        ) -> Result<(), HttpError> {
+            self.inner.set_broadcast_audience(session_id, audience)
+        }
+
         fn remove(&self, session_id: &str) -> bool {
             self.inner.remove(session_id)
         }
 
-        fn broadcast(&self, message: SseMessage) {
-            self.inner.broadcast(message);
+        fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
+            self.inner.broadcast(message, kind);
         }
 
         fn send_to_session(&self, session_id: &str, message: SseMessage) {
@@ -5643,6 +5757,16 @@ mod tests {
         let app = build_router(state.clone());
 
         let session_id = state.sessions.create_session().unwrap();
+        // This test drives the SSE stream without going through initialize, so
+        // it has to record the audience initialize would have resolved for an
+        // unauthenticated loopback listener.
+        state
+            .sessions
+            .set_broadcast_audience(
+                &session_id,
+                crate::session::BroadcastAudience::unrestricted(),
+            )
+            .unwrap();
         let sse_req = HttpRequest::builder()
             .method("GET")
             .uri("/mcp")
