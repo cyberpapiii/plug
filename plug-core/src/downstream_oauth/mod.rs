@@ -459,6 +459,15 @@ struct PendingAuthorizationCode {
     expires_at: u64,
 }
 
+/// Grants at this scope model were issued and enforced against method-family
+/// scopes. Model 1 grants predate /mcp enforcement, when every OAuth
+/// principal had unlimited method access regardless of stored scopes.
+const SCOPE_MODEL_ENFORCED: u32 = 2;
+
+fn legacy_scope_model() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IssuedAccessToken {
     client_id: String,
@@ -466,6 +475,8 @@ struct IssuedAccessToken {
     resource: String,
     issued_at: u64,
     expires_at: u64,
+    #[serde(default = "legacy_scope_model")]
+    scope_model: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,6 +485,8 @@ struct IssuedRefreshToken {
     scopes: Vec<String>,
     resource: String,
     expires_at: u64,
+    #[serde(default = "legacy_scope_model")]
+    scope_model: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,7 +718,12 @@ impl DownstreamOauthManager {
             ))
         })?;
         let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
-        let state = load_persisted_state(&state_path)?;
+        let mut state = load_persisted_state(&state_path)?;
+        if !config.oauth_scopes.is_empty()
+            && widen_pre_enforcement_grants(&mut state, &config.oauth_scopes) > 0
+        {
+            require_durable(persist_state(&state_path, &state)?, &state_path)?;
+        }
         let principal_lifecycles = state
             .clients
             .keys()
@@ -2004,6 +2022,7 @@ fn issue_token_pair(
             resource: resource.to_string(),
             issued_at: now,
             expires_at: now + ACCESS_TOKEN_LIFETIME_SECS,
+            scope_model: SCOPE_MODEL_ENFORCED,
         },
     );
     state.refresh_tokens.insert(
@@ -2013,6 +2032,7 @@ fn issue_token_pair(
             scopes: scopes.to_vec(),
             resource: resource.to_string(),
             expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
+            scope_model: SCOPE_MODEL_ENFORCED,
         },
     );
     TokenResponsePayload {
@@ -2415,6 +2435,40 @@ fn require_durable(
             )))
         }
     }
+}
+
+/// Pre-enforcement grants (scope model 1) had unlimited method access under
+/// the legacy local-trust policy, so replacing their stored scopes with the
+/// configured grant strictly reduces real privilege. Returns the number of
+/// upgraded records.
+fn widen_pre_enforcement_grants(state: &mut DownstreamOauthState, configured: &[String]) -> usize {
+    let mut widened = configured.to_vec();
+    widened.sort();
+    widened.dedup();
+    let mut upgraded = 0;
+    for record in state.access_tokens.values_mut() {
+        if record.scope_model < SCOPE_MODEL_ENFORCED {
+            record.scopes = widened.clone();
+            record.scope_model = SCOPE_MODEL_ENFORCED;
+            upgraded += 1;
+            tracing::info!(
+                client_id = %record.client_id,
+                "widened pre-enforcement access-token grant to the configured scope set"
+            );
+        }
+    }
+    for record in state.refresh_tokens.values_mut() {
+        if record.scope_model < SCOPE_MODEL_ENFORCED {
+            record.scopes = widened.clone();
+            record.scope_model = SCOPE_MODEL_ENFORCED;
+            upgraded += 1;
+            tracing::info!(
+                client_id = %record.client_id,
+                "widened pre-enforcement refresh-token grant to the configured scope set"
+            );
+        }
+    }
+    upgraded
 }
 
 fn load_persisted_state(
@@ -4091,6 +4145,150 @@ mod tests {
         assert!(state.access_tokens.contains_key("access-existing"));
         assert!(state.refresh_tokens.contains_key("refresh-existing"));
         assert!(state.revoked_client_ids.contains("plug_revoked"));
+    }
+
+    fn scope_migration_fixture(
+        now: u64,
+        extra_token_fields: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut access = serde_json::json!({
+            "client_id": "plug_existing",
+            "scopes": ["tools:read"],
+            "resource": "https://plug.example.com/mcp",
+            "issued_at": now,
+            "expires_at": now + 3600
+        });
+        let mut refresh = serde_json::json!({
+            "client_id": "plug_existing",
+            "scopes": ["tools:read"],
+            "resource": "https://plug.example.com/mcp",
+            "expires_at": now + 3600
+        });
+        for record in [&mut access, &mut refresh] {
+            record
+                .as_object_mut()
+                .expect("token fixture object")
+                .extend(
+                    extra_token_fields
+                        .as_object()
+                        .expect("extra fields object")
+                        .clone(),
+                );
+        }
+        serde_json::json!({
+            "version": 3,
+            "clients": {
+                "plug_existing": {
+                    "client_id": "plug_existing",
+                    "client_name": "Existing client",
+                    "redirect_uris": ["https://client.example/callback"],
+                    "source": "dynamic_registration",
+                    "created_at": now,
+                    "last_used_at": now,
+                    "expires_at": now + 3600
+                }
+            },
+            "access_tokens": { "access-existing": access },
+            "refresh_tokens": { "refresh-existing": refresh }
+        })
+    }
+
+    fn two_scope_config() -> DownstreamOauthConfig {
+        DownstreamOauthConfig {
+            public_base_url: "https://plug.example.com".to_string(),
+            oauth_scopes: vec!["tools:read".to_string(), "resources:read".to_string()],
+            local_port: 3282,
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_enforcement_grants_widen_to_configured_scopes_on_load() {
+        let now = epoch_secs();
+        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
+
+        let manager = DownstreamOauthManager::new_with_state_path(two_scope_config(), path.clone())
+            .expect("load pre-enforcement state");
+
+        let expected = vec!["resources:read".to_string(), "tools:read".to_string()];
+        let state = manager.state.lock().await;
+        let access = state.access_tokens.get("access-existing").unwrap();
+        assert_eq!(
+            access.scopes, expected,
+            "pre-enforcement access grant must widen to the sorted configured set"
+        );
+        assert_eq!(access.scope_model, SCOPE_MODEL_ENFORCED);
+        let refresh = state.refresh_tokens.get("refresh-existing").unwrap();
+        assert_eq!(
+            refresh.scopes, expected,
+            "pre-enforcement refresh grant must widen to the sorted configured set"
+        );
+        assert_eq!(refresh.scope_model, SCOPE_MODEL_ENFORCED);
+        drop(state);
+
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read migrated state"))
+                .expect("parse migrated state");
+        for kind in ["access_tokens", "refresh_tokens"] {
+            let record = &disk[kind][if kind == "access_tokens" {
+                "access-existing"
+            } else {
+                "refresh-existing"
+            }];
+            assert_eq!(
+                record["scopes"],
+                serde_json::json!(["resources:read", "tools:read"]),
+                "widened {kind} grant must be persisted"
+            );
+            assert_eq!(
+                record["scope_model"],
+                serde_json::json!(SCOPE_MODEL_ENFORCED)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enforced_grants_keep_their_scopes_under_a_wider_config() {
+        let now = epoch_secs();
+        let path = write_state_fixture(scope_migration_fixture(
+            now,
+            serde_json::json!({ "scope_model": SCOPE_MODEL_ENFORCED }),
+        ));
+
+        let manager = DownstreamOauthManager::new_with_state_path(two_scope_config(), path)
+            .expect("load enforced state");
+
+        let state = manager.state.lock().await;
+        let expected = vec!["tools:read".to_string()];
+        assert_eq!(
+            state.access_tokens.get("access-existing").unwrap().scopes,
+            expected,
+            "already-enforced access grant must keep its consented scopes"
+        );
+        assert_eq!(
+            state.refresh_tokens.get("refresh-existing").unwrap().scopes,
+            expected,
+            "already-enforced refresh grant must keep its consented scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_widening_is_idempotent_across_restarts() {
+        let now = epoch_secs();
+        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
+
+        let first = DownstreamOauthManager::new_with_state_path(two_scope_config(), path.clone())
+            .expect("first load migrates");
+        drop(first);
+        let after_migration = std::fs::read(&path).expect("read post-migration state");
+
+        let second = DownstreamOauthManager::new_with_state_path(two_scope_config(), path.clone())
+            .expect("second load is a no-op");
+        drop(second);
+        assert_eq!(
+            std::fs::read(&path).expect("read post-restart state"),
+            after_migration,
+            "a second startup must not rewrite already-migrated state"
+        );
     }
 
     #[tokio::test]
