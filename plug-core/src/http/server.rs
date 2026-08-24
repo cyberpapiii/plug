@@ -3139,22 +3139,7 @@ mod tests {
     }
 
     fn oauth_tools_list_request(access_token: &str, session_id: &str) -> HttpRequest<Body> {
-        HttpRequest::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
-            .header(SESSION_ID_HEADER, session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
-            .body(Body::from(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/list"
-                })
-                .to_string(),
-            ))
-            .expect("tools/list request")
+        legacy_oauth_session_request(access_token, session_id, 2, "tools/list")
     }
 
     #[test]
