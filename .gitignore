@@ -28,3 +28,8 @@ id_rsa*
 id_ecdsa*
 id_ed25519*
 .netrc
+
+# Coverage instrumentation artifacts, dropped in the working tree by
+# instrumented test runs. Regenerated on demand; never worth committing.
+*.profraw
+*.profdata
