@@ -3014,6 +3014,7 @@ mod tests {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: scopes,
                 local_port: 3282,
+                modern_downstream_enabled: false,
             },
             path,
         )
@@ -6498,6 +6499,7 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
+            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             config.clone(),
@@ -6843,6 +6845,7 @@ mod tests {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
                 local_port: 3282,
+                modern_downstream_enabled: false,
             },
             state_path.clone(),
         )
@@ -7208,6 +7211,7 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
+            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),

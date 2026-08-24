@@ -52,6 +52,10 @@ pub struct DownstreamOauthConfig {
     pub public_base_url: String,
     pub oauth_scopes: Vec<String>,
     pub local_port: u16,
+    /// Mirrors `http.modern_downstream_enabled`. The modern `/mcp` path gates
+    /// method families on a token's stored scopes, so this decides whether a
+    /// stored pre-enforcement grant was ever really constrained by them.
+    pub modern_downstream_enabled: bool,
 }
 
 impl DownstreamOauthConfig {
@@ -68,6 +72,7 @@ impl DownstreamOauthConfig {
                     .collect()
             }),
             local_port: http.port,
+            modern_downstream_enabled: http.modern_downstream_enabled,
         })
     }
 }
@@ -719,9 +724,7 @@ impl DownstreamOauthManager {
         })?;
         let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
         let mut state = load_persisted_state(&state_path)?;
-        if !config.oauth_scopes.is_empty()
-            && widen_pre_enforcement_grants(&mut state, &config.oauth_scopes) > 0
-        {
+        if mark_pre_enforcement_grants(&mut state, &config) > 0 {
             require_durable(persist_state(&state_path, &state)?, &state_path)?;
         }
         let principal_lifecycles = state
@@ -2437,38 +2440,71 @@ fn require_durable(
     }
 }
 
-/// Pre-enforcement grants (scope model 1) had unlimited method access under
-/// the legacy local-trust policy, so replacing their stored scopes with the
-/// configured grant strictly reduces real privilege. Returns the number of
-/// upgraded records.
-fn widen_pre_enforcement_grants(state: &mut DownstreamOauthState, configured: &[String]) -> usize {
-    let mut widened = configured.to_vec();
-    widened.sort();
-    widened.dedup();
-    let mut upgraded = 0;
+/// Startup treatment for grants stored before scope enforcement (scope model 1).
+///
+/// Replacing such a grant's stored scopes with the configured set is a
+/// no-privilege-change correction only for grants that were served under the
+/// legacy local-trust policy, where the stored scopes were decorative and every
+/// method family stayed reachable regardless of them. Under
+/// `modern_downstream_enabled` the modern `/mcp` path already gated method
+/// families on those same stored scopes, so the grant records real owner
+/// consent from the passkey ceremony and widening it would hand the client
+/// access the owner never approved. Widening is therefore gated on the flag.
+/// Modern-era records keep their consented scopes and are only stamped as
+/// enforced, so later startups stop re-evaluating them.
+///
+/// Returns the number of records this pass changed.
+fn mark_pre_enforcement_grants(
+    state: &mut DownstreamOauthState,
+    config: &DownstreamOauthConfig,
+) -> usize {
+    let widen_to = if config.modern_downstream_enabled {
+        None
+    } else if config.oauth_scopes.is_empty() {
+        return 0;
+    } else {
+        let mut widened = config.oauth_scopes.clone();
+        widened.sort();
+        widened.dedup();
+        Some(widened)
+    };
+
+    let mut marked = 0;
     for record in state.access_tokens.values_mut() {
-        if record.scope_model < SCOPE_MODEL_ENFORCED {
+        if record.scope_model >= SCOPE_MODEL_ENFORCED {
+            continue;
+        }
+        if let Some(widened) = &widen_to {
             record.scopes = widened.clone();
-            record.scope_model = SCOPE_MODEL_ENFORCED;
-            upgraded += 1;
             tracing::info!(
                 client_id = %record.client_id,
                 "widened pre-enforcement access-token grant to the configured scope set"
             );
         }
+        record.scope_model = SCOPE_MODEL_ENFORCED;
+        marked += 1;
     }
     for record in state.refresh_tokens.values_mut() {
-        if record.scope_model < SCOPE_MODEL_ENFORCED {
+        if record.scope_model >= SCOPE_MODEL_ENFORCED {
+            continue;
+        }
+        if let Some(widened) = &widen_to {
             record.scopes = widened.clone();
-            record.scope_model = SCOPE_MODEL_ENFORCED;
-            upgraded += 1;
             tracing::info!(
                 client_id = %record.client_id,
                 "widened pre-enforcement refresh-token grant to the configured scope set"
             );
         }
+        record.scope_model = SCOPE_MODEL_ENFORCED;
+        marked += 1;
     }
-    upgraded
+    if widen_to.is_none() && marked > 0 {
+        tracing::info!(
+            marked,
+            "marked pre-enforcement grants as scope-enforced without widening because modern-era downstream enforcement was already active"
+        );
+    }
+    marked
 }
 
 fn load_persisted_state(
@@ -2671,6 +2707,7 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
+            modern_downstream_enabled: false,
         }
     }
 
@@ -4198,6 +4235,14 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string(), "resources:read".to_string()],
             local_port: 3282,
+            modern_downstream_enabled: false,
+        }
+    }
+
+    fn two_scope_modern_config() -> DownstreamOauthConfig {
+        DownstreamOauthConfig {
+            modern_downstream_enabled: true,
+            ..two_scope_config()
         }
     }
 
@@ -4288,6 +4333,79 @@ mod tests {
             std::fs::read(&path).expect("read post-restart state"),
             after_migration,
             "a second startup must not rewrite already-migrated state"
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_era_pre_enforcement_grants_keep_their_consented_scopes() {
+        let now = epoch_secs();
+        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
+
+        let manager =
+            DownstreamOauthManager::new_with_state_path(two_scope_modern_config(), path.clone())
+                .expect("load pre-enforcement state under modern enforcement");
+
+        let consented = vec!["tools:read".to_string()];
+        let state = manager.state.lock().await;
+        let access = state.access_tokens.get("access-existing").unwrap();
+        assert_eq!(
+            access.scopes, consented,
+            "a grant already gated by modern enforcement must keep the scopes the owner approved"
+        );
+        assert_eq!(access.scope_model, SCOPE_MODEL_ENFORCED);
+        let refresh = state.refresh_tokens.get("refresh-existing").unwrap();
+        assert_eq!(
+            refresh.scopes, consented,
+            "the refresh record must not re-mint a widened set on every rotation"
+        );
+        assert_eq!(refresh.scope_model, SCOPE_MODEL_ENFORCED);
+        drop(state);
+
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read marked state"))
+                .expect("parse marked state");
+        for (kind, key) in [
+            ("access_tokens", "access-existing"),
+            ("refresh_tokens", "refresh-existing"),
+        ] {
+            let record = &disk[kind][key];
+            assert_eq!(
+                record["scopes"],
+                serde_json::json!(["tools:read"]),
+                "{kind} grant must persist with its consented scopes"
+            );
+            assert_eq!(
+                record["scope_model"],
+                serde_json::json!(SCOPE_MODEL_ENFORCED),
+                "{kind} grant must still be stamped so later startups skip it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_era_grant_marking_is_idempotent_across_restarts() {
+        let now = epoch_secs();
+        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
+        let before = std::fs::read(&path).expect("read fixture state");
+
+        let first =
+            DownstreamOauthManager::new_with_state_path(two_scope_modern_config(), path.clone())
+                .expect("first load marks");
+        drop(first);
+        let after_marking = std::fs::read(&path).expect("read post-marking state");
+        assert_ne!(
+            before, after_marking,
+            "the first startup must persist the enforced-scope stamp"
+        );
+
+        let second =
+            DownstreamOauthManager::new_with_state_path(two_scope_modern_config(), path.clone())
+                .expect("second load is a no-op");
+        drop(second);
+        assert_eq!(
+            std::fs::read(&path).expect("read post-restart state"),
+            after_marking,
+            "a second startup must not rewrite already-marked state"
         );
     }
 
@@ -5095,6 +5213,7 @@ mod tests {
                     .map(ToString::to_string)
                     .collect(),
                 local_port: 3282,
+                modern_downstream_enabled: false,
             },
             temp_state_path(),
         )
