@@ -193,10 +193,7 @@ fn legacy_http_policy_context(
         ),
     ) {
         (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-            // The legacy OAuth contract predates method-family scopes. Keep
-            // the verified identity and revocation lifecycle, but retain the
-            // legacy all-MCP-method compatibility policy for that principal.
-            .with_local_principal(principal)
+            .with_authorization(principal, claims.scopes.clone())
             .with_principal_lifecycle(claims.principal_lifecycle.clone()),
         (AuthStatus::Authenticated(None), Some(principal)) => {
             context.with_local_principal(principal)
@@ -3017,6 +3014,7 @@ mod tests {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: scopes,
                 local_port: 3282,
+                modern_downstream_enabled: false,
             },
             path,
         )
@@ -3142,22 +3140,7 @@ mod tests {
     }
 
     fn oauth_tools_list_request(access_token: &str, session_id: &str) -> HttpRequest<Body> {
-        HttpRequest::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
-            .header(SESSION_ID_HEADER, session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
-            .body(Body::from(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/list"
-                })
-                .to_string(),
-            ))
-            .expect("tools/list request")
+        legacy_oauth_session_request(access_token, session_id, 2, "tools/list")
     }
 
     #[test]
@@ -3463,7 +3446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_tools_read_oauth_principal_keeps_pre_scope_method_compatibility() {
+    async fn legacy_oauth_principal_scopes_gate_method_families() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
         let claims = match manager
@@ -3478,7 +3461,7 @@ mod tests {
             &state,
             &AuthStatus::Authenticated(Some(claims)),
             RequestId::Number(91),
-            Arc::from("legacy-oauth-regression"),
+            Arc::from("legacy-oauth-scope-gate"),
         );
 
         assert!(
@@ -3491,6 +3474,14 @@ mod tests {
         );
         for family in [
             crate::protocol::MethodFamily::ToolsList,
+            crate::protocol::MethodFamily::ToolsCall,
+        ] {
+            assert!(
+                context.policy_decision(family).is_allowed(),
+                "granted tools:read scope must keep {family:?} allowed"
+            );
+        }
+        for family in [
             crate::protocol::MethodFamily::ResourcesList,
             crate::protocol::MethodFamily::ResourcesRead,
             crate::protocol::MethodFamily::ResourcesSubscribe,
@@ -3500,9 +3491,163 @@ mod tests {
             crate::protocol::MethodFamily::Tasks,
             crate::protocol::MethodFamily::Listeners,
         ] {
+            assert_eq!(
+                context.policy_decision(family),
+                crate::protocol::PolicyDecision::Deny(
+                    crate::protocol::ProtocolOutcome::PermissionDenied
+                ),
+                "ungranted {family:?} must deny with PermissionDenied in the legacy era"
+            );
+        }
+        assert_eq!(
+            crate::protocol::ProtocolOutcome::PermissionDenied
+                .encode(crate::protocol::ProtocolEra::Legacy)
+                .code,
+            -32005,
+            "legacy-era permission denial must encode as JSON-RPC -32005"
+        );
+    }
+
+    fn legacy_oauth_session_request(
+        access_token: &str,
+        session_id: &str,
+        id: u64,
+        method: &str,
+    ) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(SESSION_ID_HEADER, session_id)
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method
+                })
+                .to_string(),
+            ))
+            .expect("legacy session request")
+    }
+
+    async fn legacy_oauth_session(app: &axum::Router, access_token: &str) -> String {
+        let initialize = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": { "name": "legacy-scope-test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("initialize request");
+        let response = app.clone().oneshot(initialize).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "initialize must succeed");
+        response
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session ID")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_read_only_token_is_denied_resources_over_http() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "tools:read").await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let session_id = legacy_oauth_session(&app, &access_token).await;
+
+        let tools = app
+            .clone()
+            .oneshot(legacy_oauth_session_request(
+                &access_token,
+                &session_id,
+                2,
+                "tools/list",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let tools_body = axum::body::to_bytes(tools.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tools_value: serde_json::Value = serde_json::from_slice(&tools_body).unwrap();
+        assert!(
+            tools_value["result"]["tools"].is_array(),
+            "granted tools:read must keep tools/list working, got {tools_value}"
+        );
+
+        let resources = app
+            .oneshot(legacy_oauth_session_request(
+                &access_token,
+                &session_id,
+                3,
+                "resources/list",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resources.status(),
+            StatusCode::OK,
+            "legacy denial stays inside an HTTP 200 envelope"
+        );
+        let resources_body = axum::body::to_bytes(resources.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resources_value: serde_json::Value = serde_json::from_slice(&resources_body).unwrap();
+        assert_eq!(
+            resources_value["error"]["code"],
+            serde_json::json!(-32005),
+            "ungranted resources/list must deny with -32005, got {resources_value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_default_grant_token_reaches_resources_and_prompts_over_http() {
+        let default_scopes: Vec<String> = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let manager = isolated_oauth_manager(default_scopes.clone());
+        let access_token = issue_test_oauth_token(&manager, &default_scopes.join(" ")).await;
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let session_id = legacy_oauth_session(&app, &access_token).await;
+
+        for (id, method) in [(2, "resources/list"), (3, "prompts/list")] {
+            let response = app
+                .clone()
+                .oneshot(legacy_oauth_session_request(
+                    &access_token,
+                    &session_id,
+                    id,
+                    method,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(
-                context.policy_decision(family).is_allowed(),
-                "legacy OAuth principal lost access to {family:?}"
+                value.get("error").is_none(),
+                "default-grant token must not be denied {method}, got {value}"
+            );
+            assert!(
+                value.get("result").is_some(),
+                "default-grant token must get a {method} result, got {value}"
             );
         }
     }
@@ -6354,6 +6499,7 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
+            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             config.clone(),
@@ -6699,6 +6845,7 @@ mod tests {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
                 local_port: 3282,
+                modern_downstream_enabled: false,
             },
             state_path.clone(),
         )
@@ -7064,6 +7211,7 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
+            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),

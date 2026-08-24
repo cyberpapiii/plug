@@ -1,45 +1,88 @@
 # Security Policy
 
-## Supported Versions
+## Reporting a vulnerability
 
-Plug is pre-1.0. Security fixes are made on `main` and in the latest published release line once releases are public.
+Report suspected vulnerabilities privately through GitHub's
+[private vulnerability reporting](https://github.com/cyberpapiii/plug/security/advisories/new)
+for this repository. Please do not open a public issue for a security problem.
 
-## Reporting A Vulnerability
+Include the version or commit, your configuration shape (transport, `auth_mode`,
+whether the downstream HTTP listener is exposed beyond loopback), and the
+smallest reproduction you have. A proof-of-concept request is more useful than a
+description of one.
 
-Do not file a public issue for vulnerabilities, credential exposure, auth bypasses, sandbox escapes, or unsafe upstream execution behavior.
+Expect an acknowledgement within a week. plug is maintained by one person as a
+personal project, so there is no paid support channel and no guaranteed
+remediation window. Reports that identify a real weakness will be fixed and
+credited in the release notes unless you ask otherwise.
 
-Use GitHub private vulnerability reporting once the public repository is available:
+## Supported versions
 
-https://github.com/cyberpapiii/plug/security/advisories/new
+Only the latest release on `main` receives security fixes. There are no
+long-term support branches.
 
-If private reporting is not enabled yet, contact the maintainer privately before publishing details. Include:
+## What plug is, in security terms
 
-- A short impact summary.
-- Affected Plug version or commit.
-- Reproduction steps.
-- Whether secrets, local files, or remote MCP credentials are exposed.
-- Any logs or traces needed to verify the issue, with secrets redacted.
+plug is a local MCP multiplexer. It holds credentials for upstream MCP servers
+and, optionally, acts as an OAuth 2.1 authorization server for downstream MCP
+clients. Three parts of it are security-relevant:
 
-## Security Model
+**The configuration file.** plug launches the stdio commands named in your
+config, with your environment and your privileges. The config file is trusted
+operator input, equivalent to a shell script you run yourself. Sandboxing for
+stdio child processes is opt-in per server and is currently implemented only on
+macOS.
 
-Plug is a multiplexer. It sits between trusted downstream clients and configured upstream MCP servers.
+**Upstream credentials.** OAuth tokens for upstream servers are stored in the
+operating system keychain where one is available, with a `0600` file mirror used
+to survive restarts. Anyone who can read your user account can read those
+credentials; plug does not defend against a compromised local account.
 
-Important boundaries:
+**The downstream authorization server.** When `http.auth_mode = "oauth"`, plug
+issues tokens to remote MCP clients. Clients register through RFC 7591 Dynamic
+Client Registration or present a Client ID Metadata Document. Every
+authorization requires PKCE (S256 only), an exact redirect-URI match, a
+resource-bound token per RFC 8707, and an explicit approval from the instance
+owner authenticated with a WebAuthn passkey. Tokens carry method-family scopes
+that are enforced on every request.
 
-- Plug executes configured stdio commands. Treat `~/.config/plug/config.toml` as trusted operator input.
-- Remote HTTP exposure must use TLS and auth. Plug rejects non-loopback binds without TLS.
-- Downstream MCP auth and operator auth are separate. Operator tokens are administrative secrets.
-- Upstream OAuth credentials and bearer tokens must not be committed to config files. Prefer environment variables or the credential store.
-- Tool annotations are risk signals, not a security boundary. Operators should inspect `plug tools --output json` for upstream-declared versus Plug-inferred risk.
-- Stdio sandboxing is opt-in and currently enforced on macOS only.
+## Threat model
 
-## Handling Secrets In Reports
+plug is designed to be safe to expose on a public origin behind a tunnel or
+reverse proxy, with the owner-passkey ceremony as the gate that keeps strangers
+from minting tokens.
 
-Redact:
+In scope, and treated as vulnerabilities:
 
-- OAuth access tokens and refresh tokens.
-- Bearer tokens and operator tokens.
-- API keys in server environment variables.
-- Local filesystem paths that should not be disclosed publicly.
+- Any way to obtain a token without an owner approval.
+- Any way for one client's grant to reach another client's session, tokens, or
+  data.
+- Any way for a token to exercise a method family outside its granted scopes.
+- Server-side request forgery through Client ID Metadata Document fetching,
+  upstream URLs, or any other client-influenced request.
+- Credential disclosure through logs, error responses, or status output.
+- Bypassing the WebAuthn origin, user-verification, or consent-binding checks.
 
-Keep enough structure for maintainers to reproduce the problem.
+Out of scope:
+
+- A compromised local user account. plug's credential storage is only as strong
+  as the account that owns the keychain.
+- Malicious or compromised upstream MCP servers. plug forwards their content and
+  does not sandbox them; treat every configured upstream as trusted code.
+- Denial of service from an authenticated client, unless it is disproportionate
+  to the request that caused it.
+- Running with `http.auth_mode = "none"` on a non-loopback address. The config
+  validator rejects this, and overriding it is a deliberate choice to serve
+  without authentication.
+- Findings that require the operator to configure something the documentation
+  explicitly warns against.
+- The risk metadata plug reports for upstream tools. Those annotations are
+  advisory signals for the operator, partly self-declared by the upstream
+  server; they are not an enforcement boundary and are not claimed to be one.
+
+## Redacting your report
+
+Strip access and refresh tokens, bearer and API credentials, upstream server
+environment variables, and any local path you would rather not publish. Keep the
+shape of the request: header names, scope strings, error codes, and timing tell
+us far more than the secret values do.

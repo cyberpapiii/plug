@@ -10,3 +10,21 @@
 /test-results/
 /playwright-report/
 /blob-report/
+
+# Credentials and local runtime state. plug stores real config and tokens
+# outside the repo; these patterns keep a stray copy from ever being committed.
+config.toml
+config.toml.*
+.env
+.env.*
+credentials*.json
+/tokens/
+*.pem
+*.key
+*.p12
+*.pfx
+*.keychain
+id_rsa*
+id_ecdsa*
+id_ed25519*
+.netrc

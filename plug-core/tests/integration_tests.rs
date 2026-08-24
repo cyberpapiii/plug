@@ -4565,6 +4565,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         public_base_url: "https://plug.example.com".to_string(),
         oauth_scopes: vec!["tools:read".to_string()],
         local_port: 3282,
+        modern_downstream_enabled: false,
     };
     let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
         oauth_config,

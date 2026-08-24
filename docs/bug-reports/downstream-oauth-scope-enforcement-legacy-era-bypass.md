@@ -1,9 +1,40 @@
 # Downstream OAuth scopes are not enforced at `/mcp` in the legacy protocol era
 
-**Status:** open, by design for now — recorded so the snapshot does not overstate enforcement
+**Status:** fixed 2026-08-24 on `fix/downstream-oauth-honest-scope-enforcement` (see Resolution)
 **Severity:** low today (see Impact); a correctness/expectation gap rather than an exploit
 **Found:** 2026-08-08, verifying the plan-018 conformance spike against current `main`
 **Supersedes:** finding 3 of `docs/plans/2026-07-downstream-oauth-conformance-findings-claude-fable.md`, which reported scopes as entirely cosmetic. Half of that finding has since been fixed.
+
+## Resolution (2026-08-24)
+
+Shipped as honest issuance plus universal enforcement. None of the three
+options below was taken as written; the shipped model removes the reason the
+bypass existed instead of gating it.
+
+- An absent `http.oauth_scopes` under `auth_mode = "oauth"` now defaults to the
+  six-family grant `DEFAULT_DOWNSTREAM_OAUTH_SCOPES` in
+  `plug-core/src/protocol.rs` (`tools:read`, `resources:read`, `prompts:read`,
+  `completion:use`, `tasks:use`, `subscriptions:listen`), matching what a
+  normal MCP client actually does. An explicit list still must include
+  `tools:read`.
+- `legacy_http_policy_context` now builds OAuth principals with
+  `.with_authorization(principal, claims.scopes)`, so `decide_method` enforces
+  method-family scopes at `/mcp` in both eras. The pinned compatibility test
+  was inverted and renamed `legacy_oauth_principal_scopes_gate_method_families`.
+- Stored grant and refresh records carry a `scope_model` marker (serde default
+  1; new records written at 2). At store load, model-1 records have their
+  scopes replaced with the currently configured set, are marked model 2, and
+  the store is persisted fail-closed. Those tokens had unlimited method access
+  under `local_trust`, so widening strictly reduces real privilege; refresh-time
+  widening would violate RFC 6749 §6 and forced re-consent would break live
+  clients. Refresh rotation after migration keeps standard narrowing-only
+  semantics.
+- Scope denial stays JSON-RPC `-32005` inside HTTP 200 in both eras. The
+  RFC 6750 `insufficient_scope` 403 path in `plug-core/src/http/error.rs`
+  remains intentionally unreachable; wiring it is a separate decision.
+
+The analysis below is the pre-fix state, kept as the record of why the bypass
+existed.
 
 ## Summary
 
