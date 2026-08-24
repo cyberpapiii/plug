@@ -32,6 +32,7 @@ struct SessionState {
     replay_events: VecDeque<SseEvent>,
     next_event_id: u64,
     client_type: crate::types::ClientType,
+    broadcast_audience: crate::session::BroadcastAudience,
 }
 
 impl StatefulSessionStore {
@@ -399,6 +400,7 @@ impl SessionStore for StatefulSessionStore {
                 replay_events: VecDeque::new(),
                 next_event_id: 1,
                 client_type: crate::types::ClientType::Unknown,
+                broadcast_audience: crate::session::BroadcastAudience::default(),
             },
         );
 
@@ -453,6 +455,19 @@ impl SessionStore for StatefulSessionStore {
         Ok(())
     }
 
+    fn set_broadcast_audience(
+        &self,
+        session_id: &str,
+        audience: crate::session::BroadcastAudience,
+    ) -> Result<(), HttpError> {
+        let mut entry = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
+        entry.broadcast_audience = audience;
+        Ok(())
+    }
+
     fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
         let entry = self
             .sessions
@@ -469,7 +484,7 @@ impl SessionStore for StatefulSessionStore {
         removed
     }
 
-    fn broadcast(&self, message: SseMessage) {
+    fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
         // Snapshot keys first so shard write locks are not held across every
         // try_send (DashMap `iter_mut` would pin the shard for the whole loop).
         let session_ids: Vec<String> = self
@@ -484,6 +499,11 @@ impl SessionStore for StatefulSessionStore {
             };
             if entry.last_activity.elapsed() > self.timeout {
                 expired.push(session_id);
+                continue;
+            }
+            // Skipped before `next_event`, so a session that is not admitted
+            // never burns an event id and its replay sequence stays dense.
+            if !entry.broadcast_audience.admits(kind) {
                 continue;
             }
             let event = Self::next_event(&mut entry, message.clone());
@@ -777,6 +797,7 @@ mod tests {
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "test"}))
                 .unwrap(),
+            crate::session::BroadcastKind::Unscoped,
         );
 
         assert!(store.validate(&id).is_err());
@@ -809,6 +830,7 @@ mod tests {
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "broadcast"}))
                 .unwrap(),
+            crate::session::BroadcastKind::Unscoped,
         );
 
         let received = tokio::time::timeout(Duration::from_secs(1), fast_rx.recv())
@@ -816,6 +838,87 @@ mod tests {
             .expect("fast receiver should not be blocked")
             .expect("fast receiver message present");
         assert_eq!(received.message.to_json_value()["type"], "broadcast");
+    }
+
+    #[tokio::test]
+    async fn broadcast_skips_sessions_whose_audience_denies_the_kind() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let narrow_id = store.create_session().unwrap();
+        let wide_id = store.create_session().unwrap();
+        // Never given an audience: stands in for the window between
+        // `create_session` and initialize recording the real one.
+        let unresolved_id = store.create_session().unwrap();
+
+        let (narrow_tx, mut narrow_rx) = mpsc::channel(4);
+        let (wide_tx, mut wide_rx) = mpsc::channel(4);
+        let (unresolved_tx, mut unresolved_rx) = mpsc::channel(4);
+        store.set_sse_sender(&narrow_id, narrow_tx, None).unwrap();
+        store.set_sse_sender(&wide_id, wide_tx, None).unwrap();
+        store
+            .set_sse_sender(&unresolved_id, unresolved_tx, None)
+            .unwrap();
+
+        store
+            .set_broadcast_audience(
+                &narrow_id,
+                crate::session::BroadcastAudience {
+                    tools: true,
+                    resources: false,
+                    prompts: false,
+                },
+            )
+            .unwrap();
+        store
+            .set_broadcast_audience(&wide_id, crate::session::BroadcastAudience::unrestricted())
+            .unwrap();
+
+        store.broadcast(
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "resources"}))
+                .unwrap(),
+            crate::session::BroadcastKind::ResourceList,
+        );
+        store.broadcast(
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "tools"}))
+                .unwrap(),
+            crate::session::BroadcastKind::ToolList,
+        );
+        store.broadcast(
+            crate::session::SseMessage::from_json_value(serde_json::json!({"type": "logging"}))
+                .unwrap(),
+            crate::session::BroadcastKind::Unscoped,
+        );
+
+        // The narrow session never sees the resource notification, and the one
+        // it does skip costs it no event id -- its first event is still id 1.
+        let first = narrow_rx.try_recv().expect("tools notification delivered");
+        assert_eq!(first.message.to_json_value()["type"], "tools");
+        assert_eq!(first.id, 1);
+        let second = narrow_rx
+            .try_recv()
+            .expect("logging notification delivered");
+        assert_eq!(second.message.to_json_value()["type"], "logging");
+        assert_eq!(second.id, 2);
+        assert!(narrow_rx.try_recv().is_err());
+
+        // An explicitly unrestricted session receives every kind.
+        for expected in ["resources", "tools", "logging"] {
+            let event = wide_rx
+                .try_recv()
+                .expect("unrestricted audience delivers all");
+            assert_eq!(event.message.to_json_value()["type"], expected);
+        }
+
+        // A session whose audience has not been resolved yet receives only the
+        // unscoped kind. Nothing scoped is queued for later replay either.
+        let unscoped_only = unresolved_rx
+            .try_recv()
+            .expect("unscoped kind is not gated");
+        assert_eq!(unscoped_only.message.to_json_value()["type"], "logging");
+        assert_eq!(unscoped_only.id, 1);
+        assert!(
+            unresolved_rx.try_recv().is_err(),
+            "an unresolved audience must not receive scoped broadcasts"
+        );
     }
 
     #[tokio::test]
