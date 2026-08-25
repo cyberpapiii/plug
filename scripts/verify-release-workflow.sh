@@ -38,10 +38,23 @@ for target in \
   assert_contains "$WORKFLOW" "target: $target"
 done
 
+assert_contains "$WORKFLOW" "if: matrix.target == 'aarch64-unknown-linux-musl'"
+assert_contains "$WORKFLOW" 'uses: taiki-e/install-action@cross'
+assert_contains "$WORKFLOW" \
+  'cross build --release --target aarch64-unknown-linux-musl -p plug-mcp'
+assert_contains "$WORKFLOW" \
+  "run: cargo build --release --target \${{ matrix.target }} -p plug-mcp"
+assert_contains "$WORKFLOW" \
+  'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc'
+assert_absent "$WORKFLOW" \
+  'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc'
+assert_contains "$WORKFLOW" "readelf -h \"\$elf_path\""
+assert_contains "$WORKFLOW" 'Requesting program interpreter'
+
 assert_contains "$WORKFLOW" 'cargo build --release -p plug-mcp --target aarch64-apple-darwin'
 assert_contains "$WORKFLOW" 'cargo build --release -p plug-mcp --target x86_64-apple-darwin'
 assert_contains "$WORKFLOW" './scripts/sign-notarize-macos-app.sh'
-assert_contains "$WORKFLOW" 'dist build --artifacts=global --tag "$TAG"'
+assert_contains "$WORKFLOW" "dist build --artifacts=global --tag \"\$TAG\""
 assert_contains "$WORKFLOW" './scripts/patch-dist-installer.sh target/distrib/plug-mcp-installer.sh'
 assert_contains "$WORKFLOW" 'cp target/distrib/plug-mcp-installer.sh artifacts/'
 assert_contains "$WORKFLOW" 'artifacts/plug-mcp-installer.sh'

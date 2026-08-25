@@ -35,26 +35,73 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux ARM)
-        if: contains(matrix.target, 'aarch64-unknown-linux')
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install musl tools
-        if: contains(matrix.target, 'musl')
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+
+      - name: Install cross (ARM musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} -p plug-mcp
+
+      - name: Build ARM musl with cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target aarch64-unknown-linux-musl -p plug-mcp
+
+      - name: Verify Linux ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          elf_path="target/${{ matrix.target }}/release/plug"
+          [[ -x "$elf_path" ]] || {
+            echo "release binary missing or not executable: $elf_path" >&2
+            exit 1
+          }
+          command -v readelf >/dev/null 2>&1 || {
+            echo "readelf is required for release ELF verification" >&2
+            exit 1
+          }
+          machine="$(readelf -h "$elf_path" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+          case "${{ matrix.target }}" in
+            x86_64-*) expected_machine='Advanced Micro Devices X86-64' ;;
+            aarch64-*) expected_machine='AArch64' ;;
+            *)
+              echo "unsupported Linux release target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+          [[ "$machine" == "$expected_machine" ]] || {
+            echo "unexpected ELF machine for $elf_path: $machine" >&2
+            exit 1
+          }
+          interpreter="$(readelf -l "$elf_path" | \
+            sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl) expected_interpreter='ld-musl-x86_64.so.1' ;;
+            aarch64-unknown-linux-musl) expected_interpreter='ld-musl-aarch64.so.1' ;;
+            *) expected_interpreter='' ;;
+          esac
+          if [[ -n "$expected_interpreter" && -n "$interpreter" && \
+            "$interpreter" != *"/$expected_interpreter" ]]; then
+            echo "unexpected musl ELF interpreter for $elf_path: $interpreter" >&2
+            exit 1
+          fi
 
       - name: Package cargo-dist-compatible archive
         shell: bash
