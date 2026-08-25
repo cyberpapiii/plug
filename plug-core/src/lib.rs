@@ -3,6 +3,7 @@
 // retains them while MCP 2025-11-25 remains the default negotiated revision.
 #![allow(deprecated)]
 
+pub mod activity;
 pub mod artifacts;
 pub mod auth;
 pub mod branding;
