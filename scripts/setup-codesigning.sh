@@ -8,7 +8,7 @@ set -euo pipefail
 IDENTITY="Plug Local Signing"
 SIGNING_DIR="${PLUG_SIGNING_DIR:-$HOME/.config/plug-signing}"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
-CARGO_PLUG="${CARGO_HOME:-$HOME/.cargo}/bin/plug"
+CARGO_PLUG_DEV="${CARGO_HOME:-$HOME/.cargo}/bin/plug-dev"
 P12_PASS="pluglocal" # local-only passphrase for the on-disk p12 (chmod 600)
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -21,12 +21,17 @@ identity_is_valid() {
 }
 
 sign_binary() {
-  if [[ -e "$CARGO_PLUG" ]]; then
-    echo "==> Signing $CARGO_PLUG with '$IDENTITY'"
-    codesign --force -s "$IDENTITY" "$CARGO_PLUG"
-    codesign -dv --verbose=2 "$CARGO_PLUG" 2>&1 | grep -E 'Authority|Signature' || true
+  if [[ -e "$CARGO_PLUG_DEV" ]]; then
+    signature_details="$(codesign -dv --verbose=4 "$CARGO_PLUG_DEV" 2>&1 || :)"
+    if [[ "$signature_details" == *'Authority=Developer ID Application:'* ]]; then
+      echo "error: refusing to replace a Developer ID signature on $CARGO_PLUG_DEV" >&2
+      exit 1
+    fi
+    echo "==> Signing $CARGO_PLUG_DEV with '$IDENTITY'"
+    codesign --force -s "$IDENTITY" "$CARGO_PLUG_DEV"
+    codesign -dv --verbose=2 "$CARGO_PLUG_DEV" 2>&1 | grep -E 'Authority|Signature' || true
   else
-    echo "Note: $CARGO_PLUG not found — build/install first (e.g. ./scripts/dev-reinstall.sh), then it will be signed."
+    echo "Note: $CARGO_PLUG_DEV not found — run ./scripts/dev-reinstall.sh first."
   fi
 }
 
@@ -86,9 +91,9 @@ sign_binary
 cat <<EOF
 
 Setup complete. Next:
-  - Restart plug in your LOGIN SESSION: plug stop && plug start
+  - Run the development command explicitly: PLUG_DEV=1 plug-dev
   - You will get ONE more round of "Always Allow" Keychain prompts (one per OAuth
     upstream) because the binary identity just changed. Click "Always Allow" —
     those approvals now bind to the stable "$IDENTITY" identity and won't recur.
-  - From now on, rebuild with ./scripts/dev-reinstall.sh — it re-signs automatically.
+  - Rebuild with ./scripts/dev-reinstall.sh — it only replaces plug-dev.
 EOF
