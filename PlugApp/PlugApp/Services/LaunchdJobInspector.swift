@@ -8,6 +8,11 @@ protocol LaunchdJobInspecting: Sendable {
     ) async throws -> DaemonOwnershipState
 }
 
+enum LaunchdJobInspectionError: Error, Equatable {
+    case listFailed(status: Int32, detail: String)
+    case printFailed(label: String, status: Int32, detail: String)
+}
+
 struct LaunchdJobInspector: LaunchdJobInspecting {
     private let records: @Sendable () async throws -> [LaunchdJobRecord]
 
@@ -26,8 +31,8 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         recognizedLegacyPaths: Set<URL>
     ) async throws -> DaemonOwnershipState {
         let allRecords = try await records()
-        let canonicalPath = canonical.executableURL.standardizedFileURL
-        let legacyPaths = Set(recognizedLegacyPaths.map(\.standardizedFileURL))
+        let canonicalPath = Self.resolvedPath(canonical.executableURL)
+        let legacyPaths = Set(recognizedLegacyPaths.map(Self.resolvedPath))
         let relevant = allRecords.filter { record in
             record.label.localizedCaseInsensitiveContains("plug")
                 || record.programURL?.lastPathComponent == "plug"
@@ -36,7 +41,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         guard !relevant.isEmpty else { return .unmanaged }
 
         let appOwned = relevant.filter {
-            $0.programURL?.standardizedFileURL == canonicalPath
+            $0.programURL.map(Self.resolvedPath) == canonicalPath
                 && $0.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
         }
         if appOwned.count == 1, relevant.count == 1, let record = appOwned.first {
@@ -46,7 +51,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         }
 
         let recognized = relevant.filter { record in
-            guard let program = record.programURL?.standardizedFileURL else { return false }
+            guard let program = record.programURL.map(Self.resolvedPath) else { return false }
             return legacyPaths.contains(program)
         }
         if recognized.count == relevant.count {
@@ -65,7 +70,12 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             arguments: ["list"],
             timeout: .seconds(10)
         )
-        guard listed.status == 0 else { return [] }
+        guard listed.status == 0 else {
+            throw LaunchdJobInspectionError.listFailed(
+                status: listed.status,
+                detail: errorDetail(listed)
+            )
+        }
         let labels = parseLabels(String(decoding: listed.stdout, as: UTF8.self))
         var records: [LaunchdJobRecord] = []
         for label in labels {
@@ -74,7 +84,13 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 arguments: ["print", "gui/\(userID)/\(label)"],
                 timeout: .seconds(5)
             )
-            guard detail.status == 0 else { continue }
+            guard detail.status == 0 else {
+                throw LaunchdJobInspectionError.printFailed(
+                    label: label,
+                    status: detail.status,
+                    detail: errorDetail(detail)
+                )
+            }
             records.append(parseRecord(label: label, output: String(decoding: detail.stdout, as: UTF8.self)))
         }
         return records
@@ -117,5 +133,14 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
     private static func value(after prefix: String, in line: String) -> String? {
         guard line.hasPrefix(prefix) else { return nil }
         return String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func resolvedPath(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private static func errorDetail(_ result: ProcessResult) -> String {
+        String(decoding: result.stderr, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
