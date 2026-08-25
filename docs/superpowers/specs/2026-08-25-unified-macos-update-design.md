@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-25
 
-**Status:** Draft for final review
+**Status:** Approved
 
 **Scope:** macOS public installation, updates, daemon ownership, command-line access, client configuration, migration, diagnosis, and release packaging
 
@@ -19,7 +19,8 @@ This design removes split ownership instead of adding synchronization among copi
 On macOS:
 
 - Plug.app is the only supported public installation.
-- `/Applications/Plug.app/Contents/Resources/plug` is the only installed executable.
+- The signed Plug.app located by bundle identifier is the only public installation, normally at `/Applications/Plug.app` and optionally at `~/Applications/Plug.app`.
+- The app bundle's `Contents/Resources/plug` is the only installed executable.
 - The app-owned launchd service runs that executable.
 - Shell commands and MCP client configurations reference that executable, directly or through a symlink.
 - Sparkle replaces Plug.app, so it updates the app, daemon source, and command-line target in one transaction.
@@ -33,13 +34,13 @@ Linux remains a standalone CLI product. Source builds on macOS remain available 
 
 ### One executable owner
 
-Canonical executable:
+Canonical executable, resolved from the signed bundle rather than hardcoded:
 
 ```text
 /Applications/Plug.app/Contents/Resources/plug
 ```
 
-Plug.app already bundles a universal signed executable and its SMAppService LaunchAgent already uses the bundle-relative executable. That mechanism becomes the sole macOS authority.
+Plug.app already bundles a universal signed executable and its SMAppService LaunchAgent already uses the bundle-relative executable. That mechanism becomes the sole macOS authority. Installation discovery resolves `com.cyberpapiii.plug` through macOS workspace services, accepts `/Applications` and `~/Applications`, and verifies the Developer ID Team ID `HJF7LN64XX`. A moved app is repaired on its next launch. Sparkle may warn that `/Applications` is preferred, but Plug does not reject a valid user-local installation.
 
 No production workflow copies `plug` into `~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`, or an MCP bundle. Command-line locations contain symlinks only.
 
@@ -51,13 +52,15 @@ Direct DMG installations maintain:
 ~/.local/bin/plug -> /Applications/Plug.app/Contents/Resources/plug
 ```
 
-The Homebrew Cask exposes the same embedded executable with its `binary` stanza. Both paths resolve to the same inode inside Plug.app; neither owns a second copy.
+The Homebrew Cask installs Plug.app only. It has no `binary` or `postflight` symlink stanza, so Homebrew never becomes a second command-path writer. Opening Plug once finishes setup, including the shell symlink, daemon consent, and legacy adoption.
 
 The app repairs the user-owned `~/.local/bin/plug` symlink atomically on every launch. It never overwrites an unrelated regular file. A conflicting unrelated file produces one actionable repair message.
 
+Any standalone macOS `plug` process that is not running from the verified bundle fully re-executes the bundle executable before dispatching any command when a signed Plug.app is present. It does not maintain a matrix of delegated and local commands. Delegation verifies the target signature and Team ID, refuses an invalid target, and uses a loop guard plus a self-path check. `PLUG_DEV=1` is the sole explicit escape for source-development builds. Unknown executables and unrelated files are reported and never touched.
+
 ### MCP client configuration
 
-On macOS, `plug link`, `plug repair`, and generated stdio client entries use the canonical app executable path, not `std::env::current_exe()` and not PATH lookup:
+On macOS, `plug link`, `plug repair`, and generated stdio client entries use the currently resolved signed app executable path, not `std::env::current_exe()` and not PATH lookup. A normal `/Applications` installation therefore writes:
 
 ```text
 /Applications/Plug.app/Contents/Resources/plug connect
@@ -65,7 +68,7 @@ On macOS, `plug link`, `plug repair`, and generated stdio client entries use the
 
 This keeps Claude, Codex, Cursor, OpenCode, and other clients attached to the updated app even when an agent launches `plug` through a legacy path.
 
-When Plug.app is not installed, source-development builds retain current-executable behavior and identify themselves as development mode. They do not silently replace the public command-line symlink.
+When Plug.app is not installed, source-development builds retain current-executable behavior and identify themselves as development mode. They do not silently replace the public command-line symlink. Unknown client entries and unrelated MCP servers are reported and never touched.
 
 ### Daemon ownership
 
@@ -76,11 +79,13 @@ Normal app startup runs one idempotent reconciliation:
 1. Verify app version matches embedded `plug --version`.
 2. Repair the user command symlink.
 3. Repair recognized Plug client entries to the canonical app path.
-4. Inspect launchd ownership and bundle version.
+4. Enumerate launchd jobs broadly, but classify ownership from each job's resolved program path rather than its label. Only jobs targeting the signed bundle or recognized legacy Plug binaries are eligible for adoption or removal.
 5. Connect to the daemon and compare its runtime version with the app version.
 6. If app-managed daemon is stale, use the existing safe replacement flow: pause adapters, unregister/register the service, stop the old daemon, kickstart the new service, and wait for an exact-version handshake.
 7. Resume adapters and refresh operator state.
 8. Report success only after launchd and daemon proof agree.
+
+Unknown launchd jobs, labels, programs, and files are reported and never touched.
 
 First adoption remains a user-visible action because macOS may require Login Items consent. Routine app-owned upgrades reconcile automatically.
 
@@ -130,17 +135,18 @@ Migration is idempotent and conservative.
 - Homebrew Formula `cyberpapiii/tap/plug`
 - client entries pointing to recognized Cargo, Homebrew, old app, or repository build paths
 - CLI-owned `~/Library/LaunchAgents/com.plug.daemon.plist`
+- other launchd jobs whose resolved program path proves they target a recognized Plug binary, regardless of label
 
 ### Migration behavior
 
 - Atomically replace `~/.local/bin/plug` with the canonical app symlink.
-- Move a recognized Plug executable in `~/.cargo/bin` to a timestamped backup; never delete it during migration.
-- Leave Homebrew’s package database untouched. The old Formula becomes dormant because no supported path or client entry points to it. Doctor explains how to remove it; release documentation stops installing it on macOS.
+- Delete a recognized Plug executable in `~/.cargo/bin` only after the signed app, embedded executable, repaired shell path, and app-owned daemon have all been verified. Unknown binaries and unrelated files are reported and never touched.
+- If the exact Homebrew Formula `cyberpapiii/tap/plug` is installed, locate Homebrew only at its standard trusted paths and run `brew uninstall cyberpapiii/tap/plug`; never delete keg files or alter Homebrew's database directly. Formula removal precedes any command-path repair. If Homebrew removal fails, leave the Formula dormant and show the exact repair command. Unknown formulae, casks, taps, and package files are reported and never touched.
 - Repair only known Plug entries in detected client files, preserving unknown fields, comments where the format permits, project-local settings, and unrelated MCP servers.
-- Remove the legacy CLI LaunchAgent only through existing adoption logic.
+- Remove legacy launchd jobs only through existing adoption logic and only when their resolved program path proves Plug ownership. Unknown jobs and unrelated files are reported and never touched.
 - Preserve config, OAuth state, tokens, sockets, logs, and Keychain identities.
 
-An unrelated file at any target path stops that repair step and surfaces a precise message. No blind overwrite, package-manager mutation, or credential migration occurs.
+An unrelated file at any target path stops that repair step and surfaces a precise message. Unknown files are reported and never touched. No blind overwrite, manual package-manager mutation, or credential migration occurs.
 
 ## Update Flow
 
@@ -164,7 +170,7 @@ Public artifacts:
 
 - signed, notarized, stapled Plug DMG
 - signed Sparkle appcast
-- Homebrew Cask using the same DMG and exposing the embedded `plug` binary
+- Homebrew Cask using the same DMG, installing only Plug.app, and instructing the user to launch Plug once to finish setup
 - checksums and source archive
 
 Removed as macOS public installation paths:
@@ -177,7 +183,9 @@ Removed as macOS public installation paths:
 
 The Homebrew Formula and shell installer remain for Linux. The crates remain publishable for development and downstream builds.
 
-MCPB distribution is retired unless the format can reference the canonical app executable without embedding another copy. A package-local executable violates the one-owner contract.
+MCPB distribution is retired unless the format can reference the resolved app executable without embedding another copy. A package-local executable violates the one-owner contract.
+
+The release job publishes the DMG, Sparkle appcast, and Cask update as one release operation. It does not update the appcast and Cask independently, preventing `brew upgrade --greedy` from reinstalling a Cask version older than the current Sparkle release.
 
 ### Version source
 
@@ -202,6 +210,7 @@ Swift handshake metadata reads `Bundle.main`; it contains no hardcoded release v
 - linked-client command conformity
 - live adapter versions when available
 - dormant shadow installations
+- app bundle location and Developer ID Team ID
 
 Healthy output is one line: “Plug.app owns the app, command line, daemon, and client links.”
 
@@ -215,7 +224,7 @@ Existing doctor warnings remain separate:
 
 ## Development Workflow
 
-`scripts/dev-reinstall.sh` no longer takes over public `plug` paths by default. It installs `plug-dev` or runs a repository build explicitly. An `--activate` option may temporarily point the development environment at that build, with a matching restore command and a visible warning.
+`scripts/dev-reinstall.sh` no longer takes over public `plug` paths by default. It installs `plug-dev` or runs a repository build explicitly with `PLUG_DEV=1`. An `--activate` option may temporarily point the development environment at that build, with a matching restore command and a visible warning.
 
 Development builds never modify Plug.app, Sparkle state, Homebrew state, or production client configuration without explicit activation.
 
@@ -224,11 +233,16 @@ Development builds never modify Plug.app, Sparkle state, Homebrew state, or prod
 ### Rust
 
 - canonical path selection with and without Plug.app
+- bundle discovery in `/Applications`, `~/Applications`, and moved-app scenarios
+- delegation target signature and Team ID verification, full-exec behavior, and loop prevention
+- `PLUG_DEV=1` delegation bypass
 - client export always uses canonical path in production macOS mode
 - config migration for every supported JSON, TOML, and YAML client format
 - unknown fields and unrelated servers survive migration
 - optional adapter version decodes from old and new clients
 - doctor state matrix for healthy, stale CLI, stale daemon, stale client links, and shadow installs
+- doctor checks actual shell resolution order, not merely expected symlink targets
+- launchd discovery classifies ownership by resolved program path and preserves unknown jobs
 - CLI-owned startup fallback remains valid outside app-managed production mode
 
 Every behavior change follows red-green TDD.
@@ -245,11 +259,12 @@ Every behavior change follows red-green TDD.
 
 ### Integration and release
 
-- clean DMG install creates canonical shell access and app-owned daemon
-- migration fixture covers Cargo, Formula, old client entries, and CLI LaunchAgent
+- clean DMG install creates canonical shell access and app-owned daemon after first launch
+- clean Cask install claims no command path and converges after first app launch
+- migration fixture covers Cargo, Formula removal through Homebrew, old client entries, known-path launchd jobs, and unknown-item preservation
 - Sparkle update fixture proves app, embedded CLI, daemon, and client paths converge
 - real stdio adapter survives daemon replacement and replays session state
-- Cask installation exposes the embedded app binary, not a copy
+- Cask and Sparkle metadata are published from the same release transaction
 - installed app, daemon, shell command, and fresh adapter report the same version
 - Developer ID, notarization, stapling, appcast signatures, checksums, full Rust gates, Swift tests, Xcode build, MSRV, clippy, formatting, dependency advisories, and todo guard remain release gates
 
@@ -262,7 +277,7 @@ Every behavior change follows red-green TDD.
 5. Install on the current machine and migrate the existing Cargo/Homebrew split.
 6. Verify app, shell CLI, daemon, launchd, client links, fresh adapters, all enabled upstreams, public OAuth metadata, and one real routed tool call.
 7. Update `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` from verified live state.
-8. Remove migration backups only after explicit user approval and a stable observation period.
+8. Confirm no recognized legacy macOS executable, Formula, command path, client entry, or launchd job remains; unknown files and jobs remain untouched.
 
 ## Success Criteria
 
