@@ -4,7 +4,7 @@
   <key>Label</key><string>com.plug.daemon</string>
   <key>BundleProgram</key><string>Contents/Resources/plug</string>
   <key>ProgramArguments</key><array>
-    <string>plug</string><string>serve</string><string>--daemon</string>
+    <string>Contents/Resources/plug</string><string>serve</string><string>--daemon</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Interactive</string>

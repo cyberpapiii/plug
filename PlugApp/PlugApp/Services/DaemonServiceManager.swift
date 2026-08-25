@@ -13,14 +13,16 @@ final class DaemonServiceManager {
         guard agent.status == .enabled else { return true }
         return !Self.isAppManaged(
             launchctlOutput: launchctlPrint(),
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "",
+            bundleVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
             bundlePath: Bundle.main.bundlePath
         )
     }
 
-    func adopt() throws {
+    func adopt() async throws {
         bootOutLegacyAgent()
         try? FileManager.default.removeItem(at: legacyPlist)
-        if agent.status == .enabled { try? agent.unregister() }
+        if agent.status == .enabled { try? await agent.unregister() }
         if agent.status != .enabled { try agent.register() }
         guard agent.status == .enabled else {
             openLoginItemSettings()
@@ -28,8 +30,7 @@ final class DaemonServiceManager {
                 NSLocalizedDescriptionKey: "Allow Plug in Login Items, then choose Use Plug again."
             ])
         }
-        stopExistingDaemon()
-        kickstartAgent()
+        try await replaceRunningDaemon()
     }
 
     func restart() async throws {
@@ -58,6 +59,105 @@ final class DaemonServiceManager {
 
     private func kickstartAgent() {
         runLaunchctl(["kickstart", "-k", "gui/\(getuid())/com.plug.daemon"])
+    }
+
+    private func replaceRunningDaemon() async throws {
+        // Older `plug connect` builds spawned a replacement daemon themselves
+        // whenever the socket disappeared. Pause only those legacy connectors
+        // during the one-time ownership handoff, then resume them onto the
+        // launchd-owned daemon once it is stable.
+        let pausedConnectors = pauseLegacyConnectors()
+        defer { resumeLegacyConnectors(pausedConnectors) }
+        for _ in 0..<3 {
+            let previousPID = daemonPID()
+            stopExistingDaemon()
+            if let previousPID {
+                await waitForExit(pid: previousPID)
+            }
+            kickstartAgent()
+            if await waitForAgentReady() { return }
+            if launchctlPrint().contains("state = running") { break }
+        }
+        throw CocoaError(.executableLoad, userInfo: [
+            NSLocalizedDescriptionKey: "Plug's background service did not become ready. Approve any Keychain prompt, then choose Use Plug again."
+        ])
+    }
+
+    private func daemonPID() -> Int32? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/Application Support/plug/plug.pid")
+        guard let value = try? String(contentsOf: url, encoding: .utf8),
+              let pid = Int32(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return pid
+    }
+
+    private func waitForExit(pid: Int32) async {
+        for _ in 0..<60 {
+            if kill(pid, 0) != 0 { return }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    private func waitForAgentReady() async -> Bool {
+        for _ in 0..<120 {
+            if launchctlPrint().contains("state = running"), daemonAvailable() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return false
+    }
+
+    private func daemonAvailable() -> Bool {
+        guard let plug = Bundle.main.url(forResource: "plug", withExtension: nil) else {
+            return false
+        }
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = plug
+        process.arguments = ["status", "--output", "json"]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return false }
+            return payload["daemon_running"] as? Bool == true
+        } catch {
+            return false
+        }
+    }
+
+    private func pauseLegacyConnectors() -> [Int32] {
+        Self.connectorPIDs(psOutput: currentUserProcessList()).compactMap { pid in
+            guard kill(pid, SIGSTOP) == 0 else { return nil }
+            return pid
+        }
+    }
+
+    private func resumeLegacyConnectors(_ pids: [Int32]) {
+        for pid in pids { _ = kill(pid, SIGCONT) }
+    }
+
+    private func currentUserProcessList() -> String {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-x", "-o", "pid=", "-o", "command="]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return ""
+        }
     }
 
     private func launchctlPrint() -> String {
@@ -96,7 +196,29 @@ final class DaemonServiceManager {
         process.waitUntilExit()
     }
 
-    static func isAppManaged(launchctlOutput: String, bundlePath: String) -> Bool {
-        launchctlOutput.contains("BundleProgram") || launchctlOutput.contains(bundlePath)
+    static func isAppManaged(
+        launchctlOutput: String,
+        bundleIdentifier: String,
+        bundleVersion: String,
+        bundlePath: String
+    ) -> Bool {
+        let serviceManagementMatch = launchctlOutput.contains(
+            "parent bundle identifier = \(bundleIdentifier)"
+        ) && launchctlOutput.contains("parent bundle version = \(bundleVersion)")
+        return serviceManagementMatch
+            || launchctlOutput.contains(bundlePath)
+    }
+
+    static func connectorPIDs(psOutput: String) -> [Int32] {
+        psOutput.split(separator: "\n").compactMap { row in
+            let fields = row.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 3,
+                  let pid = Int32(fields[0]),
+                  pid != getpid(),
+                  URL(fileURLWithPath: String(fields[1])).lastPathComponent == "plug",
+                  fields.dropFirst(2).contains("connect")
+            else { return nil }
+            return pid
+        }
     }
 }
