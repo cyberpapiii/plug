@@ -52,6 +52,7 @@ pub struct UnifiedInstallSnapshot {
     pub launchd_inspection_complete: bool,
     pub app_service_daemon_invocation_verified: bool,
     pub inspection_errors: Vec<String>,
+    pub client_repair_needed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

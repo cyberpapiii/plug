@@ -343,10 +343,14 @@ fn unified_install_check_from_snapshot(
         })
         .map(|item| item.target.as_str())
         .collect::<Vec<_>>();
-    if !stale_clients.is_empty() {
+    if snapshot.client_repair_needed || !stale_clients.is_empty() {
         drift.push(format!(
             "client links need repair: {}",
-            stale_clients.join(", ")
+            if stale_clients.is_empty() {
+                "inspection incomplete".to_string()
+            } else {
+                stale_clients.join(", ")
+            }
         ));
     }
     let incompatible_adapters = snapshot
@@ -404,6 +408,18 @@ fn unified_install_check_from_snapshot(
             fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
         }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn client_repair_needed(linked_clients: &[ClientRepairItem]) -> bool {
+    linked_clients.iter().any(|item| {
+        !matches!(
+            item.disposition,
+            PlugLinkDisposition::Canonical
+                | PlugLinkDisposition::Http
+                | PlugLinkDisposition::Missing
+        )
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -560,6 +576,7 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
         _ => false,
     };
     let shadows = crate::install::discover_shadow_installations(app.as_ref());
+    let client_repair_needed = client_repair_needed(&linked_clients);
     crate::install::UnifiedInstallSnapshot {
         app,
         shell_resolution,
@@ -575,6 +592,7 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
         launchd_inspection_complete,
         app_service_daemon_invocation_verified,
         inspection_errors,
+        client_repair_needed,
     }
 }
 
@@ -1207,6 +1225,7 @@ mod tests {
             launchd_inspection_complete: true,
             app_service_daemon_invocation_verified: true,
             inspection_errors: Vec::new(),
+            client_repair_needed: false,
         }
     }
 
@@ -1236,6 +1255,7 @@ mod tests {
             "launchd_inspection_complete",
             "app_service_daemon_invocation_verified",
             "inspection_errors",
+            "client_repair_needed",
         ] {
             assert!(json.get(key).is_some(), "missing stable JSON field {key}");
         }
@@ -1349,6 +1369,49 @@ mod tests {
         let result = super::unified_install_check_from_snapshot(&snapshot);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("launchd inspection timed out"));
+    }
+
+    #[test]
+    fn unified_install_client_repair_needed_is_conservative_and_serialized() {
+        for (disposition, expected) in [
+            (PlugLinkDisposition::Canonical, false),
+            (PlugLinkDisposition::Http, false),
+            (PlugLinkDisposition::Missing, false),
+            (PlugLinkDisposition::RecognizedLegacy, true),
+            (PlugLinkDisposition::UnknownCommand, true),
+        ] {
+            let mut snapshot = unified_snapshot();
+            snapshot.linked_clients[0].disposition = disposition;
+            snapshot.client_repair_needed = super::client_repair_needed(&snapshot.linked_clients);
+            let report = plug_core::doctor::DoctorReport {
+                checks: vec![super::unified_install_check_from_snapshot(&snapshot)],
+                exit_code: 0,
+            };
+            let value = super::doctor_json_value(&report, &snapshot);
+            assert_eq!(
+                value["unified_install"]["client_repair_needed"],
+                serde_json::json!(expected)
+            );
+            assert_eq!(
+                value["unified_install"]["linked_clients"][0]["disposition"],
+                serde_json::to_value(&snapshot.linked_clients[0].disposition).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn unified_install_incomplete_inspection_does_not_false_pass_client_state() {
+        let mut snapshot = unified_snapshot();
+        snapshot.adapter_inspection_complete = false;
+        snapshot
+            .inspection_errors
+            .push("adapter inspection failed".to_string());
+        snapshot.client_repair_needed = false;
+
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("adapter inspection failed"));
+        assert!(!snapshot.client_repair_needed);
     }
 
     #[test]
