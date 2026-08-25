@@ -6,6 +6,14 @@ import PlugIPC
 final class AppModel {
     enum ConnectionState: Equatable { case disconnected, connecting, incompatible, ready }
 
+    struct ServerPresentation: Identifiable, Equatable {
+        let configured: ConfiguredServer
+        let runtime: ServerStatus?
+        var id: String { configured.name }
+        var health: String { configured.enabled ? (runtime?.health ?? "Starting") : "Disabled" }
+        var toolCount: Int { runtime?.toolCount ?? 0 }
+    }
+
     private let ipc: PlugIPCClient
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
@@ -18,8 +26,11 @@ final class AppModel {
 
     init(ipc: PlugIPCClient = PlugIPCClient()) { self.ipc = ipc }
 
-    var visibleServers: [ServerStatus] {
-        snapshot.servers.enumerated().sorted {
+    var visibleServers: [ServerPresentation] {
+        let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverID, $0) })
+        return snapshot.configuredServers.map {
+            ServerPresentation(configured: $0, runtime: runtimeByName[$0.name])
+        }.enumerated().sorted {
             let lhsBad = $0.element.health != "Healthy"
             let rhsBad = $1.element.health != "Healthy"
             return lhsBad == rhsBad ? $0.offset < $1.offset : lhsBad && !rhsBad
@@ -28,11 +39,15 @@ final class AppModel {
 
     var menuBarSymbol: String {
         if connectionState != .ready { return "bolt.slash.circle" }
-        return snapshot.servers.contains { $0.health == "Failed" || $0.health == "AuthRequired" }
+        return visibleServers.contains { $0.health == "Failed" || $0.health == "AuthRequired" }
             ? "bolt.trianglebadge.exclamationmark" : "bolt.circle.fill"
     }
 
-    var isHealthy: Bool { connectionState == .ready && visibleServers.allSatisfy { $0.health == "Healthy" } }
+    var isHealthy: Bool {
+        connectionState == .ready && visibleServers.allSatisfy {
+            !$0.configured.enabled || $0.health == "Healthy"
+        }
+    }
 
     func startMonitoring() async {
         guard monitoringTask == nil else { return }

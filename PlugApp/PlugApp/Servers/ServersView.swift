@@ -12,7 +12,7 @@ struct ServersView: View {
                 HStack(spacing: 10) {
                     Circle().fill(server.health == "Healthy" ? .green : .orange).frame(width: 8, height: 8)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(server.serverID)
+                        Text(server.configured.name)
                         Text("\(server.toolCount) tools · \(server.health)").font(.caption).foregroundStyle(.secondary)
                     }
                 }.tag(server.id)
@@ -31,18 +31,22 @@ struct ServersView: View {
 
 struct ServerDetailView: View {
     let model: AppModel
-    let server: ServerStatus
+    let server: AppModel.ServerPresentation
     var body: some View {
         Form {
             LabeledContent("Status", value: server.health)
             LabeledContent("Tools", value: String(server.toolCount))
             HStack {
-                Button("Restart") { Task { await model.perform { .restartServer(authToken: $0, serverID: server.serverID) } } }
-                Button("Disable") { Task { await model.perform { .setServerEnabled(authToken: $0, name: server.serverID, enabled: false) } } }
+                if server.configured.enabled {
+                    Button("Restart") { Task { await model.perform { .restartServer(authToken: $0, serverID: server.configured.name) } } }
+                    Button("Disable") { Task { await model.perform { .setServerEnabled(authToken: $0, name: server.configured.name, enabled: false) } } }
+                } else {
+                    Button("Enable") { Task { await model.perform { .setServerEnabled(authToken: $0, name: server.configured.name, enabled: true) } } }
+                }
                 Spacer()
-                Button("Remove", role: .destructive) { Task { await model.perform { .removeServer(authToken: $0, name: server.serverID) } } }
+                Button("Remove", role: .destructive) { Task { await model.perform { .removeServer(authToken: $0, name: server.configured.name) } } }
             }
-        }.formStyle(.grouped).padding().navigationTitle(server.serverID)
+        }.formStyle(.grouped).padding().navigationTitle(server.configured.name)
     }
 }
 

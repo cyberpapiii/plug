@@ -85,6 +85,7 @@ pub struct OperatorSnapshot {
     pub runtime_version: String,
     pub uptime_secs: u64,
     pub ownership: DaemonOwnershipMode,
+    pub configured_servers: Vec<crate::operator::OperatorServerSummary>,
     pub servers: Vec<ServerStatus>,
     pub live_sessions: Vec<IpcLiveSessionInfo>,
     pub client_visibility: Vec<OperatorClientVisibility>,

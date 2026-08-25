@@ -1134,6 +1134,23 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             ),
         },
         IpcRequest::OperatorSnapshot { .. } => {
+            let config = match plug_core::operator::load_editable_config(&ctx.config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    return IpcResponse::Error {
+                        code: "CONFIG_READ_FAILED".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            let mut configured_servers = config
+                .servers
+                .iter()
+                .map(|(name, server)| {
+                    plug_core::operator::OperatorServerSummary::from_config(name.clone(), server)
+                })
+                .collect::<Vec<_>>();
+            configured_servers.sort_by(|a, b| a.name.cmp(&b.name));
             let mut live_sessions = ctx.client_registry.list_live_sessions();
             if let Some(http_sessions) = ctx.http_sessions.as_ref() {
                 live_sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
@@ -1170,6 +1187,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                     uptime_secs: ctx.started_at.elapsed().as_secs(),
                     ownership: crate::service::ipc_ownership(),
+                    configured_servers,
                     servers: ctx.server_manager.server_statuses(),
                     live_sessions,
                     client_visibility,

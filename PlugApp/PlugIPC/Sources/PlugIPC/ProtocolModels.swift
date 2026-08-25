@@ -16,6 +16,14 @@ public struct ServerStatus: Codable, Identifiable, Equatable, Sendable {
     public let error: String?
 }
 
+public struct ConfiguredServer: Codable, Identifiable, Equatable, Sendable {
+    public var id: String { name }
+    public let name: String
+    public let enabled: Bool
+    public let transport: String
+    public let oauth: Bool
+}
+
 public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     public var id: String { sessionID }
     public let transport: String
@@ -56,6 +64,7 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let runtimeVersion: String
     public let uptimeSecs: UInt64
     public let ownership: String
+    public let configuredServers: [ConfiguredServer]
     public let servers: [ServerStatus]
     public let liveSessions: [LiveSession]
     public let clientVisibility: [ClientVisibility]
@@ -63,7 +72,7 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let downstreamClients: [DownstreamClient]
 
     public static let empty = OperatorSnapshot(
-        runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged", servers: [],
+        runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged", configuredServers: [], servers: [],
         liveSessions: [], clientVisibility: [], upstreamAuth: [], downstreamClients: []
     )
 }
