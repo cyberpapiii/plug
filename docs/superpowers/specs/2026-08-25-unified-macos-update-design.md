@@ -52,7 +52,7 @@ Direct DMG installations maintain:
 ~/.local/bin/plug -> /Applications/Plug.app/Contents/Resources/plug
 ```
 
-The Homebrew Cask installs Plug.app only. It has no `binary` or `postflight` symlink stanza, so Homebrew never becomes a second command-path writer. Opening Plug once finishes setup, including the shell symlink, daemon consent, and legacy adoption.
+The Homebrew Cask installs Plug.app only. It has no `binary` or `postflight` symlink stanza, so Homebrew never becomes a second command-path writer. Opening Plug once finishes setup, including the shell symlink, daemon consent, and legacy adoption. On uninstall, the Cask invokes the embedded Plug cleanup command before removing the app; that command unregisters the app service and removes only a shell symlink proven to target this app. Unknown files and jobs are reported and never touched.
 
 The app repairs the user-owned `~/.local/bin/plug` symlink atomically on every launch. It never overwrites an unrelated regular file. A conflicting unrelated file produces one actionable repair message.
 
@@ -186,6 +186,8 @@ The Homebrew Formula and shell installer remain for Linux. The crates remain pub
 MCPB distribution is retired unless the format can reference the resolved app executable without embedding another copy. A package-local executable violates the one-owner contract.
 
 The release job publishes the DMG, Sparkle appcast, and Cask update as one release operation. It does not update the appcast and Cask independently, preventing `brew upgrade --greedy` from reinstalling a Cask version older than the current Sparkle release.
+
+The public macOS download presented by the Plug website and GitHub Releases is the same DMG. Homebrew Cask downloads that DMG rather than building another artifact.
 
 ### Version source
 
