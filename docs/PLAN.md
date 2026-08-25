@@ -60,7 +60,7 @@ forwarding work:
 - signed/notarized/stapled DMG distribution, Sparkle 2 signed updates, and a Homebrew cask sharing the same app artifact (PR #96)
 - daemon operator IPC with compatibility-range negotiation, inventory/activity snapshots, server mutations, OAuth actions, and downstream grant revocation (PR #96)
 - official prerelease MCP 2026 server conformance at 22/22, with request-scoped progress, concrete resource-template routing, and prefix-disabled routing fixes (PR #96)
-- public `v0.5.2` release with independently verified checksums, Developer ID signatures, notarized/stapled universal app + DMG, signed Sparkle feed, and installed 0.5.2 app/CLI (PR #101)
+- public `v0.6.1` release with independently verified checksums, Developer ID signatures, notarized/stapled universal app + DMG, signed Sparkle feed, and installed 0.6.1 app/CLI; the calm single-sidebar redesign shipped in PR #104 and its live ServiceManagement adoption repair in PR #105
 
 ## What Exists Today
 
@@ -129,12 +129,13 @@ Optional future scope only:
 
 Current operator rollout: this Mac enables the independently certified modern
 downstream HTTP path while keeping modern upstream negotiation off and every
-configured upstream pinned to `legacy`. The installed 0.5.2 binary passes the
-official prerelease MCP `2026-07-28` server suite 22/22. App-owned launchd
-adoption is ready and registered to the public build-6 bundle; its final live
-handoff is waiting only on the owner's one-time macOS Keychain **Always Allow**
-decision for the existing `plug` credential. Reconnecting clients continue to
-run the healthy 0.5.2 daemon in the meantime.
+configured upstream pinned to `legacy`. The public 0.6.1 app and CLI are
+installed. App-owned launchd adoption is complete: the live daemon runs from
+the bundled binary under `com.cyberpapiii.plug`, reports 0.6.1, and fresh stdio
+initialization, tool listing, and a real routed tool call pass. The operator UI
+uses one stable sidebar with full-width Servers, Clients, Activity, and Auth
+workspaces; the 0.6.0 adoption crash is fixed in 0.6.1. The official prerelease
+MCP `2026-07-28` server suite remains recorded at 22/22 for this release line.
 
 ## Modernization And Prior Program Phases
 
