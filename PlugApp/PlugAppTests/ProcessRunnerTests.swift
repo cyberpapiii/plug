@@ -68,6 +68,24 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertLessThan(started.duration(to: clock.now), .seconds(2))
     }
 
+    func testTimeoutKillsDescendantThatRetainsOutputPipes() async {
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        do {
+            _ = try await runner.run(
+                executable: shell,
+                arguments: ["-c", "sleep 4 &"],
+                timeout: .milliseconds(100)
+            )
+            XCTFail("Expected timeout")
+        } catch {
+            XCTAssertEqual(error as? ProcessRunnerError, .timedOut)
+        }
+
+        XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
+    }
+
     @MainActor
     func testRunDoesNotBlockMainActor() async throws {
         let clock = ContinuousClock()

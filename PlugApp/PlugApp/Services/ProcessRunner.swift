@@ -1,5 +1,5 @@
-import Foundation
 import Darwin
+import Foundation
 
 struct ProcessResult: Sendable {
     let status: Int32
@@ -33,10 +33,12 @@ struct ProcessRunner: ProcessRunning {
 }
 
 private final class ProcessExecution: @unchecked Sendable {
-    private let process = Process()
+    private let executable: URL
+    private let arguments: [String]
     private let output = Pipe()
     private let error = Pipe()
     private let lock = NSLock()
+    private var processGroup: pid_t?
     private var continuation: CheckedContinuation<ProcessResult, Error>?
     private var stdout: Data?
     private var stderr: Data?
@@ -48,16 +50,14 @@ private final class ProcessExecution: @unchecked Sendable {
         arguments: [String],
         continuation: CheckedContinuation<ProcessResult, Error>
     ) {
-        process.executableURL = executable
-        process.arguments = arguments
-        process.standardOutput = output
-        process.standardError = error
+        self.executable = executable
+        self.arguments = arguments
         self.continuation = continuation
     }
 
     func start(timeout: Duration) {
         do {
-            try process.run()
+            processGroup = try spawnInIsolatedProcessGroup()
         } catch {
             finishImmediately(throwing: error)
             return
@@ -70,8 +70,8 @@ private final class ProcessExecution: @unchecked Sendable {
             record(stderr: error.fileHandleForReading.readDataToEndOfFile())
         }
         DispatchQueue.global(qos: .utility).async { [self] in
-            process.waitUntilExit()
-            record(status: process.terminationStatus)
+            guard let processGroup else { return }
+            record(status: waitForExit(of: processGroup))
         }
 
         Task.detached { [weak self] in
@@ -82,13 +82,13 @@ private final class ProcessExecution: @unchecked Sendable {
 
     private func expire() {
         lock.lock()
-        guard continuation != nil, status == nil else {
+        guard continuation != nil, let processGroup else {
             lock.unlock()
             return
         }
         timedOut = true
         lock.unlock()
-        process.terminate()
+        _ = Darwin.kill(-processGroup, SIGTERM)
         Task.detached { [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             self?.forceTerminateIfNeeded()
@@ -97,13 +97,72 @@ private final class ProcessExecution: @unchecked Sendable {
 
     private func forceTerminateIfNeeded() {
         lock.lock()
-        guard status == nil else {
+        guard continuation != nil, let processGroup else {
             lock.unlock()
             return
         }
-        let pid = process.processIdentifier
         lock.unlock()
-        _ = Darwin.kill(pid, SIGKILL)
+        _ = Darwin.kill(-processGroup, SIGKILL)
+    }
+
+    private func spawnInIsolatedProcessGroup() throws -> pid_t {
+        var fileActions: posix_spawn_file_actions_t?
+        var attributes: posix_spawnattr_t?
+        try check(posix_spawn_file_actions_init(&fileActions))
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        try check(posix_spawnattr_init(&attributes))
+        defer {
+            posix_spawnattr_destroy(&attributes)
+        }
+
+        let outputRead = output.fileHandleForReading.fileDescriptor
+        let outputWrite = output.fileHandleForWriting.fileDescriptor
+        let errorRead = error.fileHandleForReading.fileDescriptor
+        let errorWrite = error.fileHandleForWriting.fileDescriptor
+
+        try check(posix_spawn_file_actions_adddup2(&fileActions, outputWrite, STDOUT_FILENO))
+        try check(posix_spawn_file_actions_adddup2(&fileActions, errorWrite, STDERR_FILENO))
+        try check(posix_spawn_file_actions_addclose(&fileActions, outputRead))
+        try check(posix_spawn_file_actions_addclose(&fileActions, errorRead))
+        try check(posix_spawn_file_actions_addclose(&fileActions, outputWrite))
+        try check(posix_spawn_file_actions_addclose(&fileActions, errorWrite))
+        try check(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)))
+        try check(posix_spawnattr_setpgroup(&attributes, 0))
+
+        var processID = pid_t()
+        let values = [executable.path] + arguments
+        var arguments = values.map { strdup($0) }
+        arguments.append(nil)
+        defer { arguments.compactMap { $0 }.forEach { free($0) } }
+
+        let spawnStatus = arguments.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(
+                &processID,
+                executable.path,
+                &fileActions,
+                &attributes,
+                buffer.baseAddress!,
+                environ
+            )
+        }
+        try check(spawnStatus)
+
+        output.fileHandleForWriting.closeFile()
+        error.fileHandleForWriting.closeFile()
+        return processID
+    }
+
+    private func check(_ status: Int32) throws {
+        guard status == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: status) ?? .EINVAL)
+        }
+    }
+
+    private func waitForExit(of processID: pid_t) -> Int32 {
+        var rawStatus: Int32 = 0
+        while Darwin.waitpid(processID, &rawStatus, 0) == -1, errno == EINTR {}
+        let signal = rawStatus & 0x7f
+        return signal == 0 ? (rawStatus >> 8) & 0xff : 128 + signal
     }
 
     private func record(stdout: Data) {
