@@ -132,7 +132,7 @@ struct ConnectionRecoveryNotice: View {
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Plug needs reconciliation").font(.callout)
-                Text("The app and daemon do not share a compatible IPC range.")
+                Text(model.connectionRecoveryDetail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

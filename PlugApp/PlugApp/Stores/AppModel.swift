@@ -89,6 +89,10 @@ final class AppModel {
         connectionState == .incompatible
     }
 
+    var connectionRecoveryDetail: String {
+        "The app and daemon need compatible versions and IPC support."
+    }
+
     var installationFailure: InstallationFailure? {
         guard case let .blocked(failure) = installationState else { return nil }
         return failure
@@ -134,6 +138,7 @@ final class AppModel {
     }
 
     func retry() async {
+        await ipc.disconnect()
         await runReconciliation { [coordinator] in
             await coordinator.retry()
         }

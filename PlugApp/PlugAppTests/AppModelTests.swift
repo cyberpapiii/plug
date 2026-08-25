@@ -200,6 +200,10 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
+        XCTAssertEqual(
+            model.connectionRecoveryDetail,
+            "The app and daemon need compatible versions and IPC support."
+        )
     }
 
     @MainActor
@@ -221,12 +225,72 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.connectionState, .incompatible)
         XCTAssertTrue(model.connectionRecoveryIsRequired)
         XCTAssertFalse(model.isHealthy)
+        XCTAssertEqual(
+            model.connectionRecoveryDetail,
+            "The app and daemon need compatible versions and IPC support."
+        )
 
         await model.retryConnection()
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
         XCTAssertTrue(model.connectionRecoveryIsRequired)
+    }
+
+    @MainActor
+    func testRetryDisconnectsStaleIPCBeforeDaemonSocketReplacement() async throws {
+        let events = LockedEvents()
+        let socketURL = URL(
+            fileURLWithPath: "/tmp/plug-app-model-replacement-\(UUID().uuidString).sock"
+        )
+        let oldServer = try OperatorFixtureServer(
+            events: events,
+            ipcMin: 5,
+            ipcMax: 6,
+            socketURL: socketURL
+        )
+        var replacement: OperatorFixtureServer?
+        defer {
+            if let replacement {
+                replacement.stop()
+            } else {
+                oldServer.stop()
+            }
+        }
+
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: events
+        )
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: socketURL, clientVersion: "0.6.4"),
+            coordinator: coordinator
+        )
+        await model.start()
+        XCTAssertEqual(model.connectionState, .incompatible)
+
+        coordinator.operation = {
+            events.append("coordinator.replaceSocket")
+            oldServer.stop()
+            replacement = try? OperatorFixtureServer(
+                events: events,
+                socketURL: socketURL
+            )
+        }
+
+        await model.retryConnection()
+
+        XCTAssertEqual(model.connectionState, .ready)
+        let values = events.values
+        guard let replacementIndex = values.firstIndex(of: "coordinator.replaceSocket") else {
+            return XCTFail("Expected coordinator to replace daemon socket")
+        }
+        guard let reconnectIndex = values.indices.first(where: {
+            $0 > replacementIndex && values[$0] == "ipc.handshake"
+        }) else {
+            return XCTFail("Expected IPC handshake after daemon socket replacement")
+        }
+        XCTAssertGreaterThan(reconnectIndex, replacementIndex)
     }
 
     @MainActor
@@ -430,19 +494,21 @@ private final class OperatorFixtureServer: @unchecked Sendable {
         events: LockedEvents,
         daemonVersion: String = "0.6.4",
         ipcMin: UInt16 = 3,
-        ipcMax: UInt16 = 4
+        ipcMax: UInt16 = 4,
+        socketURL providedSocketURL: URL? = nil
     ) throws {
         self.events = events
         self.daemonVersion = daemonVersion
         self.ipcMin = ipcMin
         self.ipcMax = ipcMax
-        socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-\(UUID().uuidString).sock")
+        self.socketURL = providedSocketURL
+            ?? URL(fileURLWithPath: "/tmp/plug-app-model-\(UUID().uuidString).sock")
         listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(socketURL.path)
+        Darwin.unlink(self.socketURL.path)
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(socketURL.path.utf8CString)
+        let bytes = Array(self.socketURL.path.utf8CString)
         withUnsafeMutableBytes(of: &address.sun_path) { destination in
             bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
         }
@@ -473,45 +539,51 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     }
 
     private func serve() {
-        let accepted = Darwin.accept(listener, nil, nil)
-        guard accepted >= 0 else { return }
-        lock.lock(); connection = accepted; lock.unlock()
         while true {
-            guard let header = readExact(accepted, count: 4) else { break }
-            let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-            guard let payload = readExact(accepted, count: Int(length)),
-                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
-                  let type = object["type"] as? String
-            else { break }
-            switch type {
-            case "OperatorHandshake":
-                clientVersion = object["client_version"] as? String
-                events.append("ipc.handshake")
-                send(response: [
-                    "type": "OperatorHandshake",
-                    "handshake": [
-                        "daemon_version": daemonVersion, "ipc_min": ipcMin, "ipc_max": ipcMax,
-                        "ownership": "app", "capabilities": [],
-                    ],
-                ], to: accepted)
-            case "OperatorSnapshot":
-                events.append("ipc.snapshot")
-                send(response: [
-                    "type": "OperatorSnapshot",
-                    "snapshot": [
-                        "runtime_version": "0.6.4", "uptime_secs": 1, "ownership": "app",
-                        "configured_servers": [], "servers": [], "live_sessions": [],
-                        "client_visibility": [], "upstream_auth": [], "downstream_clients": [],
-                    ],
-                ], to: accepted)
-            case "ActivitySnapshot":
-                events.append("ipc.activity")
-                send(response: ["type": "ActivitySnapshot", "events": []], to: accepted)
-            default:
-                send(response: ["type": "Ok"], to: accepted)
+            let accepted = Darwin.accept(listener, nil, nil)
+            guard accepted >= 0 else { return }
+            lock.lock(); connection = accepted; lock.unlock()
+            while true {
+                guard let header = readExact(accepted, count: 4) else { break }
+                let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
+                guard let payload = readExact(accepted, count: Int(length)),
+                      let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                      let type = object["type"] as? String
+                else { break }
+                switch type {
+                case "OperatorHandshake":
+                    clientVersion = object["client_version"] as? String
+                    events.append("ipc.handshake")
+                    send(response: [
+                        "type": "OperatorHandshake",
+                        "handshake": [
+                            "daemon_version": daemonVersion, "ipc_min": ipcMin, "ipc_max": ipcMax,
+                            "ownership": "app", "capabilities": [],
+                        ],
+                    ], to: accepted)
+                case "OperatorSnapshot":
+                    events.append("ipc.snapshot")
+                    send(response: [
+                        "type": "OperatorSnapshot",
+                        "snapshot": [
+                            "runtime_version": "0.6.4", "uptime_secs": 1, "ownership": "app",
+                            "configured_servers": [], "servers": [], "live_sessions": [],
+                            "client_visibility": [], "upstream_auth": [], "downstream_clients": [],
+                        ],
+                    ], to: accepted)
+                case "ActivitySnapshot":
+                    events.append("ipc.activity")
+                    send(response: ["type": "ActivitySnapshot", "events": []], to: accepted)
+                default:
+                    send(response: ["type": "Ok"], to: accepted)
+                }
             }
+            lock.lock()
+            let ownsConnection = connection == accepted
+            if ownsConnection { connection = -1 }
+            lock.unlock()
+            if ownsConnection { Darwin.close(accepted) }
         }
-        Darwin.close(accepted)
     }
 
     private func send(response: [String: Any], to fd: Int32) {
