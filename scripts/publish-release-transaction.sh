@@ -161,7 +161,7 @@ if [[ "$release_was_published" == false ]]; then
   gh_run release upload "$TAG" --repo "$REPO" "${ASSET_PATHS[@]}" --clobber
 fi
 
-release_api="$(gh_run api --repo "$REPO" "repos/$REPO/releases/tags/$TAG")"
+release_api="$(gh_run api "repos/$REPO/releases/tags/$TAG")"
 remote_asset_count="$(jq '.assets | length' <<<"$release_api")"
 (( remote_asset_count >= ${#ASSET_NAMES[@]} )) || \
   die "release $TAG has $remote_asset_count assets; expected at least ${#ASSET_NAMES[@]}"
@@ -250,7 +250,7 @@ final_draft="$(jq -r '.isDraft // false' <<<"$final_json")"
 final_prerelease="$(jq -r '.isPrerelease // false' <<<"$final_json")"
 [[ "$final_draft" == false && "$final_prerelease" == false ]] || \
   die "release $TAG was not promoted"
-latest_json="$(gh_run api --repo "$REPO" "repos/$REPO/releases/latest")"
+latest_json="$(gh_run api "repos/$REPO/releases/latest")"
 latest_tag="$(jq -r '.tag_name // ""' <<<"$latest_json")"
 [[ "$latest_tag" == "$TAG" ]] || \
   die "release $TAG is not latest (GitHub latest is ${latest_tag:-<none>})"

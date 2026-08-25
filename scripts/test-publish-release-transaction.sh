@@ -133,8 +133,16 @@ case "\$action" in
     ;;
   api)
     shift
-    [[ "\$1" == --repo ]] && shift 2
+    [[ \$# -gt 0 && "\$1" != -* ]] || {
+      echo "unsupported fake gh api option: \${1:-<missing>}" >&2
+      exit 1
+    }
     endpoint="\$1"
+    shift
+    [[ \$# -eq 0 ]] || {
+      echo "unsupported fake gh api option: \$1" >&2
+      exit 1
+    }
     if [[ "\$endpoint" == "repos/\$REPO/releases/latest" ]]; then
       jq -n --arg tag "\$(cat "\$STATE/latest")" '{tag_name: \$tag}'
     elif [[ "\$endpoint" == repos/\$REPO/releases/tags/* ]]; then
