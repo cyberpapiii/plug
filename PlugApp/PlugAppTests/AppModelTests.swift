@@ -4,6 +4,10 @@ import XCTest
 @testable import Plug
 import PlugIPC
 
+private let currentTestAppVersion = PlugIPCClient.clientVersion(
+    from: Bundle.main.infoDictionary ?? [:]
+)
+
 final class AppModelTests: XCTestCase {
     @MainActor func testEmptyModelIsQuietlyDisconnected() {
         let model = AppModel()
@@ -33,7 +37,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -74,7 +78,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -92,7 +96,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -108,7 +112,7 @@ final class AppModelTests: XCTestCase {
             events: LockedEvents()
         )
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
 
@@ -129,7 +133,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -160,7 +164,7 @@ final class AppModelTests: XCTestCase {
             events: LockedEvents()
         )
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
 
@@ -193,7 +197,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -217,7 +221,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -263,7 +267,7 @@ final class AppModelTests: XCTestCase {
             events: events
         )
         let model = AppModel(
-            ipc: PlugIPCClient(socketURL: socketURL, clientVersion: "0.6.4"),
+            ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
@@ -341,9 +345,9 @@ final class AppModelTests: XCTestCase {
         let app = VerifiedAppInstallation(
             bundleURL: executable.deletingLastPathComponent().deletingLastPathComponent(),
             executableURL: executable,
-            appVersion: "0.6.4",
+            appVersion: currentTestAppVersion,
             buildVersion: "12",
-            embeddedVersion: "0.6.4",
+            embeddedVersion: currentTestAppVersion,
             teamID: AppInstallationInspector.teamID
         )
         let record = LaunchdJobRecord(
@@ -355,14 +359,14 @@ final class AppModelTests: XCTestCase {
         )
         let service = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(record),
-            daemonVersion: "0.6.4",
+            daemonVersion: currentTestAppVersion,
             daemonExecutable: executable
         )
         return InstallationSnapshot(
             app: app,
             shellLink: .canonical(executable),
             service: service,
-            daemonVersion: "0.6.4",
+            daemonVersion: currentTestAppVersion,
             clientRepairNeeded: false,
             shadowInstalls: []
         )
@@ -378,7 +382,7 @@ final class AppModelTests: XCTestCase {
             : "[]"
         let payload = """
         {
-          "runtimeVersion": "0.6.4",
+          "runtimeVersion": "\(currentTestAppVersion)",
           "uptimeSecs": 1,
           "ownership": "app_managed",
           "configuredServers": [],
@@ -492,7 +496,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
 
     init(
         events: LockedEvents,
-        daemonVersion: String = "0.6.4",
+        daemonVersion: String = currentTestAppVersion,
         ipcMin: UInt16 = 3,
         ipcMax: UInt16 = 4,
         socketURL providedSocketURL: URL? = nil
@@ -566,7 +570,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                     send(response: [
                         "type": "OperatorSnapshot",
                         "snapshot": [
-                            "runtime_version": "0.6.4", "uptime_secs": 1, "ownership": "app",
+                            "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app",
                             "configured_servers": [], "servers": [], "live_sessions": [],
                             "client_visibility": [], "upstream_auth": [], "downstream_clients": [],
                         ],
