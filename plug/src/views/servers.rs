@@ -45,7 +45,8 @@ async fn prompt_server_actions(
                 None,
                 None,
                 false,
-            )?;
+            )
+            .await?;
             Ok(true)
         }
         Some(2) => {
@@ -68,15 +69,15 @@ async fn prompt_server_actions(
             Ok(true)
         }
         Some(3) => {
-            cmd_server_remove(config_path, None, false)?;
+            cmd_server_remove(config_path, None, false).await?;
             Ok(true)
         }
         Some(4) => {
-            cmd_server_set_enabled(config_path, None, true)?;
+            cmd_server_set_enabled(config_path, None, true).await?;
             Ok(true)
         }
         Some(5) => {
-            cmd_server_set_enabled(config_path, None, false)?;
+            cmd_server_set_enabled(config_path, None, false).await?;
             Ok(true)
         }
         _ => Ok(false),

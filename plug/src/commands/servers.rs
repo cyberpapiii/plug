@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use dialoguer::{Confirm, Input, Password, Select};
 
-use crate::commands::config::{load_editable_config, save_config};
+use crate::commands::config::load_editable_config;
 use crate::ui::{cli_prompt_theme, print_info_line, print_success_line};
 use crate::{OutputFormat, ServerCommands};
 
@@ -245,21 +245,24 @@ pub(crate) async fn cmd_server_command(
             oauth_client_id,
             oauth_scopes,
             disabled,
-        } => cmd_server_add(
-            config_path,
-            name,
-            command,
-            url,
-            args,
-            env,
-            transport,
-            auth,
-            bearer_token,
-            oauth_client_id,
-            oauth_scopes,
-            disabled,
-        ),
-        ServerCommands::Remove { name, yes } => cmd_server_remove(config_path, name, yes),
+        } => {
+            cmd_server_add(
+                config_path,
+                name,
+                command,
+                url,
+                args,
+                env,
+                transport,
+                auth,
+                bearer_token,
+                oauth_client_id,
+                oauth_scopes,
+                disabled,
+            )
+            .await
+        }
+        ServerCommands::Remove { name, yes } => cmd_server_remove(config_path, name, yes).await,
         ServerCommands::Edit {
             name,
             command,
@@ -290,12 +293,58 @@ pub(crate) async fn cmd_server_command(
             )
             .await
         }
-        ServerCommands::Enable { name } => cmd_server_set_enabled(config_path, name, true),
-        ServerCommands::Disable { name } => cmd_server_set_enabled(config_path, name, false),
+        ServerCommands::Enable { name } => cmd_server_set_enabled(config_path, name, true).await,
+        ServerCommands::Disable { name } => cmd_server_set_enabled(config_path, name, false).await,
     }
 }
 
-pub(crate) fn cmd_server_add(
+async fn apply_server_mutation(
+    config_path: Option<&std::path::PathBuf>,
+    mutation: plug_core::operator::OperatorMutation,
+) -> anyhow::Result<plug_core::operator::OperatorMutationResult> {
+    // An explicit --config path is an offline configuration document, not the
+    // live daemon's configuration. Keep it isolated while using the exact same
+    // validated atomic mutation primitive as the daemon.
+    if let Some(path) = config_path {
+        return Ok(plug_core::operator::apply_operator_mutation(path, mutation)?.1);
+    }
+
+    crate::runtime::ensure_daemon_with_feedback(None, false).await?;
+    let auth_token = crate::daemon::read_auth_token()?;
+    let request = match mutation {
+        plug_core::operator::OperatorMutation::AddServer { name, server } => {
+            plug_core::ipc::IpcRequest::AddServer {
+                name,
+                server: Box::new(server),
+                auth_token,
+            }
+        }
+        plug_core::operator::OperatorMutation::UpdateServer { name, server } => {
+            plug_core::ipc::IpcRequest::UpdateServer {
+                name,
+                server: Box::new(server),
+                auth_token,
+            }
+        }
+        plug_core::operator::OperatorMutation::RemoveServer { name } => {
+            plug_core::ipc::IpcRequest::RemoveServer { name, auth_token }
+        }
+        plug_core::operator::OperatorMutation::SetServerEnabled { name, enabled } => {
+            plug_core::ipc::IpcRequest::SetServerEnabled {
+                name,
+                enabled,
+                auth_token,
+            }
+        }
+    };
+    match crate::daemon::ipc_request(&request).await? {
+        plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),
+        plug_core::ipc::IpcResponse::Error { message, .. } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+pub(crate) async fn cmd_server_add(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
     command: Option<String>,
@@ -309,7 +358,7 @@ pub(crate) fn cmd_server_add(
     oauth_scopes: Option<Vec<String>>,
     disabled: bool,
 ) -> anyhow::Result<()> {
-    let (path, mut config) = load_editable_config(config_path)?;
+    let (_path, config) = load_editable_config(config_path)?;
     let name = match name {
         Some(name) => name,
         None => Input::with_theme(&cli_prompt_theme())
@@ -459,15 +508,17 @@ pub(crate) fn cmd_server_add(
         }
     };
 
-    config.servers.insert(name.clone(), server);
-    save_config(&path, &config)?;
+    let oauth_enabled = server.auth.as_deref() == Some("oauth");
+    apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::AddServer {
+            name: name.clone(),
+            server,
+        },
+    )
+    .await?;
     print_success_line(format!("Added server `{name}`."));
-    if config
-        .servers
-        .get(&name)
-        .and_then(|server| server.auth.as_deref())
-        == Some("oauth")
-    {
+    if oauth_enabled {
         print_info_line(format!(
             "Run `plug auth login --server {name}` after saving if this upstream needs authorization."
         ));
@@ -475,12 +526,12 @@ pub(crate) fn cmd_server_add(
     Ok(())
 }
 
-pub(crate) fn cmd_server_remove(
+pub(crate) async fn cmd_server_remove(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
     yes: bool,
 ) -> anyhow::Result<()> {
-    let (path, mut config) = load_editable_config(config_path)?;
+    let (_path, config) = load_editable_config(config_path)?;
     if config.servers.is_empty() {
         print_info_line("No configured servers to remove.");
         return Ok(());
@@ -513,8 +564,11 @@ pub(crate) fn cmd_server_remove(
         return Ok(());
     }
 
-    config.servers.remove(&name);
-    save_config(&path, &config)?;
+    apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::RemoveServer { name: name.clone() },
+    )
+    .await?;
     print_success_line(format!("Removed server `{name}`."));
     Ok(())
 }
@@ -534,7 +588,7 @@ pub(crate) async fn cmd_server_edit(
     oauth_scopes: Option<Vec<String>>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    let (path, mut config) = load_editable_config(config_path)?;
+    let (_path, mut config) = load_editable_config(config_path)?;
     if config.servers.is_empty() {
         print_info_line("No configured servers to edit.");
         return Ok(());
@@ -702,7 +756,19 @@ pub(crate) async fn cmd_server_edit(
 
         server.auth.as_deref() == Some("oauth")
     };
-    save_config(&path, &config)?;
+    let updated_server = config
+        .servers
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown server `{name}`"))?;
+    apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::UpdateServer {
+            name: name.clone(),
+            server: updated_server,
+        },
+    )
+    .await?;
     match output {
         OutputFormat::Json => {
             let server = config.servers.get(&name);
@@ -727,12 +793,12 @@ pub(crate) async fn cmd_server_edit(
     Ok(())
 }
 
-pub(crate) fn cmd_server_set_enabled(
+pub(crate) async fn cmd_server_set_enabled(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
     enabled: bool,
 ) -> anyhow::Result<()> {
-    let (path, mut config) = load_editable_config(config_path)?;
+    let (_path, config) = load_editable_config(config_path)?;
     if config.servers.is_empty() {
         print_info_line("No configured servers found.");
         return Ok(());
@@ -756,12 +822,17 @@ pub(crate) fn cmd_server_set_enabled(
         }
     };
 
-    let server = config
-        .servers
-        .get_mut(&name)
-        .ok_or_else(|| anyhow::anyhow!("unknown server `{name}`"))?;
-    server.enabled = enabled;
-    save_config(&path, &config)?;
+    if !config.servers.contains_key(&name) {
+        anyhow::bail!("unknown server `{name}`");
+    }
+    apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::SetServerEnabled {
+            name: name.clone(),
+            enabled,
+        },
+    )
+    .await?;
     if enabled {
         print_success_line(format!("Enabled server `{name}`."));
     } else {
@@ -773,6 +844,7 @@ pub(crate) fn cmd_server_set_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::config::save_config;
 
     fn test_config_path(prefix: &str) -> std::path::PathBuf {
         let dir =
@@ -1083,8 +1155,8 @@ mod tests {
         assert!(saved_server.oauth_scopes.is_none());
     }
 
-    #[test]
-    fn cmd_server_add_applies_stdio_env_assignments() {
+    #[tokio::test]
+    async fn cmd_server_add_applies_stdio_env_assignments() {
         let config_path = test_config_path("add-stdio-env");
 
         cmd_server_add(
@@ -1101,6 +1173,7 @@ mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
 
         let saved = plug_core::config::load_config(Some(&config_path)).unwrap();
