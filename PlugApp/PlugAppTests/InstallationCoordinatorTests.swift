@@ -228,6 +228,82 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(eventValues.filter { $0 == "app.inspect" }.count, 1)
     }
 
+    func testHandshakeOwnershipMismatchPreservesCargoAndDoesNotReportHealthy() async {
+        let events = EventLog()
+        let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [
+                    LegacyInstallSnapshot(
+                        formulaInstalled: false,
+                        cargoBinary: cargo,
+                        shellLink: .canonical(canonical.executableURL),
+                        recognizedPaths: [cargo],
+                        unknownPaths: []
+                    ),
+                    emptyLegacy(),
+                ]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [healthyService(), healthyService()],
+                handshakes: [handshake(version: canonical.appVersion, ownership: "cli_managed")]
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        if case .healthy = coordinator.state {
+            XCTFail("A non-app-managed handshake must not report healthy")
+        }
+        let eventValues = await events.values
+        XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
+    }
+
+    func testIncompatibleHandshakePreservesCargoAndDoesNotReportHealthy() async {
+        let events = EventLog()
+        let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [
+                    LegacyInstallSnapshot(
+                        formulaInstalled: false,
+                        cargoBinary: cargo,
+                        shellLink: .canonical(canonical.executableURL),
+                        recognizedPaths: [cargo],
+                        unknownPaths: []
+                    ),
+                    emptyLegacy(),
+                ]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [healthyService(), healthyService()],
+                handshakes: [handshake(
+                    version: canonical.appVersion,
+                    ipcMin: 5,
+                    ipcMax: 6
+                )]
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        if case .healthy = coordinator.state {
+            XCTFail("An incompatible handshake must not report healthy")
+        }
+        let eventValues = await events.values
+        XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
+    }
+
     func testConcurrentReconciliationCallsShareOneInFlightOperation() async {
         let events = EventLog()
         let gate = AsyncGate()
@@ -354,6 +430,46 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
     }
 
+    func testFinalUnknownDaemonOwnershipBlocksInsteadOfReportingRepairableDrift() async {
+        let events = EventLog()
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [emptyLegacy(), emptyLegacy()]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [
+                    healthyService(),
+                    DaemonServiceSnapshot(
+                        ownership: .unknown([
+                            LaunchdJobRecord(
+                                label: "com.plug.daemon",
+                                programURL: URL(fileURLWithPath: "/Applications/Other.app/plug"),
+                                parentBundleIdentifier: "com.example.other",
+                                parentBundleVersion: "1",
+                                loaded: true
+                            ),
+                        ]),
+                        daemonVersion: nil,
+                        daemonExecutable: nil
+                    ),
+                ],
+                handshakes: [handshake(version: canonical.appVersion)]
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .blocked(failure) = coordinator.state else {
+            return XCTFail("Unknown final ownership must block, got \(coordinator.state)")
+        }
+        XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
+    }
+
     func testOpenLogUsesBlockedFailureLogURL() async {
         let events = EventLog()
         let opened = OpenedURL()
@@ -398,12 +514,17 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
     }
 
-    private func handshake(version: String) -> OperatorHandshake {
+    private func handshake(
+        version: String,
+        ipcMin: UInt16 = 3,
+        ipcMax: UInt16 = 4,
+        ownership: String = "app_managed"
+    ) -> OperatorHandshake {
         let data = try! JSONSerialization.data(withJSONObject: [
             "daemonVersion": version,
-            "ipcMin": 3,
-            "ipcMax": 4,
-            "ownership": "app",
+            "ipcMin": ipcMin,
+            "ipcMax": ipcMax,
+            "ownership": ownership,
             "capabilities": [],
         ])
         return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
@@ -579,7 +700,7 @@ private func makeHandshake(version: String) -> OperatorHandshake {
         "daemonVersion": version,
         "ipcMin": 3,
         "ipcMax": 4,
-        "ownership": "app",
+        "ownership": "app_managed",
         "capabilities": [],
     ])
     return try! JSONDecoder().decode(OperatorHandshake.self, from: data)

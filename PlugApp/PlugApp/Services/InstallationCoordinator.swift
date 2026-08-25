@@ -34,6 +34,10 @@ extension DaemonServiceManager: DaemonServiceManaging {}
 
 @MainActor @Observable
 final class InstallationCoordinator {
+    private static let supportedIPCMin: UInt16 = 3
+    private static let supportedIPCMax: UInt16 = 4
+    private static let appManagedOwnership = "app_managed"
+
     private(set) var state: InstallationState
 
     private let appInspector: any AppInstallationInspecting
@@ -164,9 +168,14 @@ final class InstallationCoordinator {
                 embeddedVersion: canonical.embeddedVersion,
                 daemonVersion: handshake.daemonVersion,
                 shellTarget: canonical.executableURL.standardizedFileURL,
-                appManaged: true
+                appManaged: handshake.ownership == Self.appManagedOwnership
             )
-            try requireExactProof(proof, canonical: canonical, shellLink: shellLink)
+            try requireExactProof(
+                proof,
+                handshake: handshake,
+                canonical: canonical,
+                shellLink: shellLink
+            )
 
             if legacy.cargoBinary != nil {
                 publish(.cleaningLegacyBinary)
@@ -291,6 +300,9 @@ final class InstallationCoordinator {
         guard case let .healthy(snapshot) = final else {
             throw CoordinatorError.finalDisagreement("Final installation state was not healthy.")
         }
+        if case .unknown = snapshot.service.ownership {
+            throw CoordinatorError.unknownOwnership
+        }
         guard snapshot.app == canonical,
               snapshot.daemonVersion == canonical.appVersion,
               !snapshot.clientRepairNeeded,
@@ -389,10 +401,13 @@ final class InstallationCoordinator {
 
     private func requireExactProof(
         _ proof: ReconciliationProof,
+        handshake: OperatorHandshake,
         canonical: VerifiedAppInstallation,
         shellLink: ShellLinkState
     ) throws {
         guard proof.appManaged,
+              handshake.ownership == Self.appManagedOwnership,
+              isCompatible(handshake),
               proof.appVersion == canonical.appVersion,
               proof.embeddedVersion == canonical.embeddedVersion,
               proof.daemonVersion == canonical.appVersion,
@@ -400,6 +415,12 @@ final class InstallationCoordinator {
         else {
             throw CoordinatorError.proofDisagreement
         }
+    }
+
+    private func isCompatible(_ handshake: OperatorHandshake) -> Bool {
+        guard handshake.ipcMin <= handshake.ipcMax else { return false }
+        return handshake.ipcMin <= Self.supportedIPCMax
+            && handshake.ipcMax >= Self.supportedIPCMin
     }
 
     private func isExactService(
