@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import PlugIPC
 import Security
 import ServiceManagement
@@ -38,6 +39,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             try String(contentsOf: fixture.clientURL, encoding: .utf8),
             fixture.canonicalClientContents
         )
+        assertCanonicalClientConfig(at: fixture.clientURL, executable: fixture.canonical.executableURL)
         XCTAssertEqual(
             try String(contentsOf: fixture.unknownClientURL, encoding: .utf8),
             fixture.unknownClientContents
@@ -64,8 +66,10 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         }
         XCTAssertTrue(handshakeVersions.contains(fixture.version))
         XCTAssertEqual(adopted.daemonVersion, fixture.version)
+        XCTAssertTrue(harness.connector.waitForReconnect())
         XCTAssertEqual(harness.connector.replayCount, 1)
-        XCTAssertEqual(harness.connector.sessions, ["stdio-fixture-1"])
+        XCTAssertEqual(harness.connector.sessions, ["stdio-fixture-1", "stdio-fixture-2"])
+        XCTAssertTrue(harness.connector.observedReconnect)
 
         await harness.coordinator.retry()
 
@@ -88,6 +92,30 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertEqual(harness.connector.replayCount, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.cargoURL.path))
         assertProtectedFilesUnchanged(fixture)
+
+        let firstRetryState = retried
+        let firstRetryArtifacts = fixture.artifactsSnapshot()
+        let firstRetryEvents = harness.backend.mutationEvents
+        let firstRetryAllCalls = await harness.runner.calls
+        let firstRetryRunnerCalls = firstRetryAllCalls.filter { call in
+            call.arguments == ["uninstall", "cyberpapiii/tap/plug"]
+                || call.arguments == ["repair", "--all", "--output", "json"]
+        }
+        let firstRetryConnector = harness.connector.snapshot
+
+        await harness.coordinator.retry()
+
+        guard let retriedAgain = healthySnapshot(harness.coordinator.state) else { return }
+        XCTAssertEqual(retriedAgain, firstRetryState)
+        XCTAssertEqual(fixture.artifactsSnapshot(), firstRetryArtifacts)
+        XCTAssertEqual(harness.backend.mutationEvents, firstRetryEvents)
+        let secondRetryAllCalls = await harness.runner.calls
+        let secondRetryRunnerCalls = secondRetryAllCalls.filter { call in
+            call.arguments == ["uninstall", "cyberpapiii/tap/plug"]
+                || call.arguments == ["repair", "--all", "--output", "json"]
+        }
+        XCTAssertEqual(secondRetryRunnerCalls, firstRetryRunnerCalls)
+        XCTAssertEqual(harness.connector.snapshot, firstRetryConnector)
     }
 
     func testSignedFreshFixtureRepairsCommandWithoutAdoption() async throws {
@@ -102,6 +130,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.cargoURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.formulaURL.path))
         XCTAssertEqual(try fixture.shellDestination(), fixture.canonical.executableURL.path)
+        assertCanonicalClientConfig(at: fixture.clientURL, executable: fixture.canonical.executableURL)
         XCTAssertTrue(
             harness.backend.events.allSatisfy { event in
                 if case .bootOut = event { return false }
@@ -133,6 +162,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargoURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.formulaURL.path))
         XCTAssertEqual(try fixture.shellDestination(), fixture.canonical.executableURL.path)
+        XCTAssertTrue(harness.connector.waitForReconnect())
         XCTAssertEqual(harness.connector.replayCount, 1)
         assertProtectedFilesUnchanged(fixture)
 
@@ -189,7 +219,12 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
                 : [fixture.currentJob, fixture.launchdDecoyJob],
             currentJob: fixture.currentJob
         )
-        let connector = FixtureConnectorReplay()
+        let connector = try FixtureConnectorReplay(
+            executableURL: fixture.canonical.executableURL,
+            homeURL: fixture.homeURL,
+            socketURL: fixture.ipcSocketURL,
+            enabled: fixture.mode == .legacy
+        )
         let backend = FixtureDaemonBackend(
             enabled: fixture.mode == .fresh,
             legacyVersion: fixture.legacyVersion,
@@ -259,6 +294,19 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             fixture.unknownDecoyContents
         )
     }
+
+    private func assertCanonicalClientConfig(at url: URL, executable: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let servers = root["mcpServers"] as? [String: Any],
+              let plug = servers["plug"] as? [String: Any]
+        else {
+            return XCTFail("client repair must write JSON mcpServers.plug entry")
+        }
+        XCTAssertEqual(plug["command"] as? String, executable.path)
+        XCTAssertEqual(plug["args"] as? [String], ["connect"])
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("CANONICAL"))
+    }
 }
 
 private struct ReconciliationHarness {
@@ -267,6 +315,17 @@ private struct ReconciliationHarness {
     let launchd: FixtureLaunchdTimeline
     let backend: FixtureDaemonBackend
     let connector: FixtureConnectorReplay
+}
+
+private struct FixtureArtifacts: Equatable {
+    let shellDestination: String?
+    let clientContents: String?
+    let unknownClientContents: String?
+    let cargoExists: Bool
+    let formulaExists: Bool
+    let configContents: String?
+    let credentialContents: String?
+    let unknownDecoyContents: String?
 }
 
 private enum FixtureMode: Sendable, Equatable {
@@ -289,11 +348,23 @@ private struct SignedReconciliationFixture {
     let shellURL: URL
     let clientURL: URL
     let unknownClientURL: URL
+    let ipcSocketURL: URL
     let configURL: URL
     let credentialURL: URL
     let unknownDecoyURL: URL
     let logURL: URL
-    let canonicalClientContents = "{\"mcpServers\":{\"plug\":{\"command\":\"CANONICAL\"}}}"
+    var canonicalClientContents: String {
+        let object: [String: Any] = [
+            "mcpServers": [
+                "plug": [
+                    "command": canonical.executableURL.path,
+                    "args": ["connect"],
+                ],
+            ],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
     let unknownClientContents = "{\"mcpServers\":{\"unknown\":{\"command\":\"do-not-touch\"}}}"
     let configContents = "[servers]\nplug = \"preserve\"\n"
     let credentialContents = "fixture-credential-do-not-delete\n"
@@ -341,6 +412,9 @@ private struct SignedReconciliationFixture {
         shellURL = homeURL.appending(path: ".local/bin/plug")
         clientURL = rootURL.appending(path: "Library/Application Support/Claude/claude_desktop_config.json")
         unknownClientURL = rootURL.appending(path: "Library/Application Support/Other/plug.json")
+        ipcSocketURL = URL(
+            fileURLWithPath: "/tmp/plug-app-task7-\(UUID().uuidString.prefix(8)).sock"
+        )
         configURL = rootURL.appending(path: "Library/Application Support/Plug/config.toml")
         credentialURL = rootURL.appending(path: "Library/Keychains/plug-credential")
         unknownDecoyURL = rootURL.appending(path: "decoys/plug-not-owned")
@@ -428,11 +502,27 @@ private struct SignedReconciliationFixture {
         try FileManager.default.destinationOfSymbolicLink(atPath: shellURL.path)
     }
 
+    func artifactsSnapshot() -> FixtureArtifacts {
+        FixtureArtifacts(
+            shellDestination: try? shellDestination(),
+            clientContents: try? String(contentsOf: clientURL, encoding: .utf8),
+            unknownClientContents: try? String(contentsOf: unknownClientURL, encoding: .utf8),
+            cargoExists: FileManager.default.fileExists(atPath: cargoURL.path),
+            formulaExists: FileManager.default.fileExists(atPath: formulaURL.path),
+            configContents: try? String(contentsOf: configURL, encoding: .utf8),
+            credentialContents: try? String(contentsOf: credentialURL, encoding: .utf8),
+            unknownDecoyContents: try? String(contentsOf: unknownDecoyURL, encoding: .utf8)
+        )
+    }
+
     private func createBundle(from signedHost: URL) throws {
         try FileManager.default.createDirectory(
             at: bundleURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        // Copy the signed host bundle into an isolated temporary app. The
+        // embedded executable then has a real temporary path while retaining
+        // its signed code and resources.
         try FileManager.default.copyItem(at: signedHost, to: bundleURL)
     }
 
@@ -462,10 +552,11 @@ private struct SignedReconciliationFixture {
     }
 
     private static func signedHostBundleURL() throws -> URL {
-        var candidates = [Bundle.main.bundleURL]
+        var candidates: [URL] = []
         if let products = ProcessInfo.processInfo.environment["BUILT_PRODUCTS_DIR"] {
             candidates.append(URL(fileURLWithPath: products).appending(path: "Plug.app"))
         }
+        candidates.append(Bundle.main.bundleURL)
         guard let bundle = candidates
             .map(\.standardizedFileURL)
             .first(where: {
@@ -677,10 +768,95 @@ private actor FixtureLaunchdTimeline: LaunchdJobInspecting {
 }
 
 private final class FixtureConnectorReplay: @unchecked Sendable {
+    struct Snapshot: Equatable, Sendable {
+        let sessions: [String]
+        let replayCount: Int
+        let observedReconnect: Bool
+        let requestTypes: [String]
+    }
+
     private let lock = NSLock()
-    private var sessionStorage = ["stdio-fixture-1"]
+    private let outputCondition = NSCondition()
+    private let process: Process?
+    private let input: FileHandle?
+    private let listener: Int32?
+    private let socketURL: URL?
+    private var activeConnection: Int32 = -1
+    private var stopped = false
+    private var sessionStorage: [String] = []
     private var replayStorage = 0
-    private var eventStorage: [String] = []
+    private var registerStorage = 0
+    private var requestStorage: [String] = []
+    private var outputBuffer = Data()
+    private var outputLines: [String] = []
+    private var stderrBuffer = Data()
+    private var nextRequestID = 1
+
+    init(
+        executableURL: URL,
+        homeURL: URL,
+        socketURL: URL,
+        enabled: Bool
+    ) throws {
+        guard enabled else {
+            process = nil
+            input = nil
+            listener = nil
+            self.socketURL = nil
+            return
+        }
+
+        self.socketURL = socketURL.standardizedFileURL
+        try? FileManager.default.removeItem(at: socketURL)
+        let listener = try Self.makeListener(path: socketURL.path)
+        self.listener = listener
+
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ["connect"]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PLUG_DEV"] = "1"
+        environment["PLUG_SOCKET_PATH"] = socketURL.path
+        environment["HOME"] = homeURL.path
+        environment["PLUG_LOG"] = "error"
+        process.environment = environment
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        self.process = process
+        self.input = inputPipe.fileHandleForWriting
+
+        try process.run()
+        Self.startOutputReader(
+            outputPipe.fileHandleForReading,
+            owner: self
+        )
+        Self.startOutputReader(
+            errorPipe.fileHandleForReading,
+            owner: self,
+            stderr: true
+        )
+        Self.startDaemonLoop(listener: listener, owner: self)
+
+        sendMCP(Self.initializeMessage(id: 1))
+        guard waitForRequest(matching: "Capabilities", count: 2, timeout: 5) else {
+            let detail = diagnostic()
+            stop()
+            throw FixtureConnectorError.processDidNotInitialize(detail)
+        }
+        sendMCP(Self.notificationMessage(method: "notifications/initialized"))
+        sendMCP(Self.requestMessage(id: 2, method: "tools/list"))
+        guard waitForRequest(matching: "tools/list", count: 1, timeout: 5) else {
+            let detail = diagnostic()
+            stop()
+            throw FixtureConnectorError.processDidNotListTools(detail)
+        }
+    }
+
+    deinit { stop() }
 
     var sessions: [String] {
         lock.lock(); defer { lock.unlock() }
@@ -692,22 +868,363 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         return replayStorage
     }
 
-    var events: [String] {
+    var observedReconnect: Bool {
         lock.lock(); defer { lock.unlock() }
-        return eventStorage
+        return registerStorage >= 2 && replayStorage >= 1
+    }
+
+    func waitForReconnect(timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        repeat {
+            if observedReconnect { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        } while Date() < deadline
+        return false
+    }
+
+    var snapshot: Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return Snapshot(
+            sessions: sessionStorage,
+            replayCount: replayStorage,
+            observedReconnect: registerStorage >= 2 && replayStorage >= 1,
+            // Heartbeat pings are liveness observations, not reconciliation
+            // mutations. Exclude them so a healthy retry compares stable
+            // replay/session evidence instead of timing-sensitive watchdog
+            // traffic.
+            requestTypes: requestStorage.filter { $0 != "Ping" }
+        )
     }
 
     func pause() -> [Int32] {
-        lock.lock(); defer { lock.unlock() }
-        eventStorage.append("pause")
-        return [4101]
+        lock.lock()
+        let connection = activeConnection
+        activeConnection = -1
+        lock.unlock()
+        if connection >= 0 {
+            _ = Darwin.shutdown(connection, SHUT_RDWR)
+            Darwin.close(connection)
+        }
+        guard let process, process.isRunning else { return [] }
+        return [process.processIdentifier]
     }
 
     func resume(_ pids: [Int32]) {
-        lock.lock(); defer { lock.unlock() }
-        eventStorage.append("resume:\(pids.map(String.init).joined(separator: ","))")
-        replayStorage += sessionStorage.count
+        guard !pids.isEmpty else { return }
+        // A real stdio adapter only reconnects once it has traffic to forward.
+        // Drive one safe request after replacement, then wait for the actual
+        // Register/Capabilities/replay frames from the rebuilt daemon session.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            Thread.sleep(forTimeInterval: 0.05)
+            let expectedRegisterCount = self.registerCount + 1
+            let id = self.reserveRequestID()
+            self.sendMCP(Self.requestMessage(id: id, method: "tools/list"))
+            _ = self.waitForRequest(matching: "Register", count: expectedRegisterCount, timeout: 5)
+            _ = self.waitForRequest(matching: "tools/list", count: 2, timeout: 5)
+        }
     }
+
+    private var registerCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return registerStorage
+    }
+
+    private func reserveRequestID() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        defer { nextRequestID += 1 }
+        return nextRequestID
+    }
+
+    private func sendMCP(_ message: Data) {
+        guard let input else { return }
+        try? input.write(contentsOf: message)
+    }
+
+    private func waitForRequest(
+        matching needle: String,
+        count: Int,
+        timeout: TimeInterval
+    ) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        repeat {
+            lock.lock()
+            let observed = requestStorage.filter { $0.contains(needle) }.count
+            lock.unlock()
+            if observed >= count { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        } while Date() < deadline
+        return false
+    }
+
+    private func stop() {
+        lock.lock()
+        guard !stopped else {
+            lock.unlock()
+            return
+        }
+        stopped = true
+        let connection = activeConnection
+        activeConnection = -1
+        lock.unlock()
+
+        if connection >= 0 {
+            _ = Darwin.shutdown(connection, SHUT_RDWR)
+            Darwin.close(connection)
+        }
+        if let listener {
+            _ = Darwin.shutdown(listener, SHUT_RDWR)
+            Darwin.close(listener)
+        }
+        process?.terminate()
+        process?.waitUntilExit()
+        try? input?.close()
+        if let socketURL { try? FileManager.default.removeItem(at: socketURL) }
+    }
+
+    private func diagnostic() -> String {
+        lock.lock()
+        let requests = requestStorage
+        let status = process?.isRunning == true ? "running" : "exited"
+        let stderr = String(decoding: stderrBuffer, as: UTF8.self)
+        let termination = process.map {
+            "status=\($0.terminationStatus), reason=\($0.terminationReason.rawValue)"
+        } ?? "none"
+        lock.unlock()
+        outputCondition.lock()
+        let output = outputLines
+        outputCondition.unlock()
+        return "status=\(status), termination=\(termination), requests=\(requests), output=\(output), stderr=\(stderr)"
+    }
+
+    private static func startOutputReader(
+        _ handle: FileHandle,
+        owner: FixtureConnectorReplay,
+        stderr: Bool = false
+    ) {
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                let data = handle.readData(ofLength: 1)
+                if data.isEmpty { break }
+                if stderr {
+                    owner.lock.lock()
+                    owner.stderrBuffer.append(data)
+                    owner.lock.unlock()
+                    continue
+                }
+                owner.outputCondition.lock()
+                owner.outputBuffer.append(data)
+                while let newline = owner.outputBuffer.firstIndex(of: 0x0a) {
+                    let line = String(
+                        decoding: owner.outputBuffer[..<newline],
+                        as: UTF8.self
+                    )
+                    owner.outputLines.append(line)
+                    owner.outputBuffer.removeSubrange(...newline)
+                }
+                owner.outputCondition.broadcast()
+                owner.outputCondition.unlock()
+            }
+        }
+    }
+
+    private static func startDaemonLoop(listener: Int32, owner: FixtureConnectorReplay) {
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                owner.lock.lock()
+                let shouldStop = owner.stopped
+                owner.lock.unlock()
+                if shouldStop { return }
+                let connection = Darwin.accept(listener, nil, nil)
+                if connection < 0 {
+                    owner.lock.lock()
+                    let stopped = owner.stopped
+                    owner.lock.unlock()
+                    if stopped { return }
+                    continue
+                }
+                DispatchQueue.global(qos: .utility).async {
+                    owner.handleDaemonConnection(connection)
+                }
+            }
+        }
+    }
+
+    private func handleDaemonConnection(_ connection: Int32) {
+        lock.lock()
+        activeConnection = connection
+        lock.unlock()
+        var generation = 0
+        defer {
+            lock.lock()
+            if activeConnection == connection { activeConnection = -1 }
+            lock.unlock()
+            _ = Darwin.shutdown(connection, SHUT_RDWR)
+            Darwin.close(connection)
+        }
+
+        while let payload = Self.readFrame(connection),
+              let object = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
+              let type = object["type"] as? String {
+            lock.lock()
+            let method = object["method"] as? String
+            requestStorage.append(method.map { "\(type):\($0)" } ?? type)
+            lock.unlock()
+            switch type {
+            case "Register":
+                lock.lock()
+                registerStorage += 1
+                generation = registerStorage
+                let session = "stdio-fixture-\(registerStorage)"
+                sessionStorage.append(session)
+                let clientID = object["client_id"] as? String ?? "fixture-client"
+                lock.unlock()
+                Self.sendJSON([
+                    "type": "Registered",
+                    "protocol_version": object["protocol_version"] as? Int ?? 3,
+                    "client_id": clientID,
+                    "session_id": session,
+                    "modern_downstream_enabled": false,
+                    "cancellation_capability": "fixture-cancellation",
+                ], to: connection)
+            case "Capabilities":
+                Self.sendJSON(["type": "Capabilities", "capabilities": [:]], to: connection)
+            case "UpdateSession", "UpdateCapabilities", "RestoreResourceSubscriptions":
+                if type == "UpdateCapabilities" && generation > 1 {
+                    lock.lock()
+                    replayStorage += 1
+                    lock.unlock()
+                }
+                Self.sendJSON(["type": "Ok"], to: connection)
+            case "Ping":
+                Self.sendJSON(["type": "Pong"], to: connection)
+            case "ModernDownstreamGate":
+                Self.sendJSON(["type": "ModernDownstreamGate", "enabled": false], to: connection)
+            case "McpRequest", "McpRequestWithContext":
+                let method = object["method"] as? String ?? ""
+                switch method {
+                case "tools/list":
+                    Self.sendJSON(["type": "McpResponse", "payload": ["tools": []]], to: connection)
+                default:
+                    Self.sendJSON(["type": "McpResponse", "payload": [:]], to: connection)
+                }
+            default:
+                Self.sendJSON(["type": "Ok"], to: connection)
+            }
+        }
+    }
+
+    private static func makeListener(path: String) throws -> Int32 {
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw FixtureConnectorError.socket(errno) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8CString)
+        guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
+            Darwin.close(descriptor)
+            throw FixtureConnectorError.socketPathTooLong
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { destination in
+            bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
+        }
+        let offset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
+        let length = socklen_t(offset + bytes.count)
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, length)
+            }
+        }
+        guard result == 0, Darwin.listen(descriptor, 4) == 0 else {
+            let code = errno
+            Darwin.close(descriptor)
+            throw FixtureConnectorError.socket(code)
+        }
+        return descriptor
+    }
+
+    private static func readFrame(_ descriptor: Int32) -> Data? {
+        guard let header = readExactly(4, from: descriptor) else { return nil }
+        let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
+        guard length <= UInt32(FrameCodec.maximumPayloadSize) else { return nil }
+        return readExactly(Int(length), from: descriptor)
+    }
+
+    private static func readExactly(_ count: Int, from descriptor: Int32) -> Data? {
+        var result = Data()
+        result.reserveCapacity(count)
+        while result.count < count {
+            var buffer = [UInt8](repeating: 0, count: count - result.count)
+            let readCount = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if readCount == 0 { return nil }
+            if readCount < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            result.append(buffer, count: readCount)
+        }
+        return result
+    }
+
+    private static func sendJSON(_ object: [String: Any], to descriptor: Int32) {
+        guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
+        var length = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
+        frame.append(payload)
+        frame.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let written = Darwin.write(
+                    descriptor,
+                    bytes.baseAddress!.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if written <= 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                offset += written
+            }
+        }
+    }
+
+    private static func initializeMessage(id: Int) -> Data {
+        requestMessage(
+            id: id,
+            method: "initialize",
+            params: [
+                "protocolVersion": "2025-11-25",
+                "capabilities": [:],
+                "clientInfo": ["name": "plug-task7-fixture", "version": "1"],
+            ]
+        )
+    }
+
+    private static func notificationMessage(method: String) -> Data {
+        Data((try! JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "method": method])) + Data([0x0a]))
+    }
+
+    private static func requestMessage(
+        id: Int,
+        method: String,
+        params: [String: Any] = [:]
+    ) -> Data {
+        let object: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        ]
+        return (try! JSONSerialization.data(withJSONObject: object)) + Data([0x0a])
+    }
+}
+
+private enum FixtureConnectorError: Error {
+    case processDidNotInitialize(String)
+    case processDidNotListTools(String)
+    case socket(Int32)
+    case socketPathTooLong
 }
 
 @MainActor
@@ -728,6 +1245,13 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     private let launchd: FixtureLaunchdTimeline
     private let connector: FixtureConnectorReplay
     private(set) var events: [Event] = []
+
+    var mutationEvents: [Event] {
+        events.filter {
+            if case .handshake = $0 { return false }
+            return true
+        }
+    }
 
     init(
         enabled: Bool,
