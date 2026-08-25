@@ -282,16 +282,13 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
         return false;
     }
 
-    let components = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+    let path_components = path.components().collect::<Vec<_>>();
     let has_suffix = |suffix: &[&str]| {
-        components.len() >= suffix.len()
-            && components[components.len() - suffix.len()..]
+        path_components.len() >= suffix.len()
+            && path_components[path_components.len() - suffix.len()..]
                 .iter()
-                .map(String::as_str)
-                .eq(suffix.iter().copied())
+                .map(|component| component.as_os_str())
+                .eq(suffix.iter().map(std::ffi::OsStr::new))
     };
 
     let home = dirs::home_dir();
@@ -304,22 +301,26 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
             .is_some_and(|home| path == home.join("Applications/Plug.app/Contents/Resources/plug"));
 
     is_home_legacy
-        || has_suffix(&["opt", "homebrew", "bin", "plug"])
-        || has_suffix(&["usr", "local", "bin", "plug"])
-        || components.windows(7).any(|parts| {
-            ((parts[0] == "opt" && parts[1] == "homebrew")
-                || (parts[0] == "usr" && parts[1] == "local"))
-                && parts[2] == "Cellar"
-                && parts[3] == "plug"
-                && !parts[4].is_empty()
-                && parts[5] == "bin"
-                && parts[6] == "plug"
-        })
+        || path == Path::new("/opt/homebrew/bin/plug")
+        || path == Path::new("/usr/local/bin/plug")
+        || is_homebrew_cellar_path(path)
         || is_old_app
-        || components.windows(3).any(|parts| {
-            parts[0] == "target"
-                && (parts[1] == "debug" || parts[1] == "release")
-                && parts[2] == "plug"
+        || has_suffix(&["target", "debug", "plug"])
+        || has_suffix(&["target", "release", "plug"])
+}
+
+fn is_homebrew_cellar_path(path: &Path) -> bool {
+    ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"]
+        .iter()
+        .any(|root| {
+            let Ok(relative) = path.strip_prefix(root) else {
+                return false;
+            };
+            let parts = relative.components().collect::<Vec<_>>();
+            parts.len() == 3
+                && !parts[0].as_os_str().is_empty()
+                && parts[1].as_os_str() == "bin"
+                && parts[2].as_os_str() == "plug"
         })
 }
 
@@ -1174,6 +1175,7 @@ fn replace_toml_stdio_command(content: &str, command: &str) -> anyhow::Result<St
             ("command", toml_string_literal(command)),
             ("args", "[\"connect\"]".to_string()),
         ],
+        AssignmentSyntax::Toml,
     )?;
     Ok(join_lines(content, lines))
 }
@@ -1204,6 +1206,7 @@ fn replace_yaml_stdio_command(content: &str, command: &str) -> anyhow::Result<St
             ("command", yaml_string_scalar(command)),
             ("args", "[\"connect\"]".to_string()),
         ],
+        AssignmentSyntax::Yaml,
     )?;
     Ok(join_lines(content, lines))
 }
@@ -1212,15 +1215,24 @@ fn indentation(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+#[derive(Clone, Copy)]
+enum AssignmentSyntax {
+    Toml,
+    Yaml,
+}
+
 fn replace_assignments(
-    lines: &mut [String],
+    lines: &mut Vec<String>,
     start: usize,
     end: usize,
     replacements: &[(&str, String)],
+    syntax: AssignmentSyntax,
 ) -> anyhow::Result<()> {
+    let mut section_end = end;
     for (key, value) in replacements {
         let mut found = false;
-        for line in &mut lines[start..end] {
+        for index in start..section_end {
+            let line = &lines[index];
             let trimmed = line.trim_start();
             let Some(after_key) = trimmed.strip_prefix(key) else {
                 continue;
@@ -1235,8 +1247,15 @@ fn replace_assignments(
                 ':'
             };
             let separator_index = line.find(separator).expect("assignment separator");
-            let comment = inline_comment(&line[separator_index + 1..]);
-            *line = format!("{} {}{}", &line[..=separator_index], value, comment);
+            let value_span_end =
+                assignment_value_span_end(lines, index, section_end, separator_index, syntax);
+            let comment = inline_comment(&line[separator_index + 1..]).to_string();
+            lines[index] = format!("{} {}{}", &line[..=separator_index], value, comment);
+            if value_span_end > index + 1 {
+                let removed = value_span_end - index - 1;
+                lines.drain(index + 1..value_span_end);
+                section_end -= removed;
+            }
             found = true;
             break;
         }
@@ -1245,6 +1264,92 @@ fn replace_assignments(
         }
     }
     Ok(())
+}
+
+fn assignment_value_span_end(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    separator_index: usize,
+    syntax: AssignmentSyntax,
+) -> usize {
+    match syntax {
+        AssignmentSyntax::Toml => toml_value_span_end(lines, start, end, separator_index),
+        AssignmentSyntax::Yaml => yaml_value_span_end(lines, start, end, separator_index),
+    }
+}
+
+fn toml_value_span_end(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    separator_index: usize,
+) -> usize {
+    if !lines[start][separator_index + 1..]
+        .trim_start()
+        .starts_with('[')
+    {
+        return start + 1;
+    }
+
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (line_index, line) in lines.iter().enumerate().take(end).skip(start) {
+        let value = if line_index == start {
+            &line[separator_index + 1..]
+        } else {
+            line.as_str()
+        };
+        for character in value.chars() {
+            match character {
+                '\\' if quoted => escaped = !escaped,
+                '"' if !escaped => quoted = !quoted,
+                '#' if !quoted => break,
+                '[' if !quoted => depth += 1,
+                ']' if !quoted && depth > 0 => depth -= 1,
+                _ => escaped = false,
+            }
+        }
+        if depth == 0 {
+            return line_index + 1;
+        }
+    }
+    start + 1
+}
+
+fn yaml_value_span_end(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    separator_index: usize,
+) -> usize {
+    let value = &lines[start][separator_index + 1..];
+    let comment = inline_comment(value);
+    let value_without_comment = if comment.is_empty() {
+        value
+    } else {
+        &value[..value.len() - comment.len()]
+    }
+    .trim();
+    if !value_without_comment.is_empty() {
+        return start + 1;
+    }
+
+    let assignment_indent = indentation(&lines[start]);
+    let mut value_end = start + 1;
+    while value_end < end {
+        let line = &lines[value_end];
+        if !line.trim().is_empty() && indentation(line) <= assignment_indent {
+            break;
+        }
+        if !line.trim().is_empty() {
+            value_end += 1;
+        } else {
+            break;
+        }
+    }
+    value_end
 }
 
 fn inline_comment(value: &str) -> &str {
@@ -1685,8 +1790,11 @@ extensions:
         let connect = vec!["connect".to_string()];
         for command in [
             "/tmp/homebrew/bin/plug",
+            "/tmp/opt/homebrew/bin/plug",
+            "/tmp/usr/local/bin/plug",
             "/Applications/Other Plug.app/Contents/Resources/plug",
             "/Users/rob/project/target/custom/plug",
+            "/Users/rob/target/release/plug/not-a-plug/plug",
         ] {
             assert_eq!(
                 classify_plug_client_command(command, &connect, canonical),

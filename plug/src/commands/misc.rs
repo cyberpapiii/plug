@@ -1170,11 +1170,28 @@ mod tests {
             .join(".cargo/bin/plug")
             .to_string_lossy()
             .into_owned();
-        let invalid_args = r#"{"mcpServers":{"plug":{"command":"/Users/rob/.cargo/bin/plug","args":["connect",7]}}}"#;
+        let invalid_args = format!(
+            r#"{{"mcpServers":{{"plug":{{"command":"{cargo_command}","args":["connect",7]}}}}}}"#
+        );
+        let valid_args = format!(
+            r#"{{"mcpServers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}}}}}}"#
+        );
+        let recognized = repair_client_content(
+            plug_core::export::ExportTarget::Cursor,
+            std::path::Path::new("config.json"),
+            &valid_args,
+            canonical,
+            "http://localhost:3282/mcp",
+        )
+        .expect("recognized Cargo path should be repairable with valid args");
+        assert_eq!(
+            recognized.disposition,
+            PlugLinkDisposition::RecognizedLegacy
+        );
         let invalid = repair_client_content(
             plug_core::export::ExportTarget::Cursor,
             std::path::Path::new("config.json"),
-            invalid_args,
+            &invalid_args,
             canonical,
             "http://localhost:3282/mcp",
         )
@@ -1238,6 +1255,43 @@ mod tests {
             assert!(updated.contains("# command note"));
             assert!(updated.contains("# args note"));
             assert!(updated.contains("unknown = \"keep\"") || updated.contains("unknown: keep"));
+        }
+    }
+
+    #[test]
+    fn repair_replaces_complete_multiline_toml_and_yaml_args_values() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let cargo_command = dirs::home_dir()
+            .expect("test home directory")
+            .join(".cargo/bin/plug")
+            .to_string_lossy()
+            .into_owned();
+        let fixtures = vec![
+            (
+                plug_core::export::ExportTarget::CodexCli,
+                std::path::Path::new("config.toml"),
+                "[mcp_servers.plug]\ncommand = \"/opt/homebrew/bin/plug\"\nargs = [\n  \"connect\",\n]\n\n# retain this unrelated comment\n[mcp_servers.other]\ncommand = \"other\"\n".to_string(),
+            ),
+            (
+                plug_core::export::ExportTarget::Goose,
+                std::path::Path::new("config.yaml"),
+                format!("extensions:\n  plug:\n    command: {cargo_command}\n    args:\n      - connect\n\n  # retain this unrelated comment\n  other:\n    command: other\n"),
+            ),
+        ];
+        for (target, path, content) in fixtures {
+            let repair =
+                repair_client_content(target, path, &content, canonical, "unused").unwrap();
+            let updated = repair.updated.expect("legacy entry should update");
+            assert!(updated.contains("# retain this unrelated comment"));
+            match target {
+                plug_core::export::ExportTarget::CodexCli => {
+                    assert!(toml::from_str::<toml::Value>(&updated).is_ok());
+                }
+                plug_core::export::ExportTarget::Goose => {
+                    assert!(serde_norway::from_str::<serde_norway::Value>(&updated).is_ok());
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
