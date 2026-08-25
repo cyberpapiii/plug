@@ -1198,8 +1198,9 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
 /// macOS only: warn when the running binary is ad-hoc signed *and* keychain-backed
 /// OAuth upstreams are configured, because the macOS Keychain "Always Allow" ACL
 /// binds to the binary's signature and an ad-hoc signature changes on every
-/// rebuild — so macOS re-prompts for Keychain access constantly. A stable
-/// self-signed identity (via `plug codesign-setup`) makes the approval persist.
+/// rebuild — so macOS re-prompts for Keychain access constantly. Production
+/// installs should use Plug.app's Developer ID signature; isolated source builds
+/// use `PLUG_DEV=1 plug-dev codesign-setup`.
 async fn check_codesign_identity(config: &Config) -> CheckResult {
     let name = "codesign_identity".to_string();
 
@@ -1239,7 +1240,7 @@ async fn check_codesign_identity(config: &Config) -> CheckResult {
                     "plug is ad-hoc signed, so macOS re-prompts for Keychain access on every rebuild ({oauth_count} OAuth upstream(s) affected)"
                 ),
                 fix_suggestion: Some(
-                    "Run `plug codesign-setup` once to install a stable self-signed code-signing identity so the Keychain \"Always Allow\" approval persists across rebuilds.".to_string(),
+                    "Install or open signed Plug.app for production. For source development, run `./scripts/dev-reinstall.sh`, then `PLUG_DEV=1 plug-dev codesign-setup`; never re-sign Plug.app or a release executable.".to_string(),
                 ),
             },
             Some(false) => CheckResult {

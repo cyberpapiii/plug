@@ -82,9 +82,19 @@ cargo install --path plug --root "$STAGE_DIR" --force --locked
 # docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md
 if [[ "$(uname -s)" == "Darwin" ]]; then
   SIGN_IDENTITY="Plug Local Signing"
-  if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
+  SIGNING_KEYCHAIN="${PLUG_CODESIGN_KEYCHAIN:-}"
+  identity_args=(find-identity -v -p codesigning)
+  if [[ -n "$SIGNING_KEYCHAIN" ]]; then
+    identity_args+=("$SIGNING_KEYCHAIN")
+  fi
+  identity_details="$(security "${identity_args[@]}" 2>/dev/null || :)"
+  if [[ "$identity_details" == *"$SIGN_IDENTITY"* ]]; then
     echo "==> Code-signing staged plug with '$SIGN_IDENTITY'"
-    codesign --force -s "$SIGN_IDENTITY" "$STAGED_PLUG"
+    codesign_args=(--force -s "$SIGN_IDENTITY")
+    if [[ -n "$SIGNING_KEYCHAIN" ]]; then
+      codesign_args+=(--keychain "$SIGNING_KEYCHAIN")
+    fi
+    codesign "${codesign_args[@]}" "$STAGED_PLUG"
     codesign --verify --deep --strict "$STAGED_PLUG"
     codesign -dv --verbose=2 "$STAGED_PLUG" 2>&1 | grep -E 'Authority' || true
   else

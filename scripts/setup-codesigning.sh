@@ -7,7 +7,7 @@ set -euo pipefail
 
 IDENTITY="Plug Local Signing"
 SIGNING_DIR="${PLUG_SIGNING_DIR:-$HOME/.config/plug-signing}"
-KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+KEYCHAIN="${PLUG_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 CARGO_PLUG_DEV="${CARGO_HOME:-$HOME/.cargo}/bin/plug-dev"
 P12_PASS="pluglocal" # local-only passphrase for the on-disk p12 (chmod 600)
 
@@ -17,7 +17,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 identity_is_valid() {
-  security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"
+  identity_details="$(security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null || :)"
+  [[ "$identity_details" == *"$IDENTITY"* ]]
 }
 
 sign_binary() {
@@ -28,7 +29,7 @@ sign_binary() {
       exit 1
     fi
     echo "==> Signing $CARGO_PLUG_DEV with '$IDENTITY'"
-    codesign --force -s "$IDENTITY" "$CARGO_PLUG_DEV"
+    codesign --force -s "$IDENTITY" --keychain "$KEYCHAIN" "$CARGO_PLUG_DEV"
     codesign -dv --verbose=2 "$CARGO_PLUG_DEV" 2>&1 | grep -E 'Authority|Signature' || true
   else
     echo "Note: $CARGO_PLUG_DEV not found — run ./scripts/dev-reinstall.sh first."

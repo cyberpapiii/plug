@@ -96,14 +96,12 @@ fn run_macos(output: &OutputFormat) -> anyhow::Result<()> {
             );
         }
         println!();
-        println!("Done. Next:");
-        println!("  1. Restart plug in your login session:  plug stop && plug start");
+        println!("Development signing is ready.");
+        println!("Run this isolated binary with: PLUG_DEV=1 plug-dev");
         println!(
-            "  2. Click \"Always Allow\" on the one final round of Keychain prompts (one per OAuth"
+            "Click \"Always Allow\" on the one final round of Keychain prompts (one per OAuth"
         );
-        println!(
-            "     upstream). They now bind to '{IDENTITY}' and won't recur on future rebuilds."
-        );
+        println!("upstream). They now bind to '{IDENTITY}' and won't recur on future rebuilds.");
     }
 
     Ok(())
