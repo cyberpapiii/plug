@@ -6,6 +6,10 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Toggle("Open Plug at login", isOn: $launchAtLogin)
+                .onChange(of: launchAtLogin) { _, enabled in
+                    do { try DaemonServiceManager.shared.setMainAppAtLogin(enabled) }
+                    catch { DaemonServiceManager.shared.openLoginItemSettings() }
+                }
             LabeledContent("Daemon", value: model.snapshot.ownership.replacingOccurrences(of: "_", with: " ").capitalized)
             LabeledContent("Version", value: model.snapshot.runtimeVersion.isEmpty ? "—" : model.snapshot.runtimeVersion)
             Text("Plug keeps running when this window closes.").font(.caption).foregroundStyle(.secondary)

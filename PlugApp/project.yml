@@ -14,6 +14,25 @@ targets:
       - path: PlugApp
     dependencies:
       - package: PlugIPC
+    preBuildScripts:
+      - name: Bundle daemon and LaunchAgent
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          ROOT="$SRCROOT/.."
+          if [ "$CONFIGURATION" = "Release" ]; then
+            cargo build --manifest-path "$ROOT/Cargo.toml" --release -p plug-mcp
+            PLUG_BIN="$ROOT/target/release/plug"
+          else
+            cargo build --manifest-path "$ROOT/Cargo.toml" -p plug-mcp
+            PLUG_BIN="$ROOT/target/debug/plug"
+          fi
+          RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          AGENTS="$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/Library/LaunchAgents"
+          mkdir -p "$RESOURCES" "$AGENTS"
+          cp "$PLUG_BIN" "$RESOURCES/plug"
+          chmod 755 "$RESOURCES/plug"
+          cp "$SRCROOT/PlugApp/Resources/com.plug.daemon.plist" "$AGENTS/com.plug.daemon.plist"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cyberpapiii.plug

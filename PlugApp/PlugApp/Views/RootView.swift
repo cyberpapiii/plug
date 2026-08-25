@@ -35,5 +35,17 @@ struct RootView: View {
                 Text(error).font(.callout).padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)).padding()
             }
         }
+        .safeAreaInset(edge: .top) {
+            if model.serviceNeedsAdoption {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Let Plug manage its background service").fontWeight(.semibold)
+                        Text("This replaces the older command-line startup entry and keeps one daemon in charge.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Use Plug") { Task { await model.adoptDaemon() } }.buttonStyle(.borderedProminent)
+                }.padding(12).background(.regularMaterial)
+            }
+        }
     }
 }

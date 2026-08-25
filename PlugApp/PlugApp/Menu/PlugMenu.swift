@@ -13,6 +13,9 @@ struct PlugMenu: View {
         Divider()
         Button("Open Plug") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
         Button("Refresh") { Task { await model.refresh() } }
+        if model.connectionState == .disconnected {
+            Button("Start Plug") { Task { await model.restartDaemon() } }
+        }
         Divider()
         Button("Quit Plug") { NSApp.terminate(nil) }
     }

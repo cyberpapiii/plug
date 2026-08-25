@@ -13,6 +13,7 @@ final class AppModel {
     private(set) var snapshot: OperatorSnapshot = .empty
     private(set) var activities: [ActivityEvent] = []
     private(set) var lastError: String?
+    private(set) var serviceNeedsAdoption = DaemonServiceManager.shared.needsAdoption
 
     init(ipc: PlugIPCClient = PlugIPCClient()) { self.ipc = ipc }
 
@@ -78,6 +79,23 @@ final class AppModel {
             let token = try String(contentsOf: PlugIPCClient.defaultTokenURL, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             _ = try await ipc.request(request(token))
+            await refresh()
+        } catch { lastError = error.localizedDescription }
+    }
+
+    func adoptDaemon() async {
+        do {
+            try DaemonServiceManager.shared.adopt()
+            serviceNeedsAdoption = false
+            try await Task.sleep(for: .milliseconds(700))
+            await refresh()
+        } catch { lastError = error.localizedDescription }
+    }
+
+    func restartDaemon() async {
+        do {
+            try await DaemonServiceManager.shared.restart()
+            try await Task.sleep(for: .milliseconds(700))
             await refresh()
         } catch { lastError = error.localizedDescription }
     }
