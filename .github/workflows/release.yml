@@ -250,13 +250,21 @@ jobs:
             https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      - name: Verify cargo-dist plan and custom release workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/verify-release-workflow.sh
+          dist plan --no-local-paths
+
       - name: Build global cargo-dist artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/distrib
           cp artifacts/plug-mcp-*.tar.gz target/distrib/
-          dist build --artifacts=global --tag "$TAG" --allow-dirty
+          dist build --artifacts=global --tag "$TAG"
+          ./scripts/patch-dist-installer.sh target/distrib/plug-mcp-installer.sh
           cp target/distrib/plug-mcp-installer.sh artifacts/
           cp target/distrib/source.tar.gz artifacts/
           cp target/distrib/source.tar.gz.sha256 artifacts/
