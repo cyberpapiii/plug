@@ -118,16 +118,75 @@ fn parse_launchd_labels(output: &str) -> Vec<String> {
     labels
 }
 
-fn parse_launchd_job(label: &str, output: &str) -> Option<LaunchdJobRecord> {
-    let program = output
+fn parse_launchd_job(
+    label: &str,
+    output: &str,
+    verified_app_program: Option<&Path>,
+) -> Option<LaunchdJobRecord> {
+    if let Some(program) = output
         .lines()
-        .find_map(|line| line.trim().strip_prefix("program = "))?;
-    let program = PathBuf::from(program.trim_matches('"'));
-    let program = std::fs::canonicalize(&program).unwrap_or(program);
-    Some(LaunchdJobRecord {
-        label: label.to_string(),
-        program,
-    })
+        .find_map(|line| line.trim().strip_prefix("program = "))
+    {
+        let program = PathBuf::from(program.trim_matches('"'));
+        let program = std::fs::canonicalize(&program).unwrap_or(program);
+        return Some(LaunchdJobRecord {
+            label: label.to_string(),
+            program,
+        });
+    }
+
+    let managed_by_service_management = output
+        .lines()
+        .any(|line| line.trim() == "managed_by = com.apple.xpc.ServiceManagement");
+    let parent_is_plug = output
+        .lines()
+        .any(|line| line.trim() == "parent bundle identifier = com.cyberpapiii.plug");
+    let program_identifier_is_plug = output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("program identifier = ")
+            .is_some_and(|value| {
+                value == "Contents/Resources/plug" || value.starts_with("Contents/Resources/plug (")
+            })
+    });
+    let arguments = parse_launchd_arguments(output);
+    let arguments_identify_daemon = arguments.first().map(String::as_str)
+        == Some("Contents/Resources/plug")
+        && arguments.get(1).map(String::as_str) == Some("serve")
+        && arguments.get(2).map(String::as_str) == Some("--daemon");
+
+    if managed_by_service_management
+        && parent_is_plug
+        && program_identifier_is_plug
+        && arguments_identify_daemon
+    {
+        let program = verified_app_program?;
+        let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+        return Some(LaunchdJobRecord {
+            label: label.to_string(),
+            program,
+        });
+    }
+
+    None
+}
+
+fn parse_launchd_arguments(output: &str) -> Vec<String> {
+    let mut in_arguments = false;
+    let mut arguments = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if !in_arguments {
+            in_arguments = line == "arguments = {";
+            continue;
+        }
+        if line == "}" {
+            break;
+        }
+        if !line.is_empty() {
+            arguments.push(line.trim_matches('"').to_string());
+        }
+    }
+    arguments
 }
 
 /// Enumerate launchd jobs for diagnosis only. Startup remains authoritative
@@ -146,13 +205,21 @@ pub fn discover_launchd_jobs() -> anyhow::Result<Vec<LaunchdJobRecord>> {
         );
     }
     let labels = parse_launchd_labels(&String::from_utf8_lossy(&output.stdout));
+    let verified_app_program = crate::install::resolve_verified_app()
+        .ok()
+        .flatten()
+        .map(|app| app.executable_path);
     let mut jobs = Vec::new();
     for label in labels {
         let output = Command::new("launchctl")
             .args(["print", &format!("{domain}/{label}")])
             .output()?;
         if output.status.success()
-            && let Some(job) = parse_launchd_job(&label, &String::from_utf8_lossy(&output.stdout))
+            && let Some(job) = parse_launchd_job(
+                &label,
+                &String::from_utf8_lossy(&output.stdout),
+                verified_app_program.as_deref(),
+            )
         {
             jobs.push(job);
         }
@@ -417,13 +484,63 @@ mod tests {
         let output =
             "gui/501/local.claude-rc.plug = {\n\tprogram = /Users/example/.cargo/bin/plug\n}";
         assert_eq!(
-            parse_launchd_job("local.claude-rc.plug", output),
+            parse_launchd_job("local.claude-rc.plug", output, None),
             Some(LaunchdJobRecord {
                 label: "local.claude-rc.plug".to_string(),
                 program: PathBuf::from("/Users/example/.cargo/bin/plug"),
             })
         );
-        assert_eq!(parse_launchd_job("unrelated.job", "state = running"), None);
+        assert_eq!(
+            parse_launchd_job("unrelated.job", "state = running", None),
+            None
+        );
+    }
+
+    #[test]
+    fn launchd_job_parser_resolves_verified_smappservice_program() {
+        let output = r#"gui/501/com.plug.daemon = {
+	active count = 1
+	path = (submitted by smd.338)
+	type = Submitted
+	managed_by = com.apple.xpc.ServiceManagement
+	state = running
+
+	program identifier = Contents/Resources/plug (mode: 2)
+	parent bundle identifier = com.cyberpapiii.plug
+	parent bundle version = 12
+	arguments = {
+		Contents/Resources/plug
+		serve
+		--daemon
+	}
+}"#;
+        let app_program = Path::new("/Applications/Plug.app/Contents/Resources/plug");
+
+        assert_eq!(
+            parse_launchd_job("com.plug.daemon", output, Some(app_program)),
+            Some(LaunchdJobRecord {
+                label: "com.plug.daemon".to_string(),
+                program: app_program.to_path_buf(),
+            })
+        );
+    }
+
+    #[test]
+    fn launchd_job_parser_rejects_unproven_relative_program() {
+        let output = r#"managed_by = com.apple.xpc.ServiceManagement
+program identifier = Contents/Resources/plug (mode: 2)
+parent bundle identifier = com.example.other
+arguments = {
+	Contents/Resources/plug
+	serve
+	--daemon
+}"#;
+        let app_program = Path::new("/Applications/Plug.app/Contents/Resources/plug");
+
+        assert_eq!(
+            parse_launchd_job("com.plug.daemon", output, Some(app_program)),
+            None
+        );
     }
 
     #[test]
