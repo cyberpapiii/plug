@@ -161,6 +161,8 @@ pub(crate) async fn cmd_doctor(
     let config = plug_core::config::load_config(config_path)?;
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
     report.checks.extend(runtime_doctor_checks().await);
+    #[cfg(target_os = "macos")]
+    report.checks.push(unified_install_check().await);
     if let Some(interpreted) = synthesize_doctor_interpretation(&report.checks) {
         report.checks.push(interpreted);
     }
@@ -211,6 +213,259 @@ pub(crate) async fn cmd_doctor(
         }
     }
     Ok(report.exit_code)
+}
+
+fn unified_install_check_from_snapshot(
+    snapshot: &crate::install::UnifiedInstallSnapshot,
+) -> plug_core::doctor::CheckResult {
+    use plug_core::doctor::{CheckResult, CheckStatus};
+
+    let Some(app) = snapshot.app.as_ref() else {
+        return CheckResult {
+            name: "unified_install".to_string(),
+            status: CheckStatus::Fail,
+            message: "No verified Plug.app installation was found.".to_string(),
+            fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
+        };
+    };
+
+    let mut drift = Vec::new();
+    if !snapshot
+        .shell_resolution
+        .as_ref()
+        .is_some_and(|path| install_paths_match(path, &app.executable_path))
+    {
+        drift.push(format!(
+            "shell resolves {} instead of {}",
+            snapshot.shell_resolution.as_ref().map_or_else(
+                || "no plug command".to_string(),
+                |path| path.display().to_string()
+            ),
+            app.executable_path.display()
+        ));
+    }
+    if snapshot.daemon_version.as_deref() != Some(app.version.as_str()) {
+        drift.push(format!(
+            "daemon version is {} instead of {}",
+            snapshot.daemon_version.as_deref().unwrap_or("unavailable"),
+            app.version
+        ));
+    }
+    if !snapshot
+        .daemon_executable
+        .as_ref()
+        .is_some_and(|path| install_paths_match(path, &app.executable_path))
+    {
+        drift.push(format!(
+            "daemon executable is {} instead of {}",
+            snapshot.daemon_executable.as_ref().map_or_else(
+                || "unavailable".to_string(),
+                |path| path.display().to_string()
+            ),
+            app.executable_path.display()
+        ));
+    }
+    if snapshot.ownership != plug_core::ipc::DaemonOwnershipMode::AppManaged {
+        drift.push(format!("daemon ownership is {:?}", snapshot.ownership));
+    }
+    let stale_clients = snapshot
+        .linked_clients
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.disposition,
+                PlugLinkDisposition::Canonical
+                    | PlugLinkDisposition::Http
+                    | PlugLinkDisposition::Missing
+            )
+        })
+        .map(|item| item.target.as_str())
+        .collect::<Vec<_>>();
+    if !stale_clients.is_empty() {
+        drift.push(format!(
+            "client links need repair: {}",
+            stale_clients.join(", ")
+        ));
+    }
+    let incompatible_adapters = snapshot
+        .adapters
+        .iter()
+        .filter(|state| matches!(state, crate::install::AdapterVersionState::Incompatible))
+        .count();
+    if incompatible_adapters > 0 {
+        drift.push(format!(
+            "{incompatible_adapters} live adapter(s) are incompatible"
+        ));
+    }
+    if !snapshot.shadows.is_empty() {
+        let paths = snapshot
+            .shadows
+            .iter()
+            .map(|shadow| {
+                if shadow.verified_plug_owned {
+                    shadow.path.display().to_string()
+                } else {
+                    format!("{} (unknown file, left untouched)", shadow.path.display())
+                }
+            })
+            .collect::<Vec<_>>();
+        drift.push(format!("shadow installations: {}", paths.join(", ")));
+    }
+    let unexpected_jobs = snapshot
+        .launchd_jobs
+        .iter()
+        .filter(|job| {
+            !install_paths_match(&job.program, &app.executable_path)
+                || job.label != "com.plug.daemon"
+        })
+        .map(|job| format!("{} ({})", job.label, job.program.display()))
+        .collect::<Vec<_>>();
+    if !unexpected_jobs.is_empty() {
+        drift.push(format!(
+            "unknown or legacy launchd jobs left untouched: {}",
+            unexpected_jobs.join(", ")
+        ));
+    }
+
+    if drift.is_empty() {
+        CheckResult {
+            name: "unified_install".to_string(),
+            status: CheckStatus::Pass,
+            message: "Plug.app owns the app, command line, daemon, and client links.".to_string(),
+            fix_suggestion: None,
+        }
+    } else {
+        CheckResult {
+            name: "unified_install".to_string(),
+            status: CheckStatus::Warn,
+            message: drift.join("; "),
+            fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
+        }
+    }
+}
+
+fn install_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn unified_install_check() -> plug_core::doctor::CheckResult {
+    use plug_core::ipc::{
+        DaemonOwnershipMode, IpcRequest, IpcResponse, OPERATOR_IPC_MAX, OPERATOR_IPC_MIN,
+    };
+
+    let app = crate::install::resolve_verified_app().ok().flatten();
+    let shell_resolution = crate::install::resolve_login_shell_command().ok().flatten();
+    let handshake = crate::daemon::ipc_request(&IpcRequest::OperatorHandshake {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        ipc_min: OPERATOR_IPC_MIN,
+        ipc_max: OPERATOR_IPC_MAX,
+    })
+    .await
+    .ok();
+    let (daemon_version, daemon_executable, ownership) = match handshake {
+        Some(IpcResponse::OperatorHandshake { handshake }) => (
+            Some(handshake.daemon_version),
+            handshake.daemon_executable,
+            handshake.ownership,
+        ),
+        _ => (None, None, DaemonOwnershipMode::Unmanaged),
+    };
+    let live_sessions = match crate::daemon::ipc_request(&IpcRequest::ListLiveSessions).await {
+        Ok(IpcResponse::LiveSessions { sessions, .. }) => sessions,
+        _ => Vec::new(),
+    };
+    let current_version = app
+        .as_ref()
+        .map_or(env!("CARGO_PKG_VERSION"), |app| app.version.as_str());
+    let adapters = live_sessions
+        .iter()
+        .map(|session| {
+            crate::install::classify_adapter_version(
+                session.adapter_version.as_deref(),
+                current_version,
+            )
+        })
+        .collect();
+    let linked_clients = inspect_linked_clients(app.as_ref());
+    let launchd_jobs = crate::service::discover_launchd_jobs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(crate::install::is_plug_launchd_candidate)
+        .collect();
+    let shadows = crate::install::discover_shadow_installations(app.as_ref());
+    unified_install_check_from_snapshot(&crate::install::UnifiedInstallSnapshot {
+        app,
+        shell_resolution,
+        daemon_version,
+        daemon_executable,
+        ownership,
+        linked_clients,
+        adapters,
+        shadows,
+        launchd_jobs,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_linked_clients(
+    app: Option<&crate::install::VerifiedAppInstallation>,
+) -> Vec<ClientRepairItem> {
+    let Some(app) = app else {
+        return Vec::new();
+    };
+    let http_url = crate::commands::clients::configured_http_export_url(None)
+        .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
+    crate::commands::clients::all_client_targets()
+        .iter()
+        .filter_map(|(_, target)| {
+            let target_enum: plug_core::export::ExportTarget = target.parse().ok()?;
+            let path = plug_core::export::default_config_path(target_enum, false)?;
+            if !path.exists() {
+                return None;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) => {
+                    return Some(ClientRepairItem {
+                        target: (*target).to_string(),
+                        path,
+                        disposition: PlugLinkDisposition::UnknownCommand,
+                        changed: false,
+                        message: format!("Could not read client config; left untouched: {error}"),
+                    });
+                }
+            };
+            match repair_client_content(
+                target_enum,
+                &path,
+                &content,
+                &app.executable_path,
+                &http_url,
+            ) {
+                Ok(repair) => Some(ClientRepairItem {
+                    target: (*target).to_string(),
+                    path,
+                    disposition: repair.disposition,
+                    changed: false,
+                    message: repair.message,
+                }),
+                Err(error) => Some(ClientRepairItem {
+                    target: (*target).to_string(),
+                    path,
+                    disposition: PlugLinkDisposition::UnknownCommand,
+                    changed: false,
+                    message: format!("Could not inspect client config; left untouched: {error}"),
+                }),
+            }
+        })
+        .collect()
 }
 
 async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
@@ -651,6 +906,7 @@ pub(crate) fn cmd_setup(
     Ok(())
 }
 
+#[cfg(test)]
 fn repair_export_endpoint(
     linked_endpoint: Option<&str>,
     config_path: Option<&std::path::PathBuf>,
@@ -750,6 +1006,144 @@ mod tests {
             message: message.to_string(),
             fix_suggestion: None,
         }
+    }
+
+    fn unified_snapshot() -> crate::install::UnifiedInstallSnapshot {
+        let executable = std::path::PathBuf::from("/Applications/Plug.app/Contents/Resources/plug");
+        crate::install::UnifiedInstallSnapshot {
+            app: Some(crate::install::VerifiedAppInstallation {
+                bundle_path: std::path::PathBuf::from("/Applications/Plug.app"),
+                executable_path: executable.clone(),
+                version: "0.6.4".to_string(),
+            }),
+            shell_resolution: Some(executable.clone()),
+            daemon_version: Some("0.6.4".to_string()),
+            daemon_executable: Some(executable),
+            ownership: plug_core::ipc::DaemonOwnershipMode::AppManaged,
+            linked_clients: vec![ClientRepairItem {
+                target: "cursor".to_string(),
+                path: std::path::PathBuf::from("/tmp/cursor.json"),
+                disposition: PlugLinkDisposition::Canonical,
+                changed: false,
+                message: "Already canonical.".to_string(),
+            }],
+            adapters: vec![
+                crate::install::AdapterVersionState::Current,
+                crate::install::AdapterVersionState::CompatibleOlder,
+                crate::install::AdapterVersionState::Missing,
+            ],
+            shadows: Vec::new(),
+            launchd_jobs: vec![crate::service::LaunchdJobRecord {
+                label: "com.plug.daemon".to_string(),
+                program: std::path::PathBuf::from("/Applications/Plug.app/Contents/Resources/plug"),
+            }],
+        }
+    }
+
+    #[test]
+    fn unified_install_healthy_matrix_has_one_canonical_message() {
+        let snapshot = unified_snapshot();
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(
+            result.message,
+            "Plug.app owns the app, command line, daemon, and client links."
+        );
+        assert_eq!(result.fix_suggestion, None);
+        let json = serde_json::to_value(snapshot).unwrap();
+        for key in [
+            "app",
+            "shell_resolution",
+            "daemon_version",
+            "daemon_executable",
+            "ownership",
+            "linked_clients",
+            "adapters",
+            "shadows",
+            "launchd_jobs",
+        ] {
+            assert!(json.get(key).is_some(), "missing stable JSON field {key}");
+        }
+    }
+
+    #[test]
+    fn unified_install_matrix_reports_every_repairable_drift_with_one_action() {
+        let cases = [
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot.shell_resolution =
+                    Some(std::path::PathBuf::from("/opt/homebrew/bin/plug"));
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot.daemon_version = Some("0.6.3".to_string());
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot.daemon_executable =
+                    Some(std::path::PathBuf::from("/Users/me/.cargo/bin/plug"));
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot.ownership = plug_core::ipc::DaemonOwnershipMode::CliManaged;
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot.linked_clients[0].disposition = PlugLinkDisposition::RecognizedLegacy;
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot.shadows.push(crate::install::ShadowInstallation {
+                    kind: "homebrew_formula".to_string(),
+                    path: std::path::PathBuf::from("/opt/homebrew/Cellar/plug/0.6.3/bin/plug"),
+                    verified_plug_owned: true,
+                });
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot
+                    .adapters
+                    .push(crate::install::AdapterVersionState::Incompatible);
+                snapshot
+            },
+            {
+                let mut snapshot = unified_snapshot();
+                snapshot
+                    .launchd_jobs
+                    .push(crate::service::LaunchdJobRecord {
+                        label: "local.plug.lookalike".to_string(),
+                        program: std::path::PathBuf::from("/Applications/Other.app/other"),
+                    });
+                snapshot
+            },
+        ];
+
+        for snapshot in cases {
+            let result = super::unified_install_check_from_snapshot(&snapshot);
+            assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
+            assert_eq!(
+                result.fix_suggestion.as_deref(),
+                Some("Open Plug.app and retry reconciliation.")
+            );
+        }
+    }
+
+    #[test]
+    fn unified_install_absent_app_is_a_failure() {
+        let mut snapshot = unified_snapshot();
+        snapshot.app = None;
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.fix_suggestion.as_deref(),
+            Some("Open Plug.app and retry reconciliation.")
+        );
     }
 
     #[test]
@@ -1442,5 +1836,22 @@ pub(crate) fn cmd_repair(
         }
     }
 
+    Ok(())
+}
+
+pub(crate) fn cmd_uninstall_cleanup(output: &OutputFormat) -> anyhow::Result<()> {
+    let report = crate::install::uninstall_cleanup()?;
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Text => {
+            for item in report.items {
+                if item.changed {
+                    print_success_line(item.message);
+                } else {
+                    print_info_line(item.message);
+                }
+            }
+        }
+    }
     Ok(())
 }

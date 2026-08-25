@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 
 pub const APP_BUNDLE_ID: &str = "com.cyberpapiii.plug";
 pub const DEVELOPER_TEAM_ID: &str = "HJF7LN64XX";
@@ -12,11 +13,60 @@ pub const DEVELOPER_TEAM_ID: &str = "HJF7LN64XX";
 const LOOP_MARKER: &str = "PLUG_APP_EXEC";
 const BUNDLE_EXECUTABLE: &str = "Contents/Resources/plug";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifiedAppInstallation {
     pub bundle_path: PathBuf,
     pub executable_path: PathBuf,
     pub version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterVersionState {
+    Current,
+    CompatibleOlder,
+    Missing,
+    Incompatible,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ShadowInstallation {
+    pub kind: String,
+    pub path: PathBuf,
+    pub verified_plug_owned: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UnifiedInstallSnapshot {
+    pub app: Option<VerifiedAppInstallation>,
+    pub shell_resolution: Option<PathBuf>,
+    pub daemon_version: Option<String>,
+    pub daemon_executable: Option<PathBuf>,
+    pub ownership: plug_core::ipc::DaemonOwnershipMode,
+    pub linked_clients: Vec<crate::commands::clients::ClientRepairItem>,
+    pub adapters: Vec<AdapterVersionState>,
+    pub shadows: Vec<ShadowInstallation>,
+    pub launchd_jobs: Vec<crate::service::LaunchdJobRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UninstallCleanupItem {
+    pub kind: String,
+    pub path: Option<PathBuf>,
+    pub label: Option<String>,
+    pub changed: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UninstallCleanupReport {
+    pub items: Vec<UninstallCleanupItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CleanupLaunchdPlan {
+    remove_labels: Vec<String>,
+    preserved: Vec<UninstallCleanupItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +222,293 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn bounded_output(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().context("could not start bounded command")?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child
+                .wait_with_output()
+                .context("could not collect command output");
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("command timed out after {}ms", timeout.as_millis());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Resolve the command a normal interactive login shell will execute.
+pub fn resolve_login_shell_command() -> Result<Option<PathBuf>> {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsStr::new("/bin/zsh").to_owned());
+    let mut command = Command::new(shell);
+    command.args(["-lic", "command -v plug"]);
+    let output = bounded_output(command, std::time::Duration::from_secs(2))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let output =
+        String::from_utf8(output.stdout).context("shell command resolution was not UTF-8")?;
+    let path = output
+        .lines()
+        .last()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    Ok(path.map(PathBuf::from))
+}
+
+pub fn classify_adapter_version(version: Option<&str>, current: &str) -> AdapterVersionState {
+    let Some(version) = version else {
+        return AdapterVersionState::Missing;
+    };
+    if version == current {
+        return AdapterVersionState::Current;
+    }
+    match (numeric_version(version), numeric_version(current)) {
+        (Some(found), Some(expected)) if found < expected => AdapterVersionState::CompatibleOlder,
+        _ => AdapterVersionState::Incompatible,
+    }
+}
+
+fn numeric_version(version: &str) -> Option<Vec<u64>> {
+    version
+        .split('.')
+        .map(|part| {
+            part.split_once('-')
+                .map_or(part, |(number, _)| number)
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+fn verify_shadow_identity(path: &Path) -> bool {
+    let mut command = Command::new(path);
+    command.arg("--version");
+    bounded_output(command, std::time::Duration::from_secs(2))
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|output| {
+            output
+                .trim()
+                .strip_prefix("plug ")
+                .is_some_and(|version| numeric_version(version).is_some())
+        })
+}
+
+/// Inspect only recognized legacy installation locations. Unknown contents are
+/// reported with `verified_plug_owned = false` and never mutated here.
+pub fn discover_shadow_installations(
+    app: Option<&VerifiedAppInstallation>,
+) -> Vec<ShadowInstallation> {
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(("cargo", home.join(".cargo/bin/plug")));
+    }
+    candidates.push(("homebrew", PathBuf::from("/opt/homebrew/bin/plug")));
+    candidates.push(("homebrew", PathBuf::from("/usr/local/bin/plug")));
+    for cellar in ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"] {
+        if let Ok(versions) = std::fs::read_dir(cellar) {
+            for version in versions.flatten() {
+                candidates.push(("homebrew_formula", version.path().join("bin/plug")));
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| left.1.cmp(&right.1));
+    candidates.dedup_by(|left, right| left.1 == right.1);
+    candidates
+        .into_iter()
+        .filter(|(_, path)| path.exists())
+        .filter(|(_, path)| !app.is_some_and(|app| paths_match(path, &app.executable_path)))
+        .map(|(kind, path)| ShadowInstallation {
+            verified_plug_owned: verify_shadow_identity(&path),
+            kind: kind.to_string(),
+            path,
+        })
+        .collect()
+}
+
+fn cleanup_command_link(
+    path: &Path,
+    app: Option<&VerifiedAppInstallation>,
+) -> Result<UninstallCleanupItem> {
+    let base = UninstallCleanupItem {
+        kind: "command_link".to_string(),
+        path: Some(path.to_path_buf()),
+        label: None,
+        changed: false,
+        message: String::new(),
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(UninstallCleanupItem {
+            message: "Command link was absent; nothing changed.".to_string(),
+            ..base
+        });
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(UninstallCleanupItem {
+            message: "Unknown command file was left untouched.".to_string(),
+            ..base
+        });
+    }
+    let Some(app) = app else {
+        return Ok(UninstallCleanupItem {
+            message: "Command link ownership could not be proven; left untouched.".to_string(),
+            ..base
+        });
+    };
+    let target = std::fs::read_link(path)?;
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+    };
+    if !paths_match(&resolved, &app.executable_path) {
+        return Ok(UninstallCleanupItem {
+            message: "Command link does not target the verified Plug.app; left untouched."
+                .to_string(),
+            ..base
+        });
+    }
+    std::fs::remove_file(path)?;
+    Ok(UninstallCleanupItem {
+        changed: true,
+        message: "Removed the verified Plug.app command link.".to_string(),
+        ..base
+    })
+}
+
+fn cleanup_launchd_plan(
+    jobs: &[crate::service::LaunchdJobRecord],
+    app: Option<&VerifiedAppInstallation>,
+) -> CleanupLaunchdPlan {
+    let mut remove_labels = Vec::new();
+    let mut preserved = Vec::new();
+    for job in jobs {
+        if matches!(
+            crate::service::classify_launchd_program(
+                job,
+                app.map(|app| app.executable_path.as_path())
+            ),
+            crate::service::LaunchdProgramOwnership::CurrentApp
+        ) {
+            remove_labels.push(job.label.clone());
+        } else {
+            preserved.push(UninstallCleanupItem {
+                kind: "launchd_job".to_string(),
+                path: Some(job.program.clone()),
+                label: Some(job.label.clone()),
+                changed: false,
+                message: "Launchd job ownership was not proven app-owned; left untouched."
+                    .to_string(),
+            });
+        }
+    }
+    CleanupLaunchdPlan {
+        remove_labels,
+        preserved,
+    }
+}
+
+pub fn is_plug_launchd_candidate(job: &crate::service::LaunchdJobRecord) -> bool {
+    job.label == "com.plug.daemon"
+        || job.label.to_ascii_lowercase().ends_with(".plug")
+        || job.program.file_name().and_then(|name| name.to_str()) == Some("plug")
+}
+
+/// Remove only installation artifacts positively proven to belong to the
+/// currently verified Plug.app. Configuration and credentials are untouched.
+pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
+    let mut items = Vec::new();
+    let app = match resolve_verified_app() {
+        Ok(app) => app,
+        Err(error) => {
+            items.push(UninstallCleanupItem {
+                kind: "app_verification".to_string(),
+                path: None,
+                label: None,
+                changed: false,
+                message: format!("Plug.app verification failed; all unknown files and jobs were left untouched: {error}"),
+            });
+            None
+        }
+    };
+    let command_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/bin/plug");
+    items.push(cleanup_command_link(&command_path, app.as_ref())?);
+
+    let jobs = match crate::service::discover_launchd_jobs() {
+        Ok(jobs) => jobs.into_iter().filter(is_plug_launchd_candidate).collect(),
+        Err(error) => {
+            items.push(UninstallCleanupItem {
+                kind: "launchd_discovery".to_string(),
+                path: None,
+                label: None,
+                changed: false,
+                message: format!("Launchd jobs could not be proven; left untouched: {error}"),
+            });
+            Vec::new()
+        }
+    };
+    let plan = cleanup_launchd_plan(&jobs, app.as_ref());
+    items.extend(plan.preserved);
+    if !plan.remove_labels.is_empty() {
+        let uid = bounded_output(
+            {
+                let mut command = Command::new("/usr/bin/id");
+                command.arg("-u");
+                command
+            },
+            std::time::Duration::from_secs(2),
+        )?;
+        let uid = String::from_utf8(uid.stdout)?.trim().to_string();
+        for label in plan.remove_labels {
+            let mut command = Command::new("/bin/launchctl");
+            command.args(["bootout", &format!("gui/{uid}/{label}")]);
+            let output = bounded_output(command, std::time::Duration::from_secs(5));
+            match output {
+                Ok(output) if output.status.success() => items.push(UninstallCleanupItem {
+                    kind: "launchd_job".to_string(),
+                    path: app.as_ref().map(|app| app.executable_path.clone()),
+                    label: Some(label),
+                    changed: true,
+                    message: "Unregistered the verified Plug.app launchd service.".to_string(),
+                }),
+                Ok(output) => items.push(UninstallCleanupItem {
+                    kind: "launchd_job".to_string(),
+                    path: app.as_ref().map(|app| app.executable_path.clone()),
+                    label: Some(label),
+                    changed: false,
+                    message: format!(
+                        "Verified app-owned launchd service could not be unregistered; left registered: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                }),
+                Err(error) => items.push(UninstallCleanupItem {
+                    kind: "launchd_job".to_string(),
+                    path: app.as_ref().map(|app| app.executable_path.clone()),
+                    label: Some(label),
+                    changed: false,
+                    message: format!("Verified app-owned launchd service could not be unregistered; left registered: {error}"),
+                }),
+            }
+        }
+    }
+    Ok(UninstallCleanupReport { items })
+}
+
 fn verify_candidate(
     bundle_version: &str,
     executable_version: &str,
@@ -233,11 +570,10 @@ fn verify_app_bundle(bundle_path: &Path) -> Result<VerifiedAppInstallation> {
 
 #[cfg(target_os = "macos")]
 fn verify_codesign(bundle_path: &Path) -> Result<()> {
-    let requirement = format!(
-        "anchor apple generic and identifier \"{APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{DEVELOPER_TEAM_ID}\""
-    );
+    let requirement = codesign_requirement_argument();
     let status = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict", "-R", &requirement])
+        .args(["--verify", "--strict"])
+        .arg(&requirement)
         .arg(bundle_path)
         .status()
         .context("could not run codesign to verify Plug.app")?;
@@ -247,6 +583,16 @@ fn verify_codesign(bundle_path: &Path) -> Result<()> {
         bundle_path.display()
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_requirement_argument() -> String {
+    // codesign requires the short requirement option and its value in one
+    // argv element. Passing "-R" and the expression separately makes codesign
+    // interpret the expression as a file path.
+    format!(
+        "-R=anchor apple generic and identifier \"{APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{DEVELOPER_TEAM_ID}\""
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -373,5 +719,106 @@ mod tests {
             canonical_client_command_from(None, current, false, false).unwrap(),
             current
         );
+    }
+
+    #[test]
+    fn adapter_versions_distinguish_current_older_missing_and_incompatible() {
+        assert_eq!(
+            super::classify_adapter_version(Some("0.6.4"), "0.6.4"),
+            super::AdapterVersionState::Current
+        );
+        assert_eq!(
+            super::classify_adapter_version(Some("0.6.3"), "0.6.4"),
+            super::AdapterVersionState::CompatibleOlder
+        );
+        assert_eq!(
+            super::classify_adapter_version(None, "0.6.4"),
+            super::AdapterVersionState::Missing
+        );
+        assert_eq!(
+            super::classify_adapter_version(Some("0.7.0"), "0.6.4"),
+            super::AdapterVersionState::Incompatible
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codesign_requirement_is_one_option_argument() {
+        let argument = super::codesign_requirement_argument();
+        assert!(argument.starts_with("-R=anchor apple generic"));
+        assert!(argument.contains(super::APP_BUNDLE_ID));
+        assert!(argument.contains(super::DEVELOPER_TEAM_ID));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_cleanup_removes_only_symlink_to_verified_app() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "plug-uninstall-cleanup-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let app = app(root.join("Plug.app"));
+        std::fs::create_dir_all(app.executable_path.parent().unwrap()).unwrap();
+        std::fs::write(&app.executable_path, "plug").unwrap();
+        let link = root.join("bin/plug");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&app.executable_path, &link).unwrap();
+
+        let outcome = super::cleanup_command_link(&link, Some(&app)).unwrap();
+        assert!(outcome.changed);
+        assert!(!link.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_cleanup_reports_unknown_file_and_leaves_it_untouched() {
+        let root =
+            std::env::temp_dir().join(format!("plug-uninstall-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("plug");
+        std::fs::write(&path, "unrelated").unwrap();
+
+        let outcome = super::cleanup_command_link(&path, None).unwrap();
+        assert!(!outcome.changed);
+        assert!(outcome.message.contains("left untouched"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "unrelated");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_cleanup_plans_only_proven_app_owned_launchd_jobs() {
+        let app = app("/Applications/Plug.app");
+        let jobs = vec![
+            crate::service::LaunchdJobRecord {
+                label: "com.plug.daemon".to_string(),
+                program: app.executable_path.clone(),
+            },
+            crate::service::LaunchdJobRecord {
+                label: "local.plug.unknown".to_string(),
+                program: PathBuf::from("/Applications/Other.app/other"),
+            },
+        ];
+
+        let plan = super::cleanup_launchd_plan(&jobs, Some(&app));
+        assert_eq!(plan.remove_labels, vec!["com.plug.daemon"]);
+        assert_eq!(plan.preserved.len(), 1);
+        assert!(plan.preserved[0].message.contains("left untouched"));
+    }
+
+    #[test]
+    fn uninstall_cleanup_candidate_filter_ignores_unrelated_plugin_jobs() {
+        let unrelated = crate::service::LaunchdJobRecord {
+            label: "com.apple.XprotectFramework.PluginService".to_string(),
+            program: PathBuf::from("/System/Library/XProtectPluginService"),
+        };
+        let unknown_plug = crate::service::LaunchdJobRecord {
+            label: "local.claude-rc.plug".to_string(),
+            program: PathBuf::from("/Users/example/.local/bin/claude"),
+        };
+        assert!(!super::is_plug_launchd_candidate(&unrelated));
+        assert!(super::is_plug_launchd_candidate(&unknown_plug));
     }
 }

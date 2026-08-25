@@ -237,6 +237,9 @@ enum Commands {
     #[command(display_order = 20)]
     /// macOS: install a stable code-signing identity so Keychain prompts stop recurring
     CodesignSetup,
+    #[command(hide = true)]
+    /// Internal: remove only installation artifacts proven to belong to Plug.app
+    UninstallCleanup,
 }
 
 #[derive(Subcommand)]
@@ -548,6 +551,7 @@ async fn main() -> anyhow::Result<()> {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
         Some(Commands::CodesignSetup) => commands::codesign::cmd_codesign_setup(&cli.output)?,
+        Some(Commands::UninstallCleanup) => commands::misc::cmd_uninstall_cleanup(&cli.output)?,
     }
 
     Ok(())
