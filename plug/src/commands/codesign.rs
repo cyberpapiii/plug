@@ -107,6 +107,7 @@ fn run_macos(output: &OutputFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_development_signing_target(
     development_mode: bool,
     executable: &std::path::Path,

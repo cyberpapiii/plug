@@ -41,6 +41,9 @@ pub(crate) fn install_test_credential_environment() {
 
 mod commands;
 mod daemon;
+// The unified installation model is fully exercised on macOS and in tests;
+// Linux keeps only the small standalone-command subset at runtime.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod install;
 mod ipc_proxy;
 mod runtime;
