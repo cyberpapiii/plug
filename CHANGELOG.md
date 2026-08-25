@@ -7,6 +7,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-25
+
+Detailed notes: [Plug 0.5.1](docs/RELEASE-NOTES-0.5.1.md).
+
+### Fixed
+
+- Prevented the native app from crashing when macOS completes notification authorization on a background queue.
+- Made first-run daemon adoption recognize and replace stale or legacy LaunchAgents, stop an unmanaged older daemon gracefully, and restart the app-owned daemon deterministically.
+- Prevented test runtimes from ever registering their temporary binaries as the real macOS background service.
+
 ## [0.5.0] - 2026-08-25
 
 Detailed notes: [Plug 0.5.0](docs/RELEASE-NOTES-0.5.0.md).
@@ -180,7 +190,8 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/cyberpapiii/plug/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/cyberpapiii/plug/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cyberpapiii/plug/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cyberpapiii/plug/releases/tag/v0.3.0

@@ -139,6 +139,10 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     if crate::daemon::connect_to_daemon().await.is_some() {
         return Ok(false);
     }
+    #[cfg(test)]
+    if crate::daemon::test_runtime_paths_active() {
+        anyhow::bail!("test daemon unavailable; refusing to mutate launchd");
+    }
     let uid = user_id()?;
     let state = inspect()?;
     match state.ownership {
@@ -215,5 +219,22 @@ mod tests {
         assert!(plist.contains("/tmp/Plug &amp; Me/plug"));
         assert!(plist.contains("/tmp/a&lt;b.toml"));
         assert_eq!(plist.matches("--daemon").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirected_test_runtime_never_mutates_launchd() {
+        let _guard = crate::daemon::runtime_paths_test_lock().lock().await;
+        let temp =
+            std::env::temp_dir().join(format!("plug-service-launchd-guard-{}", std::process::id()));
+        crate::daemon::set_test_runtime_paths(temp.join("runtime"), temp.join("state"));
+
+        let result = ensure_started(None).await;
+
+        crate::daemon::clear_test_runtime_paths();
+        let error = result.expect_err("test startup must fail closed");
+        assert!(
+            error.to_string().contains("refusing to mutate launchd"),
+            "unexpected error: {error:#}"
+        );
     }
 }
