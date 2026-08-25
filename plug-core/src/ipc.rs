@@ -67,6 +67,8 @@ pub enum OperatorCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorHandshake {
     pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_executable: Option<std::path::PathBuf>,
     pub ipc_min: u16,
     pub ipc_max: u16,
     pub ownership: DaemonOwnershipMode,
@@ -1140,6 +1142,9 @@ mod tests {
         let response = IpcResponse::OperatorHandshake {
             handshake: OperatorHandshake {
                 daemon_version: "0.5.0".to_string(),
+                daemon_executable: Some(std::path::PathBuf::from(
+                    "/Applications/Plug.app/Contents/Resources/plug",
+                )),
                 ipc_min: 3,
                 ipc_max: 4,
                 ownership: DaemonOwnershipMode::AppManaged,
@@ -1154,8 +1159,35 @@ mod tests {
             panic!("expected operator handshake");
         };
         assert_eq!(handshake.daemon_version, "0.5.0");
+        assert_eq!(
+            handshake.daemon_executable.as_deref(),
+            Some(std::path::Path::new(
+                "/Applications/Plug.app/Contents/Resources/plug"
+            ))
+        );
         assert_eq!(handshake.ipc_max, 4);
         assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
+    }
+
+    #[test]
+    fn operator_handshake_decodes_without_daemon_executable() {
+        let old_response = serde_json::json!({
+            "type": "OperatorHandshake",
+            "handshake": {
+                "daemon_version": "0.5.0",
+                "ipc_min": 3,
+                "ipc_max": 4,
+                "ownership": "cli_managed",
+                "capabilities": []
+            }
+        });
+
+        let decoded: IpcResponse =
+            serde_json::from_value(old_response).expect("old handshake must remain compatible");
+        let IpcResponse::OperatorHandshake { handshake } = decoded else {
+            panic!("expected operator handshake");
+        };
+        assert_eq!(handshake.daemon_executable, None);
     }
 
     #[test]

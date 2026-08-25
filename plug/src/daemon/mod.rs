@@ -1062,6 +1062,12 @@ async fn dispatch_operator_mutation(
     }
 }
 
+fn current_daemon_executable() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+}
+
 /// Dispatch a single IPC request to the appropriate Engine query.
 async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     fn downstream_http_live_sessions(
@@ -1111,6 +1117,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
             handshake: plug_core::ipc::OperatorHandshake {
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                daemon_executable: current_daemon_executable(),
                 ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
                 ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
                 ownership: crate::service::ipc_ownership(),
@@ -2137,6 +2144,12 @@ mod tests {
         if let Some(dir) = config_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn reported_daemon_executable_is_canonical() {
+        let expected = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(current_daemon_executable(), Some(expected));
     }
 
     #[test]
