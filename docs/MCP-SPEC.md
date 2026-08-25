@@ -282,7 +282,7 @@ Normal request/response/notification flow.
 **Plug's own icon metadata**:
 - Plug advertises embedded PNG `data:` icons first in `initialize.serverInfo.icons`: `16x16`, `32x32`, `64x64`, `128x128`, `256x256`, and `512x512`.
 - Plug also advertises its trusted embedded SVG icon as a final `sizes: ["any"]` fallback.
-- Claude Desktop's MCPB/Desktop Extension UI uses `packaging/mcpb/manifest.json` icon fields when Plug is packaged as `target/dist/plug.mcpb`; those package icons are separate from runtime MCP `serverInfo.icons`.
+- Client UIs may choose whether to render MCP icon metadata. Plug keeps this runtime metadata independent of its macOS app packaging.
 - Codex Desktop may ignore MCP icon metadata in its current UI even when Plug sends it correctly.
 
 **Icon normalization in `plug`**:

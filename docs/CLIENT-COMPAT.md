@@ -26,7 +26,7 @@ For clients that render MCP item icons, Plug forwards source-specific icons on r
 
 Operator JSON also exposes the normalized upstream metadata so clients or diagnostics can show which routed tools came from which branded upstream server.
 
-Claude Desktop has a separate MCPB/Desktop Extension icon surface. If you install Plug through an MCPB bundle, Claude's extension/settings UI reads `packaging/mcpb/manifest.json`, whose `icon` and `icons` fields point to the packaged PNG assets. This is distinct from runtime MCP `serverInfo.icons`.
+Claude Desktop is linked through its normal MCP configuration and `plug connect`. Its UI may choose whether to render runtime MCP `serverInfo.icons`; Plug's macOS app packaging is separate from that protocol metadata.
 
 Codex Desktop currently documents MCP server configuration but does not document rendering MCP icon metadata. Treat Plug's `icons` fields as correct metadata for clients that support them, not as a guarantee that Codex Desktop will show the image in its current MCP panel.
 

@@ -84,20 +84,18 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releas
 
 Download the binary for your platform from the [releases page](https://github.com/cyberpapiii/plug/releases), verify the SHA-256 checksum, and place it in your PATH.
 
-### Claude Desktop extension bundle
+### Connect Claude Desktop
 
-Claude Desktop can show icons through its MCPB/Desktop Extension install surface.
-Build a local bundle after compiling the release binary:
+Open Plug.app once to finish setup, then link Claude Desktop from the app's
+Clients view. The CLI equivalent is:
 
 ```sh
-cargo build --release
-./scripts/build-mcpb.sh
+plug link claude-desktop
 ```
 
-This writes `target/dist/plug.mcpb`, bundling the `plug` binary plus PNG icon
-assets. Install that file from Claude Desktop's Extensions developer settings.
-The normal `plug connect` config path remains supported; MCPB is only needed when
-you want Claude Desktop's extension UI to use Plug's packaged icon metadata.
+Plug writes Claude Desktop's normal MCP configuration and routes it through the
+same bundled runtime as the app. There is no separate executable extension to
+install or update.
 
 ## Quick Start
 
