@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` at squash commit `52b2c7b` on 2026-08-25.
+Baseline: `main` at squash commit `9fdae06` on 2026-08-25.
 
 This is the canonical current-state doc for the project.
 
@@ -124,16 +124,35 @@ Partial on `main`:
 No roadmap-relevant implementation currently exists only off-main. The native
 operator app, its daemon API and lifecycle ownership, distribution automation,
 and the 22/22 official modern server conformance fixes landed on `main` in
-PR #96 (`52b2c7b`).
+PR #96 (`52b2c7b`); the public-install daemon-adoption repair landed in PR #101
+(`9fdae06`).
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
-modern protocol gates still default to off. Modern listeners, mixed-era
+modern protocol gates still default to off. This Mac enables only the proven
+modern downstream HTTP gate; modern upstream negotiation remains off and every
+configured upstream remains pinned to `legacy` until its real client/server
+combination is certified. Modern listeners, mixed-era
 multi-round bridging, task-plus-multi-round calls, and Apps/UI capability
 advertisement remain intentionally suppressed rather than advertised.
 Synthesized multi-upstream catalog pages emit conservative cache directives
 (`ttlMs: 0`, `cacheScope: private`) for modern peers; legacy responses strip them.
 
 ## Release Status
+
+Release `v0.5.2` is published from `9fdae06`. Its public checksums verify, the
+universal `Plug.app` and embedded daemon are Developer ID signed with hardened
+runtime, and both the app and DMG are notarized and stapled. The release app and
+CLI are installed on this Mac and report version `0.5.2`. The installed binary
+also passed the official prerelease MCP `2026-07-28` server suite independently
+against the release fixture: 22 passed, 0 failed. Production enables modern
+downstream HTTP only; modern upstream remains legacy-compatible by design for
+the currently observed clients and servers.
+
+The app's ServiceManagement registration points at the public build-6 bundle.
+On this developer machine, final app-owned daemon adoption still requires the
+one-time macOS Keychain **Always Allow** decision for the existing `plug`
+credential; until that owner action completes, reconnecting CLI clients keep a
+healthy 0.5.2 daemon running through the existing fallback path.
 
 Owner-verified downstream OAuth is done on `main` through merge commit
 `8adbcd1`. Fresh merged-main verification passed 1,106 workspace tests and 5

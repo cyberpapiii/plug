@@ -60,6 +60,7 @@ forwarding work:
 - signed/notarized/stapled DMG distribution, Sparkle 2 signed updates, and a Homebrew cask sharing the same app artifact (PR #96)
 - daemon operator IPC with compatibility-range negotiation, inventory/activity snapshots, server mutations, OAuth actions, and downstream grant revocation (PR #96)
 - official prerelease MCP 2026 server conformance at 22/22, with request-scoped progress, concrete resource-template routing, and prefix-disabled routing fixes (PR #96)
+- public `v0.5.2` release with independently verified checksums, Developer ID signatures, notarized/stapled universal app + DMG, signed Sparkle feed, and installed 0.5.2 app/CLI (PR #101)
 
 ## What Exists Today
 
@@ -125,6 +126,15 @@ Optional future scope only:
 - continuing optional operator/runtime polish now that daemon mode owns the primary shared runtime
 - further low-priority simplification of internal reload/session/SSE helper structure
 - further optional modern follow-through behind gates (`subscriptions/listen`, mixed-era MRTR, task+MRTR) when production clients speak 2026
+
+Current operator rollout: this Mac enables the independently certified modern
+downstream HTTP path while keeping modern upstream negotiation off and every
+configured upstream pinned to `legacy`. The installed 0.5.2 binary passes the
+official prerelease MCP `2026-07-28` server suite 22/22. App-owned launchd
+adoption is ready and registered to the public build-6 bundle; its final live
+handoff is waiting only on the owner's one-time macOS Keychain **Always Allow**
+decision for the existing `plug` credential. Reconnecting clients continue to
+run the healthy 0.5.2 daemon in the meantime.
 
 ## Modernization And Prior Program Phases
 
