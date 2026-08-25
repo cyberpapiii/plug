@@ -173,7 +173,7 @@ private final class AcceptWithoutReplyServer: @unchecked Sendable {
 private final class AcceptedNeverReadServer: @unchecked Sendable {
     let socketURL: URL
     private let listener: Int32
-    private let accepting = DispatchSemaphore(value: 0)
+    private let accepted = DispatchSemaphore(value: 0)
     private let release = DispatchSemaphore(value: 0)
     private let finished = DispatchSemaphore(value: 0)
 
@@ -196,19 +196,33 @@ private final class AcceptedNeverReadServer: @unchecked Sendable {
             throw PlugIPCError.systemCall("listen", code)
         }
 
+        // Establish a first connection so readiness is signaled only after accept
+        // succeeds. The second connection is the request socket that never reads.
+        let readinessClient = try PlugIPCClient.openSocket(path: socketURL.path)
         let release = release
         let finished = finished
-        let accepting = accepting
+        let accepted = accepted
         DispatchQueue.global(qos: .userInitiated).async {
-            accepting.signal()
-            let accepted = Darwin.accept(listenerFD, nil, nil)
-            if accepted >= 0 {
+            let readinessSocket = Darwin.accept(listenerFD, nil, nil)
+            if readinessSocket >= 0 {
+                accepted.signal()
+                Darwin.close(readinessSocket)
+            }
+
+            let requestSocket = Darwin.accept(listenerFD, nil, nil)
+            if requestSocket >= 0 {
                 _ = release.wait(timeout: .now() + .milliseconds(750))
-                Darwin.close(accepted)
+                Darwin.close(requestSocket)
             }
             finished.signal()
         }
-        _ = accepting.wait(timeout: .now() + 1)
+        guard accepted.wait(timeout: .now() + 1) == .success else {
+            Darwin.close(readinessClient)
+            Darwin.close(listener)
+            _ = finished.wait(timeout: .now() + 1)
+            throw PlugIPCError.systemCall("accept", ETIMEDOUT)
+        }
+        Darwin.close(readinessClient)
     }
 
     func stop() {
