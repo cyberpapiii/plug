@@ -1340,14 +1340,14 @@ fn yaml_value_span_end(
     let mut value_end = start + 1;
     while value_end < end {
         let line = &lines[value_end];
-        if !line.trim().is_empty() && indentation(line) <= assignment_indent {
-            break;
-        }
-        if !line.trim().is_empty() {
+        if line.trim().is_empty() {
             value_end += 1;
-        } else {
+            continue;
+        }
+        if indentation(line) <= assignment_indent {
             break;
         }
+        value_end += 1;
     }
     value_end
 }

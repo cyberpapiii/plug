@@ -1275,7 +1275,7 @@ mod tests {
             (
                 plug_core::export::ExportTarget::Goose,
                 std::path::Path::new("config.yaml"),
-                format!("extensions:\n  plug:\n    command: {cargo_command}\n    args:\n      - connect\n\n  # retain this unrelated comment\n  other:\n    command: other\n"),
+                format!("extensions:\n  plug:\n    command: {cargo_command}\n    args:\n\n      - connect\n\n  # retain this unrelated comment\n  other:\n    command: other\n"),
             ),
         ];
         for (target, path, content) in fixtures {
@@ -1283,6 +1283,10 @@ mod tests {
                 repair_client_content(target, path, &content, canonical, "unused").unwrap();
             let updated = repair.updated.expect("legacy entry should update");
             assert!(updated.contains("# retain this unrelated comment"));
+            assert!(
+                updated.contains("[mcp_servers.other]\ncommand = \"other\"")
+                    || updated.contains("other:\n    command: other")
+            );
             match target {
                 plug_core::export::ExportTarget::CodexCli => {
                     assert!(toml::from_str::<toml::Value>(&updated).is_ok());
