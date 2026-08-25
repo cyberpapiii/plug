@@ -7,6 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Documentation
+
+- Clarified supported installation paths: one Plug.app on macOS from the
+  website/GitHub DMG or Homebrew Cask (open it once), Linux Formula/shell/archive
+  installs, and isolated source development through `plug-dev`. Plug.app owns
+  the macOS GUI, command line, daemon, client links, and updates; headless macOS
+  is unsupported.
+
 ## [0.5.2] - 2026-08-25
 
 Detailed notes: [Plug 0.5.2](docs/RELEASE-NOTES-0.5.2.md).

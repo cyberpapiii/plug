@@ -51,6 +51,7 @@ targets:
         ENABLE_APP_SANDBOX: NO
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: HJF7LN64XX
+        VERSIONING_SYSTEM: apple-generic
   PlugAppTests:
     type: bundle.unit-test
     platform: macOS
