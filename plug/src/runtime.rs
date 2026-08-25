@@ -693,6 +693,7 @@ pub(crate) async fn send_authenticated_operator_request(
 struct ConfiguredHttpRuntime {
     router: Router,
     sessions: Arc<dyn plug_core::session::SessionStore>,
+    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
 }
 
 fn public_host_allowance(public_base_url: &str) -> Option<Arc<str>> {
@@ -733,7 +734,7 @@ fn build_configured_http_runtime(
         sessions: Arc::clone(&sessions),
         cancel: engine.cancel_token().clone(),
         auth_mode: config.http.auth_mode.clone(),
-        downstream_oauth,
+        downstream_oauth: downstream_oauth.clone(),
         sse_channel_capacity: config.http.sse_channel_capacity,
         allowed_origins: config
             .http
@@ -774,6 +775,7 @@ fn build_configured_http_runtime(
             )),
         ),
         sessions,
+        downstream_oauth,
     })
 }
 
@@ -1503,6 +1505,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         config_path,
         engine.config().daemon_grace_period_secs,
         Some(http_runtime.sessions),
+        http_runtime.downstream_oauth,
         runtime_lock,
     );
     tokio::pin!(daemon_future);

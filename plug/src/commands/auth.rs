@@ -285,6 +285,9 @@ async fn cmd_downstream_oauth_clients(
     command: crate::DownstreamOauthClientCommands,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
+    if config_path.is_none() {
+        return cmd_downstream_oauth_clients_via_daemon(command, output).await;
+    }
     let operator = local_operator_client(config_path, "/_plug/oauth/clients")?;
 
     match command {
@@ -342,6 +345,78 @@ async fn cmd_downstream_oauth_clients(
                 status => {
                     anyhow::bail!("the running Plug service rejected the revocation ({status})")
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_downstream_oauth_clients_via_daemon(
+    command: crate::DownstreamOauthClientCommands,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    crate::runtime::ensure_daemon_with_feedback(None, false).await?;
+    let auth_token = crate::daemon::read_auth_token()?;
+    match command {
+        crate::DownstreamOauthClientCommands::List => {
+            let response =
+                crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot {
+                    auth_token,
+                })
+                .await?;
+            let clients = match response {
+                plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot } => {
+                    snapshot.downstream_clients
+                }
+                plug_core::ipc::IpcResponse::Error { code, message } => {
+                    anyhow::bail!("{code}: {message}")
+                }
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            };
+            match output {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
+                OutputFormat::Text if clients.is_empty() => {
+                    ui::print_info_line("No downstream OAuth clients are registered")
+                }
+                OutputFormat::Text => {
+                    println!("{}", style("Registered downstream OAuth clients").bold());
+                    for registered in clients {
+                        println!(
+                            "  {} ({})",
+                            style(&registered.client_name).bold(),
+                            registered.client_id
+                        );
+                        println!("    Redirects: {}", registered.redirect_uris.join(", "));
+                        println!("    Source: {:?}", registered.source);
+                    }
+                }
+            }
+        }
+        crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
+            if !yes
+                && !dialoguer::Confirm::new()
+                    .with_prompt(format!("Revoke {client_id} and all of its Plug tokens?"))
+                    .default(false)
+                    .interact()?
+            {
+                ui::print_info_line("Revocation cancelled");
+                return Ok(());
+            }
+            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::RevokeDownstreamClient {
+                auth_token,
+                client_id: client_id.clone(),
+            })
+            .await?
+            {
+                plug_core::ipc::IpcResponse::DownstreamClientRevoked { .. } => {
+                    ui::print_success_line(format!(
+                        "Revoked {client_id} and all of its downstream OAuth grants"
+                    ));
+                }
+                plug_core::ipc::IpcResponse::Error { code, message } => {
+                    anyhow::bail!("{code}: {message}")
+                }
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
             }
         }
     }
