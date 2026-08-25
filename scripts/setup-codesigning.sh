@@ -36,11 +36,33 @@ sign_binary() {
   fi
 }
 
+print_next_steps() {
+  echo
+  if [[ -e "$CARGO_PLUG_DEV" ]]; then
+    cat <<EOF
+Setup complete. Next:
+  - Run the development command explicitly: PLUG_DEV=1 plug-dev
+  - You will get ONE more round of "Always Allow" Keychain prompts (one per OAuth
+    upstream) because the binary identity just changed. Click "Always Allow" —
+    those approvals now bind to the stable "$IDENTITY" identity and won't recur.
+  - Rebuild with ./scripts/dev-reinstall.sh — it only replaces plug-dev.
+EOF
+  else
+    cat <<'EOF'
+Setup complete. Next:
+  - Run ./scripts/dev-reinstall.sh to build and install plug-dev before running a development command.
+EOF
+  fi
+}
+
 if identity_is_valid; then
   echo "==> '$IDENTITY' is already a valid code-signing identity. Nothing to create."
   sign_binary
-  echo
-  echo "Done. Re-sign on every rebuild with ./scripts/dev-reinstall.sh (it signs automatically)."
+  if [[ -e "$CARGO_PLUG_DEV" ]]; then
+    echo
+    echo "Done. Re-sign on every rebuild with ./scripts/dev-reinstall.sh (it signs automatically)."
+  fi
+  print_next_steps
   exit 0
 fi
 
@@ -88,13 +110,4 @@ fi
 echo "==> '$IDENTITY' is now a valid code-signing identity."
 
 sign_binary
-
-cat <<EOF
-
-Setup complete. Next:
-  - Run the development command explicitly: PLUG_DEV=1 plug-dev
-  - You will get ONE more round of "Always Allow" Keychain prompts (one per OAuth
-    upstream) because the binary identity just changed. Click "Always Allow" —
-    those approvals now bind to the stable "$IDENTITY" identity and won't recur.
-  - Rebuild with ./scripts/dev-reinstall.sh — it only replaces plug-dev.
-EOF
+print_next_steps
