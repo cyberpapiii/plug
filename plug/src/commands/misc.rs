@@ -1370,6 +1370,179 @@ mod tests {
         assert!(value["checks"].is_array());
     }
 
+    #[test]
+    fn app_coordinator_release_contract_is_stable_and_preserves_unknown_state() {
+        let app = crate::install::VerifiedAppInstallation {
+            bundle_path: std::path::PathBuf::from("/Applications/Plug.app"),
+            executable_path: std::path::PathBuf::from(
+                "/Applications/Plug.app/Contents/Resources/plug",
+            ),
+            version: "0.6.4".to_string(),
+        };
+        let canonical_command = app.executable_path.to_string_lossy().into_owned();
+
+        // Canonical stdio export points clients at the app-owned executable.
+        let exported = plug_core::export::export_config(&plug_core::export::ExportOptions {
+            target: plug_core::export::ExportTarget::Cursor,
+            transport: plug_core::export::ExportTransport::Stdio,
+            port: 3282,
+            http_url: None,
+            command: canonical_command.clone(),
+        });
+        let exported: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(exported["mcpServers"]["plug"]["command"], canonical_command);
+        assert_eq!(
+            exported["mcpServers"]["plug"]["args"],
+            serde_json::json!(["connect"])
+        );
+
+        // Production delegation is a full exec plan into the verified app.
+        assert_eq!(
+            crate::install::delegation_decision(
+                std::path::Path::new("/opt/homebrew/bin/plug"),
+                Some(&app),
+                false,
+            )
+            .unwrap(),
+            crate::install::DelegationDecision::Exec(app.executable_path.clone())
+        );
+
+        // A recognized legacy client entry migrates to the canonical command.
+        let legacy = r#"{"mcpServers":{"plug":{"command":"/opt/homebrew/bin/plug","args":["connect"]},"unrelated":{"command":"other","custom":true}},"unknown":{"preserved":true}}"#;
+        let migrated = repair_client_content(
+            plug_core::export::ExportTarget::Cursor,
+            std::path::Path::new("/tmp/cursor.json"),
+            legacy,
+            &app.executable_path,
+            "http://localhost:3282/mcp",
+        )
+        .unwrap()
+        .updated
+        .expect("recognized legacy entry must migrate");
+        let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(
+            migrated["mcpServers"]["plug"]["command"],
+            serde_json::json!(app.executable_path)
+        );
+        assert_eq!(migrated["mcpServers"]["unrelated"]["custom"], true);
+        assert_eq!(migrated["unknown"]["preserved"], true);
+
+        // Unknown commands are represented exactly and never receive a rewrite.
+        let unknown_source = r#"{"mcpServers":{"plug":{"command":"/tmp/not-plug","args":["connect"]}},"unknown":{"preserved":true}}"#;
+        let unknown = repair_client_content(
+            plug_core::export::ExportTarget::Cursor,
+            std::path::Path::new("/tmp/unknown.json"),
+            unknown_source,
+            &app.executable_path,
+            "http://localhost:3282/mcp",
+        )
+        .unwrap();
+        assert_eq!(unknown.updated, None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(unknown_source).unwrap()["unknown"],
+            serde_json::json!({"preserved": true})
+        );
+
+        let repair = ClientRepairReport {
+            canonical_command: app.executable_path.clone(),
+            items: vec![ClientRepairItem {
+                target: "cursor".to_string(),
+                path: std::path::PathBuf::from("/tmp/unknown.json"),
+                disposition: unknown.disposition,
+                changed: false,
+                message: "Unknown command was left untouched.".to_string(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&repair).unwrap(),
+            serde_json::json!({
+                "canonical_command": "/Applications/Plug.app/Contents/Resources/plug",
+                "items": [{
+                    "target": "cursor",
+                    "path": "/tmp/unknown.json",
+                    "disposition": "unknown_command",
+                    "changed": false,
+                    "message": "Unknown command was left untouched."
+                }]
+            })
+        );
+
+        // Old adapter and daemon payloads remain decodable; new evidence is exact.
+        let old_register: plug_core::ipc::IpcRequest = serde_json::from_value(serde_json::json!({
+            "type": "Register",
+            "protocol_version": plug_core::ipc::IPC_PROTOCOL_VERSION,
+            "client_id": "legacy-client",
+            "client_info": "cursor"
+        }))
+        .unwrap();
+        assert!(matches!(
+            old_register,
+            plug_core::ipc::IpcRequest::Register {
+                adapter_version: None,
+                ..
+            }
+        ));
+        let new_register = plug_core::ipc::IpcRequest::Register {
+            protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+            client_id: "current-client".to_string(),
+            client_info: Some("cursor".to_string()),
+            adapter_version: Some("0.6.4".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(new_register).unwrap()["adapter_version"],
+            "0.6.4"
+        );
+
+        let old_handshake: plug_core::ipc::IpcResponse =
+            serde_json::from_value(serde_json::json!({
+                "type": "OperatorHandshake",
+                "handshake": {
+                    "daemon_version": "0.6.3",
+                    "ipc_min": 3,
+                    "ipc_max": 4,
+                    "ownership": "cli_managed",
+                    "capabilities": []
+                }
+            }))
+            .unwrap();
+        let plug_core::ipc::IpcResponse::OperatorHandshake { handshake } = old_handshake else {
+            panic!("expected old operator handshake");
+        };
+        assert_eq!(handshake.daemon_executable, None);
+
+        let snapshot = unified_snapshot();
+        let report = plug_core::doctor::DoctorReport {
+            checks: vec![super::unified_install_check_from_snapshot(&snapshot)],
+            exit_code: 0,
+        };
+        let doctor = super::doctor_json_value(&report, &snapshot);
+        assert_eq!(doctor["exit_code"], 0);
+        assert_eq!(doctor["checks"][0]["status"], "Pass");
+        assert_eq!(
+            doctor["checks"][0]["message"],
+            "Plug.app owns the app, command line, daemon, and client links."
+        );
+        assert_eq!(
+            doctor["unified_install"]["daemon_executable"],
+            "/Applications/Plug.app/Contents/Resources/plug"
+        );
+        assert_eq!(doctor["unified_install"]["adapters"][0], "current");
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(crate::install::resolve_verified_app().unwrap(), None);
+            assert_eq!(
+                crate::install::delegation_decision(
+                    std::path::Path::new("/usr/local/bin/plug"),
+                    None,
+                    false,
+                )
+                .unwrap(),
+                crate::install::DelegationDecision::Stay
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unified_install_ipc_probe_timeout_is_bounded() {
         let result = super::bounded_ipc_probe(
