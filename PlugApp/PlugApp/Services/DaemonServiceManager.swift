@@ -23,6 +23,11 @@ final class DaemonServiceManager {
     }
 
     func adopt() async throws {
+        // Pause legacy connectors before removing their LaunchAgent. Otherwise
+        // one can observe the missing socket in this handoff window and
+        // recreate the CLI-owned service before SMAppService registers ours.
+        let pausedConnectors = pauseLegacyConnectors()
+        defer { resumeLegacyConnectors(pausedConnectors) }
         bootOutLegacyAgent()
         try? FileManager.default.removeItem(at: legacyPlist)
         if agent.status == .enabled { try? await unregisterAgent() }
@@ -72,12 +77,6 @@ final class DaemonServiceManager {
     }
 
     private func replaceRunningDaemon() async throws {
-        // Older `plug connect` builds spawned a replacement daemon themselves
-        // whenever the socket disappeared. Pause only those legacy connectors
-        // during the one-time ownership handoff, then resume them onto the
-        // launchd-owned daemon once it is stable.
-        let pausedConnectors = pauseLegacyConnectors()
-        defer { resumeLegacyConnectors(pausedConnectors) }
         for _ in 0..<3 {
             let previousPID = daemonPID()
             stopExistingDaemon()
