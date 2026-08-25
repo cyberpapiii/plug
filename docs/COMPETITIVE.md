@@ -8,7 +8,9 @@ Plug keeps installation platform-specific and ownership simple:
 
 - macOS: one signed `Plug.app`, downloaded as a DMG from the Plug website or GitHub Releases, or installed with the Homebrew Cask. Open it once; the app owns the GUI, `plug` command, daemon, client links, and updates.
 - Linux: standalone Homebrew Formula, release shell installer, or release archive.
-- Source development: isolated `plug-dev` from `./scripts/dev-reinstall.sh`.
+- Source development: run `./scripts/setup-codesigning.sh`, then
+  `./scripts/dev-reinstall.sh`; invoke the installed binary as
+  `PLUG_DEV=1 plug-dev`.
 - Headless macOS is unsupported because first-use ServiceManagement and Keychain consent need a logged-in GUI session.
 
 ---

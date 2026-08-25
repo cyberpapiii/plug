@@ -12,13 +12,18 @@ Plug is a Rust MCP multiplexer. Changes should preserve the operator model: one 
 
 ## Local Setup
 
+For a fresh source checkout, run the isolated development setup in this order:
+
 ```sh
-cargo check --workspace
-./scripts/dev-reinstall.sh --quick
-plug status
+./scripts/setup-codesigning.sh
+./scripts/dev-reinstall.sh
+PLUG_DEV=1 plug-dev status
 ```
 
-The development reinstall keeps the PATH binary at `~/.cargo/bin/plug` and normalizes `~/.local/bin/plug` to point at it.
+The development reinstall installs `~/.cargo/bin/plug-dev` and leaves the
+production `plug` command owned by Plug.app unchanged. It also runs the
+workspace check and `plug-core` tests; use `--quick` when those tests are not
+needed.
 
 Use `./scripts/dev-reinstall.sh --quick --clean` when you want to reinstall the local binary and immediately remove generated build artifacts.
 

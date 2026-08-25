@@ -170,7 +170,7 @@ assert_contains "$ROOT/.github/workflows/release.yml" \
 }
 
 if rg -q 'UninstallCleanup' "$ROOT/plug/src/main.rs"; then
-    (cd "$ROOT" && cargo run --quiet -p plug-mcp -- uninstall-cleanup --help >/dev/null)
+    (cd "$ROOT" && PLUG_DEV=1 cargo run --quiet -p plug-mcp -- uninstall-cleanup --help >/dev/null)
     echo "PASS: embedded runtime exposes uninstall-cleanup"
 else
     echo "DEFERRED: uninstall-cleanup runtime precondition awaits unified-macos-install merge"

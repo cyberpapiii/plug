@@ -18,8 +18,9 @@ First launch needs a logged-in GUI session for ServiceManagement and Keychain
 consent, so headless macOS is unsupported.
 
 Linux users choose the Formula, release shell installer, or release archive.
-People developing Plug from source use the isolated `plug-dev` command from
-`./scripts/dev-reinstall.sh`.
+For fresh source development, run `./scripts/setup-codesigning.sh` before
+`./scripts/dev-reinstall.sh`, then invoke the installed binary as
+`PLUG_DEV=1 plug-dev`.
 
 ---
 
@@ -209,7 +210,10 @@ Rob just reformatted his MacBook. He has Claude Code, Cursor, Gemini CLI, and Co
 # Or: brew install --cask cyberpapiii/tap/plug-app
 
 # Linux: choose the Formula, release shell installer, or release archive.
-# Source development: ./scripts/dev-reinstall.sh, then PLUG_DEV=1 plug-dev.
+# Fresh source development:
+./scripts/setup-codesigning.sh
+./scripts/dev-reinstall.sh --quick
+PLUG_DEV=1 plug-dev
 
 # Auto-detects existing configs, imports with Y
 # Outputs connection snippets for each client

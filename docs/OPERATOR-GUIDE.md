@@ -16,9 +16,10 @@ Open Plug.app once. First launch needs a logged-in GUI session for
 ServiceManagement and Keychain consent. Plug.app owns the GUI, `plug` command,
 background daemon, client links, and updates. Headless macOS is unsupported.
 
-Linux uses standalone Formula, shell-installer, or archive paths. Source
-development uses `./scripts/dev-reinstall.sh` and the isolated `plug-dev`
-command; it never replaces the production `plug` command.
+Linux uses standalone Formula, shell-installer, or archive paths. For a fresh
+source checkout, run `./scripts/setup-codesigning.sh` before
+`./scripts/dev-reinstall.sh`; invoke the installed development binary only as
+`PLUG_DEV=1 plug-dev`. It never replaces the production `plug` command.
 
 ## Runtime Model
 
@@ -266,7 +267,7 @@ Current distribution names:
 - GitHub repo: `cyberpapiii/plug`
 - macOS app: signed `Plug.app` DMG and `plug-app` Homebrew Cask
 - Linux: `plug` Homebrew Formula, release shell installer, and standalone archives
-- Source development: isolated `plug-dev`
+- Source development: isolated `PLUG_DEV=1 plug-dev`
 
 Release checks before publishing:
 
@@ -300,6 +301,7 @@ Use `--runtime-cache` only when old `plug://artifact/...` result files are no lo
 For local source reinstalls, the cleanup can be folded into the reinstall command:
 
 ```sh
+./scripts/setup-codesigning.sh
 ./scripts/dev-reinstall.sh --quick --clean
 PLUG_DEV=1 plug-dev
 ```

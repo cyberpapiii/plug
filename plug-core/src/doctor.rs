@@ -1195,12 +1195,17 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     }
 }
 
+/// Source-development repair sequence for the macOS code-signing warning.
+fn codesign_fix_suggestion() -> &'static str {
+    "Install or open signed Plug.app for production. For source development, run `./scripts/setup-codesigning.sh`, then `./scripts/dev-reinstall.sh`, then `PLUG_DEV=1 plug-dev`; never re-sign Plug.app or a release executable."
+}
+
 /// macOS only: warn when the running binary is ad-hoc signed *and* keychain-backed
 /// OAuth upstreams are configured, because the macOS Keychain "Always Allow" ACL
 /// binds to the binary's signature and an ad-hoc signature changes on every
 /// rebuild — so macOS re-prompts for Keychain access constantly. Production
 /// installs should use Plug.app's Developer ID signature; isolated source builds
-/// use `PLUG_DEV=1 plug-dev codesign-setup`.
+/// use the setup sequence in `codesign_fix_suggestion`.
 async fn check_codesign_identity(config: &Config) -> CheckResult {
     let name = "codesign_identity".to_string();
 
@@ -1239,9 +1244,7 @@ async fn check_codesign_identity(config: &Config) -> CheckResult {
                 message: format!(
                     "plug is ad-hoc signed, so macOS re-prompts for Keychain access on every rebuild ({oauth_count} OAuth upstream(s) affected)"
                 ),
-                fix_suggestion: Some(
-                    "Install or open signed Plug.app for production. For source development, run `./scripts/dev-reinstall.sh`, then `PLUG_DEV=1 plug-dev codesign-setup`; never re-sign Plug.app or a release executable.".to_string(),
-                ),
+                fix_suggestion: Some(codesign_fix_suggestion().to_string()),
             },
             Some(false) => CheckResult {
                 name,
@@ -1910,6 +1913,23 @@ command = "example-server"
     }
 
     // -- DoctorReport --
+
+    #[test]
+    fn codesign_fix_suggestion_preserves_source_setup_order() {
+        let suggestion = codesign_fix_suggestion();
+        let setup = suggestion
+            .find("./scripts/setup-codesigning.sh")
+            .expect("setup script in doctor guidance");
+        let reinstall = suggestion
+            .find("./scripts/dev-reinstall.sh")
+            .expect("reinstall script in doctor guidance");
+        let invocation = suggestion
+            .find("PLUG_DEV=1 plug-dev")
+            .expect("development invocation in doctor guidance");
+
+        assert!(setup < reinstall && reinstall < invocation);
+        assert!(!suggestion.contains("codesign-setup"));
+    }
 
     #[test]
     fn report_exit_code_all_pass() {
