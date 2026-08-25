@@ -7,6 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-25
+
+### Fixed
+
+- Fixed an installed-app delegation loop that could make the embedded CLI time
+  out while verifying its own version. Plug.app now performs that internal
+  version probe without re-entering app discovery.
+
 ## [0.7.0] - 2026-08-25
 
 Detailed notes: [Plug 0.7.0](docs/RELEASE-NOTES-0.7.0.md).
@@ -248,7 +256,8 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/cyberpapiii/plug/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/cyberpapiii/plug/compare/v0.6.4...v0.7.0
 [0.5.2]: https://github.com/cyberpapiii/plug/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/cyberpapiii/plug/compare/v0.5.0...v0.5.1

@@ -698,11 +698,7 @@ fn bundle_version(bundle_path: &Path) -> Result<String> {
 #[cfg(target_os = "macos")]
 fn executable_version(executable_path: &Path) -> Result<String> {
     let output = bounded_output(
-        {
-            let mut command = Command::new(executable_path);
-            command.arg("--version");
-            command
-        },
+        version_probe_command(executable_path),
         std::time::Duration::from_secs(2),
     )
     .with_context(|| format!("could not run {} --version", executable_path.display()))?;
@@ -714,6 +710,16 @@ fn executable_version(executable_path: &Path) -> Result<String> {
         .context("embedded executable did not report a Plug version")?;
     ensure!(!version.is_empty(), "embedded Plug version was empty");
     Ok(version.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn version_probe_command(executable_path: &Path) -> Command {
+    let mut command = Command::new(executable_path);
+    // A production executable normally resolves and verifies Plug.app before
+    // parsing arguments. The verifier is already checking that same signed
+    // bundle, so a nested --version probe must not enter delegation again.
+    command.arg("--version").env("PLUG_DEV", "1");
+    command
 }
 
 #[cfg(test)]
@@ -835,6 +841,19 @@ mod tests {
         assert!(argument.starts_with("-R=anchor apple generic"));
         assert!(argument.contains(super::APP_BUNDLE_ID));
         assert!(argument.contains(super::DEVELOPER_TEAM_ID));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_version_probe_does_not_reenter_app_delegation() {
+        let command = super::version_probe_command(Path::new(
+            "/Applications/Plug.app/Contents/Resources/plug",
+        ));
+        let plug_dev = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("PLUG_DEV"))
+            .and_then(|(_, value)| value);
+        assert_eq!(plug_dev, Some(std::ffi::OsStr::new("1")));
     }
 
     #[cfg(unix)]
