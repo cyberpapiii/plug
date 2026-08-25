@@ -6,7 +6,7 @@ use crate::commands::clients::{
 };
 use crate::ui::{
     cli_prompt_theme, print_banner, print_heading, print_info_line, print_next_step,
-    print_success_line,
+    print_success_line, print_warning_line,
 };
 
 pub(crate) fn cmd_import(
@@ -694,11 +694,49 @@ fn repair_targets(requested: Vec<String>, all: bool) -> anyhow::Result<Vec<Strin
     Ok(selected)
 }
 
+fn repair_attention_messages(report: &ClientRepairReport) -> Vec<String> {
+    report
+        .items
+        .iter()
+        .filter(|item| {
+            !item.changed
+                && !matches!(
+                    item.disposition,
+                    PlugLinkDisposition::Canonical
+                        | PlugLinkDisposition::Http
+                        | PlugLinkDisposition::Missing
+                )
+        })
+        .map(|item| format!("{}: {}", item.target, item.message))
+        .collect()
+}
+
+fn repair_text_summary(report: &ClientRepairReport, repaired_count: usize) -> String {
+    let needing_attention = repair_attention_messages(report);
+    if !needing_attention.is_empty() {
+        format!(
+            "Repair finished with {} client configuration(s) needing attention.",
+            needing_attention.len()
+        )
+    } else if repaired_count > 0 {
+        format!("Successfully repaired {repaired_count} client configuration(s).")
+    } else if report
+        .items
+        .iter()
+        .any(|item| !matches!(item.disposition, PlugLinkDisposition::Missing))
+    {
+        "Linked client configurations already use the canonical command.".to_string()
+    } else {
+        "No linked clients found to repair.".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PlugLinkDisposition, doctor_check_details, doctor_next_steps, repair_client_content,
-        repair_export_endpoint, repair_targets, runtime_auth_checks,
+        ClientRepairItem, ClientRepairReport, PlugLinkDisposition, doctor_check_details,
+        doctor_next_steps, repair_attention_messages, repair_client_content,
+        repair_export_endpoint, repair_targets, repair_text_summary, runtime_auth_checks,
         runtime_health_checks_for_tests, synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
@@ -1084,27 +1122,32 @@ mod tests {
     #[test]
     fn repair_content_updates_legacy_json_toml_and_yaml_without_losing_neighbors() {
         let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
-        let fixtures = [
+        let cargo_command = dirs::home_dir()
+            .expect("test home directory")
+            .join(".cargo/bin/plug")
+            .to_string_lossy()
+            .into_owned();
+        let fixtures = vec![
             (
                 plug_core::export::ExportTarget::Cursor,
                 std::path::Path::new("config.json"),
-                r#"{"mcpServers":{"plug":{"command":"/Users/rob/.cargo/bin/plug","args":["connect"]},"other":{"command":"other"}},"unknown":{"preserved":true}}"#,
+                format!(r#"{{"mcpServers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}},"other":{{"command":"other"}}}},"unknown":{{"preserved":true}}}}"#),
             ),
             (
                 plug_core::export::ExportTarget::CodexCli,
                 std::path::Path::new("config.toml"),
-                "[mcp_servers.plug]\ncommand = \"/opt/homebrew/bin/plug\"\nargs = [\"connect\"]\nunknown = \"keep\"\n\n[mcp_servers.other]\ncommand = \"other\"\n",
+                "[mcp_servers.plug]\ncommand = \"/opt/homebrew/bin/plug\"\nargs = [\"connect\"]\nunknown = \"keep\"\n\n[mcp_servers.other]\ncommand = \"other\"\n".to_string(),
             ),
             (
                 plug_core::export::ExportTarget::Goose,
                 std::path::Path::new("config.yaml"),
-                "extensions:\n  plug:\n    type: stdio\n    command: /Users/rob/src/plug/target/release/plug\n    args: [connect]\n    unknown: keep\n  other:\n    type: stdio\n    command: other\nunknown: preserved\n",
+                "extensions:\n  plug:\n    type: stdio\n    command: /Users/rob/src/plug/target/release/plug\n    args: [connect]\n    unknown: keep\n  other:\n    type: stdio\n    command: other\nunknown: preserved\n".to_string(),
             ),
         ];
 
-        for (target, path, content) in fixtures {
+        for (target, path, content) in &fixtures {
             let repair = repair_client_content(
-                target,
+                *target,
                 path,
                 content,
                 canonical,
@@ -1117,6 +1160,107 @@ mod tests {
             assert!(updated.contains("other"));
             assert!(updated.contains("unknown"));
         }
+    }
+
+    #[test]
+    fn repair_rejects_invalid_args_and_updates_the_same_json_container_it_parsed() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let cargo_command = dirs::home_dir()
+            .expect("test home directory")
+            .join(".cargo/bin/plug")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_args = r#"{"mcpServers":{"plug":{"command":"/Users/rob/.cargo/bin/plug","args":["connect",7]}}}"#;
+        let invalid = repair_client_content(
+            plug_core::export::ExportTarget::Cursor,
+            std::path::Path::new("config.json"),
+            invalid_args,
+            canonical,
+            "http://localhost:3282/mcp",
+        )
+        .expect("invalid args are reported, not repaired");
+        assert_eq!(invalid.disposition, PlugLinkDisposition::UnknownCommand);
+        assert_eq!(invalid.updated, None);
+
+        let dual_container = format!(
+            r#"{{"mcpServers":{{"other":{{"command":"other"}}}},"context_servers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}}}}}}"#
+        );
+        let repaired = repair_client_content(
+            plug_core::export::ExportTarget::Zed,
+            std::path::Path::new("config.json"),
+            &dual_container,
+            canonical,
+            "http://localhost:3282/mcp",
+        )
+        .expect("dual container config should repair");
+        let updated = repaired
+            .updated
+            .expect("context_servers Plug entry should update");
+        let json: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            json["context_servers"]["plug"]["command"].as_str(),
+            canonical.to_str()
+        );
+        assert_eq!(
+            json["mcpServers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn repair_preserves_toml_and_yaml_comments_outside_repaired_fields() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let cargo_command = dirs::home_dir()
+            .expect("test home directory")
+            .join(".cargo/bin/plug")
+            .to_string_lossy()
+            .into_owned();
+        let fixtures = vec![
+            (
+                plug_core::export::ExportTarget::CodexCli,
+                std::path::Path::new("config.toml"),
+                "# keep this document comment\n[mcp_servers.plug]\n# keep this entry comment\ncommand = \"/opt/homebrew/bin/plug\" # command note\nargs = [\"connect\"] # args note\nunknown = \"keep\"\n\n# keep neighboring comment\n[mcp_servers.other]\ncommand = \"other\"\n".to_string(),
+                "# keep neighboring comment",
+            ),
+            (
+                plug_core::export::ExportTarget::Goose,
+                std::path::Path::new("config.yaml"),
+                format!("# keep this document comment\nextensions:\n  plug:\n    # keep this entry comment\n    command: {cargo_command} # command note\n    args: [connect] # args note\n    unknown: keep\n  # keep neighboring comment\n  other:\n    command: other\n"),
+                "# keep neighboring comment",
+            ),
+        ];
+        for (target, path, content, retained_comment) in fixtures {
+            let repair =
+                repair_client_content(target, path, &content, canonical, "unused").unwrap();
+            let updated = repair.updated.expect("legacy entry should update");
+            assert!(updated.contains("# keep this document comment"));
+            assert!(updated.contains(retained_comment));
+            assert!(updated.contains("# command note"));
+            assert!(updated.contains("# args note"));
+            assert!(updated.contains("unknown = \"keep\"") || updated.contains("unknown: keep"));
+        }
+    }
+
+    #[test]
+    fn repair_text_reports_attention_without_a_success_summary() {
+        let report = ClientRepairReport {
+            canonical_command: std::path::PathBuf::from(
+                "/Applications/Plug.app/Contents/Resources/plug",
+            ),
+            items: vec![ClientRepairItem {
+                target: "cursor".to_string(),
+                path: std::path::PathBuf::from("/tmp/cursor.json"),
+                disposition: PlugLinkDisposition::UnknownCommand,
+                changed: false,
+                message: "Plug command is not recognized; left unchanged.".to_string(),
+            }],
+        };
+        assert_eq!(
+            repair_attention_messages(&report),
+            vec!["cursor: Plug command is not recognized; left unchanged.".to_string()]
+        );
+        assert!(repair_text_summary(&report, 0).contains("needing attention"));
+        assert!(!repair_text_summary(&report, 0).contains("Successfully"));
     }
 }
 
@@ -1231,15 +1375,13 @@ pub(crate) fn cmd_repair(
 
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text if repaired_count == 0 => println!(
-            "\n{} No linked clients found to repair.",
-            style("•").green().bold()
-        ),
-        OutputFormat::Text => println!(
-            "\n{} Successfully repaired {} client configuration(s).",
-            style("•").green().bold(),
-            repaired_count
-        ),
+        OutputFormat::Text => {
+            let needing_attention = repair_attention_messages(&report);
+            for message in &needing_attention {
+                print_warning_line(message);
+            }
+            println!("\n{}", repair_text_summary(&report, repaired_count));
+        }
     }
 
     Ok(())

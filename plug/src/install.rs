@@ -51,13 +51,33 @@ pub fn resolve_verified_app() -> Result<Option<VerifiedAppInstallation>> {
 }
 
 /// Return the app-owned client command when Plug.app is available, otherwise
-/// preserve the current executable for development and Linux installs.
-#[allow(dead_code)] // Consumed by the following client-repair task.
+/// preserve the current executable only for development and Linux installs.
 pub fn canonical_client_command() -> Result<PathBuf> {
-    Ok(match resolve_verified_app()? {
-        Some(app) => app.executable_path,
-        None => std::env::current_exe().context("could not resolve the running executable")?,
-    })
+    let app = resolve_verified_app()?;
+    let current = std::env::current_exe().context("could not resolve the running executable")?;
+    #[cfg(target_os = "macos")]
+    let production_macos = true;
+    #[cfg(not(target_os = "macos"))]
+    let production_macos = false;
+    let dev = std::env::var_os("PLUG_DEV").as_deref() == Some(OsStr::new("1"));
+    canonical_client_command_from(app.as_ref(), &current, dev, production_macos)
+}
+
+fn canonical_client_command_from(
+    app: Option<&VerifiedAppInstallation>,
+    current: &Path,
+    dev: bool,
+    production_macos: bool,
+) -> Result<PathBuf> {
+    if let Some(app) = app {
+        return Ok(app.executable_path.clone());
+    }
+    if !production_macos || dev {
+        return Ok(current.to_path_buf());
+    }
+    anyhow::bail!(
+        "no verified Plug.app is available; install or open Plug.app, or set PLUG_DEV=1 for source development"
+    )
 }
 
 #[allow(dead_code)] // Exposed for focused decision tests and diagnostic callers.
@@ -268,7 +288,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        DelegationDecision, VerifiedAppInstallation, delegation_decision, verify_candidate,
+        DelegationDecision, VerifiedAppInstallation, canonical_client_command_from,
+        delegation_decision, verify_candidate,
     };
 
     fn app(path: impl Into<PathBuf>) -> VerifiedAppInstallation {
@@ -337,6 +358,20 @@ mod tests {
             super::delegation_decision_with_loop(&app.executable_path, Some(&app), false, true,)
                 .unwrap(),
             DelegationDecision::Stay,
+        );
+    }
+
+    #[test]
+    fn production_macos_requires_a_verified_app_for_client_exports() {
+        let current = Path::new("/opt/homebrew/bin/plug");
+        assert!(canonical_client_command_from(None, current, false, true).is_err());
+        assert_eq!(
+            canonical_client_command_from(None, current, true, true).unwrap(),
+            current
+        );
+        assert_eq!(
+            canonical_client_command_from(None, current, false, false).unwrap(),
+            current
         );
     }
 }

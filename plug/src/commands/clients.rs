@@ -9,7 +9,7 @@ pub(crate) struct LinkedClientConfig {
     pub(crate) transport: ExportTransport,
     pub(crate) endpoint: Option<String>,
     pub(crate) command: Option<String>,
-    pub(crate) args: Vec<String>,
+    pub(crate) args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -136,7 +136,7 @@ pub(crate) fn linked_client_config_from_content(
                     transport: ExportTransport::Http,
                     endpoint: Some(url.to_string()),
                     command: None,
-                    args: Vec::new(),
+                    args: None,
                 })
             } else if table.get("command").is_some() {
                 Some(LinkedClientConfig {
@@ -146,15 +146,7 @@ pub(crate) fn linked_client_config_from_content(
                         .get("command")
                         .and_then(|value| value.as_str())
                         .map(str::to_owned),
-                    args: table
-                        .get("args")
-                        .and_then(|value| value.as_array())
-                        .map(|args| {
-                            args.iter()
-                                .filter_map(|value| value.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    args: table.get("args").and_then(toml_string_args),
                 })
             } else {
                 None
@@ -168,7 +160,7 @@ pub(crate) fn linked_client_config_from_content(
                     transport: ExportTransport::Http,
                     endpoint: Some(uri.to_string()),
                     command: None,
-                    args: Vec::new(),
+                    args: None,
                 })
             } else if plug.get("command").is_some() {
                 Some(LinkedClientConfig {
@@ -178,15 +170,7 @@ pub(crate) fn linked_client_config_from_content(
                         .get("command")
                         .and_then(|value| value.as_str())
                         .map(str::to_owned),
-                    args: plug
-                        .get("args")
-                        .and_then(|value| value.as_sequence())
-                        .map(|args| {
-                            args.iter()
-                                .filter_map(|value| value.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    args: plug.get("args").and_then(yaml_string_args),
                 })
             } else {
                 None
@@ -211,7 +195,7 @@ pub(crate) fn linked_client_config_from_content(
                     transport: ExportTransport::Http,
                     endpoint: Some(url.to_string()),
                     command: None,
-                    args: Vec::new(),
+                    args: None,
                 })
             } else if plug.get("command").is_some() {
                 Some(LinkedClientConfig {
@@ -221,21 +205,37 @@ pub(crate) fn linked_client_config_from_content(
                         .get("command")
                         .and_then(|value| value.as_str())
                         .map(str::to_owned),
-                    args: plug
-                        .get("args")
-                        .and_then(|value| value.as_array())
-                        .map(|args| {
-                            args.iter()
-                                .filter_map(|value| value.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    args: plug.get("args").and_then(json_string_args),
                 })
             } else {
                 None
             }
         }
     }
+}
+
+fn toml_string_args(value: &toml::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn yaml_string_args(value: &serde_norway::Value) -> Option<Vec<String>> {
+    value
+        .as_sequence()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn json_string_args(value: &serde_json::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Classify a stdio `plug` entry without executing its configured command.
@@ -294,19 +294,33 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
                 .eq(suffix.iter().copied())
     };
 
-    has_suffix(&[".cargo", "bin", "plug"])
-        || has_suffix(&["homebrew", "bin", "plug"])
-        || has_suffix(&["local", "bin", "plug"])
-        || components
-            .windows(4)
-            .any(|parts| parts[0] == "Cellar" && parts[1] == "plug" && parts[3] == "bin")
-        || (has_suffix(&["Contents", "Resources", "plug"])
-            && components
-                .iter()
-                .any(|component| component == "Plug.app" || component.ends_with(" Plug.app")))
-        || components
-            .windows(3)
-            .any(|parts| parts[0] == "target" && parts[2] == "plug")
+    let home = dirs::home_dir();
+    let is_home_legacy = home.as_ref().is_some_and(|home| {
+        path == home.join(".cargo/bin/plug") || path == home.join(".local/bin/plug")
+    });
+    let is_old_app = path == Path::new("/Applications/Plug.app/Contents/Resources/plug")
+        || home
+            .as_ref()
+            .is_some_and(|home| path == home.join("Applications/Plug.app/Contents/Resources/plug"));
+
+    is_home_legacy
+        || has_suffix(&["opt", "homebrew", "bin", "plug"])
+        || has_suffix(&["usr", "local", "bin", "plug"])
+        || components.windows(7).any(|parts| {
+            ((parts[0] == "opt" && parts[1] == "homebrew")
+                || (parts[0] == "usr" && parts[1] == "local"))
+                && parts[2] == "Cellar"
+                && parts[3] == "plug"
+                && !parts[4].is_empty()
+                && parts[5] == "bin"
+                && parts[6] == "plug"
+        })
+        || is_old_app
+        || components.windows(3).any(|parts| {
+            parts[0] == "target"
+                && (parts[1] == "debug" || parts[1] == "release")
+                && parts[2] == "plug"
+        })
 }
 
 pub(crate) fn is_detected(target: &str) -> bool {
@@ -829,8 +843,8 @@ pub(crate) fn cmd_link(
             ),
             (2, ExportTransport::Stdio) => (
                 format!(
-                    "\n[mcp_servers.plug]\ncommand = \"{}\"\nargs = [\"connect\"]\n",
-                    canonical_command.as_deref().expect("stdio command")
+                    "\n[mcp_servers.plug]\ncommand = {}\nargs = [\"connect\"]\n",
+                    toml_string_literal(canonical_command.as_deref().expect("stdio command"))
                 ),
                 true,
                 false,
@@ -843,7 +857,7 @@ pub(crate) fn cmd_link(
             (3, ExportTransport::Stdio) => (
                 format!(
                     "\nextensions:\n  plug:\n    type: stdio\n    command: {}\n    args: [\"connect\"]\n    enabled: true\n",
-                    canonical_command.as_deref().expect("stdio command")
+                    yaml_string_scalar(canonical_command.as_deref().expect("stdio command"))
                 ),
                 false,
                 true,
@@ -1092,7 +1106,8 @@ pub(crate) fn repair_client_content(
     let disposition = linked
         .command
         .as_deref()
-        .map(|command| classify_plug_client_command(command, &linked.args, canonical))
+        .zip(linked.args.as_deref())
+        .map(|(command, args)| classify_plug_client_command(command, args, canonical))
         .unwrap_or(PlugLinkDisposition::UnknownCommand);
     match disposition {
         PlugLinkDisposition::Canonical => Ok(ClientContentRepair {
@@ -1122,43 +1137,144 @@ fn replace_stdio_command(
 ) -> anyhow::Result<String> {
     let command = canonical.to_string_lossy().to_string();
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some("toml") => {
-            let mut value = toml::from_str::<toml::Value>(content)?;
-            let plug = value
-                .get_mut("mcp_servers")
-                .and_then(|servers| servers.get_mut("plug"))
-                .and_then(toml::Value::as_table_mut)
-                .ok_or_else(|| anyhow::anyhow!("missing Codex Plug entry"))?;
-            plug.insert("command".to_string(), toml::Value::String(command));
-            plug.insert(
-                "args".to_string(),
-                toml::Value::Array(vec![toml::Value::String("connect".to_string())]),
-            );
-            Ok(toml::to_string_pretty(&value)?)
-        }
-        Some("yaml") | Some("yml") => {
-            let mut value = serde_norway::from_str::<serde_norway::Value>(content)?;
-            let key = serde_norway::Value::from("extensions");
-            let plug_key = serde_norway::Value::from("plug");
-            let plug = value
-                .as_mapping_mut()
-                .and_then(|root| root.get_mut(&key))
-                .and_then(serde_norway::Value::as_mapping_mut)
-                .and_then(|extensions| extensions.get_mut(&plug_key))
-                .and_then(serde_norway::Value::as_mapping_mut)
-                .ok_or_else(|| anyhow::anyhow!("missing Goose Plug entry"))?;
-            plug.insert(
-                serde_norway::Value::from("command"),
-                serde_norway::Value::from(command),
-            );
-            plug.insert(
-                serde_norway::Value::from("args"),
-                serde_norway::Value::from(vec![serde_norway::Value::from("connect")]),
-            );
-            Ok(serde_norway::to_string(&value)?)
-        }
+        Some("toml") => replace_toml_stdio_command(content, &command),
+        Some("yaml") | Some("yml") => replace_yaml_stdio_command(content, &command),
         _ => replace_json_stdio_command(target, content, command),
     }
+}
+
+fn toml_string_literal(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+fn yaml_string_scalar(value: &str) -> String {
+    serde_norway::to_string(&serde_norway::Value::from(value))
+        .expect("serializing a YAML string cannot fail")
+        .trim()
+        .to_string()
+}
+
+fn replace_toml_stdio_command(content: &str, command: &str) -> anyhow::Result<String> {
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "[mcp_servers.plug]")
+        .ok_or_else(|| anyhow::anyhow!("missing Codex Plug entry"))?
+        + 1;
+    let end = lines[start..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|offset| start + offset)
+        .unwrap_or(lines.len());
+    replace_assignments(
+        &mut lines,
+        start,
+        end,
+        &[
+            ("command", toml_string_literal(command)),
+            ("args", "[\"connect\"]".to_string()),
+        ],
+    )?;
+    Ok(join_lines(content, lines))
+}
+
+fn replace_yaml_stdio_command(content: &str, command: &str) -> anyhow::Result<String> {
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let extensions = lines
+        .iter()
+        .position(|line| line.trim() == "extensions:")
+        .ok_or_else(|| anyhow::anyhow!("missing Goose extensions"))?;
+    let extensions_indent = indentation(&lines[extensions]);
+    let plug = lines[extensions + 1..]
+        .iter()
+        .position(|line| indentation(line) > extensions_indent && line.trim() == "plug:")
+        .map(|offset| extensions + 1 + offset)
+        .ok_or_else(|| anyhow::anyhow!("missing Goose Plug entry"))?;
+    let plug_indent = indentation(&lines[plug]);
+    let end = lines[plug + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty() && indentation(line) <= plug_indent)
+        .map(|offset| plug + 1 + offset)
+        .unwrap_or(lines.len());
+    replace_assignments(
+        &mut lines,
+        plug + 1,
+        end,
+        &[
+            ("command", yaml_string_scalar(command)),
+            ("args", "[\"connect\"]".to_string()),
+        ],
+    )?;
+    Ok(join_lines(content, lines))
+}
+
+fn indentation(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn replace_assignments(
+    lines: &mut [String],
+    start: usize,
+    end: usize,
+    replacements: &[(&str, String)],
+) -> anyhow::Result<()> {
+    for (key, value) in replacements {
+        let mut found = false;
+        for line in &mut lines[start..end] {
+            let trimmed = line.trim_start();
+            let Some(after_key) = trimmed.strip_prefix(key) else {
+                continue;
+            };
+            if !after_key.trim_start().starts_with('=') && !after_key.trim_start().starts_with(':')
+            {
+                continue;
+            }
+            let separator = if after_key.trim_start().starts_with('=') {
+                '='
+            } else {
+                ':'
+            };
+            let separator_index = line.find(separator).expect("assignment separator");
+            let comment = inline_comment(&line[separator_index + 1..]);
+            *line = format!("{} {}{}", &line[..=separator_index], value, comment);
+            found = true;
+            break;
+        }
+        if !found {
+            anyhow::bail!("missing Plug {key} entry");
+        }
+    }
+    Ok(())
+}
+
+fn inline_comment(value: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        match character {
+            '\\' if quoted => escaped = !escaped,
+            '"' if !escaped => quoted = !quoted,
+            '#' if !quoted => {
+                let comment_start = value[..index]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, character)| !character.is_whitespace())
+                    .map(|(index, character)| index + character.len_utf8())
+                    .unwrap_or(0);
+                return &value[comment_start..];
+            }
+            _ => escaped = false,
+        }
+    }
+    ""
+}
+
+fn join_lines(original: &str, lines: Vec<String>) -> String {
+    let mut result = lines.join("\n");
+    if original.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn replace_json_stdio_command(
@@ -1177,7 +1293,11 @@ fn replace_json_stdio_command(
             .and_then(|mcp| mcp.get_mut("servers"))
             .and_then(|servers| servers.get_mut("plug")),
         _ => {
-            if value.get("mcpServers").is_some() {
+            if value
+                .get("mcpServers")
+                .and_then(|servers| servers.get("plug"))
+                .is_some()
+            {
                 value
                     .get_mut("mcpServers")
                     .and_then(|servers| servers.get_mut("plug"))
@@ -1525,19 +1645,22 @@ extensions:
     fn classifies_only_canonical_or_recognized_legacy_connect_commands() {
         let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
         let connect = vec!["connect".to_string()];
+        let home = dirs::home_dir().expect("test home directory");
 
         assert_eq!(
             classify_plug_client_command(canonical.to_str().unwrap(), &connect, canonical),
             PlugLinkDisposition::Canonical
         );
         for legacy in [
-            "/Users/rob/.cargo/bin/plug",
-            "/opt/homebrew/bin/plug",
-            "/Applications/Old Plug.app/Contents/Resources/plug",
-            "/Users/rob/src/plug/target/release/plug",
+            home.join(".cargo/bin/plug").to_string_lossy().into_owned(),
+            "/opt/homebrew/bin/plug".to_string(),
+            home.join("Applications/Plug.app/Contents/Resources/plug")
+                .to_string_lossy()
+                .into_owned(),
+            "/Users/rob/src/plug/target/release/plug".to_string(),
         ] {
             assert_eq!(
-                classify_plug_client_command(legacy, &connect, canonical),
+                classify_plug_client_command(&legacy, &connect, canonical),
                 PlugLinkDisposition::RecognizedLegacy,
                 "{legacy} should be a recognized legacy Plug command"
             );
@@ -1553,6 +1676,39 @@ extensions:
                 canonical,
             ),
             PlugLinkDisposition::UnknownCommand
+        );
+    }
+
+    #[test]
+    fn rejects_broad_legacy_path_shapes_and_escapes_custom_stdio_paths() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let connect = vec!["connect".to_string()];
+        for command in [
+            "/tmp/homebrew/bin/plug",
+            "/Applications/Other Plug.app/Contents/Resources/plug",
+            "/Users/rob/project/target/custom/plug",
+        ] {
+            assert_eq!(
+                classify_plug_client_command(command, &connect, canonical),
+                PlugLinkDisposition::UnknownCommand,
+                "{command} must not be adopted"
+            );
+        }
+
+        let special = "/Applications/Plug #1.app/Contents/Resources/plug";
+        let toml = toml_string_literal(special);
+        assert_eq!(
+            toml::from_str::<toml::Value>(&format!("command = {toml}")).unwrap()["command"]
+                .as_str(),
+            Some(special)
+        );
+        let yaml = yaml_string_scalar(special);
+        assert_eq!(
+            serde_norway::from_str::<serde_norway::Value>(&format!("command: {yaml}\n"))
+                .unwrap()
+                .get("command")
+                .and_then(|value| value.as_str()),
+            Some(special)
         );
     }
 
