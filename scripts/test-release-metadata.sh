@@ -64,10 +64,36 @@ fi
 assert_contains "$CASK" 'cask "plug-app" do'
 assert_contains "$CASK" 'version "1.2.3"'
 assert_contains "$CASK" "$DMG_SHA"
-assert_contains "$CASK" 'Plug-1.2.3.dmg'
+assert_contains "$CASK" 'Plug-#{version}.dmg'
+assert_contains "$CASK" 'url "https://github.com/cyberpapiii/plug/releases/download/v#{version}/Plug-#{version}.dmg"'
+assert_contains "$CASK" 'auto_updates true'
+assert_contains "$CASK" 'depends_on macos: ">= :sonoma"'
 assert_contains "$CASK" 'app "Plug.app"'
+assert_contains "$CASK" 'uninstall script: {'
+assert_contains "$CASK" 'executable: "#{appdir}/Plug.app/Contents/Resources/plug"'
+assert_contains "$CASK" 'args:       ["uninstall-cleanup"],'
+assert_contains "$CASK" 'caveats "Open Plug once to finish command-line and background-service setup."'
 assert_absent "$CASK" 'apple-darwin'
 assert_absent "$CASK" 'binary '
+assert_absent "$CASK" 'postflight'
+if grep -Eq '^[[:space:]]*(binary|postflight)' "$CASK"; then
+    echo "FAIL: Cask contains forbidden installation hook" >&2
+    exit 1
+fi
+ruby -c "$CASK" >/dev/null
+
+WORKFLOW="$ROOT/.github/workflows/release.yml"
+assert_contains "$WORKFLOW" 'url "https://github.com/cyberpapiii/plug/releases/download/v#{version}/Plug-#{version}.dmg"'
+assert_contains "$WORKFLOW" 'auto_updates true'
+assert_contains "$WORKFLOW" 'depends_on macos: ">= :sonoma"'
+assert_contains "$WORKFLOW" 'executable: "#{appdir}/Plug.app/Contents/Resources/plug"'
+assert_contains "$WORKFLOW" 'args:       ["uninstall-cleanup"],'
+assert_contains "$WORKFLOW" 'caveats "Open Plug once to finish command-line and background-service setup."'
+assert_absent "$WORKFLOW" 'releases/download/${GITHUB_REF_NAME}/${app_dmg}'
+if grep -Eq '^[[:space:]]*(binary|postflight)' "$WORKFLOW"; then
+    echo "FAIL: release workflow contains forbidden Cask installation hook" >&2
+    exit 1
+fi
 assert_absent "$CASK" 'bin.install'
 
 DIST_INSTALLER="$ROOT/target/distrib/plug-mcp-installer.sh"
