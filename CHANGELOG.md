@@ -7,8 +7,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-The MCP 2026 entries below describe the current development branch. They do not
-claim that the work is on `main`, released, or installed on a user's machine.
+## [0.4.0] - 2026-08-24
 
 Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md), [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
 
@@ -129,6 +128,7 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/cyberpapiii/plug/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cyberpapiii/plug/releases/tag/v0.3.0
 [0.1.0]: https://github.com/cyberpapiii/plug/releases/tag/v0.1.0
