@@ -86,8 +86,7 @@ Download the binary for your platform from the [releases page](https://github.co
 
 ### Connect Claude Desktop
 
-Open Plug.app once to finish setup, then link Claude Desktop from the app's
-Clients view. The CLI equivalent is:
+Link Claude Desktop with:
 
 ```sh
 plug link claude-desktop
