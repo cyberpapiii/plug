@@ -47,6 +47,11 @@ pub struct UnifiedInstallSnapshot {
     pub adapters: Vec<AdapterVersionState>,
     pub shadows: Vec<ShadowInstallation>,
     pub launchd_jobs: Vec<crate::service::LaunchdJobRecord>,
+    pub daemon_inspection_complete: bool,
+    pub adapter_inspection_complete: bool,
+    pub launchd_inspection_complete: bool,
+    pub app_service_daemon_invocation_verified: bool,
+    pub inspection_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -392,17 +397,21 @@ fn cleanup_command_link(
 fn cleanup_launchd_plan(
     jobs: &[crate::service::LaunchdJobRecord],
     app: Option<&VerifiedAppInstallation>,
+    proven_daemon_invocations: &std::collections::BTreeSet<String>,
 ) -> CleanupLaunchdPlan {
     let mut remove_labels = Vec::new();
     let mut preserved = Vec::new();
     for job in jobs {
-        if matches!(
-            crate::service::classify_launchd_program(
-                job,
-                app.map(|app| app.executable_path.as_path())
-            ),
-            crate::service::LaunchdProgramOwnership::CurrentApp
-        ) {
+        if job.label == "com.plug.daemon"
+            && proven_daemon_invocations.contains(&job.label)
+            && matches!(
+                crate::service::classify_launchd_program(
+                    job,
+                    app.map(|app| app.executable_path.as_path())
+                ),
+                crate::service::LaunchdProgramOwnership::CurrentApp
+            )
+        {
             remove_labels.push(job.label.clone());
         } else {
             preserved.push(UninstallCleanupItem {
@@ -427,6 +436,71 @@ pub fn is_plug_launchd_candidate(job: &crate::service::LaunchdJobRecord) -> bool
         || job.program.file_name().and_then(|name| name.to_str()) == Some("plug")
 }
 
+fn receive_launchd_discovery(
+    receiver: std::sync::mpsc::Receiver<anyhow::Result<Vec<crate::service::LaunchdJobRecord>>>,
+    timeout: std::time::Duration,
+) -> Result<Vec<crate::service::LaunchdJobRecord>> {
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                anyhow::anyhow!(
+                    "launchd inspection timed out after {}ms",
+                    timeout.as_millis()
+                )
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                anyhow::anyhow!("launchd inspection worker stopped unexpectedly")
+            }
+        })?
+}
+
+pub fn discover_launchd_jobs_bounded(
+    timeout: std::time::Duration,
+) -> Result<Vec<crate::service::LaunchdJobRecord>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(crate::service::discover_launchd_jobs());
+    });
+    receive_launchd_discovery(receiver, timeout)
+}
+
+fn login_user_id() -> Result<String> {
+    let uid = bounded_output(
+        {
+            let mut command = Command::new("/usr/bin/id");
+            command.arg("-u");
+            command
+        },
+        std::time::Duration::from_secs(2),
+    )?;
+    ensure!(uid.status.success(), "could not determine login user id");
+    Ok(String::from_utf8(uid.stdout)?.trim().to_string())
+}
+
+pub fn prove_app_daemon_invocation(label: &str, app: &VerifiedAppInstallation) -> Result<bool> {
+    if label != "com.plug.daemon" {
+        return Ok(false);
+    }
+    let uid = login_user_id()?;
+    let mut command = Command::new("/bin/launchctl");
+    command.args(["print", &format!("gui/{uid}/{label}")]);
+    let output = bounded_output(command, std::time::Duration::from_secs(2))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let output = String::from_utf8(output.stdout)?;
+    let has_daemon_arguments = output
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|lines| lines == ["serve", "--daemon"]);
+    let identifies_app = output.contains("parent bundle identifier = com.cyberpapiii.plug")
+        || output.contains(&format!("program = {}", app.executable_path.display()));
+    Ok(has_daemon_arguments && identifies_app)
+}
+
 /// Remove only installation artifacts positively proven to belong to the
 /// currently verified Plug.app. Configuration and credentials are untouched.
 pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
@@ -449,7 +523,7 @@ pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
         .join(".local/bin/plug");
     items.push(cleanup_command_link(&command_path, app.as_ref())?);
 
-    let jobs = match crate::service::discover_launchd_jobs() {
+    let jobs = match discover_launchd_jobs_bounded(std::time::Duration::from_secs(4)) {
         Ok(jobs) => jobs.into_iter().filter(is_plug_launchd_candidate).collect(),
         Err(error) => {
             items.push(UninstallCleanupItem {
@@ -462,18 +536,18 @@ pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
             Vec::new()
         }
     };
-    let plan = cleanup_launchd_plan(&jobs, app.as_ref());
+    let mut proven_daemon_invocations = std::collections::BTreeSet::new();
+    if let Some(app) = app.as_ref() {
+        for job in &jobs {
+            if prove_app_daemon_invocation(&job.label, app).unwrap_or(false) {
+                proven_daemon_invocations.insert(job.label.clone());
+            }
+        }
+    }
+    let plan = cleanup_launchd_plan(&jobs, app.as_ref(), &proven_daemon_invocations);
     items.extend(plan.preserved);
     if !plan.remove_labels.is_empty() {
-        let uid = bounded_output(
-            {
-                let mut command = Command::new("/usr/bin/id");
-                command.arg("-u");
-                command
-            },
-            std::time::Duration::from_secs(2),
-        )?;
-        let uid = String::from_utf8(uid.stdout)?.trim().to_string();
+        let uid = login_user_id()?;
         for label in plan.remove_labels {
             let mut command = Command::new("/bin/launchctl");
             command.args(["bootout", &format!("gui/{uid}/{label}")]);
@@ -571,12 +645,19 @@ fn verify_app_bundle(bundle_path: &Path) -> Result<VerifiedAppInstallation> {
 #[cfg(target_os = "macos")]
 fn verify_codesign(bundle_path: &Path) -> Result<()> {
     let requirement = codesign_requirement_argument();
-    let status = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict"])
-        .arg(&requirement)
-        .arg(bundle_path)
-        .status()
-        .context("could not run codesign to verify Plug.app")?;
+    let status = bounded_output(
+        {
+            let mut command = Command::new("/usr/bin/codesign");
+            command
+                .args(["--verify", "--strict"])
+                .arg(&requirement)
+                .arg(bundle_path);
+            command
+        },
+        std::time::Duration::from_secs(3),
+    )
+    .context("could not run codesign to verify Plug.app")?
+    .status;
     ensure!(
         status.success(),
         "Plug.app at {} is unsigned or does not satisfy the Plug Developer ID requirement",
@@ -615,10 +696,15 @@ fn bundle_version(bundle_path: &Path) -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn executable_version(executable_path: &Path) -> Result<String> {
-    let output = Command::new(executable_path)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("could not run {} --version", executable_path.display()))?;
+    let output = bounded_output(
+        {
+            let mut command = Command::new(executable_path);
+            command.arg("--version");
+            command
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .with_context(|| format!("could not run {} --version", executable_path.display()))?;
     ensure!(output.status.success(), "embedded plug --version failed");
     let output = String::from_utf8(output.stdout).context("embedded plug version was not UTF-8")?;
     let version = output
@@ -802,10 +888,46 @@ mod tests {
             },
         ];
 
-        let plan = super::cleanup_launchd_plan(&jobs, Some(&app));
+        let proven = std::collections::BTreeSet::from(["com.plug.daemon".to_string()]);
+        let plan = super::cleanup_launchd_plan(&jobs, Some(&app), &proven);
         assert_eq!(plan.remove_labels, vec!["com.plug.daemon"]);
         assert_eq!(plan.preserved.len(), 1);
         assert!(plan.preserved[0].message.contains("left untouched"));
+    }
+
+    #[test]
+    fn uninstall_cleanup_preserves_unknown_label_targeting_current_app() {
+        let app = app("/Applications/Plug.app");
+        let jobs = vec![crate::service::LaunchdJobRecord {
+            label: "unknown.helper".to_string(),
+            program: app.executable_path.clone(),
+        }];
+        let proven = std::collections::BTreeSet::from(["unknown.helper".to_string()]);
+        let plan = super::cleanup_launchd_plan(&jobs, Some(&app), &proven);
+        assert!(plan.remove_labels.is_empty());
+        assert_eq!(plan.preserved.len(), 1);
+        assert!(plan.preserved[0].message.contains("left untouched"));
+    }
+
+    #[test]
+    fn uninstall_cleanup_preserves_canonical_label_without_daemon_invocation_proof() {
+        let app = app("/Applications/Plug.app");
+        let jobs = vec![crate::service::LaunchdJobRecord {
+            label: "com.plug.daemon".to_string(),
+            program: app.executable_path.clone(),
+        }];
+        let plan =
+            super::cleanup_launchd_plan(&jobs, Some(&app), &std::collections::BTreeSet::new());
+        assert!(plan.remove_labels.is_empty());
+        assert_eq!(plan.preserved.len(), 1);
+    }
+
+    #[test]
+    fn launchd_discovery_timeout_fails_closed() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let result =
+            super::receive_launchd_discovery(receiver, std::time::Duration::from_millis(1));
+        assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 
     #[test]

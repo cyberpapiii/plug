@@ -162,7 +162,11 @@ pub(crate) async fn cmd_doctor(
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
     report.checks.extend(runtime_doctor_checks().await);
     #[cfg(target_os = "macos")]
-    report.checks.push(unified_install_check().await);
+    let unified_snapshot = unified_install_snapshot().await;
+    #[cfg(target_os = "macos")]
+    report
+        .checks
+        .push(unified_install_check_from_snapshot(&unified_snapshot));
     if let Some(interpreted) = synthesize_doctor_interpretation(&report.checks) {
         report.checks.push(interpreted);
     }
@@ -182,7 +186,15 @@ pub(crate) async fn cmd_doctor(
         0
     };
     match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Json => {
+            #[cfg(target_os = "macos")]
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doctor_json_value(&report, &unified_snapshot))?
+            );
+            #[cfg(not(target_os = "macos"))]
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         OutputFormat::Text => {
             print_banner("◆", "Doctor", "Diagnose problems with your plug setup");
             for c in &report.checks {
@@ -215,6 +227,19 @@ pub(crate) async fn cmd_doctor(
     Ok(report.exit_code)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn doctor_json_value(
+    report: &plug_core::doctor::DoctorReport,
+    snapshot: &crate::install::UnifiedInstallSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "checks": report.checks,
+        "exit_code": report.exit_code,
+        "unified_install": snapshot,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn unified_install_check_from_snapshot(
     snapshot: &crate::install::UnifiedInstallSnapshot,
 ) -> plug_core::doctor::CheckResult {
@@ -228,6 +253,35 @@ fn unified_install_check_from_snapshot(
             fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
         };
     };
+
+    if !snapshot.inspection_errors.is_empty()
+        || !snapshot.daemon_inspection_complete
+        || !snapshot.adapter_inspection_complete
+        || !snapshot.launchd_inspection_complete
+    {
+        let mut failures = snapshot.inspection_errors.clone();
+        if !snapshot.daemon_inspection_complete
+            && !failures.iter().any(|failure| failure.contains("daemon"))
+        {
+            failures.push("daemon inspection was incomplete".to_string());
+        }
+        if !snapshot.adapter_inspection_complete
+            && !failures.iter().any(|failure| failure.contains("adapter"))
+        {
+            failures.push("adapter inspection was incomplete".to_string());
+        }
+        if !snapshot.launchd_inspection_complete
+            && !failures.iter().any(|failure| failure.contains("launchd"))
+        {
+            failures.push("launchd inspection was incomplete".to_string());
+        }
+        return CheckResult {
+            name: "unified_install".to_string(),
+            status: CheckStatus::Fail,
+            message: failures.join("; "),
+            fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
+        };
+    }
 
     let mut drift = Vec::new();
     if !snapshot
@@ -267,6 +321,14 @@ fn unified_install_check_from_snapshot(
     }
     if snapshot.ownership != plug_core::ipc::DaemonOwnershipMode::AppManaged {
         drift.push(format!("daemon ownership is {:?}", snapshot.ownership));
+    }
+    let expected_service_present = snapshot.launchd_jobs.iter().any(|job| {
+        job.label == "com.plug.daemon" && install_paths_match(&job.program, &app.executable_path)
+    });
+    if !expected_service_present {
+        drift.push("expected app service is absent".to_string());
+    } else if !snapshot.app_service_daemon_invocation_verified {
+        drift.push("expected app service daemon invocation is not proven".to_string());
     }
     let stale_clients = snapshot
         .linked_clients
@@ -344,6 +406,7 @@ fn unified_install_check_from_snapshot(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn install_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
     if left == right {
         return true;
@@ -354,32 +417,86 @@ fn install_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool 
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+async fn bounded_ipc_probe<F>(
+    future: F,
+    timeout: std::time::Duration,
+    name: &str,
+) -> anyhow::Result<plug_core::ipc::IpcResponse>
+where
+    F: std::future::Future<Output = anyhow::Result<plug_core::ipc::IpcResponse>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("{name} timed out after {}ms", timeout.as_millis()))?
+}
+
 #[cfg(target_os = "macos")]
-async fn unified_install_check() -> plug_core::doctor::CheckResult {
+async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
     use plug_core::ipc::{
         DaemonOwnershipMode, IpcRequest, IpcResponse, OPERATOR_IPC_MAX, OPERATOR_IPC_MIN,
     };
 
-    let app = crate::install::resolve_verified_app().ok().flatten();
-    let shell_resolution = crate::install::resolve_login_shell_command().ok().flatten();
-    let handshake = crate::daemon::ipc_request(&IpcRequest::OperatorHandshake {
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        ipc_min: OPERATOR_IPC_MIN,
-        ipc_max: OPERATOR_IPC_MAX,
-    })
-    .await
-    .ok();
-    let (daemon_version, daemon_executable, ownership) = match handshake {
-        Some(IpcResponse::OperatorHandshake { handshake }) => (
+    let mut inspection_errors = Vec::new();
+    let app = match crate::install::resolve_verified_app() {
+        Ok(app) => app,
+        Err(error) => {
+            inspection_errors.push(format!("app inspection failed: {error}"));
+            None
+        }
+    };
+    let shell_resolution = match crate::install::resolve_login_shell_command() {
+        Ok(path) => path,
+        Err(error) => {
+            inspection_errors.push(format!("shell inspection failed: {error}"));
+            None
+        }
+    };
+    let handshake = bounded_ipc_probe(
+        crate::daemon::ipc_request(&IpcRequest::OperatorHandshake {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            ipc_min: OPERATOR_IPC_MIN,
+            ipc_max: OPERATOR_IPC_MAX,
+        }),
+        std::time::Duration::from_secs(2),
+        "daemon operator handshake",
+    )
+    .await;
+    let (daemon_version, daemon_executable, ownership, daemon_inspection_complete) = match handshake
+    {
+        Ok(IpcResponse::OperatorHandshake { handshake }) => (
             Some(handshake.daemon_version),
             handshake.daemon_executable,
             handshake.ownership,
+            true,
         ),
-        _ => (None, None, DaemonOwnershipMode::Unmanaged),
+        Ok(_) => {
+            inspection_errors
+                .push("daemon operator handshake returned an unexpected response".to_string());
+            (None, None, DaemonOwnershipMode::Unmanaged, false)
+        }
+        Err(error) => {
+            inspection_errors.push(format!("daemon inspection failed: {error}"));
+            (None, None, DaemonOwnershipMode::Unmanaged, false)
+        }
     };
-    let live_sessions = match crate::daemon::ipc_request(&IpcRequest::ListLiveSessions).await {
-        Ok(IpcResponse::LiveSessions { sessions, .. }) => sessions,
-        _ => Vec::new(),
+    let live_sessions = bounded_ipc_probe(
+        crate::daemon::ipc_request(&IpcRequest::ListLiveSessions),
+        std::time::Duration::from_secs(2),
+        "adapter session inspection",
+    )
+    .await;
+    let (live_sessions, adapter_inspection_complete) = match live_sessions {
+        Ok(IpcResponse::LiveSessions { sessions, .. }) => (sessions, true),
+        Ok(_) => {
+            inspection_errors
+                .push("adapter session inspection returned an unexpected response".to_string());
+            (Vec::new(), false)
+        }
+        Err(error) => {
+            inspection_errors.push(format!("adapter inspection failed: {error}"));
+            (Vec::new(), false)
+        }
     };
     let current_version = app
         .as_ref()
@@ -394,13 +511,56 @@ async fn unified_install_check() -> plug_core::doctor::CheckResult {
         })
         .collect();
     let linked_clients = inspect_linked_clients(app.as_ref());
-    let launchd_jobs = crate::service::discover_launchd_jobs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(crate::install::is_plug_launchd_candidate)
-        .collect();
+    let launchd = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        tokio::task::spawn_blocking(|| {
+            crate::install::discover_launchd_jobs_bounded(std::time::Duration::from_secs(3))
+        }),
+    )
+    .await;
+    let (launchd_jobs, launchd_inspection_complete) = match launchd {
+        Ok(Ok(Ok(jobs))) => (
+            jobs.into_iter()
+                .filter(crate::install::is_plug_launchd_candidate)
+                .collect(),
+            true,
+        ),
+        Ok(Ok(Err(error))) => {
+            inspection_errors.push(format!("launchd inspection failed: {error}"));
+            (Vec::new(), false)
+        }
+        Ok(Err(error)) => {
+            inspection_errors.push(format!("launchd inspection worker failed: {error}"));
+            (Vec::new(), false)
+        }
+        Err(_) => {
+            inspection_errors.push("launchd inspection timed out after 4000ms".to_string());
+            (Vec::new(), false)
+        }
+    };
+    let mut launchd_inspection_complete = launchd_inspection_complete;
+    let app_service_daemon_invocation_verified = match app.as_ref() {
+        Some(app)
+            if launchd_jobs.iter().any(|job| {
+                job.label == "com.plug.daemon"
+                    && install_paths_match(&job.program, &app.executable_path)
+            }) =>
+        {
+            match crate::install::prove_app_daemon_invocation("com.plug.daemon", app) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    launchd_inspection_complete = false;
+                    inspection_errors.push(format!(
+                        "launchd app service invocation inspection failed: {error}"
+                    ));
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
     let shadows = crate::install::discover_shadow_installations(app.as_ref());
-    unified_install_check_from_snapshot(&crate::install::UnifiedInstallSnapshot {
+    crate::install::UnifiedInstallSnapshot {
         app,
         shell_resolution,
         daemon_version,
@@ -410,7 +570,12 @@ async fn unified_install_check() -> plug_core::doctor::CheckResult {
         adapters,
         shadows,
         launchd_jobs,
-    })
+        daemon_inspection_complete,
+        adapter_inspection_complete,
+        launchd_inspection_complete,
+        app_service_daemon_invocation_verified,
+        inspection_errors,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1037,6 +1202,11 @@ mod tests {
                 label: "com.plug.daemon".to_string(),
                 program: std::path::PathBuf::from("/Applications/Plug.app/Contents/Resources/plug"),
             }],
+            daemon_inspection_complete: true,
+            adapter_inspection_complete: true,
+            launchd_inspection_complete: true,
+            app_service_daemon_invocation_verified: true,
+            inspection_errors: Vec::new(),
         }
     }
 
@@ -1061,6 +1231,11 @@ mod tests {
             "adapters",
             "shadows",
             "launchd_jobs",
+            "daemon_inspection_complete",
+            "adapter_inspection_complete",
+            "launchd_inspection_complete",
+            "app_service_daemon_invocation_verified",
+            "inspection_errors",
         ] {
             assert!(json.get(key).is_some(), "missing stable JSON field {key}");
         }
@@ -1144,6 +1319,66 @@ mod tests {
             result.fix_suggestion.as_deref(),
             Some("Open Plug.app and retry reconciliation.")
         );
+    }
+
+    #[test]
+    fn unified_install_absent_expected_service_is_not_healthy() {
+        let mut snapshot = unified_snapshot();
+        snapshot.launchd_jobs.clear();
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("expected app service is absent"));
+    }
+
+    #[test]
+    fn unified_install_unproven_daemon_invocation_is_not_healthy() {
+        let mut snapshot = unified_snapshot();
+        snapshot.app_service_daemon_invocation_verified = false;
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("daemon invocation is not proven"));
+    }
+
+    #[test]
+    fn unified_install_inspection_failure_fails_closed() {
+        let mut snapshot = unified_snapshot();
+        snapshot.launchd_inspection_complete = false;
+        snapshot
+            .inspection_errors
+            .push("launchd inspection timed out".to_string());
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("launchd inspection timed out"));
+    }
+
+    #[test]
+    fn unified_install_cli_json_contract_exposes_snapshot() {
+        let snapshot = unified_snapshot();
+        let report = plug_core::doctor::DoctorReport {
+            checks: vec![super::unified_install_check_from_snapshot(&snapshot)],
+            exit_code: 0,
+        };
+        let value = super::doctor_json_value(&report, &snapshot);
+        assert_eq!(
+            value["unified_install"]["app"]["version"],
+            serde_json::json!("0.6.4")
+        );
+        assert_eq!(
+            value["unified_install"]["ownership"],
+            serde_json::json!("app_managed")
+        );
+        assert!(value["checks"].is_array());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unified_install_ipc_probe_timeout_is_bounded() {
+        let result = super::bounded_ipc_probe(
+            std::future::pending::<anyhow::Result<plug_core::ipc::IpcResponse>>(),
+            std::time::Duration::from_secs(2),
+            "operator handshake",
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 
     #[test]
