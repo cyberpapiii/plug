@@ -6,9 +6,20 @@ struct PlugMenu: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Text(model.connectionState == .ready ? (model.isHealthy ? "Everything looks good" : "Plug needs attention") : "Plug is not connected")
-        ForEach(model.visibleServers.prefix(6)) { server in
-            Label(server.configured.name, systemImage: server.health == "Healthy" ? "circle.fill" : "exclamationmark.circle.fill")
+        Label(
+            model.connectionState == .ready
+                ? (model.isHealthy ? "Running normally" : "Needs attention")
+                : "Not connected",
+            systemImage: model.menuBarSymbol
+        )
+        .disabled(true)
+        Text("\(model.visibleServers.filter(\.configured.enabled).count) servers · \(model.snapshot.liveSessions.count) clients")
+            .disabled(true)
+        if !attentionServers.isEmpty {
+            Divider()
+            ForEach(attentionServers.prefix(4)) { server in
+                Label(server.configured.name, systemImage: "exclamationmark.circle.fill")
+            }
         }
         Divider()
         Button("Open Plug") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
@@ -19,5 +30,9 @@ struct PlugMenu: View {
         }
         Divider()
         Button("Quit Plug") { NSApp.terminate(nil) }
+    }
+
+    private var attentionServers: [AppModel.ServerPresentation] {
+        model.visibleServers.filter { $0.configured.enabled && $0.health != "Healthy" }
     }
 }

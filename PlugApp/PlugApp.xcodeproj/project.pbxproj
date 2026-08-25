@@ -24,6 +24,7 @@
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
 		E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */; };
+		E8F55758CCD235C746771CD0 /* AppChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BB10ED3645727B693E33897 /* AppChrome.swift */; };
 		F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F74CE97E0DF2E6BB479555A /* ClientsView.swift */; };
 /* End PBXBuildFile section */
 
@@ -43,6 +44,7 @@
 		17049C687463885E5E5C1CF0 /* PlugIPC */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PlugIPC; path = PlugIPC; sourceTree = SOURCE_ROOT; };
 		2AFB9D205089F380BB49E9C6 /* ServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServersView.swift; sourceTree = "<group>"; };
 		2B949E8F0B71D3EF15DF8ACE /* PlugMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugMenu.swift; sourceTree = "<group>"; };
+		2BB10ED3645727B693E33897 /* AppChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppChrome.swift; sourceTree = "<group>"; };
 		2D1B09D36EE0E0D152888537 /* UpdateService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateService.swift; sourceTree = "<group>"; };
 		36FB89E2C8814400C0F38A5D /* PlugApplication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugApplication.swift; sourceTree = "<group>"; };
 		44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PlugApp.entitlements; sourceTree = "<group>"; };
@@ -142,6 +144,7 @@
 		94579476E085452846D089D1 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				2BB10ED3645727B693E33897 /* AppChrome.swift */,
 				E823B05501E7735EEA26993A /* RootView.swift */,
 			);
 			path = Views;
@@ -351,6 +354,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6467183EF2D0B0C1FB4A3500 /* ActivityView.swift in Sources */,
+				E8F55758CCD235C746771CD0 /* AppChrome.swift in Sources */,
 				6BD4B241EB8557471C018CB5 /* AppModel.swift in Sources */,
 				E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */,
 				43F14541E9B4E1B33178101A /* AuthView.swift in Sources */,

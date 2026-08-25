@@ -16,10 +16,10 @@ struct PlugApplication: App {
     var body: some Scene {
         WindowGroup("Plug", id: "main") {
             RootView(model: model)
-                .frame(minWidth: 860, minHeight: 560)
+                .frame(minWidth: 760, minHeight: 520)
                 .task { await model.startMonitoring() }
         }
-        .defaultSize(width: 980, height: 680)
+        .defaultSize(width: 940, height: 640)
 
         MenuBarExtra("Plug", systemImage: model.menuBarSymbol) {
             PlugMenu(model: model)
