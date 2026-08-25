@@ -113,6 +113,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read workspace release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace_version="$(cargo metadata --no-deps --format-version 1 | \
+            python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "plug-mcp"))')"
+          echo "WORKSPACE_VERSION=${workspace_version}" >> "$GITHUB_ENV"
+
       - name: Install build tools
         run: |
           brew install xcodegen
@@ -146,6 +154,8 @@ jobs:
             ARCHS="arm64 x86_64" \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="$WORKSPACE_VERSION" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
             PLUG_RELEASE_BINARY="$GITHUB_WORKSPACE/target/plug-universal"
 
       - name: Sign, notarize, and staple app DMG
@@ -158,10 +168,32 @@ jobs:
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
           ./scripts/sign-notarize-macos-app.sh \
             "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app" \
-            "$RUNNER_TEMP/Plug-${version}.dmg"
+            "$RUNNER_TEMP/Plug-${WORKSPACE_VERSION}.dmg"
+
+      - name: Generate Homebrew Cask
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_dmg="Plug-${WORKSPACE_VERSION}.dmg"
+          app_sha="$(shasum -a 256 "$RUNNER_TEMP/$app_dmg" | cut -d' ' -f1)"
+          cat > "$RUNNER_TEMP/plug-app.rb" <<EOF
+          cask "plug-app" do
+            version "${WORKSPACE_VERSION}"
+            sha256 "${app_sha}"
+
+            url "https://github.com/cyberpapiii/plug/releases/download/${GITHUB_REF_NAME}/${app_dmg}"
+            name "Plug"
+            desc "Calm macOS control surface for the Plug MCP multiplexer"
+            homepage "https://github.com/cyberpapiii/plug"
+
+            auto_updates true
+            depends_on macos: ">= :sonoma"
+            app "Plug.app"
+          end
+          EOF
+          ruby -c "$RUNNER_TEMP/plug-app.rb"
 
       - name: Generate signed Sparkle appcast
         env:
@@ -188,6 +220,15 @@ jobs:
               "$RUNNER_TEMP/appcast-source"
           cp "$RUNNER_TEMP/appcast-source/appcast.xml" "$RUNNER_TEMP/appcast.xml"
 
+      - name: Verify release version contract
+        shell: bash
+        run: |
+          ./scripts/verify-release-contract.sh \
+            --tag "$GITHUB_REF_NAME" \
+            --app "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app" \
+            --appcast "$RUNNER_TEMP/appcast.xml" \
+            --cask "$RUNNER_TEMP/plug-app.rb"
+
       - name: Upload app release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -195,6 +236,7 @@ jobs:
           path: |
             ${{ runner.temp }}/Plug-*.dmg
             ${{ runner.temp }}/appcast.xml
+            ${{ runner.temp }}/plug-app.rb
 
   publish:
     name: Publish GitHub release and Homebrew tap
@@ -287,23 +329,6 @@ jobs:
           EOF
           ruby -c plug.rb
 
-          app_dmg="Plug-${version}.dmg"
-          app_sha=$(sha256sum "$app_dmg" | cut -d' ' -f1)
-          cat > plug-app.rb <<EOF
-          cask "plug-app" do
-            version "${version}"
-            sha256 "${app_sha}"
-
-            url "https://github.com/cyberpapiii/plug/releases/download/${TAG}/${app_dmg}"
-            name "Plug"
-            desc "Calm macOS control surface for the Plug MCP multiplexer"
-            homepage "https://github.com/cyberpapiii/plug"
-
-            auto_updates true
-            depends_on macos: ">= :sonoma"
-            app "Plug.app"
-          end
-          EOF
           ruby -c plug-app.rb
 
       - name: Generate checksums
