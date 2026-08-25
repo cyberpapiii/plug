@@ -1231,14 +1231,17 @@ fn replace_assignments(
     let mut section_end = end;
     for (key, value) in replacements {
         let mut found = false;
-        for index in start..section_end {
+        let mut index = start;
+        while index < section_end {
             let line = &lines[index];
             let trimmed = line.trim_start();
             let Some(after_key) = trimmed.strip_prefix(key) else {
+                index += 1;
                 continue;
             };
             if !after_key.trim_start().starts_with('=') && !after_key.trim_start().starts_with(':')
             {
+                index += 1;
                 continue;
             }
             let separator = if after_key.trim_start().starts_with('=') {
