@@ -78,6 +78,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  test-macos-app:
+    name: Test (Plug.app)
+    needs: check
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: plug-app-ci
+      - run: brew install xcodegen
+      - run: swift test --package-path PlugApp/PlugIPC
+      - run: xcodegen generate --spec PlugApp/project.yml
+      - run: >-
+          xcodebuild test
+          -project PlugApp/PlugApp.xcodeproj
+          -scheme PlugApp
+          -destination 'platform=macOS'
+          CODE_SIGNING_ALLOWED=NO
+
   cross-check:
     name: Cross-check (${{ matrix.target }})
     needs: check
