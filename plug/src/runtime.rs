@@ -1061,6 +1061,15 @@ fn validate_proxy_daemon_handshake(
     Ok(())
 }
 
+// Unit tests run an in-process daemon (or a fake daemon) from the test
+// executable. Keep that identity hermetic: tests must not depend on an
+// installed app or on the process-global PLUG_DEV environment variable.
+#[cfg(test)]
+fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)> {
+    Ok((std::env::current_exe()?, false))
+}
+
+#[cfg(not(test))]
 fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)> {
     #[cfg(target_os = "macos")]
     {
@@ -1075,6 +1084,7 @@ fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)
             return Ok((app.executable_path, true));
         }
     }
+
     Ok((std::env::current_exe()?, false))
 }
 
