@@ -8,7 +8,10 @@ final class NotificationService {
     private var previous: OperatorSnapshot?
 
     func requestAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        Task {
+            _ = try? await UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert, .sound])
+        }
     }
 
     func observe(_ snapshot: OperatorSnapshot) {

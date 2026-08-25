@@ -103,7 +103,7 @@ final class AppModel {
     func adoptDaemon() async {
         do {
             try DaemonServiceManager.shared.adopt()
-            serviceNeedsAdoption = false
+            serviceNeedsAdoption = DaemonServiceManager.shared.needsAdoption
             try await Task.sleep(for: .milliseconds(700))
             await refresh()
         } catch { lastError = error.localizedDescription }

@@ -81,6 +81,14 @@ fn test_runtime_paths() -> &'static std::sync::Mutex<Option<(PathBuf, PathBuf)>>
 }
 
 #[cfg(test)]
+pub(crate) fn test_runtime_paths_active() -> bool {
+    test_runtime_paths()
+        .lock()
+        .expect("test runtime path mutex poisoned")
+        .is_some()
+}
+
+#[cfg(test)]
 pub(crate) fn set_test_runtime_paths(runtime: PathBuf, state: PathBuf) {
     *test_runtime_paths()
         .lock()

@@ -27,7 +27,10 @@ use framing::FrameReader;
 
 mod paths;
 #[cfg(test)]
-pub(crate) use paths::{clear_test_runtime_paths, runtime_paths_test_lock, set_test_runtime_paths};
+pub(crate) use paths::{
+    clear_test_runtime_paths, runtime_paths_test_lock, set_test_runtime_paths,
+    test_runtime_paths_active,
+};
 use paths::{ensure_dir, pid_path, runtime_dir, set_file_permissions_0600, token_path};
 pub use paths::{log_dir, socket_path};
 
