@@ -163,11 +163,38 @@ jobs:
             "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app" \
             "$RUNNER_TEMP/Plug-${version}.dmg"
 
-      - name: Upload app DMG
+      - name: Generate signed Sparkle appcast
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -n "$SPARKLE_PRIVATE_KEY"
+          mkdir -p "$RUNNER_TEMP/appcast-source" "$RUNNER_TEMP/sparkle-tools"
+          gh release download --repo cyberpapiii/plug --pattern appcast.xml \
+            --dir "$RUNNER_TEMP/appcast-source" 2>/dev/null || true
+          cp "$RUNNER_TEMP"/Plug-*.dmg "$RUNNER_TEMP/appcast-source/"
+          gh release download 2.9.2 --repo sparkle-project/Sparkle \
+            --pattern Sparkle-2.9.2.tar.xz --dir "$RUNNER_TEMP/sparkle-tools"
+          tar -xJf "$RUNNER_TEMP/sparkle-tools/Sparkle-2.9.2.tar.xz" \
+            -C "$RUNNER_TEMP/sparkle-tools"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+            "$RUNNER_TEMP/sparkle-tools/bin/generate_appcast" \
+              --ed-key-file - \
+              --maximum-versions 0 \
+              --download-url-prefix "https://github.com/cyberpapiii/plug/releases/download/${TAG}/" \
+              --link "https://github.com/cyberpapiii/plug" \
+              "$RUNNER_TEMP/appcast-source"
+          cp "$RUNNER_TEMP/appcast-source/appcast.xml" "$RUNNER_TEMP/appcast.xml"
+
+      - name: Upload app release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: plug-app
-          path: ${{ runner.temp }}/Plug-*.dmg
+          path: |
+            ${{ runner.temp }}/Plug-*.dmg
+            ${{ runner.temp }}/appcast.xml
 
   publish:
     name: Publish GitHub release and Homebrew tap
@@ -278,29 +305,6 @@ jobs:
           end
           EOF
           ruby -c plug-app.rb
-
-      - name: Generate signed Sparkle appcast
-        env:
-          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$SPARKLE_PRIVATE_KEY"
-          mkdir -p appcast-source sparkle-tools
-          gh release download --repo cyberpapiii/plug --pattern appcast.xml \
-            --dir appcast-source 2>/dev/null || true
-          cp artifacts/Plug-*.dmg appcast-source/
-          gh release download 2.9.2 --repo sparkle-project/Sparkle \
-            --pattern Sparkle-2.9.2.tar.xz --dir sparkle-tools
-          tar -xJf sparkle-tools/Sparkle-2.9.2.tar.xz -C sparkle-tools
-          printf '%s' "$SPARKLE_PRIVATE_KEY" | \
-            sparkle-tools/bin/generate_appcast \
-              --ed-key-file - \
-              --maximum-versions 0 \
-              --download-url-prefix "https://github.com/cyberpapiii/plug/releases/download/${TAG}/" \
-              --link "https://github.com/cyberpapiii/plug" \
-              appcast-source
-          cp appcast-source/appcast.xml artifacts/appcast.xml
 
       - name: Generate checksums
         shell: bash
