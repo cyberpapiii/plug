@@ -41,6 +41,10 @@ pub(crate) fn install_test_credential_environment() {
 
 mod commands;
 mod daemon;
+// The unified installation model is fully exercised on macOS and in tests;
+// Linux keeps only the small standalone-command subset at runtime.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod install;
 mod ipc_proxy;
 mod runtime;
 mod service;
@@ -236,6 +240,9 @@ enum Commands {
     #[command(display_order = 20)]
     /// macOS: install a stable code-signing identity so Keychain prompts stop recurring
     CodesignSetup,
+    #[command(hide = true)]
+    /// Internal: remove only installation artifacts proven to belong to Plug.app
+    UninstallCleanup,
 }
 
 #[derive(Subcommand)]
@@ -419,6 +426,7 @@ pub(crate) enum OwnerCommands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install::maybe_delegate_to_app()?;
     apply_dotenv();
     plug_core::tls::ensure_rustls_provider_installed();
 
@@ -521,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Repair { targets, all }) => {
-            commands::misc::cmd_repair(cli.config.as_ref(), targets, all)?
+            commands::misc::cmd_repair(cli.config.as_ref(), targets, all, &cli.output)?
         }
         Some(Commands::Setup { yes, transport }) => {
             commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
@@ -546,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
         Some(Commands::CodesignSetup) => commands::codesign::cmd_codesign_setup(&cli.output)?,
+        Some(Commands::UninstallCleanup) => commands::misc::cmd_uninstall_cleanup(&cli.output)?,
     }
 
     Ok(())

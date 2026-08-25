@@ -15,89 +15,71 @@ OpenCode ─────┘
 
 ## Installation
 
-### Cargo
+Choose one supported path for your platform. Do not install a second `plug`
+binary beside the one that owns your runtime.
+
+### macOS
+
+Download the signed DMG from the Plug website or [GitHub Releases](https://github.com/cyberpapiii/plug/releases), move `Plug.app` to Applications, and open it once. Plug.app then owns the GUI, `plug` command, background daemon, client links, and Sparkle updates.
+
+Or install the same app with the Homebrew Cask:
 
 ```sh
-cargo install plug-mcp --locked
+brew install --cask cyberpapiii/tap/plug-app
 ```
 
-### Cargo from GitHub
+Open Plug.app once after either installation. First launch needs a logged-in
+macOS GUI session so ServiceManagement and Keychain consent can complete.
+Headless macOS is unsupported.
 
-Use this when you want the current `main` branch instead of the latest crates.io release:
+### Linux
 
-```sh
-cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked
-```
+Linux users can choose one standalone path:
 
-### Local development reinstall
+- Linux-only Homebrew Formula:
 
-When working on `plug` locally, use the repo script instead of manually copying binaries:
+  ```sh
+  brew install cyberpapiii/tap/plug
+  ```
 
-```sh
-./scripts/dev-reinstall.sh
-```
+- Linux-only release shell installer:
 
-This rebuilds the workspace, reinstalls `plug`, and normalizes `~/.local/bin/plug`
-to a symlink pointing at `~/.cargo/bin/plug` so the PATH binary stays in sync.
+  ```sh
+  curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh
+  ```
 
-To clean generated build artifacts after reinstalling:
+- Linux release archive from the [GitHub Releases](https://github.com/cyberpapiii/plug/releases) page. Verify its SHA-256 checksum, then place `plug` in your PATH.
 
-```sh
-./scripts/dev-reinstall.sh --quick --clean
-```
+### Source development
 
-### macOS: stop repeated Keychain prompts (one-time)
+Source builds use an isolated development command and never replace the
+production `plug` command owned by Plug.app:
 
-plug stores upstream OAuth credentials in the macOS login Keychain. A
-locally-built binary is ad-hoc signed, and its signature changes on every
-rebuild, so the Keychain "Always Allow" approval never persists and macOS
-re-prompts constantly. Run this once per machine to give plug a stable
-self-signed code-signing identity:
+For a fresh checkout, set up local signing before the first development
+install. The setup script is idempotent and safely no-ops off macOS:
 
 ```sh
-plug codesign-setup        # built-in; works for any install (cargo, Homebrew, release)
-# or, in a repo clone:
 ./scripts/setup-codesigning.sh
+./scripts/dev-reinstall.sh --quick
+PLUG_DEV=1 plug-dev
 ```
 
-Both are idempotent (no-op on non-macOS, skip if already set up). `plug doctor`
-also flags the condition (`codesign_identity` check). Afterward,
-`./scripts/dev-reinstall.sh` re-signs automatically on every rebuild. Details:
-`docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md`.
+Use `./scripts/dev-reinstall.sh --quick --clean` when you also want generated
+build artifacts removed; invoke the installed development binary afterward with
+`PLUG_DEV=1 plug-dev`. Do not use development signing commands on Plug.app or
+release binaries.
 
-### Release installers
+### Connect Claude Desktop
 
-After a release is cut, install with Homebrew:
+Link Claude Desktop with:
 
 ```sh
-brew install cyberpapiii/tap/plug
+plug link claude-desktop
 ```
 
-Or use the shell installer, which installs into `$CARGO_HOME/bin` or
-`$HOME/.cargo/bin`:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh
-```
-
-### Manual
-
-Download the binary for your platform from the [releases page](https://github.com/cyberpapiii/plug/releases), verify the SHA-256 checksum, and place it in your PATH.
-
-### Claude Desktop extension bundle
-
-Claude Desktop can show icons through its MCPB/Desktop Extension install surface.
-Build a local bundle after compiling the release binary:
-
-```sh
-cargo build --release
-./scripts/build-mcpb.sh
-```
-
-This writes `target/dist/plug.mcpb`, bundling the `plug` binary plus PNG icon
-assets. Install that file from Claude Desktop's Extensions developer settings.
-The normal `plug connect` config path remains supported; MCPB is only needed when
-you want Claude Desktop's extension UI to use Plug's packaged icon metadata.
+Plug writes Claude Desktop's normal MCP configuration and routes it through the
+same bundled runtime as the app. There is no separate executable extension to
+install or update.
 
 ## Quick Start
 
@@ -352,7 +334,7 @@ Notes:
 
 ## Design Principles
 
-1. **Single binary, zero dependencies** — `cargo install plug-mcp --locked && plug`
+1. **One install, one owner** — Plug.app on macOS; Formula, shell installer, or archive on Linux
 2. **Ruthlessly minimal** — if a feature can't be explained in one sentence, simplify it
 3. **Dual-audience UX** — every command works for humans (pretty) AND agents (`--output json`)
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering

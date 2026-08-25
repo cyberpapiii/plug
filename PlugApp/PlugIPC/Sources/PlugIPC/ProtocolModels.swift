@@ -2,10 +2,31 @@ import Foundation
 
 public struct OperatorHandshake: Codable, Equatable, Sendable {
     public let daemonVersion: String
+    public let daemonExecutable: URL?
     public let ipcMin: UInt16
     public let ipcMax: UInt16
     public let ownership: String
     public let capabilities: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case daemonVersion, daemonExecutable, ipcMin, ipcMax, ownership, capabilities
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        daemonVersion = try container.decode(String.self, forKey: .daemonVersion)
+        if let value = try container.decodeIfPresent(String.self, forKey: .daemonExecutable) {
+            daemonExecutable = value.contains("://")
+                ? URL(string: value)
+                : URL(fileURLWithPath: value)
+        } else {
+            daemonExecutable = nil
+        }
+        ipcMin = try container.decode(UInt16.self, forKey: .ipcMin)
+        ipcMax = try container.decode(UInt16.self, forKey: .ipcMax)
+        ownership = try container.decode(String.self, forKey: .ownership)
+        capabilities = try container.decode([String].self, forKey: .capabilities)
+    }
 }
 
 public struct ServerStatus: Codable, Identifiable, Equatable, Sendable {

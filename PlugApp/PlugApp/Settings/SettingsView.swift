@@ -14,7 +14,9 @@ struct SettingsView: View {
             LabeledContent("Version", value: model.snapshot.runtimeVersion.isEmpty ? "—" : model.snapshot.runtimeVersion)
             Button("Check for Updates…") { UpdateService.shared.checkForUpdates() }
                 .disabled(!UpdateService.shared.canCheckForUpdates)
-            Text("Plug keeps running when this window closes.").font(.caption).foregroundStyle(.secondary)
+            Text("Plug keeps running when this window closes or the app quits.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }.formStyle(.grouped).frame(width: 440, height: 220).padding()
     }
 }

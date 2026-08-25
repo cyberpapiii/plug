@@ -50,7 +50,7 @@ assert_selector_present() {
 }
 
 validate_local_evidence_mapping() {
-  local evidence selector spec_target spec_selector mapped
+  local evidence selector spec_selector mapped
   while IFS= read -r evidence; do
     IFS=';' read -ra selectors <<<"$evidence"
     for selector in "${selectors[@]}"; do
@@ -58,7 +58,7 @@ validate_local_evidence_mapping() {
       selector=${selector%"${selector##*[![:space:]]}"}
       mapped=false
       for spec in "${local_specs[@]}"; do
-        IFS=$'\t' read -r spec_target spec_selector <<<"$spec"
+        IFS=$'\t' read -r _ spec_selector <<<"$spec"
         if [[ "$selector" == "$spec_selector" ]]; then
           mapped=true
           break

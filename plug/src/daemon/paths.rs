@@ -124,7 +124,20 @@ pub(crate) fn runtime_paths_test_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 pub fn socket_path() -> PathBuf {
+    // An alternate endpoint is a source-development/test seam only. A normal
+    // production process must always use the per-user runtime socket.
+    let development = std::env::var_os("PLUG_DEV").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if let Some(path) = socket_path_override(development, std::env::var_os("PLUG_SOCKET_PATH")) {
+        return path;
+    }
     runtime_dir().join("plug.sock")
+}
+
+fn socket_path_override(development: bool, value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if !development {
+        return None;
+    }
+    value.filter(|path| !path.is_empty()).map(PathBuf::from)
 }
 
 pub fn pid_path() -> PathBuf {
@@ -177,6 +190,23 @@ mod tests {
         let sock = socket_path();
         assert!(sock.starts_with(&rt));
         assert!(sock.to_string_lossy().ends_with("plug.sock"));
+    }
+
+    #[test]
+    fn socket_path_ignores_override_without_development_gate() {
+        let _guard = runtime_paths_test_lock().blocking_lock();
+        let override_path = std::ffi::OsString::from("/tmp/plug-production-override.sock");
+        assert_eq!(socket_path_override(false, Some(override_path)), None);
+    }
+
+    #[test]
+    fn socket_path_accepts_override_in_development() {
+        let _guard = runtime_paths_test_lock().blocking_lock();
+        let override_path = std::ffi::OsString::from("/tmp/plug-development-override.sock");
+        assert_eq!(
+            socket_path_override(true, Some(override_path)),
+            Some(PathBuf::from("/tmp/plug-development-override.sock"))
+        );
     }
 
     #[test]

@@ -218,6 +218,7 @@ async fn operator_live_sessions(
             session_id: snapshot.session_id,
             client_type: snapshot.client_type,
             client_info: None,
+            adapter_version: None,
             connected_secs: snapshot.connected_seconds,
             last_activity_secs: Some(snapshot.idle_seconds),
         })
@@ -947,6 +948,7 @@ pub(crate) async fn fetch_live_sessions(
                             .map(plug_core::client_detect::detect_client)
                             .unwrap_or(plug_core::types::ClientType::Unknown),
                         client_info: client.client_info,
+                        adapter_version: client.adapter_version,
                         connected_secs: client.connected_secs,
                         last_activity_secs: None,
                     })
@@ -997,12 +999,93 @@ pub(crate) struct DaemonProxySession {
 }
 
 enum PendingIpcResponse {
+    OperatorHandshake(plug_core::ipc::OperatorHandshake),
     Registered {
         session_id: String,
         modern_downstream_enabled: bool,
         cancellation_capability: plug_core::ipc::IpcCancellationCapability,
     },
     Capabilities(rmcp::model::ServerCapabilities),
+}
+
+fn paths_resolve_to_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn validate_proxy_daemon_handshake(
+    handshake: &plug_core::ipc::OperatorHandshake,
+    expected_executable: &std::path::Path,
+    require_app_ownership: bool,
+) -> anyhow::Result<()> {
+    if handshake.daemon_version != env!("CARGO_PKG_VERSION") {
+        anyhow::bail!(
+            "daemon/client version mismatch: daemon={}, client={}",
+            handshake.daemon_version,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    if handshake.ipc_min > plug_core::ipc::IPC_PROTOCOL_VERSION
+        || handshake.ipc_max < plug_core::ipc::IPC_PROTOCOL_VERSION
+    {
+        anyhow::bail!(
+            "daemon/client IPC ranges do not overlap: daemon={}..={}, client={}",
+            handshake.ipc_min,
+            handshake.ipc_max,
+            plug_core::ipc::IPC_PROTOCOL_VERSION
+        );
+    }
+    let daemon_executable = handshake.daemon_executable.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("daemon did not report its executable; refusing an unverified session")
+    })?;
+    if !paths_resolve_to_same_file(daemon_executable, expected_executable) {
+        anyhow::bail!(
+            "daemon executable mismatch: expected {}, got {}",
+            expected_executable.display(),
+            daemon_executable.display()
+        );
+    }
+    if require_app_ownership
+        && handshake.ownership != plug_core::ipc::DaemonOwnershipMode::AppManaged
+    {
+        anyhow::bail!(
+            "daemon ownership mismatch: expected app-managed, got {:?}",
+            handshake.ownership
+        );
+    }
+    Ok(())
+}
+
+// Unit tests run an in-process daemon (or a fake daemon) from the test
+// executable. Keep that identity hermetic: tests must not depend on an
+// installed app or on the process-global PLUG_DEV environment variable.
+#[cfg(test)]
+fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)> {
+    Ok((std::env::current_exe()?, false))
+}
+
+#[cfg(not(test))]
+fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)> {
+    #[cfg(target_os = "macos")]
+    {
+        let development =
+            std::env::var_os("PLUG_DEV").as_deref() == Some(std::ffi::OsStr::new("1"));
+        if !development {
+            let app = crate::install::resolve_verified_app()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no verified Plug.app is available; open Plug.app to finish installation"
+                )
+            })?;
+            return Ok((app.executable_path, true));
+        }
+    }
+
+    Ok((std::env::current_exe()?, false))
 }
 
 async fn read_pending_or_matching_response(
@@ -1084,10 +1167,39 @@ pub(crate) async fn establish_daemon_proxy_session(
 
     let (mut reader, mut writer) = stream.into_split();
     let mut pending_notifications = Vec::new();
+    let handshake_req = plug_core::ipc::IpcRequest::OperatorHandshake {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
+        ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
+    };
+    let payload = serde_json::to_vec(&handshake_req)?;
+    plug_core::ipc::write_frame(&mut writer, &payload).await?;
+    let handshake = match read_pending_or_matching_response(
+        &mut reader,
+        &client_id,
+        &mut pending_notifications,
+        |response| match response {
+            plug_core::ipc::IpcResponse::OperatorHandshake { handshake } => {
+                Some(PendingIpcResponse::OperatorHandshake(handshake.clone()))
+            }
+            _ => None,
+        },
+    )
+    .await?
+    {
+        PendingIpcResponse::OperatorHandshake(handshake) => handshake,
+        PendingIpcResponse::Registered { .. } | PendingIpcResponse::Capabilities(_) => {
+            unreachable!("operator handshake response expected")
+        }
+    };
+    let (expected_executable, require_app_ownership) = expected_proxy_daemon_identity()?;
+    validate_proxy_daemon_handshake(&handshake, &expected_executable, require_app_ownership)?;
+
     let register_req = plug_core::ipc::IpcRequest::Register {
         protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
         client_id: client_id.clone(),
         client_info: client_info.clone(),
+        adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
@@ -1122,6 +1234,9 @@ pub(crate) async fn establish_daemon_proxy_session(
                 cancellation_capability,
             ),
             PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
+            PendingIpcResponse::OperatorHandshake(_) => {
+                unreachable!("registration response expected")
+            }
         };
     let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
         session_id: session_id.clone(),
@@ -1145,6 +1260,9 @@ pub(crate) async fn establish_daemon_proxy_session(
     {
         PendingIpcResponse::Capabilities(capabilities) => capabilities,
         PendingIpcResponse::Registered { .. } => unreachable!("capabilities response expected"),
+        PendingIpcResponse::OperatorHandshake(_) => {
+            unreachable!("capabilities response expected")
+        }
     };
     Ok(DaemonProxySession {
         reader,
@@ -2045,6 +2163,7 @@ mod tests {
             session_id: "daemon-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2054,6 +2173,7 @@ mod tests {
             session_id: "http-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeDesktop,
             client_info: None,
+            adapter_version: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2079,6 +2199,7 @@ mod tests {
             session_id: "daemon-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2104,6 +2225,7 @@ mod tests {
             session_id: "daemon-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2129,6 +2251,7 @@ mod tests {
             session_id: "http-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeDesktop,
             client_info: None,
+            adapter_version: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2206,6 +2329,7 @@ mod tests {
                 session_id: "daemon-1".to_string(),
                 client_type: plug_core::types::ClientType::ClaudeCode,
                 client_info: Some("Claude Code".to_string()),
+                adapter_version: Some("0.6.5".to_string()),
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -2215,6 +2339,7 @@ mod tests {
                 session_id: "http-1".to_string(),
                 client_type: plug_core::types::ClientType::ClaudeDesktop,
                 client_info: None,
+                adapter_version: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },
@@ -3419,5 +3544,60 @@ mod tests {
         handle.abort();
         assert!(matches!(state, LiveSessionSourceState::Unavailable));
         std::fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    fn proxy_handshake(
+        executable: Option<&str>,
+        ownership: plug_core::ipc::DaemonOwnershipMode,
+    ) -> plug_core::ipc::OperatorHandshake {
+        plug_core::ipc::OperatorHandshake {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            daemon_executable: executable.map(std::path::PathBuf::from),
+            ipc_min: plug_core::ipc::IPC_PROTOCOL_VERSION,
+            ipc_max: plug_core::ipc::IPC_PROTOCOL_VERSION,
+            ownership,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn proxy_handshake_requires_exact_daemon_identity() {
+        let expected = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let valid = proxy_handshake(
+            Some("/Applications/Plug.app/Contents/Resources/plug"),
+            plug_core::ipc::DaemonOwnershipMode::AppManaged,
+        );
+        validate_proxy_daemon_handshake(&valid, expected, true).expect("valid identity");
+
+        let foreign = proxy_handshake(
+            Some("/Users/example/Applications/Plug.app/Contents/Resources/plug"),
+            plug_core::ipc::DaemonOwnershipMode::AppManaged,
+        );
+        assert!(validate_proxy_daemon_handshake(&foreign, expected, true).is_err());
+
+        let unowned = proxy_handshake(
+            Some("/Applications/Plug.app/Contents/Resources/plug"),
+            plug_core::ipc::DaemonOwnershipMode::CliManaged,
+        );
+        assert!(validate_proxy_daemon_handshake(&unowned, expected, true).is_err());
+
+        let missing = proxy_handshake(None, plug_core::ipc::DaemonOwnershipMode::AppManaged);
+        assert!(validate_proxy_daemon_handshake(&missing, expected, true).is_err());
+    }
+
+    #[test]
+    fn proxy_handshake_rejects_version_and_protocol_mismatch() {
+        let expected = std::path::Path::new("/tmp/plug");
+        let mut handshake = proxy_handshake(
+            Some("/tmp/plug"),
+            plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+        );
+        handshake.daemon_version = "0.0.0".to_string();
+        assert!(validate_proxy_daemon_handshake(&handshake, expected, false).is_err());
+
+        handshake.daemon_version = env!("CARGO_PKG_VERSION").to_string();
+        handshake.ipc_min = plug_core::ipc::IPC_PROTOCOL_VERSION + 1;
+        handshake.ipc_max = plug_core::ipc::IPC_PROTOCOL_VERSION + 1;
+        assert!(validate_proxy_daemon_handshake(&handshake, expected, false).is_err());
     }
 }

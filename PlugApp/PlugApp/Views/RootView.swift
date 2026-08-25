@@ -29,8 +29,16 @@ struct RootView: View {
             }
         } detail: {
             VStack(spacing: 0) {
-                if model.serviceNeedsAdoption {
+                if model.showsReconciliationProgress {
+                    ReconciliationProgressNotice()
+                } else if model.adoptionIsRequired {
                     ServiceAdoptionNotice(model: model)
+                } else if let failure = model.installationFailure {
+                    InstallationFailureNotice(model: model, failure: failure)
+                } else if model.connectionRecoveryIsRequired {
+                    ConnectionRecoveryNotice(model: model)
+                } else if let drift = model.installationDrift {
+                    InstallationDriftNotice(drift: drift)
                 }
                 Group {
                     switch selection ?? .servers {
@@ -49,7 +57,7 @@ struct RootView: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if let error = model.lastError {
+            if let error = model.lastError, model.installationFailure == nil {
                 ErrorToast(message: error)
             }
         }

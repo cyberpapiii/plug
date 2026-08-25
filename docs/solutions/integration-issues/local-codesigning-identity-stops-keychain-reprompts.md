@@ -66,23 +66,24 @@ short-lived processes. Frustrating, and easy to mistake for a broken install.
 
 ## Solution
 
-Give the binary a **stable, trusted self-signed code-signing identity** and sign
-with it after every build. Because the Keychain ACL binds to the signature's
-*designated requirement* (which references the cert, not the per-build CDHash),
-"Always Allow" then persists across rebuilds.
+Give a source-development binary a **stable, trusted self-signed code-signing
+identity** and sign it after every build. Because the Keychain ACL binds to the
+signature's *designated requirement* (which references the cert, not the
+per-build CDHash), "Always Allow" then persists across rebuilds.
 
-**Easiest path (any install) — the built-in command:**
+**Source-development path — the isolated development command:**
 
 ```sh
-plug codesign-setup   # creates the identity if missing, then signs the running binary
+./scripts/dev-reinstall.sh --quick
+PLUG_DEV=1 plug-dev codesign-setup
 ```
 
-`plug codesign-setup` is install-path-agnostic (cargo, Homebrew, release download)
-and self-contained — it runs all the steps below for you. `plug doctor` surfaces
-the need for it: a `codesign_identity` check warns when plug is ad-hoc signed and
-keychain-backed OAuth upstreams are configured, and points at the command.
-`scripts/setup-codesigning.sh` is the equivalent standalone shell script for the
-repo clone flow.
+`plug-dev codesign-setup` is deliberately development-only. It requires
+`PLUG_DEV=1`, refuses any executable not named `plug-dev`, and refuses to replace
+a Developer ID signature. Release and Plug.app binaries already carry their
+production signature and must never be re-signed locally. `scripts/setup-codesigning.sh`
+is the equivalent standalone helper for a repository clone and targets only
+`~/.cargo/bin/plug-dev`.
 
 The underlying one-time steps (what the command/script automate):
 
@@ -114,16 +115,15 @@ Then use the staged installer for every local rebuild:
 
 ```sh
 ./scripts/dev-reinstall.sh --quick
-codesign --verify --deep --strict ~/.cargo/bin/plug
-codesign -dv --verbose=2 ~/.cargo/bin/plug 2>&1 | grep Authority
+codesign --verify --deep --strict ~/.cargo/bin/plug-dev
+codesign -dv --verbose=2 ~/.cargo/bin/plug-dev 2>&1 | grep Authority
 # → Authority=Plug Local Signing   (no longer Signature=adhoc)
 ```
 
 The script installs into a private same-filesystem staging directory, signs and
-verifies the candidate, smoke-tests it, and only then atomically renames it over
-the live binary. Do not replace the live binary first and sign it afterward:
-an auto-respawning client could execute that unsigned intermediate build and
-reopen the Keychain authorization flood.
+verifies the candidate, smoke-tests it with `PLUG_DEV=1`, and only then atomically
+renames it to `~/.cargo/bin/plug-dev`. It never creates, replaces, or redirects a
+public `plug` command. Plug.app remains the sole production owner.
 
 Daemon operator queries must also stay off the synchronous Keychain path.
 `AuthStatus` reads the in-memory credential cache and protected file mirror
@@ -178,22 +178,23 @@ Digital Signature** extension (not just Extended Key Usage). Miss either and
 - **`plug doctor` catches it.** The `codesign_identity` check warns when plug is
   ad-hoc signed and OAuth upstreams are configured, so the condition is
   discoverable on any install path (not just the repo clone).
-- **`plug codesign-setup` fixes it** in one command, idempotently — it creates the
-  identity if missing and signs the running binary, regardless of install method.
-- **Always re-sign after installing.** Use `scripts/dev-reinstall.sh` (which
-  signs automatically when the identity exists) instead of a bare
-  `cargo install`. A bare install drops back to ad-hoc and the prompts return.
+- **`PLUG_DEV=1 plug-dev codesign-setup` fixes source builds** idempotently. It
+  creates the identity if missing and signs only the isolated development binary.
+- **Always re-sign development builds.** Use `scripts/dev-reinstall.sh`, which
+  signs automatically when the identity exists. It installs `plug-dev` without
+  touching Plug.app's public command.
 - **Never let tests use production credential paths.** Workspace OAuth tests
   install an isolated temporary token directory and in-memory keyring before
   the first credential operation; keep regression coverage for that boundary.
 - **Acquire singleton ownership before external initialization.** A daemon that
   cannot own the runtime lock must not start upstreams or read credentials.
-- **Run `plug codesign-setup` (or `scripts/setup-codesigning.sh`) once per
-  machine.** Both are idempotent: they no-op on non-macOS and skip creation when
-  a valid `Plug Local Signing` identity already exists.
-- **Distributed binaries need a real fix:** Developer ID signing + notarization in
-  the release pipeline so release/Homebrew installs are signed out of the box —
-  tracked in `todos/069-pending-p3-release-binary-codesigning-notarization.md`.
+- **Run `PLUG_DEV=1 plug-dev codesign-setup` (or
+  `scripts/setup-codesigning.sh`) once per development machine.** Both are
+  idempotent, no-op on non-macOS, and skip identity creation when a valid
+  `Plug Local Signing` identity already exists.
+- **Distributed binaries use Developer ID signing and notarization.** Never run
+  the local signing setup against Plug.app or a release executable; both the
+  command and shell helper refuse to replace a Developer ID signature.
 - **When generating a code-signing cert by hand, set both KU and EKU**:
   `keyUsage=critical,digitalSignature` and
   `extendedKeyUsage=critical,codeSigning`. KU-only or EKU-only certs fail the

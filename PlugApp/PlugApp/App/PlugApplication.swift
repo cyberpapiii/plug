@@ -6,6 +6,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         NotificationService.shared.requestAuthorization()
     }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
 }
 
 @main
@@ -17,7 +21,7 @@ struct PlugApplication: App {
         WindowGroup("Plug", id: "main") {
             RootView(model: model)
                 .frame(minWidth: 760, minHeight: 520)
-                .task { await model.startMonitoring() }
+                .task { await model.start() }
         }
         .defaultSize(width: 940, height: 640)
 

@@ -38,3 +38,6 @@ id_ed25519*
 **/.build/
 **/xcuserdata/
 *.xcuserstate
+
+# Compound Engineering scratch reports are local-only.
+.superpowers/

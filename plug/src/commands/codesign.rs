@@ -1,14 +1,15 @@
-//! `plug codesign-setup` — give the binary a stable macOS code-signing identity.
+//! `PLUG_DEV=1 plug-dev codesign-setup` — give the isolated development binary
+//! a stable macOS code-signing identity.
 //!
 //! plug stores upstream OAuth credentials in the macOS login Keychain. A
-//! locally-built / release binary is ad-hoc signed, and its signature changes on
+//! locally-built binary is ad-hoc signed, and its signature changes on
 //! every rebuild, so the Keychain "Always Allow" ACL never persists and macOS
 //! re-prompts constantly. This command creates (once) a stable self-signed
 //! code-signing identity and signs the running binary with it, so the approval
 //! sticks across rebuilds.
 //!
-//! It is install-path-agnostic: it signs whatever `plug` binary is running, so it
-//! works for `cargo install`, Homebrew, and release-download installs alike.
+//! It only signs an executable named `plug-dev` in explicit development mode.
+//! Developer ID release and Plug.app binaries are never re-signed.
 //!
 //! Background:
 //! `docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md`
@@ -39,6 +40,7 @@ pub(crate) fn cmd_codesign_setup(output: &OutputFormat) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn run_macos(output: &OutputFormat) -> anyhow::Result<()> {
     use anyhow::Context as _;
+    use std::ffi::OsStr;
 
     let json = matches!(output, OutputFormat::Json);
 
@@ -46,6 +48,8 @@ fn run_macos(output: &OutputFormat) -> anyhow::Result<()> {
     // regardless of how plug was installed.
     let exe = std::env::current_exe().context("could not resolve the running executable")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let development_mode = std::env::var_os("PLUG_DEV").as_deref() == Some(OsStr::new("1"));
+    validate_development_signing_target(development_mode, &exe, developer_id_signed(&exe)?)?;
 
     let created = if identity_valid()? {
         if !json {
@@ -92,17 +96,50 @@ fn run_macos(output: &OutputFormat) -> anyhow::Result<()> {
             );
         }
         println!();
-        println!("Done. Next:");
-        println!("  1. Restart plug in your login session:  plug stop && plug start");
+        println!("Development signing is ready.");
+        println!("Run this isolated binary with: PLUG_DEV=1 plug-dev");
         println!(
-            "  2. Click \"Always Allow\" on the one final round of Keychain prompts (one per OAuth"
+            "Click \"Always Allow\" on the one final round of Keychain prompts (one per OAuth"
         );
-        println!(
-            "     upstream). They now bind to '{IDENTITY}' and won't recur on future rebuilds."
-        );
+        println!("upstream). They now bind to '{IDENTITY}' and won't recur on future rebuilds.");
     }
 
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_development_signing_target(
+    development_mode: bool,
+    executable: &std::path::Path,
+    developer_id_signed: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        development_mode,
+        "codesign-setup is development-only; run PLUG_DEV=1 plug-dev codesign-setup"
+    );
+    anyhow::ensure!(
+        !developer_id_signed,
+        "refusing to replace the Developer ID signature on {}",
+        executable.display()
+    );
+    anyhow::ensure!(
+        executable.file_name() == Some(std::ffi::OsStr::new("plug-dev")),
+        "codesign-setup only operates on the isolated plug-dev executable"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn developer_id_signed(executable: &std::path::Path) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+
+    let output = std::process::Command::new("codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(executable)
+        .output()
+        .context("failed to inspect the current executable's code signature")?;
+    let details = String::from_utf8_lossy(&output.stderr);
+    Ok(details.contains("Authority=Developer ID Application:"))
 }
 
 /// True when `security` lists `IDENTITY` as a *valid* code-signing identity.
@@ -252,4 +289,57 @@ fn adhoc_or_unsigned(exe: &std::path::Path) -> Option<bool> {
 fn set_mode(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::validate_development_signing_target;
+
+    #[test]
+    fn codesign_setup_requires_explicit_development_mode() {
+        let error = validate_development_signing_target(
+            false,
+            Path::new("/Users/test/.cargo/bin/plug-dev"),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("PLUG_DEV=1"));
+    }
+
+    #[test]
+    fn codesign_setup_only_accepts_plug_dev_executable() {
+        let error = validate_development_signing_target(
+            true,
+            Path::new("/Users/test/.cargo/bin/plug"),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("plug-dev"));
+    }
+
+    #[test]
+    fn codesign_setup_refuses_developer_id_executable() {
+        let error = validate_development_signing_target(
+            true,
+            Path::new("/Applications/Plug.app/Contents/Resources/plug"),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Developer ID"));
+    }
+
+    #[test]
+    fn codesign_setup_accepts_unsigned_plug_dev_in_development_mode() {
+        validate_development_signing_target(
+            true,
+            Path::new("/Users/test/.cargo/bin/plug-dev"),
+            false,
+        )
+        .unwrap();
+    }
 }

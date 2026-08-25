@@ -5,7 +5,15 @@ import PlugIPC
 @MainActor
 final class NotificationService {
     static let shared = NotificationService()
+
+    typealias NotificationSink = @MainActor @Sendable (String, String, String) -> Void
+
+    private let sink: NotificationSink
     private var previous: OperatorSnapshot?
+
+    init(sink: @escaping NotificationSink = NotificationService.enqueue) {
+        self.sink = sink
+    }
 
     func requestAuthorization() {
         Task {
@@ -38,6 +46,10 @@ final class NotificationService {
     }
 
     private func post(id: String, title: String, body: String) {
+        sink(id, title, body)
+    }
+
+    private static func enqueue(id: String, title: String, body: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body

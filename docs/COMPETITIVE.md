@@ -2,6 +2,17 @@
 
 Every MCP multiplexer, router, gateway, and proxy we could find — analyzed for what they do well, what they do poorly, and what gap fanout fills.
 
+## Plug installation model
+
+Plug keeps installation platform-specific and ownership simple:
+
+- macOS: one signed `Plug.app`, downloaded as a DMG from the Plug website or GitHub Releases, or installed with the Homebrew Cask. Open it once; the app owns the GUI, `plug` command, daemon, client links, and updates.
+- Linux: standalone Homebrew Formula, release shell installer, or release archive.
+- Source development: run `./scripts/setup-codesigning.sh`, then
+  `./scripts/dev-reinstall.sh`; invoke the installed binary as
+  `PLUG_DEV=1 plug-dev`.
+- Headless macOS is unsupported because first-use ServiceManagement and Keychain consent need a logged-in GUI session.
+
 ---
 
 ## Landscape Summary
@@ -181,7 +192,7 @@ Worth considering for later phases — optional security scanning pipeline.
 What makes fanout defensible:
 
 1. **Rust performance** — Can't be matched by Python/TypeScript competitors without rewriting
-2. **Single binary UX** — brew install + one command is unbeatable for onboarding
+2. **Single-owner UX** — one signed Plug.app plus one first launch keeps onboarding simple
 3. **Client-aware intelligence** — Deep knowledge of every client's quirks is hard to replicate
 4. **Token efficiency** — Architectural advantage from the ground up, not bolted on
 5. **TUI quality** — A beautiful TUI creates emotional attachment (like lazygit)

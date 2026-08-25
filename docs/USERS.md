@@ -9,6 +9,19 @@ plug is NOT built for:
 - Non-technical users who don't know what MCP is
 - People who use only one AI client (they don't need a multiplexer)
 
+## Installation paths
+
+On macOS, download the signed `Plug.app` DMG from the Plug website or GitHub
+Releases, or install the same app with the Homebrew Cask. Open Plug.app once;
+it owns the GUI, `plug` command, background daemon, client links, and updates.
+First launch needs a logged-in GUI session for ServiceManagement and Keychain
+consent, so headless macOS is unsupported.
+
+Linux users choose the Formula, release shell installer, or release archive.
+For fresh source development, run `./scripts/setup-codesigning.sh` before
+`./scripts/dev-reinstall.sh`, then invoke the installed binary as
+`PLUG_DEV=1 plug-dev`.
+
 ---
 
 ## Primary Personas
@@ -72,18 +85,20 @@ plug is NOT built for:
 
 **Success metric**: They should be able to develop and test an MCP server with plug faster than connecting clients directly.
 
-### Persona 4: "The Server Admin" — Always-On Deployment
+### Persona 4: "The Server Admin" — Always-On Linux Deployment
 
-**Who**: A developer or team that runs an always-on server (home lab, cloud VM, dedicated machine) where AI agents operate autonomously 24/7. The machine may not have a display.
+**Who**: A developer or team that runs an always-on Linux server (home lab,
+cloud VM, dedicated machine) where AI agents operate autonomously 24/7. The
+machine may not have a display.
 
 **Pain today**:
-- No good headless MCP multiplexer option — most require GUI or Docker
+- No good headless Linux MCP multiplexer option — most require Docker
 - No monitoring of server health or tool availability
 - No automatic recovery from server failures
 - No way to manage the multiplexer remotely
 
 **What they want**:
-- Headless/daemon mode (`plug start`)
+- Headless Linux daemon mode (`plug start`)
 - Automatic recovery from failures (circuit breakers, reconnection)
 - Structured logging to files
 - CLI commands for remote management (over SSH)
@@ -99,7 +114,7 @@ plug is NOT built for:
 
 | ID | Story | Persona | Priority |
 |----|-------|---------|----------|
-| S1 | As a polyglot, I want to install plug with one command (`cargo install plug-mcp --locked`) so that I can get started immediately | 1 | P0 |
+| S1 | As a user, I want one supported install path for my platform so that I can get started immediately | 1 | P0 |
 | S2 | As a polyglot, I want plug to auto-detect my existing MCP configs (Claude Desktop, Cursor, Codex, Claude Code) on first run so that I don't have to re-enter everything | 1 | P0 |
 | S3 | As a polyglot, I want to import configs with one keystroke so that migration is effortless | 1 | P0 |
 | S4 | As an automator, I want to run `plug setup --yes` non-interactively so that I can script the setup | 2 | P0 |
@@ -191,8 +206,15 @@ Rob just reformatted his MacBook. He has Claude Code, Cursor, Gemini CLI, and Co
 
 **With plug**:
 ```bash
-cargo install plug-mcp --locked
-plug
+# macOS: download Plug.app from the website or GitHub Releases, then open it once.
+# Or: brew install --cask cyberpapiii/tap/plug-app
+
+# Linux: choose the Formula, release shell installer, or release archive.
+# Fresh source development:
+./scripts/setup-codesigning.sh
+./scripts/dev-reinstall.sh --quick
+PLUG_DEV=1 plug-dev
+
 # Auto-detects existing configs, imports with Y
 # Outputs connection snippets for each client
 # Copy-paste 4 snippets. Done. 5 minutes.
@@ -226,19 +248,24 @@ Rob has 60 tools across all his MCP servers. He notices Cursor only shows 40. He
 
 **With plug**: The TUI shows `Cursor #3: 40/60 tools served`. The doctor command explains the limit. The config allows setting `priority_tools` to control which 40 Cursor gets.
 
-### Scenario 5: "The Server Admin"
+### Scenario 5: "The Linux Server Admin"
 
-Rob runs a headless Linux server where AI agents operate 24/7. He needs MCP servers always available.
+Rob runs a headless Linux server where AI agents operate 24/7. He needs MCP
+servers always available.
 
 **Without plug**: Write a custom systemd service. No monitoring. No auto-recovery. SSH in to check if things are working.
 
 **With plug**:
 ```bash
-plug start  # or run as a systemd service
+# Linux only: run as a systemd service or start directly.
+plug start
 plug status --output json  # check health over SSH
 # Circuit breakers and auto-reconnection handle failures
-# Logs rotate to ~/Library/Logs/plug/ on macOS or ~/.local/state/plug/logs/ on Linux
+# Logs rotate to ~/.local/state/plug/logs/ on Linux
 ```
+
+Headless macOS is unsupported. A Mac must complete Plug.app's first-use
+ServiceManagement and Keychain consent in a logged-in GUI session.
 
 ---
 

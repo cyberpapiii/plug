@@ -8,6 +8,18 @@ This document captures the MCP protocol details that directly affect Plug's impl
 **Modern spec URL**: https://modelcontextprotocol.io/specification/2026-07-28
 **Rust SDK**: RMCP 3.1.0 (exactly pinned)
 
+## Installation boundary
+
+This document describes MCP wire behavior, not a second executable package.
+On macOS, users install one signed `Plug.app` from the website/GitHub DMG or
+the Homebrew Cask, then open it once. The app owns the GUI, `plug` command,
+daemon, client links, and updates. Linux uses standalone Formula, shell
+installer, or archive paths. Fresh source development runs
+`./scripts/setup-codesigning.sh` before `./scripts/dev-reinstall.sh`, then
+invokes the installed binary as `PLUG_DEV=1 plug-dev`.
+Headless macOS is unsupported because first-use ServiceManagement and Keychain
+consent need a logged-in GUI session.
+
 ---
 
 ## Spec Version History
@@ -282,7 +294,7 @@ Normal request/response/notification flow.
 **Plug's own icon metadata**:
 - Plug advertises embedded PNG `data:` icons first in `initialize.serverInfo.icons`: `16x16`, `32x32`, `64x64`, `128x128`, `256x256`, and `512x512`.
 - Plug also advertises its trusted embedded SVG icon as a final `sizes: ["any"]` fallback.
-- Claude Desktop's MCPB/Desktop Extension UI uses `packaging/mcpb/manifest.json` icon fields when Plug is packaged as `target/dist/plug.mcpb`; those package icons are separate from runtime MCP `serverInfo.icons`.
+- Client UIs may choose whether to render MCP icon metadata. Plug keeps this runtime metadata independent of its macOS app packaging.
 - Codex Desktop may ignore MCP icon metadata in its current UI even when Plug sends it correctly.
 
 **Icon normalization in `plug`**:

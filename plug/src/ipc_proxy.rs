@@ -2925,7 +2925,7 @@ mod tests {
         UnixListener::bind(&path).expect("bind fake daemon socket")
     }
 
-    /// Perform the Register + Capabilities handshake that
+    /// Perform the OperatorHandshake + Register + Capabilities handshake that
     /// `establish_daemon_proxy_session` sends on the initial connect AND on
     /// every reconnect, replying with `session_id` and default
     /// `ServerCapabilities`. Returns the split halves for further scripted
@@ -2960,6 +2960,43 @@ mod tests {
     ) -> (OwnedReadHalf, OwnedWriteHalf, Vec<String>) {
         let (mut reader, mut writer) = stream.into_split();
         let mut seen = Vec::new();
+
+        let frame = ipc::read_frame(&mut reader)
+            .await
+            .expect("read operator handshake frame")
+            .expect("connection closed before operator handshake");
+        let req: IpcRequest =
+            serde_json::from_slice(&frame).expect("parse operator handshake request");
+        match req {
+            IpcRequest::OperatorHandshake {
+                client_version,
+                ipc_min,
+                ipc_max,
+            } => {
+                seen.push("OperatorHandshake".to_string());
+                assert_eq!(client_version, env!("CARGO_PKG_VERSION"));
+                assert!(ipc_min <= ipc::OPERATOR_IPC_MAX);
+                assert!(ipc_max >= ipc::OPERATOR_IPC_MIN);
+                ipc::send_response(
+                    &mut writer,
+                    &IpcResponse::OperatorHandshake {
+                        handshake: ipc::OperatorHandshake {
+                            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                            daemon_executable: Some(
+                                std::env::current_exe().expect("test executable path"),
+                            ),
+                            ipc_min: ipc::OPERATOR_IPC_MIN,
+                            ipc_max: ipc::OPERATOR_IPC_MAX,
+                            ownership: ipc::DaemonOwnershipMode::Unmanaged,
+                            capabilities: Vec::new(),
+                        },
+                    },
+                )
+                .await
+                .expect("send OperatorHandshake");
+            }
+            other => panic!("expected OperatorHandshake, got {other:?}"),
+        }
 
         let frame = ipc::read_frame(&mut reader)
             .await
@@ -3018,7 +3055,7 @@ mod tests {
     /// `IpcProxyHandler::initialize` performs the FIRST time a downstream
     /// MCP client connects (`UpdateSession`, `UpdateCapabilities`, a
     /// `Capabilities` refresh) — NOT repeated on later reconnects, which
-    /// only redo Register+Capabilities (see
+    /// only redo OperatorHandshake+Register+Capabilities (see
     /// `reconnect_reregisters_with_register_and_capabilities_only` below).
     /// Returns once the daemon side has answered the final `Capabilities`
     /// refresh, matching the point at which production populates
@@ -3414,14 +3451,18 @@ mod tests {
             drop(writer1);
 
             // Connection 2: the reconnect handshake itself is still exactly
-            // Register+Capabilities...
+            // OperatorHandshake+Register+Capabilities...
             let (stream2, _) = listener.accept().await.expect("accept 2");
             let (mut reader2, mut writer2, seen2) =
                 fake_daemon_handshake(stream2, "fake-session-2").await;
             assert_eq!(
                 seen2,
-                vec!["Register".to_string(), "Capabilities".to_string()],
-                "reconnect handshake itself is still exactly Register+Capabilities; \
+                vec![
+                    "OperatorHandshake".to_string(),
+                    "Register".to_string(),
+                    "Capabilities".to_string(),
+                ],
+                "reconnect handshake itself is still exactly OperatorHandshake+Register+Capabilities; \
                  capability replay happens as a SEPARATE round trip right after it"
             );
 
@@ -4177,7 +4218,7 @@ mod tests {
             drop(writer1);
 
             // The reconnect after the transport failure only re-sends
-            // Register + Capabilities (see
+            // OperatorHandshake + Register + Capabilities (see
             // reconnect_replays_client_capabilities) — not the full
             // initialize() sequence, which only runs once per downstream
             // client lifetime. It IS followed by a replay of the client

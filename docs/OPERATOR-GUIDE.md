@@ -2,6 +2,25 @@
 
 This guide is for running Plug as shared infrastructure: a local daemon for daily agent work, or a remote MCP gateway for trusted clients.
 
+## Installation boundary
+
+On macOS, install one `Plug.app` from the signed DMG on the Plug website or
+[GitHub Releases](https://github.com/cyberpapiii/plug/releases), or install the
+same app with the Homebrew Cask:
+
+```sh
+brew install --cask cyberpapiii/tap/plug-app
+```
+
+Open Plug.app once. First launch needs a logged-in GUI session for
+ServiceManagement and Keychain consent. Plug.app owns the GUI, `plug` command,
+background daemon, client links, and updates. Headless macOS is unsupported.
+
+Linux uses standalone Formula, shell-installer, or archive paths. For a fresh
+source checkout, run `./scripts/setup-codesigning.sh` before
+`./scripts/dev-reinstall.sh`; invoke the installed development binary only as
+`PLUG_DEV=1 plug-dev`. It never replaces the production `plug` command.
+
 ## Runtime Model
 
 Plug has one configured upstream set and many downstream clients.
@@ -246,9 +265,9 @@ Current limits:
 Current distribution names:
 
 - GitHub repo: `cyberpapiii/plug`
-- Homebrew tap: `cyberpapiii/tap/plug`
-- crates.io package: `plug-mcp`
-- Installed binary: `plug`
+- macOS app: signed `Plug.app` DMG and `plug-app` Homebrew Cask
+- Linux: `plug` Homebrew Formula, release shell installer, and standalone archives
+- Source development: isolated `PLUG_DEV=1 plug-dev`
 
 Release checks before publishing:
 
@@ -258,10 +277,12 @@ cargo clippy --workspace -- -D warnings
 cargo deny check advisories
 dist plan --no-local-paths
 dist build --artifacts=global
-dist build --artifacts=local --target aarch64-apple-darwin
 ```
 
-Publish order matters for crates.io: publish `plug-core` before `plug-mcp`, because the CLI package depends on the library package by version. The public install command is `cargo install plug-mcp --locked`; use `cargo install --git https://github.com/cyberpapiii/plug plug-mcp --locked` only when validating unreleased `main` builds.
+The release workflow builds Darwin binaries only as inputs to the signed,
+universal Plug.app. It publishes Linux Formula, shell-installer, and archive
+artifacts separately. Do not turn those internal app inputs into a second
+macOS command-line install.
 
 Build, package, and install checks can leave large generated directories behind. Before or after a release pass, inspect cleanup candidates with:
 
@@ -280,5 +301,7 @@ Use `--runtime-cache` only when old `plug://artifact/...` result files are no lo
 For local source reinstalls, the cleanup can be folded into the reinstall command:
 
 ```sh
+./scripts/setup-codesigning.sh
 ./scripts/dev-reinstall.sh --quick --clean
+PLUG_DEV=1 plug-dev
 ```

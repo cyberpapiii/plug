@@ -4,9 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
-LOCAL_BIN_DIR="$HOME/.local/bin"
-CARGO_PLUG="$CARGO_BIN_DIR/plug"
-LOCAL_PLUG="$LOCAL_BIN_DIR/plug"
+CARGO_PLUG_DEV="$CARGO_BIN_DIR/plug-dev"
 STAGE_DIR=""
 
 RUN_TESTS=1
@@ -16,9 +14,8 @@ usage() {
   cat <<'EOF'
 dev-reinstall.sh
 
-Rebuild and reinstall the local `plug` binary in a way that avoids the
-macOS copied-binary code-signing kill. The installed command on PATH is
-normalized to a symlink pointing at ~/.cargo/bin/plug.
+Rebuild and install an isolated `plug-dev` binary without changing the
+production `plug` command owned by Plug.app.
 
 Usage:
   ./scripts/dev-reinstall.sh
@@ -85,9 +82,19 @@ cargo install --path plug --root "$STAGE_DIR" --force --locked
 # docs/solutions/integration-issues/local-codesigning-identity-stops-keychain-reprompts.md
 if [[ "$(uname -s)" == "Darwin" ]]; then
   SIGN_IDENTITY="Plug Local Signing"
-  if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
+  SIGNING_KEYCHAIN="${PLUG_CODESIGN_KEYCHAIN:-}"
+  identity_args=(find-identity -v -p codesigning)
+  if [[ -n "$SIGNING_KEYCHAIN" ]]; then
+    identity_args+=("$SIGNING_KEYCHAIN")
+  fi
+  identity_details="$(security "${identity_args[@]}" 2>/dev/null || :)"
+  if [[ "$identity_details" == *"$SIGN_IDENTITY"* ]]; then
     echo "==> Code-signing staged plug with '$SIGN_IDENTITY'"
-    codesign --force -s "$SIGN_IDENTITY" "$STAGED_PLUG"
+    codesign_args=(--force -s "$SIGN_IDENTITY")
+    if [[ -n "$SIGNING_KEYCHAIN" ]]; then
+      codesign_args+=(--keychain "$SIGNING_KEYCHAIN")
+    fi
+    codesign "${codesign_args[@]}" "$STAGED_PLUG"
     codesign --verify --deep --strict "$STAGED_PLUG"
     codesign -dv --verbose=2 "$STAGED_PLUG" 2>&1 | grep -E 'Authority' || true
   else
@@ -98,29 +105,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 echo "==> Smoke testing staged binary"
-"$STAGED_PLUG" --help >/dev/null
+PLUG_DEV=1 "$STAGED_PLUG" --help >/dev/null
 
-echo "==> Atomically installing verified plug to $CARGO_PLUG"
-mv -f "$STAGED_PLUG" "$CARGO_PLUG"
-
-mkdir -p "$LOCAL_BIN_DIR"
-
-if [[ -L "$LOCAL_PLUG" ]]; then
-  current_target="$(readlink "$LOCAL_PLUG" || true)"
-  if [[ "$current_target" != "$CARGO_PLUG" ]]; then
-    rm -f "$LOCAL_PLUG"
-    ln -s "$CARGO_PLUG" "$LOCAL_PLUG"
-  fi
-elif [[ -e "$LOCAL_PLUG" ]]; then
-  rm -f "$LOCAL_PLUG"
-  ln -s "$CARGO_PLUG" "$LOCAL_PLUG"
-else
-  ln -s "$CARGO_PLUG" "$LOCAL_PLUG"
-fi
+echo "==> Atomically installing verified plug-dev to $CARGO_PLUG_DEV"
+mv -f "$STAGED_PLUG" "$CARGO_PLUG_DEV"
 
 echo "==> Smoke testing installed binary"
-"$CARGO_PLUG" --help >/dev/null
-"$LOCAL_PLUG" --help >/dev/null
+PLUG_DEV=1 "$CARGO_PLUG_DEV" --help >/dev/null
 
 if [[ "$CLEAN_AFTER" -eq 1 ]]; then
   echo "==> Cleaning generated build artifacts"
@@ -129,8 +120,8 @@ fi
 
 echo
 echo "Installed:"
-echo "  cargo bin: $CARGO_PLUG"
-echo "  path bin:  $LOCAL_PLUG -> $(readlink "$LOCAL_PLUG")"
+echo "  development bin: $CARGO_PLUG_DEV"
+echo "  production plug paths were not changed"
 echo
 echo "Run:"
-echo "  plug"
+echo "  PLUG_DEV=1 plug-dev"

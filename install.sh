@@ -109,9 +109,6 @@ build_target() {
     OS="$(detect_os)"
     ARCH="$(detect_arch)"
     case "$OS" in
-        macos)
-            echo "${ARCH}-apple-darwin"
-            ;;
         linux)
             LIBC="$(detect_libc)"
             echo "${ARCH}-unknown-linux-${LIBC}"
@@ -308,6 +305,11 @@ post_install_owner_setup() {
 main() {
     info "Installing plug — MCP multiplexer"
 
+    OS="$(detect_os)"
+    if [ "$OS" = "macos" ]; then
+        error "macOS standalone CLI artifacts are not published.\nDownload and open Plug.app from the release DMG:\n  https://github.com/${PLUG_REPO}/releases\nOr install the app with Homebrew:\n  brew install --cask cyberpapiii/tap/plug-app"
+    fi
+
     TARGET="$(build_target)"
     info "Detected target: $TARGET"
 
@@ -391,20 +393,6 @@ main() {
     # authenticated operator API and are never rotated or replaced here.
     post_install_owner_setup "$DEST" "$PREVIOUS_PLUG"
 
-    # Released binaries are ad-hoc signed, and an ad-hoc signature changes with
-    # every build. The macOS Keychain "Always Allow" ACL binds to the signature,
-    # so without a stable identity every update re-prompts for each OAuth
-    # upstream. `plug codesign-setup` fixes that with a per-machine self-signed
-    # identity. Only suggest it — the command adds a code-signing trust root to
-    # the login keychain and pops a password dialog, which must be a deliberate,
-    # informed choice rather than something a piped installer does silently.
-    if [ "$OS" = "macos" ]; then
-        printf "\n"
-        printf "macOS: if you use OAuth upstreams, run this once so Keychain\n"
-        printf "approvals persist across updates instead of re-prompting:\n"
-        printf "  plug codesign-setup\n"
-    fi
-
     # Show next steps
     printf "\n"
     printf "Get started:\n"
@@ -412,7 +400,7 @@ main() {
     printf "  plug connect          Connect all AI clients to all MCP servers\n"
     printf "  plug status           Check server health\n"
     printf "\n"
-    printf "Documentation: https://github.com/${PLUG_REPO}\n"
+    printf "Documentation: https://github.com/%s\n" "$PLUG_REPO"
 }
 
 main "$@"

@@ -67,6 +67,8 @@ pub enum OperatorCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorHandshake {
     pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_executable: Option<std::path::PathBuf>,
     pub ipc_min: u16,
     pub ipc_max: u16,
     pub ownership: DaemonOwnershipMode,
@@ -173,6 +175,9 @@ pub enum IpcRequest {
         client_id: String,
         /// Client type from MCP initialize (e.g., "claude-code", "cursor").
         client_info: Option<String>,
+        /// Connector binary version. Absent for older adapters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adapter_version: Option<String>,
     },
 
     /// Deregister a proxy client session (clean disconnect).
@@ -346,11 +351,13 @@ impl fmt::Debug for IpcRequest {
                 protocol_version,
                 client_id,
                 client_info,
+                adapter_version,
             } => f
                 .debug_struct("Register")
                 .field("protocol_version", protocol_version)
                 .field("client_id", client_id)
                 .field("client_info", client_info)
+                .field("adapter_version", adapter_version)
                 .finish(),
             Self::Deregister { session_id } => f
                 .debug_struct("Deregister")
@@ -633,6 +640,8 @@ pub struct IpcClientInfo {
     pub client_id: String,
     pub session_id: String,
     pub client_info: Option<String>,
+    #[serde(default)]
+    pub adapter_version: Option<String>,
     pub connected_secs: u64,
 }
 
@@ -660,6 +669,8 @@ pub struct IpcLiveSessionInfo {
     pub session_id: String,
     pub client_type: crate::types::ClientType,
     pub client_info: Option<String>,
+    #[serde(default)]
+    pub adapter_version: Option<String>,
     pub connected_secs: u64,
     pub last_activity_secs: Option<u64>,
 }
@@ -1075,11 +1086,13 @@ mod tests {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 client_id: "client-123".to_string(),
                 client_info: Some("claude-code".to_string()),
+                adapter_version: Some("0.6.5".to_string()),
             },
             IpcRequest::Register {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 client_id: "client-456".to_string(),
                 client_info: None,
+                adapter_version: None,
             },
             IpcRequest::Deregister {
                 session_id: "sess-123".to_string(),
@@ -1129,6 +1142,9 @@ mod tests {
         let response = IpcResponse::OperatorHandshake {
             handshake: OperatorHandshake {
                 daemon_version: "0.5.0".to_string(),
+                daemon_executable: Some(std::path::PathBuf::from(
+                    "/Applications/Plug.app/Contents/Resources/plug",
+                )),
                 ipc_min: 3,
                 ipc_max: 4,
                 ownership: DaemonOwnershipMode::AppManaged,
@@ -1143,8 +1159,35 @@ mod tests {
             panic!("expected operator handshake");
         };
         assert_eq!(handshake.daemon_version, "0.5.0");
+        assert_eq!(
+            handshake.daemon_executable.as_deref(),
+            Some(std::path::Path::new(
+                "/Applications/Plug.app/Contents/Resources/plug"
+            ))
+        );
         assert_eq!(handshake.ipc_max, 4);
         assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
+    }
+
+    #[test]
+    fn operator_handshake_decodes_without_daemon_executable() {
+        let old_response = serde_json::json!({
+            "type": "OperatorHandshake",
+            "handshake": {
+                "daemon_version": "0.5.0",
+                "ipc_min": 3,
+                "ipc_max": 4,
+                "ownership": "cli_managed",
+                "capabilities": []
+            }
+        });
+
+        let decoded: IpcResponse =
+            serde_json::from_value(old_response).expect("old handshake must remain compatible");
+        let IpcResponse::OperatorHandshake { handshake } = decoded else {
+            panic!("expected operator handshake");
+        };
+        assert_eq!(handshake.daemon_executable, None);
     }
 
     #[test]
@@ -1194,6 +1237,7 @@ mod tests {
                     session_id: "sess-456".to_string(),
                     client_type: crate::types::ClientType::ClaudeCode,
                     client_info: Some("claude-code".to_string()),
+                    adapter_version: Some("0.6.5".to_string()),
                     connected_secs: 12,
                     last_activity_secs: Some(1),
                 }],
@@ -1391,6 +1435,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             client_id: "client-123".to_string(),
             client_info: None,
+            adapter_version: None,
         }));
         assert!(!requires_auth(&IpcRequest::Deregister {
             session_id: "s".to_string(),
@@ -1545,13 +1590,43 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             client_id: "client-123".to_string(),
             client_info: Some("claude-code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
         };
 
-        let value = serde_json::to_value(req).unwrap();
+        let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["type"], "Register");
         assert_eq!(value["protocol_version"], IPC_PROTOCOL_VERSION);
         assert_eq!(value["client_id"], "client-123");
         assert_eq!(value["client_info"], "claude-code");
+        assert_eq!(value["adapter_version"], "0.6.5");
+
+        let decoded: IpcRequest = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded,
+            IpcRequest::Register {
+                adapter_version: Some(version),
+                ..
+            } if version == "0.6.5"
+        ));
+    }
+
+    #[test]
+    fn register_json_without_adapter_version_remains_compatible() {
+        let decoded: IpcRequest = serde_json::from_value(serde_json::json!({
+            "type": "Register",
+            "protocol_version": IPC_PROTOCOL_VERSION,
+            "client_id": "legacy-client",
+            "client_info": "claude-code"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            decoded,
+            IpcRequest::Register {
+                adapter_version: None,
+                ..
+            }
+        ));
     }
 
     #[test]

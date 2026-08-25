@@ -5,14 +5,14 @@ members = ["cargo:plug"]
 # cargo-dist configuration
 cargo-dist-version = "0.31.0"
 
-# Hosting and CI
-ci = "github"
+# GitHub release hosting is orchestrated by the checked-in custom workflow.
+# Keep cargo-dist's CI generator disabled so `dist plan --no-local-paths` does
+# not silently bless drift between that workflow and cargo-dist's generic one.
+ci = []
 hosting = ["github"]
 
 # Build targets
 targets = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-gnu",

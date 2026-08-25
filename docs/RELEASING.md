@@ -1,8 +1,38 @@
 # Releasing plug
 
 A release is a `v*` tag pushed to `main`. That tag triggers
-`.github/workflows/release.yml`, which builds every target, signs and notarizes
-the macOS binaries, publishes a GitHub release, and updates the Homebrew tap.
+`.github/workflows/release.yml`, which builds Linux standalone archives and the
+universal macOS Plug.app, signs and notarizes its DMG, publishes a GitHub
+release, and updates the Homebrew tap. macOS is distributed through Plug.app;
+Darwin binaries ship only inside that app.
+
+## Installation paths
+
+macOS users download the signed DMG from the Plug website or [GitHub
+Releases](https://github.com/cyberpapiii/plug/releases), move `Plug.app` to
+Applications, and open it once. The alternative is the Homebrew Cask:
+
+```sh
+brew install --cask cyberpapiii/tap/plug-app
+```
+
+Opening Plug.app once is required after either install. First launch performs
+the ServiceManagement and Keychain consent that needs a logged-in macOS GUI
+session. Plug.app owns the GUI, `plug` command, daemon, client links, and
+Sparkle updates. Headless macOS is unsupported.
+
+Linux users choose one standalone path: the Linux-only Homebrew Formula, the
+Linux-only release shell installer, or a Linux release archive. These artifacts
+are not macOS installation paths. Source development uses an isolated command;
+it does not replace the production command owned by Plug.app. On a fresh
+checkout, create the local signing identity before the development install,
+then invoke `PLUG_DEV=1 plug-dev` only after that install:
+
+```sh
+./scripts/setup-codesigning.sh
+./scripts/dev-reinstall.sh --quick
+PLUG_DEV=1 plug-dev
+```
 
 ## Before tagging
 
@@ -27,16 +57,15 @@ before anything is published, which is the intended behaviour.
 
 ## macOS code signing
 
-Downloaded macOS binaries are signed with a Developer ID Application
-certificate and notarized by Apple. Without that, Gatekeeper refuses to run
-anything a browser downloaded, and users have to strip the quarantine attribute
-by hand — an instruction no one should have to follow to install a tool that
-holds their credentials.
+The public macOS artifact is a universal Plug.app inside a signed, notarized,
+stapled DMG. The release workflow builds arm64 and x86_64 Darwin binaries only
+as inputs to that app, then runs `scripts/sign-notarize-macos-app.sh`. It
+hard-fails when any secret is missing rather than falling back to an unsigned
+build, so a release cannot imply that an unsigned app is trusted.
 
-Signing runs in `scripts/sign-macos-release.sh`, which the release workflow
-calls on both `apple-darwin` targets. The script hard-fails when any secret is
-missing rather than falling back to an unsigned build, so a release cannot ship
-an unsigned binary while implying otherwise.
+The cargo-dist shell installer and Linux standalone archives are Linux-only.
+The published `plug-mcp-installer.sh` exits before network or filesystem work
+on Darwin and directs users to the DMG or Homebrew Cask.
 
 ### Required repository secrets
 
@@ -61,29 +90,29 @@ password because it is scoped to notarization and can be revoked on its own.
 
 ### What is signed, and what that does not cover
 
-The `plug` executable is signed with the hardened runtime and a secure
-timestamp, then notarized. A notarization ticket can only be stapled to a
-bundle, disk image, or installer package, so a bare command-line binary cannot
-carry one; Gatekeeper resolves the notarization online instead. That is normal
-for CLI tools, but it means a first launch on a machine with no network may be
-slower or, on a quarantined copy, blocked until the check completes.
+The Plug.app bundle and its embedded daemon are signed with the hardened
+runtime and secure timestamp. The DMG is notarized and stapled, so Gatekeeper
+can verify the downloaded app before first launch. The Linux archives and
+Linux-only cargo-dist installer are separate artifacts; they do not provide a
+macOS command-line installation path.
 
-Homebrew and the shell installer do not set the quarantine attribute, so those
-paths were never blocked. Signing still matters for them: it is what makes the
-binary's origin verifiable, and it is what keeps the macOS Keychain from
-re-prompting after every upgrade.
+Homebrew installs the same signed DMG through the `plug-app` Cask. Plug.app
+creates the command-line link and registers its background service on first
+launch, so macOS installation requires a logged-in GUI session. The app remains
+the sole owner of the GUI, command line, daemon, and updates.
 
 ### Upgrading from an unsigned build
 
 The Keychain grants access based on the code signature of the program asking.
-Moving from a locally-signed or unsigned build to the Developer ID identity is a
-signature change, so macOS will prompt once more for access to plug's stored
+Moving from a locally-signed or unsigned build to the Developer ID Plug.app is
+a signature change, so macOS will prompt once more for access to Plug's stored
 upstream credentials. Choosing Always Allow at that prompt holds for every
 later Developer ID release.
 
 ## Local development signing is a different thing
 
-`scripts/setup-codesigning.sh` creates a self-signed identity used by
-`scripts/dev-reinstall.sh`. Its only job is to keep a locally-built binary's
-signature stable across rebuilds so the Keychain stops re-prompting. It is not a
-distribution identity and must never be used to sign a release.
+`scripts/setup-codesigning.sh` creates a self-signed identity used by the
+isolated `plug-dev` binary from `scripts/dev-reinstall.sh`. Its only job is to
+keep a locally-built development binary's signature stable across rebuilds so
+the Keychain stops re-prompting. It is not a distribution identity and must
+never be used to sign Plug.app or a release binary.
