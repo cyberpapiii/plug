@@ -6,6 +6,27 @@ universal macOS Plug.app, signs and notarizes its DMG, publishes a GitHub
 release, and updates the Homebrew tap. macOS is distributed through Plug.app;
 Darwin binaries ship only inside that app.
 
+## Installation paths
+
+macOS users download the signed DMG from the Plug website or [GitHub
+Releases](https://github.com/cyberpapiii/plug/releases), move `Plug.app` to
+Applications, and open it once. The alternative is the Homebrew Cask:
+
+```sh
+brew install --cask cyberpapiii/tap/plug-app
+```
+
+Opening Plug.app once is required after either install. First launch performs
+the ServiceManagement and Keychain consent that needs a logged-in macOS GUI
+session. Plug.app owns the GUI, `plug` command, daemon, client links, and
+Sparkle updates. Headless macOS is unsupported.
+
+Linux users choose one standalone path: the Linux-only Homebrew Formula, the
+Linux-only release shell installer, or a Linux release archive. These artifacts
+are not macOS installation paths. Source development uses the isolated
+`plug-dev` command from `./scripts/dev-reinstall.sh`; it does not replace the
+production command owned by Plug.app.
+
 ## Before tagging
 
 1. `main` is green: `cargo test --workspace`, `cargo clippy --workspace
@@ -35,9 +56,9 @@ as inputs to that app, then runs `scripts/sign-notarize-macos-app.sh`. It
 hard-fails when any secret is missing rather than falling back to an unsigned
 build, so a release cannot imply that an unsigned app is trusted.
 
-The cargo-dist shell installer and Linux standalone archives are not macOS
-installation paths. The published `plug-mcp-installer.sh` exits before network
-or filesystem work on Darwin and directs users to the DMG or Homebrew Cask.
+The cargo-dist shell installer and Linux standalone archives are Linux-only.
+The published `plug-mcp-installer.sh` exits before network or filesystem work
+on Darwin and directs users to the DMG or Homebrew Cask.
 
 ### Required repository secrets
 
@@ -70,7 +91,8 @@ macOS command-line installation path.
 
 Homebrew installs the same signed DMG through the `plug-app` Cask. Plug.app
 creates the command-line link and registers its background service on first
-launch, so macOS installation requires a logged-in GUI session.
+launch, so macOS installation requires a logged-in GUI session. The app remains
+the sole owner of the GUI, command line, daemon, and updates.
 
 ### Upgrading from an unsigned build
 
@@ -82,7 +104,8 @@ later Developer ID release.
 
 ## Local development signing is a different thing
 
-`scripts/setup-codesigning.sh` creates a self-signed identity used by
-`scripts/dev-reinstall.sh`. Its only job is to keep a locally-built binary's
-signature stable across rebuilds so the Keychain stops re-prompting. It is not a
-distribution identity and must never be used to sign a release.
+`scripts/setup-codesigning.sh` creates a self-signed identity used by the
+isolated `plug-dev` binary from `scripts/dev-reinstall.sh`. Its only job is to
+keep a locally-built development binary's signature stable across rebuilds so
+the Keychain stops re-prompting. It is not a distribution identity and must
+never be used to sign Plug.app or a release binary.

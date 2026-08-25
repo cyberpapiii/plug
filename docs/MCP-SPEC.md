@@ -8,6 +8,16 @@ This document captures the MCP protocol details that directly affect Plug's impl
 **Modern spec URL**: https://modelcontextprotocol.io/specification/2026-07-28
 **Rust SDK**: RMCP 3.1.0 (exactly pinned)
 
+## Installation boundary
+
+This document describes MCP wire behavior, not a second executable package.
+On macOS, users install one signed `Plug.app` from the website/GitHub DMG or
+the Homebrew Cask, then open it once. The app owns the GUI, `plug` command,
+daemon, client links, and updates. Linux uses standalone Formula, shell
+installer, or archive paths; source development uses isolated `plug-dev`.
+Headless macOS is unsupported because first-use ServiceManagement and Keychain
+consent need a logged-in GUI session.
+
 ---
 
 ## Spec Version History

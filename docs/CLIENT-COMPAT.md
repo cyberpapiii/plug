@@ -30,6 +30,19 @@ Claude Desktop is linked through its normal MCP configuration and `plug connect`
 
 Codex Desktop currently documents MCP server configuration but does not document rendering MCP icon metadata. Treat Plug's `icons` fields as correct metadata for clients that support them, not as a guarantee that Codex Desktop will show the image in its current MCP panel.
 
+## Install and link once
+
+On macOS, install one signed `Plug.app` from the website/GitHub DMG or the
+Homebrew Cask, then open it once. Plug.app owns the GUI, `plug` command,
+background daemon, client links, and updates. Client configurations should
+invoke `plug connect`; they should not point at a separately installed binary.
+Headless macOS is unsupported because first-use ServiceManagement and Keychain
+consent need a logged-in GUI session.
+
+Linux uses standalone Formula, shell-installer, or archive paths. Source
+development uses the isolated `plug-dev` command from
+`./scripts/dev-reinstall.sh`.
+
 ---
 
 ## Client Matrix
