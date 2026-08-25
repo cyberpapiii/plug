@@ -309,6 +309,7 @@ final class InstallationCoordinator {
               !snapshot.clientRepairNeeded,
               isCanonical(snapshot.shellLink, executable: canonical.executableURL),
               snapshot.service.daemonVersion == canonical.appVersion,
+              snapshot.service.daemonExecutable.map { samePath($0, canonical.executableURL) } == true,
               isAppManagedCurrent(snapshot.service.ownership, canonical: canonical),
               snapshot.shadowInstalls.isEmpty
         else {

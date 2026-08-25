@@ -206,6 +206,60 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
         XCTAssertEqual(try String(contentsOf: fixture.cargo, encoding: .utf8), "unknown replacement")
     }
+
+    func testCargoDirectoryReplacementAfterIdentityCheckIsPreserved() async throws {
+        let identity = LegacyBinaryIdentity(
+            identifier: "plug",
+            teamID: AppInstallationInspector.teamID,
+            sha256: "legacy-digest"
+        )
+        let fixture = try Fixture(
+            identityReader: { url in
+                guard (try? String(contentsOf: url, encoding: .utf8)) == "legacy plug" else {
+                    return nil
+                }
+                let trigger = url.deletingLastPathComponent().appending(path: ".replace-with-directory")
+                guard FileManager.default.fileExists(atPath: trigger.path) else { return identity }
+
+                try? FileManager.default.removeItem(at: url)
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+                try? Data("do not delete".utf8).write(to: url.appending(path: "nested"))
+                try? FileManager.default.removeItem(at: trigger)
+                return identity
+            }
+        )
+        try Data("legacy plug".utf8).write(to: fixture.cargo)
+        _ = try await fixture.migrator.repairShellLink(to: fixture.canonical.executableURL)
+        let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
+        try Data().write(to: fixture.cargo.deletingLastPathComponent().appending(path: ".replace-with-directory"))
+
+        do {
+            try await fixture.migrator.removeVerifiedCargoBinary(
+                snapshot,
+                proof: ReconciliationProof(
+                    appVersion: "0.7.0",
+                    embeddedVersion: "0.7.0",
+                    daemonVersion: "0.7.0",
+                    shellTarget: fixture.canonical.executableURL,
+                    daemonExecutable: fixture.canonical.executableURL,
+                    appManaged: true
+                )
+            )
+            XCTFail("Expected replacement directory to fail closed")
+        } catch let error as LegacyInstallError {
+            guard case .fileOperation = error else {
+                return XCTFail("Unexpected legacy error: \(error)")
+            }
+        }
+
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargo.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertEqual(
+            try String(contentsOf: fixture.cargo.appending(path: "nested"), encoding: .utf8),
+            "do not delete"
+        )
+    }
 }
 
 private actor RecordingProcessRunner: ProcessRunning {

@@ -218,16 +218,6 @@ final class DaemonServiceManager {
             canonical: canonical,
             recognizedLegacyPaths: legacyPaths
         )
-        let executable: URL?
-        switch ownership {
-        case let .appManagedCurrent(record), let .appManagedStale(record):
-            executable = record.programURL
-        case let .recognizedLegacy(records):
-            executable = records.count == 1 ? records[0].programURL : nil
-        case .unmanaged, .unknown:
-            executable = nil
-        }
-
         let handshake: OperatorHandshake?
         switch ownership {
         case .appManagedCurrent, .appManagedStale, .recognizedLegacy:
@@ -239,7 +229,7 @@ final class DaemonServiceManager {
             snapshot: DaemonServiceSnapshot(
                 ownership: ownership,
                 daemonVersion: handshake?.daemonVersion,
-                daemonExecutable: executable
+                daemonExecutable: handshake?.daemonExecutable
             ),
             handshake: handshake
         )

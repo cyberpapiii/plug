@@ -182,7 +182,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         else { return }
         guard identityReader(cargo) == expectedIdentity else { return }
         do {
-            try FileManager.default.removeItem(at: cargo)
+            try removeRegularFileWithoutFollowing(at: cargo)
         } catch {
             throw LegacyInstallError.fileOperation(error.localizedDescription)
         }
@@ -232,6 +232,19 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     private func pathExistsWithoutFollowing(_ url: URL) -> Bool {
         var information = stat()
         return url.path.withCString { Darwin.lstat($0, &information) } == 0
+    }
+
+    private func removeRegularFileWithoutFollowing(at url: URL) throws {
+        var information = stat()
+        guard url.path.withCString({ Darwin.lstat($0, &information) }) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .ENOENT)
+        }
+        guard (information.st_mode & S_IFMT) == S_IFREG else {
+            throw POSIXError(.EFTYPE)
+        }
+        guard Darwin.unlink(url.path) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
     }
 
     private func resolved(_ url: URL) -> URL {

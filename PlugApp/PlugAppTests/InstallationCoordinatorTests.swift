@@ -430,6 +430,39 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
     }
 
+    func testFinalHandshakeExecutableMismatchNeverReportsHealthy() async {
+        let events = EventLog()
+        let wrongExecutable = URL(fileURLWithPath: "/Applications/Other Plug.app/Contents/Resources/plug")
+        let finalRecord = LaunchdJobRecord(
+            label: "com.plug.daemon",
+            programURL: canonical.executableURL,
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: canonical.buildVersion,
+            loaded: true
+        )
+        let finalService = DaemonServiceSnapshot(
+            ownership: .appManagedCurrent(finalRecord),
+            daemonVersion: canonical.appVersion,
+            daemonExecutable: wrongExecutable
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [healthyService(), finalService]
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        if case .healthy = coordinator.state {
+            XCTFail("Final handshake executable mismatch must not report healthy")
+        }
+    }
+
     func testFinalUnknownDaemonOwnershipBlocksInsteadOfReportingRepairableDrift() async {
         let events = EventLog()
         let coordinator = InstallationCoordinator(

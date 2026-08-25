@@ -159,6 +159,21 @@ final class DaemonServiceManagerTests: XCTestCase {
         }
     }
 
+    func testInspectionRetainsHandshakeExecutableForFinalProof() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let handshakeExecutable = URL(fileURLWithPath: "/Users/me/Applications/Other Plug.app/Contents/Resources/plug")
+        let inspector = SequenceLaunchdInspector([.appManagedCurrent(current)])
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: [handshake("0.7.0", executable: handshakeExecutable)]
+        )
+        let manager = makeManager(inspector: inspector, backend: backend)
+
+        let snapshot = try await manager.inspect(canonical: canonical, legacyPaths: [])
+
+        XCTAssertEqual(snapshot.daemonExecutable, handshakeExecutable)
+    }
+
     func testUnknownJobIsRefusedWithoutBootoutOrRegistration() async throws {
         let unknown = record(label: "com.plug.daemon", path: "/tmp/not-plug", build: nil)
         let inspector = SequenceLaunchdInspector([.unknown([unknown])])
