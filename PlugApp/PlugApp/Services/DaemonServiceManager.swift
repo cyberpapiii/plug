@@ -12,8 +12,7 @@ final class DaemonServiceManager {
     var needsAdoption: Bool { agent.status != .enabled }
 
     func adopt() throws {
-        var removalError: Unmanaged<CFError>?
-        _ = SMJobRemove(kSMDomainUserLaunchd, "com.plug.daemon" as CFString, nil, true, &removalError)
+        bootOutLegacyAgent()
         try? FileManager.default.removeItem(at: legacyPlist)
         if agent.status == .enabled { try agent.unregister() }
         try agent.register()
@@ -38,4 +37,17 @@ final class DaemonServiceManager {
     }
 
     func openLoginItemSettings() { SMAppService.openSystemSettingsLoginItems() }
+
+    private func bootOutLegacyAgent() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = [
+            "bootout",
+            "gui/\(getuid())/com.plug.daemon",
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
 }
