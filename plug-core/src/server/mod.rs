@@ -314,12 +314,15 @@ fn login_shell_path(stdout: &[u8]) -> Option<OsString> {
         .map(OsString::from)
 }
 
+#[cfg(target_os = "macos")]
 fn apply_stdio_environment(command: &mut tokio::process::Command) {
-    #[cfg(target_os = "macos")]
     if let Some(path) = macos_login_shell_path() {
         command.env("PATH", path);
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn apply_stdio_environment(_command: &mut tokio::process::Command) {}
 
 #[cfg(target_os = "macos")]
 fn build_macos_sandbox_profile(
