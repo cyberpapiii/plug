@@ -52,7 +52,7 @@ write_appcast() {
     <item>
       <title>Plug previous</title>
       <sparkle:version>${previous_build}</sparkle:version>
-      <sparkle:shortVersionString>0.6.3</sparkle:shortVersionString>
+      <sparkle:shortVersionString>0.6.4</sparkle:shortVersionString>
       <enclosure url="https://example.invalid/Plug-previous.dmg" />
     </item>
   </channel>

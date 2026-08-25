@@ -7,6 +7,44 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-25
+
+Detailed notes: [Plug 0.7.0](docs/RELEASE-NOTES-0.7.0.md).
+
+### Added
+
+- A bounded macOS installation coordinator that reconciles the signed app,
+  embedded daemon, command link, MCP client entries, launchd ownership, and
+  runtime version as one installation.
+- Recognition and conservative migration of supported legacy Plug binaries,
+  Homebrew Formula installs, LaunchAgents, and client paths.
+
+### Changed
+
+- Plug.app is now the sole supported public macOS owner of the GUI, `plug`
+  command, background daemon, client links, and Sparkle updates. The Homebrew
+  Cask installs the app without a competing command binary.
+- macOS client linking, command delegation, and repairs resolve the verified
+  app executable. Source development is isolated to `plug-dev` with
+  `PLUG_DEV=1`; Linux keeps standalone Formula, shell-installer, and archive
+  paths.
+- Release packaging stages the DMG, signed appcast, app-only Cask, Linux
+  artifacts, and checksums through one publication transaction governed by a
+  single workspace version.
+
+### Fixed
+
+- App-owned daemon updates now use bounded ownership checks, exact-version IPC
+  handshakes, and safe replacement/reconnect behavior, including session replay
+  for compatible adapters.
+- Recognized Plug state can be repaired without overwriting unrelated files,
+  launchd jobs, client entries, configuration, or credentials.
+
+### Removed
+
+- macOS standalone CLI release artifacts and the executable MCPB bundle, which
+  could create a second runtime owner.
+
 ### Documentation
 
 - Clarified supported installation paths: one Plug.app on macOS from the
@@ -210,7 +248,8 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/cyberpapiii/plug/compare/v0.6.4...v0.7.0
 [0.5.2]: https://github.com/cyberpapiii/plug/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/cyberpapiii/plug/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/cyberpapiii/plug/compare/v0.4.0...v0.5.0
