@@ -45,15 +45,33 @@ write_appcast() {
   <channel>
     <item>
       <title>Plug ${current_version}</title>
-      <enclosure url="https://example.invalid/Plug-${current_version}.dmg"
-        sparkle:version="${current_build}"
-        sparkle:shortVersionString="${current_version}" />
+      <sparkle:version>${current_build}</sparkle:version>
+      <sparkle:shortVersionString>${current_version}</sparkle:shortVersionString>
+      <enclosure url="https://example.invalid/Plug-${current_version}.dmg" />
     </item>
     <item>
       <title>Plug previous</title>
-      <enclosure url="https://example.invalid/Plug-previous.dmg"
-        sparkle:version="${previous_build}"
-        sparkle:shortVersionString="0.6.3" />
+      <sparkle:version>${previous_build}</sparkle:version>
+      <sparkle:shortVersionString>0.6.3</sparkle:shortVersionString>
+      <enclosure url="https://example.invalid/Plug-previous.dmg" />
+    </item>
+  </channel>
+</rss>
+EOF
+}
+
+write_current_only_appcast() {
+  local current_version="$1"
+  local current_build="$2"
+  cat > "$APPCAST" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <item>
+      <title>Plug ${current_version}</title>
+      <sparkle:version>${current_build}</sparkle:version>
+      <sparkle:shortVersionString>${current_version}</sparkle:shortVersionString>
+      <enclosure url="https://example.invalid/Plug-${current_version}.dmg" />
     </item>
   </channel>
 </rss>
@@ -80,6 +98,11 @@ reset_valid_fixture() {
 
 verify() {
   bash "$VERIFY" --tag "v$1" --app "$APP" --appcast "$APPCAST" --cask "$CASK"
+}
+
+verify_bootstrap() {
+  bash "$VERIFY" --tag "v$1" --app "$APP" --appcast "$APPCAST" --cask "$CASK" \
+    --allow-no-history
 }
 
 expect_failure() {
@@ -127,5 +150,12 @@ reset_valid_fixture
 write_app "$WORKSPACE_VERSION" 199
 write_appcast "$WORKSPACE_VERSION" 199 199
 expect_failure "non-increasing build number" "greater than prior appcast build" verify "$WORKSPACE_VERSION"
+
+reset_valid_fixture
+write_current_only_appcast "$WORKSPACE_VERSION" 200
+expect_failure "missing published history" "published predecessor history is required" verify "$WORKSPACE_VERSION"
+
+verify_bootstrap "$WORKSPACE_VERSION" >/dev/null
+echo "PASS: explicit first-release bootstrap"
 
 echo "All release contract tests passed."

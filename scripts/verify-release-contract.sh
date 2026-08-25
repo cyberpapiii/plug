@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --tag <vX.Y.Z> --app <Plug.app> --appcast <appcast.xml> --cask <plug-app.rb>" >&2
+  echo "usage: $0 --tag <vX.Y.Z> --app <Plug.app> --appcast <appcast.xml> --cask <plug-app.rb> [--allow-no-history]" >&2
   exit 2
 }
 
@@ -10,12 +10,14 @@ TAG=""
 APP=""
 APPCAST=""
 CASK=""
+ALLOW_NO_HISTORY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag) TAG="${2:-}"; shift 2 ;;
     --app) APP="${2:-}"; shift 2 ;;
     --appcast) APPCAST="${2:-}"; shift 2 ;;
     --cask) CASK="${2:-}"; shift 2 ;;
+    --allow-no-history) ALLOW_NO_HISTORY=true; shift ;;
     *) usage ;;
   esac
 done
@@ -65,23 +67,35 @@ if [[ "$BINARY_VERSION" != "$WORKSPACE_VERSION" ]]; then
   exit 1
 fi
 
-read -r APPCAST_VERSION APPCAST_BUILD PRIOR_MAX < <(python3 - "$APPCAST" "$WORKSPACE_VERSION" "$APP_BUILD" <<'PY'
+APPCAST_RESULT="$(mktemp)"
+trap 'rm -f "$APPCAST_RESULT"' EXIT
+python3 - "$APPCAST" "$WORKSPACE_VERSION" "$APP_BUILD" > "$APPCAST_RESULT" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 
 path, expected_version, expected_build = sys.argv[1:]
 root = ET.parse(path).getroot()
 
-def attr(element, local_name):
+def local_name(name):
+    return name.rsplit("}", 1)[-1]
+
+def attr(element, name):
     for key, value in element.attrib.items():
-        if key == local_name or key.endswith("}" + local_name):
+        if local_name(key) == name:
             return value
     return ""
 
 entries = []
-for enclosure in root.iter("enclosure"):
-    short_version = attr(enclosure, "shortVersionString")
-    build = attr(enclosure, "version")
+for item in (element for element in root.iter() if local_name(element.tag) == "item"):
+    children = {local_name(child.tag): (child.text or "").strip() for child in item}
+    enclosure = next((child for child in item if local_name(child.tag) == "enclosure"), None)
+    short_version = children.get("shortVersionString", "")
+    build = children.get("version", "")
+    # Older appcasts may place these values on the enclosure. Keep reading them
+    # while treating Sparkle 2's item child elements as authoritative.
+    if enclosure is not None:
+        short_version = short_version or attr(enclosure, "shortVersionString")
+        build = build or attr(enclosure, "version")
     if short_version and build:
         entries.append((short_version, build))
 
@@ -100,7 +114,9 @@ prior_builds = [int(build) for version, build in entries
                 if (version, build) != current and build.isdigit()]
 print(current[0], current[1], max(prior_builds, default=-1))
 PY
-)
+read -r APPCAST_VERSION APPCAST_BUILD PRIOR_MAX < "$APPCAST_RESULT"
+rm -f "$APPCAST_RESULT"
+trap - EXIT
 
 if [[ "$APPCAST_VERSION" != "$WORKSPACE_VERSION" ]]; then
   echo "release contract: appcast short version '$APPCAST_VERSION' does not match workspace version '$WORKSPACE_VERSION'" >&2
@@ -108,6 +124,10 @@ if [[ "$APPCAST_VERSION" != "$WORKSPACE_VERSION" ]]; then
 fi
 if [[ "$APPCAST_BUILD" != "$APP_BUILD" ]]; then
   echo "release contract: appcast build '$APPCAST_BUILD' does not match CFBundleVersion '$APP_BUILD'" >&2
+  exit 1
+fi
+if (( PRIOR_MAX < 0 )) && [[ "$ALLOW_NO_HISTORY" != true ]]; then
+  echo "release contract: published predecessor history is required; use --allow-no-history only for the first release" >&2
   exit 1
 fi
 if (( APP_BUILD <= PRIOR_MAX )); then

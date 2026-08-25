@@ -204,8 +204,15 @@ jobs:
           set -euo pipefail
           test -n "$SPARKLE_PRIVATE_KEY"
           mkdir -p "$RUNNER_TEMP/appcast-source" "$RUNNER_TEMP/sparkle-tools"
-          gh release download --repo cyberpapiii/plug --pattern appcast.xml \
-            --dir "$RUNNER_TEMP/appcast-source" 2>/dev/null || true
+          latest_release_tag="$(gh api 'repos/cyberpapiii/plug/releases?per_page=1' \
+            --jq '.[0].tag_name // ""')"
+          if [[ -n "$latest_release_tag" ]]; then
+            gh release download "$latest_release_tag" --repo cyberpapiii/plug \
+              --pattern appcast.xml --dir "$RUNNER_TEMP/appcast-source"
+            echo "HAS_PUBLISHED_PREDECESSOR=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_PUBLISHED_PREDECESSOR=false" >> "$GITHUB_ENV"
+          fi
           cp "$RUNNER_TEMP"/Plug-*.dmg "$RUNNER_TEMP/appcast-source/"
           gh release download 2.9.2 --repo sparkle-project/Sparkle \
             --pattern Sparkle-2.9.2.tar.xz --dir "$RUNNER_TEMP/sparkle-tools"
@@ -223,11 +230,17 @@ jobs:
       - name: Verify release version contract
         shell: bash
         run: |
+          set -euo pipefail
+          history_args=()
+          if [[ "$HAS_PUBLISHED_PREDECESSOR" != true ]]; then
+            history_args+=(--allow-no-history)
+          fi
           ./scripts/verify-release-contract.sh \
             --tag "$GITHUB_REF_NAME" \
             --app "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app" \
             --appcast "$RUNNER_TEMP/appcast.xml" \
-            --cask "$RUNNER_TEMP/plug-app.rb"
+            --cask "$RUNNER_TEMP/plug-app.rb" \
+            "${history_args[@]}"
 
       - name: Upload app release artifacts
         uses: actions/upload-artifact@v4
