@@ -41,6 +41,7 @@ pub(crate) fn install_test_credential_environment() {
 
 mod commands;
 mod daemon;
+mod install;
 mod ipc_proxy;
 mod runtime;
 mod service;
@@ -419,6 +420,7 @@ pub(crate) enum OwnerCommands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install::maybe_delegate_to_app()?;
     apply_dotenv();
     plug_core::tls::ensure_rustls_provider_installed();
 

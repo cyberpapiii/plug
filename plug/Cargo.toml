@@ -48,6 +48,12 @@ axum-server.workspace = true
 rustls.workspace = true
 oauth2.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Safe bindings for NSWorkspace bundle-identifier discovery. Keeping this
+# target-scoped preserves the standalone Linux binary and its dependency graph.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
+
 [dev-dependencies]
 rcgen = "0.14"
 tokio-rustls = { version = "0.26", default-features = false }

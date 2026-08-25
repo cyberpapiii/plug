@@ -38,6 +38,15 @@ operating system keychain where one is available, with a `0600` file mirror used
 to survive restarts. Anyone who can read your user account can read those
 credentials; plug does not defend against a compromised local account.
 
+**Verified macOS command delegation.** A standalone macOS `plug` command may
+verify Plug.app immediately before re-executing its embedded command-line
+binary. This accepts the normal same-user time-of-check/time-of-use boundary:
+an attacker able to replace a verified app between signature verification and
+`exec` already controls that user's application files. Plug nevertheless
+verifies the app signature, bundle identifier, and Developer ID Team ID on each
+delegation and never intentionally delegates to an unsigned or wrong-Team-ID
+target.
+
 **The downstream authorization server.** When `http.auth_mode = "oauth"`, plug
 issues tokens to remote MCP clients. Clients register through RFC 7591 Dynamic
 Client Registration or present a Client ID Metadata Document. Every
