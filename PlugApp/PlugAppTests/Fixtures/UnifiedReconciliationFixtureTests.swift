@@ -401,10 +401,25 @@ private struct SignedReconciliationFixture {
                 guard url.standardizedFileURL == executableURL,
                       FileManager.default.isExecutableFile(atPath: url.path)
                 else { throw AppInstallationError.missingEmbeddedExecutable(url) }
-                // The shipped CLI's --version path also verifies the live
-                // /Applications/Plug.app, so execute-free fixture inspection
-                // keeps this harness isolated from the installed daemon.
-                return expectedVersion
+                // PLUG_DEV keeps the copied binary from delegating to any
+                // live installation while still exercising its real --version
+                // path and proving the embedded version.
+                let result = try await ProcessRunner().run(
+                    executable: URL(fileURLWithPath: "/usr/bin/env"),
+                    arguments: ["PLUG_DEV=1", url.path, "--version"],
+                    timeout: .seconds(3)
+                )
+                let output = String(decoding: result.stdout, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard result.status == 0,
+                      let version = output.split(whereSeparator: \.isWhitespace).last,
+                      String(version) == expectedVersion
+                else {
+                    throw AppInstallationError.embeddedVersionFailure(
+                        String(decoding: result.stderr, as: UTF8.self)
+                    )
+                }
+                return String(version)
             }
         )
     }
