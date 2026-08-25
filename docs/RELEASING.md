@@ -23,9 +23,16 @@ Sparkle updates. Headless macOS is unsupported.
 
 Linux users choose one standalone path: the Linux-only Homebrew Formula, the
 Linux-only release shell installer, or a Linux release archive. These artifacts
-are not macOS installation paths. Source development uses the isolated
-`plug-dev` command from `./scripts/dev-reinstall.sh`; it does not replace the
-production command owned by Plug.app.
+are not macOS installation paths. Source development uses an isolated command;
+it does not replace the production command owned by Plug.app. On a fresh
+checkout, create the local signing identity before the development install,
+then invoke `PLUG_DEV=1 plug-dev` only after that install:
+
+```sh
+./scripts/setup-codesigning.sh
+./scripts/dev-reinstall.sh --quick
+PLUG_DEV=1 plug-dev
+```
 
 ## Before tagging
 

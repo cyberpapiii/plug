@@ -52,19 +52,22 @@ Linux users can choose one standalone path:
 
 ### Source development
 
-Source builds use an isolated `plug-dev` command and never replace the
+Source builds use an isolated development command and never replace the
 production `plug` command owned by Plug.app:
 
+For a fresh checkout, set up local signing before the first development
+install. The setup script is idempotent and safely no-ops off macOS:
+
 ```sh
+./scripts/setup-codesigning.sh
 ./scripts/dev-reinstall.sh --quick
 PLUG_DEV=1 plug-dev
 ```
 
 Use `./scripts/dev-reinstall.sh --quick --clean` when you also want generated
-build artifacts removed. On macOS, run `PLUG_DEV=1 plug-dev codesign-setup`
-once before the first rebuild if local Keychain access needs a stable signing
-identity. Do not use development signing commands on Plug.app or release
-binaries.
+build artifacts removed; invoke the installed development binary afterward with
+`PLUG_DEV=1 plug-dev`. Do not use development signing commands on Plug.app or
+release binaries.
 
 ### Connect Claude Desktop
 
