@@ -7,6 +7,58 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-25
+
+Detailed notes: [Plug 0.5.0](docs/RELEASE-NOTES-0.5.0.md).
+
+### Added
+
+- A native macOS 14+ menu-bar app with calm health status, server controls,
+  connected-client visibility, a redacted activity feed, upstream OAuth repair,
+  and settings. The app is a full client of the same daemon used by the CLI.
+- A versioned, redacted operator IPC surface for the app: compatibility
+  handshake, server/client snapshots, bounded activity history, server
+  mutations, and downstream-client revocation.
+- LaunchAgent ownership through `SMAppService`, including first-run adoption of
+  older CLI-managed installations and a clear restart action after app updates.
+- Signed, notarized, and stapled universal `.dmg` distribution, Sparkle 2
+  updates with a signed stable appcast, and a Homebrew cask using the identical
+  disk image.
+- Native notifications for upstream reauthorization and newly authorized
+  downstream clients, coalesced so retries and flapping servers cannot spam the
+  user.
+- A complete official prerelease MCP `2026-07-28` server conformance fixture and
+  durable evidence for 22 passing checks with zero failures.
+
+### Changed
+
+- Daemon startup is now single-owner and launchd-managed. The CLI, app, and
+  reconnecting clients share one arbitration path instead of competing to spawn
+  child daemons.
+- Live server edits now flow through daemon verbs and atomic config persistence,
+  so the app and CLI cannot create two sources of truth.
+- `enable_prefix = false` now does what the configuration promises. Unique tools,
+  resources, templates, and prompts pass through unchanged; collisions alone
+  fall back to server-qualified names.
+
+### Fixed
+
+- Modern request-scoped progress survives metadata translation, maps RMCP's
+  upstream token back to the client's token, and streams on the finite HTTP POST
+  response before the final result.
+- Concrete URIs expanded from advertised resource templates now route to the
+  correct upstream server, with ambiguous cross-server matches rejected.
+- The installed app and daemon negotiate an IPC compatibility range and offer a
+  useful update/restart action instead of failing opaquely on version skew.
+
+### Security
+
+- The operator activity feed is bounded and redacted at capture time; tool
+  arguments, results, credentials, and raw prompts never enter app telemetry.
+- Sparkle's EdDSA update signature and Apple's Developer ID signature provide
+  independent verification of app updates. Missing signing material fails the
+  release before any unsigned artifact can be published.
+
 ## [0.4.0] - 2026-08-24
 
 Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md), [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
@@ -128,7 +180,8 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cyberpapiii/plug/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cyberpapiii/plug/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cyberpapiii/plug/releases/tag/v0.3.0
 [0.1.0]: https://github.com/cyberpapiii/plug/releases/tag/v0.1.0
