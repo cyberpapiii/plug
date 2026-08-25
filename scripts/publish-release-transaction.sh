@@ -100,6 +100,12 @@ done < "$CHECKSUMS_FILE"
 
 (( ${#ASSET_NAMES[@]} > 0 )) || die "checksum manifest has no assets"
 
+# The manifest describes the other assets but cannot contain its own digest.
+# Publish it separately so retries can download and compare the exact staged
+# manifest before any tap mutation or release promotion.
+ASSET_NAMES+=("$(basename "$CHECKSUMS_FILE")")
+ASSET_PATHS+=("$CHECKSUMS_FILE")
+
 echo "Verifying staged release assets"
 (cd "$ARTIFACTS_DIR" && sha256sum -c "$(basename "$CHECKSUMS_FILE")")
 
@@ -244,4 +250,8 @@ final_draft="$(jq -r '.isDraft // false' <<<"$final_json")"
 final_prerelease="$(jq -r '.isPrerelease // false' <<<"$final_json")"
 [[ "$final_draft" == false && "$final_prerelease" == false ]] || \
   die "release $TAG was not promoted"
+latest_json="$(gh_run api --repo "$REPO" "repos/$REPO/releases/latest")"
+latest_tag="$(jq -r '.tag_name // ""' <<<"$latest_json")"
+[[ "$latest_tag" == "$TAG" ]] || \
+  die "release $TAG is not latest (GitHub latest is ${latest_tag:-<none>})"
 echo "Release transaction complete: $TAG latest, tap commit $tap_head"
