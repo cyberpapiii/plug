@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  build-linux:
+    name: Build Linux ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -161,8 +161,16 @@ jobs:
           set -euo pipefail
           test -n "$SPARKLE_PRIVATE_KEY"
           mkdir -p "$RUNNER_TEMP/appcast-source" "$RUNNER_TEMP/sparkle-tools"
-          latest_release_tag="$(gh api 'repos/cyberpapiii/plug/releases?per_page=1' \
-            --jq '.[0].tag_name // ""')"
+          latest_release_error="$RUNNER_TEMP/latest-release-error"
+          if latest_release_tag="$(gh api 'repos/cyberpapiii/plug/releases/latest' \
+            --jq '.tag_name // ""' 2>"$latest_release_error")"; then
+            :
+          elif grep -Eiq '404|not found' "$latest_release_error"; then
+            latest_release_tag=""
+          else
+            cat "$latest_release_error" >&2
+            exit 1
+          fi
           if [[ -n "$latest_release_tag" ]]; then
             gh release download "$latest_release_tag" --repo cyberpapiii/plug \
               --pattern appcast.xml --dir "$RUNNER_TEMP/appcast-source"
@@ -208,9 +216,9 @@ jobs:
             ${{ runner.temp }}/appcast.xml
             ${{ runner.temp }}/plug-app.rb
 
-  publish:
-    name: Publish GitHub release and Homebrew tap
-    needs: [build, build-app]
+  prepare-release:
+    name: Prepare release assets
+    needs: [build-linux, build-app]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -299,43 +307,62 @@ jobs:
         env:
           OUTPUT: RELEASE_NOTES.md
 
-      - name: Create GitHub release
+      - name: Verify prepared assets
         shell: bash
         run: |
-          gh release create "$TAG" \
-            --title "plug $TAG" \
-            --notes-file RELEASE_NOTES.md \
-            artifacts/plug-mcp-*.tar.gz \
-            artifacts/source.tar.gz \
-            artifacts/source.tar.gz.sha256 \
-            artifacts/plug-mcp-installer.sh \
-            artifacts/plug.rb \
-            artifacts/plug-app.rb \
-            artifacts/Plug-*.dmg \
-            artifacts/appcast.xml \
-            artifacts/checksums.sha256
+          set -euo pipefail
+          test -s artifacts/appcast.xml
+          test -f artifacts/plug-mcp-installer.sh
+          test -n "$(compgen -G 'artifacts/Plug-*.dmg')"
+          if command -v xmllint >/dev/null 2>&1; then
+            xmllint --noout artifacts/appcast.xml
+          fi
+          (cd artifacts && sha256sum -c checksums.sha256)
+          ruby -c artifacts/plug.rb
+          ruby -c artifacts/plug-app.rb
 
-      - name: Publish Homebrew formula
+      - name: Include release notes in prepared bundle
+        shell: bash
+        run: cp RELEASE_NOTES.md artifacts/RELEASE_NOTES.md
+
+      - name: Upload prepared release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-release
+          path: artifacts
+
+  publish-release:
+    name: Publish release transaction
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download prepared release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-release
+          path: artifacts
+
+      - name: Checkout Homebrew tap
         uses: actions/checkout@v4
         with:
           repository: cyberpapiii/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
-      - name: Commit Homebrew formula
+      - name: Publish staged release and tap transaction
         shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          cp artifacts/plug.rb homebrew-tap/plug.rb
-          mkdir -p homebrew-tap/Casks
-          cp artifacts/plug-app.rb homebrew-tap/Casks/plug-app.rb
-          cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add plug.rb Casks/plug-app.rb
-          if git diff --cached --quiet; then
-            echo "Homebrew formula already up to date"
-          else
-            git commit -m "plug ${TAG#v}"
-            git push
-          fi
+          bash ./scripts/publish-release-transaction.sh \
+            --tag "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --artifacts-dir artifacts \
+            --notes-file artifacts/RELEASE_NOTES.md \
+            --tap-dir homebrew-tap
