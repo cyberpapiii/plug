@@ -1736,7 +1736,8 @@ command = "example-server"
         config.servers.insert("b".to_string(), stdio_server("echo"));
         let result = check_tool_collisions(&config).await;
         assert_eq!(result.status, CheckStatus::Pass);
-        assert!(result.message.contains("always on"));
+        assert!(result.message.contains("disabled"));
+        assert!(result.message.contains("duplicate names fall back"));
     }
 
     // -- check_client_limits --
