@@ -4,7 +4,10 @@ import ServiceManagement
 @MainActor
 final class DaemonServiceManager {
     static let shared = DaemonServiceManager()
-    private let agent = SMAppService.agent(plistName: "com.plug.daemon.plist")
+    // ServiceManagement is process-safe and owns its own XPC serialization.
+    // Its async methods are nonisolated, so keep this immutable handle usable
+    // across that boundary under Swift 6's strict concurrency checks.
+    nonisolated(unsafe) private let agent = SMAppService.agent(plistName: "com.plug.daemon.plist")
     private let legacyPlist = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: "Library/LaunchAgents/com.plug.daemon.plist")
 
@@ -41,11 +44,14 @@ final class DaemonServiceManager {
     }
 
     private func unregisterAgent() async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            agent.unregister { error in
-                if let error { continuation.resume(throwing: error) }
-                else { continuation.resume() }
-            }
+        // The callback variant completes on a private ServiceManagement queue.
+        // Calling it from this MainActor type makes Swift 6 enforce the actor
+        // precondition on that queue and crash before the callback body runs.
+        // The async API resumes through Swift concurrency safely; poll its
+        // observable status before registering the replacement.
+        try await agent.unregister()
+        for _ in 0..<60 where agent.status == .enabled {
+            try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
