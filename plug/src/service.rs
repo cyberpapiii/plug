@@ -228,8 +228,29 @@ pub fn discover_launchd_jobs() -> anyhow::Result<Vec<LaunchdJobRecord>> {
 }
 
 pub fn classify_launchctl_output(output: &str, cli_plist_exists: bool) -> ServiceOwnership {
-    if output.contains("Plug.app/Contents/")
-        || output.contains("parent bundle identifier = com.cyberpapiii.plug")
+    let managed_by_service_management = output
+        .lines()
+        .any(|line| line.trim() == "managed_by = com.apple.xpc.ServiceManagement");
+    let parent_is_plug = output
+        .lines()
+        .any(|line| line.trim() == "parent bundle identifier = com.cyberpapiii.plug");
+    let program_identifier_is_plug = output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("program identifier = ")
+            .is_some_and(|value| {
+                value == "Contents/Resources/plug" || value.starts_with("Contents/Resources/plug (")
+            })
+    });
+    let arguments = parse_launchd_arguments(output);
+    let arguments_identify_daemon = arguments.first().map(String::as_str)
+        == Some("Contents/Resources/plug")
+        && arguments.get(1).map(String::as_str) == Some("serve")
+        && arguments.get(2).map(String::as_str) == Some("--daemon");
+
+    if managed_by_service_management
+        && parent_is_plug
+        && program_identifier_is_plug
+        && arguments_identify_daemon
     {
         ServiceOwnership::AppManaged
     } else if !output.trim().is_empty() || cli_plist_exists {
@@ -544,13 +565,13 @@ arguments = {
     }
 
     #[test]
-    fn app_service_wins_over_stale_cli_plist() {
+    fn embedded_cli_path_without_service_management_is_not_app_owned() {
         assert_eq!(
             classify_launchctl_output(
                 "program = /Applications/Plug.app/Contents/Resources/plug",
                 true
             ),
-            ServiceOwnership::AppManaged
+            ServiceOwnership::CliManaged
         );
     }
 
@@ -558,10 +579,21 @@ arguments = {
     fn app_service_is_recognized_from_real_launchctl_shape() {
         assert_eq!(
             classify_launchctl_output(
-                "managed_by = com.apple.xpc.ServiceManagement\nparent bundle identifier = com.cyberpapiii.plug",
+                "managed_by = com.apple.xpc.ServiceManagement\nparent bundle identifier = com.cyberpapiii.plug\nprogram identifier = Contents/Resources/plug (mode: 2)\narguments = {\nContents/Resources/plug\nserve\n--daemon\n}",
                 false
             ),
             ServiceOwnership::AppManaged
+        );
+    }
+
+    #[test]
+    fn partial_service_management_metadata_is_not_app_owned() {
+        assert_eq!(
+            classify_launchctl_output(
+                "managed_by = com.apple.xpc.ServiceManagement\nparent bundle identifier = com.cyberpapiii.plug\nprogram = /Applications/Plug.app/Contents/Resources/plug",
+                false
+            ),
+            ServiceOwnership::CliManaged
         );
     }
 
