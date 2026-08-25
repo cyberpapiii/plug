@@ -15,37 +15,58 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             List(AppSection.allCases, selection: $selection) { section in
-                Label(section.rawValue, systemImage: section.symbol).tag(section)
+                SidebarSectionRow(
+                    section: section,
+                    detail: sidebarDetail(for: section)
+                )
+                .tag(section)
             }
             .listStyle(.sidebar)
             .navigationTitle("Plug")
+            .navigationSplitViewColumnWidth(min: 168, ideal: 188, max: 220)
+            .safeAreaInset(edge: .bottom) {
+                RuntimeFooter(model: model)
+            }
         } detail: {
-            Group {
-                switch selection ?? .servers {
-                case .servers: ServersView(model: model)
-                case .clients: ClientsView(model: model)
-                case .activity: ActivityView(model: model)
-                case .auth: AuthView(model: model)
+            VStack(spacing: 0) {
+                if model.serviceNeedsAdoption {
+                    ServiceAdoptionNotice(model: model)
+                }
+                Group {
+                    switch selection ?? .servers {
+                    case .servers: ServersView(model: model)
+                    case .clients: ClientsView(model: model)
+                    case .activity: ActivityView(model: model)
+                    case .auth: AuthView(model: model)
+                    }
                 }
             }
-            .toolbar { Button { Task { await model.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") } }
+            .toolbar {
+                Button { Task { await model.refresh() } } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .keyboardShortcut("r", modifiers: .command)
+            }
         }
         .overlay(alignment: .bottom) {
             if let error = model.lastError {
-                Text(error).font(.callout).padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)).padding()
+                ErrorToast(message: error)
             }
         }
-        .safeAreaInset(edge: .top) {
-            if model.serviceNeedsAdoption {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Let Plug manage its background service").fontWeight(.semibold)
-                        Text("This replaces the older command-line startup entry and keeps one daemon in charge.").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Use Plug") { Task { await model.adoptDaemon() } }.buttonStyle(.borderedProminent)
-                }.padding(12).background(.regularMaterial)
-            }
+    }
+
+    private func sidebarDetail(for section: AppSection) -> String {
+        switch section {
+        case .servers:
+            let enabled = model.visibleServers.filter(\.configured.enabled).count
+            return "\(enabled) enabled"
+        case .clients:
+            return "\(model.snapshot.liveSessions.count) connected"
+        case .activity:
+            return model.activities.isEmpty ? "No recent calls" : "\(model.activities.count) recent"
+        case .auth:
+            let attention = model.snapshot.upstreamAuth.filter { !$0.authenticated }.count
+            return attention == 0 ? "All connected" : "\(attention) need attention"
         }
     }
 }

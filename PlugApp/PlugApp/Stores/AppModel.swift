@@ -63,7 +63,7 @@ final class AppModel {
         guard refreshTask == nil else { return }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            connectionState = .connecting
+            if connectionState != .ready { connectionState = .connecting }
             do {
                 let handshake = try await ipc.connect()
                 guard handshake.ipcMin <= 4, handshake.ipcMax >= 3 else {
