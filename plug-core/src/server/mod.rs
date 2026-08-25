@@ -1,11 +1,15 @@
 #![allow(clippy::mutable_key_type)]
 
 use std::collections::{BTreeSet, HashMap};
+#[cfg(target_os = "macos")]
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -222,6 +226,7 @@ fn build_stdio_command(
     let Some(sandbox) = sandbox else {
         let mut cmd = tokio::process::Command::new(&resolved_command);
         cmd.args(args);
+        apply_stdio_environment(&mut cmd);
         return Ok(cmd);
     };
 
@@ -238,6 +243,7 @@ fn build_stdio_command(
         }
         cmd.arg(&resolved_command);
         cmd.args(args);
+        apply_stdio_environment(&mut cmd);
         Ok(cmd)
     }
 
@@ -267,19 +273,14 @@ pub(crate) fn resolve_stdio_command(command: &str) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         // SMAppService launch agents intentionally receive launchd's minimal
-        // PATH, while MCP commands are normally configured from the user's
-        // login shell. Resolve a missing bare command through that same shell
-        // without interpolating the configured value into shell source.
-        if let Ok(output) = std::process::Command::new("/bin/zsh")
-            .args([
-                "-lic",
-                "resolved=$(command -v -- \"$PLUG_STDIO_COMMAND\") || exit 127; printf '__PLUG_STDIO_PATH__%s\\n' \"$resolved\"",
-            ])
-            .env("PLUG_STDIO_COMMAND", command)
-            .output()
-            && output.status.success()
-            && let Some(path) = login_shell_command_path(&output.stdout)
-        {
+        // PATH. Resolve through the user's login PATH, which is also inherited
+        // by the child below so script launchers such as `#!/usr/bin/env node`
+        // can find their own interpreter.
+        if let Some(path) = macos_login_shell_path().and_then(|paths| {
+            std::env::split_paths(paths)
+                .map(|dir| dir.join(command))
+                .find(|path| path.is_file())
+        }) {
             return path;
         }
     }
@@ -288,14 +289,36 @@ pub(crate) fn resolve_stdio_command(command: &str) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn login_shell_command_path(stdout: &[u8]) -> Option<PathBuf> {
+fn macos_login_shell_path() -> Option<&'static OsStr> {
+    static LOGIN_SHELL_PATH: OnceLock<Option<OsString>> = OnceLock::new();
+    LOGIN_SHELL_PATH
+        .get_or_init(|| {
+            std::process::Command::new("/bin/zsh")
+                .args(["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| login_shell_path(&output.stdout))
+        })
+        .as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn login_shell_path(stdout: &[u8]) -> Option<OsString> {
     const MARKER: &str = "__PLUG_STDIO_PATH__";
     String::from_utf8_lossy(stdout)
         .lines()
         .map(str::trim)
         .filter_map(|line| line.strip_prefix(MARKER))
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
+        .find(|path| !path.is_empty())
+        .map(OsString::from)
+}
+
+fn apply_stdio_environment(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = macos_login_shell_path() {
+        command.env("PATH", path);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2432,12 +2455,12 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn login_shell_command_path_ignores_shell_noise() {
+    fn login_shell_path_ignores_shell_noise() {
         assert_eq!(
-            login_shell_command_path(b"welcome from shell config\n__PLUG_STDIO_PATH__/bin/sh\n"),
-            Some(PathBuf::from("/bin/sh"))
+            login_shell_path(b"welcome from shell config\n__PLUG_STDIO_PATH__/bin:/opt/bin\n"),
+            Some(OsString::from("/bin:/opt/bin"))
         );
-        assert_eq!(login_shell_command_path(b"/bin/sh\n"), None);
+        assert_eq!(login_shell_path(b"/bin:/opt/bin\n"), None);
     }
 
     fn session_watcher() -> (
