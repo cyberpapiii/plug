@@ -22,7 +22,7 @@ final class DaemonServiceManager {
     func adopt() async throws {
         bootOutLegacyAgent()
         try? FileManager.default.removeItem(at: legacyPlist)
-        if agent.status == .enabled { try? await agent.unregister() }
+        if agent.status == .enabled { try? await unregisterAgent() }
         if agent.status != .enabled { try agent.register() }
         guard agent.status == .enabled else {
             openLoginItemSettings()
@@ -35,14 +35,18 @@ final class DaemonServiceManager {
 
     func restart() async throws {
         if agent.status == .enabled {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                agent.unregister { error in
-                    if let error { continuation.resume(throwing: error) }
-                    else { continuation.resume() }
-                }
-            }
+            try await unregisterAgent()
         }
         try agent.register()
+    }
+
+    private func unregisterAgent() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            agent.unregister { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            }
+        }
     }
 
     func setMainAppAtLogin(_ enabled: Bool) throws {
