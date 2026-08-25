@@ -523,7 +523,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Repair { targets, all }) => {
-            commands::misc::cmd_repair(cli.config.as_ref(), targets, all)?
+            commands::misc::cmd_repair(cli.config.as_ref(), targets, all, &cli.output)?
         }
         Some(Commands::Setup { yes, transport }) => {
             commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?

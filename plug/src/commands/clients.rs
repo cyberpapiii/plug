@@ -1,5 +1,6 @@
 use dialoguer::console::style;
 use plug_core::export::{ExportTarget, ExportTransport};
+use std::path::{Path, PathBuf};
 
 use crate::ui::{cli_prompt_theme, print_banner, print_info_line, print_warning_line};
 
@@ -7,6 +8,32 @@ use crate::ui::{cli_prompt_theme, print_banner, print_info_line, print_warning_l
 pub(crate) struct LinkedClientConfig {
     pub(crate) transport: ExportTransport,
     pub(crate) endpoint: Option<String>,
+    pub(crate) command: Option<String>,
+    pub(crate) args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum PlugLinkDisposition {
+    Canonical,
+    RecognizedLegacy,
+    UnknownCommand,
+    Http,
+    Missing,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientRepairItem {
+    pub target: String,
+    pub path: PathBuf,
+    pub disposition: PlugLinkDisposition,
+    pub changed: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientRepairReport {
+    pub canonical_command: PathBuf,
+    pub items: Vec<ClientRepairItem>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -93,8 +120,8 @@ pub(crate) fn linked_client_config(target: &str, project: bool) -> Option<Linked
     linked_client_config_from_content(&path, target_enum, &content)
 }
 
-fn linked_client_config_from_content(
-    path: &std::path::Path,
+pub(crate) fn linked_client_config_from_content(
+    path: &Path,
     target_enum: plug_core::export::ExportTarget,
     content: &str,
 ) -> Option<LinkedClientConfig> {
@@ -108,11 +135,26 @@ fn linked_client_config_from_content(
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Http,
                     endpoint: Some(url.to_string()),
+                    command: None,
+                    args: Vec::new(),
                 })
             } else if table.get("command").is_some() {
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Stdio,
                     endpoint: None,
+                    command: table
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    args: table
+                        .get("args")
+                        .and_then(|value| value.as_array())
+                        .map(|args| {
+                            args.iter()
+                                .filter_map(|value| value.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             } else {
                 None
@@ -125,11 +167,26 @@ fn linked_client_config_from_content(
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Http,
                     endpoint: Some(uri.to_string()),
+                    command: None,
+                    args: Vec::new(),
                 })
             } else if plug.get("command").is_some() {
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Stdio,
                     endpoint: None,
+                    command: plug
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    args: plug
+                        .get("args")
+                        .and_then(|value| value.as_sequence())
+                        .map(|args| {
+                            args.iter()
+                                .filter_map(|value| value.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             } else {
                 None
@@ -153,17 +210,103 @@ fn linked_client_config_from_content(
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Http,
                     endpoint: Some(url.to_string()),
+                    command: None,
+                    args: Vec::new(),
                 })
             } else if plug.get("command").is_some() {
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Stdio,
                     endpoint: None,
+                    command: plug
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    args: plug
+                        .get("args")
+                        .and_then(|value| value.as_array())
+                        .map(|args| {
+                            args.iter()
+                                .filter_map(|value| value.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             } else {
                 None
             }
         }
     }
+}
+
+/// Classify a stdio `plug` entry without executing its configured command.
+///
+/// Repair is intentionally limited to paths that can only reasonably be a
+/// Plug installation. A bare `plug` command or an arbitrary executable might
+/// be another program, so it remains untouched.
+pub fn classify_plug_client_command(
+    command: &str,
+    args: &[String],
+    canonical: &Path,
+) -> PlugLinkDisposition {
+    if args != ["connect"] {
+        return PlugLinkDisposition::UnknownCommand;
+    }
+
+    let command_path = Path::new(command);
+    if paths_equivalent(command_path, canonical) {
+        return PlugLinkDisposition::Canonical;
+    }
+
+    let identified_path = command_path
+        .canonicalize()
+        .unwrap_or_else(|_| command_path.into());
+    if is_recognized_legacy_plug_path(&identified_path) {
+        PlugLinkDisposition::RecognizedLegacy
+    } else {
+        PlugLinkDisposition::UnknownCommand
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn is_recognized_legacy_plug_path(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("plug") {
+        return false;
+    }
+
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let has_suffix = |suffix: &[&str]| {
+        components.len() >= suffix.len()
+            && components[components.len() - suffix.len()..]
+                .iter()
+                .map(String::as_str)
+                .eq(suffix.iter().copied())
+    };
+
+    has_suffix(&[".cargo", "bin", "plug"])
+        || has_suffix(&["homebrew", "bin", "plug"])
+        || has_suffix(&["local", "bin", "plug"])
+        || components
+            .windows(4)
+            .any(|parts| parts[0] == "Cellar" && parts[1] == "plug" && parts[3] == "bin")
+        || (has_suffix(&["Contents", "Resources", "plug"])
+            && components
+                .iter()
+                .any(|component| component == "Plug.app" || component.ends_with(" Plug.app")))
+        || components
+            .windows(3)
+            .any(|parts| parts[0] == "target" && parts[2] == "plug")
 }
 
 pub(crate) fn is_detected(target: &str) -> bool {
@@ -654,9 +797,18 @@ pub(crate) fn cmd_link(
             "How should this client connect to plug?",
             false,
         )?;
+        let canonical_command = if matches!(transport, ExportTransport::Stdio) {
+            Some(
+                crate::install::canonical_client_command()?
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
         let (snippet, is_toml, is_yaml) = match (format, transport) {
             (0, ExportTransport::Stdio) => (
-                serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":"plug","args":["connect"]}}})).unwrap(),
+                serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"plug":{"command":canonical_command,"args":["connect"]}}})).unwrap(),
                 false,
                 false,
             ),
@@ -666,7 +818,7 @@ pub(crate) fn cmd_link(
                 false,
             ),
             (1, ExportTransport::Stdio) => (
-                serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"command":"plug","args":["connect"]}}}})).unwrap(),
+                serde_json::to_string_pretty(&serde_json::json!({"mcp":{"servers":{"plug":{"command":canonical_command,"args":["connect"]}}}})).unwrap(),
                 false,
                 false,
             ),
@@ -676,7 +828,10 @@ pub(crate) fn cmd_link(
                 false,
             ),
             (2, ExportTransport::Stdio) => (
-                "\n[mcp_servers.plug]\ncommand = \"plug\"\nargs = [\"connect\"]\n".to_string(),
+                format!(
+                    "\n[mcp_servers.plug]\ncommand = \"{}\"\nargs = [\"connect\"]\n",
+                    canonical_command.as_deref().expect("stdio command")
+                ),
                 true,
                 false,
             ),
@@ -686,7 +841,10 @@ pub(crate) fn cmd_link(
                 false,
             ),
             (3, ExportTransport::Stdio) => (
-                "\nextensions:\n  plug:\n    type: stdio\n    command: plug\n    args: [\"connect\"]\n    enabled: true\n".to_string(),
+                format!(
+                    "\nextensions:\n  plug:\n    type: stdio\n    command: {}\n    args: [\"connect\"]\n    enabled: true\n",
+                    canonical_command.as_deref().expect("stdio command")
+                ),
                 false,
                 true,
             ),
@@ -898,6 +1056,145 @@ fn merge_yaml_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
     Ok(serde_norway::to_string(&existing_yml)?)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClientContentRepair {
+    pub(crate) disposition: PlugLinkDisposition,
+    pub(crate) updated: Option<String>,
+    pub(crate) message: String,
+}
+
+/// Repair only a stdio entry whose command has already been proven to be a
+/// known Plug installation. The targeted field updates preserve neighbouring
+/// MCP servers and unknown configuration fields.
+pub(crate) fn repair_client_content(
+    target: ExportTarget,
+    path: &Path,
+    content: &str,
+    canonical: &Path,
+    _http_url: &str,
+) -> anyhow::Result<ClientContentRepair> {
+    let Some(linked) = linked_client_config_from_content(path, target, content) else {
+        return Ok(ClientContentRepair {
+            disposition: PlugLinkDisposition::Missing,
+            updated: None,
+            message: "No Plug entry found; left unchanged.".to_string(),
+        });
+    };
+
+    if matches!(linked.transport, ExportTransport::Http) {
+        return Ok(ClientContentRepair {
+            disposition: PlugLinkDisposition::Http,
+            updated: None,
+            message: "HTTP Plug entry does not need a command repair.".to_string(),
+        });
+    }
+
+    let disposition = linked
+        .command
+        .as_deref()
+        .map(|command| classify_plug_client_command(command, &linked.args, canonical))
+        .unwrap_or(PlugLinkDisposition::UnknownCommand);
+    match disposition {
+        PlugLinkDisposition::Canonical => Ok(ClientContentRepair {
+            disposition,
+            updated: None,
+            message: "Already uses the canonical Plug command.".to_string(),
+        }),
+        PlugLinkDisposition::UnknownCommand => Ok(ClientContentRepair {
+            disposition,
+            updated: None,
+            message: "Plug command is not recognized; left unchanged.".to_string(),
+        }),
+        PlugLinkDisposition::RecognizedLegacy => Ok(ClientContentRepair {
+            disposition,
+            updated: Some(replace_stdio_command(path, target, content, canonical)?),
+            message: "Repaired a recognized legacy Plug command.".to_string(),
+        }),
+        PlugLinkDisposition::Http | PlugLinkDisposition::Missing => unreachable!(),
+    }
+}
+
+fn replace_stdio_command(
+    path: &Path,
+    target: ExportTarget,
+    content: &str,
+    canonical: &Path,
+) -> anyhow::Result<String> {
+    let command = canonical.to_string_lossy().to_string();
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("toml") => {
+            let mut value = toml::from_str::<toml::Value>(content)?;
+            let plug = value
+                .get_mut("mcp_servers")
+                .and_then(|servers| servers.get_mut("plug"))
+                .and_then(toml::Value::as_table_mut)
+                .ok_or_else(|| anyhow::anyhow!("missing Codex Plug entry"))?;
+            plug.insert("command".to_string(), toml::Value::String(command));
+            plug.insert(
+                "args".to_string(),
+                toml::Value::Array(vec![toml::Value::String("connect".to_string())]),
+            );
+            Ok(toml::to_string_pretty(&value)?)
+        }
+        Some("yaml") | Some("yml") => {
+            let mut value = serde_norway::from_str::<serde_norway::Value>(content)?;
+            let key = serde_norway::Value::from("extensions");
+            let plug_key = serde_norway::Value::from("plug");
+            let plug = value
+                .as_mapping_mut()
+                .and_then(|root| root.get_mut(&key))
+                .and_then(serde_norway::Value::as_mapping_mut)
+                .and_then(|extensions| extensions.get_mut(&plug_key))
+                .and_then(serde_norway::Value::as_mapping_mut)
+                .ok_or_else(|| anyhow::anyhow!("missing Goose Plug entry"))?;
+            plug.insert(
+                serde_norway::Value::from("command"),
+                serde_norway::Value::from(command),
+            );
+            plug.insert(
+                serde_norway::Value::from("args"),
+                serde_norway::Value::from(vec![serde_norway::Value::from("connect")]),
+            );
+            Ok(serde_norway::to_string(&value)?)
+        }
+        _ => replace_json_stdio_command(target, content, command),
+    }
+}
+
+fn replace_json_stdio_command(
+    target: ExportTarget,
+    content: &str,
+    command: String,
+) -> anyhow::Result<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(content)?;
+    let plug = match target {
+        ExportTarget::Nanobot => value
+            .get_mut("tools")
+            .and_then(|tools| tools.get_mut("mcpServers"))
+            .and_then(|servers| servers.get_mut("plug")),
+        ExportTarget::VSCodeCopilot => value
+            .get_mut("mcp")
+            .and_then(|mcp| mcp.get_mut("servers"))
+            .and_then(|servers| servers.get_mut("plug")),
+        _ => {
+            if value.get("mcpServers").is_some() {
+                value
+                    .get_mut("mcpServers")
+                    .and_then(|servers| servers.get_mut("plug"))
+            } else {
+                value
+                    .get_mut("context_servers")
+                    .and_then(|servers| servers.get_mut("plug"))
+            }
+        }
+    }
+    .and_then(serde_json::Value::as_object_mut)
+    .ok_or_else(|| anyhow::anyhow!("missing JSON Plug entry"))?;
+    plug.insert("command".to_string(), serde_json::Value::String(command));
+    plug.insert("args".to_string(), serde_json::json!(["connect"]));
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 pub(crate) fn unlink_yaml(existing: &str) -> String {
     let mut output = Vec::new();
     let mut skipping = false;
@@ -939,7 +1236,9 @@ pub(crate) fn execute_export(
         ExportTransport::Stdio
     };
 
-    let command = std::env::current_exe()?.to_string_lossy().to_string();
+    let command = crate::install::canonical_client_command()?
+        .to_string_lossy()
+        .to_string();
 
     let options = ExportOptions {
         target: target_enum,
@@ -1220,6 +1519,41 @@ extensions:
     #[test]
     fn requested_link_transport_defaults_explicit_targets_to_prompt() {
         assert_eq!(requested_link_transport(None, false), None);
+    }
+
+    #[test]
+    fn classifies_only_canonical_or_recognized_legacy_connect_commands() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let connect = vec!["connect".to_string()];
+
+        assert_eq!(
+            classify_plug_client_command(canonical.to_str().unwrap(), &connect, canonical),
+            PlugLinkDisposition::Canonical
+        );
+        for legacy in [
+            "/Users/rob/.cargo/bin/plug",
+            "/opt/homebrew/bin/plug",
+            "/Applications/Old Plug.app/Contents/Resources/plug",
+            "/Users/rob/src/plug/target/release/plug",
+        ] {
+            assert_eq!(
+                classify_plug_client_command(legacy, &connect, canonical),
+                PlugLinkDisposition::RecognizedLegacy,
+                "{legacy} should be a recognized legacy Plug command"
+            );
+        }
+        assert_eq!(
+            classify_plug_client_command("/usr/local/bin/not-plug", &connect, canonical),
+            PlugLinkDisposition::UnknownCommand
+        );
+        assert_eq!(
+            classify_plug_client_command(
+                "/Users/rob/project/target/release/plug",
+                &["serve".to_string()],
+                canonical,
+            ),
+            PlugLinkDisposition::UnknownCommand
+        );
     }
 
     #[test]

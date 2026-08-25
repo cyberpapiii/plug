@@ -1,7 +1,9 @@
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::{cmd_link, execute_export};
+use crate::commands::clients::{
+    ClientRepairItem, ClientRepairReport, PlugLinkDisposition, cmd_link, repair_client_content,
+};
 use crate::ui::{
     cli_prompt_theme, print_banner, print_heading, print_info_line, print_next_step,
     print_success_line,
@@ -695,8 +697,9 @@ fn repair_targets(requested: Vec<String>, all: bool) -> anyhow::Result<Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        doctor_check_details, doctor_next_steps, repair_export_endpoint, repair_targets,
-        runtime_auth_checks, runtime_health_checks_for_tests, synthesize_doctor_interpretation,
+        PlugLinkDisposition, doctor_check_details, doctor_next_steps, repair_client_content,
+        repair_export_endpoint, repair_targets, runtime_auth_checks,
+        runtime_health_checks_for_tests, synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
     use plug_core::ipc::IpcAuthServerInfo;
@@ -1043,53 +1046,200 @@ mod tests {
             .expect_err("unknown target should fail");
         assert!(error.to_string().contains("unknown client target"));
     }
+
+    #[test]
+    fn repair_content_preserves_canonical_and_unknown_json_entries() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let canonical_content = format!(
+            r#"{{"mcpServers":{{"plug":{{"command":"{}","args":["connect"],"custom":true}},"other":{{"command":"other"}}}},"unknown":{{"preserved":true}}}}"#,
+            canonical.display()
+        );
+        let canonical_repair = repair_client_content(
+            plug_core::export::ExportTarget::Cursor,
+            std::path::Path::new("config.json"),
+            &canonical_content,
+            canonical,
+            "http://localhost:3282/mcp",
+        )
+        .expect("canonical config should parse");
+        assert_eq!(canonical_repair.disposition, PlugLinkDisposition::Canonical);
+        assert_eq!(canonical_repair.updated, None);
+
+        let unknown_content = r#"{"mcpServers":{"plug":{"command":"/tmp/other","args":["connect"]},"other":{"command":"other"}},"unknown":{"preserved":true}}"#;
+        let unknown_repair = repair_client_content(
+            plug_core::export::ExportTarget::Cursor,
+            std::path::Path::new("config.json"),
+            unknown_content,
+            canonical,
+            "http://localhost:3282/mcp",
+        )
+        .expect("unknown config should parse");
+        assert_eq!(
+            unknown_repair.disposition,
+            PlugLinkDisposition::UnknownCommand
+        );
+        assert_eq!(unknown_repair.updated, None);
+    }
+
+    #[test]
+    fn repair_content_updates_legacy_json_toml_and_yaml_without_losing_neighbors() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let fixtures = [
+            (
+                plug_core::export::ExportTarget::Cursor,
+                std::path::Path::new("config.json"),
+                r#"{"mcpServers":{"plug":{"command":"/Users/rob/.cargo/bin/plug","args":["connect"]},"other":{"command":"other"}},"unknown":{"preserved":true}}"#,
+            ),
+            (
+                plug_core::export::ExportTarget::CodexCli,
+                std::path::Path::new("config.toml"),
+                "[mcp_servers.plug]\ncommand = \"/opt/homebrew/bin/plug\"\nargs = [\"connect\"]\nunknown = \"keep\"\n\n[mcp_servers.other]\ncommand = \"other\"\n",
+            ),
+            (
+                plug_core::export::ExportTarget::Goose,
+                std::path::Path::new("config.yaml"),
+                "extensions:\n  plug:\n    type: stdio\n    command: /Users/rob/src/plug/target/release/plug\n    args: [connect]\n    unknown: keep\n  other:\n    type: stdio\n    command: other\nunknown: preserved\n",
+            ),
+        ];
+
+        for (target, path, content) in fixtures {
+            let repair = repair_client_content(
+                target,
+                path,
+                content,
+                canonical,
+                "http://localhost:3282/mcp",
+            )
+            .expect("legacy config should parse");
+            assert_eq!(repair.disposition, PlugLinkDisposition::RecognizedLegacy);
+            let updated = repair.updated.expect("legacy entry should update");
+            assert!(updated.contains(canonical.to_str().unwrap()));
+            assert!(updated.contains("other"));
+            assert!(updated.contains("unknown"));
+        }
+    }
 }
 
 pub(crate) fn cmd_repair(
     config_path: Option<&std::path::PathBuf>,
     targets: Vec<String>,
     all: bool,
+    output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    println!(
-        "{} {}",
-        style("◆").cyan().bold(),
-        style("Repairing AI client configurations...").bold()
-    );
-
     let repair_targets = repair_targets(targets, all)?;
+    let canonical_command = crate::install::canonical_client_command()?;
+    let mut report = ClientRepairReport {
+        canonical_command: canonical_command.clone(),
+        items: Vec::new(),
+    };
+    let http_url = crate::commands::clients::configured_http_export_url(config_path)
+        .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
+
+    if matches!(output, OutputFormat::Text) {
+        println!(
+            "{} {}",
+            style("◆").cyan().bold(),
+            style("Repairing AI client configurations...").bold()
+        );
+    }
 
     let mut repaired_count = 0;
 
     for target in repair_targets {
-        if let Some(linked) = crate::commands::clients::linked_client_config(&target, false) {
-            print!("  {} Refreshing {}... ", style("›").cyan().bold(), target);
-            let export_endpoint = repair_export_endpoint(linked.endpoint.as_deref(), config_path);
-            if let Err(e) = execute_export(
-                &target,
-                matches!(linked.transport, plug_core::export::ExportTransport::Http),
-                export_endpoint.as_str(),
-                true,
-                false,
-            ) {
-                println!("{}", style(format!("failed: {e}")).red());
+        let target_enum: plug_core::export::ExportTarget = target
+            .parse()
+            .map_err(|error: String| anyhow::anyhow!(error))?;
+        let Some(path) = plug_core::export::default_config_path(target_enum, false) else {
+            report.items.push(ClientRepairItem {
+                target,
+                path: std::path::PathBuf::new(),
+                disposition: PlugLinkDisposition::Missing,
+                changed: false,
+                message: "This client has no supported config path on this platform.".to_string(),
+            });
+            continue;
+        };
+        if !path.exists() {
+            report.items.push(ClientRepairItem {
+                target,
+                path,
+                disposition: PlugLinkDisposition::Missing,
+                changed: false,
+                message: "Client config file does not exist.".to_string(),
+            });
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                report.items.push(ClientRepairItem {
+                    target,
+                    path,
+                    disposition: PlugLinkDisposition::UnknownCommand,
+                    changed: false,
+                    message: format!("Could not read client config; left unchanged: {error}"),
+                });
+                continue;
+            }
+        };
+        let repair = match repair_client_content(
+            target_enum,
+            &path,
+            &content,
+            &canonical_command,
+            &http_url,
+        ) {
+            Ok(repair) => repair,
+            Err(error) => {
+                report.items.push(ClientRepairItem {
+                    target,
+                    path,
+                    disposition: PlugLinkDisposition::UnknownCommand,
+                    changed: false,
+                    message: format!("Could not inspect client config; left unchanged: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let mut item = ClientRepairItem {
+            target: target.clone(),
+            path: path.clone(),
+            disposition: repair.disposition,
+            changed: false,
+            message: repair.message,
+        };
+        if let Some(updated) = repair.updated {
+            if let Err(error) = std::fs::write(&path, updated) {
+                item.message = format!("Could not repair recognized Plug command: {error}");
             } else {
-                println!("{}", style("done").green());
+                item.changed = true;
                 repaired_count += 1;
+                if matches!(output, OutputFormat::Text) {
+                    println!(
+                        "  {} Refreshing {}... {}",
+                        style("›").cyan().bold(),
+                        target,
+                        style("done").green()
+                    );
+                }
             }
         }
+        report.items.push(item);
     }
 
-    if repaired_count == 0 {
-        println!(
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Text if repaired_count == 0 => println!(
             "\n{} No linked clients found to repair.",
             style("•").green().bold()
-        );
-    } else {
-        println!(
+        ),
+        OutputFormat::Text => println!(
             "\n{} Successfully repaired {} client configuration(s).",
             style("•").green().bold(),
             repaired_count
-        );
+        ),
     }
 
     Ok(())
