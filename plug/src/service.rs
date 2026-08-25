@@ -36,7 +36,9 @@ fn cli_plist_path() -> PathBuf {
 }
 
 pub fn classify_launchctl_output(output: &str, cli_plist_exists: bool) -> ServiceOwnership {
-    if output.contains("Plug.app/Contents/") || output.contains("BundleProgram") {
+    if output.contains("Plug.app/Contents/")
+        || output.contains("parent bundle identifier = com.cyberpapiii.plug")
+    {
         ServiceOwnership::AppManaged
     } else if !output.trim().is_empty() || cli_plist_exists {
         ServiceOwnership::CliManaged
@@ -205,6 +207,17 @@ mod tests {
             classify_launchctl_output(
                 "program = /Applications/Plug.app/Contents/Resources/plug",
                 true
+            ),
+            ServiceOwnership::AppManaged
+        );
+    }
+
+    #[test]
+    fn app_service_is_recognized_from_real_launchctl_shape() {
+        assert_eq!(
+            classify_launchctl_output(
+                "managed_by = com.apple.xpc.ServiceManagement\nparent bundle identifier = com.cyberpapiii.plug",
+                false
             ),
             ServiceOwnership::AppManaged
         );

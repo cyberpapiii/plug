@@ -3,7 +3,7 @@ import XCTest
 
 final class FrameCodecTests: XCTestCase {
     func testLengthPrefixedJSONRoundTrip() throws {
-        let request = IPCRequest.handshake(clientVersion: "0.5.1", ipcMin: 3, ipcMax: 4)
+        let request = IPCRequest.handshake(clientVersion: "0.5.2", ipcMin: 3, ipcMax: 4)
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let frame = try FrameCodec.encode(request, encoder: encoder)
