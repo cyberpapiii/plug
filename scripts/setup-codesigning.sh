@@ -76,7 +76,7 @@ security import "$SIGNING_DIR/plug-signing.p12" \
 # 4. Trust the cert FOR CODE SIGNING ONLY. This pops a GUI dialog for your login
 #    password — that is expected.
 echo "==> Trusting the cert for code signing (a login-password dialog is expected)"
-security add-trusted-cert -r trustRoot -p codeSign "$SIGNING_DIR/cert.pem"
+security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$SIGNING_DIR/cert.pem"
 
 # 5. Verify.
 echo "==> Verifying"
