@@ -135,6 +135,7 @@ pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
 /// This probe never creates or rewrites the PID file. Auto-start callers use it
 /// to distinguish a failed child from a child that correctly lost to another
 /// daemon which is still booting.
+#[cfg(test)]
 pub(crate) fn runtime_lock_is_held() -> bool {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -282,6 +283,7 @@ pub async fn run_daemon(
         config_path,
         grace_period_secs,
         http_sessions,
+        None,
         runtime_lock,
     )
     .await
@@ -292,6 +294,7 @@ pub(crate) async fn run_daemon_with_lock(
     config_path: PathBuf,
     grace_period_secs: u64,
     http_sessions: Option<Arc<dyn SessionStore>>,
+    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
     runtime_lock: DaemonRuntimeLock,
 ) -> anyhow::Result<()> {
     let rt_dir = runtime_dir();
@@ -394,6 +397,7 @@ pub(crate) async fn run_daemon_with_lock(
                         let registry = client_registry.clone();
                         let config_path = config_path.clone();
                         let http_sessions = http_sessions.clone();
+                        let downstream_oauth = downstream_oauth.clone();
 
                         tokio::spawn(async move {
                             let started_at = Instant::now()
@@ -408,6 +412,7 @@ pub(crate) async fn run_daemon_with_lock(
                                 started_at,
                                 client_registry: registry,
                                 http_sessions,
+                                downstream_oauth,
                                 session_id: None,
                                 reverse_request_rx: None,
                             };
@@ -553,6 +558,7 @@ struct ConnectionContext {
     started_at: Instant,
     client_registry: Arc<ClientRegistry>,
     http_sessions: Option<Arc<dyn SessionStore>>,
+    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
     /// Receiver for reverse requests from the daemon bridge. Created during
@@ -1036,6 +1042,23 @@ async fn handle_reverse_request(
     Ok(())
 }
 
+async fn dispatch_operator_mutation(
+    ctx: &ConnectionContext,
+    mutation: plug_core::operator::OperatorMutation,
+) -> IpcResponse {
+    match ctx
+        .engine
+        .apply_operator_mutation(&ctx.config_path, mutation)
+        .await
+    {
+        Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
+        Err(error) => IpcResponse::Error {
+            code: "OPERATOR_MUTATION_FAILED".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Dispatch a single IPC request to the appropriate Engine query.
 async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     fn downstream_http_live_sessions(
@@ -1080,6 +1103,165 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                 resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
             }
+        }
+        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
+            handshake: plug_core::ipc::OperatorHandshake {
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
+                ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
+                ownership: crate::service::ipc_ownership(),
+                capabilities: vec![
+                    plug_core::ipc::OperatorCapability::ServerMutation,
+                    plug_core::ipc::OperatorCapability::ClientMutation,
+                    plug_core::ipc::OperatorCapability::AuthMutation,
+                    plug_core::ipc::OperatorCapability::ConfigMutation,
+                    plug_core::ipc::OperatorCapability::ActivityStream,
+                ],
+            },
+        },
+        IpcRequest::ActivitySnapshot {
+            after_sequence,
+            limit,
+            failures_only,
+            ..
+        } => IpcResponse::ActivitySnapshot {
+            events: ctx.engine.tool_router().activity_snapshot(
+                &plug_core::activity::ActivityFilter {
+                    after_sequence: *after_sequence,
+                    failures_only: *failures_only,
+                    limit: *limit,
+                },
+            ),
+        },
+        IpcRequest::OperatorSnapshot { .. } => {
+            let config = match plug_core::operator::load_editable_config(&ctx.config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    return IpcResponse::Error {
+                        code: "CONFIG_READ_FAILED".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            let mut configured_servers = config
+                .servers
+                .iter()
+                .map(|(name, server)| {
+                    plug_core::operator::OperatorServerSummary::from_config(name.clone(), server)
+                })
+                .collect::<Vec<_>>();
+            configured_servers.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut live_sessions = ctx.client_registry.list_live_sessions();
+            if let Some(http_sessions) = ctx.http_sessions.as_ref() {
+                live_sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
+            }
+            live_sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            let client_visibility = live_sessions
+                .iter()
+                .map(|session| plug_core::ipc::OperatorClientVisibility {
+                    session_id: session.session_id.clone(),
+                    client_type: session.client_type,
+                    visible_tool_count: ctx
+                        .engine
+                        .tool_router()
+                        .list_tools_for_client_session(
+                            session.client_type,
+                            Some(session.session_id.as_str()),
+                        )
+                        .len(),
+                })
+                .collect();
+            let upstream_auth = match dispatch_auth_status(ctx).await {
+                IpcResponse::AuthStatus { servers } => servers,
+                IpcResponse::Error { code, message } => {
+                    return IpcResponse::Error { code, message };
+                }
+                _ => Vec::new(),
+            };
+            let downstream_clients = match ctx.downstream_oauth.as_ref() {
+                Some(manager) => manager.list_clients().await,
+                None => Vec::new(),
+            };
+            IpcResponse::OperatorSnapshot {
+                snapshot: Box::new(plug_core::ipc::OperatorSnapshot {
+                    runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+                    uptime_secs: ctx.started_at.elapsed().as_secs(),
+                    ownership: crate::service::ipc_ownership(),
+                    configured_servers,
+                    servers: ctx.server_manager.server_statuses(),
+                    live_sessions,
+                    client_visibility,
+                    upstream_auth,
+                    downstream_clients,
+                }),
+            }
+        }
+        IpcRequest::RevokeDownstreamClient { client_id, .. } => {
+            let Some(manager) = ctx.downstream_oauth.as_ref() else {
+                return IpcResponse::Error {
+                    code: "DOWNSTREAM_OAUTH_DISABLED".to_string(),
+                    message: "downstream OAuth is not enabled".to_string(),
+                };
+            };
+            match manager.revoke_client(client_id).await {
+                Ok(true) => IpcResponse::DownstreamClientRevoked {
+                    client_id: client_id.clone(),
+                },
+                Ok(false) => IpcResponse::Error {
+                    code: "UNKNOWN_DOWNSTREAM_CLIENT".to_string(),
+                    message: format!("registered client `{client_id}` was not found"),
+                },
+                Err(error) => IpcResponse::Error {
+                    code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
+        IpcRequest::ValidateServer { name, server, .. } => {
+            match ctx.engine.validate_server_draft(name, server) {
+                Ok(server) => IpcResponse::ServerValidated { server },
+                Err(error) => IpcResponse::Error {
+                    code: "INVALID_SERVER".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
+        IpcRequest::AddServer { name, server, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::AddServer {
+                    name: name.clone(),
+                    server: *server.clone(),
+                },
+            )
+            .await
+        }
+        IpcRequest::UpdateServer { name, server, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::UpdateServer {
+                    name: name.clone(),
+                    server: *server.clone(),
+                },
+            )
+            .await
+        }
+        IpcRequest::RemoveServer { name, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::RemoveServer { name: name.clone() },
+            )
+            .await
+        }
+        IpcRequest::SetServerEnabled { name, enabled, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::SetServerEnabled {
+                    name: name.clone(),
+                    enabled: *enabled,
+                },
+            )
+            .await
         }
         IpcRequest::RestartServer { server_id, .. } => {
             match ctx.engine.restart_server(server_id).await {
@@ -2084,6 +2266,7 @@ mod tests {
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
             http_sessions: None,
+            downstream_oauth: None,
             session_id: None,
             reverse_request_rx: None,
         }
@@ -2775,6 +2958,7 @@ mod tests {
                 started_at: Instant::now(),
                 client_registry: Arc::new(client_registry),
                 http_sessions: None,
+                downstream_oauth: None,
                 session_id: None,
                 reverse_request_rx: None,
             };
@@ -3019,6 +3203,7 @@ mod tests {
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
             http_sessions: None,
+            downstream_oauth: None,
             session_id: Some(session_id.clone()),
             reverse_request_rx: Some(reverse_rx),
         };
@@ -3139,6 +3324,7 @@ mod tests {
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
             http_sessions: None,
+            downstream_oauth: None,
             session_id: Some(session_id.clone()),
             reverse_request_rx: Some(reverse_rx),
         };

@@ -43,6 +43,7 @@ mod commands;
 mod daemon;
 mod ipc_proxy;
 mod runtime;
+mod service;
 mod ui;
 mod views;
 

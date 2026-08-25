@@ -6306,6 +6306,7 @@ mod tests {
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),

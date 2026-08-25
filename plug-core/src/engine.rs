@@ -797,6 +797,41 @@ impl Engine {
         Ok(())
     }
 
+    /// Persist and apply one operator mutation under the same lock as reload.
+    pub async fn apply_operator_mutation(
+        self: &Arc<Self>,
+        config_path: &std::path::Path,
+        mutation: crate::operator::OperatorMutation,
+    ) -> anyhow::Result<(
+        crate::operator::OperatorMutationResult,
+        crate::reload::ReloadReport,
+    )> {
+        let _guard = self.reload_lock.lock().await;
+        let (config, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
+        let report = crate::reload::apply_reload(self, config).await?;
+        Ok((result, report))
+    }
+
+    pub fn validate_server_draft(
+        &self,
+        name: &str,
+        server: &crate::config::ServerConfig,
+    ) -> anyhow::Result<crate::operator::OperatorServerSummary> {
+        let mut config = (**self.config.load()).clone();
+        if config.servers.contains_key(name) {
+            anyhow::bail!("server `{name}` already exists");
+        }
+        config.servers.insert(name.to_string(), server.clone());
+        let errors = crate::config::validate_config(&config);
+        if !errors.is_empty() {
+            anyhow::bail!(errors.join("; "));
+        }
+        Ok(crate::operator::OperatorServerSummary::from_config(
+            name.to_string(),
+            server,
+        ))
+    }
+
     /// Reload configuration from a new Config.
     ///
     /// Diffs the old and new configs, starts/stops/restarts servers as needed,
@@ -1799,6 +1834,40 @@ mod tests {
             }
         }
         assert!(found_reloaded, "expected ConfigReloaded event");
+    }
+
+    #[tokio::test]
+    async fn operator_mutation_persists_and_reloads_under_engine_lock() {
+        let engine = Arc::new(Engine::new(Config::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::operator::persist_config_atomic(&path, &Config::default()).unwrap();
+        let server: crate::config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "echo",
+            "enabled": false
+        }))
+        .unwrap();
+
+        let (result, report) = engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::AddServer {
+                    name: "fixture".into(),
+                    server,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.server.unwrap().name, "fixture");
+        assert!(report.added.contains(&"fixture".to_string()));
+        assert!(engine.config().servers.contains_key("fixture"));
+        assert!(
+            crate::operator::load_editable_config(&path)
+                .unwrap()
+                .servers
+                .contains_key("fixture")
+        );
     }
 
     #[tokio::test]

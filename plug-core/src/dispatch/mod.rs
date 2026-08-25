@@ -96,6 +96,30 @@ pub async fn dispatch_tools_call(
     ctx: &dyn DownstreamContext,
     params: CallToolRequestParams,
 ) -> Result<ToolCallOutcome, McpError> {
+    let started = std::time::Instant::now();
+    let client = ctx.downstream_call_context().client_id.to_string();
+    let result = dispatch_tools_call_inner(router, ctx, params).await;
+    router.record_activity(crate::activity::ActivityEvent {
+        sequence: 0,
+        occurred_at_ms: 0,
+        client: Some(client),
+        server: None,
+        method: "tools/call".to_string(),
+        latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        outcome: if result.is_ok() {
+            crate::activity::ActivityOutcome::Success
+        } else {
+            crate::activity::ActivityOutcome::Error
+        },
+    });
+    result
+}
+
+async fn dispatch_tools_call_inner(
+    router: &Arc<ToolRouter>,
+    ctx: &dyn DownstreamContext,
+    params: CallToolRequestParams,
+) -> Result<ToolCallOutcome, McpError> {
     // Admit unknown metadata once, before routing, task creation, buffering,
     // or forwarding. Typed MCP fields remain owned by their typed adapters.
     let extensions = crate::types::ExtensionEnvelope::from_peer_meta(params.meta.as_deref())

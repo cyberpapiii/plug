@@ -2674,6 +2674,7 @@ mod tests {
 
     fn test_router_config() -> RouterConfig {
         RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),

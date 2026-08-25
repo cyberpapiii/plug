@@ -43,6 +43,55 @@ impl fmt::Debug for IpcCancellationCapability {
 }
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
+pub const OPERATOR_IPC_MIN: u16 = 3;
+pub const OPERATOR_IPC_MAX: u16 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonOwnershipMode {
+    Unmanaged,
+    CliManaged,
+    AppManaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCapability {
+    ServerMutation,
+    ClientMutation,
+    AuthMutation,
+    ConfigMutation,
+    ActivityStream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorHandshake {
+    pub daemon_version: String,
+    pub ipc_min: u16,
+    pub ipc_max: u16,
+    pub ownership: DaemonOwnershipMode,
+    pub capabilities: Vec<OperatorCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorClientVisibility {
+    pub session_id: String,
+    pub client_type: crate::types::ClientType,
+    pub visible_tool_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorSnapshot {
+    pub runtime_version: String,
+    pub uptime_secs: u64,
+    pub ownership: DaemonOwnershipMode,
+    pub configured_servers: Vec<crate::operator::OperatorServerSummary>,
+    pub servers: Vec<ServerStatus>,
+    pub live_sessions: Vec<IpcLiveSessionInfo>,
+    pub client_visibility: Vec<OperatorClientVisibility>,
+    pub upstream_auth: Vec<IpcAuthServerInfo>,
+    pub downstream_clients: Vec<crate::downstream_oauth::RegisteredClientSummary>,
+}
 
 /// Requests sent from CLI → daemon over Unix socket.
 ///
@@ -55,16 +104,65 @@ pub enum IpcRequest {
     /// Query daemon status (servers, client count, uptime).
     Status,
 
+    /// Negotiate the operator API used by the CLI and native app.
+    OperatorHandshake {
+        client_version: String,
+        ipc_min: u16,
+        ipc_max: u16,
+    },
+    /// Read the bounded metadata-only activity ring.
+    ActivitySnapshot {
+        auth_token: String,
+        after_sequence: u64,
+        limit: usize,
+        failures_only: bool,
+    },
+    OperatorSnapshot {
+        auth_token: String,
+    },
+    RevokeDownstreamClient {
+        auth_token: String,
+        client_id: String,
+    },
+    ValidateServer {
+        auth_token: String,
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    AddServer {
+        auth_token: String,
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    UpdateServer {
+        auth_token: String,
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    RemoveServer {
+        auth_token: String,
+        name: String,
+    },
+    SetServerEnabled {
+        auth_token: String,
+        name: String,
+        enabled: bool,
+    },
+
     /// Restart a specific upstream server.
     RestartServer {
         server_id: String,
         auth_token: String,
     },
     /// Reload configuration from disk.
-    Reload { auth_token: String },
+    Reload {
+        auth_token: String,
+    },
 
     /// Graceful daemon shutdown.
-    Shutdown { auth_token: String },
+    Shutdown {
+        auth_token: String,
+    },
 
     /// Register a new proxy client session with the daemon.
     /// Returns `Registered` with an assigned session ID.
@@ -78,7 +176,9 @@ pub enum IpcRequest {
     },
 
     /// Deregister a proxy client session (clean disconnect).
-    Deregister { session_id: String },
+    Deregister {
+        session_id: String,
+    },
 
     /// Update a session's client info (sent after MCP initialize handshake).
     UpdateSession {
@@ -87,7 +187,9 @@ pub enum IpcRequest {
     },
 
     /// Liveness probe for long-lived proxy connections.
-    Ping { session_id: String },
+    Ping {
+        session_id: String,
+    },
 
     /// List all available tools across all servers.
     ListTools,
@@ -96,9 +198,13 @@ pub enum IpcRequest {
     /// List live downstream sessions with explicit transport/scope.
     ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
-    Capabilities { session_id: String },
+    Capabilities {
+        session_id: String,
+    },
     /// Query the daemon-authoritative modern downstream gate.
-    ModernDownstreamGate { session_id: String },
+    ModernDownstreamGate {
+        session_id: String,
+    },
 
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
@@ -166,6 +272,63 @@ impl fmt::Debug for IpcRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Status => write!(f, "Status"),
+            Self::OperatorHandshake {
+                client_version,
+                ipc_min,
+                ipc_max,
+            } => f
+                .debug_struct("OperatorHandshake")
+                .field("client_version", client_version)
+                .field("ipc_min", ipc_min)
+                .field("ipc_max", ipc_max)
+                .finish(),
+            Self::ActivitySnapshot {
+                after_sequence,
+                limit,
+                failures_only,
+                ..
+            } => f
+                .debug_struct("ActivitySnapshot")
+                .field("auth_token", &"[REDACTED]")
+                .field("after_sequence", after_sequence)
+                .field("limit", limit)
+                .field("failures_only", failures_only)
+                .finish(),
+            Self::OperatorSnapshot { .. } => f
+                .debug_struct("OperatorSnapshot")
+                .field("auth_token", &"[REDACTED]")
+                .finish(),
+            Self::RevokeDownstreamClient { client_id, .. } => f
+                .debug_struct("RevokeDownstreamClient")
+                .field("auth_token", &"[REDACTED]")
+                .field("client_id", client_id)
+                .finish(),
+            Self::ValidateServer { name, .. } => f
+                .debug_struct("ValidateServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::AddServer { name, .. } => f
+                .debug_struct("AddServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::UpdateServer { name, .. } => f
+                .debug_struct("UpdateServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::RemoveServer { name, .. } => f
+                .debug_struct("RemoveServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::SetServerEnabled { name, enabled, .. } => f
+                .debug_struct("SetServerEnabled")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .field("enabled", enabled)
+                .finish(),
             Self::RestartServer { server_id, .. } => f
                 .debug_struct("RestartServer")
                 .field("server_id", server_id)
@@ -517,6 +680,26 @@ pub struct IpcAuthServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcResponse {
+    /// Daemon version, compatibility range, ownership, and operator features.
+    OperatorHandshake {
+        handshake: OperatorHandshake,
+    },
+    ActivitySnapshot {
+        events: Vec<crate::activity::ActivityEvent>,
+    },
+    OperatorSnapshot {
+        snapshot: Box<OperatorSnapshot>,
+    },
+    DownstreamClientRevoked {
+        client_id: String,
+    },
+    ServerValidated {
+        server: crate::operator::OperatorServerSummary,
+    },
+    OperatorMutation {
+        result: crate::operator::OperatorMutationResult,
+        reload: crate::reload::ReloadReport,
+    },
     /// Status response with server info, client count, and uptime.
     Status {
         servers: Vec<ServerStatus>,
@@ -533,26 +716,39 @@ pub enum IpcResponse {
         resource_subscriptions: usize,
     },
     /// List of all tools available.
-    Tools { tools: Vec<IpcToolInfo> },
+    Tools {
+        tools: Vec<IpcToolInfo>,
+    },
     /// List of live client sessions connected to the daemon.
-    Clients { clients: Vec<IpcClientInfo> },
+    Clients {
+        clients: Vec<IpcClientInfo>,
+    },
     /// List of live downstream sessions with explicit transport/scope.
     LiveSessions {
         sessions: Vec<IpcLiveSessionInfo>,
         scope: LiveSessionInventoryScope,
     },
     /// Synthesized MCP capabilities for the daemon-backed shared runtime.
-    Capabilities { capabilities: serde_json::Value },
+    Capabilities {
+        capabilities: serde_json::Value,
+    },
     /// Current daemon-authoritative modern downstream gate.
-    ModernDownstreamGate { enabled: bool },
+    ModernDownstreamGate {
+        enabled: bool,
+    },
     /// Success acknowledgement for mutating commands.
     Ok,
     /// Config reload result with restart-required warnings.
-    Reloaded { report: crate::reload::ReloadReport },
+    Reloaded {
+        report: crate::reload::ReloadReport,
+    },
     /// Liveness acknowledgement for long-lived proxy connections.
     Pong,
     /// Error with machine-parseable code and human-readable message.
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
 
     /// Registration acknowledgement with assigned session ID.
     Registered {
@@ -578,7 +774,9 @@ pub enum IpcResponse {
     /// Sent asynchronously by the daemon (interleaved with responses) after
     /// a proxy client registers. The payload is a serialized
     /// `LoggingMessageNotificationParam`.
-    LoggingNotification { params: serde_json::Value },
+    LoggingNotification {
+        params: serde_json::Value,
+    },
 
     // ── Protocol push notifications ──────────────────────────────────────
     /// Push notification: the tool list changed (upstream server added/removed tools).
@@ -587,18 +785,26 @@ pub enum IpcResponse {
     ResourceListChangedNotification,
     /// Push notification: a subscribed resource changed.
     /// Payload is a serialized `ResourceUpdatedNotificationParam`.
-    ResourceUpdatedNotification { params: serde_json::Value },
+    ResourceUpdatedNotification {
+        params: serde_json::Value,
+    },
     /// Push notification: the prompt list changed.
     PromptListChangedNotification,
     /// Push notification: progress update for an in-flight tool call.
     /// Payload is a serialized `ProgressNotificationParam`.
-    ProgressNotification { params: serde_json::Value },
+    ProgressNotification {
+        params: serde_json::Value,
+    },
     /// Push notification: an in-flight tool call was cancelled.
     /// Payload is a serialized `CancelledNotificationParam`.
-    CancelledNotification { params: serde_json::Value },
+    CancelledNotification {
+        params: serde_json::Value,
+    },
 
     /// OAuth authentication status for all configured servers.
-    AuthStatus { servers: Vec<IpcAuthServerInfo> },
+    AuthStatus {
+        servers: Vec<IpcAuthServerInfo>,
+    },
 
     /// Push notification: a server's authentication state changed.
     AuthStateChanged {
@@ -606,7 +812,9 @@ pub enum IpcResponse {
         state: ServerHealth,
     },
     /// Push update for the daemon-authoritative modern downstream gate.
-    ModernDownstreamGateChanged { enabled: bool },
+    ModernDownstreamGateChanged {
+        enabled: bool,
+    },
 }
 
 // ──────────────────────── Reverse-request IPC types ──────────────────────────
@@ -668,6 +876,14 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::Reload { .. }
             | IpcRequest::Shutdown { .. }
             | IpcRequest::InjectToken { .. }
+            | IpcRequest::ActivitySnapshot { .. }
+            | IpcRequest::OperatorSnapshot { .. }
+            | IpcRequest::RevokeDownstreamClient { .. }
+            | IpcRequest::ValidateServer { .. }
+            | IpcRequest::AddServer { .. }
+            | IpcRequest::UpdateServer { .. }
+            | IpcRequest::RemoveServer { .. }
+            | IpcRequest::SetServerEnabled { .. }
     )
 }
 
@@ -678,6 +894,14 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::Reload { auth_token, .. }
         | IpcRequest::Shutdown { auth_token, .. }
         | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
+        IpcRequest::ActivitySnapshot { auth_token, .. }
+        | IpcRequest::OperatorSnapshot { auth_token, .. }
+        | IpcRequest::RevokeDownstreamClient { auth_token, .. } => Some(auth_token.as_str()),
+        IpcRequest::ValidateServer { auth_token, .. }
+        | IpcRequest::AddServer { auth_token, .. }
+        | IpcRequest::UpdateServer { auth_token, .. }
+        | IpcRequest::RemoveServer { auth_token, .. }
+        | IpcRequest::SetServerEnabled { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -829,6 +1053,17 @@ mod tests {
     fn request_serialization_round_trip() {
         let requests = vec![
             IpcRequest::Status,
+            IpcRequest::OperatorHandshake {
+                client_version: "0.5.0".to_string(),
+                ipc_min: 3,
+                ipc_max: 4,
+            },
+            IpcRequest::ActivitySnapshot {
+                auth_token: "token".to_string(),
+                after_sequence: 7,
+                limit: 25,
+                failures_only: true,
+            },
             IpcRequest::RestartServer {
                 server_id: "test-server".to_string(),
                 auth_token: "abc123".to_string(),
@@ -887,6 +1122,29 @@ mod tests {
             let json2 = serde_json::to_string(&deserialized).unwrap();
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn operator_handshake_round_trips_with_compatibility_range() {
+        let response = IpcResponse::OperatorHandshake {
+            handshake: OperatorHandshake {
+                daemon_version: "0.5.0".to_string(),
+                ipc_min: 3,
+                ipc_max: 4,
+                ownership: DaemonOwnershipMode::AppManaged,
+                capabilities: vec![OperatorCapability::ServerMutation],
+            },
+        };
+        let json = serde_json::to_value(&response).expect("serialize handshake");
+        assert_eq!(json["handshake"]["ipc_min"], 3);
+
+        let decoded: IpcResponse = serde_json::from_value(json).expect("decode handshake");
+        let IpcResponse::OperatorHandshake { handshake } = decoded else {
+            panic!("expected operator handshake");
+        };
+        assert_eq!(handshake.daemon_version, "0.5.0");
+        assert_eq!(handshake.ipc_max, 4);
+        assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
     }
 
     #[test]
@@ -1103,12 +1361,29 @@ mod tests {
         assert!(requires_auth(&IpcRequest::Shutdown {
             auth_token: "t".to_string(),
         }));
+        assert!(requires_auth(&IpcRequest::OperatorSnapshot {
+            auth_token: "t".to_string(),
+        }));
+        assert!(requires_auth(&IpcRequest::RevokeDownstreamClient {
+            auth_token: "t".to_string(),
+            client_id: "client".to_string(),
+        }));
         assert!(requires_auth(&IpcRequest::InjectToken {
             auth_token: "t".to_string(),
             server_name: "s".to_string(),
             access_token: "a".to_string(),
             refresh_token: None,
             expires_in: None,
+        }));
+        assert!(requires_auth(&IpcRequest::ActivitySnapshot {
+            auth_token: "t".to_string(),
+            after_sequence: 0,
+            limit: 500,
+            failures_only: false,
+        }));
+        assert!(requires_auth(&IpcRequest::RemoveServer {
+            auth_token: "t".to_string(),
+            name: "server".to_string(),
         }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)

@@ -216,7 +216,7 @@ impl super::ToolRouter {
                 upstream_params = upstream_params.with_arguments(args);
             }
             if let Some(meta) = extension_meta.clone() {
-                upstream_params.meta = Some(RequestMetaObject(meta));
+                merge_call_extension_meta(&mut upstream_params, meta);
             }
             upstream_params
                 .meta
@@ -1067,7 +1067,7 @@ impl super::ToolRouter {
                 upstream_params = upstream_params.with_arguments(args);
             }
             if let Some(meta) = extension_meta.clone() {
-                upstream_params.meta = Some(RequestMetaObject(meta));
+                merge_call_extension_meta(&mut upstream_params, meta);
             }
             if let Some(token) = upstream_progress_token.clone() {
                 upstream_params.set_progress_token(token);
@@ -1281,6 +1281,7 @@ mod tests {
 
     fn test_router_config() -> RouterConfig {
         RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),

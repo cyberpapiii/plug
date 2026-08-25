@@ -18,7 +18,8 @@ the macOS binaries, publishes a GitHub release, and updates the Homebrew tap.
 ## Tagging
 
 ```bash
-git tag -a v0.4.0 -m "plug 0.4.0" && git push origin v0.4.0
+version=0.5.0
+git tag -a "v$version" -m "plug $version" && git push origin "v$version"
 ```
 
 The workflow does the rest. Watch it: a failed signing step stops the release
@@ -47,6 +48,8 @@ an unsigned binary while implying otherwise.
 | `MACOS_NOTARY_KEY_P8` | Base64 of the App Store Connect API key `.p8` |
 | `MACOS_NOTARY_KEY_ID` | The API key's Key ID |
 | `MACOS_NOTARY_ISSUER_ID` | The API key's Issuer ID |
+| `SPARKLE_PRIVATE_KEY` | Sparkle EdDSA private key exported by `generate_keys -x` |
+| `HOMEBREW_TAP_TOKEN` | Token allowed to update `cyberpapiii/homebrew-tap` |
 
 Export the certificate from Keychain Access as a `.p12`, then
 `base64 -i certificate.p12 | pbcopy`. Create the notarization key in App Store

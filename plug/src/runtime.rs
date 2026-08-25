@@ -693,6 +693,7 @@ pub(crate) async fn send_authenticated_operator_request(
 struct ConfiguredHttpRuntime {
     router: Router,
     sessions: Arc<dyn plug_core::session::SessionStore>,
+    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
 }
 
 fn public_host_allowance(public_base_url: &str) -> Option<Arc<str>> {
@@ -733,7 +734,7 @@ fn build_configured_http_runtime(
         sessions: Arc::clone(&sessions),
         cancel: engine.cancel_token().clone(),
         auth_mode: config.http.auth_mode.clone(),
-        downstream_oauth,
+        downstream_oauth: downstream_oauth.clone(),
         sse_channel_capacity: config.http.sse_channel_capacity,
         allowed_origins: config
             .http
@@ -774,6 +775,7 @@ fn build_configured_http_runtime(
             )),
         ),
         sessions,
+        downstream_oauth,
     })
 }
 
@@ -1073,8 +1075,10 @@ pub(crate) async fn establish_daemon_proxy_session(
     let stream = match daemon::connect_to_daemon().await {
         Some(stream) => stream,
         None => {
-            let mut child = auto_start_daemon(config_path)?;
-            wait_for_daemon_ready(Some(&mut child)).await?
+            crate::service::ensure_started(config_path.map(|path| path.as_path())).await?;
+            daemon::connect_to_daemon().await.ok_or_else(|| {
+                anyhow::anyhow!("launchd reported success but daemon socket is unavailable")
+            })?
         }
     };
 
@@ -1316,62 +1320,7 @@ pub(crate) async fn connect_via_daemon(
     Ok(())
 }
 
-pub(crate) fn auto_start_daemon(
-    config_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<std::process::Child> {
-    let mut cmd = daemon_start_command(config_path)?;
-    cmd.stderr(std::process::Stdio::null());
-    Ok(cmd.spawn()?)
-}
-
-fn daemon_start_command(
-    config_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<std::process::Command> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("serve").arg("--daemon");
-    if let Some(path) = config_path {
-        cmd.arg("--config").arg(path);
-    }
-    for (key, value) in
-        plug_core::dotenv::read_dotenv_vars_for_config(config_path.map(|path| path.as_path()))
-    {
-        cmd.env(key, value);
-    }
-
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
-
-    Ok(cmd)
-}
-
-async fn start_daemon_with_error_output(
-    config_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<bool> {
-    if daemon::connect_to_daemon().await.is_some() {
-        return Ok(false);
-    }
-    let mut command = daemon_start_command(config_path)?;
-    command.stderr(std::process::Stdio::piped());
-    let mut child = command.spawn()?;
-    if let Err(startup_error) = wait_for_daemon_ready(Some(&mut child)).await {
-        use std::io::Read as _;
-        let mut stderr = String::new();
-        if let Some(mut stream) = child.stderr.take() {
-            let _ = stream.read_to_string(&mut stderr);
-        }
-        let stderr = stderr
-            .trim()
-            .strip_prefix("Error: ")
-            .unwrap_or(stderr.trim());
-        if !stderr.is_empty() {
-            anyhow::bail!(stderr.to_string());
-        }
-        return Err(startup_error);
-    }
-    Ok(true)
-}
-
+#[cfg(test)]
 pub(crate) async fn wait_for_daemon_ready(
     child: Option<&mut std::process::Child>,
 ) -> anyhow::Result<tokio::net::UnixStream> {
@@ -1383,15 +1332,18 @@ pub(crate) async fn wait_for_daemon_ready(
     .await
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct DaemonStartupContention;
 
+#[cfg(test)]
 impl std::fmt::Display for DaemonStartupContention {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("another Plug daemon still owns startup but is not ready")
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for DaemonStartupContention {}
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1403,6 +1355,7 @@ fn daemon_proxy_failure_policy(_error: &anyhow::Error) -> DaemonProxyFailurePoli
     DaemonProxyFailurePolicy::RefuseStandalone
 }
 
+#[cfg(test)]
 async fn wait_for_daemon_ready_with_timeouts(
     mut child: Option<&mut std::process::Child>,
     initial_timeout: std::time::Duration,
@@ -1450,15 +1403,11 @@ pub(crate) async fn ensure_daemon_with_feedback(
     config_path: Option<&std::path::PathBuf>,
     announce: bool,
 ) -> anyhow::Result<bool> {
-    if daemon::connect_to_daemon().await.is_none() {
-        let mut child = auto_start_daemon(config_path)?;
-        wait_for_daemon_ready(Some(&mut child)).await?;
-        if announce {
-            print_info_line("Started background service.");
-        }
-        return Ok(true);
+    let started = crate::service::ensure_started(config_path.map(|path| path.as_path())).await?;
+    if started && announce {
+        print_info_line("Started background service.");
     }
-    Ok(false)
+    Ok(started)
 }
 
 pub(crate) async fn daemon_running() -> bool {
@@ -1501,7 +1450,7 @@ pub(crate) async fn cmd_start(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    let started = start_daemon_with_error_output(config_path).await?;
+    let started = crate::service::ensure_started(config_path.map(|path| path.as_path())).await?;
 
     if matches!(output, OutputFormat::Json) {
         println!(
@@ -1556,6 +1505,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         config_path,
         engine.config().daemon_grace_period_secs,
         Some(http_runtime.sessions),
+        http_runtime.downstream_oauth,
         runtime_lock,
     );
     tokio::pin!(daemon_future);

@@ -2,6 +2,7 @@ use super::*;
 
 fn test_router_config() -> RouterConfig {
     RouterConfig {
+        enable_prefix: true,
         prefix_delimiter: "__".to_string(),
         priority_tools: Vec::new(),
         disabled_tools: Vec::new(),
@@ -2124,13 +2125,30 @@ fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
         )
         .expect("register active call");
 
-    router.attach_upstream_request_id(1, "s1", RequestId::from(NumberOrString::Number(42)));
+    let progress_token = ProgressToken(NumberOrString::Number(43));
+    router.attach_upstream_request_id(
+        1,
+        "s1",
+        RequestId::from(NumberOrString::Number(42)),
+        Some(progress_token.clone()),
+    );
     let record = router.active_calls.get(&1).expect("active call").clone();
     assert_eq!(
         record.upstream_request_id,
         Some(RequestId::from(NumberOrString::Number(42)))
     );
     assert!(record.pending_cancel_reason.is_none());
+    assert_eq!(record.upstream_progress_token, Some(progress_token.clone()));
+    assert_eq!(
+        router
+            .upstream_progress_lookup
+            .get(&UpstreamProgressKey {
+                server_id: "s1".to_string(),
+                progress_token,
+            })
+            .map(|entry| *entry),
+        Some(1)
+    );
 }
 
 #[test]
@@ -2497,6 +2515,13 @@ async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
         matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
         "expected TaskCreated outcome, got {outcome:?}"
     );
+    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].method, "tools/call");
+    assert_eq!(
+        activity[0].outcome,
+        crate::activity::ActivityOutcome::Success
+    );
 }
 
 #[tokio::test]
@@ -2519,6 +2544,9 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
 
     assert_eq!(err.code, ErrorCode(-32005));
     assert_eq!(router.task_count_for_owner(&owner).await, 0);
+    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
 }
 
 #[tokio::test]

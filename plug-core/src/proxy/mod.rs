@@ -130,6 +130,7 @@ impl RouterSnapshot {
 /// Configuration for token efficiency and tool filtering.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
+    pub enable_prefix: bool,
     pub prefix_delimiter: String,
     pub priority_tools: Vec<String>,
     pub disabled_tools: Vec<String>,
@@ -142,9 +143,17 @@ pub struct RouterConfig {
     pub enrichment_servers: std::collections::HashSet<String>,
 }
 
+fn merge_call_extension_meta(params: &mut CallToolRequestParams, meta: MetaObject) {
+    match params.meta.as_mut() {
+        Some(existing) => existing.extend(RequestMetaObject(meta)),
+        None => params.meta = Some(RequestMetaObject(meta)),
+    }
+}
+
 impl From<&Config> for RouterConfig {
     fn from(config: &Config) -> Self {
         Self {
+            enable_prefix: config.enable_prefix,
             prefix_delimiter: config.prefix_delimiter.clone(),
             priority_tools: config.priority_tools.clone(),
             disabled_tools: config
@@ -219,6 +228,7 @@ fn mrtr_pair_supported(
 /// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
+    activity_store: crate::activity::ActivityStore,
     cache: Arc<ArcSwap<RouterSnapshot>>,
     /// Last published call-routing identity. Catalog metadata may change
     /// without invalidating parked rounds; route targets and upstream
@@ -809,6 +819,7 @@ impl ToolRouter {
             continuations::ContinuationRegistry::new(admission_quotas.clone(), MRTR_CHAIN_TTL);
         Self {
             server_manager,
+            activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
             config,
@@ -840,6 +851,17 @@ impl ToolRouter {
             #[cfg(test)]
             continuation_insert_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn record_activity(&self, event: crate::activity::ActivityEvent) {
+        self.activity_store.record(event);
+    }
+
+    pub fn activity_snapshot(
+        &self,
+        filter: &crate::activity::ActivityFilter,
+    ) -> Vec<crate::activity::ActivityEvent> {
+        self.activity_store.snapshot(filter)
     }
 
     #[cfg(test)]
@@ -1531,10 +1553,17 @@ impl ToolRouter {
         Ok(())
     }
 
-    fn attach_upstream_request_id(&self, call_id: u64, server_id: &str, request_id: RequestId) {
+    fn attach_upstream_request_id(
+        &self,
+        call_id: u64,
+        server_id: &str,
+        request_id: RequestId,
+        progress_token: Option<ProgressToken>,
+    ) {
         let mut pending_cancel = None;
         if let Some(mut entry) = self.active_calls.get_mut(&call_id) {
             entry.upstream_request_id = Some(request_id.clone());
+            entry.upstream_progress_token = progress_token.clone();
             pending_cancel = entry.pending_cancel_reason.take();
         }
         self.upstream_request_lookup.insert(
@@ -1544,6 +1573,15 @@ impl ToolRouter {
             },
             call_id,
         );
+        if let Some(progress_token) = progress_token {
+            self.upstream_progress_lookup.insert(
+                UpstreamProgressKey {
+                    server_id: server_id.to_string(),
+                    progress_token,
+                },
+                call_id,
+            );
+        }
         if let Some(reason) = pending_cancel
             && let Some(upstream) = self.server_manager.get_upstream(server_id)
         {
@@ -1925,11 +1963,15 @@ impl ToolRouter {
         // Count how many tools map to each (prefix, stripped_name) pair.
         let mut wire_name_counts: HashMap<String, usize> = HashMap::new();
         for c in &classified {
-            let wire = crate::tool_naming::build_wire_name(
-                &c.prefix,
-                &c.stripped_name,
-                &self.config.prefix_delimiter,
-            );
+            let wire = if self.config.enable_prefix {
+                crate::tool_naming::build_wire_name(
+                    &c.prefix,
+                    &c.stripped_name,
+                    &self.config.prefix_delimiter,
+                )
+            } else {
+                c.stripped_name.clone()
+            };
             *wire_name_counts.entry(wire).or_insert(0) += 1;
         }
 
@@ -1939,11 +1981,15 @@ impl ToolRouter {
         let mut tool_risk_inventory = HashMap::new();
 
         for c in classified {
-            let stripped_wire = crate::tool_naming::build_wire_name(
-                &c.prefix,
-                &c.stripped_name,
-                &self.config.prefix_delimiter,
-            );
+            let stripped_wire = if self.config.enable_prefix {
+                crate::tool_naming::build_wire_name(
+                    &c.prefix,
+                    &c.stripped_name,
+                    &self.config.prefix_delimiter,
+                )
+            } else {
+                c.stripped_name.clone()
+            };
 
             // Use stripped name unless it would collide, then fall back to full name
             let use_stripped = wire_name_counts.get(&stripped_wire).copied().unwrap_or(1) == 1;
@@ -1954,11 +2000,15 @@ impl ToolRouter {
                 c.full_name.clone()
             };
 
-            let prefixed_name = crate::tool_naming::build_wire_name(
-                &c.prefix,
-                &final_name,
-                &self.config.prefix_delimiter,
-            );
+            let prefixed_name = if self.config.enable_prefix || !use_stripped {
+                crate::tool_naming::build_wire_name(
+                    &c.prefix,
+                    &final_name,
+                    &self.config.prefix_delimiter,
+                )
+            } else {
+                final_name.clone()
+            };
 
             if is_disabled_tool(&self.config.disabled_tools, &prefixed_name) {
                 continue;
@@ -2108,11 +2158,15 @@ impl ToolRouter {
 
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = resource.name.clone();
-            let routed_name = crate::tool_naming::build_wire_name(
-                &prefix,
-                &original_name,
-                &self.config.prefix_delimiter,
-            );
+            let routed_name = if self.config.enable_prefix {
+                crate::tool_naming::build_wire_name(
+                    &prefix,
+                    &original_name,
+                    &self.config.prefix_delimiter,
+                )
+            } else {
+                original_name.clone()
+            };
             if resource.title.is_none() {
                 resource.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
@@ -2131,11 +2185,15 @@ impl ToolRouter {
             catalog_metadata_budget.admit(&server_name, &mut template.meta, "resource-template");
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = template.name.clone();
-            let routed_name = crate::tool_naming::build_wire_name(
-                &prefix,
-                &original_name,
-                &self.config.prefix_delimiter,
-            );
+            let routed_name = if self.config.enable_prefix {
+                crate::tool_naming::build_wire_name(
+                    &prefix,
+                    &original_name,
+                    &self.config.prefix_delimiter,
+                )
+            } else {
+                original_name.clone()
+            };
             if template.title.is_none() {
                 template.title = Some(crate::tool_naming::generate_title(&prefix, &original_name));
             }
@@ -2144,22 +2202,41 @@ impl ToolRouter {
                 resolve_server_icons(&server_ctx, &server_name),
             );
             template.name = routed_name;
+            // Keep template ownership beside exact resource routes. Readers
+            // resolve exact URIs first, then match these RFC 6570-shaped keys.
+            // This makes a template advertised by Plug actually usable rather
+            // than returning `resource not found` for every expansion.
+            resource_routes
+                .entry(template.uri_template.clone())
+                .or_insert_with(|| server_name.clone());
             resource_templates_vec.push(template);
         }
         resource_templates_vec.sort_by(|a, b| a.name.cmp(&b.name));
         let resource_templates_all = Arc::new(resource_templates_vec);
 
+        let mut prompt_name_counts = HashMap::<String, usize>::new();
+        for (_, prompt) in &upstream_prompts {
+            *prompt_name_counts
+                .entry(prompt.name.to_string())
+                .or_insert(0) += 1;
+        }
         let mut prompt_routes = HashMap::new();
         let mut prompts_vec = Vec::new();
         for (server_name, mut prompt) in upstream_prompts {
             catalog_metadata_budget.admit(&server_name, &mut prompt.meta, "prompt");
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = prompt.name.clone();
-            let routed_name = crate::tool_naming::build_wire_name(
-                &prefix,
-                &original_name,
-                &self.config.prefix_delimiter,
-            );
+            let routed_name = if self.config.enable_prefix
+                || prompt_name_counts.get(&original_name).copied().unwrap_or(1) > 1
+            {
+                crate::tool_naming::build_wire_name(
+                    &prefix,
+                    &original_name,
+                    &self.config.prefix_delimiter,
+                )
+            } else {
+                original_name.clone()
+            };
             prompt_routes
                 .entry(routed_name.clone())
                 .or_insert_with(|| (server_name.clone(), original_name.clone()));
@@ -2821,11 +2898,14 @@ impl ToolRouter {
                     "plug-progress-{call_id}"
                 ))))
             });
+            if let Some(meta) = extension_meta.clone() {
+                merge_call_extension_meta(&mut upstream_params, meta);
+            }
+            // Extension metadata must be installed before the translated
+            // progress token. Assigning it afterwards replaces the entire
+            // `_meta` object and silently disables progress forwarding.
             if let Some(token) = upstream_progress_token.clone() {
                 upstream_params.set_progress_token(token);
-            }
-            if let Some(meta) = extension_meta.clone() {
-                upstream_params.meta = Some(RequestMetaObject(meta));
             }
 
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
@@ -2857,8 +2937,11 @@ impl ToolRouter {
                         downstream: call_context,
                         upstream_server_id: server_id.clone(),
                         upstream_request_id: None,
-                        downstream_progress_token,
-                        upstream_progress_token: upstream_progress_token.clone(),
+                        downstream_progress_token: downstream_progress_token.clone(),
+                        // RMCP owns the outgoing token provider and replaces
+                        // any token on the request. Record the actual token
+                        // from `RequestHandle` immediately after send.
+                        upstream_progress_token: None,
                         pending_cancel_reason: None,
                     },
                 )?;
@@ -2949,7 +3032,15 @@ impl ToolRouter {
                     }
                 })?;
 
-            self.attach_upstream_request_id(call_id, &server_id, request_handle.id.clone());
+            let actual_progress_token = downstream_progress_token
+                .as_ref()
+                .map(|_| request_handle.progress_token.clone());
+            self.attach_upstream_request_id(
+                call_id,
+                &server_id,
+                request_handle.id.clone(),
+                actual_progress_token,
+            );
             tracing::info!(
                 call_id,
                 trace_id = %trace_id,
@@ -3675,6 +3766,7 @@ mod lifecycle_regression_tests {
 
     fn test_router_config() -> RouterConfig {
         RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -3807,6 +3899,31 @@ mod lifecycle_regression_tests {
         router.remove_active_call(winner);
         assert!(!router.active_call_lookup.contains_key(&key));
         assert!(router.active_calls.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod call_metadata_regression_tests {
+    use super::*;
+
+    #[test]
+    fn extension_metadata_does_not_replace_progress_token() {
+        let token = ProgressToken(NumberOrString::String(Arc::from("progress-7")));
+        let mut params = CallToolRequestParams::new("test");
+        params.set_progress_token(token.clone());
+
+        let mut extension_meta = MetaObject::new();
+        extension_meta.insert("example.dev/value".to_string(), serde_json::json!(7));
+        merge_call_extension_meta(&mut params, extension_meta);
+
+        assert_eq!(params.progress_token(), Some(token));
+        assert_eq!(
+            params
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("example.dev/value")),
+            Some(&serde_json::json!(7))
+        );
     }
 }
 

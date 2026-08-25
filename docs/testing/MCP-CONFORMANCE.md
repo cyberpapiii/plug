@@ -123,11 +123,12 @@ PLUG_MCP_CONFORMANCE_URL=http://127.0.0.1:<port>/mcp \
   scripts/check-mcp-conformance.sh official-modern-server
 ```
 
-Fixture coverage today: simple/error/image/audio/embedded/mixed tools,
-`test://static-text` / `test://static-binary`, simple + args + image +
-embedded-resource prompts, and `completion/complete`. Rows that need
-client reverse requests or mid-call notifications
-(`test_elicitation`, `test_sampling`, `test_tool_with_logging`,
-`test_tool_with_progress`, …) remain expected-fail until a reverse-request
-fixture lands. The suite package is still alpha — never report a green
-opt-in run as stable certification. Modern gates stay default-off.
+Fixture coverage today includes the entire active modern server suite:
+completion, tools and mixed content, request-scoped progress, multiple SSE
+streams, static and templated resources, prompts, and DNS rebinding protection.
+On 2026-08-25 the pinned prerelease suite passed 22 checks with zero failures;
+the durable run note is in
+`docs/testing/results/2026-08-25-modern-server-conformance.md`. The suite package
+is still alpha, so this is strong implementation evidence rather than a claim
+of stable ecosystem certification. Modern gates stay default-off and are
+enabled only for explicitly proven peers.

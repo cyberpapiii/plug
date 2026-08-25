@@ -1,0 +1,73 @@
+name: PlugApp
+options:
+  bundleIdPrefix: com.cyberpapiii
+  deploymentTarget:
+    macOS: "14.0"
+packages:
+  PlugIPC:
+    path: PlugIPC
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.2
+targets:
+  PlugApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: PlugApp
+    dependencies:
+      - package: PlugIPC
+      - package: Sparkle
+        product: Sparkle
+    preBuildScripts:
+      - name: Bundle daemon and LaunchAgent
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          ROOT="$SRCROOT/.."
+          if [ -n "${PLUG_RELEASE_BINARY:-}" ] && [ -x "$PLUG_RELEASE_BINARY" ]; then
+            PLUG_BIN="$PLUG_RELEASE_BINARY"
+          elif [ "$CONFIGURATION" = "Release" ]; then
+            cargo build --manifest-path "$ROOT/Cargo.toml" --release -p plug-mcp
+            PLUG_BIN="$ROOT/target/release/plug"
+          else
+            cargo build --manifest-path "$ROOT/Cargo.toml" -p plug-mcp
+            PLUG_BIN="$ROOT/target/debug/plug"
+          fi
+          RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          AGENTS="$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/Library/LaunchAgents"
+          mkdir -p "$RESOURCES" "$AGENTS"
+          cp "$PLUG_BIN" "$RESOURCES/plug"
+          chmod 755 "$RESOURCES/plug"
+          cp "$SRCROOT/PlugApp/Resources/com.plug.daemon.plist" "$AGENTS/com.plug.daemon.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cyberpapiii.plug
+        PRODUCT_NAME: Plug
+        INFOPLIST_FILE: PlugApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PlugApp/PlugApp.entitlements
+        SWIFT_VERSION: 6.0
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: HJF7LN64XX
+  PlugAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [PlugAppTests]
+    dependencies:
+      - target: PlugApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 6.0
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Plug.app/Contents/MacOS/Plug"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  PlugApp:
+    build:
+      targets:
+        PlugApp: all
+        PlugAppTests: [test]
+    test:
+      targets: [PlugAppTests]
