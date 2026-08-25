@@ -87,8 +87,11 @@ pub enum BroadcastKind {
     ToolList,
     ResourceList,
     PromptList,
-    /// Not tied to a method family — logging output and fan-out lag warnings.
-    Unscoped,
+    /// Log output: upstream `notifications/message`, plug's own auth
+    /// telemetry, and fan-out lag warnings. Upstream log lines carry whatever
+    /// the upstream server chose to log, from servers the receiving principal
+    /// may hold no scope for at all, so this is gated like any other family.
+    Logging,
 }
 
 /// Which broadcast notifications a session's principal may observe.
@@ -111,6 +114,7 @@ pub struct BroadcastAudience {
     pub tools: bool,
     pub resources: bool,
     pub prompts: bool,
+    pub logging: bool,
 }
 
 impl BroadcastAudience {
@@ -121,6 +125,7 @@ impl BroadcastAudience {
             tools: true,
             resources: true,
             prompts: true,
+            logging: true,
         }
     }
 
@@ -129,7 +134,7 @@ impl BroadcastAudience {
             BroadcastKind::ToolList => self.tools,
             BroadcastKind::ResourceList => self.resources,
             BroadcastKind::PromptList => self.prompts,
-            BroadcastKind::Unscoped => true,
+            BroadcastKind::Logging => self.logging,
         }
     }
 }

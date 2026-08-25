@@ -792,12 +792,16 @@ mod tests {
         let id = store.create_session().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx, None).unwrap();
+        // Admit the kind, so expiry is the only thing that can stop delivery.
+        store
+            .set_broadcast_audience(&id, crate::session::BroadcastAudience::unrestricted())
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "test"}))
                 .unwrap(),
-            crate::session::BroadcastKind::Unscoped,
+            crate::session::BroadcastKind::Logging,
         );
 
         assert!(store.validate(&id).is_err());
@@ -816,6 +820,12 @@ mod tests {
             .set_sse_sender(&slow_id, slow_tx.clone(), None)
             .unwrap();
         store.set_sse_sender(&fast_id, fast_tx, None).unwrap();
+        // Admit the kind on both, so a full sender is the only obstacle.
+        for id in [&slow_id, &fast_id] {
+            store
+                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
+                .unwrap();
+        }
 
         slow_tx
             .try_send(crate::session::SseEvent {
@@ -830,7 +840,7 @@ mod tests {
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "broadcast"}))
                 .unwrap(),
-            crate::session::BroadcastKind::Unscoped,
+            crate::session::BroadcastKind::Logging,
         );
 
         let received = tokio::time::timeout(Duration::from_secs(1), fast_rx.recv())
@@ -865,6 +875,7 @@ mod tests {
                     tools: true,
                     resources: false,
                     prompts: false,
+                    logging: false,
                 },
             )
             .unwrap();
@@ -885,19 +896,16 @@ mod tests {
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "logging"}))
                 .unwrap(),
-            crate::session::BroadcastKind::Unscoped,
+            crate::session::BroadcastKind::Logging,
         );
 
         // The narrow session never sees the resource notification, and the one
         // it does skip costs it no event id -- its first event is still id 1.
+        // Logging is denied it too: a `tools:read` grant says nothing about
+        // reading another server's log output.
         let first = narrow_rx.try_recv().expect("tools notification delivered");
         assert_eq!(first.message.to_json_value()["type"], "tools");
         assert_eq!(first.id, 1);
-        let second = narrow_rx
-            .try_recv()
-            .expect("logging notification delivered");
-        assert_eq!(second.message.to_json_value()["type"], "logging");
-        assert_eq!(second.id, 2);
         assert!(narrow_rx.try_recv().is_err());
 
         // An explicitly unrestricted session receives every kind.
@@ -908,16 +916,12 @@ mod tests {
             assert_eq!(event.message.to_json_value()["type"], expected);
         }
 
-        // A session whose audience has not been resolved yet receives only the
-        // unscoped kind. Nothing scoped is queued for later replay either.
-        let unscoped_only = unresolved_rx
-            .try_recv()
-            .expect("unscoped kind is not gated");
-        assert_eq!(unscoped_only.message.to_json_value()["type"], "logging");
-        assert_eq!(unscoped_only.id, 1);
+        // A session whose audience has not been resolved yet receives nothing
+        // at all -- logging included, now that no kind bypasses the audience.
+        // Nothing is queued for later replay either.
         assert!(
             unresolved_rx.try_recv().is_err(),
-            "an unresolved audience must not receive scoped broadcasts"
+            "an unresolved audience must not receive any broadcast"
         );
     }
 

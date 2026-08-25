@@ -111,6 +111,12 @@ pub enum MethodFamily {
     Tasks,
     Listeners,
     Logging,
+    /// Receiving `notifications/message`, as opposed to `Logging`, which is
+    /// setting the level. No method string maps here: log delivery is a
+    /// broadcast, not a request, so this family exists only to answer
+    /// "may this principal observe log output?" through the same
+    /// `decide_method` path as everything else.
+    LoggingRead,
     Continuations,
     Extensions,
     Administration,
@@ -119,7 +125,7 @@ pub enum MethodFamily {
 
 /// Default downstream OAuth grant: the method families a normal MCP client
 /// exercises. Every entry must be a `MethodFamily::required_scope` string.
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 7] = [
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 8] = [
     "tools:read",
     "resources:read",
     "prompts:read",
@@ -127,6 +133,7 @@ pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 7] = [
     "tasks:use",
     "subscriptions:listen",
     "logging:configure",
+    "logging:read",
 ];
 
 impl MethodFamily {
@@ -161,6 +168,7 @@ impl MethodFamily {
             Self::Tasks => Some("tasks:use"),
             Self::Listeners => Some("subscriptions:listen"),
             Self::Logging => Some("logging:configure"),
+            Self::LoggingRead => Some("logging:read"),
             Self::Continuations => Some("continuations:complete"),
             Self::Extensions => Some("extensions:use"),
             Self::Administration => Some("plug:admin"),
@@ -610,6 +618,7 @@ mod tests {
             MethodFamily::Tasks,
             MethodFamily::Listeners,
             MethodFamily::Logging,
+            MethodFamily::LoggingRead,
         ]
         .map(|family| {
             family
