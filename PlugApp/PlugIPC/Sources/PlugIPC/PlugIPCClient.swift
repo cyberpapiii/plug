@@ -68,12 +68,25 @@ public actor PlugIPCClient {
     static func openSocket(path: String, requestTimeout: TimeInterval = 3) throws -> Int32 {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
+        var noSigPipe: Int32 = 1
+        guard Darwin.setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            let code = errno
+            Darwin.close(fd)
+            throw PlugIPCError.systemCall("setsockopt", code)
+        }
         let flags = Darwin.fcntl(fd, F_GETFL)
         guard flags >= 0, Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
             let code = errno
             Darwin.close(fd)
             throw PlugIPCError.systemCall("fcntl", code)
         }
+        // Keep O_NONBLOCK: readiness polling cannot bound a subsequent blocking syscall.
         var (address, addressLength) = try unixSocketAddress(path: path)
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -103,11 +116,6 @@ public actor PlugIPCClient {
                 Darwin.close(fd)
                 throw error
             }
-        }
-        guard Darwin.fcntl(fd, F_SETFL, flags) == 0 else {
-            let code = errno
-            Darwin.close(fd)
-            throw PlugIPCError.systemCall("fcntl", code)
         }
         return fd
     }
@@ -140,8 +148,13 @@ public actor PlugIPCClient {
                     deadline: deadline
                 )
                 let count = Darwin.write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
-                guard count > 0 else { throw PlugIPCError.systemCall("write", errno) }
-                offset += count
+                if count > 0 {
+                    offset += count
+                    continue
+                }
+                let code = errno
+                if code == EINTR || code == EAGAIN || code == EWOULDBLOCK { continue }
+                throw PlugIPCError.systemCall("write", code)
             }
         }
     }
@@ -157,8 +170,14 @@ public actor PlugIPCClient {
                     deadline: deadline
                 )
                 let readCount = Darwin.read(fd, raw.baseAddress!.advanced(by: offset), count - offset)
-                guard readCount > 0 else { throw readCount == 0 ? PlugIPCError.disconnected : PlugIPCError.systemCall("read", errno) }
-                offset += readCount
+                if readCount > 0 {
+                    offset += readCount
+                    continue
+                }
+                if readCount == 0 { throw PlugIPCError.disconnected }
+                let code = errno
+                if code == EINTR || code == EAGAIN || code == EWOULDBLOCK { continue }
+                throw PlugIPCError.systemCall("read", code)
             }
         }
         return data
