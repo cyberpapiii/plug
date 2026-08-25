@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` at merge commit `8adbcd1` on 2026-08-09.
+Baseline: `main` at squash commit `52b2c7b` on 2026-08-25.
 
 This is the canonical current-state doc for the project.
 
@@ -107,24 +107,24 @@ Implemented on `main`:
 - gated MCP `2026-07-28` downstream discovery/sessionless HTTP and upstream `legacy | auto | modern` negotiation
 - modern principal-owned task lifecycle, admitted extension/schema/trace propagation, and secure native modern-to-modern multi-round `tools/call` continuations
 - issuer-bound upstream OAuth credentials with fail-closed handling for legacy unbound records
+- native macOS 14+ Plug.app with a quiet menu-bar health surface and full operator window for servers, clients, activity, authentication, settings, and upstream reauthorization
+- daemon operator IPC for version negotiation, health/inventory snapshots, bounded activity history, server lifecycle mutations, and downstream grant revocation; the app and CLI remain clients of the same daemon authority
+- app-owned launchd lifecycle with first-run adoption of legacy daemon installs, single-flight startup, visible bounded failure handling, and a bundled universal Plug daemon so the app is standalone
+- direct Developer ID distribution as a signed, notarized, stapled DMG with Sparkle 2 signed updates and a Homebrew cask using the identical artifact
+- official prerelease MCP 2026 server conformance at 22 passed, 0 failed, including request-scoped progress streaming, concrete resource-template routing, and `enable_prefix = false` behavior
 
 Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
 - some low-priority internal simplification remains possible in reload/session helpers, but no roadmap-critical correctness work remains open
-- official modern npm conformance remains opt-in prerelease evidence (`0.2.0-alpha.10`), not a stable ecosystem certification
+- official modern npm conformance remains prerelease evidence (`0.2.0-alpha.10`), despite the full 22/22 server pass; stable real-client certification is still evaluated peer by peer
 
 ## What Exists Off-Main
 
-No roadmap-relevant downstream OAuth work currently exists only off-main. The
-owner-passkey implementation was merged by `8adbcd1`, pushed to `origin/main`,
-installed as a signed local binary, and started as the shared daemon.
-
-The `codex/plug-macos-app` branch adds a native menu-bar operator app and closes
-the active official modern server suite at 22 passed, 0 failed. It also fixes
-request-scoped progress streaming, concrete resource-template routing, and the
-documented `enable_prefix = false` behavior. These remain **exists off-main**
-until the branch is merged.
+No roadmap-relevant implementation currently exists only off-main. The native
+operator app, its daemon API and lifecycle ownership, distribution automation,
+and the 22/22 official modern server conformance fixes landed on `main` in
+PR #96 (`52b2c7b`).
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era

@@ -56,6 +56,10 @@ forwarding work:
 - concurrent catalog-family refresh and blocking-pool writes for oversized artifacts
 - downstream OAuth authorize-redirect allowlist and exposure-keyed secretless-OAuth guard, plus per-upstream operability metrics in `plug status --output json` (PR #60)
 - first-class upstream catalog availability (`healthy | degraded | absent`) with last-known-good carry-forward for transient listing failures, closing the PR #58 subscription-rebind residual (PR #61)
+- native macOS 14+ operator app with menu-bar health, server/client/activity/auth views, app-owned launchd lifecycle, first-run daemon adoption, and a bundled universal daemon (PR #96)
+- signed/notarized/stapled DMG distribution, Sparkle 2 signed updates, and a Homebrew cask sharing the same app artifact (PR #96)
+- daemon operator IPC with compatibility-range negotiation, inventory/activity snapshots, server mutations, OAuth actions, and downstream grant revocation (PR #96)
+- official prerelease MCP 2026 server conformance at 22/22, with request-scoped progress, concrete resource-template routing, and prefix-disabled routing fixes (PR #96)
 
 ## What Exists Today
 
@@ -78,6 +82,7 @@ The current product shape is:
 - centralized env-reference traversal reused by config loading and doctor checks
 - core MCP Tasks support as part of the routed downstream surface
 - oversized tool/task result delivery that preserves success across transports via artifact spillover and daemon-IPC chunking for medium oversized inline responses
+- `Plug.app` as the calm human operator surface while the CLI remains the first-class agent surface; both use the same daemon-owned state and IPC authority
 
 ## Remaining Work
 
