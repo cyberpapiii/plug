@@ -92,11 +92,14 @@ jobs:
       - run: brew install xcodegen
       - run: swift test --package-path PlugApp/PlugIPC
       - run: xcodegen generate --spec PlugApp/project.yml
+      # Hosted UI tests cannot query an embedded SMAppService on GitHub's
+      # ephemeral runner. The portable IPC suite runs above; this gate proves
+      # the complete app and login-service bundle compile together.
       - run: >-
-          xcodebuild test
+          xcodebuild build
           -project PlugApp/PlugApp.xcodeproj
           -scheme PlugApp
-          -destination 'platform=macOS'
+          -destination 'generic/platform=macOS'
           CODE_SIGNING_ALLOWED=NO
 
   cross-check:
