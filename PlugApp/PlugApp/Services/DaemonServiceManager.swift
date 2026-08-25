@@ -369,7 +369,16 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func unregisterAgent() async throws {
-        try await agent.unregister()
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            agent.unregister { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
         for _ in 0..<60 where agent.status == .enabled {
             try? await Task.sleep(for: .milliseconds(50))
         }
