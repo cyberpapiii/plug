@@ -9,7 +9,12 @@ struct AuthView: View {
                     HStack {
                         VStack(alignment: .leading) { Text(server.name); Text(server.authenticated ? "Connected" : "Needs sign-in").font(.caption).foregroundStyle(.secondary) }
                         Spacer()
-                        if !server.authenticated { Text("Sign in from Plug CLI").foregroundStyle(.orange) }
+                        if !server.authenticated {
+                            Button(model.signingInServers.contains(server.name) ? "Waiting for browser…" : "Sign In") {
+                                Task { await model.signIn(server: server.name) }
+                            }
+                            .disabled(model.signingInServers.contains(server.name))
+                        }
                     }
                 }
                 if model.snapshot.upstreamAuth.isEmpty { Text("No OAuth servers configured").foregroundStyle(.secondary) }

@@ -12,4 +12,7 @@
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Robert Dezendorf</string>
+  <key>SUEnableAutomaticChecks</key><true/>
+  <key>SUFeedURL</key><string>https://github.com/cyberpapiii/plug/releases/latest/download/appcast.xml</string>
+  <key>SUPublicEDKey</key><string>KdsbOX5fZP44fVLgvhhxMuViA1gN/vWKSgDKRBBT8Rc=</string>
 </dict></plist>

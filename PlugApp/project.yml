@@ -6,6 +6,9 @@ options:
 packages:
   PlugIPC:
     path: PlugIPC
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.2
 targets:
   PlugApp:
     type: application
@@ -14,13 +17,17 @@ targets:
       - path: PlugApp
     dependencies:
       - package: PlugIPC
+      - package: Sparkle
+        product: Sparkle
     preBuildScripts:
       - name: Bundle daemon and LaunchAgent
         basedOnDependencyAnalysis: false
         script: |
           set -euo pipefail
           ROOT="$SRCROOT/.."
-          if [ "$CONFIGURATION" = "Release" ]; then
+          if [ -n "${PLUG_RELEASE_BINARY:-}" ] && [ -x "$PLUG_RELEASE_BINARY" ]; then
+            PLUG_BIN="$PLUG_RELEASE_BINARY"
+          elif [ "$CONFIGURATION" = "Release" ]; then
             cargo build --manifest-path "$ROOT/Cargo.toml" --release -p plug-mcp
             PLUG_BIN="$ROOT/target/release/plug"
           else

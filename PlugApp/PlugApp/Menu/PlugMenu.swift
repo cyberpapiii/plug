@@ -13,6 +13,7 @@ struct PlugMenu: View {
         Divider()
         Button("Open Plug") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
         Button("Refresh") { Task { await model.refresh() } }
+        Button("Check for Updates…") { UpdateService.shared.checkForUpdates() }
         if model.connectionState == .disconnected {
             Button("Start Plug") { Task { await model.restartDaemon() } }
         }

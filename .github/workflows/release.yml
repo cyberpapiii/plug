@@ -107,9 +107,71 @@ jobs:
           name: archive-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
 
+  build-app:
+    name: Build Plug.app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: plug-app-universal
+
+      - name: Build universal daemon
+        run: |
+          set -euo pipefail
+          cargo build --release -p plug-mcp --target aarch64-apple-darwin
+          cargo build --release -p plug-mcp --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/plug \
+            target/x86_64-apple-darwin/release/plug \
+            -output target/plug-universal
+          lipo -archs target/plug-universal
+
+      - name: Build app archive
+        run: |
+          set -euo pipefail
+          cd PlugApp
+          xcodegen generate
+          xcodebuild archive \
+            -project PlugApp.xcodeproj \
+            -scheme PlugApp \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Plug.xcarchive" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            PLUG_RELEASE_BINARY="$GITHUB_WORKSPACE/target/plug-universal"
+
+      - name: Sign, notarize, and staple app DMG
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASS: ${{ secrets.MACOS_CERTIFICATE_PASS }}
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          ./scripts/sign-notarize-macos-app.sh \
+            "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app" \
+            "$RUNNER_TEMP/Plug-${version}.dmg"
+
+      - name: Upload app DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: plug-app
+          path: ${{ runner.temp }}/Plug-*.dmg
+
   publish:
     name: Publish GitHub release and Homebrew tap
-    needs: build
+    needs: [build, build-app]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -125,6 +187,12 @@ jobs:
           path: artifacts
           pattern: archive-*
           merge-multiple: true
+
+      - name: Download app DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: plug-app
+          path: artifacts
 
       - name: Install cargo-dist
         shell: bash
@@ -192,6 +260,48 @@ jobs:
           EOF
           ruby -c plug.rb
 
+          app_dmg="Plug-${version}.dmg"
+          app_sha=$(sha256sum "$app_dmg" | cut -d' ' -f1)
+          cat > plug-app.rb <<EOF
+          cask "plug-app" do
+            version "${version}"
+            sha256 "${app_sha}"
+
+            url "https://github.com/cyberpapiii/plug/releases/download/${TAG}/${app_dmg}"
+            name "Plug"
+            desc "Calm macOS control surface for the Plug MCP multiplexer"
+            homepage "https://github.com/cyberpapiii/plug"
+
+            auto_updates true
+            depends_on macos: ">= :sonoma"
+            app "Plug.app"
+          end
+          EOF
+          ruby -c plug-app.rb
+
+      - name: Generate signed Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SPARKLE_PRIVATE_KEY"
+          mkdir -p appcast-source sparkle-tools
+          gh release download --repo cyberpapiii/plug --pattern appcast.xml \
+            --dir appcast-source 2>/dev/null || true
+          cp artifacts/Plug-*.dmg appcast-source/
+          gh release download 2.9.2 --repo sparkle-project/Sparkle \
+            --pattern Sparkle-2.9.2.tar.xz --dir sparkle-tools
+          tar -xJf sparkle-tools/Sparkle-2.9.2.tar.xz -C sparkle-tools
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+            sparkle-tools/bin/generate_appcast \
+              --ed-key-file - \
+              --maximum-versions 0 \
+              --download-url-prefix "https://github.com/cyberpapiii/plug/releases/download/${TAG}/" \
+              --link "https://github.com/cyberpapiii/plug" \
+              appcast-source
+          cp appcast-source/appcast.xml artifacts/appcast.xml
+
       - name: Generate checksums
         shell: bash
         run: |
@@ -199,10 +309,13 @@ jobs:
           cd artifacts
           sha256sum \
             plug-mcp-*.tar.gz \
+            Plug-*.dmg \
             source.tar.gz \
             source.tar.gz.sha256 \
             plug-mcp-installer.sh \
-            plug.rb > checksums.sha256
+            plug.rb \
+            plug-app.rb \
+            appcast.xml > checksums.sha256
           cat checksums.sha256
 
       - name: Generate release notes
@@ -224,6 +337,9 @@ jobs:
             artifacts/source.tar.gz.sha256 \
             artifacts/plug-mcp-installer.sh \
             artifacts/plug.rb \
+            artifacts/plug-app.rb \
+            artifacts/Plug-*.dmg \
+            artifacts/appcast.xml \
             artifacts/checksums.sha256
 
       - name: Publish Homebrew formula
@@ -238,10 +354,12 @@ jobs:
         run: |
           set -euo pipefail
           cp artifacts/plug.rb homebrew-tap/plug.rb
+          mkdir -p homebrew-tap/Casks
+          cp artifacts/plug-app.rb homebrew-tap/Casks/plug-app.rb
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add plug.rb
+          git add plug.rb Casks/plug-app.rb
           if git diff --cached --quiet; then
             echo "Homebrew formula already up to date"
           else

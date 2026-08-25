@@ -14,6 +14,7 @@ final class AppModel {
     private(set) var activities: [ActivityEvent] = []
     private(set) var lastError: String?
     private(set) var serviceNeedsAdoption = DaemonServiceManager.shared.needsAdoption
+    private(set) var signingInServers: Set<String> = []
 
     init(ipc: PlugIPCClient = PlugIPCClient()) { self.ipc = ipc }
 
@@ -59,6 +60,7 @@ final class AppModel {
                     throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
                 }
                 snapshot = value
+                NotificationService.shared.observe(value)
                 if case let .activity(events) = try await ipc.request(
                     .activity(authToken: token, afterSequence: 0, limit: 200, failuresOnly: false)
                 ) { activities = events }
@@ -96,6 +98,15 @@ final class AppModel {
         do {
             try await DaemonServiceManager.shared.restart()
             try await Task.sleep(for: .milliseconds(700))
+            await refresh()
+        } catch { lastError = error.localizedDescription }
+    }
+
+    func signIn(server: String) async {
+        guard signingInServers.insert(server).inserted else { return }
+        defer { signingInServers.remove(server) }
+        do {
+            try await AuthFlowService().signIn(server: server)
             await refresh()
         } catch { lastError = error.localizedDescription }
     }

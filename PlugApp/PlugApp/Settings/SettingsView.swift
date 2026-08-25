@@ -12,6 +12,8 @@ struct SettingsView: View {
                 }
             LabeledContent("Daemon", value: model.snapshot.ownership.replacingOccurrences(of: "_", with: " ").capitalized)
             LabeledContent("Version", value: model.snapshot.runtimeVersion.isEmpty ? "—" : model.snapshot.runtimeVersion)
+            Button("Check for Updates…") { UpdateService.shared.checkForUpdates() }
+                .disabled(!UpdateService.shared.canCheckForUpdates)
             Text("Plug keeps running when this window closes.").font(.caption).foregroundStyle(.secondary)
         }.formStyle(.grouped).frame(width: 440, height: 220).padding()
     }
