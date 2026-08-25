@@ -212,7 +212,36 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         }
     }
 
+    func testHarnessSetupFailureRemovesFixtureRoot() throws {
+        let fixture = try SignedReconciliationFixture(mode: .legacy)
+        try FileManager.default.createDirectory(
+            at: fixture.ipcSocketURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.ipcSocketURL) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.rootURL.path))
+
+        XCTAssertThrowsError(try makeHarness(fixture: fixture))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.rootURL.path))
+    }
+
     private func makeHarness(
+        fixture: SignedReconciliationFixture,
+        failCargoRemovalOnce: Bool = false
+    ) throws -> ReconciliationHarness {
+        do {
+            return try makeHarnessWithoutCleanup(
+                fixture: fixture,
+                failCargoRemovalOnce: failCargoRemovalOnce
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: fixture.rootURL)
+            throw error
+        }
+    }
+
+    private func makeHarnessWithoutCleanup(
         fixture: SignedReconciliationFixture,
         failCargoRemovalOnce: Bool = false
     ) throws -> ReconciliationHarness {

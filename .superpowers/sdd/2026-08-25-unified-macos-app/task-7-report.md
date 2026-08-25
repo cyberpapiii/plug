@@ -61,3 +61,20 @@ pre-existing `repair_export_endpoint` dead-code and
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: still blocked by
   the two pre-existing findings named above.
+
+## P2 Fix Round: Harness Setup Failure Cleanup
+
+`makeHarness` now wraps harness construction in a cleanup boundary. Any setup
+error removes the temporary fixture root before rethrowing, while successful
+harnesses continue to use the registered async teardown. The regression blocks
+the fixture's unique temporary socket path to force `FixtureConnectorReplay`
+setup failure before teardown registration, then proves the fixture root is
+absent.
+
+## P2 Fix Round Verification
+
+- Focused `testHarnessSetupFailureRemovesFixtureRoot`: passed.
+- Repeated `UnifiedReconciliationFixtureTests` (`-test-iterations 3 -run-tests-until-failure`): 15 passed (5 tests x 3 iterations).
+- `git diff --check`: passed.
+
+No live installation, daemon, or shared configuration was mutated.
