@@ -143,7 +143,7 @@ private extension ProcessResult {
 
     static func report(changed: [Bool]) -> ProcessResult {
         let items = changed.enumerated().map { index, changed in
-            "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(changed ? "RecognizedLegacy" : "Canonical")\",\"changed\":\(changed),\"message\":\"ok\"}"
+            "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(changed ? "recognized_legacy" : "canonical")\",\"changed\":\(changed),\"message\":\"ok\"}"
         }.joined(separator: ",")
         let json = "{\"canonical_command\":\"/Applications/Plug.app/Contents/Resources/plug\",\"items\":[\(items)]}"
         return ProcessResult(status: 0, stdout: Data(json.utf8), stderr: Data())

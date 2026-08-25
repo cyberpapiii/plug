@@ -108,18 +108,6 @@ private struct ParsedRepairReport: Decodable {
         )
     }
 
-    var needsRepair: Bool {
-        items.contains { item in
-            if item.changed { return true }
-            switch item.disposition {
-            case "Canonical", "Http", "Missing", nil:
-                return false
-            default:
-                return true
-            }
-        }
-    }
-
     private enum CodingKeys: String, CodingKey {
         case items
     }
@@ -127,10 +115,8 @@ private struct ParsedRepairReport: Decodable {
 
 private struct ParsedRepairItem: Decodable {
     let changed: Bool
-    let disposition: String?
 
     private enum CodingKeys: String, CodingKey {
         case changed
-        case disposition
     }
 }

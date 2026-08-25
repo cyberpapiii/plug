@@ -68,6 +68,66 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(printedLabels.sorted(), ["com.apple.unrelated", "unexpected.owner"])
     }
 
+    func testLiveSMAppServiceShapeResolvesBundleRelativeDaemon() async throws {
+        let runner = SMAppServiceLaunchctlRunner(
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: canonical.buildVersion,
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+        )
+        let inspector = LaunchdJobInspector(runner: runner, userID: 501)
+
+        let state = try await inspector.daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+
+        let expected = record(
+            label: "com.plug.daemon",
+            program: canonical.executableURL,
+            parentID: AppInstallationInspector.bundleIdentifier,
+            parentVersion: canonical.buildVersion,
+            programIdentifier: "Contents/Resources/plug",
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+        )
+        XCTAssertEqual(state, .appManagedCurrent(expected))
+    }
+
+    func testLiveSMAppServiceShapeWithMismatchedBundleVersionRemainsUnknown() async throws {
+        let runner = SMAppServiceLaunchctlRunner(
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: "19",
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+        )
+        let inspector = LaunchdJobInspector(runner: runner, userID: 501)
+
+        let state = try await inspector.daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+
+        assertUnknown(state, programIdentifier: "Contents/Resources/plug")
+    }
+
+    func testLiveSMAppServiceShapeWithMismatchedBundleIdentifierRemainsUnknown() async throws {
+        let runner = SMAppServiceLaunchctlRunner(
+            parentBundleIdentifier: "com.example.other",
+            parentBundleVersion: canonical.buildVersion,
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+        )
+        let inspector = LaunchdJobInspector(runner: runner, userID: 501)
+
+        let state = try await inspector.daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+
+        assertUnknown(state, programIdentifier: "Contents/Resources/plug")
+    }
+
+    func testLiveSMAppServiceShapeWithMismatchedArgumentsRemainsUnknown() async throws {
+        let runner = SMAppServiceLaunchctlRunner(
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: canonical.buildVersion,
+            arguments: ["Contents/Resources/plug", "serve"]
+        )
+        let inspector = LaunchdJobInspector(runner: runner, userID: 501)
+
+        let state = try await inspector.daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+
+        assertUnknown(state, programIdentifier: "Contents/Resources/plug")
+    }
+
     func testLaunchctlListFailureIsPropagatedInsteadOfReportingUnmanaged() async {
         let inspector = LaunchdJobInspector(
             runner: FailingLaunchctlRunner(failure: .list),
@@ -125,17 +185,30 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     private func record(
         label: String,
-        program: URL,
+        program: URL?,
         parentID: String? = "com.cyberpapiii.plug",
-        parentVersion: String? = "20"
+        parentVersion: String? = "20",
+        programIdentifier: String? = nil,
+        arguments: [String] = []
     ) -> LaunchdJobRecord {
         LaunchdJobRecord(
             label: label,
             programURL: program,
             parentBundleIdentifier: parentID,
             parentBundleVersion: parentVersion,
-            loaded: true
+            loaded: true,
+            programIdentifier: programIdentifier,
+            arguments: arguments
         )
+    }
+
+    private func assertUnknown(_ state: DaemonOwnershipState, programIdentifier: String) {
+        guard case let .unknown(records) = state, let record = records.first else {
+            XCTFail("Expected unknown launchd ownership, got \(state)")
+            return
+        }
+        XCTAssertNil(record.programURL)
+        XCTAssertEqual(record.programIdentifier, programIdentifier)
     }
 }
 
@@ -182,6 +255,37 @@ private actor SymlinkLaunchctlRunner: ProcessRunning {
             )
         }
         let output = "program = \(programURL.path)\nstate = running\n"
+        return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
+    }
+}
+
+private actor SMAppServiceLaunchctlRunner: ProcessRunning {
+    let parentBundleIdentifier: String
+    let parentBundleVersion: String
+    let arguments: [String]
+
+    init(parentBundleIdentifier: String, parentBundleVersion: String, arguments: [String]) {
+        self.parentBundleIdentifier = parentBundleIdentifier
+        self.parentBundleVersion = parentBundleVersion
+        self.arguments = arguments
+    }
+
+    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        if arguments == ["list"] {
+            let output = "PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n"
+            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
+        }
+
+        let argumentLines = self.arguments.map { "    \($0)" }.joined(separator: "\n")
+        let output = """
+        program identifier = Contents/Resources/plug (mode: 2)
+        parent bundle identifier = \(parentBundleIdentifier)
+        parent bundle version = \(parentBundleVersion)
+        arguments = {
+        \(argumentLines)
+        }
+        state = running
+        """
         return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
     }
 }

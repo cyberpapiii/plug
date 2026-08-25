@@ -88,4 +88,24 @@ struct LaunchdJobRecord: Equatable, Sendable {
     let parentBundleIdentifier: String?
     let parentBundleVersion: String?
     let loaded: Bool
+    let programIdentifier: String?
+    let arguments: [String]
+
+    init(
+        label: String,
+        programURL: URL?,
+        parentBundleIdentifier: String?,
+        parentBundleVersion: String?,
+        loaded: Bool,
+        programIdentifier: String? = nil,
+        arguments: [String] = []
+    ) {
+        self.label = label
+        self.programURL = programURL
+        self.parentBundleIdentifier = parentBundleIdentifier
+        self.parentBundleVersion = parentBundleVersion
+        self.loaded = loaded
+        self.programIdentifier = programIdentifier
+        self.arguments = arguments
+    }
 }

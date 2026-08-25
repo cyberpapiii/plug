@@ -14,6 +14,9 @@ enum LaunchdJobInspectionError: Error, Equatable {
 }
 
 struct LaunchdJobInspector: LaunchdJobInspecting {
+    private static let appProgramIdentifier = "Contents/Resources/plug"
+    private static let appArguments = [appProgramIdentifier, "serve", "--daemon"]
+
     private let records: @Sendable () async throws -> [LaunchdJobRecord]
 
     init(runner: any ProcessRunning = ProcessRunner(), userID: uid_t = getuid()) {
@@ -30,12 +33,16 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         canonical: VerifiedAppInstallation,
         recognizedLegacyPaths: Set<URL>
     ) async throws -> DaemonOwnershipState {
-        let allRecords = try await records()
+        let allRecords = try await records().map {
+            Self.resolveAppManagedProgram(in: $0, canonical: canonical)
+        }
         let canonicalPath = Self.resolvedPath(canonical.executableURL)
         let legacyPaths = Set(recognizedLegacyPaths.map(Self.resolvedPath))
         let relevant = allRecords.filter { record in
             record.label.localizedCaseInsensitiveContains("plug")
                 || record.programURL?.lastPathComponent == "plug"
+                || record.programIdentifier == Self.appProgramIdentifier
+                || record.arguments.first == Self.appProgramIdentifier
                 || record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
         }
         guard !relevant.isEmpty else { return .unmanaged }
@@ -106,12 +113,25 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
 
     private static func parseRecord(label: String, output: String) -> LaunchdJobRecord {
         var program: URL?
+        var programIdentifier: String?
         var parentIdentifier: String?
         var parentVersion: String?
+        var arguments: [String] = []
+        var parsingArguments = false
         var loaded = false
         for line in output.split(separator: "\n") {
             let text = line.trimmingCharacters(in: .whitespaces)
-            if let value = value(after: "program =", in: text) {
+            if parsingArguments {
+                if text == "}" {
+                    parsingArguments = false
+                } else if !text.isEmpty {
+                    arguments.append(text)
+                }
+            } else if text == "arguments = {" {
+                parsingArguments = true
+            } else if let value = value(after: "program identifier =", in: text) {
+                programIdentifier = value.components(separatedBy: " (mode:").first
+            } else if let value = value(after: "program =", in: text) {
                 program = URL(fileURLWithPath: value).standardizedFileURL
             } else if let value = value(after: "parent bundle identifier =", in: text) {
                 parentIdentifier = value
@@ -121,12 +141,48 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 loaded = true
             }
         }
+        if parsingArguments {
+            arguments = []
+        }
         return LaunchdJobRecord(
             label: label,
             programURL: program,
             parentBundleIdentifier: parentIdentifier,
             parentBundleVersion: parentVersion,
-            loaded: loaded
+            loaded: loaded,
+            programIdentifier: programIdentifier,
+            arguments: arguments
+        )
+    }
+
+    private static func resolveAppManagedProgram(
+        in record: LaunchdJobRecord,
+        canonical: VerifiedAppInstallation
+    ) -> LaunchdJobRecord {
+        guard record.programURL == nil,
+              record.programIdentifier == appProgramIdentifier,
+              record.arguments == appArguments,
+              record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier,
+              record.parentBundleVersion == canonical.buildVersion
+        else {
+            return record
+        }
+
+        let candidate = canonical.bundleURL
+            .appending(path: appProgramIdentifier)
+            .standardizedFileURL
+        guard resolvedPath(candidate) == resolvedPath(canonical.executableURL) else {
+            return record
+        }
+
+        return LaunchdJobRecord(
+            label: record.label,
+            programURL: candidate,
+            parentBundleIdentifier: record.parentBundleIdentifier,
+            parentBundleVersion: record.parentBundleVersion,
+            loaded: record.loaded,
+            programIdentifier: record.programIdentifier,
+            arguments: record.arguments
         )
     }
 
