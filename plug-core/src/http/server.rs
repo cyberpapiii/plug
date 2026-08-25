@@ -611,7 +611,7 @@ impl HttpState {
                                             ) {
                                                 state.sessions.broadcast(
                                                     message,
-                                                    crate::session::BroadcastKind::Unscoped,
+                                                    crate::session::BroadcastKind::Logging,
                                                 );
                                             }
                                     }
@@ -629,7 +629,7 @@ impl HttpState {
                                 ) {
                                     state.sessions.broadcast(
                                         message,
-                                        crate::session::BroadcastKind::Unscoped,
+                                        crate::session::BroadcastKind::Logging,
                                     );
                                 }
                             }
@@ -654,7 +654,7 @@ impl HttpState {
                                 if let Some(message) = notification_to_sse_message(notif) {
                                     log_state.sessions.broadcast(
                                         message,
-                                        crate::session::BroadcastKind::Unscoped,
+                                        crate::session::BroadcastKind::Logging,
                                     );
                                 }
                             }
@@ -674,7 +674,7 @@ impl HttpState {
                                 if let Some(message) = notification_to_sse_message(synthetic) {
                                     log_state.sessions.broadcast(
                                         message,
-                                        crate::session::BroadcastKind::Unscoped,
+                                        crate::session::BroadcastKind::Logging,
                                     );
                                 }
                             }
@@ -2994,7 +2994,7 @@ fn project_legacy_capabilities(result: &mut InitializeResult, context: &Downstre
     if !allows(&[MethodFamily::Completion]) {
         capabilities.completions = None;
     }
-    if !allows(&[MethodFamily::Logging]) {
+    if !allows(&[MethodFamily::Logging, MethodFamily::LoggingRead]) {
         capabilities.logging = None;
     }
 }
@@ -3016,6 +3016,9 @@ fn broadcast_audience_for(context: &DownstreamCallContext) -> crate::session::Br
             .is_allowed(),
         prompts: context
             .policy_decision(MethodFamily::PromptsList)
+            .is_allowed(),
+        logging: context
+            .policy_decision(MethodFamily::LoggingRead)
             .is_allowed(),
     }
 }
@@ -3704,6 +3707,37 @@ mod tests {
             !scoped.prompts,
             "a token without prompts:read must not observe prompt list changes"
         );
+        assert!(
+            !scoped.logging,
+            "a token without logging:read must not observe upstream log output"
+        );
+
+        // `logging:read` is what admits log delivery -- not `logging:configure`,
+        // which only permits `logging/setLevel`. A grant holding the write
+        // scope alone still hears nothing.
+        for (scope, expected) in [("logging:configure", false), ("logging:read", true)] {
+            let manager = isolated_oauth_manager(vec![scope.to_string()]);
+            let token = issue_test_oauth_token(&manager, scope).await;
+            let claims = match manager
+                .validate_access_token_for(&token, &[], &manager.resource())
+                .await
+            {
+                AccessTokenValidation::Valid(claims) => claims,
+                other => panic!("issued token must validate, got {other:?}"),
+            };
+            let audience = broadcast_audience_for(&legacy_http_policy_context(
+                &state,
+                &AuthStatus::Authenticated(Some(claims)),
+                RequestId::Number(94),
+                Arc::from("broadcast-audience-logging"),
+            ));
+            assert_eq!(
+                audience.logging,
+                expected,
+                "{scope} must {} admit log delivery",
+                if expected { "" } else { "not" }
+            );
+        }
 
         // A loopback listener that requires no auth keeps the full audience,
         // so turning auth off does not silence notifications.
@@ -3728,6 +3762,7 @@ mod tests {
                 tools: false,
                 resources: false,
                 prompts: false,
+                logging: false,
             },
             "an unresolved audience must not admit broadcasts"
         );
@@ -3987,9 +4022,24 @@ mod tests {
         assert!(resources_only.resources.is_some());
         assert!(resources_only.tools.is_none() && resources_only.prompts.is_none());
 
-        // The scope that used to be the only one projected still is.
-        assert!(advertised(&["logging:configure"]).logging.is_some());
-        assert!(advertised(&["tools:read"]).logging.is_none());
+        // The logging capability covers both halves -- `logging/setLevel` and
+        // log delivery -- so it is advertised only to a grant holding both
+        // scopes. Half a grant would promise something the gate then refuses.
+        assert!(
+            advertised(&["logging:configure", "logging:read"])
+                .logging
+                .is_some()
+        );
+        for partial in [
+            vec!["logging:configure"],
+            vec!["logging:read"],
+            vec!["tools:read"],
+        ] {
+            assert!(
+                advertised(&partial).logging.is_none(),
+                "{partial:?} must not be told the logging capability exists"
+            );
+        }
 
         // The full default grant sees the whole union, so this is not a
         // behavior change for a client that consented to everything.
