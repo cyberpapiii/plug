@@ -219,6 +219,7 @@ fn mrtr_pair_supported(
 /// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
+    activity_store: crate::activity::ActivityStore,
     cache: Arc<ArcSwap<RouterSnapshot>>,
     /// Last published call-routing identity. Catalog metadata may change
     /// without invalidating parked rounds; route targets and upstream
@@ -809,6 +810,7 @@ impl ToolRouter {
             continuations::ContinuationRegistry::new(admission_quotas.clone(), MRTR_CHAIN_TTL);
         Self {
             server_manager,
+            activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
             config,
@@ -840,6 +842,17 @@ impl ToolRouter {
             #[cfg(test)]
             continuation_insert_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn record_activity(&self, event: crate::activity::ActivityEvent) {
+        self.activity_store.record(event);
+    }
+
+    pub fn activity_snapshot(
+        &self,
+        filter: &crate::activity::ActivityFilter,
+    ) -> Vec<crate::activity::ActivityEvent> {
+        self.activity_store.snapshot(filter)
     }
 
     #[cfg(test)]

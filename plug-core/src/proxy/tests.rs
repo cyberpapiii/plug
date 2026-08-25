@@ -2497,6 +2497,13 @@ async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
         matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
         "expected TaskCreated outcome, got {outcome:?}"
     );
+    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].method, "tools/call");
+    assert_eq!(
+        activity[0].outcome,
+        crate::activity::ActivityOutcome::Success
+    );
 }
 
 #[tokio::test]
@@ -2519,6 +2526,9 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
 
     assert_eq!(err.code, ErrorCode(-32005));
     assert_eq!(router.task_count_for_owner(&owner).await, 0);
+    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
 }
 
 #[tokio::test]

@@ -1090,6 +1090,20 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 capabilities: Vec::new(),
             },
         },
+        IpcRequest::ActivitySnapshot {
+            after_sequence,
+            limit,
+            failures_only,
+            ..
+        } => IpcResponse::ActivitySnapshot {
+            events: ctx.engine.tool_router().activity_snapshot(
+                &plug_core::activity::ActivityFilter {
+                    after_sequence: *after_sequence,
+                    failures_only: *failures_only,
+                    limit: *limit,
+                },
+            ),
+        },
         IpcRequest::RestartServer { server_id, .. } => {
             match ctx.engine.restart_server(server_id).await {
                 Ok(()) => IpcResponse::Ok,

@@ -90,6 +90,13 @@ pub enum IpcRequest {
         ipc_min: u16,
         ipc_max: u16,
     },
+    /// Read the bounded metadata-only activity ring.
+    ActivitySnapshot {
+        auth_token: String,
+        after_sequence: u64,
+        limit: usize,
+        failures_only: bool,
+    },
 
     /// Restart a specific upstream server.
     RestartServer {
@@ -211,6 +218,18 @@ impl fmt::Debug for IpcRequest {
                 .field("client_version", client_version)
                 .field("ipc_min", ipc_min)
                 .field("ipc_max", ipc_max)
+                .finish(),
+            Self::ActivitySnapshot {
+                after_sequence,
+                limit,
+                failures_only,
+                ..
+            } => f
+                .debug_struct("ActivitySnapshot")
+                .field("auth_token", &"[REDACTED]")
+                .field("after_sequence", after_sequence)
+                .field("limit", limit)
+                .field("failures_only", failures_only)
                 .finish(),
             Self::RestartServer { server_id, .. } => f
                 .debug_struct("RestartServer")
@@ -565,6 +584,9 @@ pub struct IpcAuthServerInfo {
 pub enum IpcResponse {
     /// Daemon version, compatibility range, ownership, and operator features.
     OperatorHandshake { handshake: OperatorHandshake },
+    ActivitySnapshot {
+        events: Vec<crate::activity::ActivityEvent>,
+    },
     /// Status response with server info, client count, and uptime.
     Status {
         servers: Vec<ServerStatus>,
@@ -716,6 +738,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::Reload { .. }
             | IpcRequest::Shutdown { .. }
             | IpcRequest::InjectToken { .. }
+            | IpcRequest::ActivitySnapshot { .. }
     )
 }
 
@@ -726,6 +749,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::Reload { auth_token, .. }
         | IpcRequest::Shutdown { auth_token, .. }
         | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
+        IpcRequest::ActivitySnapshot { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -881,6 +905,12 @@ mod tests {
                 client_version: "0.5.0".to_string(),
                 ipc_min: 3,
                 ipc_max: 4,
+            },
+            IpcRequest::ActivitySnapshot {
+                auth_token: "token".to_string(),
+                after_sequence: 7,
+                limit: 25,
+                failures_only: true,
             },
             IpcRequest::RestartServer {
                 server_id: "test-server".to_string(),
@@ -1185,6 +1215,12 @@ mod tests {
             access_token: "a".to_string(),
             refresh_token: None,
             expires_in: None,
+        }));
+        assert!(requires_auth(&IpcRequest::ActivitySnapshot {
+            auth_token: "t".to_string(),
+            after_sequence: 0,
+            limit: 500,
+            failures_only: false,
         }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)
