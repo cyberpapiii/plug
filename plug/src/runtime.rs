@@ -218,6 +218,7 @@ async fn operator_live_sessions(
             session_id: snapshot.session_id,
             client_type: snapshot.client_type,
             client_info: None,
+            adapter_version: None,
             connected_secs: snapshot.connected_seconds,
             last_activity_secs: Some(snapshot.idle_seconds),
         })
@@ -947,6 +948,7 @@ pub(crate) async fn fetch_live_sessions(
                             .map(plug_core::client_detect::detect_client)
                             .unwrap_or(plug_core::types::ClientType::Unknown),
                         client_info: client.client_info,
+                        adapter_version: client.adapter_version,
                         connected_secs: client.connected_secs,
                         last_activity_secs: None,
                     })
@@ -1088,6 +1090,7 @@ pub(crate) async fn establish_daemon_proxy_session(
         protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
         client_id: client_id.clone(),
         client_info: client_info.clone(),
+        adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
@@ -2045,6 +2048,7 @@ mod tests {
             session_id: "daemon-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2054,6 +2058,7 @@ mod tests {
             session_id: "http-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeDesktop,
             client_info: None,
+            adapter_version: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2079,6 +2084,7 @@ mod tests {
             session_id: "daemon-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2104,6 +2110,7 @@ mod tests {
             session_id: "daemon-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
+            adapter_version: Some("0.6.5".to_string()),
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2129,6 +2136,7 @@ mod tests {
             session_id: "http-1".to_string(),
             client_type: plug_core::types::ClientType::ClaudeDesktop,
             client_info: None,
+            adapter_version: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2206,6 +2214,7 @@ mod tests {
                 session_id: "daemon-1".to_string(),
                 client_type: plug_core::types::ClientType::ClaudeCode,
                 client_info: Some("Claude Code".to_string()),
+                adapter_version: Some("0.6.5".to_string()),
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -2215,6 +2224,7 @@ mod tests {
                 session_id: "http-1".to_string(),
                 client_type: plug_core::types::ClientType::ClaudeDesktop,
                 client_info: None,
+                adapter_version: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },

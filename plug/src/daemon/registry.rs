@@ -20,6 +20,7 @@ pub struct ClientRegistry {
 struct ClientSession {
     client_id: String,
     client_info: Option<String>,
+    adapter_version: Option<String>,
     connected_at: Instant,
     capabilities: ClientCapabilities,
     cancellation_capability: String,
@@ -53,6 +54,7 @@ impl ClientRegistry {
         &self,
         client_id: String,
         client_info: Option<String>,
+        adapter_version: Option<String>,
     ) -> RegistrationResult {
         let session_id = uuid::Uuid::new_v4().to_string();
         let cancellation_capability = format!(
@@ -70,6 +72,7 @@ impl ClientRegistry {
             client_id = %client_id,
             session_id = %session_id,
             client_info = ?client_info,
+            adapter_version = ?adapter_version,
             "client registered"
         );
         self.sessions.insert(
@@ -77,6 +80,7 @@ impl ClientRegistry {
             ClientSession {
                 client_id,
                 client_info,
+                adapter_version,
                 connected_at: Instant::now(),
                 capabilities: ClientCapabilities::default(),
                 cancellation_capability: cancellation_capability.clone(),
@@ -182,6 +186,7 @@ impl ClientRegistry {
                 client_id: entry.client_id.clone(),
                 session_id: entry.key().clone(),
                 client_info: entry.client_info.clone(),
+                adapter_version: entry.adapter_version.clone(),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
             })
             .collect::<Vec<_>>();
@@ -208,6 +213,7 @@ impl ClientRegistry {
                     .map(plug_core::client_detect::detect_client)
                     .unwrap_or(plug_core::types::ClientType::Unknown),
                 client_info: entry.client_info.clone(),
+                adapter_version: entry.adapter_version.clone(),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })
@@ -230,7 +236,11 @@ mod tests {
         let (registry, _count_rx) = ClientRegistry::new();
 
         for i in 0..256 {
-            registry.register(format!("client-{i}"), Some("codex-desktop".to_string()));
+            registry.register(
+                format!("client-{i}"),
+                Some("codex-desktop".to_string()),
+                None,
+            );
         }
 
         assert_eq!(registry.count(), 256);
@@ -240,8 +250,16 @@ mod tests {
     fn register_replaces_existing_session_for_same_client_id() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        let first = registry.register("client-123".to_string(), Some("claude-code".to_string()));
-        let second = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+        let first = registry.register(
+            "client-123".to_string(),
+            Some("claude-code".to_string()),
+            None,
+        );
+        let second = registry.register(
+            "client-123".to_string(),
+            Some("claude-code".to_string()),
+            None,
+        );
 
         assert!(first.replaced_session_id.is_none());
         assert_eq!(
@@ -261,12 +279,37 @@ mod tests {
     fn deregistering_replaced_session_does_not_remove_active_replacement() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        let first = registry.register("client-123".to_string(), Some("claude-code".to_string()));
-        let second = registry.register("client-123".to_string(), Some("claude-code".to_string()));
+        let first = registry.register(
+            "client-123".to_string(),
+            Some("claude-code".to_string()),
+            None,
+        );
+        let second = registry.register(
+            "client-123".to_string(),
+            Some("claude-code".to_string()),
+            None,
+        );
 
         registry.deregister(&first.session_id);
 
         assert!(registry.session_exists(&second.session_id));
         assert_eq!(registry.count(), 1);
+    }
+
+    #[test]
+    fn registration_preserves_adapter_version_in_client_and_live_inventories() {
+        let (registry, _count_rx) = ClientRegistry::new();
+
+        registry.register(
+            "client-123".to_string(),
+            Some("claude-code".to_string()),
+            Some("0.6.5".to_string()),
+        );
+
+        assert_eq!(registry.list()[0].adapter_version.as_deref(), Some("0.6.5"));
+        assert_eq!(
+            registry.list_live_sessions()[0].adapter_version.as_deref(),
+            Some("0.6.5")
+        );
     }
 }

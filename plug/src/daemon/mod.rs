@@ -1083,6 +1083,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 session_id: snapshot.session_id,
                 client_type: snapshot.client_type,
                 client_info: None,
+                adapter_version: None,
                 connected_secs: snapshot.connected_seconds,
                 last_activity_secs: Some(snapshot.idle_seconds),
             })
@@ -1305,6 +1306,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             protocol_version,
             client_id,
             client_info,
+            adapter_version,
         } => {
             if *protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
                 return IpcResponse::Error {
@@ -1320,9 +1322,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if let Some(ref old_session) = ctx.session_id {
                 ctx.client_registry.deregister(old_session);
             }
-            let registration = ctx
-                .client_registry
-                .register(client_id.clone(), client_info.clone());
+            let registration = ctx.client_registry.register(
+                client_id.clone(),
+                client_info.clone(),
+                adapter_version.clone(),
+            );
             if let Some(ref replaced_session_id) = registration.replaced_session_id {
                 tracing::info!(
                     client_id = %client_id,
@@ -2138,8 +2142,12 @@ mod tests {
     #[test]
     fn cancellation_identity_cannot_cross_client_boundary() {
         let (registry, _count_rx) = ClientRegistry::new();
-        let first = registry.register("first-client".to_string(), Some("client".to_string()));
-        let second = registry.register("second-client".to_string(), Some("client".to_string()));
+        let first = registry.register("first-client".to_string(), Some("client".to_string()), None);
+        let second = registry.register(
+            "second-client".to_string(),
+            Some("client".to_string()),
+            None,
+        );
 
         assert!(
             reject_invalid_cancellation_identity(
@@ -2321,7 +2329,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grace_period_shuts_down_when_no_http_sessions() {
         let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None);
+        let registration = registry.register("client-1".to_string(), None, None);
 
         let daemon_cancel = CancellationToken::new();
         let grace_cancel = CancellationToken::new();
@@ -2349,7 +2357,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grace_period_rearms_when_http_sessions_drain_to_zero() {
         let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None);
+        let registration = registry.register("client-1".to_string(), None, None);
 
         let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
         let http_session_id = session_store.create_session().expect("session");
@@ -2393,7 +2401,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grace_period_ipc_reconnect_during_held_alive_resumes_watching() {
         let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None);
+        let registration = registry.register("client-1".to_string(), None, None);
 
         let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
         let _http_session_id = session_store.create_session().expect("session");
@@ -2418,7 +2426,7 @@ mod tests {
         assert!(!daemon_cancel.is_cancelled());
 
         // An IPC client reconnects while the daemon is held alive by the HTTP session.
-        let reconnect = registry.register("client-2".to_string(), None);
+        let reconnect = registry.register("client-2".to_string(), None, None);
 
         // Give the re-check loop's `count_rx.changed()` branch time to observe it.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2719,6 +2727,7 @@ mod tests {
             protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
             client_id: "client-123".to_string(),
             client_info: None,
+            adapter_version: None,
         }));
     }
 
@@ -2729,7 +2738,8 @@ mod tests {
 
         let (registry, _count_rx) = ClientRegistry::new();
         let registry = Arc::new(registry);
-        let reg_result = registry.register("test-client".to_string(), Some("test".to_string()));
+        let reg_result =
+            registry.register("test-client".to_string(), Some("test".to_string()), None);
         // Capabilities default to None for elicitation/sampling
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -2801,7 +2811,8 @@ mod tests {
 
         let (registry, _count_rx) = ClientRegistry::new();
         let registry = Arc::new(registry);
-        let reg_result = registry.register("test-client".to_string(), Some("test".to_string()));
+        let reg_result =
+            registry.register("test-client".to_string(), Some("test".to_string()), None);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let bridge = DaemonBridge {
@@ -2981,6 +2992,7 @@ mod tests {
                     protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
                     client_id: uuid::Uuid::new_v4().to_string(),
                     client_info: Some("plug-test".to_string()),
+                    adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 },
             )
             .await;
