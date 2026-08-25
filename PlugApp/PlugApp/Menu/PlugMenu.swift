@@ -27,6 +27,8 @@ struct PlugMenu: View {
         Button("Check for Updates…") { UpdateService.shared.checkForUpdates() }
         if model.adoptionIsRequired {
             Button("Use Plug") { Task { await model.adopt() } }
+        } else if model.connectionRecoveryIsRequired {
+            Button("Retry") { Task { await model.retryConnection() } }
         } else if model.installationFailure != nil {
             Button("Retry") { Task { await model.retry() } }
             if model.installationFailure?.logURL != nil {

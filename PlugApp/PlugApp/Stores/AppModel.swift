@@ -18,10 +18,9 @@ extension InstallationCoordinator: InstallationCoordinating {}
 final class AppModel {
     enum ConnectionState: Equatable { case disconnected, connecting, incompatible, ready }
 
-    static let defaultClientVersion =
-        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
-            .flatMap { $0.isEmpty ? nil : $0 }
-            ?? "development"
+    static let defaultClientVersion = PlugIPCClient.clientVersion(
+        from: Bundle.main.infoDictionary ?? [:]
+    )
 
     static let reconciliationNoticeDelay = Duration.milliseconds(300)
 
@@ -80,9 +79,14 @@ final class AppModel {
     }
 
     var isHealthy: Bool {
-        connectionState == .ready && visibleServers.allSatisfy {
+        guard case .healthy = installationState, connectionState == .ready else { return false }
+        return visibleServers.allSatisfy {
             !$0.configured.enabled || $0.health == "Healthy"
         }
+    }
+
+    var connectionRecoveryIsRequired: Bool {
+        connectionState == .incompatible
     }
 
     var installationFailure: InstallationFailure? {
@@ -135,6 +139,12 @@ final class AppModel {
         }
     }
 
+    func retryConnection() async {
+        attemptedSkewRecovery = false
+        await retry()
+        await refresh()
+    }
+
     func openLog() {
         coordinator.openLog()
     }
@@ -148,10 +158,12 @@ final class AppModel {
                 let handshake = try await ipc.connect()
                 guard handshake.ipcMin <= 4, handshake.ipcMax >= 3 else {
                     connectionState = .incompatible
+                    lastError = nil
                     return
                 }
                 guard handshake.daemonVersion == clientVersion else {
                     connectionState = .incompatible
+                    lastError = nil
                     if !attemptedSkewRecovery {
                         attemptedSkewRecovery = true
                         await retry()

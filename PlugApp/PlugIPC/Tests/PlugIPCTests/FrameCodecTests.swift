@@ -3,6 +3,18 @@ import XCTest
 @testable import PlugIPC
 
 final class FrameCodecTests: XCTestCase {
+    func testBundleClientVersionFallsBackWhenMetadataMissing() {
+        XCTAssertEqual(PlugIPCClient.clientVersion(from: [:]), "development")
+        XCTAssertEqual(
+            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "  "]),
+            "development"
+        )
+        XCTAssertEqual(
+            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "0.7.0"]),
+            "0.7.0"
+        )
+    }
+
     func testLengthPrefixedJSONRoundTrip() throws {
         let request = IPCRequest.handshake(clientVersion: "0.6.4", ipcMin: 3, ipcMax: 4)
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase

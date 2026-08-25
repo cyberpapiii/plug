@@ -35,6 +35,8 @@ struct RootView: View {
                     ServiceAdoptionNotice(model: model)
                 } else if let failure = model.installationFailure {
                     InstallationFailureNotice(model: model, failure: failure)
+                } else if model.connectionRecoveryIsRequired {
+                    ConnectionRecoveryNotice(model: model)
                 } else if let drift = model.installationDrift {
                     InstallationDriftNotice(drift: drift)
                 }

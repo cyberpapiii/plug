@@ -44,12 +44,14 @@ struct RuntimeFooter: View {
 
     private var statusColor: Color {
         if model.showsReconciliationProgress { return .orange }
+        if model.connectionRecoveryIsRequired { return .orange }
         if model.connectionState != .ready { return .red }
         return model.isHealthy ? .green : .orange
     }
 
     private var statusTitle: String {
         if model.showsReconciliationProgress { return "Updating Plug" }
+        if model.connectionRecoveryIsRequired { return "Needs reconciliation" }
         if model.connectionState != .ready { return "Not connected" }
         return model.isHealthy ? "Running normally" : "Needs attention"
     }
@@ -112,6 +114,30 @@ struct InstallationFailureNotice: View {
             if failure.logURL != nil {
                 Button("View Log") { model.openLog() }
             }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+struct ConnectionRecoveryNotice: View {
+    let model: AppModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.title3)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Plug needs reconciliation").font(.callout)
+                Text("The app and daemon do not share a compatible IPC range.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Retry") { Task { await model.retryConnection() } }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

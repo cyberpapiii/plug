@@ -35,9 +35,15 @@ public actor PlugIPCClient {
     }
 
     private static var bundleClientVersion: String {
-        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
-            .flatMap { $0.isEmpty ? nil : $0 }
-            ?? "development"
+        clientVersion(from: Bundle.main.infoDictionary ?? [:])
+    }
+
+    public static func clientVersion(from infoDictionary: [String: Any]) -> String {
+        guard let version = infoDictionary["CFBundleShortVersionString"] as? String else {
+            return "development"
+        }
+        let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "development" : trimmed
     }
 
     public static var defaultSocketURL: URL {

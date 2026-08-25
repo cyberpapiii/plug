@@ -11,6 +11,47 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.visibleServers.isEmpty)
     }
 
+    func testBundleClientVersionFallback() {
+        XCTAssertEqual(PlugIPCClient.clientVersion(from: [:]), "development")
+        XCTAssertEqual(
+            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "  "]),
+            "development"
+        )
+        XCTAssertEqual(
+            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "0.7.0"]),
+            "0.7.0"
+        )
+    }
+
+    @MainActor
+    func testInstallationStateAlwaysGatesOverallHealth() async {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try! OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            coordinator: coordinator
+        )
+        await model.start()
+        XCTAssertTrue(model.isHealthy)
+
+        let nonHealthyStates: [InstallationState] = [
+            .adoptionRequired(makeInstallationSnapshot()),
+            .reconcilingUpdate(.verifying),
+            .repairableDrift(InstallationDrift(summary: "drift", detail: "detail")),
+            .blocked(InstallationFailure(summary: "blocked", detail: "detail", logURL: nil)),
+        ]
+        for state in nonHealthyStates {
+            coordinator.state = state
+            await model.reconcile(trigger: .retry)
+            XCTAssertFalse(model.isHealthy, "\(state) must not report healthy")
+        }
+    }
+
     @MainActor func testLegacyConnectorDiscoveryOnlyTargetsPlugConnectProcesses() {
         let output = """
           101 /Users/me/.local/bin/plug connect
@@ -162,6 +203,75 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
+    func testIncompatibleIPCExposesOneRetryReconcileAction() async {
+        let events = LockedEvents()
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: events
+        )
+        let server = try! OperatorFixtureServer(events: events, ipcMin: 5, ipcMax: 6)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.6.4"),
+            coordinator: coordinator
+        )
+        await model.start()
+
+        XCTAssertEqual(model.connectionState, .incompatible)
+        XCTAssertTrue(model.connectionRecoveryIsRequired)
+        XCTAssertFalse(model.isHealthy)
+
+        await model.retryConnection()
+
+        XCTAssertTrue(events.values.contains("coordinator.retry"))
+        XCTAssertEqual(model.connectionState, .incompatible)
+        XCTAssertTrue(model.connectionRecoveryIsRequired)
+    }
+
+    @MainActor
+    func testNotificationsStaySilentInitiallyAndDeduplicateTransitions() {
+        var postedIDs: [String] = []
+        let service = NotificationService { id, _, _ in postedIDs.append(id) }
+        let empty = makeNotificationSnapshot()
+        let authenticated = makeNotificationSnapshot(authenticated: true)
+        let unauthenticated = makeNotificationSnapshot(authenticated: false)
+        let newClient = makeNotificationSnapshot(authenticated: false, includeClient: true)
+
+        service.observe(empty)
+        service.observe(empty)
+        XCTAssertTrue(postedIDs.isEmpty)
+
+        service.observe(authenticated)
+        service.observe(authenticated)
+        XCTAssertTrue(postedIDs.isEmpty)
+
+        service.observe(unauthenticated)
+        service.observe(unauthenticated)
+        XCTAssertEqual(postedIDs, ["upstream-reauth-alpha"])
+
+        service.observe(newClient)
+        service.observe(newClient)
+        XCTAssertEqual(
+            postedIDs,
+            ["upstream-reauth-alpha", "downstream-client-client-1"]
+        )
+    }
+
+    func testAppModelHasNoDirectDaemonRestartOrProcessSpawnBypass() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appending(path: "../PlugApp/Stores/AppModel.swift")
+            .standardizedFileURL
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertFalse(source.contains("DaemonServiceManager.shared"))
+        XCTAssertFalse(source.contains("restartDaemon"))
+        XCTAssertFalse(source.contains("launchctl"))
+        XCTAssertFalse(source.contains("Process("))
+    }
+
+    @MainActor
     private func makeInstallationSnapshot() -> InstallationSnapshot {
         let executable = URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug")
         let app = VerifiedAppInstallation(
@@ -192,6 +302,38 @@ final class AppModelTests: XCTestCase {
             clientRepairNeeded: false,
             shadowInstalls: []
         )
+    }
+
+    @MainActor
+    private func makeNotificationSnapshot(
+        authenticated: Bool = true,
+        includeClient: Bool = false
+    ) -> OperatorSnapshot {
+        let clientJSON = includeClient
+            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test"}]"#
+            : "[]"
+        let payload = """
+        {
+          "runtimeVersion": "0.6.4",
+          "uptimeSecs": 1,
+          "ownership": "app_managed",
+          "configuredServers": [],
+          "servers": [],
+          "liveSessions": [],
+          "clientVisibility": [],
+          "upstreamAuth": [{
+            "name": "alpha",
+            "url": null,
+            "authenticated": \(authenticated),
+            "health": "Healthy",
+            "scopes": null,
+            "tokenExpiresInSecs": null,
+            "warnings": []
+          }],
+          "downstreamClients": \(clientJSON)
+        }
+        """
+        return try! JSONDecoder().decode(OperatorSnapshot.self, from: Data(payload.utf8))
     }
 }
 
@@ -278,13 +420,22 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     private let listener: Int32
     private let events: LockedEvents
     private let daemonVersion: String
+    private let ipcMin: UInt16
+    private let ipcMax: UInt16
     private let lock = NSLock()
     private(set) var clientVersion: String?
     private var connection: Int32 = -1
 
-    init(events: LockedEvents, daemonVersion: String = "0.6.4") throws {
+    init(
+        events: LockedEvents,
+        daemonVersion: String = "0.6.4",
+        ipcMin: UInt16 = 3,
+        ipcMax: UInt16 = 4
+    ) throws {
         self.events = events
         self.daemonVersion = daemonVersion
+        self.ipcMin = ipcMin
+        self.ipcMax = ipcMax
         socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-\(UUID().uuidString).sock")
         listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
@@ -339,7 +490,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                 send(response: [
                     "type": "OperatorHandshake",
                     "handshake": [
-                        "daemon_version": daemonVersion, "ipc_min": 3, "ipc_max": 4,
+                        "daemon_version": daemonVersion, "ipc_min": ipcMin, "ipc_max": ipcMax,
                         "ownership": "app", "capabilities": [],
                     ],
                 ], to: accepted)
