@@ -29,12 +29,14 @@
 		C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */; };
 		C0196520F5563F2ED423AA31 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = BA2AF18F506896646E72E95E /* Sparkle */; };
 		D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */; };
+		D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85993E0751504BE72E97ACAC /* ClientRepairService.swift */; };
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
 		E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */; };
 		E8F55758CCD235C746771CD0 /* AppChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BB10ED3645727B693E33897 /* AppChrome.swift */; };
 		ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */; };
+		F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */; };
 		F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F74CE97E0DF2E6BB479555A /* ClientsView.swift */; };
 /* End PBXBuildFile section */
 
@@ -67,10 +69,12 @@
 		6E5390A094EAB1E48AC50E51 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		722932029558C08A810E4AF7 /* PlugApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PlugApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		85993E0751504BE72E97ACAC /* ClientRepairService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientRepairService.swift; sourceTree = "<group>"; };
 		85E7D46276FEA5FFCB9BB8F2 /* ActivityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityView.swift; sourceTree = "<group>"; };
 		8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspector.swift; sourceTree = "<group>"; };
 		907978AE95DA344593F3BCA3 /* AppModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTests.swift; sourceTree = "<group>"; };
 		9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientRepairServiceTests.swift; sourceTree = "<group>"; };
 		A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspector.swift; sourceTree = "<group>"; };
 		AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlowService.swift; sourceTree = "<group>"; };
 		B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRunner.swift; sourceTree = "<group>"; };
@@ -133,6 +137,7 @@
 			children = (
 				C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */,
 				907978AE95DA344593F3BCA3 /* AppModelTests.swift */,
+				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
 				406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */,
 				1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */,
@@ -206,6 +211,7 @@
 			children = (
 				A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */,
 				AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */,
+				85993E0751504BE72E97ACAC /* ClientRepairService.swift */,
 				66F5C1631CDEC940569658B5 /* DaemonServiceManager.swift */,
 				8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */,
 				F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */,
@@ -385,6 +391,7 @@
 			files = (
 				ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */,
 				3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */,
+				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
 				D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */,
 				D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */,
@@ -402,6 +409,7 @@
 				6BD4B241EB8557471C018CB5 /* AppModel.swift in Sources */,
 				E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */,
 				43F14541E9B4E1B33178101A /* AuthView.swift in Sources */,
+				D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */,
 				F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */,
 				150EC31CFAA673C51B37F0BC /* DaemonServiceManager.swift in Sources */,
 				41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */,

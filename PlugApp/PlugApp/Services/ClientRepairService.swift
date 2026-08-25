@@ -17,7 +17,8 @@ protocol ClientRepairing: Sendable {
 }
 
 struct ClientRepairService: ClientRepairing {
-    private static let arguments = ["repair", "--all", "--output", "json"]
+    private static let inspectArguments = ["doctor", "--output", "json"]
+    private static let repairArguments = ["repair", "--all", "--output", "json"]
 
     private let runner: any ProcessRunning
     private let timeout: Duration
@@ -31,25 +32,36 @@ struct ClientRepairService: ClientRepairing {
     }
 
     func inspect(canonicalExecutable: URL) async throws -> Bool {
-        try await execute(canonicalExecutable: canonicalExecutable).needsRepair
+        let process = try await runner.run(
+            executable: canonicalExecutable,
+            arguments: Self.inspectArguments,
+            timeout: timeout
+        )
+        guard process.status == 0 || process.status == 2 else {
+            throw commandFailed(for: process)
+        }
+
+        do {
+            return try JSONDecoder().decode(ParsedDoctorReport.self, from: process.stdout)
+                .unifiedInstall
+                .clientRepairNeeded
+        } catch {
+            throw ClientRepairError.malformedOutput
+        }
     }
 
     func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult {
-        try await execute(canonicalExecutable: canonicalExecutable).result
+        try await executeRepair(canonicalExecutable: canonicalExecutable).result
     }
 
-    private func execute(canonicalExecutable: URL) async throws -> ParsedRepairReport {
+    private func executeRepair(canonicalExecutable: URL) async throws -> ParsedRepairReport {
         let process = try await runner.run(
             executable: canonicalExecutable,
-            arguments: Self.arguments,
+            arguments: Self.repairArguments,
             timeout: timeout
         )
         guard process.status == 0 else {
-            throw ClientRepairError.commandFailed(
-                status: process.status,
-                stderr: String(decoding: process.stderr, as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            )
+            throw commandFailed(for: process)
         }
 
         do {
@@ -57,6 +69,30 @@ struct ClientRepairService: ClientRepairing {
         } catch {
             throw ClientRepairError.malformedOutput
         }
+    }
+
+    private func commandFailed(for process: ProcessResult) -> ClientRepairError {
+        .commandFailed(
+            status: process.status,
+            stderr: String(decoding: process.stderr, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+}
+
+private struct ParsedDoctorReport: Decodable {
+    let unifiedInstall: ParsedUnifiedInstall
+
+    private enum CodingKeys: String, CodingKey {
+        case unifiedInstall = "unified_install"
+    }
+}
+
+private struct ParsedUnifiedInstall: Decodable {
+    let clientRepairNeeded: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case clientRepairNeeded = "client_repair_needed"
     }
 }
 

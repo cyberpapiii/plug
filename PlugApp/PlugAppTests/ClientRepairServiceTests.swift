@@ -7,8 +7,8 @@ final class ClientRepairServiceTests: XCTestCase {
         fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"
     )
 
-    func testInspectReportsDriftWhenRustReportsAChangedClient() async throws {
-        let runner = RecordingRepairRunner(result: .success(.report(changed: [true, false])))
+    func testInspectReportsDriftFromReadOnlyDoctorContract() async throws {
+        let runner = RecordingRepairRunner(result: .success(.doctor(clientRepairNeeded: true, status: 2)))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
@@ -18,18 +18,20 @@ final class ClientRepairServiceTests: XCTestCase {
         XCTAssertEqual(calls, [
             .init(
                 executable: canonicalExecutable,
-                arguments: ["repair", "--all", "--output", "json"]
+                arguments: ["doctor", "--output", "json"]
             ),
         ])
     }
 
-    func testInspectReportsNoDriftWhenRustReportsNoChangedClients() async throws {
-        let runner = RecordingRepairRunner(result: .success(.report(changed: [false, false])))
+    func testInspectReportsNoDriftFromDoctorContract() async throws {
+        let runner = RecordingRepairRunner(result: .success(.doctor(clientRepairNeeded: false)))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
 
         XCTAssertFalse(needsRepair)
+        let calls = await runner.calls
+        XCTAssertEqual(calls.map(\.arguments), [["doctor", "--output", "json"]])
     }
 
     func testRepairAllInvokesVerifiedCanonicalExecutableAndDecodesStableReport() async throws {
@@ -70,29 +72,31 @@ final class ClientRepairServiceTests: XCTestCase {
         }
     }
 
-    func testMalformedJSONBlocksRepair() async {
-        let runner = RecordingRepairRunner(
-            result: .success(
-                ProcessResult(
-                    status: 0,
-                    stdout: Data("not-json".utf8),
-                    stderr: Data()
-                )
-            )
-        )
-        let service = ClientRepairService(runner: runner)
+    func testInspectBlocksMalformedOrMissingDoctorJSON() async {
+        let fixtures = [
+            Data("not-json".utf8),
+            Data(#"{"unified_install":{}}"#.utf8),
+            Data(#"{"checks":[],"exit_code":0}"#.utf8),
+        ]
 
-        do {
-            _ = try await service.repairAll(canonicalExecutable: canonicalExecutable)
-            XCTFail("Expected malformed JSON failure")
-        } catch let error as ClientRepairError {
-            XCTAssertEqual(error, .malformedOutput)
-        } catch {
-            XCTFail("Unexpected error: \(error)")
+        for fixture in fixtures {
+            let runner = RecordingRepairRunner(
+                result: .success(ProcessResult(status: 0, stdout: fixture, stderr: Data()))
+            )
+            let service = ClientRepairService(runner: runner)
+
+            do {
+                _ = try await service.inspect(canonicalExecutable: canonicalExecutable)
+                XCTFail("Expected malformed doctor JSON failure")
+            } catch let error as ClientRepairError {
+                XCTAssertEqual(error, .malformedOutput)
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
         }
     }
 
-    func testServiceDoesNotEditClientFiles() async throws {
+    func testInspectDoesNotEditClientFilesOrInvokeRepair() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -100,12 +104,15 @@ final class ClientRepairServiceTests: XCTestCase {
         let original = "{\"mcpServers\":{\"plug\":{\"command\":\"legacy\"}}}"
         try Data(original.utf8).write(to: clientFile)
 
-        let runner = RecordingRepairRunner(result: .success(.report(changed: [true])))
+        let runner = RecordingRepairRunner(result: .success(.doctor(clientRepairNeeded: true)))
         let service = ClientRepairService(runner: runner)
 
-        _ = try await service.repairAll(canonicalExecutable: canonicalExecutable)
+        let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
+        XCTAssertTrue(needsRepair)
 
         XCTAssertEqual(try String(contentsOf: clientFile, encoding: .utf8), original)
+        let calls = await runner.calls
+        XCTAssertEqual(calls.map(\.arguments), [["doctor", "--output", "json"]])
     }
 }
 
@@ -129,6 +136,11 @@ private actor RecordingRepairRunner: ProcessRunning {
 }
 
 private extension ProcessResult {
+    static func doctor(clientRepairNeeded: Bool, status: Int32 = 0) -> ProcessResult {
+        let json = "{\"unified_install\":{\"client_repair_needed\":\(clientRepairNeeded)}}"
+        return ProcessResult(status: status, stdout: Data(json.utf8), stderr: Data())
+    }
+
     static func report(changed: [Bool]) -> ProcessResult {
         let items = changed.enumerated().map { index, changed in
             "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(changed ? "RecognizedLegacy" : "Canonical")\",\"changed\":\(changed),\"message\":\"ok\"}"
