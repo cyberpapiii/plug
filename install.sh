@@ -309,6 +309,9 @@ main() {
     if [ "$OS" = "macos" ]; then
         error "macOS standalone CLI artifacts are not published.\nDownload and open Plug.app from the release DMG:\n  https://github.com/${PLUG_REPO}/releases\nOr install the app with Homebrew:\n  brew install --cask cyberpapiii/tap/plug-app"
     fi
+    if [ "$OS" != "linux" ]; then
+        error "Standalone Plug artifacts are currently published for Linux only."
+    fi
 
     TARGET="$(build_target)"
     info "Detected target: $TARGET"
@@ -320,14 +323,13 @@ main() {
     fi
     info "Version: $VERSION"
 
-    # Build download URLs
-    OS="$(detect_os)"
-    if [ "$OS" = "windows" ]; then
-        ARCHIVE_NAME="${PLUG_BIN}-${VERSION}-${TARGET}.zip"
-    else
-        ARCHIVE_NAME="${PLUG_BIN}-${VERSION}-${TARGET}.tar.gz"
-    fi
-    BASE_URL="https://github.com/${PLUG_REPO}/releases/download/${VERSION}"
+    # Release tags keep the v prefix, while Linux archives are stable per target.
+    case "$VERSION" in
+        v*) RELEASE_TAG="$VERSION" ;;
+        *)  RELEASE_TAG="v${VERSION}" ;;
+    esac
+    ARCHIVE_NAME="plug-mcp-${TARGET}.tar.gz"
+    BASE_URL="https://github.com/${PLUG_REPO}/releases/download/${RELEASE_TAG}"
     ARCHIVE_URL="${BASE_URL}/${ARCHIVE_NAME}"
     CHECKSUMS_URL="${BASE_URL}/checksums.sha256"
 
@@ -349,20 +351,11 @@ main() {
 
     # Extract
     info "Extracting..."
-    if [ "$OS" = "windows" ]; then
-        unzip -q "$TMP_DIR/$ARCHIVE_NAME" -d "$TMP_DIR/extracted"
-    else
-        tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR"
-    fi
+    tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR"
 
     # Find the binary
-    if [ "$OS" = "windows" ]; then
-        BIN_FILE=$(find "$TMP_DIR" -name "${PLUG_BIN}.exe" -type f | head -n1)
-        BIN_DEST_NAME="${PLUG_BIN}.exe"
-    else
-        BIN_FILE=$(find "$TMP_DIR" -name "$PLUG_BIN" -type f | head -n1)
-        BIN_DEST_NAME="$PLUG_BIN"
-    fi
+    BIN_FILE=$(find "$TMP_DIR" -name "$PLUG_BIN" -type f | head -n1)
+    BIN_DEST_NAME="$PLUG_BIN"
 
     if [ -z "$BIN_FILE" ]; then
         error "Binary not found in archive.\nArchive contents:\n$(find "$TMP_DIR" -type f | sed 's/^/  /')"

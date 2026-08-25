@@ -45,6 +45,10 @@ assert_equal_files() {
     fi
 }
 
+assert_contains "$ROOT/install.sh" 'ARCHIVE_NAME="plug-mcp-'
+assert_contains "$ROOT/install.sh" 'RELEASE_TAG="v'
+assert_absent "$ROOT/install.sh" "ARCHIVE_NAME=\"\${PLUG_BIN}-\${VERSION}-"
+
 bash "$ROOT/scripts/verify-release-workflow.sh"
 
 bash "$GENERATOR" \
