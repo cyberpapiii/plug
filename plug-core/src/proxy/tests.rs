@@ -3250,6 +3250,49 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
 }
 
 #[tokio::test]
+async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&[]);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot(&router, "Modern__tool", "modern");
+
+    let principal =
+        crate::types::PrincipalId::downstream_oauth("https://issuer.example", "client", "plug");
+    let context = DownstreamCallContext::http_for_client(
+        "modern-session",
+        RequestId::from(NumberOrString::Number(9)),
+        ClientType::Unknown,
+    )
+    .with_authorization(
+        principal,
+        crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES.map(str::to_string),
+    )
+    .with_protocol(
+        crate::protocol::ProtocolEra::Modern,
+        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+    )
+    .with_modern_direction_enabled(true);
+
+    let response = router
+        .call_tool_round_with_context(
+            CallToolRequestParams::new("Modern__tool"),
+            None,
+            Some(context),
+        )
+        .await
+        .expect("the full default grant must admit a plain modern tool call");
+
+    assert!(matches!(response, CallToolResponse::Complete(_)));
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(router.continuation_registry.len(), 0);
+}
+
+#[tokio::test]
 async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     let sm = Arc::new(ServerManager::new());
     let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));

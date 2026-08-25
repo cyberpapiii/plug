@@ -125,7 +125,7 @@ pub enum MethodFamily {
 
 /// Default downstream OAuth grant: the method families a normal MCP client
 /// exercises. Every entry must be a `MethodFamily::required_scope` string.
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 8] = [
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 9] = [
     "tools:read",
     "resources:read",
     "prompts:read",
@@ -134,6 +134,7 @@ pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 8] = [
     "subscriptions:listen",
     "logging:configure",
     "logging:read",
+    "continuations:complete",
 ];
 
 impl MethodFamily {
@@ -619,6 +620,7 @@ mod tests {
             MethodFamily::Listeners,
             MethodFamily::Logging,
             MethodFamily::LoggingRead,
+            MethodFamily::Continuations,
         ]
         .map(|family| {
             family
