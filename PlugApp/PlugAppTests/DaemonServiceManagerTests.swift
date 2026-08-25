@@ -124,6 +124,41 @@ final class DaemonServiceManagerTests: XCTestCase {
         XCTAssertEqual(backend.events.last, .resume([101, 102]))
     }
 
+    func testMissingHandshakeExecutableFailsClosedEvenWhenVersionAndBuildMatch() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 3))
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: Array(repeating: handshake("0.7.0", executable: nil), count: 2)
+        )
+        let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 1)
+
+        do {
+            _ = try await manager.ensureRunning(expectedVersion: "0.7.0")
+            XCTFail("Expected missing executable proof to fail closed")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .verificationFailed(expectedVersion: "0.7.0", actualVersion: "0.7.0"))
+        }
+    }
+
+    func testSameBuildOtherAppCopyInHandshakeFailsClosed() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let otherAppExecutable = URL(fileURLWithPath: "/Users/me/Applications/Other Plug.app/Contents/Resources/plug")
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 3))
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: Array(repeating: handshake("0.7.0", executable: otherAppExecutable), count: 2)
+        )
+        let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 1)
+
+        do {
+            _ = try await manager.ensureRunning(expectedVersion: "0.7.0")
+            XCTFail("Expected other app copy proof to fail closed")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .verificationFailed(expectedVersion: "0.7.0", actualVersion: "0.7.0"))
+        }
+    }
+
     func testUnknownJobIsRefusedWithoutBootoutOrRegistration() async throws {
         let unknown = record(label: "com.plug.daemon", path: "/tmp/not-plug", build: nil)
         let inspector = SequenceLaunchdInspector([.unknown([unknown])])
@@ -355,9 +390,10 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
     func openLoginItemSettings() {}
 }
 
-private func handshake(_ version: String) -> OperatorHandshake {
+private func handshake(_ version: String, executable: URL? = URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug")) -> OperatorHandshake {
+    let executableJSON = executable.map { "\"daemonExecutable\":\"\($0.path)\", " } ?? ""
     let json = """
-    {"daemonVersion":"\(version)","ipcMin":3,"ipcMax":4,"ownership":"app","capabilities":[]}
+    {"daemonVersion":"\(version)",\(executableJSON)"ipcMin":3,"ipcMax":4,"ownership":"app","capabilities":[]}
     """
     return try! JSONDecoder().decode(OperatorHandshake.self, from: Data(json.utf8))
 }

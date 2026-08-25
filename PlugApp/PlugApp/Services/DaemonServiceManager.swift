@@ -319,6 +319,7 @@ final class DaemonServiceManager {
         return resolved(program) == resolved(canonical.executableURL)
             && record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
             && record.parentBundleVersion == canonical.buildVersion
+            && handshake.daemonExecutable.map { resolved($0) == resolved(canonical.executableURL) } == true
             && handshake.daemonVersion == expectedVersion
     }
 

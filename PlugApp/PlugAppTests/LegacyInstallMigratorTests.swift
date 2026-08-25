@@ -103,18 +103,37 @@ final class LegacyInstallMigratorTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.shellLink.path))
     }
 
-    func testCargoBinaryIsRetainedUntilExactProofThenDeleted() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
-            if arguments == ["--version"] {
-                return ProcessResult(status: 0, stdout: Data("plug 0.7.0\n".utf8), stderr: Data())
-            }
-            return ProcessResult(status: 1, stdout: Data(), stderr: Data())
+    func testUnprovenCargoBinaryIsNeverExecutedOrDeleted() async throws {
+        let runner = RecordingProcessRunner { _, _ in
+            ProcessResult(status: 0, stdout: Data("plug 0.7.0\n".utf8), stderr: Data())
         }
         let fixture = try Fixture(runner: runner)
+        try Data("legacy plug".utf8).write(to: fixture.cargo)
+        let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
+        XCTAssertNil(snapshot.cargoBinary)
+        XCTAssertTrue(snapshot.unknownPaths.contains(fixture.cargo))
+
+        let calls = await runner.calls
+        XCTAssertFalse(calls.contains { $0.executable.standardizedFileURL == fixture.cargo.standardizedFileURL })
+    }
+
+    func testCargoBinaryIsRetainedUntilExactProofThenDeleted() async throws {
+        let identity = LegacyBinaryIdentity(
+            identifier: "plug",
+            teamID: AppInstallationInspector.teamID,
+            sha256: "legacy-digest"
+        )
+        let fixture = try Fixture(
+            identityReader: { url in
+                guard (try? String(contentsOf: url, encoding: .utf8)) == "legacy plug" else { return nil }
+                return identity
+            }
+        )
         try Data("legacy plug".utf8).write(to: fixture.cargo)
         _ = try await fixture.migrator.repairShellLink(to: fixture.canonical.executableURL)
         let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
         XCTAssertEqual(snapshot.cargoBinary, fixture.cargo)
+        XCTAssertEqual(snapshot.cargoBinaryIdentity, identity)
 
         try await fixture.migrator.removeVerifiedCargoBinary(
             snapshot,
@@ -123,6 +142,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
                 embeddedVersion: "0.7.0",
                 daemonVersion: "0.6.4",
                 shellTarget: fixture.canonical.executableURL,
+                daemonExecutable: fixture.canonical.executableURL,
                 appManaged: true
             )
         )
@@ -135,6 +155,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
                 embeddedVersion: "0.7.0",
                 daemonVersion: "0.7.0",
                 shellTarget: URL(fileURLWithPath: "/tmp/plug"),
+                daemonExecutable: fixture.canonical.executableURL,
                 appManaged: true
             )
         )
@@ -147,6 +168,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
                 embeddedVersion: "0.7.0",
                 daemonVersion: "0.7.0",
                 shellTarget: fixture.canonical.executableURL,
+                daemonExecutable: fixture.canonical.executableURL,
                 appManaged: true
             )
         )
@@ -154,16 +176,17 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testCargoReplacementAfterInspectionIsNeverDeleted() async throws {
-        let runner = RecordingProcessRunner { executable, arguments in
-            guard arguments == ["--version"],
-                  let contents = try? String(contentsOf: executable, encoding: .utf8),
-                  contents == "legacy plug"
-            else {
-                return ProcessResult(status: 1, stdout: Data(), stderr: Data())
+        let identity = LegacyBinaryIdentity(
+            identifier: "plug",
+            teamID: AppInstallationInspector.teamID,
+            sha256: "legacy-digest"
+        )
+        let fixture = try Fixture(
+            identityReader: { url in
+                guard (try? String(contentsOf: url, encoding: .utf8)) == "legacy plug" else { return nil }
+                return identity
             }
-            return ProcessResult(status: 0, stdout: Data("plug 0.7.0\n".utf8), stderr: Data())
-        }
-        let fixture = try Fixture(runner: runner)
+        )
         try Data("legacy plug".utf8).write(to: fixture.cargo)
         _ = try await fixture.migrator.repairShellLink(to: fixture.canonical.executableURL)
         let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
@@ -176,6 +199,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
                 embeddedVersion: "0.7.0",
                 daemonVersion: "0.7.0",
                 shellTarget: fixture.canonical.executableURL,
+                daemonExecutable: fixture.canonical.executableURL,
                 appManaged: true
             )
         )
@@ -212,9 +236,12 @@ private final class Fixture {
     let canonical: VerifiedAppInstallation
     let migrator: LegacyInstallMigrator
 
-    init(runner: any ProcessRunning = RecordingProcessRunner { _, _ in
-        ProcessResult(status: 1, stdout: Data(), stderr: Data())
-    }) throws {
+    init(
+        runner: any ProcessRunning = RecordingProcessRunner { _, _ in
+            ProcessResult(status: 1, stdout: Data(), stderr: Data())
+        },
+        identityReader: @escaping @Sendable (URL) -> LegacyBinaryIdentity? = { _ in nil }
+    ) throws {
         root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         home = root.appending(path: "home")
         shellLink = home.appending(path: ".local/bin/plug")
@@ -236,7 +263,12 @@ private final class Fixture {
         try FileManager.default.createDirectory(at: brew.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("canonical".utf8).write(to: executable)
         try Data("brew".utf8).write(to: brew)
-        migrator = LegacyInstallMigrator(homeURL: home, brewURLs: [brew], runner: runner)
+        migrator = LegacyInstallMigrator(
+            homeURL: home,
+            brewURLs: [brew],
+            runner: runner,
+            identityReader: identityReader
+        )
     }
 
     deinit {

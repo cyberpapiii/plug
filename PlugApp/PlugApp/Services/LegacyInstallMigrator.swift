@@ -1,20 +1,46 @@
 import Darwin
 import Foundation
+import CryptoKit
+import Security
 
 struct ReconciliationProof: Sendable {
     let appVersion: String
     let embeddedVersion: String
     let daemonVersion: String
     let shellTarget: URL
+    let daemonExecutable: URL?
     let appManaged: Bool
+}
+
+struct LegacyBinaryIdentity: Equatable, Sendable {
+    let identifier: String
+    let teamID: String
+    let sha256: String
 }
 
 struct LegacyInstallSnapshot: Equatable, Sendable {
     let formulaInstalled: Bool
     let cargoBinary: URL?
+    let cargoBinaryIdentity: LegacyBinaryIdentity?
     let shellLink: ShellLinkState
     let recognizedPaths: Set<URL>
     let unknownPaths: Set<URL>
+
+    init(
+        formulaInstalled: Bool,
+        cargoBinary: URL?,
+        cargoBinaryIdentity: LegacyBinaryIdentity? = nil,
+        shellLink: ShellLinkState,
+        recognizedPaths: Set<URL>,
+        unknownPaths: Set<URL>
+    ) {
+        self.formulaInstalled = formulaInstalled
+        self.cargoBinary = cargoBinary
+        self.cargoBinaryIdentity = cargoBinaryIdentity
+        self.shellLink = shellLink
+        self.recognizedPaths = recognizedPaths
+        self.unknownPaths = unknownPaths
+    }
 }
 
 enum LegacyInstallError: Error, Equatable {
@@ -39,6 +65,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     private let homeURL: URL
     private let brewURLs: [URL]
     private let runner: any ProcessRunning
+    private let identityReader: @Sendable (URL) -> LegacyBinaryIdentity?
 
     init(
         homeURL: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -46,23 +73,25 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
             URL(fileURLWithPath: "/opt/homebrew/bin/brew"),
             URL(fileURLWithPath: "/usr/local/bin/brew"),
         ],
-        runner: any ProcessRunning = ProcessRunner()
+        runner: any ProcessRunning = ProcessRunner(),
+        identityReader: @escaping @Sendable (URL) -> LegacyBinaryIdentity? = LegacyInstallMigrator.readLegacyBinaryIdentity
     ) {
         self.homeURL = homeURL.standardizedFileURL
         self.brewURLs = brewURLs.map(\.standardizedFileURL)
         self.runner = runner
+        self.identityReader = identityReader
     }
 
     func inspect(canonical: VerifiedAppInstallation) async throws -> LegacyInstallSnapshot {
         let shellURL = homeURL.appending(path: ".local/bin/plug")
         let cargoURL = homeURL.appending(path: ".cargo/bin/plug")
         let shellState = inspectShellLink(at: shellURL, canonical: canonical.executableURL)
-        let cargoRecognized = await isPlugBinary(at: cargoURL)
+        let cargoIdentity = identityReader(cargoURL)
         let formulaInstalled = try await installedBrew() != nil
 
         var recognizedPaths = Set<URL>()
         var unknownPaths = Set<URL>()
-        if cargoRecognized {
+        if cargoIdentity != nil {
             recognizedPaths.insert(cargoURL.standardizedFileURL)
         } else if pathExists(cargoURL) {
             unknownPaths.insert(cargoURL.standardizedFileURL)
@@ -79,7 +108,8 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
 
         return LegacyInstallSnapshot(
             formulaInstalled: formulaInstalled,
-            cargoBinary: cargoRecognized ? cargoURL.standardizedFileURL : nil,
+            cargoBinary: cargoIdentity == nil ? nil : cargoURL.standardizedFileURL,
+            cargoBinaryIdentity: cargoIdentity,
             shellLink: shellState,
             recognizedPaths: recognizedPaths,
             unknownPaths: unknownPaths
@@ -144,11 +174,13 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
               proof.appVersion == proof.embeddedVersion,
               proof.embeddedVersion == proof.daemonVersion,
               snapshot.shellLink == .canonical(proof.shellTarget.standardizedFileURL),
+              proof.daemonExecutable.map({ resolved($0) == resolved(proof.shellTarget) }) == true,
               let cargo = snapshot.cargoBinary,
+              let expectedIdentity = snapshot.cargoBinaryIdentity,
               snapshot.recognizedPaths.contains(cargo.standardizedFileURL),
               cargo.standardizedFileURL == homeURL.appending(path: ".cargo/bin/plug").standardizedFileURL
         else { return }
-        guard await isPlugBinary(at: cargo) else { return }
+        guard identityReader(cargo) == expectedIdentity else { return }
         do {
             try FileManager.default.removeItem(at: cargo)
         } catch {
@@ -166,17 +198,6 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
             if result.status == 0, !result.stdout.isEmpty { return brew }
         }
         return nil
-    }
-
-    private func isPlugBinary(at url: URL) async -> Bool {
-        guard pathExists(url) else { return false }
-        guard let result = try? await runner.run(
-            executable: url,
-            arguments: ["--version"],
-            timeout: .seconds(3)
-        ) else { return false }
-        let output = String(decoding: result.stdout, as: UTF8.self)
-        return result.status == 0 && output.hasPrefix("plug ")
     }
 
     private func inspectShellLink(at link: URL, canonical: URL) -> ShellLinkState {
@@ -211,5 +232,49 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     private func pathExistsWithoutFollowing(_ url: URL) -> Bool {
         var information = stat()
         return url.path.withCString { Darwin.lstat($0, &information) } == 0
+    }
+
+    private func resolved(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private static func readLegacyBinaryIdentity(at url: URL) -> LegacyBinaryIdentity? {
+        guard isRegularFileWithoutFollowing(at: url),
+              FileManager.default.isExecutableFile(atPath: url.path)
+        else { return nil }
+
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &staticCode) == errSecSuccess,
+              let staticCode
+        else { return nil }
+
+        let requirementText = "anchor apple generic and identifier \"plug\" and certificate leaf[subject.OU] = \"\(AppInstallationInspector.teamID)\""
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
+              let requirement,
+              SecStaticCodeCheckValidity(staticCode, [], requirement) == errSecSuccess
+        else { return nil }
+
+        var signingInformation: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &signingInformation) == errSecSuccess,
+              let information = signingInformation as? [String: Any],
+              let identifier = information[kSecCodeInfoIdentifier as String] as? String,
+              let teamID = information[kSecCodeInfoTeamIdentifier as String] as? String,
+              teamID == AppInstallationInspector.teamID,
+              identifier == "plug",
+              let data = try? Data(contentsOf: url)
+        else { return nil }
+
+        return LegacyBinaryIdentity(
+            identifier: identifier,
+            teamID: teamID,
+            sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        )
+    }
+
+    private static func isRegularFileWithoutFollowing(at url: URL) -> Bool {
+        var information = stat()
+        guard url.path.withCString({ Darwin.lstat($0, &information) }) == 0 else { return false }
+        return (information.st_mode & S_IFMT) == S_IFREG
     }
 }

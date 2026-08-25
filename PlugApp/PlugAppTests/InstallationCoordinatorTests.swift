@@ -522,6 +522,7 @@ final class InstallationCoordinatorTests: XCTestCase {
     ) -> OperatorHandshake {
         let data = try! JSONSerialization.data(withJSONObject: [
             "daemonVersion": version,
+            "daemonExecutable": canonical.executableURL.path,
             "ipcMin": ipcMin,
             "ipcMax": ipcMax,
             "ownership": ownership,
@@ -698,6 +699,7 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
 private func makeHandshake(version: String) -> OperatorHandshake {
     let data = try! JSONSerialization.data(withJSONObject: [
         "daemonVersion": version,
+        "daemonExecutable": "/Applications/Plug.app/Contents/Resources/plug",
         "ipcMin": 3,
         "ipcMax": 4,
         "ownership": "app_managed",

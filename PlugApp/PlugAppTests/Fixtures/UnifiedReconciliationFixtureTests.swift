@@ -260,7 +260,17 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             real: LegacyInstallMigrator(
                 homeURL: fixture.homeURL,
                 brewURLs: [fixture.brewURL],
-                runner: runner
+                runner: runner,
+                identityReader: { url in
+                    guard url.standardizedFileURL == fixture.cargoURL.standardizedFileURL,
+                          (try? String(contentsOf: url, encoding: .utf8)) == "legacy plug \(fixture.legacyVersion)\n"
+                    else { return nil }
+                    return LegacyBinaryIdentity(
+                        identifier: "plug",
+                        teamID: AppInstallationInspector.teamID,
+                        sha256: "fixture-cargo"
+                    )
+                }
             ),
             formulaURL: fixture.formulaURL,
             interruptions: interruptions
@@ -275,12 +285,15 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             executableURL: fixture.canonical.executableURL,
             homeURL: fixture.homeURL,
             socketURL: fixture.ipcSocketURL,
-            enabled: fixture.mode == .legacy
+            enabled: fixture.mode == .legacy,
+            daemonVersion: fixture.version
         )
         let backend = FixtureDaemonBackend(
             enabled: fixture.mode == .fresh,
             legacyVersion: fixture.legacyVersion,
             currentVersion: fixture.version,
+            legacyExecutable: fixture.cargoURL,
+            currentExecutable: fixture.canonical.executableURL,
             launchd: launchd,
             connector: connector
         )
@@ -713,12 +726,6 @@ private actor FixtureProcessRunner: ProcessRunning {
             }
         }
 
-        if executable == cargoURL, arguments == ["--version"] {
-            return FileManager.default.fileExists(atPath: cargoURL.path)
-                ? ProcessResult(status: 0, stdout: Data("plug \(version)\n".utf8), stderr: Data())
-                : ProcessResult(status: 1, stdout: Data(), stderr: Data())
-        }
-
         if executable == canonicalExecutable {
             if arguments == ["doctor", "--output", "json"] {
                 let json = "{\"unified_install\":{\"client_repair_needed\":\(clientNeedsRepair)}}"
@@ -774,6 +781,7 @@ private struct FixtureLegacyMigrator: LegacyInstallMigrating {
         return LegacyInstallSnapshot(
             formulaInstalled: observed.formulaInstalled,
             cargoBinary: observed.cargoBinary,
+            cargoBinaryIdentity: observed.cargoBinaryIdentity,
             shellLink: observed.shellLink,
             recognizedPaths: recognized,
             unknownPaths: observed.unknownPaths
@@ -843,6 +851,8 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     private let outputCondition = NSCondition()
     private let workerGroup = DispatchGroup()
     private let process: Process?
+    private let executableURL: URL?
+    private let daemonVersion: String?
     private let input: FileHandle?
     private let outputWrite: FileHandle?
     private let errorWrite: FileHandle?
@@ -872,10 +882,13 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         executableURL: URL,
         homeURL: URL,
         socketURL: URL,
-        enabled: Bool
+        enabled: Bool,
+        daemonVersion: String
     ) throws {
         guard enabled else {
             process = nil
+            self.executableURL = nil
+            self.daemonVersion = nil
             input = nil
             outputWrite = nil
             errorWrite = nil
@@ -889,6 +902,8 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         }
 
         self.socketURL = socketURL.standardizedFileURL
+        self.executableURL = executableURL.standardizedFileURL
+        self.daemonVersion = daemonVersion
         let listener = try Self.makeListener(path: socketURL.path)
         self.listener = listener
         socketOwned = true
@@ -1292,6 +1307,19 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             requestStorage.append(method.map { "\(type):\($0)" } ?? type)
             lock.unlock()
             switch type {
+            case "OperatorHandshake":
+                guard let executableURL, let daemonVersion else { break }
+                Self.sendJSON([
+                    "type": "OperatorHandshake",
+                    "handshake": [
+                        "daemon_version": daemonVersion,
+                        "daemon_executable": executableURL.path,
+                        "ipc_min": 3,
+                        "ipc_max": 4,
+                        "ownership": "app_managed",
+                        "capabilities": [],
+                    ],
+                ], to: connection)
             case "Register":
                 lock.lock()
                 registerStorage += 1
@@ -1463,6 +1491,8 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     var serviceStatus: SMAppService.Status { enabled ? .enabled : .notRegistered }
     private let legacyVersion: String
     private let currentVersion: String
+    private let legacyExecutable: URL
+    private let currentExecutable: URL
     private let launchd: FixtureLaunchdTimeline
     private let connector: FixtureConnectorReplay
     private(set) var events: [Event] = []
@@ -1478,12 +1508,16 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
         enabled: Bool,
         legacyVersion: String,
         currentVersion: String,
+        legacyExecutable: URL,
+        currentExecutable: URL,
         launchd: FixtureLaunchdTimeline,
         connector: FixtureConnectorReplay
     ) {
         self.enabled = enabled
         self.legacyVersion = legacyVersion
         self.currentVersion = currentVersion
+        self.legacyExecutable = legacyExecutable
+        self.currentExecutable = currentExecutable
         self.launchd = launchd
         self.connector = connector
     }
@@ -1521,7 +1555,10 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     func handshake() async throws -> OperatorHandshake {
         let version = enabled ? currentVersion : legacyVersion
         events.append(.handshake(version))
-        return fixtureHandshake(version: version)
+        return fixtureHandshake(
+            version: version,
+            executable: enabled ? currentExecutable : legacyExecutable
+        )
     }
 
     func waitBeforeRetry() async {}
@@ -1529,9 +1566,10 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     func openLoginItemSettings() {}
 }
 
-private func fixtureHandshake(version: String) -> OperatorHandshake {
+private func fixtureHandshake(version: String, executable: URL) -> OperatorHandshake {
     let data = try! JSONSerialization.data(withJSONObject: [
         "daemonVersion": version,
+        "daemonExecutable": executable.path,
         "ipcMin": 3,
         "ipcMax": 4,
         "ownership": "app_managed",

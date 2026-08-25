@@ -168,6 +168,7 @@ final class InstallationCoordinator {
                 embeddedVersion: canonical.embeddedVersion,
                 daemonVersion: handshake.daemonVersion,
                 shellTarget: canonical.executableURL.standardizedFileURL,
+                daemonExecutable: handshake.daemonExecutable?.standardizedFileURL,
                 appManaged: handshake.ownership == Self.appManagedOwnership
             )
             try requireExactProof(
@@ -383,6 +384,7 @@ final class InstallationCoordinator {
         LegacyInstallSnapshot(
             formulaInstalled: formulaInstalled ?? snapshot.formulaInstalled,
             cargoBinary: snapshot.cargoBinary,
+            cargoBinaryIdentity: snapshot.cargoBinaryIdentity,
             shellLink: shellLink ?? snapshot.shellLink,
             recognizedPaths: snapshot.recognizedPaths,
             unknownPaths: snapshot.unknownPaths
@@ -408,6 +410,7 @@ final class InstallationCoordinator {
         guard proof.appManaged,
               handshake.ownership == Self.appManagedOwnership,
               isCompatible(handshake),
+              handshake.daemonExecutable.map({ samePath($0, canonical.executableURL) }) == true,
               proof.appVersion == canonical.appVersion,
               proof.embeddedVersion == canonical.embeddedVersion,
               proof.daemonVersion == canonical.appVersion,
