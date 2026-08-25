@@ -27,10 +27,10 @@ final class NotificationService {
             )
         }
 
-        let oldClients = Set(previous.downstreamClients.map(\.clientID))
-        for client in snapshot.downstreamClients where !oldClients.contains(client.clientID) {
+        let oldClients = Set(previous.downstreamClients.map(\.clientId))
+        for client in snapshot.downstreamClients where !oldClients.contains(client.clientId) {
             post(
-                id: "downstream-client-\(client.clientID)",
+                id: "downstream-client-\(client.clientId)",
                 title: "New client connected",
                 body: "\(client.clientName) can now use Plug."
             )

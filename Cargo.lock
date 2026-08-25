@@ -2389,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "plug-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "plug-mcp"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2484,7 +2484,7 @@ dependencies = [
 
 [[package]]
 name = "plug-test-harness"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

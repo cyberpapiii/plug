@@ -25,7 +25,7 @@ public actor PlugIPCClient {
 
     public func connect() throws -> OperatorHandshake {
         if descriptor < 0 { descriptor = try Self.openSocket(path: socketURL.path) }
-        let response = try request(.handshake(clientVersion: "0.5.2", ipcMin: 3, ipcMax: 4))
+        let response = try request(.handshake(clientVersion: "0.5.3", ipcMin: 3, ipcMax: 4))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         return handshake
     }
@@ -51,26 +51,35 @@ public actor PlugIPCClient {
         if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 }
     }
 
-    private static func openSocket(path: String) throws -> Int32 {
+    static func openSocket(path: String) throws -> Int32 {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        var address = sockaddr_un(); address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8CString)
-        guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
-            Darwin.close(fd); throw PlugIPCError.socketPathTooLong
-        }
-        bytes.withUnsafeBytes { source in
-            withUnsafeMutableBytes(of: &address) { destination in
-                destination[MemoryLayout<sa_family_t>.size...].copyBytes(from: source)
-            }
-        }
+        var (address, addressLength) = try unixSocketAddress(path: path)
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                Darwin.connect(fd, $0, addressLength)
             }
         }
         guard result == 0 else { let code = errno; Darwin.close(fd); throw PlugIPCError.systemCall("connect", code) }
         return fd
+    }
+
+    static func unixSocketAddress(path: String) throws -> (sockaddr_un, socklen_t) {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8CString)
+        guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
+            throw PlugIPCError.socketPathTooLong
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { destination in
+            bytes.withUnsafeBytes { source in
+                destination.copyBytes(from: source)
+            }
+        }
+        let headerLength = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
+        let addressLength = headerLength + bytes.count
+        address.sun_len = UInt8(addressLength)
+        return (address, socklen_t(addressLength))
     }
 
     private static func writeAll(_ data: Data, to fd: Int32) throws {

@@ -19,11 +19,11 @@ struct ClientsView: View {
             }
             Section("Remote grants") {
                 ForEach(model.snapshot.downstreamClients) { client in
-                    VStack(alignment: .leading) { Text(client.clientName); Text(client.clientID).font(.caption).foregroundStyle(.secondary) }
+                    VStack(alignment: .leading) { Text(client.clientName); Text(client.clientId).font(.caption).foregroundStyle(.secondary) }
                 }
                 if model.snapshot.downstreamClients.isEmpty { Text("No remote clients authorized").foregroundStyle(.secondary) }
             }
         }.navigationTitle("Clients")
     }
-    private func visibleCount(_ sessionID: String) -> Int { model.snapshot.clientVisibility.first { $0.sessionID == sessionID }?.visibleToolCount ?? 0 }
+    private func visibleCount(_ sessionID: String) -> Int { model.snapshot.clientVisibility.first { $0.sessionId == sessionID }?.visibleToolCount ?? 0 }
 }
