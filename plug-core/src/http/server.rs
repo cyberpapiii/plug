@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2424,6 +2425,8 @@ async fn handle_request(
                     }),
             };
             let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
+            let downstream_target = downstream.notification_target();
+            let mut modern_notifications = modern.then(|| state.router.subscribe_notifications());
             let mut cancellation_guard = HttpRequestCancellationGuard {
                 router: Arc::clone(&state.router),
                 context: downstream,
@@ -2487,6 +2490,12 @@ async fn handle_request(
                     Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
                 };
             cancellation_guard.disarm();
+            if let Some(receiver) = modern_notifications.as_mut() {
+                let notifications = drain_targeted_notifications(receiver, &downstream_target);
+                if !notifications.is_empty() {
+                    return modern_sse_response(&notifications, &response_msg);
+                }
+            }
             json_response_for_era(&response_msg, era)
         }
 
@@ -3135,6 +3144,75 @@ fn json_response_for_era(
     Ok(response)
 }
 
+fn drain_targeted_notifications(
+    receiver: &mut tokio::sync::broadcast::Receiver<ProtocolNotification>,
+    target: &NotificationTarget,
+) -> Vec<ProtocolNotification> {
+    let mut notifications = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(notification) => {
+                let addressed_here = matches!(
+                    crate::notifications::fanout::resolve(
+                        crate::notifications::fanout::classify(&notification)
+                    ),
+                    crate::notifications::fanout::ResolvedDelivery::ToTarget(candidate)
+                        if candidate == target
+                );
+                if addressed_here {
+                    notifications.push(notification);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+        }
+    }
+    notifications
+}
+
+/// Return modern server notifications and the final JSON-RPC response on one
+/// finite SSE stream. Streamable HTTP has no session-wide GET channel in the
+/// modern era, so request-scoped progress must travel on the POST response.
+fn modern_sse_response(
+    notifications: &[ProtocolNotification],
+    response_message: &ServerJsonRpcMessage,
+) -> Result<Response, HttpError> {
+    use axum::response::sse::{Event, Sse};
+
+    let mut payloads = notifications
+        .iter()
+        .map(ProtocolNotification::to_server_jsonrpc_message)
+        .map(|message| {
+            serde_json::to_string(&message).map_err(|error| {
+                HttpError::Internal(format!("failed to serialize SSE event: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    payloads.push(serde_json::to_string(response_message).map_err(|error| {
+        HttpError::Internal(format!("failed to serialize SSE response: {error}"))
+    })?);
+
+    let stream = futures::stream::iter(
+        payloads
+            .into_iter()
+            .map(|payload| Ok::<Event, Infallible>(Event::default().data(payload))),
+    );
+    let mut response = Sse::new(stream).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        PROTOCOL_VERSION_HEADER,
+        HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+    );
+    Ok(response)
+}
+
 fn json_response_with_session(
     session_id: &str,
     msg: &ServerJsonRpcMessage,
@@ -3163,6 +3241,40 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    #[test]
+    fn modern_tool_call_deserialization_preserves_progress_metadata() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "test_tool_with_progress",
+                "arguments": {},
+                "_meta": {
+                    "progressToken": "progress-test-1",
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .expect("modern tool call");
+
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("request")
+        };
+        let ClientRequest::CallToolRequest(call) = request.request else {
+            panic!("tools/call")
+        };
+        assert_eq!(
+            call.extensions
+                .get::<RequestMetaObject>()
+                .and_then(RequestMetaObject::get_progress_token),
+            Some(ProgressToken(NumberOrString::String(Arc::from(
+                "progress-test-1"
+            ))))
+        );
+    }
 
     fn isolated_oauth_manager(
         scopes: Vec<String>,
@@ -3194,6 +3306,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -3450,6 +3563,7 @@ mod tests {
 
     fn test_state() -> Arc<HttpState> {
         test_state_with_router_config(crate::proxy::RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -4813,6 +4927,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -5087,6 +5202,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -5277,6 +5393,7 @@ mod tests {
     #[tokio::test]
     async fn http_tools_list_uses_meta_tool_mode_surface() {
         let state = test_state_with_router_config(crate::proxy::RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -6152,6 +6269,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -6278,6 +6396,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -6339,6 +6458,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -6400,6 +6520,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -7611,6 +7732,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -7667,6 +7789,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),
@@ -8278,6 +8401,7 @@ mod tests {
         let router = Arc::new(ToolRouter::new(
             sm,
             crate::proxy::RouterConfig {
+                enable_prefix: true,
                 prefix_delimiter: "__".to_string(),
                 priority_tools: Vec::new(),
                 disabled_tools: Vec::new(),

@@ -472,7 +472,8 @@ async fn check_tool_collisions(config: &Config) -> CheckResult {
     let message = if config.enable_prefix {
         "Tool prefixing is enabled — collisions are avoided".to_string()
     } else {
-        "Tool prefixing is always on in v0.1; `enable_prefix = false` is ignored".to_string()
+        "Tool prefixing is disabled; duplicate names fall back to server-qualified names"
+            .to_string()
     };
 
     CheckResult {

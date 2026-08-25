@@ -112,13 +112,19 @@ Partial on `main`:
 
 - daemon continuity recovery is proven narrowly for stdio-over-IPC reconnect, not as full cross-transport persistence
 - some low-priority internal simplification remains possible in reload/session helpers, but no roadmap-critical correctness work remains open
-- official modern npm conformance remains opt-in evidence (`0.2.0-alpha.10`); use mock `--official-modern-fixture` plus `enable_prefix = false` for suite content rows; elicitation/sampling/progress/logging fixture rows stay expected-fail until reverse-request fixture coverage lands
+- official modern npm conformance remains opt-in prerelease evidence (`0.2.0-alpha.10`), not a stable ecosystem certification
 
 ## What Exists Off-Main
 
 No roadmap-relevant downstream OAuth work currently exists only off-main. The
 owner-passkey implementation was merged by `8adbcd1`, pushed to `origin/main`,
 installed as a signed local binary, and started as the shared daemon.
+
+The `codex/plug-macos-app` branch adds a native menu-bar operator app and closes
+the active official modern server suite at 22 passed, 0 failed. It also fixes
+request-scoped progress streaming, concrete resource-template routing, and the
+documented `enable_prefix = false` behavior. These remain **exists off-main**
+until the branch is merged.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. Modern listeners, mixed-era

@@ -713,6 +713,11 @@ impl ServerHandler for OfficialModernFixture {
                     "Official suite mixed content tool",
                     Self::empty_object_schema(),
                 ),
+                Self::tool(
+                    "test_tool_with_progress",
+                    "Official suite progress tool",
+                    Self::empty_object_schema(),
+                ),
             ];
             Ok(ListToolsResult::with_all_items(tools))
         }
@@ -721,7 +726,7 @@ impl ServerHandler for OfficialModernFixture {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         async move {
             match request.name.as_ref() {
@@ -769,6 +774,33 @@ impl ServerHandler for OfficialModernFixture {
                     ])
                     .into())
                 }
+                "test_tool_with_progress" => {
+                    // RMCP 3.x materializes wire-level `params._meta` on the
+                    // request context, not the typed params. Read the token
+                    // from its canonical runtime home just like a real modern
+                    // server would.
+                    if let Some(token) = context.meta.get_progress_token() {
+                        for progress in [0.0, 50.0, 100.0] {
+                            context
+                                .peer
+                                .notify_progress(
+                                    ProgressNotificationParam::new(token.clone(), progress)
+                                        .with_total(100.0),
+                                )
+                                .await
+                                .map_err(|error| {
+                                    McpError::internal_error(error.to_string(), None)
+                                })?;
+                            if progress < 100.0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        "Progress tool execution completed.",
+                    )])
+                    .into())
+                }
                 other => Err(McpError::invalid_params(
                     format!("unknown official fixture tool: {other}"),
                     None,
@@ -811,11 +843,32 @@ impl ServerHandler for OfficialModernFixture {
                         .with_mime_type("image/png"),
                 ])
                 .into()),
+                "test://template/123/data" => Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(
+                        r#"{"id":"123","templateTest":true,"data":"Data for ID: 123"}"#,
+                        "test://template/123/data",
+                    )
+                    .with_mime_type("application/json"),
+                ])
+                .into()),
                 other => Err(McpError::resource_not_found(
                     format!("unknown official fixture resource: {other}"),
                     Some(serde_json::json!({"uri": other})),
                 )),
             }
+        }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        async move {
+            Ok(ListResourceTemplatesResult::with_all_items(vec![
+                ResourceTemplate::new("test://template/{id}/data", "test_template")
+                    .with_mime_type("application/json"),
+            ]))
         }
     }
 

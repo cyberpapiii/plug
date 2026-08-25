@@ -1549,6 +1549,7 @@ async fn test_proxy_handler_refresh_tools_empty() {
     let handler = ProxyHandler::new(
         sm,
         plug_core::proxy::RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -1770,6 +1771,7 @@ fn test_proxy_handler_get_info() {
     let handler = ProxyHandler::new(
         sm,
         plug_core::proxy::RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -1812,6 +1814,7 @@ fn test_resources_capability_omitted_until_upstream_support() {
     let handler = ProxyHandler::new(
         sm,
         plug_core::proxy::RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -1837,6 +1840,7 @@ fn test_prompts_not_advertised() {
     let handler = ProxyHandler::new(
         sm,
         plug_core::proxy::RouterConfig {
+            enable_prefix: true,
             prefix_delimiter: "__".to_string(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
