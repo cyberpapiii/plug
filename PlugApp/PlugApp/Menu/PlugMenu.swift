@@ -25,8 +25,13 @@ struct PlugMenu: View {
         Button("Open Plug") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
         Button("Refresh") { Task { await model.refresh() } }
         Button("Check for Updates…") { UpdateService.shared.checkForUpdates() }
-        if model.connectionState == .disconnected {
-            Button("Start Plug") { Task { await model.restartDaemon() } }
+        if model.adoptionIsRequired {
+            Button("Use Plug") { Task { await model.adopt() } }
+        } else if model.installationFailure != nil {
+            Button("Retry") { Task { await model.retry() } }
+            if model.installationFailure?.logURL != nil {
+                Button("View Log") { model.openLog() }
+            }
         }
         Divider()
         Button("Quit Plug") { NSApp.terminate(nil) }

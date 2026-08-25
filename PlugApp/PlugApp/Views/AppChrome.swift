@@ -43,13 +43,31 @@ struct RuntimeFooter: View {
     }
 
     private var statusColor: Color {
+        if model.showsReconciliationProgress { return .orange }
         if model.connectionState != .ready { return .red }
         return model.isHealthy ? .green : .orange
     }
 
     private var statusTitle: String {
+        if model.showsReconciliationProgress { return "Updating Plug" }
         if model.connectionState != .ready { return "Not connected" }
         return model.isHealthy ? "Running normally" : "Needs attention"
+    }
+}
+
+struct ReconciliationProgressNotice: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Finishing Plug update…")
+                .font(.callout)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
@@ -68,8 +86,56 @@ struct ServiceAdoptionNotice: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Use Plug") { Task { await model.adoptDaemon() } }
+            Button("Use Plug") { Task { await model.adopt() } }
                 .buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+struct InstallationFailureNotice: View {
+    let model: AppModel
+    let failure: InstallationFailure
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.title3)
+                .foregroundStyle(.orange)
+            Text(failure.summary)
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Retry") { Task { await model.retry() } }
+            if failure.logURL != nil {
+                Button("View Log") { model.openLog() }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+struct InstallationDriftNotice: View {
+    let drift: InstallationDrift
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "questionmark.circle")
+                .font(.title3)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(drift.summary).font(.callout)
+                Text(drift.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

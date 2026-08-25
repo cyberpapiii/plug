@@ -4,18 +4,40 @@ import Foundation
 public actor PlugIPCClient {
     private var descriptor: Int32 = -1
     private let socketURL: URL
+    private let clientVersion: String
     private let requestTimeout: TimeInterval
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
     public init(
         socketURL: URL = PlugIPCClient.defaultSocketURL,
+        clientVersion: String,
         requestTimeout: TimeInterval = 3
     ) {
         self.socketURL = socketURL
+        self.clientVersion = clientVersion
         self.requestTimeout = min(60, max(0.001, requestTimeout))
         encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+    }
+
+    // Keep package-level callers source-compatible while app callers pass the
+    // installed bundle version explicitly.
+    public init(
+        socketURL: URL = PlugIPCClient.defaultSocketURL,
+        requestTimeout: TimeInterval = 3
+    ) {
+        self.init(
+            socketURL: socketURL,
+            clientVersion: Self.bundleClientVersion,
+            requestTimeout: requestTimeout
+        )
+    }
+
+    private static var bundleClientVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "development"
     }
 
     public static var defaultSocketURL: URL {
@@ -32,7 +54,7 @@ public actor PlugIPCClient {
         if descriptor < 0 {
             descriptor = try Self.openSocket(path: socketURL.path, requestTimeout: requestTimeout)
         }
-        let response = try request(.handshake(clientVersion: "0.6.4", ipcMin: 3, ipcMax: 4))
+        let response = try request(.handshake(clientVersion: clientVersion, ipcMin: 3, ipcMax: 4))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         return handshake
     }

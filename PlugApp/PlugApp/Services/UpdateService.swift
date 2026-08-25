@@ -14,6 +14,9 @@ final class UpdateService {
     var canCheckForUpdates: Bool { controller.updater.canCheckForUpdates }
 
     func checkForUpdates() {
+        guard canCheckForUpdates else { return }
+        // Sparkle owns app replacement and relaunch. Startup reconciliation is
+        // the only commit point for bringing the embedded daemon into sync.
         controller.checkForUpdates(nil)
     }
 }
