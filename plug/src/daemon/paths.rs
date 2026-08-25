@@ -124,6 +124,16 @@ pub(crate) fn runtime_paths_test_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 pub fn socket_path() -> PathBuf {
+    // The app's signed-app reconciliation fixture runs the real `plug connect`
+    // adapter against an isolated Unix socket. Keep this seam deliberately
+    // narrow: only the socket endpoint is injectable; production continues to
+    // use the normal per-user runtime directory for every other daemon path.
+    if let Ok(path) = std::env::var("PLUG_SOCKET_PATH") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
     runtime_dir().join("plug.sock")
 }
 
