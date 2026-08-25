@@ -97,6 +97,30 @@ pub enum IpcRequest {
         limit: usize,
         failures_only: bool,
     },
+    ValidateServer {
+        auth_token: String,
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    AddServer {
+        auth_token: String,
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    UpdateServer {
+        auth_token: String,
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    RemoveServer {
+        auth_token: String,
+        name: String,
+    },
+    SetServerEnabled {
+        auth_token: String,
+        name: String,
+        enabled: bool,
+    },
 
     /// Restart a specific upstream server.
     RestartServer {
@@ -104,10 +128,14 @@ pub enum IpcRequest {
         auth_token: String,
     },
     /// Reload configuration from disk.
-    Reload { auth_token: String },
+    Reload {
+        auth_token: String,
+    },
 
     /// Graceful daemon shutdown.
-    Shutdown { auth_token: String },
+    Shutdown {
+        auth_token: String,
+    },
 
     /// Register a new proxy client session with the daemon.
     /// Returns `Registered` with an assigned session ID.
@@ -121,7 +149,9 @@ pub enum IpcRequest {
     },
 
     /// Deregister a proxy client session (clean disconnect).
-    Deregister { session_id: String },
+    Deregister {
+        session_id: String,
+    },
 
     /// Update a session's client info (sent after MCP initialize handshake).
     UpdateSession {
@@ -130,7 +160,9 @@ pub enum IpcRequest {
     },
 
     /// Liveness probe for long-lived proxy connections.
-    Ping { session_id: String },
+    Ping {
+        session_id: String,
+    },
 
     /// List all available tools across all servers.
     ListTools,
@@ -139,9 +171,13 @@ pub enum IpcRequest {
     /// List live downstream sessions with explicit transport/scope.
     ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
-    Capabilities { session_id: String },
+    Capabilities {
+        session_id: String,
+    },
     /// Query the daemon-authoritative modern downstream gate.
-    ModernDownstreamGate { session_id: String },
+    ModernDownstreamGate {
+        session_id: String,
+    },
 
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
@@ -230,6 +266,32 @@ impl fmt::Debug for IpcRequest {
                 .field("after_sequence", after_sequence)
                 .field("limit", limit)
                 .field("failures_only", failures_only)
+                .finish(),
+            Self::ValidateServer { name, .. } => f
+                .debug_struct("ValidateServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::AddServer { name, .. } => f
+                .debug_struct("AddServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::UpdateServer { name, .. } => f
+                .debug_struct("UpdateServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::RemoveServer { name, .. } => f
+                .debug_struct("RemoveServer")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::SetServerEnabled { name, enabled, .. } => f
+                .debug_struct("SetServerEnabled")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .field("enabled", enabled)
                 .finish(),
             Self::RestartServer { server_id, .. } => f
                 .debug_struct("RestartServer")
@@ -587,6 +649,13 @@ pub enum IpcResponse {
     ActivitySnapshot {
         events: Vec<crate::activity::ActivityEvent>,
     },
+    ServerValidated {
+        server: crate::operator::OperatorServerSummary,
+    },
+    OperatorMutation {
+        result: crate::operator::OperatorMutationResult,
+        reload: crate::reload::ReloadReport,
+    },
     /// Status response with server info, client count, and uptime.
     Status {
         servers: Vec<ServerStatus>,
@@ -739,6 +808,11 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::Shutdown { .. }
             | IpcRequest::InjectToken { .. }
             | IpcRequest::ActivitySnapshot { .. }
+            | IpcRequest::ValidateServer { .. }
+            | IpcRequest::AddServer { .. }
+            | IpcRequest::UpdateServer { .. }
+            | IpcRequest::RemoveServer { .. }
+            | IpcRequest::SetServerEnabled { .. }
     )
 }
 
@@ -750,6 +824,11 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::Shutdown { auth_token, .. }
         | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
         IpcRequest::ActivitySnapshot { auth_token, .. } => Some(auth_token.as_str()),
+        IpcRequest::ValidateServer { auth_token, .. }
+        | IpcRequest::AddServer { auth_token, .. }
+        | IpcRequest::UpdateServer { auth_token, .. }
+        | IpcRequest::RemoveServer { auth_token, .. }
+        | IpcRequest::SetServerEnabled { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -1221,6 +1300,10 @@ mod tests {
             after_sequence: 0,
             limit: 500,
             failures_only: false,
+        }));
+        assert!(requires_auth(&IpcRequest::RemoveServer {
+            auth_token: "t".to_string(),
+            name: "server".to_string(),
         }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)

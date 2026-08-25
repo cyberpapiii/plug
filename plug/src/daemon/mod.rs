@@ -1036,6 +1036,23 @@ async fn handle_reverse_request(
     Ok(())
 }
 
+async fn dispatch_operator_mutation(
+    ctx: &ConnectionContext,
+    mutation: plug_core::operator::OperatorMutation,
+) -> IpcResponse {
+    match ctx
+        .engine
+        .apply_operator_mutation(&ctx.config_path, mutation)
+        .await
+    {
+        Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
+        Err(error) => IpcResponse::Error {
+            code: "OPERATOR_MUTATION_FAILED".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Dispatch a single IPC request to the appropriate Engine query.
 async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     fn downstream_http_live_sessions(
@@ -1087,7 +1104,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
                 ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
                 ownership: plug_core::ipc::DaemonOwnershipMode::Unmanaged,
-                capabilities: Vec::new(),
+                capabilities: vec![
+                    plug_core::ipc::OperatorCapability::ServerMutation,
+                    plug_core::ipc::OperatorCapability::ConfigMutation,
+                    plug_core::ipc::OperatorCapability::ActivityStream,
+                ],
             },
         },
         IpcRequest::ActivitySnapshot {
@@ -1104,6 +1125,52 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             ),
         },
+        IpcRequest::ValidateServer { name, server, .. } => {
+            match ctx.engine.validate_server_draft(name, server) {
+                Ok(server) => IpcResponse::ServerValidated { server },
+                Err(error) => IpcResponse::Error {
+                    code: "INVALID_SERVER".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
+        IpcRequest::AddServer { name, server, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::AddServer {
+                    name: name.clone(),
+                    server: *server.clone(),
+                },
+            )
+            .await
+        }
+        IpcRequest::UpdateServer { name, server, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::UpdateServer {
+                    name: name.clone(),
+                    server: *server.clone(),
+                },
+            )
+            .await
+        }
+        IpcRequest::RemoveServer { name, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::RemoveServer { name: name.clone() },
+            )
+            .await
+        }
+        IpcRequest::SetServerEnabled { name, enabled, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::SetServerEnabled {
+                    name: name.clone(),
+                    enabled: *enabled,
+                },
+            )
+            .await
+        }
         IpcRequest::RestartServer { server_id, .. } => {
             match ctx.engine.restart_server(server_id).await {
                 Ok(()) => IpcResponse::Ok,
