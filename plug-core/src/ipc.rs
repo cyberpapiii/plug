@@ -43,6 +43,35 @@ impl fmt::Debug for IpcCancellationCapability {
 }
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
+pub const OPERATOR_IPC_MIN: u16 = 3;
+pub const OPERATOR_IPC_MAX: u16 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonOwnershipMode {
+    Unmanaged,
+    CliManaged,
+    AppManaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCapability {
+    ServerMutation,
+    ClientMutation,
+    AuthMutation,
+    ConfigMutation,
+    ActivityStream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorHandshake {
+    pub daemon_version: String,
+    pub ipc_min: u16,
+    pub ipc_max: u16,
+    pub ownership: DaemonOwnershipMode,
+    pub capabilities: Vec<OperatorCapability>,
+}
 
 /// Requests sent from CLI → daemon over Unix socket.
 ///
@@ -54,6 +83,13 @@ pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub enum IpcRequest {
     /// Query daemon status (servers, client count, uptime).
     Status,
+
+    /// Negotiate the operator API used by the CLI and native app.
+    OperatorHandshake {
+        client_version: String,
+        ipc_min: u16,
+        ipc_max: u16,
+    },
 
     /// Restart a specific upstream server.
     RestartServer {
@@ -166,6 +202,16 @@ impl fmt::Debug for IpcRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Status => write!(f, "Status"),
+            Self::OperatorHandshake {
+                client_version,
+                ipc_min,
+                ipc_max,
+            } => f
+                .debug_struct("OperatorHandshake")
+                .field("client_version", client_version)
+                .field("ipc_min", ipc_min)
+                .field("ipc_max", ipc_max)
+                .finish(),
             Self::RestartServer { server_id, .. } => f
                 .debug_struct("RestartServer")
                 .field("server_id", server_id)
@@ -517,6 +563,8 @@ pub struct IpcAuthServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcResponse {
+    /// Daemon version, compatibility range, ownership, and operator features.
+    OperatorHandshake { handshake: OperatorHandshake },
     /// Status response with server info, client count, and uptime.
     Status {
         servers: Vec<ServerStatus>,
@@ -829,6 +877,11 @@ mod tests {
     fn request_serialization_round_trip() {
         let requests = vec![
             IpcRequest::Status,
+            IpcRequest::OperatorHandshake {
+                client_version: "0.5.0".to_string(),
+                ipc_min: 3,
+                ipc_max: 4,
+            },
             IpcRequest::RestartServer {
                 server_id: "test-server".to_string(),
                 auth_token: "abc123".to_string(),
@@ -887,6 +940,29 @@ mod tests {
             let json2 = serde_json::to_string(&deserialized).unwrap();
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn operator_handshake_round_trips_with_compatibility_range() {
+        let response = IpcResponse::OperatorHandshake {
+            handshake: OperatorHandshake {
+                daemon_version: "0.5.0".to_string(),
+                ipc_min: 3,
+                ipc_max: 4,
+                ownership: DaemonOwnershipMode::AppManaged,
+                capabilities: vec![OperatorCapability::ServerMutation],
+            },
+        };
+        let json = serde_json::to_value(&response).expect("serialize handshake");
+        assert_eq!(json["handshake"]["ipc_min"], 3);
+
+        let decoded: IpcResponse = serde_json::from_value(json).expect("decode handshake");
+        let IpcResponse::OperatorHandshake { handshake } = decoded else {
+            panic!("expected operator handshake");
+        };
+        assert_eq!(handshake.daemon_version, "0.5.0");
+        assert_eq!(handshake.ipc_max, 4);
+        assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
     }
 
     #[test]

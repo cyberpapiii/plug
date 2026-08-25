@@ -1081,6 +1081,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
             }
         }
+        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
+            handshake: plug_core::ipc::OperatorHandshake {
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
+                ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
+                ownership: plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+                capabilities: Vec::new(),
+            },
+        },
         IpcRequest::RestartServer { server_id, .. } => {
             match ctx.engine.restart_server(server_id).await {
                 Ok(()) => IpcResponse::Ok,
