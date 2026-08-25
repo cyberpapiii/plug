@@ -400,7 +400,7 @@ main() {
     printf "  plug connect          Connect all AI clients to all MCP servers\n"
     printf "  plug status           Check server health\n"
     printf "\n"
-    printf "Documentation: https://github.com/${PLUG_REPO}\n"
+    printf "Documentation: https://github.com/%s\n" "$PLUG_REPO"
 }
 
 main "$@"

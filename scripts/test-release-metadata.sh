@@ -130,7 +130,10 @@ if [[ "$(grep -Fc './scripts/generate-release-metadata.sh' "$WORKFLOW")" -ne 2 ]
 fi
 assert_absent "$WORKFLOW" 'cask "plug-app" do'
 assert_absent "$WORKFLOW" 'args:       ["uninstall-cleanup"],'
+# These are literal workflow fragments, not shell expansions.
+# shellcheck disable=SC2016
 assert_absent "$WORKFLOW" 'cat > "$RUNNER_TEMP/plug-app.rb"'
+# shellcheck disable=SC2016
 assert_absent "$WORKFLOW" 'releases/download/${GITHUB_REF_NAME}/${app_dmg}'
 if grep -Eq '^[[:space:]]*(binary|postflight)' "$WORKFLOW"; then
     echo "FAIL: release workflow contains forbidden Cask installation hook" >&2

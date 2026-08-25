@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
+# Test cases intentionally isolate HOME changes in subshells.
+# shellcheck disable=SC2030,SC2031
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+ROOT_DIR=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 TEST_DIR=$(mktemp -d /tmp/plug-task5.XXXXXX)
 REAL_PLUG=${PLUG_TEST_BIN:-"$ROOT_DIR/target/debug/plug"}
 CALLS="$TEST_DIR/calls"
