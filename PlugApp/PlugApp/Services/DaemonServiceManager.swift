@@ -94,13 +94,9 @@ final class DaemonServiceManager {
             throw DaemonServiceError.evidenceChanged
         }
         let canonical = try await verifiedApp(expectedVersion: expectedVersion)
-        let current = try await launchdInspector.daemonJobs(
-            canonical: canonical,
-            recognizedLegacyPaths: legacyPaths
-        )
-        guard current == snapshot.ownership else { throw DaemonServiceError.evidenceChanged }
-        return try await replace(
-            verifiedRecords: [record],
+        return try await replaceAppOwned(
+            snapshot: snapshot,
+            record: record,
             canonical: canonical,
             expectedVersion: expectedVersion
         )
@@ -124,14 +120,16 @@ final class DaemonServiceManager {
             {
                 return handshake
             }
-            return try await replace(
-                verifiedRecords: [record],
+            return try await replaceAppOwned(
+                snapshot: inspection.snapshot,
+                record: record,
                 canonical: canonical,
                 expectedVersion: expectedVersion
             )
         case let .appManagedStale(record):
-            return try await replace(
-                verifiedRecords: [record],
+            return try await replaceAppOwned(
+                snapshot: inspection.snapshot,
+                record: record,
                 canonical: canonical,
                 expectedVersion: expectedVersion
             )
@@ -173,8 +171,9 @@ final class DaemonServiceManager {
         let snapshot = try await inspect(canonical: canonical, legacyPaths: legacyPaths)
         switch snapshot.ownership {
         case let .appManagedCurrent(record), let .appManagedStale(record):
-            _ = try await replace(
-                verifiedRecords: [record],
+            _ = try await replaceAppOwned(
+                snapshot: snapshot,
+                record: record,
                 canonical: canonical,
                 expectedVersion: canonical.appVersion
             )
@@ -289,6 +288,24 @@ final class DaemonServiceManager {
         throw DaemonServiceError.verificationFailed(
             expectedVersion: expectedVersion,
             actualVersion: actualVersion
+        )
+    }
+
+    private func replaceAppOwned(
+        snapshot: DaemonServiceSnapshot,
+        record: LaunchdJobRecord,
+        canonical: VerifiedAppInstallation,
+        expectedVersion: String
+    ) async throws -> OperatorHandshake {
+        let current = try await launchdInspector.daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: legacyPaths
+        )
+        guard current == snapshot.ownership else { throw DaemonServiceError.evidenceChanged }
+        return try await replace(
+            verifiedRecords: [record],
+            canonical: canonical,
+            expectedVersion: expectedVersion
         )
     }
 

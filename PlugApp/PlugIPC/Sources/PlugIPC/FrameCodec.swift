@@ -25,6 +25,7 @@ public enum PlugIPCError: LocalizedError, Equatable {
     case frameTooLarge(Int)
     case truncatedFrame
     case socketPathTooLong
+    case timedOut
     case disconnected
     case systemCall(String, Int32)
     case daemon(String, String)
@@ -35,6 +36,7 @@ public enum PlugIPCError: LocalizedError, Equatable {
         case .frameTooLarge: "Plug sent an unexpectedly large response."
         case .truncatedFrame: "Plug closed the connection mid-response."
         case .socketPathTooLong: "Plug's local socket path is too long."
+        case .timedOut: "Plug did not respond before the local IPC deadline."
         case let .systemCall(name, code): "\(name) failed (\(code))."
         case .disconnected: "Plug is not running."
         case let .daemon(_, message): message

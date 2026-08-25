@@ -77,6 +77,69 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(snapshot.clientVisibility.first?.sessionId, "session-1")
         XCTAssertEqual(snapshot.downstreamClients.first?.clientId, "remote-1")
     }
+
+    func testHandshakeTimesOutWhenSocketAcceptsButNeverReplies() async throws {
+        let server = try AcceptWithoutReplyServer()
+        defer { server.stop() }
+        let client = PlugIPCClient(socketURL: server.socketURL, requestTimeout: 0.15)
+        let started = ContinuousClock.now
+
+        do {
+            _ = try await client.connect()
+            XCTFail("Expected bounded IPC timeout")
+        } catch let error as PlugIPCError {
+            XCTAssertEqual(error, .timedOut)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    }
 }
 
 private struct IPCRequestMirror: Decodable { let type: String }
+
+private final class AcceptWithoutReplyServer: @unchecked Sendable {
+    let socketURL: URL
+    private let listener: Int32
+    private let release = DispatchSemaphore(value: 0)
+    private let finished = DispatchSemaphore(value: 0)
+
+    init() throws {
+        socketURL = URL(fileURLWithPath: "/tmp")
+            .appending(path: "plug-stale-ipc-\(UUID().uuidString).sock")
+        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
+        Darwin.unlink(socketURL.path)
+        let listenerFD = listener
+        var (address, addressLength) = try PlugIPCClient.unixSocketAddress(path: socketURL.path)
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listenerFD, $0, addressLength)
+            }
+        }
+        guard bound == 0, Darwin.listen(listenerFD, 1) == 0 else {
+            let code = errno
+            Darwin.close(listener)
+            throw PlugIPCError.systemCall("listen", code)
+        }
+
+        let release = release
+        let finished = finished
+        DispatchQueue.global(qos: .userInitiated).async {
+            let accepted = Darwin.accept(listenerFD, nil, nil)
+            if accepted >= 0 {
+                release.wait()
+                Darwin.close(accepted)
+            }
+            finished.signal()
+        }
+    }
+
+    func stop() {
+        release.signal()
+        _ = finished.wait(timeout: .now() + 1)
+        Darwin.close(listener)
+        Darwin.unlink(socketURL.path)
+    }
+}

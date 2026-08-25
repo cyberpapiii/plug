@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import PlugIPC
 import ServiceManagement
@@ -52,7 +53,11 @@ final class DaemonServiceManagerTests: XCTestCase {
     func testEnsureRunningAutomaticallyReplacesVerifiedStaleAppService() async throws {
         let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
-        let inspector = SequenceLaunchdInspector([.appManagedStale(stale), .appManagedCurrent(current)])
+        let inspector = SequenceLaunchdInspector([
+            .appManagedStale(stale),
+            .appManagedStale(stale),
+            .appManagedCurrent(current),
+        ])
         let backend = FakeDaemonBackend(
             enabled: true,
             handshakes: [handshake("0.6.4"), handshake("0.7.0")]
@@ -101,7 +106,7 @@ final class DaemonServiceManagerTests: XCTestCase {
 
     func testWrongVersionReadySocketRetriesAreBoundedThenFail() async throws {
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
-        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 4))
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
         let backend = FakeDaemonBackend(
             enabled: true,
             handshakes: Array(repeating: handshake("0.6.4"), count: 4)
@@ -153,6 +158,64 @@ final class DaemonServiceManagerTests: XCTestCase {
         }
 
         XCTAssertTrue(backend.events.isEmpty)
+    }
+
+    func testAutomaticStaleReplacementRevalidatesOwnerImmediatelyBeforeBootout() async throws {
+        let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
+        let changed = record(label: "com.plug.daemon", path: "/tmp/replaced-by-someone-else", build: nil)
+        let inspector = SequenceLaunchdInspector([.appManagedStale(stale), .unknown([changed])])
+        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.4")])
+        let manager = makeManager(inspector: inspector, backend: backend)
+
+        do {
+            _ = try await manager.ensureRunning(expectedVersion: "0.7.0")
+            XCTFail("Expected changed ownership refusal")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .evidenceChanged)
+        }
+
+        XCTAssertEqual(backend.events, [.handshake])
+    }
+
+    func testRestartBridgeRevalidatesOwnerImmediatelyBeforeBootout() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let changed = record(label: "com.plug.daemon", path: "/tmp/replaced-by-someone-else", build: nil)
+        let inspector = SequenceLaunchdInspector([.appManagedCurrent(current), .unknown([changed])])
+        let backend = FakeDaemonBackend(handshakes: [handshake("0.7.0")])
+        let manager = makeManager(inspector: inspector, backend: backend)
+
+        do {
+            try await manager.restart()
+            XCTFail("Expected changed ownership refusal")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .evidenceChanged)
+        }
+
+        XCTAssertEqual(backend.events, [.handshake])
+    }
+
+    func testTimedOutHandshakeRemainsBoundedByReplacementRetryLimit() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakeFailures: Array(
+                repeating: PlugIPCError.systemCall("read", ETIMEDOUT),
+                count: 4
+            )
+        )
+        let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 3)
+
+        do {
+            _ = try await manager.ensureRunning(expectedVersion: "0.7.0")
+            XCTFail("Expected bounded verification failure")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .verificationFailed(expectedVersion: "0.7.0", actualVersion: nil))
+        }
+
+        XCTAssertEqual(backend.events.filter { $0 == .handshake }.count, 4)
+        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 3)
+        XCTAssertEqual(backend.events.last, .resume([101, 102]))
     }
 
     private func makeManager(
@@ -237,10 +300,16 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
     var events: [Event] = []
     var registerError: Error?
     private var handshakes: [OperatorHandshake]
+    private var handshakeFailures: [Error]
 
-    init(enabled: Bool = false, handshakes: [OperatorHandshake] = []) {
+    init(
+        enabled: Bool = false,
+        handshakes: [OperatorHandshake] = [],
+        handshakeFailures: [Error] = []
+    ) {
         self.enabled = enabled
         self.handshakes = handshakes
+        self.handshakeFailures = handshakeFailures
     }
 
     func pauseConnectors() -> [Int32] {
@@ -273,6 +342,7 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
 
     func handshake() async throws -> OperatorHandshake {
         events.append(.handshake)
+        if !handshakeFailures.isEmpty { throw handshakeFailures.removeFirst() }
         guard !handshakes.isEmpty else { throw CocoaError(.fileReadUnknown) }
         if handshakes.count == 1 { return handshakes[0] }
         return handshakes.removeFirst()
