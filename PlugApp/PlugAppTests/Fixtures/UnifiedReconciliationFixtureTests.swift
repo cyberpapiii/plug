@@ -10,8 +10,8 @@ import XCTest
 final class UnifiedReconciliationFixtureTests: XCTestCase {
     func testSignedLegacyFixtureAdoptsOnceAndConvergesExactly() async throws {
         let fixture = try SignedReconciliationFixture(mode: .legacy)
-        defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
         let harness = try makeHarness(fixture: fixture)
+        registerTeardown(for: fixture, harness: harness)
 
         await harness.coordinator.reconcile(trigger: .applicationLaunch)
 
@@ -120,8 +120,8 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
 
     func testSignedFreshFixtureRepairsCommandWithoutAdoption() async throws {
         let fixture = try SignedReconciliationFixture(mode: .fresh)
-        defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
         let harness = try makeHarness(fixture: fixture)
+        registerTeardown(for: fixture, harness: harness)
 
         await harness.coordinator.reconcile(trigger: .applicationLaunch)
 
@@ -146,8 +146,8 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
 
     func testInterruptedCargoCleanupRetriesIdempotently() async throws {
         let fixture = try SignedReconciliationFixture(mode: .legacy)
-        defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
         let harness = try makeHarness(fixture: fixture, failCargoRemovalOnce: true)
+        registerTeardown(for: fixture, harness: harness)
 
         await harness.coordinator.reconcile(trigger: .applicationLaunch)
         guard case .adoptionRequired = harness.coordinator.state else {
@@ -189,7 +189,59 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         assertProtectedFilesUnchanged(fixture)
     }
 
+    func testConnectorShutdownReapsProcessAndSocketAcrossRepeatedRuns() async throws {
+        for _ in 0..<3 {
+            let fixture = try SignedReconciliationFixture(mode: .legacy)
+            do {
+                let harness = try makeHarness(fixture: fixture)
+                let processID = try XCTUnwrap(harness.connector.processIdentifier)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.ipcSocketURL.path))
+
+                await harness.connector.shutdown()
+
+                let result = Darwin.kill(processID, 0)
+                let errorCode = errno
+                XCTAssertEqual(result, -1)
+                XCTAssertEqual(errorCode, ESRCH)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.ipcSocketURL.path))
+            } catch {
+                try? FileManager.default.removeItem(at: fixture.rootURL)
+                throw error
+            }
+            try? FileManager.default.removeItem(at: fixture.rootURL)
+        }
+    }
+
+    func testHarnessSetupFailureRemovesFixtureRoot() throws {
+        let fixture = try SignedReconciliationFixture(mode: .legacy)
+        try FileManager.default.createDirectory(
+            at: fixture.ipcSocketURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.ipcSocketURL) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.rootURL.path))
+
+        XCTAssertThrowsError(try makeHarness(fixture: fixture))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.rootURL.path))
+    }
+
     private func makeHarness(
+        fixture: SignedReconciliationFixture,
+        failCargoRemovalOnce: Bool = false
+    ) throws -> ReconciliationHarness {
+        do {
+            return try makeHarnessWithoutCleanup(
+                fixture: fixture,
+                failCargoRemovalOnce: failCargoRemovalOnce
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: fixture.rootURL)
+            throw error
+        }
+    }
+
+    private func makeHarnessWithoutCleanup(
         fixture: SignedReconciliationFixture,
         failCargoRemovalOnce: Bool = false
     ) throws -> ReconciliationHarness {
@@ -254,6 +306,18 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             backend: backend,
             connector: connector
         )
+    }
+
+    private func registerTeardown(
+        for fixture: SignedReconciliationFixture,
+        harness: ReconciliationHarness
+    ) {
+        let connector = harness.connector
+        let rootURL = fixture.rootURL
+        addTeardownBlock {
+            await connector.shutdown()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
     }
 
     private func healthySnapshot(_ state: InstallationState) -> InstallationSnapshot? {
@@ -777,12 +841,24 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
 
     private let lock = NSLock()
     private let outputCondition = NSCondition()
+    private let workerGroup = DispatchGroup()
     private let process: Process?
     private let input: FileHandle?
+    private let outputWrite: FileHandle?
+    private let errorWrite: FileHandle?
+    private let outputRead: FileHandle?
+    private let errorRead: FileHandle?
+    private let outputDescriptor: Int32?
+    private let errorDescriptor: Int32?
     private let listener: Int32?
     private let socketURL: URL?
     private var activeConnection: Int32 = -1
+    private var connections = Set<Int32>()
     private var stopped = false
+    private var socketOwned = false
+    private var shutdownStarted = false
+    private var shutdownComplete = false
+    private let shutdownFinished = DispatchSemaphore(value: 0)
     private var sessionStorage: [String] = []
     private var replayStorage = 0
     private var registerStorage = 0
@@ -801,15 +877,21 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         guard enabled else {
             process = nil
             input = nil
+            outputWrite = nil
+            errorWrite = nil
+            outputRead = nil
+            errorRead = nil
+            outputDescriptor = nil
+            errorDescriptor = nil
             listener = nil
             self.socketURL = nil
             return
         }
 
         self.socketURL = socketURL.standardizedFileURL
-        try? FileManager.default.removeItem(at: socketURL)
         let listener = try Self.makeListener(path: socketURL.path)
         self.listener = listener
+        socketOwned = true
 
         let inputPipe = Pipe()
         let outputPipe = Pipe()
@@ -828,14 +910,25 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         process.standardError = errorPipe
         self.process = process
         self.input = inputPipe.fileHandleForWriting
+        self.outputWrite = outputPipe.fileHandleForWriting
+        self.errorWrite = errorPipe.fileHandleForWriting
+        self.outputRead = outputPipe.fileHandleForReading
+        self.errorRead = errorPipe.fileHandleForReading
+        self.outputDescriptor = outputPipe.fileHandleForReading.fileDescriptor
+        self.errorDescriptor = errorPipe.fileHandleForReading.fileDescriptor
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            shutdownSynchronously()
+            throw error
+        }
         Self.startOutputReader(
-            outputPipe.fileHandleForReading,
+            outputDescriptor,
             owner: self
         )
         Self.startOutputReader(
-            errorPipe.fileHandleForReading,
+            errorDescriptor,
             owner: self,
             stderr: true
         )
@@ -844,19 +937,33 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         sendMCP(Self.initializeMessage(id: 1))
         guard waitForRequest(matching: "Capabilities", count: 2, timeout: 5) else {
             let detail = diagnostic()
-            stop()
+            shutdownSynchronously()
             throw FixtureConnectorError.processDidNotInitialize(detail)
         }
         sendMCP(Self.notificationMessage(method: "notifications/initialized"))
         sendMCP(Self.requestMessage(id: 2, method: "tools/list"))
         guard waitForRequest(matching: "tools/list", count: 1, timeout: 5) else {
             let detail = diagnostic()
-            stop()
+            shutdownSynchronously()
             throw FixtureConnectorError.processDidNotListTools(detail)
         }
     }
 
-    deinit { stop() }
+    deinit { shutdownSynchronously() }
+
+    var processIdentifier: Int32? {
+        guard let process else { return nil }
+        return process.processIdentifier > 0 ? process.processIdentifier : nil
+    }
+
+    func shutdown() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [self] in
+                shutdownSynchronously()
+                continuation.resume()
+            }
+        }
+    }
 
     var sessions: [String] {
         lock.lock(); defer { lock.unlock() }
@@ -898,10 +1005,11 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
 
     func pause() -> [Int32] {
         lock.lock()
-        let connection = activeConnection
+        let connections = self.connections
+        self.connections.removeAll()
         activeConnection = -1
         lock.unlock()
-        if connection >= 0 {
+        for connection in connections where connection >= 0 {
             _ = Darwin.shutdown(connection, SHUT_RDWR)
             Darwin.close(connection)
         }
@@ -914,9 +1022,13 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         // A real stdio adapter only reconnects once it has traffic to forward.
         // Drive one safe request after replacement, then wait for the actual
         // Register/Capabilities/replay frames from the rebuilt daemon session.
+        let group = workerGroup
+        group.enter()
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer { group.leave() }
             guard let self else { return }
             Thread.sleep(forTimeInterval: 0.05)
+            guard !self.isStopped else { return }
             let expectedRegisterCount = self.registerCount + 1
             let id = self.reserveRequestID()
             self.sendMCP(Self.requestMessage(id: id, method: "tools/list"))
@@ -937,7 +1049,12 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     }
 
     private func sendMCP(_ message: Data) {
-        guard let input else { return }
+        lock.lock()
+        guard !stopped, let input else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
         try? input.write(contentsOf: message)
     }
 
@@ -948,6 +1065,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     ) -> Bool {
         let deadline = Date(timeIntervalSinceNow: timeout)
         repeat {
+            if isStopped { return false }
             lock.lock()
             let observed = requestStorage.filter { $0.contains(needle) }.count
             lock.unlock()
@@ -957,29 +1075,83 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         return false
     }
 
-    private func stop() {
+    private var isStopped: Bool {
         lock.lock()
-        guard !stopped else {
+        defer { lock.unlock() }
+        return stopped
+    }
+
+    private func shutdownSynchronously() {
+        lock.lock()
+        if shutdownComplete {
             lock.unlock()
             return
         }
+        if shutdownStarted {
+            lock.unlock()
+            _ = shutdownFinished.wait(timeout: .now() + 5)
+            return
+        }
+        shutdownStarted = true
         stopped = true
-        let connection = activeConnection
+        let connections = self.connections
+        self.connections.removeAll()
         activeConnection = -1
+        let listener = self.listener
+        let socketURL = self.socketURL
+        let socketOwned = self.socketOwned
         lock.unlock()
 
-        if connection >= 0 {
+        for connection in connections where connection >= 0 {
             _ = Darwin.shutdown(connection, SHUT_RDWR)
             Darwin.close(connection)
         }
-        if let listener {
+        if let listener, listener >= 0 {
             _ = Darwin.shutdown(listener, SHUT_RDWR)
             Darwin.close(listener)
         }
-        process?.terminate()
-        process?.waitUntilExit()
-        try? input?.close()
-        if let socketURL { try? FileManager.default.removeItem(at: socketURL) }
+        terminateProcessBounded()
+        outputWrite?.closeFile()
+        errorWrite?.closeFile()
+        _ = workerGroup.wait(timeout: .now() + 5)
+        outputRead?.closeFile()
+        errorRead?.closeFile()
+        input?.closeFile()
+        if socketOwned, let socketURL, Self.isTestOwnedSocket(socketURL) {
+            try? FileManager.default.removeItem(at: socketURL)
+        }
+
+        lock.lock()
+        shutdownComplete = true
+        lock.unlock()
+        shutdownFinished.signal()
+    }
+
+    private func terminateProcessBounded() {
+        guard let process else { return }
+        guard process.isRunning else {
+            process.waitUntilExit()
+            return
+        }
+        process.terminate()
+        let deadline = Date(timeIntervalSinceNow: 0.25)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if process.isRunning {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+    }
+
+    private static func isTestOwnedSocket(_ url: URL) -> Bool {
+        let temporaryDirectory = FileManager.default.temporaryDirectory.standardizedFileURL
+        let candidate = url.standardizedFileURL
+        let name = candidate.lastPathComponent
+        let directory = candidate.deletingLastPathComponent()
+        return (directory == temporaryDirectory || directory.path == "/tmp")
+            && name.hasPrefix("plug-app-task7-")
+            && name.hasSuffix(".sock")
     }
 
     private func diagnostic() -> String {
@@ -998,13 +1170,21 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     }
 
     private static func startOutputReader(
-        _ handle: FileHandle,
+        _ descriptor: Int32?,
         owner: FixtureConnectorReplay,
         stderr: Bool = false
     ) {
-        DispatchQueue.global(qos: .utility).async {
+        guard let descriptor else { return }
+        let group = owner.workerGroup
+        group.enter()
+        DispatchQueue.global(qos: .utility).async { [weak owner] in
+            defer { group.leave() }
             while true {
-                let data = handle.readData(ofLength: 1)
+                guard let owner else { break }
+                guard let data = Self.readByte(
+                    from: descriptor,
+                    shouldStop: { owner.isStopped }
+                ) else { break }
                 if data.isEmpty { break }
                 if stderr {
                     owner.lock.lock()
@@ -1028,9 +1208,32 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         }
     }
 
+    private static func readByte(
+        from descriptor: Int32,
+        shouldStop: () -> Bool
+    ) -> Data? {
+        var byte: UInt8 = 0
+        while true {
+            if shouldStop() { return nil }
+            let count = Darwin.read(descriptor, &byte, 1)
+            if count == 1 { return Data([byte]) }
+            if count == 0 { return nil }
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                Thread.sleep(forTimeInterval: 0.005)
+                continue
+            }
+            return nil
+        }
+    }
+
     private static func startDaemonLoop(listener: Int32, owner: FixtureConnectorReplay) {
-        DispatchQueue.global(qos: .utility).async {
+        let group = owner.workerGroup
+        group.enter()
+        DispatchQueue.global(qos: .utility).async { [weak owner] in
+            defer { group.leave() }
             while true {
+                guard let owner else { return }
                 owner.lock.lock()
                 let shouldStop = owner.stopped
                 owner.lock.unlock()
@@ -1043,7 +1246,25 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                     if stopped { return }
                     continue
                 }
-                DispatchQueue.global(qos: .utility).async {
+                owner.lock.lock()
+                if owner.stopped {
+                    owner.lock.unlock()
+                    _ = Darwin.shutdown(connection, SHUT_RDWR)
+                    Darwin.close(connection)
+                    return
+                }
+                owner.connections.insert(connection)
+                owner.activeConnection = connection
+                owner.lock.unlock()
+                let handlerGroup = owner.workerGroup
+                handlerGroup.enter()
+                DispatchQueue.global(qos: .utility).async { [weak owner] in
+                    defer { handlerGroup.leave() }
+                    guard let owner else {
+                        _ = Darwin.shutdown(connection, SHUT_RDWR)
+                        Darwin.close(connection)
+                        return
+                    }
                     owner.handleDaemonConnection(connection)
                 }
             }
@@ -1051,16 +1272,16 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     }
 
     private func handleDaemonConnection(_ connection: Int32) {
-        lock.lock()
-        activeConnection = connection
-        lock.unlock()
         var generation = 0
         defer {
             lock.lock()
+            let ownsConnection = connections.remove(connection) != nil
             if activeConnection == connection { activeConnection = -1 }
             lock.unlock()
-            _ = Darwin.shutdown(connection, SHUT_RDWR)
-            Darwin.close(connection)
+            if ownsConnection {
+                _ = Darwin.shutdown(connection, SHUT_RDWR)
+                Darwin.close(connection)
+            }
         }
 
         while let payload = Self.readFrame(connection),
