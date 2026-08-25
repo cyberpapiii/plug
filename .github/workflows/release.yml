@@ -243,16 +243,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          history_args=()
+          verify_args=(
+            --tag "$GITHUB_REF_NAME"
+            --app "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app"
+            --appcast "$RUNNER_TEMP/appcast.xml"
+            --cask "$RUNNER_TEMP/plug-app.rb"
+          )
           if [[ "$HAS_PUBLISHED_PREDECESSOR" != true ]]; then
-            history_args+=(--allow-no-history)
+            verify_args+=(--allow-no-history)
           fi
-          ./scripts/verify-release-contract.sh \
-            --tag "$GITHUB_REF_NAME" \
-            --app "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app" \
-            --appcast "$RUNNER_TEMP/appcast.xml" \
-            --cask "$RUNNER_TEMP/plug-app.rb" \
-            "${history_args[@]}"
+          ./scripts/verify-release-contract.sh "${verify_args[@]}"
 
       - name: Upload app release artifacts
         uses: actions/upload-artifact@v4
