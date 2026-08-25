@@ -21,7 +21,7 @@ struct AuthView: View {
             }
             Section("Remote clients") {
                 ForEach(model.snapshot.downstreamClients) { client in
-                    HStack { Text(client.clientName); Spacer(); Button("Revoke", role: .destructive) { Task { await model.perform { .revokeClient(authToken: $0, clientID: client.clientID) } } } }
+                    HStack { Text(client.clientName); Spacer(); Button("Revoke", role: .destructive) { Task { await model.perform { .revokeClient(authToken: $0, clientID: client.clientId) } } } }
                 }
                 if model.snapshot.downstreamClients.isEmpty { Text("No remote grants").foregroundStyle(.secondary) }
             }

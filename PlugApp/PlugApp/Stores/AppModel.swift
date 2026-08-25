@@ -27,7 +27,7 @@ final class AppModel {
     init(ipc: PlugIPCClient = PlugIPCClient()) { self.ipc = ipc }
 
     var visibleServers: [ServerPresentation] {
-        let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverID, $0) })
+        let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
         return snapshot.configuredServers.map {
             ServerPresentation(configured: $0, runtime: runtimeByName[$0.name])
         }.enumerated().sorted {

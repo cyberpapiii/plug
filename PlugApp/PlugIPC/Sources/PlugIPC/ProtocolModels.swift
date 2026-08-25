@@ -9,8 +9,8 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
 }
 
 public struct ServerStatus: Codable, Identifiable, Equatable, Sendable {
-    public var id: String { serverID }
-    public let serverID: String
+    public var id: String { serverId }
+    public let serverId: String
     public let health: String
     public let toolCount: Int
     public let error: String?
@@ -25,10 +25,10 @@ public struct ConfiguredServer: Codable, Identifiable, Equatable, Sendable {
 }
 
 public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
-    public var id: String { sessionID }
+    public var id: String { sessionId }
     public let transport: String
-    public let clientID: String?
-    public let sessionID: String
+    public let clientId: String?
+    public let sessionId: String
     public let clientType: String
     public let clientInfo: String?
     public let connectedSecs: UInt64
@@ -36,7 +36,7 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
 }
 
 public struct ClientVisibility: Codable, Equatable, Sendable {
-    public let sessionID: String
+    public let sessionId: String
     public let clientType: String
     public let visibleToolCount: Int
 }
@@ -53,8 +53,8 @@ public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
 }
 
 public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
-    public var id: String { clientID }
-    public let clientID: String
+    public var id: String { clientId }
+    public let clientId: String
     public let clientName: String
     public let redirectUris: [String]
     public let source: String
@@ -185,7 +185,7 @@ public enum IPCResponse: Decodable, Sendable {
     case ok
     case error(code: String, message: String)
 
-    private enum CodingKeys: String, CodingKey { case type, handshake, snapshot, events, clientID, code, message }
+    private enum CodingKeys: String, CodingKey { case type, handshake, snapshot, events, clientId, code, message }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -196,7 +196,7 @@ public enum IPCResponse: Decodable, Sendable {
         case "ActivitySnapshot": self = .activity(try c.decode([ActivityEvent].self, forKey: .events))
         case "ServerValidated": self = .validated
         case "OperatorMutation": self = .mutation
-        case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientID))
+        case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
         case "Ok": self = .ok
         case "Error": self = .error(code: try c.decode(String.self, forKey: .code), message: try c.decode(String.self, forKey: .message))
         default: throw PlugIPCError.unexpectedResponse(type)
