@@ -141,10 +141,10 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-Release `v0.6.1` is published from `6dcfc1b`. Public checksums verify, the
+Release `v0.6.1` is the currently published predecessor to the 0.6.2 command
+lookup repair. Its public checksums verify, the
 universal `Plug.app` and embedded daemon are Developer ID signed with hardened
-runtime, and both the app and DMG are notarized and stapled. The public app and
-CLI are installed on this Mac and report version `0.6.1`.
+runtime, and both the app and DMG are notarized and stapled.
 
 The app's ServiceManagement registration is live under
 `com.cyberpapiii.plug`: launchd owns the bundled 0.6.1 daemon as a PID-1 child,
@@ -157,6 +157,11 @@ listed tools, and called `Agent-admin__admin_capabilities` successfully. The
 public OAuth resource metadata advertises the operator-pinned six-scope grant.
 Production enables modern downstream HTTP only; modern upstream remains
 legacy-compatible by design for the currently observed clients and servers.
+
+The 0.6.2 source line also repairs a live app-owned launchd compatibility gap:
+bare stdio commands such as `node` and `npx` resolve through the user's login
+shell when launchd supplies only its minimal system `PATH`. Runtime startup and
+`plug doctor` share this resolution path, so command checks match execution.
 
 Owner-verified downstream OAuth is done on `main` through merge commit
 `8adbcd1`. Fresh merged-main verification passed 1,106 workspace tests and 5

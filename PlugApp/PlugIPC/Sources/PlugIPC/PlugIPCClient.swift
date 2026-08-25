@@ -25,7 +25,7 @@ public actor PlugIPCClient {
 
     public func connect() throws -> OperatorHandshake {
         if descriptor < 0 { descriptor = try Self.openSocket(path: socketURL.path) }
-        let response = try request(.handshake(clientVersion: "0.6.1", ipcMin: 3, ipcMax: 4))
+        let response = try request(.handshake(clientVersion: "0.6.2", ipcMin: 3, ipcMax: 4))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         return handshake
     }

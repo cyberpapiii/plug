@@ -458,11 +458,8 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
 
 /// Simple which-like lookup in PATH.
 fn which(binary: &str) -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(binary))
-            .find(|path| path.is_file())
-    })
+    let path = crate::server::resolve_stdio_command(binary);
+    path.is_file().then_some(path)
 }
 
 /// Check 6: detect tools with the same name from different servers.

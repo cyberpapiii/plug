@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 #[cfg(target_os = "macos")]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -216,9 +217,10 @@ fn build_stdio_command(
     args: &[String],
     config: &ServerConfig,
 ) -> Result<tokio::process::Command, anyhow::Error> {
+    let resolved_command = resolve_stdio_command(command);
     let sandbox = config.sandbox.as_ref().filter(|sandbox| sandbox.enabled);
     let Some(sandbox) = sandbox else {
-        let mut cmd = tokio::process::Command::new(command);
+        let mut cmd = tokio::process::Command::new(&resolved_command);
         cmd.args(args);
         return Ok(cmd);
     };
@@ -229,10 +231,12 @@ fn build_stdio_command(
         if let Some(profile_path) = &sandbox.profile_path {
             cmd.arg("-f").arg(profile_path);
         } else {
-            cmd.arg("-p")
-                .arg(build_macos_sandbox_profile(command, sandbox)?);
+            cmd.arg("-p").arg(build_macos_sandbox_profile(
+                resolved_command.to_string_lossy().as_ref(),
+                sandbox,
+            )?);
         }
-        cmd.arg(command);
+        cmd.arg(&resolved_command);
         cmd.args(args);
         Ok(cmd)
     }
@@ -244,6 +248,54 @@ fn build_stdio_command(
         let _ = sandbox;
         anyhow::bail!("stdio sandboxing is currently implemented only on macOS")
     }
+}
+
+pub(crate) fn resolve_stdio_command(command: &str) -> PathBuf {
+    let configured = PathBuf::from(command);
+    if configured.components().count() > 1 {
+        return configured;
+    }
+
+    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(command))
+            .find(|path| path.is_file())
+    }) {
+        return path;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // SMAppService launch agents intentionally receive launchd's minimal
+        // PATH, while MCP commands are normally configured from the user's
+        // login shell. Resolve a missing bare command through that same shell
+        // without interpolating the configured value into shell source.
+        if let Ok(output) = std::process::Command::new("/bin/zsh")
+            .args([
+                "-lic",
+                "resolved=$(command -v -- \"$PLUG_STDIO_COMMAND\") || exit 127; printf '__PLUG_STDIO_PATH__%s\\n' \"$resolved\"",
+            ])
+            .env("PLUG_STDIO_COMMAND", command)
+            .output()
+            && output.status.success()
+            && let Some(path) = login_shell_command_path(&output.stdout)
+        {
+            return path;
+        }
+    }
+
+    configured
+}
+
+#[cfg(target_os = "macos")]
+fn login_shell_command_path(stdout: &[u8]) -> Option<PathBuf> {
+    const MARKER: &str = "__PLUG_STDIO_PATH__";
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix(MARKER))
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
 }
 
 #[cfg(target_os = "macos")]
@@ -2377,6 +2429,16 @@ mod tests {
     use super::*;
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_shell_command_path_ignores_shell_noise() {
+        assert_eq!(
+            login_shell_command_path(b"welcome from shell config\n__PLUG_STDIO_PATH__/bin/sh\n"),
+            Some(PathBuf::from("/bin/sh"))
+        );
+        assert_eq!(login_shell_command_path(b"/bin/sh\n"), None);
+    }
 
     fn session_watcher() -> (
         InitializedNotificationCompatHttpClient,
