@@ -135,6 +135,7 @@ pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
 /// This probe never creates or rewrites the PID file. Auto-start callers use it
 /// to distinguish a failed child from a child that correctly lost to another
 /// daemon which is still booting.
+#[cfg(test)]
 pub(crate) fn runtime_lock_is_held() -> bool {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -1103,7 +1104,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
                 ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
-                ownership: plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+                ownership: crate::service::ipc_ownership(),
                 capabilities: vec![
                     plug_core::ipc::OperatorCapability::ServerMutation,
                     plug_core::ipc::OperatorCapability::ConfigMutation,
