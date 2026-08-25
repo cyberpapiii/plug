@@ -39,3 +39,25 @@ replacement.
 `cargo clippy -p plug-mcp --all-targets -- -D warnings` remains blocked by
 pre-existing `repair_export_endpoint` dead-code and
 `clippy::mut-range-bound` findings outside this Task 7 change.
+
+## Fix Round: Shutdown and Socket Override Safety
+
+- `FixtureConnectorReplay` now has explicit async teardown and bounded
+  shutdown. It weakly captures reader/daemon closures, joins worker tasks,
+  closes connections and pipes, terminates then kills the child if needed, and
+  unlinks only its prefixed temporary socket.
+- A repeated-run regression checks child reaping and socket removal. Three
+  iterations of all four fixture tests passed with no test-owned child or
+  socket left behind.
+- `PLUG_SOCKET_PATH` is now accepted only when `PLUG_DEV=1`; production falls
+  back to the normal runtime socket. Rust unit tests cover both branches.
+
+## Fix Round Verification
+
+- Full PlugApp: 74 passed.
+- Repeated fixture: 12 passed (4 tests x 3 iterations).
+- PlugIPC: 6 passed.
+- `cargo test --workspace`: passed (864 `plug-core`, 247 `plug-mcp`).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: still blocked by
+  the two pre-existing findings named above.
