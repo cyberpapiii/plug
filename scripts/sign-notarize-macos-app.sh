@@ -47,14 +47,52 @@ printf '%s' "$MACOS_NOTARY_KEY_P8" | base64 --decode > "$WORK_DIR/notary.p8"
 chmod 600 "$WORK_DIR/notary.p8"
 
 echo "==> Signing app"
-codesign --force --deep --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+# Sign inside-out. Apple's distribution guidance explicitly warns against
+# --deep for signing: it misses raw executables in resource locations and can
+# apply the wrong entitlements to Sparkle's helpers.
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+SPARKLE_CURRENT="$SPARKLE/Versions/Current"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+  --options runtime --timestamp "$SPARKLE_CURRENT/XPCServices/Installer.xpc"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+  --options runtime --timestamp --preserve-metadata=entitlements \
+  "$SPARKLE_CURRENT/XPCServices/Downloader.xpc"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+  --options runtime --timestamp "$SPARKLE_CURRENT/Autoupdate"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+  --options runtime --timestamp "$SPARKLE_CURRENT/Updater.app"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+  --options runtime --timestamp "$SPARKLE"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
+  --identifier com.cyberpapiii.plug.daemon --options runtime --timestamp \
+  "$APP/Contents/Resources/plug"
+codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" \
   --options runtime --timestamp "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
+notarize() {
+  local artifact="$1"
+  local result="$WORK_DIR/notary-result.json"
+  local exit_code=0
+  xcrun notarytool submit "$artifact" --key "$WORK_DIR/notary.p8" \
+    --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" \
+    --wait --timeout 30m --output-format json > "$result" || exit_code=$?
+  cat "$result"
+  if [[ "$exit_code" -ne 0 ]]; then
+    local submission_id
+    submission_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$result")"
+    if [[ -n "$submission_id" ]]; then
+      echo "==> Apple notarization log for $submission_id" >&2
+      xcrun notarytool log "$submission_id" --key "$WORK_DIR/notary.p8" \
+        --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" || true
+    fi
+    return "$exit_code"
+  fi
+}
+
 echo "==> Notarizing app"
 ditto -c -k --keepParent "$APP" "$WORK_DIR/Plug.zip"
-xcrun notarytool submit "$WORK_DIR/Plug.zip" --key "$WORK_DIR/notary.p8" \
-  --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" --wait --timeout 30m
+notarize "$WORK_DIR/Plug.zip"
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
 spctl --assess --type exec --verbose=2 "$APP"
@@ -67,8 +105,7 @@ hdiutil create -volname Plug -srcfolder "$WORK_DIR/dmg" -ov -format UDZO "$DMG"
 codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$KEYCHAIN" --timestamp "$DMG"
 
 echo "==> Notarizing DMG"
-xcrun notarytool submit "$DMG" --key "$WORK_DIR/notary.p8" \
-  --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" --wait --timeout 30m
+notarize "$DMG"
 xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
