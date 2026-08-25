@@ -1,0 +1,47 @@
+name: PlugApp
+options:
+  bundleIdPrefix: com.cyberpapiii
+  deploymentTarget:
+    macOS: "14.0"
+packages:
+  PlugIPC:
+    path: PlugIPC
+targets:
+  PlugApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: PlugApp
+    dependencies:
+      - package: PlugIPC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cyberpapiii.plug
+        PRODUCT_NAME: Plug
+        INFOPLIST_FILE: PlugApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PlugApp/PlugApp.entitlements
+        SWIFT_VERSION: 6.0
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: HJF7LN64XX
+  PlugAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [PlugAppTests]
+    dependencies:
+      - target: PlugApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 6.0
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Plug.app/Contents/MacOS/Plug"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  PlugApp:
+    build:
+      targets:
+        PlugApp: all
+        PlugAppTests: [test]
+    test:
+      targets: [PlugAppTests]

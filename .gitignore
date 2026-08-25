@@ -33,3 +33,8 @@ id_ed25519*
 # instrumented test runs. Regenerated on demand; never worth committing.
 *.profraw
 *.profdata
+
+# Native macOS build products and per-user Xcode state.
+**/.build/
+**/xcuserdata/
+*.xcuserstate
