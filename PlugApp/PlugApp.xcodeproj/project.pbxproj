@@ -28,6 +28,7 @@
 		B736680D4CC1B797B3856113 /* PlugMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B949E8F0B71D3EF15DF8ACE /* PlugMenu.swift */; };
 		C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */; };
 		C0196520F5563F2ED423AA31 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = BA2AF18F506896646E72E95E /* Sparkle */; };
+		CAE0A7C58194808516DC87E1 /* InstallationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */; };
 		D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */; };
 		D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85993E0751504BE72E97ACAC /* ClientRepairService.swift */; };
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
@@ -38,6 +39,7 @@
 		ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */; };
 		F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */; };
 		F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F74CE97E0DF2E6BB479555A /* ClientsView.swift */; };
+		F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,6 +62,7 @@
 		2B949E8F0B71D3EF15DF8ACE /* PlugMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugMenu.swift; sourceTree = "<group>"; };
 		2BB10ED3645727B693E33897 /* AppChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppChrome.swift; sourceTree = "<group>"; };
 		2D1B09D36EE0E0D152888537 /* UpdateService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateService.swift; sourceTree = "<group>"; };
+		317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationCoordinatorTests.swift; sourceTree = "<group>"; };
 		36FB89E2C8814400C0F38A5D /* PlugApplication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugApplication.swift; sourceTree = "<group>"; };
 		406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspectorTests.swift; sourceTree = "<group>"; };
 		44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PlugApp.entitlements; sourceTree = "<group>"; };
@@ -76,6 +79,7 @@
 		9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientRepairServiceTests.swift; sourceTree = "<group>"; };
 		A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspector.swift; sourceTree = "<group>"; };
+		A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationCoordinator.swift; sourceTree = "<group>"; };
 		AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlowService.swift; sourceTree = "<group>"; };
 		B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRunner.swift; sourceTree = "<group>"; };
 		B8B2BC9F43EB4287115C47DA /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
@@ -139,6 +143,7 @@
 				907978AE95DA344593F3BCA3 /* AppModelTests.swift */,
 				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
+				317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */,
 				406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */,
 				1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */,
 				28E1C65673D42038754E140C /* ProcessRunnerTests.swift */,
@@ -213,6 +218,7 @@
 				AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */,
 				85993E0751504BE72E97ACAC /* ClientRepairService.swift */,
 				66F5C1631CDEC940569658B5 /* DaemonServiceManager.swift */,
+				A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */,
 				8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */,
 				F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */,
 				6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */,
@@ -393,6 +399,7 @@
 				3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */,
 				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
+				CAE0A7C58194808516DC87E1 /* InstallationCoordinatorTests.swift in Sources */,
 				D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */,
 				D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */,
 				273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */,
@@ -412,6 +419,7 @@
 				D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */,
 				F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */,
 				150EC31CFAA673C51B37F0BC /* DaemonServiceManager.swift in Sources */,
+				F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */,
 				41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */,
 				9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */,
 				C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */,
