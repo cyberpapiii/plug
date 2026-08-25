@@ -8,27 +8,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.visibleServers.isEmpty)
     }
 
-    @MainActor func testDaemonOwnershipRequiresThisAppBundle() {
-        XCTAssertTrue(DaemonServiceManager.isAppManaged(
-            launchctlOutput: "parent bundle identifier = com.cyberpapiii.plug\nparent bundle version = 4",
-            bundleIdentifier: "com.cyberpapiii.plug",
-            bundleVersion: "4",
-            bundlePath: "/Applications/Plug.app"
-        ))
-        XCTAssertFalse(DaemonServiceManager.isAppManaged(
-            launchctlOutput: "parent bundle identifier = com.cyberpapiii.plug\nparent bundle version = 3",
-            bundleIdentifier: "com.cyberpapiii.plug",
-            bundleVersion: "4",
-            bundlePath: "/Applications/Plug.app"
-        ))
-        XCTAssertFalse(DaemonServiceManager.isAppManaged(
-            launchctlOutput: "program = /tmp/old/plug",
-            bundleIdentifier: "com.cyberpapiii.plug",
-            bundleVersion: "4",
-            bundlePath: "/Applications/Plug.app"
-        ))
-    }
-
     @MainActor func testLegacyConnectorDiscoveryOnlyTargetsPlugConnectProcesses() {
         let output = """
           101 /Users/me/.local/bin/plug connect

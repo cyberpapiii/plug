@@ -20,6 +20,7 @@
 		6C3A2ACAD67159A496C5DC58 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E823B05501E7735EEA26993A /* RootView.swift */; };
 		6C979F41AD0669EF1B229C11 /* ServersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AFB9D205089F380BB49E9C6 /* ServersView.swift */; };
 		75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */; };
+		8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */; };
 		9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */; };
 		B2857C070B5C6292A2B38282 /* AppInstallationInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */; };
 		B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */; };
@@ -77,6 +78,7 @@
 		C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspectorTests.swift; sourceTree = "<group>"; };
 		CC541E7062C47E08EF5F5B4B /* PlugAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PlugAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		E823B05501E7735EEA26993A /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManagerTests.swift; sourceTree = "<group>"; };
 		F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigrator.swift; sourceTree = "<group>"; };
 		FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = com.plug.daemon.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -131,6 +133,7 @@
 			children = (
 				C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */,
 				907978AE95DA344593F3BCA3 /* AppModelTests.swift */,
+				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
 				406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */,
 				1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */,
 				28E1C65673D42038754E140C /* ProcessRunnerTests.swift */,
@@ -382,6 +385,7 @@
 			files = (
 				ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */,
 				3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */,
+				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
 				D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */,
 				D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */,
 				273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */,
