@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` at squash commit `9fdae06` on 2026-08-25.
+Baseline: `main` through merge commit `6dcfc1b` on 2026-08-25.
 
 This is the canonical current-state doc for the project.
 
@@ -125,7 +125,9 @@ No roadmap-relevant implementation currently exists only off-main. The native
 operator app, its daemon API and lifecycle ownership, distribution automation,
 and the 22/22 official modern server conformance fixes landed on `main` in
 PR #96 (`52b2c7b`); the public-install daemon-adoption repair landed in PR #101
-(`9fdae06`).
+(`9fdae06`). The calm single-sidebar operator redesign landed in PR #104
+(`b045000`), and the Swift 6-safe ServiceManagement adoption repair landed in
+PR #105 (`6dcfc1b`).
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. This Mac enables only the proven
@@ -139,20 +141,22 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-Release `v0.5.2` is published from `9fdae06`. Its public checksums verify, the
+Release `v0.6.1` is published from `6dcfc1b`. Public checksums verify, the
 universal `Plug.app` and embedded daemon are Developer ID signed with hardened
-runtime, and both the app and DMG are notarized and stapled. The release app and
-CLI are installed on this Mac and report version `0.5.2`. The installed binary
-also passed the official prerelease MCP `2026-07-28` server suite independently
-against the release fixture: 22 passed, 0 failed. Production enables modern
-downstream HTTP only; modern upstream remains legacy-compatible by design for
-the currently observed clients and servers.
+runtime, and both the app and DMG are notarized and stapled. The public app and
+CLI are installed on this Mac and report version `0.6.1`.
 
-The app's ServiceManagement registration points at the public build-6 bundle.
-On this developer machine, final app-owned daemon adoption still requires the
-one-time macOS Keychain **Always Allow** decision for the existing `plug`
-credential; until that owner action completes, reconnecting CLI clients keep a
-healthy 0.5.2 daemon running through the existing fallback path.
+The app's ServiceManagement registration is live under
+`com.cyberpapiii.plug`: launchd owns the bundled 0.6.1 daemon as a PID-1 child,
+with parent bundle version 9. First-run adoption now completes without the Swift
+6 actor-isolation crash found in 0.6.0. The app presents one stable sidebar and
+full-width Servers, Clients, Activity, and Authentication workspaces; polling
+preserves the last good snapshot instead of flashing a disconnected state.
+Fresh installed-runtime certification initialized a real stdio MCP client,
+listed tools, and called `Agent-admin__admin_capabilities` successfully. The
+public OAuth resource metadata advertises the operator-pinned six-scope grant.
+Production enables modern downstream HTTP only; modern upstream remains
+legacy-compatible by design for the currently observed clients and servers.
 
 Owner-verified downstream OAuth is done on `main` through merge commit
 `8adbcd1`. Fresh merged-main verification passed 1,106 workspace tests and 5
