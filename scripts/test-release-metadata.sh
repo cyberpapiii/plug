@@ -34,6 +34,17 @@ assert_absent() {
     fi
 }
 
+assert_equal_files() {
+    local expected="$1"
+    local actual="$2"
+    local label="$3"
+    if ! cmp -s "$expected" "$actual"; then
+        echo "FAIL: $label differ" >&2
+        diff -u "$expected" "$actual" >&2 || true
+        exit 1
+    fi
+}
+
 bash "$ROOT/scripts/verify-release-workflow.sh"
 
 bash "$GENERATOR" \
@@ -47,6 +58,33 @@ FORMULA="$OUTPUT/plug.rb"
 CASK="$OUTPUT/plug-app.rb"
 [[ -f "$FORMULA" ]] || { echo "FAIL: formula not generated" >&2; exit 1; }
 [[ -f "$CASK" ]] || { echo "FAIL: Cask not generated" >&2; exit 1; }
+
+CASK_ONLY_OUTPUT="$FIXTURE_ROOT/cask-only"
+bash "$GENERATOR" \
+    --version "$VERSION" \
+    --dmg-sha "$DMG_SHA" \
+    --cask-only \
+    --output "$CASK_ONLY_OUTPUT"
+[[ ! -e "$CASK_ONLY_OUTPUT/plug.rb" ]] || {
+    echo "FAIL: cask-only generation emitted Formula" >&2
+    exit 1
+}
+assert_equal_files "$CASK" "$CASK_ONLY_OUTPUT/plug-app.rb" \
+    "full and cask-only metadata Casks"
+
+FORMULA_ONLY_OUTPUT="$FIXTURE_ROOT/formula-only"
+bash "$GENERATOR" \
+    --version "$VERSION" \
+    --linux-arm-sha "$LINUX_ARM_SHA" \
+    --linux-x64-sha "$LINUX_X64_SHA" \
+    --formula-only \
+    --output "$FORMULA_ONLY_OUTPUT"
+[[ ! -e "$FORMULA_ONLY_OUTPUT/plug-app.rb" ]] || {
+    echo "FAIL: formula-only generation emitted Cask" >&2
+    exit 1
+}
+assert_equal_files "$FORMULA" "$FORMULA_ONLY_OUTPUT/plug.rb" \
+    "full and formula-only metadata Formulas"
 
 assert_contains "$FORMULA" 'depends_on :linux'
 assert_contains "$FORMULA" "plug-mcp-aarch64-unknown-linux-gnu.tar.gz"
@@ -83,12 +121,16 @@ fi
 ruby -c "$CASK" >/dev/null
 
 WORKFLOW="$ROOT/.github/workflows/release.yml"
-assert_contains "$WORKFLOW" 'url "https://github.com/cyberpapiii/plug/releases/download/v#{version}/Plug-#{version}.dmg"'
-assert_contains "$WORKFLOW" 'auto_updates true'
-assert_contains "$WORKFLOW" 'depends_on macos: ">= :sonoma"'
-assert_contains "$WORKFLOW" 'executable: "#{appdir}/Plug.app/Contents/Resources/plug"'
-assert_contains "$WORKFLOW" 'args:       ["uninstall-cleanup"],'
-assert_contains "$WORKFLOW" 'caveats "Open Plug once to finish command-line and background-service setup."'
+assert_contains "$WORKFLOW" './scripts/generate-release-metadata.sh'
+assert_contains "$WORKFLOW" '--cask-only'
+assert_contains "$WORKFLOW" '--formula-only'
+if [[ "$(grep -Fc './scripts/generate-release-metadata.sh' "$WORKFLOW")" -ne 2 ]]; then
+    echo "FAIL: workflow must invoke one metadata generator for Cask and Formula" >&2
+    exit 1
+fi
+assert_absent "$WORKFLOW" 'cask "plug-app" do'
+assert_absent "$WORKFLOW" 'args:       ["uninstall-cleanup"],'
+assert_absent "$WORKFLOW" 'cat > "$RUNNER_TEMP/plug-app.rb"'
 assert_absent "$WORKFLOW" 'releases/download/${GITHUB_REF_NAME}/${app_dmg}'
 if grep -Eq '^[[:space:]]*(binary|postflight)' "$WORKFLOW"; then
     echo "FAIL: release workflow contains forbidden Cask installation hook" >&2
@@ -126,6 +168,13 @@ assert_contains "$ROOT/.github/workflows/release.yml" \
     echo "FAIL: obsolete macOS signing script still exists" >&2
     exit 1
 }
+
+if rg -q 'UninstallCleanup' "$ROOT/plug/src/main.rs"; then
+    (cd "$ROOT" && cargo run --quiet -p plug-mcp -- uninstall-cleanup --help >/dev/null)
+    echo "PASS: embedded runtime exposes uninstall-cleanup"
+else
+    echo "DEFERRED: uninstall-cleanup runtime precondition awaits unified-macos-install merge"
+fi
 
 FAKE_BIN="$FIXTURE_ROOT/bin"
 mkdir -p "$FAKE_BIN" "$FIXTURE_ROOT/home" "$FIXTURE_ROOT/config"

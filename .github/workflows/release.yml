@@ -145,26 +145,11 @@ jobs:
           set -euo pipefail
           app_dmg="Plug-${WORKSPACE_VERSION}.dmg"
           app_sha="$(shasum -a 256 "$RUNNER_TEMP/$app_dmg" | cut -d' ' -f1)"
-          cat > "$RUNNER_TEMP/plug-app.rb" <<EOF
-          cask "plug-app" do
-            version "${WORKSPACE_VERSION}"
-            sha256 "${app_sha}"
-
-            url "https://github.com/cyberpapiii/plug/releases/download/v#{version}/Plug-#{version}.dmg"
-            name "Plug"
-            desc "Calm macOS control surface for the Plug MCP multiplexer"
-            homepage "https://github.com/cyberpapiii/plug"
-
-            auto_updates true
-            depends_on macos: ">= :sonoma"
-            app "Plug.app"
-            uninstall script: {
-              executable: "#{appdir}/Plug.app/Contents/Resources/plug",
-              args:       ["uninstall-cleanup"],
-            }
-            caveats "Open Plug once to finish command-line and background-service setup."
-          end
-          EOF
+          ./scripts/generate-release-metadata.sh \
+            --version "$WORKSPACE_VERSION" \
+            --dmg-sha "$app_sha" \
+            --cask-only \
+            --output "$RUNNER_TEMP"
           ruby -c "$RUNNER_TEMP/plug-app.rb"
 
       - name: Generate signed Sparkle appcast
@@ -274,7 +259,7 @@ jobs:
           cp target/distrib/source.tar.gz artifacts/
           cp target/distrib/source.tar.gz.sha256 artifacts/
 
-      - name: Generate release metadata
+      - name: Generate Homebrew Formula
         shell: bash
         run: |
           set -euo pipefail
@@ -285,6 +270,7 @@ jobs:
             --dmg-sha "$(sha256sum "$app_dmg" | awk '{print $1}')" \
             --linux-arm-sha "$(sha256sum artifacts/plug-mcp-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')" \
             --linux-x64-sha "$(sha256sum artifacts/plug-mcp-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')" \
+            --formula-only \
             --output artifacts
           ruby -c artifacts/plug.rb
           ruby -c artifacts/plug-app.rb
