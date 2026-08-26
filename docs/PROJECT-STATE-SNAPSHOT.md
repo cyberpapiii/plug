@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through merge commit `e2e99d2` on 2026-08-26.
+Baseline: `main` through merge commit `a197f65` on 2026-08-26.
 
 This is the canonical current-state doc for the project.
 
@@ -107,7 +107,8 @@ Implemented on `main`:
 - gated MCP `2026-07-28` downstream discovery/sessionless HTTP and upstream `legacy | auto | modern` negotiation
 - modern principal-owned task lifecycle, admitted extension/schema/trace propagation, and secure native modern-to-modern multi-round `tools/call` continuations
 - issuer-bound upstream OAuth credentials with fail-closed handling for legacy unbound records
-- native macOS 14+ Plug.app with a quiet menu-bar health surface and full operator window for servers, clients, activity, authentication, settings, and upstream reauthorization
+- native macOS 14+ Plug.app with one shared verdict model, a glanceable menu-bar surface, and full operator workspaces for servers, tools, connections, activity, settings, and upstream reauthorization
+- human/CLI feature parity for normal operation: server add/import/edit/remove and enablement, per-tool enablement with wildcard-safe behavior, local client linking, remote-grant revocation, activity attribution, checkup, reload, restart, logs, and sign-out
 - daemon operator IPC for version negotiation, health/inventory snapshots, bounded activity history, server lifecycle mutations, and downstream grant revocation; the app and CLI remain clients of the same daemon authority
 - app-owned launchd lifecycle with first-run adoption of legacy daemon installs, single-flight startup, visible bounded failure handling, and a bundled universal Plug daemon so the app is standalone
 - direct Developer ID distribution as a signed, notarized, stapled DMG with Sparkle 2 signed updates and a Homebrew cask using the identical artifact
@@ -127,7 +128,9 @@ and the 22/22 official modern server conformance fixes landed on `main` in
 PR #96 (`52b2c7b`); the public-install daemon-adoption repair landed in PR #101
 (`9fdae06`). The calm single-sidebar operator redesign landed in PR #104
 (`b045000`), and the Swift 6-safe ServiceManagement adoption repair landed in
-PR #105 (`6dcfc1b`).
+PR #105 (`6dcfc1b`). The complete menu-bar/operator overhaul landed in PR #121
+(`163bc87`), and the real cold-start lifecycle repair landed in PR #122
+(`a197f65`).
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. This Mac enables only the proven
@@ -141,19 +144,23 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-Release `v0.7.5` is the current unified macOS release. Plug.app contains the
+Release `v0.8.1` is the current unified macOS release. Plug.app contains the
 matching universal CLI/runtime, owns daemon lifecycle after first-run adoption,
 repairs the canonical `~/.local/bin/plug` link, and redirects older stray CLIs
 into the signed bundle. Homebrew, GitHub, and website installs therefore
 converge on one app, one version, and one runtime.
 
-`v0.7.5` closes the remaining split-ownership path found after the 0.7.4
-reconciliation repair. When the verified app is installed, `plug connect`
-opens Plug.app instead of recreating a CLI launchd service; Plug.app may recover
-legacy or unmanaged ownership automatically only after the user has already
-granted ServiceManagement consent; and production `plug serve --daemon`
-rejects foreign supervisors. One signed bundle is therefore the sole runtime
-authority while `PLUG_DEV=1` preserves an explicit development escape hatch.
+`v0.8.1` replaces the older diagnostic-heavy window with a minimal native
+operator experience built around one shared verdict. Servers, tools,
+connections, and activity are visible directly; Settings owns service control,
+checkup, files, updates, and quit. The app now exposes the normal CLI operator
+surface without creating a second configuration or runtime authority.
+
+The 0.8.1 lifecycle fix also lets a real app-owned cold start finish. Plug.app
+kickstarts `com.plug.daemon` once, then waits up to 90 seconds for the bundled
+runtime and all configured upstreams instead of repeatedly killing a healthy
+startup while it is still initializing. The delayed-readiness behavior is
+covered by focused app tests.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
@@ -172,11 +179,12 @@ fail-safe path classification instead of running the full build matrix. Any
 code, configuration, dependency, script, or workflow change still runs every
 validation gate.
 
-Releases `v0.7.0` through `v0.7.4` are superseded. They established
+Releases `v0.7.0` through `v0.8.0` are superseded. They established
 the unified distribution and delegation model but each exposed installed-only
 regressions: recursive version probing, cold-daemon preflight rejection,
 unrelated launchd-label ownership classification, adoption/convergence defects,
-or a remaining second-owner path.
+remaining second-owner paths, or the repeated-kickstart cold-start failure fixed
+in 0.8.1.
 
 Release `v0.6.1` is the historical predecessor to the unified macOS line. Its
 public checksums verify, the universal `Plug.app` and embedded daemon are
@@ -185,12 +193,13 @@ notarized and stapled.
 
 The app's ServiceManagement registration is live under
 `com.cyberpapiii.plug`: launchd owns the bundled daemon as a PID-1 child from
-`/Applications/Plug.app/Contents/Resources/plug`, with parent bundle version 25.
-The installed app, CLI, and runtime all report 0.7.5; all 13 enabled upstreams
+`/Applications/Plug.app/Contents/Resources/plug`, with parent bundle version 27.
+The installed app, CLI, and runtime all report 0.8.1; all 13 enabled upstreams
 are healthy with 486 routed tools; the canonical shell link resolves into the
 bundle; and the obsolete CLI LaunchAgent plist is absent. The app reports
-"Running normally" without a reconciliation banner. Fresh installed-runtime
-certification initialized a real stdio MCP client, listed tools, and completed
+all servers as running without a setup or reconciliation banner. Fresh
+installed-runtime certification initialized a real stdio MCP client, listed 472
+tools for that client's policy, and completed
 a routed `Context7__resolve_library_id` call successfully. The
 public OAuth resource metadata advertises the operator-pinned six-scope grant.
 Production enables modern downstream HTTP only; modern upstream remains
