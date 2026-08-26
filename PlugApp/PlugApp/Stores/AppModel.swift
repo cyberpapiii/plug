@@ -50,9 +50,10 @@ final class AppModel {
     /// How far back the history goes. The daemon keeps a bounded ring, so this
     /// is the whole of what can be asked for, not a page of a longer list.
     static let activityLimit = 200
-    /// True when history is long enough to have been cut off at that limit,
-    /// which the list says out loud rather than pretending to be complete.
-    var activityIsCapped: Bool { activities.count >= Self.activityLimit }
+    /// True only after Plug has actually discarded older rows. Reaching exactly
+    /// 200 events is not proof that a 201st event exists.
+    private(set) var activityWasTruncated = false
+    var activityIsCapped: Bool { activityWasTruncated }
     private(set) var lastError: String?
     private(set) var installationState: InstallationState
     private(set) var showsReconciliationProgress = false
@@ -61,6 +62,8 @@ final class AppModel {
     private(set) var connectableApps: [LinkableApp] = []
     private(set) var busyApps: Set<String> = []
     private var capabilities: Set<String> = []
+    private var toolCatalogFingerprint = ""
+    private var lastToolRefreshAt: Date?
 
     /// The daemon accepts per-tool switches. Older daemons do not, and the
     /// interface hides the switches rather than offering a button that fails.
@@ -222,7 +225,7 @@ final class AppModel {
 
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
-                let interval = await self?.pollInterval ?? Self.backgroundPollInterval
+                let interval = self?.pollInterval ?? Self.backgroundPollInterval
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
                 await self?.refresh()
@@ -259,7 +262,7 @@ final class AppModel {
         coordinator.openLog()
     }
 
-    func refresh() async {
+    func refresh(forceCatalog: Bool = false) async {
         guard refreshTask == nil, !reconciliationInFlight else { return }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -267,7 +270,7 @@ final class AppModel {
             do {
                 let handshake = try await ipc.connect()
                 capabilities = Set(handshake.capabilities)
-                guard handshake.ipcMin <= 5, handshake.ipcMax >= 3 else {
+                guard handshake.ipcMin <= 6, handshake.ipcMax >= 3 else {
                     connectionState = .incompatible
                     lastError = nil
                     return
@@ -287,13 +290,38 @@ final class AppModel {
                 guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
                     throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
                 }
+                let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
+                let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
                 snapshot = value
                 NotificationService.shared.observe(value)
                 if case let .activity(events) = try await ipc.request(
-                    .activity(authToken: token, afterSequence: 0, limit: Self.activityLimit, failuresOnly: false)
-                ) { activities = events }
-                if case let .tools(tools) = try await ipc.request(.listTools) {
+                    .activity(
+                        authToken: token,
+                        afterSequence: activityCursor,
+                        limit: Self.activityLimit + 1,
+                        failuresOnly: false
+                    )
+                ) {
+                    if activityCursor == 0 {
+                        activityWasTruncated = events.count > Self.activityLimit
+                        activities = Array(events.suffix(Self.activityLimit))
+                    } else if !events.isEmpty {
+                        let merged = activities + events
+                        activityWasTruncated = activityWasTruncated
+                            || merged.count > Self.activityLimit
+                        activities = Array(merged.suffix(Self.activityLimit))
+                    }
+                }
+                let fingerprint = Self.catalogFingerprint(for: value)
+                let catalogAge = lastToolRefreshAt.map { Date().timeIntervalSince($0) } ?? .infinity
+                let catalogRefreshInterval = watcherCount > 0 ? 15.0 : 60.0
+                if forceCatalog || toolCatalog.isEmpty || fingerprint != toolCatalogFingerprint
+                    || catalogAge >= catalogRefreshInterval,
+                   case let .tools(tools) = try await ipc.request(.listTools)
+                {
                     toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
+                    toolCatalogFingerprint = fingerprint
+                    lastToolRefreshAt = Date()
                 }
                 connectionState = .ready
                 lastError = nil
@@ -312,7 +340,8 @@ final class AppModel {
             let token = try String(contentsOf: tokenURL, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             _ = try await ipc.request(request(token))
-            await refresh()
+            lastToolRefreshAt = nil
+            await refresh(forceCatalog: true)
         } catch { lastError = error.localizedDescription }
     }
 
@@ -325,6 +354,27 @@ final class AppModel {
 
     func updateServer(name: String, config: ServerConfig) async {
         await perform { .updateServer(authToken: $0, name: name, server: config) }
+    }
+
+    func serverConfig(name: String) async throws -> ServerConfig {
+        let token = try String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard case let .serverConfig(returnedName, config) = try await ipc.request(
+            .serverConfig(authToken: token, name: name)
+        ), returnedName == name else {
+            throw PlugIPCError.unexpectedResponse("ServerConfig")
+        }
+        return config
+    }
+
+    nonisolated private static func catalogFingerprint(for snapshot: OperatorSnapshot) -> String {
+        let configured = snapshot.configuredServers
+            .map { "\($0.name):\($0.enabled):\($0.transport)" }
+            .sorted()
+        let runtime = snapshot.servers
+            .map { "\($0.serverId):\($0.health):\($0.toolCount)" }
+            .sorted()
+        return (configured + runtime).joined(separator: "|")
     }
 
     /// Which AI apps are wired into Plug. Read from the client configuration

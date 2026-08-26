@@ -121,7 +121,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(state, .appManagedCurrent(expected))
     }
 
-    func testLiveSMAppServiceShapeWithMismatchedBundleVersionRemainsUnknown() async throws {
+    func testLiveSMAppServiceShapeWithOlderBundleVersionIsRecognizedAsStale() async throws {
         let runner = SMAppServiceLaunchctlRunner(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: "19",
@@ -131,7 +131,15 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
         let state = try await inspector.daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
 
-        assertUnknown(state, programIdentifier: "Contents/Resources/plug")
+        let expected = record(
+            label: "com.plug.daemon",
+            program: canonical.executableURL,
+            parentID: AppInstallationInspector.bundleIdentifier,
+            parentVersion: "19",
+            programIdentifier: "Contents/Resources/plug",
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+        )
+        XCTAssertEqual(state, .appManagedStale(expected))
     }
 
     func testLiveSMAppServiceShapeWithMismatchedBundleIdentifierRemainsUnknown() async throws {

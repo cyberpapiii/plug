@@ -44,7 +44,7 @@ impl fmt::Debug for IpcCancellationCapability {
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const OPERATOR_IPC_MIN: u16 = 3;
-pub const OPERATOR_IPC_MAX: u16 = 5;
+pub const OPERATOR_IPC_MAX: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +65,9 @@ pub enum OperatorCapability {
     /// Operator clients may turn individual merged tools on and off.
     /// Added in operator IPC v5.
     ToolMutation,
+    /// Operator clients may read one complete server definition before editing it.
+    /// Added in operator IPC v6 so updates preserve fields the editor does not expose.
+    ServerConfigRead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +127,10 @@ pub enum IpcRequest {
     },
     OperatorSnapshot {
         auth_token: String,
+    },
+    GetServerConfig {
+        auth_token: String,
+        name: String,
     },
     RevokeDownstreamClient {
         auth_token: String,
@@ -311,6 +318,11 @@ impl fmt::Debug for IpcRequest {
             Self::OperatorSnapshot { .. } => f
                 .debug_struct("OperatorSnapshot")
                 .field("auth_token", &"[REDACTED]")
+                .finish(),
+            Self::GetServerConfig { name, .. } => f
+                .debug_struct("GetServerConfig")
+                .field("auth_token", &"[REDACTED]")
+                .field("name", name)
                 .finish(),
             Self::RevokeDownstreamClient { client_id, .. } => f
                 .debug_struct("RevokeDownstreamClient")
@@ -726,6 +738,10 @@ pub enum IpcResponse {
     OperatorSnapshot {
         snapshot: Box<OperatorSnapshot>,
     },
+    ServerConfig {
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
     DownstreamClientRevoked {
         client_id: String,
     },
@@ -935,6 +951,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::InjectToken { .. }
             | IpcRequest::ActivitySnapshot { .. }
             | IpcRequest::OperatorSnapshot { .. }
+            | IpcRequest::GetServerConfig { .. }
             | IpcRequest::RevokeDownstreamClient { .. }
             | IpcRequest::ValidateServer { .. }
             | IpcRequest::AddServer { .. }
@@ -954,6 +971,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
         IpcRequest::ActivitySnapshot { auth_token, .. }
         | IpcRequest::OperatorSnapshot { auth_token, .. }
+        | IpcRequest::GetServerConfig { auth_token, .. }
         | IpcRequest::RevokeDownstreamClient { auth_token, .. } => Some(auth_token.as_str()),
         IpcRequest::ValidateServer { auth_token, .. }
         | IpcRequest::AddServer { auth_token, .. }
@@ -1459,6 +1477,10 @@ mod tests {
         }));
         assert!(requires_auth(&IpcRequest::OperatorSnapshot {
             auth_token: "t".to_string(),
+        }));
+        assert!(requires_auth(&IpcRequest::GetServerConfig {
+            auth_token: "t".to_string(),
+            name: "server".to_string(),
         }));
         assert!(requires_auth(&IpcRequest::RevokeDownstreamClient {
             auth_token: "t".to_string(),

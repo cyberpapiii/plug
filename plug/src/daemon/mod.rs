@@ -1128,6 +1128,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     plug_core::ipc::OperatorCapability::ConfigMutation,
                     plug_core::ipc::OperatorCapability::ActivityStream,
                     plug_core::ipc::OperatorCapability::ToolMutation,
+                    plug_core::ipc::OperatorCapability::ServerConfigRead,
                 ],
             },
         },
@@ -1206,6 +1207,27 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     upstream_auth,
                     downstream_clients,
                 }),
+            }
+        }
+        IpcRequest::GetServerConfig { name, .. } => {
+            let config = match plug_core::operator::load_editable_config(&ctx.config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    return IpcResponse::Error {
+                        code: "CONFIG_READ_FAILED".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            match config.servers.get(name) {
+                Some(server) => IpcResponse::ServerConfig {
+                    name: name.clone(),
+                    server: Box::new(server.clone()),
+                },
+                None => IpcResponse::Error {
+                    code: "UNKNOWN_SERVER".to_string(),
+                    message: format!("unknown server `{name}`"),
+                },
             }
         }
         IpcRequest::RevokeDownstreamClient { client_id, .. } => {

@@ -93,15 +93,19 @@ impl ActivityStore {
         } else {
             filter.limit.min(ACTIVITY_CAPACITY)
         };
-        self.events
+        let mut events = self
+            .events
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .iter()
             .filter(|event| event.sequence > filter.after_sequence)
             .filter(|event| !filter.failures_only || event.outcome != ActivityOutcome::Success)
+            .rev()
             .take(limit)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        events.reverse();
+        events
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ActivityEvent> {
@@ -167,5 +171,25 @@ mod tests {
         for forbidden in ["params", "result", "token", "secret"] {
             assert!(!json.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn a_bounded_snapshot_returns_the_newest_matching_events_in_order() {
+        let store = ActivityStore::default();
+        for index in 0..10 {
+            store.record(event(index));
+        }
+        let events = store.snapshot(&ActivityFilter {
+            after_sequence: 0,
+            failures_only: false,
+            limit: 3,
+        });
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
     }
 }

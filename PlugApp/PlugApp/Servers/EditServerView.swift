@@ -21,6 +21,7 @@ struct EditServerView: View {
     @State private var saving = false
     @State private var failure: String?
     @State private var loaded = false
+    @State private var loadedConfig: ServerConfig?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
@@ -41,7 +42,7 @@ struct EditServerView: View {
             Form {
                 if isRemote {
                     TextField("Address", text: $url, prompt: Text("https://example.com/mcp"))
-                    TextField("Access token", text: $authToken, prompt: Text("Optional"))
+                    SecureField("Access token", text: $authToken, prompt: Text("Optional"))
                 } else {
                     TextField("Command", text: $command, prompt: Text("npx"))
                     TextField("Arguments", text: $arguments, prompt: Text("-y linear-mcp"))
@@ -70,12 +71,12 @@ struct EditServerView: View {
                 Button(saving ? "Saving…" : "Save") { save() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(saving || !isComplete)
+                    .disabled(saving || !loaded || !isComplete)
             }
         }
         .padding(Metric.roomy)
         .frame(width: 520)
-        .task { load() }
+        .task { await load() }
     }
 
     private var isComplete: Bool {
@@ -84,29 +85,51 @@ struct EditServerView: View {
             : !command.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    /// Prefill from what the snapshot already knows. The daemon does not hand
-    /// back the full server definition, so anything it does not report is left
-    /// blank and only sent when it is filled in.
-    private func load() {
+    /// Load the daemon's complete definition once. Saving starts from this
+    /// value, so advanced settings the compact form does not show stay intact.
+    private func load() async {
         guard !loaded else { return }
-        loaded = true
-        guard let server = model.snapshot.configuredServers.first(where: { $0.name == name })
-        else { return }
-        isRemote = server.transport.lowercased() != "stdio"
+        do {
+            let config = try await model.serverConfig(name: name)
+            loadedConfig = config
+            isRemote = config.transport.lowercased() != "stdio"
+            command = config.command ?? ""
+            arguments = Self.renderArguments(config.args)
+            url = config.url ?? ""
+            authToken = config.authToken ?? ""
+            environment = config.env
+                .sorted { $0.key.localizedStandardCompare($1.key) == .orderedAscending }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: "\n")
+            loaded = true
+        } catch {
+            failure = error.localizedDescription
+        }
     }
 
     private func save() {
         saving = true
         failure = nil
-        var config = isRemote
-            ? ServerConfig.remote(url.trimmingCharacters(in: .whitespaces))
-            : ServerConfig.command("", args: [])
+        guard var config = loadedConfig else {
+            failure = "The server settings could not be loaded."
+            return
+        }
         if isRemote {
+            config.transport = "http"
+            config.command = nil
+            config.args = []
+            config.url = url.trimmingCharacters(in: .whitespaces)
             let token = authToken.trimmingCharacters(in: .whitespaces)
             config.authToken = token.isEmpty ? nil : token
         } else {
+            config.transport = "stdio"
             config.command = command.trimmingCharacters(in: .whitespaces)
             config.args = ServerDraftParser.tokenize(arguments)
+            config.url = nil
+            config.authToken = nil
+            config.auth = nil
+            config.oauthClientID = nil
+            config.oauthScopes = nil
         }
         config.env = Self.parseEnvironment(environment)
         let saved = config
@@ -128,9 +151,9 @@ struct EditServerView: View {
         }
     }
 
-    static func parseEnvironment(_ text: String) -> [String: String] {
+    nonisolated static func parseEnvironment(_ text: String) -> [String: String] {
         var result: [String: String] = [:]
-        for line in text.split(whereSeparator: { $0 == "\n" || $0 == "," }) {
+        for line in text.split(whereSeparator: { $0 == "\n" }) {
             let entry = line.trimmingCharacters(in: .whitespaces)
             guard let split = entry.firstIndex(of: "=") else { continue }
             let key = String(entry[entry.startIndex..<split]).trimmingCharacters(in: .whitespaces)
@@ -140,5 +163,14 @@ struct EditServerView: View {
             result[key] = value
         }
         return result
+    }
+
+    nonisolated static func renderArguments(_ arguments: [String]) -> String {
+        arguments.map { argument in
+            guard argument.isEmpty || argument.contains(where: { $0.isWhitespace || "'\"\\".contains($0) }) else {
+                return argument
+            }
+            return "'\(argument.replacingOccurrences(of: "'", with: "'\\''"))'"
+        }.joined(separator: " ")
     }
 }

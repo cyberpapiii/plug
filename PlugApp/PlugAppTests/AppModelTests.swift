@@ -227,7 +227,7 @@ final class AppModelTests: XCTestCase {
             state: .healthy(makeInstallationSnapshot()),
             events: events
         )
-        let server = try! OperatorFixtureServer(events: events, ipcMin: 6, ipcMax: 7)
+        let server = try! OperatorFixtureServer(events: events, ipcMin: 7, ipcMax: 7)
         defer { server.stop() }
 
         let model = AppModel(
@@ -259,8 +259,8 @@ final class AppModelTests: XCTestCase {
         )
         let oldServer = try OperatorFixtureServer(
             events: events,
-            ipcMin: 6,
-            ipcMax: 6,
+            ipcMin: 7,
+            ipcMax: 7,
             socketURL: socketURL
         )
         var replacement: OperatorFixtureServer?
@@ -335,19 +335,6 @@ final class AppModelTests: XCTestCase {
             postedIDs,
             ["upstream-reauth-alpha", "downstream-client-client-1"]
         )
-    }
-
-    func testAppModelHasNoDirectDaemonRestartOrProcessSpawnBypass() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .appending(path: "../PlugApp/Stores/AppModel.swift")
-            .standardizedFileURL
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-
-        XCTAssertFalse(source.contains("DaemonServiceManager.shared"))
-        XCTAssertFalse(source.contains("restartDaemon"))
-        XCTAssertFalse(source.contains("launchctl"))
-        XCTAssertFalse(source.contains("Process("))
     }
 
     @MainActor

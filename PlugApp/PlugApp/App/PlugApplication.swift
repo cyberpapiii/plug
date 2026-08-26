@@ -49,7 +49,7 @@ struct PlugApplication: App {
             // for something the app already does. The shortcut people reach for
             // out of habit still works.
             CommandGroup(after: .toolbar) {
-                Button("Refresh") { Task { await model.refresh() } }
+                Button("Refresh") { Task { await model.refresh(forceCatalog: true) } }
                     .keyboardShortcut("r", modifiers: .command)
             }
         }

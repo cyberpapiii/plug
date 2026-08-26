@@ -188,7 +188,7 @@ struct AttentionRow: View {
         }
         .padding(.vertical, Metric.tight)
         .padding(.horizontal, Metric.snug)
-        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: Metric.corner))
+        .nativeGlassSurface(tint: .orange.opacity(0.12))
         .accessibilityElement(children: .combine)
     }
 }
@@ -294,5 +294,27 @@ extension View {
     /// Standard inset for popover content blocks.
     func popoverInset() -> some View {
         padding(.horizontal, Metric.regular)
+    }
+
+    /// Use the system's real Liquid Glass on macOS 26 while keeping the same
+    /// readable material hierarchy on the app's macOS 14–15 floor.
+    @ViewBuilder
+    func nativeGlassSurface(tint: Color? = nil) -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(.regular.tint(tint), in: .rect(cornerRadius: Metric.corner))
+        } else {
+            background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
+        }
+    }
+
+    /// Native glass controls belong on the small action cluster, not on every
+    /// row. That keeps the hierarchy calm while making the controls unmistakable.
+    @ViewBuilder
+    func nativeGlassButton() -> some View {
+        if #available(macOS 26.0, *) {
+            buttonStyle(.glass)
+        } else {
+            buttonStyle(.bordered)
+        }
     }
 }

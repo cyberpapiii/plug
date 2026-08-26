@@ -7,6 +7,44 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-26
+
+### Added
+
+- Rebuilt Plug.app around a useful menu-bar popover, with one plain-language
+  status, direct repair actions, live server state, connected-app visibility,
+  Settings, and Quit in immediate reach.
+- Added full Servers, Tools, Connections, and Activity workspaces, including
+  searchable tool names, per-tool switches, server editing, app linking,
+  server import, remote-client revocation, sign-in and sign-out, and readable
+  call attribution.
+- Added native macOS 26 Liquid Glass for compact controls and transient
+  surfaces, with an accessible material fallback on macOS 14 and 15.
+
+### Changed
+
+- Replaced protocol and service jargon with calm, human language and made
+  state readable by symbol and text rather than color alone.
+- Refreshes stay responsive while the app is visible, slow down in the
+  background, fetch activity incrementally, and avoid reloading the complete
+  tool catalog every two seconds.
+- Operator IPC v6 lets the signed app load a complete server definition before
+  editing, so compact edits preserve advanced settings and credentials.
+
+### Fixed
+
+- Editing a server no longer replaces fields the form did not display with
+  empty defaults.
+- Activity history now returns the newest bounded calls instead of the oldest
+  calls in the retained ring.
+- PlugApp's architecture check now runs as a shell CI gate instead of reading
+  source files from the signed XCTest host, removing a macOS privacy hang from
+  the local test loop.
+- Recognize the exact bundle-relative ServiceManagement daemon as app-owned
+  when its recorded build is older, then unregister the old app service before
+  registering the replacement. Updates no longer strand a valid installation
+  behind stale background-service evidence.
+
 ## [0.7.5] - 2026-08-25
 
 ### Fixed

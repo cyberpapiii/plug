@@ -171,10 +171,10 @@ final class EditServerEnvironmentTests: XCTestCase {
         )
     }
 
-    func testCommasSeparatePairsToo() {
+    func testCommasStayInsideValues() {
         XCTAssertEqual(
             EditServerView.parseEnvironment("A=1, B=2"),
-            ["A": "1", "B": "2"]
+            ["A": "1, B=2"]
         )
     }
 
@@ -196,5 +196,13 @@ final class EditServerEnvironmentTests: XCTestCase {
 
     func testNothingTypedMeansNoEnvironment() {
         XCTAssertTrue(EditServerView.parseEnvironment("   \n ").isEmpty)
+    }
+
+    func testArgumentsRoundTripThroughTheDisplayedCommandLine() {
+        let arguments = ["-y", "a package", "", "it's-safe", #"a\"quote"#]
+        XCTAssertEqual(
+            ServerDraftParser.tokenize(EditServerView.renderArguments(arguments)),
+            arguments
+        )
     }
 }

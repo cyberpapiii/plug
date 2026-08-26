@@ -315,3 +315,31 @@ ran out.
   exists — the app now says so at the end of the list rather than implying more.
 - **Import copies servers in, it does not keep them in step.** A server later
   changed in Cursor is not re-imported.
+
+## Codex 5.6 Sol verification pass
+
+The implementation was rebuilt and exercised against the real macOS 26 SDK,
+not accepted from screenshots or branch summaries alone. This pass corrected
+four gaps before installation:
+
+- **Server editing now preserves the whole definition.** The first draft knew
+  only a server's transport, then submitted a new mostly empty definition.
+  Operator IPC v6 now loads the authenticated, daemon-owned definition once;
+  the compact form changes only its visible fields and round-trips advanced
+  timeouts, OAuth choices, tool groups, sandbox rules, environment, and token.
+- **Recent activity is actually recent.** A bounded read previously took the
+  oldest matching events. It now selects the newest matching events and keeps
+  them in chronological order; the app asks only for events after its cursor.
+- **The live view is lighter.** The snapshot still updates quickly while a
+  person is looking, but the 486-item tool catalog refreshes only when server
+  evidence changes, after a mutation, on manual refresh, or at a bounded
+  interval.
+- **Liquid Glass is real and restrained.** macOS 26 uses SwiftUI's native
+  `glassEffect` and glass button style on the small action cluster, problem
+  cards, and transient errors. Older supported macOS releases retain a native
+  material fallback. Lists and content remain quiet instead of becoming a wall
+  of glass.
+- **Update adoption follows the real ServiceManagement shape.** macOS reports
+  the embedded daemon as a bundle-relative program. An older recorded bundle
+  version is now classified as the app's stale service, not unknown software;
+  replacement unregisters that service before creating the new registration.

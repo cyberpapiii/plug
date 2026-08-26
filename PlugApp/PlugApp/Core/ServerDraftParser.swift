@@ -208,8 +208,15 @@ enum ServerDraftParser {
         var current = ""
         var quote: Character?
         var hasContent = false
+        var escaping = false
 
         for character in text {
+            if escaping {
+                current.append(character)
+                hasContent = true
+                escaping = false
+                continue
+            }
             if let active = quote {
                 if character == active {
                     quote = nil
@@ -219,6 +226,9 @@ enum ServerDraftParser {
                 continue
             }
             switch character {
+            case "\\":
+                escaping = true
+                hasContent = true
             case "\"", "'":
                 quote = character
                 hasContent = true
@@ -233,6 +243,7 @@ enum ServerDraftParser {
                 hasContent = true
             }
         }
+        if escaping { current.append("\\") }
         if hasContent { tokens.append(current) }
         return tokens
     }

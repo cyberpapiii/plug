@@ -120,10 +120,11 @@ struct PlugPopover: View {
     private var footer: some View {
         HStack(spacing: Metric.tight) {
             Button { run(.addServer) } label: {
-                Label("Add Server", systemImage: "plus.circle")
+                Label("Add Server", systemImage: "plus")
                     .font(.callout)
             }
-            .buttonStyle(QuietRowButtonStyle())
+            .nativeGlassButton()
+            .controlSize(.small)
             .fixedSize()
             .help("Add a server")
 
@@ -131,7 +132,8 @@ struct PlugPopover: View {
                 Label("Open Plug", systemImage: "macwindow")
                     .font(.callout)
             }
-            .buttonStyle(QuietRowButtonStyle())
+            .nativeGlassButton()
+            .controlSize(.small)
             .fixedSize()
             .help("Open the Plug window")
 
@@ -145,7 +147,8 @@ struct PlugPopover: View {
                 Image(systemName: "gearshape")
                     .font(.callout)
             }
-            .buttonStyle(QuietIconButtonStyle())
+            .nativeGlassButton()
+            .controlSize(.small)
             .fixedSize()
             .help("Settings")
             .accessibilityLabel("Settings")
@@ -154,7 +157,8 @@ struct PlugPopover: View {
                 Image(systemName: "power")
                     .font(.callout)
             }
-            .buttonStyle(QuietIconButtonStyle())
+            .nativeGlassButton()
+            .controlSize(.small)
             .fixedSize()
             .help("Quit Plug. Your servers keep running.")
             .accessibilityLabel("Quit Plug")

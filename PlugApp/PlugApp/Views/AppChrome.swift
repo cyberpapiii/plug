@@ -11,7 +11,7 @@ struct ErrorToast: View {
             .lineLimit(2)
             .padding(.horizontal, Metric.regular)
             .padding(.vertical, Metric.snug)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
+            .nativeGlassSurface(tint: .red.opacity(0.08))
             .shadow(radius: 8, y: 2)
             .padding()
     }

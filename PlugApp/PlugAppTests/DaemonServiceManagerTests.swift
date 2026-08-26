@@ -70,7 +70,6 @@ final class DaemonServiceManagerTests: XCTestCase {
         XCTAssertEqual(backend.events, [
             .handshake,
             .pause,
-            .bootOut(label: stale.label, path: stale.programURL!),
             .unregister,
             .register,
             .kickstart,
@@ -99,9 +98,8 @@ final class DaemonServiceManagerTests: XCTestCase {
         }
 
         XCTAssertEqual(backend.events.last, .resume([101, 102]))
-        XCTAssertTrue(backend.events.firstIndex(of: .pause)! < backend.events.firstIndex {
-            if case .bootOut = $0 { true } else { false }
-        }!)
+        XCTAssertTrue(backend.events.firstIndex(of: .pause)! < backend.events.firstIndex(of: .unregister)!)
+        XCTAssertFalse(backend.events.contains { if case .bootOut = $0 { true } else { false } })
     }
 
     func testWrongVersionReadySocketRetriesAreBoundedThenFail() async throws {

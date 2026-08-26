@@ -134,6 +134,7 @@ jobs:
           key: plug-app-ci
       - run: brew install xcodegen
       - run: swift test --package-path PlugApp/PlugIPC
+      - run: ./scripts/check-app-architecture.sh
       - run: xcodegen generate --spec PlugApp/project.yml
       # This gate proves the complete app and login-service bundle compile
       # together, then runs the PlugApp unit suite. The signed fixture class

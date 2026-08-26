@@ -200,8 +200,8 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public var circuitBreakerEnabled = true
     public var enrichment = false
     public var toolRenames: [String: String] = [:]
-    public var toolGroups: [String] = []
-    public var sandbox: String?
+    public var toolGroups: [ToolGroupRule] = []
+    public var sandbox: StdioSandboxConfig?
 
     public static func command(_ command: String, args: [String]) -> Self {
         Self(command: command, args: args, transport: "stdio")
@@ -212,9 +212,57 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     }
 }
 
+extension ServerConfig {
+    private enum CodingKeys: String, CodingKey {
+        case command, args, env, enabled, transport, protocolMode = "protocol", url, authToken
+        case auth, oauthClientID, oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
+        case healthCheckIntervalSecs, circuitBreakerEnabled, enrichment, toolRenames, toolGroups
+        case sandbox
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        command = try c.decodeIfPresent(String.self, forKey: .command)
+        args = try c.decodeIfPresent([String].self, forKey: .args) ?? []
+        env = try c.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        transport = try c.decodeIfPresent(String.self, forKey: .transport) ?? "stdio"
+        protocolMode = try c.decodeIfPresent(String.self, forKey: .protocolMode) ?? "legacy"
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        authToken = try c.decodeIfPresent(String.self, forKey: .authToken)
+        auth = try c.decodeIfPresent(String.self, forKey: .auth)
+        oauthClientID = try c.decodeIfPresent(String.self, forKey: .oauthClientID)
+        oauthScopes = try c.decodeIfPresent([String].self, forKey: .oauthScopes)
+        timeoutSecs = try c.decodeIfPresent(Int.self, forKey: .timeoutSecs) ?? 30
+        callTimeoutSecs = try c.decodeIfPresent(Int.self, forKey: .callTimeoutSecs) ?? 300
+        maxConcurrent = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) ?? 1
+        healthCheckIntervalSecs = try c.decodeIfPresent(Int.self, forKey: .healthCheckIntervalSecs) ?? 60
+        circuitBreakerEnabled = try c.decodeIfPresent(Bool.self, forKey: .circuitBreakerEnabled) ?? true
+        enrichment = try c.decodeIfPresent(Bool.self, forKey: .enrichment) ?? false
+        toolRenames = try c.decodeIfPresent([String: String].self, forKey: .toolRenames) ?? [:]
+        toolGroups = try c.decodeIfPresent([ToolGroupRule].self, forKey: .toolGroups) ?? []
+        sandbox = try c.decodeIfPresent(StdioSandboxConfig.self, forKey: .sandbox)
+    }
+}
+
+public struct ToolGroupRule: Codable, Equatable, Sendable {
+    public var prefix: String
+    public var contains: [String]
+    public var strip: [String] = []
+}
+
+public struct StdioSandboxConfig: Codable, Equatable, Sendable {
+    public var enabled = false
+    public var allowNetwork = false
+    public var allowRead: [String] = []
+    public var allowWrite: [String] = []
+    public var profilePath: String?
+}
+
 public enum IPCRequest: Encodable, Equatable, Sendable {
     case handshake(clientVersion: String, ipcMin: UInt16, ipcMax: UInt16)
     case snapshot(authToken: String)
+    case serverConfig(authToken: String, name: String)
     case activity(authToken: String, afterSequence: UInt64, limit: Int, failuresOnly: Bool)
     case validateServer(authToken: String, name: String, server: ServerConfig)
     case addServer(authToken: String, name: String, server: ServerConfig)
@@ -241,6 +289,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode(min, forKey: .ipcMin); try c.encode(max, forKey: .ipcMax)
         case let .snapshot(token):
             try c.encode("OperatorSnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
+        case let .serverConfig(token, name):
+            try c.encode("GetServerConfig", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(name, forKey: .name)
         case let .activity(token, after, limit, failures):
             try c.encode("ActivitySnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(after, forKey: .afterSequence); try c.encode(limit, forKey: .limit)
@@ -318,6 +369,7 @@ public struct ReloadSummary: Decodable, Equatable, Sendable {
 public enum IPCResponse: Decodable, Sendable {
     case handshake(OperatorHandshake)
     case snapshot(OperatorSnapshot)
+    case serverConfig(name: String, server: ServerConfig)
     case activity([ActivityEvent])
     case tools([ToolInfo])
     case validated
@@ -329,7 +381,7 @@ public enum IPCResponse: Decodable, Sendable {
     case error(code: String, message: String)
 
     private enum CodingKeys: String, CodingKey {
-        case type, handshake, snapshot, events, tools, clientId, code, message, report
+        case type, handshake, snapshot, events, tools, clientId, code, message, report, name, server
     }
 
     public init(from decoder: Decoder) throws {
@@ -338,6 +390,10 @@ public enum IPCResponse: Decodable, Sendable {
         switch type {
         case "OperatorHandshake": self = .handshake(try c.decode(OperatorHandshake.self, forKey: .handshake))
         case "OperatorSnapshot": self = .snapshot(try c.decode(OperatorSnapshot.self, forKey: .snapshot))
+        case "ServerConfig": self = .serverConfig(
+            name: try c.decode(String.self, forKey: .name),
+            server: try c.decode(ServerConfig.self, forKey: .server)
+        )
         case "ActivitySnapshot": self = .activity(try c.decode([ActivityEvent].self, forKey: .events))
         case "Tools": self = .tools(try c.decode([ToolInfo].self, forKey: .tools))
         case "ServerValidated": self = .validated

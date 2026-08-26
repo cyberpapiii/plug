@@ -168,8 +168,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         guard record.programURL == nil,
               record.programIdentifier == appProgramIdentifier,
               record.arguments == appArguments,
-              record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier,
-              record.parentBundleVersion == canonical.buildVersion
+              record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
         else {
             return record
         }

@@ -76,6 +76,9 @@ private struct GeneralSettings: View {
         }
         .formStyle(.grouped)
         .frame(height: 250)
+        .task {
+            launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
+        }
     }
 }
 
