@@ -64,6 +64,22 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(state, .unmanaged)
     }
 
+    func testRunningPlugApplicationJobIsNotMistakenForDaemonOwnership() async throws {
+        let applicationJob = record(
+            label: "application.com.cyberpapiii.plug.123.456",
+            program: canonical.bundleURL.appending(path: "Contents/MacOS/Plug"),
+            parentID: AppInstallationInspector.bundleIdentifier,
+            parentVersion: canonical.buildVersion
+        )
+
+        let state = try await LaunchdJobInspector(records: { [applicationJob] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+
+        XCTAssertEqual(state, .unmanaged)
+    }
+
     func testBroadEnumerationFindsPlugProgramBehindUnrelatedLabel() async throws {
         let runner = RecordingLaunchctlRunner()
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
@@ -179,6 +195,18 @@ final class LaunchdJobInspectorTests: XCTestCase {
         }
     }
 
+    func testVanishedUnrelatedLaunchdJobIsIgnored() async throws {
+        let runner = VanishedUnrelatedLaunchctlRunner()
+        let inspector = LaunchdJobInspector(runner: runner, userID: 501)
+
+        let state = try await inspector.daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+
+        XCTAssertEqual(state, .unmanaged)
+    }
+
     func testLaunchdProgramSymlinkResolvesToRecognizedLegacyBinary() async throws {
         let fixture = try LaunchdSymlinkFixture()
         defer { fixture.cleanup() }
@@ -225,6 +253,23 @@ final class LaunchdJobInspectorTests: XCTestCase {
         }
         XCTAssertNil(record.programURL)
         XCTAssertEqual(record.programIdentifier, programIdentifier)
+    }
+}
+
+private actor VanishedUnrelatedLaunchctlRunner: ProcessRunning {
+    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        if arguments == ["list"] {
+            return ProcessResult(
+                status: 0,
+                stdout: Data("PID\tStatus\tLabel\n123\t0\tcom.apple.transient\n".utf8),
+                stderr: Data()
+            )
+        }
+        return ProcessResult(
+            status: 113,
+            stdout: Data(),
+            stderr: Data("Could not find service".utf8)
+        )
     }
 }
 

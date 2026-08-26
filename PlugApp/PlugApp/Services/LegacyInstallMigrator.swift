@@ -91,13 +91,21 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
 
         var recognizedPaths = Set<URL>()
         var unknownPaths = Set<URL>()
+        switch shellState {
+        case .canonical, .repairable:
+            // The launchd job records the stable shell-link path, not its
+            // destination. Preserve that proven legacy location so daemon
+            // adoption can classify and replace it safely.
+            recognizedPaths.insert(shellURL.standardizedFileURL)
+        case let .unrelated(url):
+            unknownPaths.insert(url.standardizedFileURL)
+        case .absent:
+            break
+        }
         if cargoIdentity != nil {
             recognizedPaths.insert(cargoURL.standardizedFileURL)
         } else if pathExists(cargoURL) {
             unknownPaths.insert(cargoURL.standardizedFileURL)
-        }
-        if case .unrelated(let url) = shellState {
-            unknownPaths.insert(url.standardizedFileURL)
         }
         if formulaInstalled {
             for prefix in ["/opt/homebrew", "/usr/local"] {
