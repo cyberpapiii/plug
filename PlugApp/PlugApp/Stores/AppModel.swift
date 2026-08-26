@@ -50,6 +50,23 @@ final class AppModel {
     private(set) var installationState: InstallationState
     private(set) var showsReconciliationProgress = false
     private(set) var signingInServers: Set<String> = []
+    /// Someone is looking at Plug right now, so refresh briskly. Nothing is
+    /// visible otherwise, and a background poll every few seconds is rude to
+    /// a laptop battery for information no one is reading.
+    private var watcherCount = 0
+
+    static let foregroundPollInterval = Duration.seconds(2)
+    static let backgroundPollInterval = Duration.seconds(30)
+
+    private var pollInterval: Duration {
+        watcherCount > 0 ? Self.foregroundPollInterval : Self.backgroundPollInterval
+    }
+
+    /// Called when a surface appears or disappears. Balanced pairs only.
+    func setWatching(_ watching: Bool) {
+        watcherCount = max(0, watcherCount + (watching ? 1 : -1))
+        if watching { Task { await refresh() } }
+    }
 
     init(
         ipc: PlugIPCClient? = nil,
@@ -75,17 +92,84 @@ final class AppModel {
         }.map(\.element)
     }
 
-    var menuBarSymbol: String {
-        if connectionState != .ready { return "bolt.slash.circle" }
-        return visibleServers.contains { $0.health == "Failed" || $0.health == "AuthRequired" }
-            ? "bolt.trianglebadge.exclamationmark" : "bolt.circle.fill"
+    /// Everything the interface needs to describe Plug, as one plain value.
+    var situation: PlugSituation {
+        PlugSituation(
+            setup: setupState,
+            runtime: runtimeState,
+            servers: serverFacts,
+            connectedApps: snapshot.liveSessions.count,
+            version: snapshot.runtimeVersion
+        )
     }
+
+    /// The single sentence every surface renders.
+    var verdict: Verdict { PlugVerdict.verdict(for: situation) }
+
+    /// Problems paired with the buttons that fix them.
+    var attentionItems: [AttentionItem] { PlugVerdict.attention(for: situation) }
+
+    var serverFacts: [ServerFacts] {
+        let auth = Dictionary(
+            snapshot.upstreamAuth.map { ($0.name, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return visibleServers.map { server in
+            let account = auth[server.configured.name]
+            return ServerFacts(
+                name: server.configured.name,
+                enabled: server.configured.enabled,
+                transport: server.configured.transport,
+                usesOAuth: server.configured.oauth,
+                health: ServerHealth(
+                    daemonValue: server.configured.enabled ? server.runtime?.health : "Disabled",
+                    enabled: server.configured.enabled
+                ),
+                toolCount: server.toolCount,
+                error: server.runtime?.error,
+                isSigningIn: signingInServers.contains(server.configured.name),
+                tokenExpiresInSecs: account?.tokenExpiresInSecs,
+                authWarnings: account?.warnings ?? []
+            )
+        }
+    }
+
+    private var setupState: PlugSituation.Setup {
+        if showsReconciliationProgress { return .settingUp }
+        switch installationState {
+        case .healthy: return .ready
+        case .adoptionRequired: return .needsPermission
+        case .reconcilingUpdate: return .settingUp
+        case let .repairableDrift(drift): return .needsRepair(detail: drift.detail)
+        case let .blocked(failure): return .blocked(detail: failure.detail, hasLog: failure.logURL != nil)
+        }
+    }
+
+    private var runtimeState: PlugSituation.Runtime {
+        switch connectionState {
+        case .ready: .running
+        case .connecting: .starting
+        case .incompatible: .versionMismatch
+        case .disconnected: .stopped
+        }
+    }
+
+    var menuBarSymbol: String { PlugVerdict.menuBarSymbol(for: verdict) }
 
     var isHealthy: Bool {
         guard case .healthy = installationState, connectionState == .ready else { return false }
         return visibleServers.allSatisfy {
             !$0.configured.enabled || $0.health == "Healthy"
         }
+    }
+
+    /// Recent calls that touched one server, newest first.
+    func recentActivity(for server: String, limit: Int = 12) -> [ActivityEvent] {
+        activities
+            .filter { $0.server == server }
+            .sorted { $0.sequence > $1.sequence }
+            .prefix(limit)
+            .map { $0 }
     }
 
     var connectionRecoveryIsRequired: Bool {
@@ -121,7 +205,8 @@ final class AppModel {
 
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
+                let interval = await self?.pollInterval ?? Self.backgroundPollInterval
+                try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
                 await self?.refresh()
             }

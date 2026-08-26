@@ -1,0 +1,281 @@
+import SwiftUI
+
+// MARK: - Metrics
+
+/// One spacing scale for the whole app. Every gap in Plug is one of these.
+enum Metric {
+    static let hairline: CGFloat = 2
+    static let tight: CGFloat = 6
+    static let snug: CGFloat = 10
+    static let regular: CGFloat = 14
+    static let roomy: CGFloat = 20
+    static let corner: CGFloat = 10
+    static let popoverWidth: CGFloat = 340
+    static let popoverMaxListHeight: CGFloat = 268
+}
+
+// MARK: - Tone
+
+extension Verdict.Tone {
+    var color: Color {
+        switch self {
+        case .good: .green
+        case .busy: .secondary
+        case .attention: .orange
+        case .blocked: .red
+        }
+    }
+
+    /// Only trouble earns a filled, coloured badge. Calm states stay quiet.
+    var isLoud: Bool {
+        switch self {
+        case .good, .busy: false
+        case .attention, .blocked: true
+        }
+    }
+}
+
+extension ServerHealth {
+    var color: Color {
+        switch self {
+        case .working: .green
+        case .starting: .secondary
+        case .signInNeeded: .orange
+        case .down, .unknown: .red
+        case .off: .secondary
+        }
+    }
+
+    /// Shape, not just colour, carries the state.
+    var symbol: String {
+        switch self {
+        case .working: "checkmark.circle.fill"
+        case .starting: "circle.dotted"
+        case .signInNeeded: "person.badge.key.fill"
+        case .down: "exclamationmark.circle.fill"
+        case .unknown: "questionmark.circle.fill"
+        case .off: "circle.slash"
+        }
+    }
+}
+
+// MARK: - Small parts
+
+/// A server's state as one glyph. Carries its own accessibility wording so the
+/// meaning never lives in colour alone.
+struct StatusGlyph: View {
+    let health: ServerHealth
+    var size: Font = .body
+
+    var body: some View {
+        Image(systemName: health.symbol)
+            .font(size)
+            .foregroundStyle(health.color)
+            .symbolRenderingMode(.hierarchical)
+            .accessibilityLabel(health.label)
+    }
+}
+
+/// A section title in the quiet, all-caps register used for grouping.
+struct SectionLabel: View {
+    let text: String
+    var trailing: String?
+
+    var body: some View {
+        HStack(spacing: Metric.tight) {
+            Text(text.uppercased())
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+            if let trailing {
+                Text(trailing)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// The headline. Rendered large in the popover, compact in the window banner,
+/// but always the same words, so the app cannot contradict itself.
+struct VerdictView: View {
+    let verdict: Verdict
+    var compact = false
+    let run: (PlugIntent) -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: Metric.snug) {
+            icon
+            VStack(alignment: .leading, spacing: 1) {
+                Text(verdict.title)
+                    .font(compact ? .callout.weight(.medium) : .headline)
+                    .foregroundStyle(.primary)
+                if let detail = verdict.detail {
+                    Text(detail)
+                        .font(compact ? .caption : .subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: Metric.tight)
+            buttons
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(verdict.title). \(verdict.detail ?? "")")
+    }
+
+    @ViewBuilder private var icon: some View {
+        if verdict.tone == .busy {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 22, height: 22)
+        } else {
+            Image(systemName: verdict.symbol)
+                .font(compact ? .body : .title3)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(verdict.tone.color)
+                .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
+        }
+    }
+
+    @ViewBuilder private var buttons: some View {
+        HStack(spacing: Metric.tight) {
+            if let secondary = verdict.secondary {
+                Button(secondary.title) { run(secondary.intent) }
+                    .buttonStyle(.link)
+            }
+            if let primary = verdict.primary {
+                Button(primary.title) { run(primary.intent) }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(compact ? .small : .regular)
+            }
+        }
+    }
+}
+
+/// A problem next to the button that fixes it.
+struct AttentionRow: View {
+    let item: AttentionItem
+    let run: (PlugIntent) -> Void
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            Image(systemName: item.symbol)
+                .font(.callout)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.orange)
+                .frame(width: 18)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(item.title)
+                    .font(.callout.weight(.medium))
+                Text(item.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: Metric.tight)
+            if item.isWorking {
+                ProgressView().controlSize(.small)
+            } else if let button = item.button {
+                Button(button.title) { run(button.intent) }
+                    .controlSize(.small)
+            }
+        }
+        .padding(.vertical, Metric.tight)
+        .padding(.horizontal, Metric.snug)
+        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: Metric.corner))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// One server, read-only and quiet. The same row shape in the popover and the
+/// window so the two surfaces never feel like different apps.
+struct ServerRow: View {
+    let server: ServerFacts
+    var showsTrailingDetail = true
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            StatusGlyph(health: server.health)
+            Text(server.name)
+                .font(.callout)
+                .foregroundStyle(server.enabled ? .primary : .secondary)
+                .lineLimit(1)
+            Spacer(minLength: Metric.tight)
+            if showsTrailingDetail {
+                Text(trailingText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(server.name), \(server.health.label)")
+    }
+
+    private var trailingText: String {
+        switch server.health {
+        case .working: server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools"
+        default: server.health.label
+        }
+    }
+}
+
+/// A row that reads as one tappable line: label, value, chevron.
+struct DisclosureRow<Trailing: View>: View {
+    let symbol: String
+    let title: String
+    let detail: String?
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            Image(systemName: symbol)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title).font(.callout)
+                if let detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: Metric.tight)
+            trailing
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Buttons
+
+/// A full-width, quiet row button — the popover's footer vocabulary.
+struct QuietRowButtonStyle: ButtonStyle {
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, Metric.snug)
+            .padding(.vertical, Metric.tight)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : (hovering ? 0.07 : 0)))
+            )
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+    }
+}
+
+extension View {
+    /// Standard inset for popover content blocks.
+    func popoverInset() -> some View {
+        padding(.horizontal, Metric.regular)
+    }
+}

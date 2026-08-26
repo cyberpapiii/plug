@@ -1,0 +1,152 @@
+import PlugIPC
+import SwiftUI
+
+/// Who can use Plug. The old app split this in two — "Clients" listed apps and
+/// "Auth" listed the grants for the same apps — so the audit question ("who
+/// reaches my tools, and how do I cut them off?") could not be answered in one
+/// place. It can now.
+struct ConnectionsView: View {
+    let model: AppModel
+    let run: (PlugIntent) -> Void
+
+    private var sessions: [LiveSession] { model.snapshot.liveSessions }
+    private var grants: [DownstreamClient] { model.snapshot.downstreamClients }
+
+    var body: some View {
+        Group {
+            if sessions.isEmpty && grants.isEmpty {
+                EmptyPage(
+                    title: "Nothing is connected",
+                    message: "When an AI app connects through Plug it shows up here, along with everything it can reach.",
+                    symbol: "app.connected.to.app.below.fill"
+                )
+            } else {
+                List {
+                    if !sessions.isEmpty {
+                        Section("Connected now") {
+                            ForEach(sessions) { session in
+                                sessionRow(session)
+                            }
+                        }
+                    }
+                    if !grants.isEmpty {
+                        Section {
+                            ForEach(grants) { grant in
+                                GrantRow(grant: grant, run: run)
+                            }
+                        } header: {
+                            Text("Authorized to connect remotely")
+                        } footer: {
+                            Text("These have a standing key to reach Plug over the network. Revoke anything you don't recognize.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .navigationTitle("Connections")
+    }
+
+    private func sessionRow(_ session: LiveSession) -> some View {
+        HStack(spacing: Metric.snug) {
+            Image(systemName: symbol(for: session))
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(displayName(session)).font(.body)
+                Text(connectionDescription(session))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: Metric.tight)
+            Text(toolsText(session))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, Metric.tight - 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func displayName(_ session: LiveSession) -> String {
+        if let info = session.clientInfo, !info.isEmpty { return info }
+        return session.clientType
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+    }
+
+    private func symbol(for session: LiveSession) -> String {
+        let value = session.clientType.lowercased()
+        if value.contains("cursor") { return "cursorarrow.rays" }
+        if value.contains("desktop") || value.contains("claude") { return "sparkles" }
+        if value.contains("code") { return "chevron.left.forwardslash.chevron.right" }
+        return "terminal"
+    }
+
+    /// Says how it reached Plug in words, not transport identifiers.
+    private func connectionDescription(_ session: LiveSession) -> String {
+        let how: String
+        switch session.transport.lowercased() {
+        case "stdio", "ipc": how = "On this Mac"
+        case "http", "streamable_http", "sse": how = "Over the network"
+        default: how = session.transport.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+        return "\(how) · \(duration(session.connectedSecs))"
+    }
+
+    private func duration(_ seconds: UInt64) -> String {
+        if seconds < 60 { return "just connected" }
+        if seconds < 3_600 { return "connected \(seconds / 60)m" }
+        if seconds < 86_400 { return "connected \(seconds / 3_600)h" }
+        return "connected \(seconds / 86_400)d"
+    }
+
+    private func toolsText(_ session: LiveSession) -> String {
+        let count = model.snapshot.clientVisibility
+            .first { $0.sessionId == session.sessionId }?
+            .visibleToolCount ?? 0
+        return count == 1 ? "1 tool" : "\(count) tools"
+    }
+}
+
+private struct GrantRow: View {
+    let grant: DownstreamClient
+    let run: (PlugIntent) -> Void
+    @State private var confirming = false
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            Image(systemName: "key.horizontal")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(grant.clientName).font(.body)
+                Text(grant.clientId)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: Metric.tight)
+            Button("Revoke…", role: .destructive) { confirming = true }
+                .controlSize(.small)
+        }
+        .padding(.vertical, Metric.tight - 2)
+        .confirmationDialog(
+            "Revoke \(grant.clientName)?",
+            isPresented: $confirming,
+            titleVisibility: .visible
+        ) {
+            Button("Revoke Access", role: .destructive) { run(.revokeClient(id: grant.clientId)) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("It loses access immediately and has to ask for permission again.")
+        }
+    }
+}

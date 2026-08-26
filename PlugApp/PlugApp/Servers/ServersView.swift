@@ -1,257 +1,178 @@
 import PlugIPC
 import SwiftUI
 
+/// The workbench. Servers that need something come first, because that is why
+/// the window is open; everything healthy sits underneath, quiet.
 struct ServersView: View {
     let model: AppModel
-    @State private var selection: ServerStatus.ID?
-    @State private var showingInspector = false
-    @State private var showingAdd = false
+    @Bindable var router: Router
+    let run: (PlugIntent) -> Void
+    @State private var search = ""
 
     var body: some View {
-        VStack(spacing: 0) {
-            PageHeader(
-                title: "Servers",
-                subtitle: serverSummary,
-                metrics: [
-                    (String(enabledCount), "Enabled"),
-                    (String(totalTools), "Tools")
-                ]
-            )
-
-            List(model.visibleServers, selection: $selection) { server in
-                ServerRow(server: server)
-                    .tag(server.id)
-                    .contextMenu { ServerContextMenu(model: model, server: server) }
-            }
-            .listStyle(.inset)
-            .overlay {
-                if model.visibleServers.isEmpty {
-                    ContentUnavailableView(
-                        "No servers yet",
-                        systemImage: "shippingbox",
-                        description: Text("Add a command or URL to get started.")
-                    )
-                }
+        Group {
+            if model.situation.servers.isEmpty {
+                EmptyPage(
+                    title: "No servers yet",
+                    message: "Add one and every AI app connected to Plug can use it right away.",
+                    symbol: "shippingbox",
+                    actionTitle: "Add Server",
+                    actionIntent: .addServer,
+                    run: run
+                )
+            } else {
+                list
             }
         }
-        .navigationTitle("Servers")
+        .searchable(text: $search, placement: .toolbar, prompt: "Search servers")
         .toolbar {
-            Button { showingAdd = true } label: {
-                Label("Add Server", systemImage: "plus")
-            }
-            .keyboardShortcut("n", modifiers: .command)
-        }
-        .onChange(of: selection) { _, value in showingInspector = value != nil }
-        .inspector(isPresented: $showingInspector) {
-            if let server = selectedServer {
-                ServerInspector(model: model, server: server, isPresented: $showingInspector)
-                    .inspectorColumnWidth(min: 260, ideal: 290, max: 340)
+            ToolbarItem {
+                Button { run(.addServer) } label: {
+                    Label("Add Server", systemImage: "plus")
+                }
+                .keyboardShortcut("n", modifiers: .command)
+                .help("Add a server")
             }
         }
-        .sheet(isPresented: $showingAdd) { AddServerView(model: model) }
+        .inspector(isPresented: inspectorShown) {
+            if let selected {
+                ServerDetailView(model: model, server: selected, router: router, run: run)
+                    .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+            }
+        }
+        .sheet(isPresented: $router.isAddingServer) {
+            AddServerView(model: model)
+        }
     }
 
-    private var selectedServer: AppModel.ServerPresentation? {
-        model.visibleServers.first { $0.id == selection }
+    /// The inspector is open exactly when a server is selected, and closing it
+    /// clears the selection, so the two can never disagree.
+    private var inspectorShown: Binding<Bool> {
+        Binding(
+            get: { selected != nil },
+            set: { shown in if !shown { router.selectedServer = nil } }
+        )
     }
 
-    private var enabledCount: Int {
-        model.visibleServers.filter(\.configured.enabled).count
+    private var selected: ServerFacts? {
+        model.situation.servers.first { $0.name == router.selectedServer }
     }
 
-    private var totalTools: Int {
-        model.visibleServers.reduce(0) { $0 + $1.toolCount }
+    private var list: some View {
+        List(selection: $router.selectedServer) {
+            group("Needs attention", servers: matching(model.situation.troubledServers))
+            group("Running", servers: matching(runningServers))
+            group("Off", servers: matching(offServers))
+        }
+        .listStyle(.inset)
+        .overlay {
+            if matching(model.situation.servers).isEmpty {
+                ContentUnavailableView.search(text: search)
+            }
+        }
     }
 
-    private var serverSummary: String {
-        let attention = model.visibleServers.filter {
-            $0.configured.enabled && $0.health != "Healthy"
-        }.count
-        return attention == 0 ? "Everything is running normally" : "\(attention) need attention"
+    @ViewBuilder
+    private func group(_ title: String, servers: [ServerFacts]) -> some View {
+        if !servers.isEmpty {
+            Section(title) {
+                ForEach(servers) { server in
+                    ServerListRow(server: server, run: run)
+                        .tag(server.name)
+                        .contextMenu { ServerActions(server: server, run: run) }
+                }
+            }
+        }
+    }
+
+    private var runningServers: [ServerFacts] {
+        model.situation.activeServers.filter { !$0.health.needsAttention }
+    }
+
+    private var offServers: [ServerFacts] {
+        model.situation.servers.filter { !$0.enabled }
+    }
+
+    private func matching(_ servers: [ServerFacts]) -> [ServerFacts] {
+        let query = search.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return servers }
+        return servers.filter { $0.name.localizedCaseInsensitiveContains(query) }
     }
 }
 
-private struct ServerRow: View {
-    let server: AppModel.ServerPresentation
+/// A server as a row: state, name, what it offers, and — when something is
+/// wrong — the button that fixes it, without opening anything first.
+private struct ServerListRow: View {
+    let server: ServerFacts
+    let run: (PlugIntent) -> Void
+    @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 12) {
-            StatusDot(color: server.statusColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(server.configured.name).fontWeight(.medium)
-                Text(server.configured.transport.capitalized)
+        HStack(spacing: Metric.snug) {
+            StatusGlyph(health: server.health)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(server.name).font(.body)
+                Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-            Spacer()
-            Text("\(server.toolCount) tools")
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(minWidth: 72, alignment: .trailing)
-            Text(server.displayHealth)
-                .font(.callout)
-                .foregroundStyle(server.health == "Healthy" ? .secondary : server.statusColor)
-                .frame(minWidth: 92, alignment: .leading)
+            Spacer(minLength: Metric.tight)
+            if let fix {
+                Button(fix.title) { run(fix.intent) }
+                    .controlSize(.small)
+            } else if server.health == .working {
+                Text(server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(hovering ? .secondary : .tertiary)
+            }
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, Metric.tight - 2)
         .contentShape(Rectangle())
-        .help(server.runtime?.error ?? server.displayHealth)
+        .onHover { hovering = $0 }
     }
-}
 
-private struct ServerInspector: View {
-    let model: AppModel
-    let server: AppModel.ServerPresentation
-    @Binding var isPresented: Bool
-    @State private var confirmRemoval = false
-
-    var body: some View {
-        Form {
-            Section {
-                HStack(spacing: 10) {
-                    StatusDot(color: server.statusColor)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(server.configured.name).font(.headline)
-                        Text(server.displayHealth).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button { isPresented = false } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.tertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Close Details")
-                }
-            }
-            Section("Details") {
-                LabeledContent("Transport", value: server.configured.transport.capitalized)
-                LabeledContent("Tools", value: String(server.toolCount))
-                LabeledContent("Authentication", value: server.configured.oauth ? "OAuth" : "None")
-            }
-            if let error = server.runtime?.error, !error.isEmpty {
-                Section("Last error") {
-                    Text(error).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-                }
-            }
-            Section {
-                if server.configured.enabled {
-                    Button("Restart Server") {
-                        Task { await model.perform { .restartServer(authToken: $0, serverID: server.id) } }
-                    }
-                    Button("Disable Server") {
-                        Task { await model.perform { .setServerEnabled(authToken: $0, name: server.id, enabled: false) } }
-                    }
-                } else {
-                    Button("Enable Server") {
-                        Task { await model.perform { .setServerEnabled(authToken: $0, name: server.id, enabled: true) } }
-                    }
-                }
-                Button("Remove Server…", role: .destructive) { confirmRemoval = true }
-            }
+    private var subtitle: String {
+        if server.health.needsAttention, let error = server.error, !error.isEmpty {
+            return error.split(separator: "\n").first.map(String.init) ?? error
         }
-        .formStyle(.grouped)
-        .confirmationDialog(
-            "Remove \(server.configured.name)?",
-            isPresented: $confirmRemoval
-        ) {
-            Button("Remove Server", role: .destructive) {
-                Task { await model.perform { .removeServer(authToken: $0, name: server.id) } }
-            }
-        } message: {
-            Text("Plug will remove this server from your configuration.")
+        if !server.enabled { return "Switched off" }
+        return transportLabel
+    }
+
+    private var transportLabel: String {
+        switch server.transport.lowercased() {
+        case "stdio": "Runs on this Mac"
+        case "sse": "Remote server"
+        case "http": "Remote server"
+        default: server.transport.capitalized
+        }
+    }
+
+    private var fix: Verdict.Button? {
+        switch server.health {
+        case .signInNeeded: server.isSigningIn ? nil : .init("Sign In", .signIn(server: server.name))
+        case .down, .unknown: .init("Restart", .restartServer(server.name))
+        default: nil
         }
     }
 }
 
-private struct ServerContextMenu: View {
-    let model: AppModel
-    let server: AppModel.ServerPresentation
+/// The same verbs everywhere a server can be acted on.
+struct ServerActions: View {
+    let server: ServerFacts
+    let run: (PlugIntent) -> Void
 
     var body: some View {
-        if server.configured.enabled {
-            Button("Restart") {
-                Task { await model.perform { .restartServer(authToken: $0, serverID: server.id) } }
-            }
-            Button("Disable") {
-                Task { await model.perform { .setServerEnabled(authToken: $0, name: server.id, enabled: false) } }
-            }
+        if server.health == .signInNeeded {
+            Button("Sign In…") { run(.signIn(server: server.name)) }
+        }
+        if server.enabled {
+            Button("Restart") { run(.restartServer(server.name)) }
+            Button("Turn Off") { run(.setServerEnabled(server.name, false)) }
         } else {
-            Button("Enable") {
-                Task { await model.perform { .setServerEnabled(authToken: $0, name: server.id, enabled: true) } }
-            }
-        }
-    }
-}
-
-struct AddServerView: View {
-    let model: AppModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var definition = ""
-    @State private var working = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Add a server").font(.title2.weight(.semibold))
-                Text("Paste the command you run or the server URL.")
-                    .foregroundStyle(.secondary)
-            }
-            Form {
-                TextField("Name", text: $name, prompt: Text("My server"))
-                TextField("Command or URL", text: $definition, prompt: Text("npx server or https://…"))
-            }
-            .formStyle(.grouped)
-            HStack {
-                Text("Plug validates this before saving.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button(working ? "Adding…" : "Add Server") { add() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(name.isEmpty || definition.isEmpty || working)
-            }
-        }
-        .padding(24)
-        .frame(width: 520)
-    }
-
-    private func add() {
-        working = true
-        let server: ServerConfig
-        if definition.hasPrefix("http://") || definition.hasPrefix("https://") {
-            server = .remote(definition)
-        } else {
-            let parts = definition.split(whereSeparator: \.isWhitespace).map(String.init)
-            server = .command(parts.first ?? definition, args: Array(parts.dropFirst()))
-        }
-        Task {
-            await model.perform { .validateServer(authToken: $0, name: name, server: server) }
-            guard model.lastError == nil else { working = false; return }
-            await model.perform { .addServer(authToken: $0, name: name, server: server) }
-            working = false
-            if model.lastError == nil { dismiss() }
-        }
-    }
-}
-
-private extension AppModel.ServerPresentation {
-    var displayHealth: String {
-        switch health {
-        case "AuthRequired": "Sign in required"
-        case "Starting": "Starting"
-        case "Failed": "Unavailable"
-        default: health
-        }
-    }
-
-    var statusColor: Color {
-        switch health {
-        case "Healthy": .green
-        case "Disabled": .secondary
-        case "Failed": .red
-        default: .orange
+            Button("Turn On") { run(.setServerEnabled(server.name, true)) }
         }
     }
 }
