@@ -37,7 +37,9 @@ struct ClientRepairService: ClientRepairing {
             arguments: Self.inspectArguments,
             timeout: timeout
         )
-        guard process.status == 0 || process.status == 2 else {
+        // Doctor uses 0 for healthy, 1 for failed checks, and 2 for warnings.
+        // All three still carry the same machine-readable inspection report.
+        guard (0...2).contains(process.status) else {
             throw commandFailed(for: process)
         }
 
