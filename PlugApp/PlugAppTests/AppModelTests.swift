@@ -489,8 +489,10 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     private let ipcMin: UInt16
     private let ipcMax: UInt16
     private let lock = NSLock()
+    private let serveStopped = DispatchSemaphore(value: 0)
     private(set) var clientVersion: String?
     private var connection: Int32 = -1
+    private var didStop = false
 
     init(
         events: LockedEvents,
@@ -532,15 +534,31 @@ private final class OperatorFixtureServer: @unchecked Sendable {
 
     func stop() {
         lock.lock()
+        guard !didStop else {
+            lock.unlock()
+            return
+        }
+        didStop = true
         let connection = self.connection
         self.connection = -1
         lock.unlock()
-        if connection >= 0 { Darwin.close(connection) }
+
+        if connection >= 0 {
+            Darwin.shutdown(connection, SHUT_RDWR)
+            Darwin.close(connection)
+        }
+        Darwin.shutdown(listener, SHUT_RDWR)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
+        XCTAssertEqual(
+            serveStopped.wait(timeout: .now() + 2),
+            .success,
+            "Fixture server did not finish before its socket path was reused"
+        )
     }
 
     private func serve() {
+        defer { serveStopped.signal() }
         while true {
             let accepted = Darwin.accept(listener, nil, nil)
             guard accepted >= 0 else { return }
