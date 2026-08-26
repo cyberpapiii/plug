@@ -9,6 +9,7 @@ struct ServerDetailView: View {
     @Bindable var router: Router
     let run: (PlugIntent) -> Void
     @State private var confirmRemoval = false
+    @State private var confirmSignOut = false
 
     var body: some View {
         ScrollView {
@@ -22,6 +23,16 @@ struct ServerDetailView: View {
             .padding(Metric.roomy)
         }
         .scrollBounceBehavior(.basedOnSize)
+        .confirmationDialog(
+            "Sign out of \(server.name)?",
+            isPresented: $confirmSignOut,
+            titleVisibility: .visible
+        ) {
+            Button("Sign Out", role: .destructive) { run(.signOut(server: server.name)) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Plug forgets the stored account. The server stops working until you sign in again.")
+        }
         .confirmationDialog(
             "Remove \(server.name)?",
             isPresented: $confirmRemoval,
@@ -196,6 +207,9 @@ struct ServerDetailView: View {
                 Button("Turn On") { run(.setServerEnabled(server.name, true)) }
             }
             Button("Edit Settings…") { run(.editServer(server.name)) }
+            if server.usesOAuth, server.health != .signInNeeded {
+                Button("Sign Out…") { confirmSignOut = true }
+            }
             Button("Remove Server…", role: .destructive) { confirmRemoval = true }
         }
     }

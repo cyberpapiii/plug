@@ -252,9 +252,66 @@ icon, Cursor's icon, VS Code's icon. A row is recognized before it is read.
 Colour is never the only carrier: every glyph is a distinct shape, and every one
 has words behind it for VoiceOver and for anyone who does not read colour.
 
+## Round four: the last two things only the terminal could do
+
+The point of this app is that a person never has to open a terminal to run
+Plug. Two capabilities were still missing, and one screen was quietly lying
+about how much history it had.
+
+### A tool has its own details panel
+
+The tool list could say what exists and whether it was on. Selecting a tool now
+opens the same inspector the server list uses. It carries the merged name a
+client actually calls (`figma__delete_node`, selectable, because that is the
+value worth copying), the server it came from, its state, and — when the tool is
+held off by a wildcard — the pattern that covers it and the rest of what that
+pattern took with it. A padlock in the list says a tool cannot be switched on;
+the panel is where it says why, and what else went with it.
+
+Tool names are now monospaced wherever they appear: in the list, in the activity
+log, and in a server's recent calls. An identifier should read as an identifier.
+While there, a server's recent calls started naming the tool instead of
+`tools/call`, which said nothing about what happened.
+
+### Importing servers from other apps
+
+Most people arrive with servers already configured in Claude Desktop or Cursor,
+and the whole promise of Plug is that they are configured once. **Add Server**
+in the toolbar is now a split control, and the menu beside it opens **Import
+from Other Apps**. The empty servers page offers the same thing as a second,
+quieter button.
+
+The sheet asks the command line tool to read the other apps' settings — its JSON
+mode only ever reports, and writes nothing, which is what makes it safe to run
+the moment the sheet opens. What comes back is grouped by the app it was found
+in, each row carrying that app's own icon, the server's name, and what it runs.
+Everything is ticked to begin with, because someone who opens this sheet wants
+their servers, not a checklist.
+
+Two things the scan gets right and a person would not think to check: Plug's own
+entry is skipped in every app that has one, since importing it would point Plug
+at itself; and an app whose settings could not be read is named underneath, so an
+empty result is never mistaken for "you have nothing set up". Importing goes
+through the same path as adding a server by hand, so nothing is appended to a
+file behind the running service's back, and no other app's settings are touched.
+
+### Signing out of a server
+
+A server that uses an account now has **Sign Out…** among its actions, behind a
+confirmation that says what it costs: Plug forgets the stored account, and the
+server stops working until it is signed into again. It sits next to the sign-in
+button it undoes, on the server it belongs to.
+
+### History says how much history there is
+
+The activity list holds the most recent 200 calls because the service keeps a
+bounded ring, not because the app pages through a longer list. The end of the
+list now says so, rather than letting a scroll that stops look like a scroll that
+ran out.
+
 ## Known gaps, deliberately left
 
-- **Importing servers from other apps** (`plug import`) and **signing out of a
-  server** (`plug auth logout`) are still terminal-only. Doctor, reload, and the
-  config path arrived in Settings; these two did not.
-- **Activity is capped at 200 events** with no paging.
+- **Activity keeps the most recent 200 calls**, and that is the whole of what
+  exists — the app now says so at the end of the list rather than implying more.
+- **Import copies servers in, it does not keep them in step.** A server later
+  changed in Cursor is not re-imported.

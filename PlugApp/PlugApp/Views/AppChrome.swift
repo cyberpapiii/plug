@@ -24,6 +24,9 @@ struct EmptyPage: View {
     let symbol: String
     var actionTitle: String?
     var actionIntent: PlugIntent?
+    /// A quieter second way out of an empty page, when there is more than one.
+    var secondaryTitle: String?
+    var secondaryIntent: PlugIntent?
     var run: (PlugIntent) -> Void = { _ in }
 
     var body: some View {
@@ -37,10 +40,17 @@ struct EmptyPage: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 320)
-            if let actionTitle, let actionIntent {
-                Button(actionTitle) { run(actionIntent) }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, Metric.tight)
+            if actionTitle != nil || secondaryTitle != nil {
+                HStack(spacing: Metric.snug) {
+                    if let actionTitle, let actionIntent {
+                        Button(actionTitle) { run(actionIntent) }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    if let secondaryTitle, let secondaryIntent {
+                        Button(secondaryTitle) { run(secondaryIntent) }
+                    }
+                }
+                .padding(.top, Metric.tight)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

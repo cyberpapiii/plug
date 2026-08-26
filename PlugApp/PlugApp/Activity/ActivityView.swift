@@ -41,6 +41,16 @@ struct ActivityView: View {
                             }
                         }
                     }
+                    // History is a bounded ring in the service, so the end of
+                    // this list is the end of what exists, not the end of a
+                    // page. Saying so is better than an empty scroll.
+                    if model.activityIsCapped {
+                        Text("This is the most recent \(AppModel.activityLimit) calls. Older ones are not kept.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .listRowSeparator(.hidden)
+                    }
                 }
                 .listStyle(.inset)
             }

@@ -18,6 +18,8 @@ struct ServersView: View {
                     symbol: "shippingbox",
                     actionTitle: "Add Server",
                     actionIntent: .addServer,
+                    secondaryTitle: "Import from Other Apps…",
+                    secondaryIntent: .importServers,
                     run: run
                 )
             } else {
@@ -27,9 +29,18 @@ struct ServersView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Search servers")
         .toolbar {
             ToolbarItem {
-                Button { run(.addServer) } label: {
+                // Adding is the common case, so pressing the button adds; the
+                // menu beside it carries the rarer way of getting servers in.
+                Menu {
+                    Button { run(.importServers) } label: {
+                        Label("Import from Other Apps…", systemImage: "square.and.arrow.down")
+                    }
+                } label: {
                     Label("Add Server", systemImage: "plus")
+                } primaryAction: {
+                    run(.addServer)
                 }
+                .menuStyle(.button)
                 .keyboardShortcut("n", modifiers: .command)
                 .help("Add a server")
             }
@@ -42,6 +53,9 @@ struct ServersView: View {
         }
         .sheet(isPresented: $router.isAddingServer) {
             AddServerView(model: model)
+        }
+        .sheet(isPresented: $router.isImportingServers) {
+            ImportServersView(model: model)
         }
         .sheet(item: $router.editingServer) { target in
             EditServerView(model: model, name: target.id)

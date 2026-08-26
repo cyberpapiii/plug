@@ -190,6 +190,10 @@ enum PlugIntent: Equatable, Sendable {
     /// uses. Nothing in the app ever kills it directly.
     case restartService
     case reloadConfiguration
+    /// Copy servers over from the other AI apps on this Mac.
+    case importServers
+    /// Forget a server's stored account.
+    case signOut(server: String)
     case openLogs
     case quit
 }

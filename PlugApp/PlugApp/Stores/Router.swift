@@ -12,6 +12,7 @@ final class Router {
     /// The tool whose details are open, by its merged name.
     var selectedTool: String?
     var isAddingServer = false
+    var isImportingServers = false
     /// The server whose settings are open for editing, if any.
     var editingServer: ServerName?
 
@@ -69,6 +70,12 @@ struct PlugIntentRunner {
             router.section = .servers
             router.isAddingServer = true
             showWindow()
+        case .importServers:
+            router.section = .servers
+            router.isImportingServers = true
+            showWindow()
+        case let .signOut(server):
+            Task { await model.signOut(server: server) }
         case let .openWindow(section):
             router.section = section
             showWindow()

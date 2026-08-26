@@ -47,6 +47,12 @@ final class AppModel {
     private(set) var connectionState: ConnectionState = .disconnected
     private(set) var snapshot: OperatorSnapshot = .empty
     private(set) var activities: [ActivityEvent] = []
+    /// How far back the history goes. The daemon keeps a bounded ring, so this
+    /// is the whole of what can be asked for, not a page of a longer list.
+    static let activityLimit = 200
+    /// True when history is long enough to have been cut off at that limit,
+    /// which the list says out loud rather than pretending to be complete.
+    var activityIsCapped: Bool { activities.count >= Self.activityLimit }
     private(set) var lastError: String?
     private(set) var installationState: InstallationState
     private(set) var showsReconciliationProgress = false
@@ -284,7 +290,7 @@ final class AppModel {
                 snapshot = value
                 NotificationService.shared.observe(value)
                 if case let .activity(events) = try await ipc.request(
-                    .activity(authToken: token, afterSequence: 0, limit: 200, failuresOnly: false)
+                    .activity(authToken: token, afterSequence: 0, limit: Self.activityLimit, failuresOnly: false)
                 ) { activities = events }
                 if case let .tools(tools) = try await ipc.request(.listTools) {
                     toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
@@ -339,6 +345,15 @@ final class AppModel {
                 try await appLinker.unlink(target: target)
             }
             await loadConnectableApps()
+            await refresh()
+        } catch { lastError = error.localizedDescription }
+    }
+
+    /// Forgets a server's stored account. The button that starts this is behind
+    /// a confirmation, so by the time it runs the choice has been made.
+    func signOut(server: String) async {
+        do {
+            try await AuthFlowService().signOut(server: server)
             await refresh()
         } catch { lastError = error.localizedDescription }
     }
