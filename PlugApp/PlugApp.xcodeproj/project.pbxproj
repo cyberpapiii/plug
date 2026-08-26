@@ -7,40 +7,59 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		073040F588BBBE1EBFDC7858 /* ToolDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */; };
+		09CDEA0A92446FF939334D26 /* ImportServersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C9504345828F0EF55E53933 /* ImportServersView.swift */; };
+		0A5A8232017C3F2DDFA8AAA8 /* PlugVerdictTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */; };
+		145CFE4F269BFCB5BAF368F6 /* ImportService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7064392FEB7D9C4D2C6E502B /* ImportService.swift */; };
 		150EC31CFAA673C51B37F0BC /* DaemonServiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66F5C1631CDEC940569658B5 /* DaemonServiceManager.swift */; };
+		1727DBB0F7C3147BA74B940A /* AppLinkService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EECB5A101BC8CAF84B2DA4D /* AppLinkService.swift */; };
 		17D83615A424704B1CC1366D /* UnifiedReconciliationFixtureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32DABE7B3A070D7DE0195A25 /* UnifiedReconciliationFixtureTests.swift */; };
 		2089DA66D395D3CB66FC5A26 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0D96A945383702097BA4CCEA /* Assets.xcassets */; };
 		273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E1C65673D42038754E140C /* ProcessRunnerTests.swift */; };
+		2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBC2D67DE9038B09D240E689 /* PlugStatus.swift */; };
+		2C730DB265AF0C768DE18BAF /* Router.swift in Sources */ = {isa = PBXBuildFile; fileRef = 246CCC51D3BBEE0246E4E96F /* Router.swift */; };
+		3033A18407F2E2063809099D /* ServerDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AF46523DEE1BB787D58EAEA /* ServerDetailView.swift */; };
+		30CD76E3B3CFFB219A05A76A /* AppIcons.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */; };
 		3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 907978AE95DA344593F3BCA3 /* AppModelTests.swift */; };
 		41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64E2869334004AD1B34ADA93 /* InstallationState.swift */; };
-		43F14541E9B4E1B33178101A /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52004ADBDE2E29BC25EF51B2 /* AuthView.swift */; };
 		4CCD74568EADAD432672189D /* UpdateService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1B09D36EE0E0D152888537 /* UpdateService.swift */; };
+		5BA8E9724BF22D7D0CB34DCB /* ToolCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E4992C088CE31961C6537D0 /* ToolCatalog.swift */; };
+		62A674116B71E58C151041D4 /* EditServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 588717CF2790EF93C4710EE6 /* EditServerView.swift */; };
 		62FB2A2B8196D3C86DAF8E9E /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */; };
 		6467183EF2D0B0C1FB4A3500 /* ActivityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85E7D46276FEA5FFCB9BB8F2 /* ActivityView.swift */; };
 		6BD4B241EB8557471C018CB5 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8B2BC9F43EB4287115C47DA /* AppModel.swift */; };
 		6C3A2ACAD67159A496C5DC58 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E823B05501E7735EEA26993A /* RootView.swift */; };
 		6C979F41AD0669EF1B229C11 /* ServersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AFB9D205089F380BB49E9C6 /* ServersView.swift */; };
+		6D02466341A5E96732383E80 /* ServerDraftParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */; };
+		711532F652CB8274D9C13EF3 /* AddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB031695DA969096D2B34BD3 /* AddServerView.swift */; };
 		75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */; };
+		763622F2CD115FC4B56D8537 /* ConnectionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4421712FD919B5174C54F8E1 /* ConnectionsView.swift */; };
 		8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */; };
 		9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */; };
 		B2857C070B5C6292A2B38282 /* AppInstallationInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */; };
 		B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */; };
 		B4705E82E33B265C78BAB13A /* PlugIPC in Frameworks */ = {isa = PBXBuildFile; productRef = 17AE7DC1CCB3C84D1993523B /* PlugIPC */; };
-		B736680D4CC1B797B3856113 /* PlugMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B949E8F0B71D3EF15DF8ACE /* PlugMenu.swift */; };
 		C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */; };
 		C0196520F5563F2ED423AA31 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = BA2AF18F506896646E72E95E /* Sparkle */; };
+		C5B0CCC1229F822317F64843 /* ToolSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59D35A236F003E96A80E9E08 /* ToolSurfaceTests.swift */; };
+		C6185FC89B0385625A2B0673 /* CheckupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC1CDCB2E539B73277AFE537 /* CheckupService.swift */; };
 		CAE0A7C58194808516DC87E1 /* InstallationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */; };
 		D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */; };
 		D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85993E0751504BE72E97ACAC /* ClientRepairService.swift */; };
+		D0E6D2C5CE02C83CA2608F7D /* ServerDraftParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */; };
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
+		D493DD449196A1E61453FA99 /* ToolsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA534EAE5C6EB28861A7201A /* ToolsView.swift */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
+		DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */; };
 		E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */; };
 		E8F55758CCD235C746771CD0 /* AppChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BB10ED3645727B693E33897 /* AppChrome.swift */; };
 		ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */; };
 		F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */; };
-		F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F74CE97E0DF2E6BB479555A /* ClientsView.swift */; };
+		F1057FCF7F1AA3BDC9856E2E /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */; };
 		F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */; };
+		F762470FA24AB181FB13685B /* PlugPopover.swift in Sources */ = {isa = PBXBuildFile; fileRef = 744D87194D46A6D1C6BB459D /* PlugPopover.swift */; };
+		FD7472A76A6E545F5CAE7D78 /* ImportSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -54,28 +73,40 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolDetailView.swift; sourceTree = "<group>"; };
 		0D96A945383702097BA4CCEA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		0F74CE97E0DF2E6BB479555A /* ClientsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientsView.swift; sourceTree = "<group>"; };
 		17049C687463885E5E5C1CF0 /* PlugIPC */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PlugIPC; path = PlugIPC; sourceTree = SOURCE_ROOT; };
+		1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIcons.swift; sourceTree = "<group>"; };
+		1EECB5A101BC8CAF84B2DA4D /* AppLinkService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLinkService.swift; sourceTree = "<group>"; };
 		1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigratorTests.swift; sourceTree = "<group>"; };
+		246CCC51D3BBEE0246E4E96F /* Router.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Router.swift; sourceTree = "<group>"; };
 		28E1C65673D42038754E140C /* ProcessRunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRunnerTests.swift; sourceTree = "<group>"; };
 		2AFB9D205089F380BB49E9C6 /* ServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServersView.swift; sourceTree = "<group>"; };
-		2B949E8F0B71D3EF15DF8ACE /* PlugMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugMenu.swift; sourceTree = "<group>"; };
 		2BB10ED3645727B693E33897 /* AppChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppChrome.swift; sourceTree = "<group>"; };
 		2D1B09D36EE0E0D152888537 /* UpdateService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateService.swift; sourceTree = "<group>"; };
 		317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationCoordinatorTests.swift; sourceTree = "<group>"; };
 		32DABE7B3A070D7DE0195A25 /* UnifiedReconciliationFixtureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedReconciliationFixtureTests.swift; sourceTree = "<group>"; };
 		36FB89E2C8814400C0F38A5D /* PlugApplication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugApplication.swift; sourceTree = "<group>"; };
+		39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportSurfaceTests.swift; sourceTree = "<group>"; };
+		3C9504345828F0EF55E53933 /* ImportServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportServersView.swift; sourceTree = "<group>"; };
 		406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspectorTests.swift; sourceTree = "<group>"; };
+		4421712FD919B5174C54F8E1 /* ConnectionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionsView.swift; sourceTree = "<group>"; };
 		44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PlugApp.entitlements; sourceTree = "<group>"; };
-		52004ADBDE2E29BC25EF51B2 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
+		588717CF2790EF93C4710EE6 /* EditServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerView.swift; sourceTree = "<group>"; };
+		59D35A236F003E96A80E9E08 /* ToolSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolSurfaceTests.swift; sourceTree = "<group>"; };
 		64E2869334004AD1B34ADA93 /* InstallationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationState.swift; sourceTree = "<group>"; };
 		66F5C1631CDEC940569658B5 /* DaemonServiceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManager.swift; sourceTree = "<group>"; };
 		6E5390A094EAB1E48AC50E51 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		7064392FEB7D9C4D2C6E502B /* ImportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportService.swift; sourceTree = "<group>"; };
 		722932029558C08A810E4AF7 /* PlugApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PlugApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		744D87194D46A6D1C6BB459D /* PlugPopover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugPopover.swift; sourceTree = "<group>"; };
+		75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
+		7E4992C088CE31961C6537D0 /* ToolCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCatalog.swift; sourceTree = "<group>"; };
 		85993E0751504BE72E97ACAC /* ClientRepairService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientRepairService.swift; sourceTree = "<group>"; };
 		85E7D46276FEA5FFCB9BB8F2 /* ActivityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityView.swift; sourceTree = "<group>"; };
+		8AF46523DEE1BB787D58EAEA /* ServerDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerDetailView.swift; sourceTree = "<group>"; };
+		8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerDraftParser.swift; sourceTree = "<group>"; };
 		8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspector.swift; sourceTree = "<group>"; };
 		907978AE95DA344593F3BCA3 /* AppModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTests.swift; sourceTree = "<group>"; };
 		9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -85,11 +116,18 @@
 		AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlowService.swift; sourceTree = "<group>"; };
 		B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRunner.swift; sourceTree = "<group>"; };
 		B8B2BC9F43EB4287115C47DA /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		BB031695DA969096D2B34BD3 /* AddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddServerView.swift; sourceTree = "<group>"; };
 		C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspectorTests.swift; sourceTree = "<group>"; };
 		CC541E7062C47E08EF5F5B4B /* PlugAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PlugAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugVerdictTests.swift; sourceTree = "<group>"; };
+		E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSurfaceTests.swift; sourceTree = "<group>"; };
 		E823B05501E7735EEA26993A /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		EC1CDCB2E539B73277AFE537 /* CheckupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckupService.swift; sourceTree = "<group>"; };
+		F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerDraftParserTests.swift; sourceTree = "<group>"; };
 		F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManagerTests.swift; sourceTree = "<group>"; };
 		F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigrator.swift; sourceTree = "<group>"; };
+		FA534EAE5C6EB28861A7201A /* ToolsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolsView.swift; sourceTree = "<group>"; };
+		FBC2D67DE9038B09D240E689 /* PlugStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugStatus.swift; sourceTree = "<group>"; };
 		FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = com.plug.daemon.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -114,12 +152,23 @@
 			name = Packages;
 			sourceTree = "<group>";
 		};
-		154A99C2EE3AC663C0E5CD09 /* Auth */ = {
+		0F61D9DDA3D2CC8C15A9D715 /* Connections */ = {
 			isa = PBXGroup;
 			children = (
-				52004ADBDE2E29BC25EF51B2 /* AuthView.swift */,
+				4421712FD919B5174C54F8E1 /* ConnectionsView.swift */,
 			);
-			path = Auth;
+			path = Connections;
+			sourceTree = "<group>";
+		};
+		14BE9CF6FE76C465735ECD02 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */,
+				FBC2D67DE9038B09D240E689 /* PlugStatus.swift */,
+				8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */,
+				7E4992C088CE31961C6537D0 /* ToolCatalog.swift */,
+			);
+			path = Core;
 			sourceTree = "<group>";
 		};
 		22CC65A9DE8DABA943A6935A /* Activity */ = {
@@ -145,21 +194,27 @@
 				907978AE95DA344593F3BCA3 /* AppModelTests.swift */,
 				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
+				39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */,
 				317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */,
 				406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */,
 				1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */,
+				D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */,
 				28E1C65673D42038754E140C /* ProcessRunnerTests.swift */,
+				F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */,
+				E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */,
+				59D35A236F003E96A80E9E08 /* ToolSurfaceTests.swift */,
 				E413BAE1E3F3D1C73DD4364E /* Fixtures */,
 			);
 			path = PlugAppTests;
 			sourceTree = "<group>";
 		};
-		7340EA9AE1731128CEABBF9F /* Clients */ = {
+		6B86EBCEF490E4D63DAFD1A6 /* Tools */ = {
 			isa = PBXGroup;
 			children = (
-				0F74CE97E0DF2E6BB479555A /* ClientsView.swift */,
+				0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */,
+				FA534EAE5C6EB28861A7201A /* ToolsView.swift */,
 			);
-			path = Clients;
+			path = Tools;
 			sourceTree = "<group>";
 		};
 		7AA042891B4B51AA69A0DAFB /* Products */ = {
@@ -174,7 +229,7 @@
 		82BB641BEEA138358B0DB072 /* Menu */ = {
 			isa = PBXGroup;
 			children = (
-				2B949E8F0B71D3EF15DF8ACE /* PlugMenu.swift */,
+				744D87194D46A6D1C6BB459D /* PlugPopover.swift */,
 			);
 			path = Menu;
 			sourceTree = "<group>";
@@ -191,6 +246,7 @@
 			isa = PBXGroup;
 			children = (
 				2BB10ED3645727B693E33897 /* AppChrome.swift */,
+				75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */,
 				E823B05501E7735EEA26993A /* RootView.swift */,
 			);
 			path = Views;
@@ -218,9 +274,12 @@
 			isa = PBXGroup;
 			children = (
 				A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */,
+				1EECB5A101BC8CAF84B2DA4D /* AppLinkService.swift */,
 				AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */,
+				EC1CDCB2E539B73277AFE537 /* CheckupService.swift */,
 				85993E0751504BE72E97ACAC /* ClientRepairService.swift */,
 				66F5C1631CDEC940569658B5 /* DaemonServiceManager.swift */,
+				7064392FEB7D9C4D2C6E502B /* ImportService.swift */,
 				A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */,
 				8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */,
 				F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */,
@@ -239,8 +298,8 @@
 				44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */,
 				22CC65A9DE8DABA943A6935A /* Activity */,
 				FCC4251DF7B9C1E48B7B3BB8 /* App */,
-				154A99C2EE3AC663C0E5CD09 /* Auth */,
-				7340EA9AE1731128CEABBF9F /* Clients */,
+				0F61D9DDA3D2CC8C15A9D715 /* Connections */,
+				14BE9CF6FE76C465735ECD02 /* Core */,
 				82BB641BEEA138358B0DB072 /* Menu */,
 				8AF1048C1BBFBA43CABAA2C0 /* Models */,
 				C40F14F0E853E9D3057DDC64 /* Resources */,
@@ -248,6 +307,7 @@
 				C7335DD31E4332F0F92AB729 /* Services */,
 				3A6C0F880F7E22F45D385900 /* Settings */,
 				D8C6E964F535104EA3C427DA /* Stores */,
+				6B86EBCEF490E4D63DAFD1A6 /* Tools */,
 				94579476E085452846D089D1 /* Views */,
 			);
 			path = PlugApp;
@@ -257,6 +317,7 @@
 			isa = PBXGroup;
 			children = (
 				B8B2BC9F43EB4287115C47DA /* AppModel.swift */,
+				246CCC51D3BBEE0246E4E96F /* Router.swift */,
 			);
 			path = Stores;
 			sourceTree = "<group>";
@@ -264,6 +325,10 @@
 		E10C718A5E9717CB4498DF80 /* Servers */ = {
 			isa = PBXGroup;
 			children = (
+				BB031695DA969096D2B34BD3 /* AddServerView.swift */,
+				588717CF2790EF93C4710EE6 /* EditServerView.swift */,
+				3C9504345828F0EF55E53933 /* ImportServersView.swift */,
+				8AF46523DEE1BB787D58EAEA /* ServerDetailView.swift */,
 				2AFB9D205089F380BB49E9C6 /* ServersView.swift */,
 			);
 			path = Servers;
@@ -410,10 +475,15 @@
 				3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */,
 				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
+				FD7472A76A6E545F5CAE7D78 /* ImportSurfaceTests.swift in Sources */,
 				CAE0A7C58194808516DC87E1 /* InstallationCoordinatorTests.swift in Sources */,
 				D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */,
 				D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */,
+				0A5A8232017C3F2DDFA8AAA8 /* PlugVerdictTests.swift in Sources */,
 				273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */,
+				D0E6D2C5CE02C83CA2608F7D /* ServerDraftParserTests.swift in Sources */,
+				DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */,
+				C5B0CCC1229F822317F64843 /* ToolSurfaceTests.swift in Sources */,
 				17D83615A424704B1CC1366D /* UnifiedReconciliationFixtureTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -423,25 +493,39 @@
 			buildActionMask = 2147483647;
 			files = (
 				6467183EF2D0B0C1FB4A3500 /* ActivityView.swift in Sources */,
+				711532F652CB8274D9C13EF3 /* AddServerView.swift in Sources */,
 				E8F55758CCD235C746771CD0 /* AppChrome.swift in Sources */,
+				30CD76E3B3CFFB219A05A76A /* AppIcons.swift in Sources */,
 				B2857C070B5C6292A2B38282 /* AppInstallationInspector.swift in Sources */,
+				1727DBB0F7C3147BA74B940A /* AppLinkService.swift in Sources */,
 				6BD4B241EB8557471C018CB5 /* AppModel.swift in Sources */,
 				E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */,
-				43F14541E9B4E1B33178101A /* AuthView.swift in Sources */,
+				C6185FC89B0385625A2B0673 /* CheckupService.swift in Sources */,
 				D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */,
-				F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */,
+				763622F2CD115FC4B56D8537 /* ConnectionsView.swift in Sources */,
 				150EC31CFAA673C51B37F0BC /* DaemonServiceManager.swift in Sources */,
+				F1057FCF7F1AA3BDC9856E2E /* DesignSystem.swift in Sources */,
+				62A674116B71E58C151041D4 /* EditServerView.swift in Sources */,
+				09CDEA0A92446FF939334D26 /* ImportServersView.swift in Sources */,
+				145CFE4F269BFCB5BAF368F6 /* ImportService.swift in Sources */,
 				F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */,
 				41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */,
 				9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */,
 				C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */,
 				B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */,
 				DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */,
-				B736680D4CC1B797B3856113 /* PlugMenu.swift in Sources */,
+				F762470FA24AB181FB13685B /* PlugPopover.swift in Sources */,
+				2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */,
 				75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */,
 				6C3A2ACAD67159A496C5DC58 /* RootView.swift in Sources */,
+				2C730DB265AF0C768DE18BAF /* Router.swift in Sources */,
+				3033A18407F2E2063809099D /* ServerDetailView.swift in Sources */,
+				6D02466341A5E96732383E80 /* ServerDraftParser.swift in Sources */,
 				6C979F41AD0669EF1B229C11 /* ServersView.swift in Sources */,
 				62FB2A2B8196D3C86DAF8E9E /* SettingsView.swift in Sources */,
+				5BA8E9724BF22D7D0CB34DCB /* ToolCatalog.swift in Sources */,
+				073040F588BBBE1EBFDC7858 /* ToolDetailView.swift in Sources */,
+				D493DD449196A1E61453FA99 /* ToolsView.swift in Sources */,
 				4CCD74568EADAD432672189D /* UpdateService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

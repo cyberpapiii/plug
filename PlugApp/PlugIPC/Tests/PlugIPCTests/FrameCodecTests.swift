@@ -90,6 +90,49 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(snapshot.downstreamClients.first?.clientId, "remote-1")
     }
 
+    func testServerConfigRequestAndResponseRoundTripAdvancedFields() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let request = IPCRequest.serverConfig(authToken: "secret", name: "workspace")
+        let frame = try FrameCodec.encode(request, encoder: encoder)
+        let decodedRequest = try JSONDecoder().decode(
+            IPCRequestMirror.self,
+            from: frame.dropFirst(4)
+        )
+        XCTAssertEqual(decodedRequest.type, "GetServerConfig")
+
+        let payload = Data(#"""
+        {
+          "type":"ServerConfig",
+          "name":"workspace",
+          "server":{
+            "command":"uvx",
+            "args":["workspace-mcp"],
+            "env":{"API_KEY":"kept"},
+            "enabled":true,
+            "transport":"stdio",
+            "protocol":"legacy",
+            "timeout_secs":30,
+            "call_timeout_secs":300,
+            "max_concurrent":1,
+            "health_check_interval_secs":60,
+            "circuit_breaker_enabled":true,
+            "enrichment":false,
+            "tool_renames":{},
+            "tool_groups":[{"prefix":"Gmail","contains":["gmail"],"strip":[]}],
+            "sandbox":{"enabled":true,"allow_network":false,"allow_read":["/tmp"],"allow_write":[]}
+          }
+        }
+        """#.utf8)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard case let .serverConfig(name, server) = try decoder.decode(IPCResponse.self, from: payload) else {
+            return XCTFail("server config response expected")
+        }
+        XCTAssertEqual(name, "workspace")
+        XCTAssertEqual(server.env["API_KEY"], "kept")
+        XCTAssertEqual(server.toolGroups.first?.prefix, "Gmail")
+        XCTAssertEqual(server.sandbox?.allowRead, ["/tmp"])
+    }
+
     func testHandshakeTimesOutWhenSocketAcceptsButNeverReplies() async throws {
         let server = try AcceptWithoutReplyServer()
         defer { server.stop() }

@@ -1127,6 +1127,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     plug_core::ipc::OperatorCapability::AuthMutation,
                     plug_core::ipc::OperatorCapability::ConfigMutation,
                     plug_core::ipc::OperatorCapability::ActivityStream,
+                    plug_core::ipc::OperatorCapability::ToolMutation,
+                    plug_core::ipc::OperatorCapability::ServerConfigRead,
                 ],
             },
         },
@@ -1207,6 +1209,27 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 }),
             }
         }
+        IpcRequest::GetServerConfig { name, .. } => {
+            let config = match plug_core::operator::load_editable_config(&ctx.config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    return IpcResponse::Error {
+                        code: "CONFIG_READ_FAILED".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            match config.servers.get(name) {
+                Some(server) => IpcResponse::ServerConfig {
+                    name: name.clone(),
+                    server: Box::new(server.clone()),
+                },
+                None => IpcResponse::Error {
+                    code: "UNKNOWN_SERVER".to_string(),
+                    message: format!("unknown server `{name}`"),
+                },
+            }
+        }
         IpcRequest::RevokeDownstreamClient { client_id, .. } => {
             let Some(manager) = ctx.downstream_oauth.as_ref() else {
                 return IpcResponse::Error {
@@ -1269,6 +1292,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 ctx,
                 plug_core::operator::OperatorMutation::SetServerEnabled {
                     name: name.clone(),
+                    enabled: *enabled,
+                },
+            )
+            .await
+        }
+        IpcRequest::SetToolEnabled { tool, enabled, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::SetToolEnabled {
+                    tool: tool.clone(),
                     enabled: *enabled,
                 },
             )
@@ -1527,6 +1560,14 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                             config.servers.get(&server_id),
                         ),
                         risk,
+                        disabled: plug_core::ipc::tool_is_disabled(
+                            &config.disabled_tools,
+                            tool.name.as_ref(),
+                        ),
+                        disabled_by_pattern: plug_core::ipc::disabling_wildcard(
+                            &config.disabled_tools,
+                            tool.name.as_ref(),
+                        ),
                         name: tool.name.to_string(),
                         server_id,
                         description: tool.description.map(|d| d.to_string()),

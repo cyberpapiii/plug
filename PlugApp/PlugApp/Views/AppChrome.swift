@@ -1,234 +1,59 @@
 import SwiftUI
 
-struct SidebarSectionRow: View {
-    let section: AppSection
-    let detail: String
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: section.symbol)
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(section.rawValue)
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .padding(.vertical, 2)
-    }
-}
-
-struct RuntimeFooter: View {
-    let model: AppModel
-
-    var body: some View {
-        HStack(spacing: 8) {
-            StatusDot(color: statusColor)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(statusTitle).font(.caption.weight(.medium))
-                if !model.snapshot.runtimeVersion.isEmpty {
-                    Text("Version \(model.snapshot.runtimeVersion)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.bar)
-    }
-
-    private var statusColor: Color {
-        if model.showsReconciliationProgress { return .orange }
-        if model.connectionRecoveryIsRequired { return .orange }
-        if model.connectionState != .ready { return .red }
-        return model.isHealthy ? .green : .orange
-    }
-
-    private var statusTitle: String {
-        if model.showsReconciliationProgress { return "Updating Plug" }
-        if model.connectionRecoveryIsRequired { return "Needs reconciliation" }
-        if model.connectionState != .ready { return "Not connected" }
-        return model.isHealthy ? "Running normally" : "Needs attention"
-    }
-}
-
-struct ReconciliationProgressNotice: View {
-    var body: some View {
-        HStack(spacing: 10) {
-            ProgressView()
-                .controlSize(.small)
-            Text("Finishing Plug update…")
-                .font(.callout)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
-struct ServiceAdoptionNotice: View {
-    let model: AppModel
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "checkmark.shield")
-                .font(.title3)
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Finish setup").fontWeight(.semibold)
-                Text("Let this app keep Plug running in the background.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("Use Plug") { Task { await model.adopt() } }
-                .buttonStyle(.borderedProminent)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
-struct InstallationFailureNotice: View {
-    let model: AppModel
-    let failure: InstallationFailure
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.title3)
-                .foregroundStyle(.orange)
-            Text(failure.summary)
-                .font(.callout)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Button("Retry") { Task { await model.retry() } }
-            if failure.logURL != nil {
-                Button("View Log") { model.openLog() }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
-struct ConnectionRecoveryNotice: View {
-    let model: AppModel
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.title3)
-                .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Plug needs reconciliation").font(.callout)
-                Text(model.connectionRecoveryDetail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Button("Retry") { Task { await model.retryConnection() } }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
-struct InstallationDriftNotice: View {
-    let drift: InstallationDrift
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "questionmark.circle")
-                .font(.title3)
-                .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(drift.summary).font(.callout)
-                Text(drift.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
-struct PageHeader: View {
-    let title: String
-    let subtitle: String
-    let metrics: [(String, String)]
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 18) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.title2.weight(.semibold))
-                Text(subtitle).font(.callout).foregroundStyle(.secondary)
-            }
-            Spacer()
-            ForEach(Array(metrics.enumerated()), id: \.offset) { _, metric in
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text(metric.0).font(.headline.monospacedDigit())
-                    Text(metric.1).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .background(.background)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
-struct StatusDot: View {
-    let color: Color
-
-    var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 8, height: 8)
-            .overlay(Circle().stroke(.white.opacity(0.35), lineWidth: 0.5))
-    }
-}
-
-struct EmptySectionRow: View {
-    let title: String
-    let systemImage: String
-
-    var body: some View {
-        Label(title, systemImage: systemImage)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 8)
-    }
-}
-
+/// A brief report of something that just failed. Persistent trouble is the
+/// verdict's job; this is only for one-off action failures.
 struct ErrorToast: View {
     let message: String
 
     var body: some View {
         Label(message, systemImage: "exclamationmark.triangle.fill")
             .font(.callout)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            .lineLimit(2)
+            .padding(.horizontal, Metric.regular)
+            .padding(.vertical, Metric.snug)
+            .nativeGlassSurface(tint: .red.opacity(0.08))
             .shadow(radius: 8, y: 2)
             .padding()
+    }
+}
+
+/// The empty state for a whole page: says what would be here and how to get it.
+struct EmptyPage: View {
+    let title: String
+    let message: String
+    let symbol: String
+    var actionTitle: String?
+    var actionIntent: PlugIntent?
+    /// A quieter second way out of an empty page, when there is more than one.
+    var secondaryTitle: String?
+    var secondaryIntent: PlugIntent?
+    var run: (PlugIntent) -> Void = { _ in }
+
+    var body: some View {
+        VStack(spacing: Metric.snug) {
+            Image(systemName: symbol)
+                .font(.system(size: 34, weight: .light))
+                .foregroundStyle(.tertiary)
+            Text(title).font(.title3.weight(.medium))
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
+            if actionTitle != nil || secondaryTitle != nil {
+                HStack(spacing: Metric.snug) {
+                    if let actionTitle, let actionIntent {
+                        Button(actionTitle) { run(actionIntent) }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    if let secondaryTitle, let secondaryIntent {
+                        Button(secondaryTitle) { run(secondaryIntent) }
+                    }
+                }
+                .padding(.top, Metric.tight)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }

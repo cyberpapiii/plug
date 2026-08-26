@@ -336,6 +336,13 @@ async fn apply_server_mutation(
                 auth_token,
             }
         }
+        plug_core::operator::OperatorMutation::SetToolEnabled { tool, enabled } => {
+            plug_core::ipc::IpcRequest::SetToolEnabled {
+                tool,
+                enabled,
+                auth_token,
+            }
+        }
     };
     match crate::daemon::ipc_request(&request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),

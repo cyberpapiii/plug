@@ -55,6 +55,7 @@ final class DaemonServiceManager {
 
     var status: SMAppService.Status { backend.serviceStatus }
     var appServiceEnabled: Bool { backend.enabled }
+    var mainAppAtLoginEnabled: Bool { SMAppService.mainApp.status == .enabled }
 
     // Temporary bridge while AppModel moves to the asynchronous installation snapshot.
     // It never authorizes replacement; every mutation below re-inspects evidence.
@@ -83,7 +84,8 @@ final class DaemonServiceManager {
         return try await replace(
             verifiedRecords: records,
             canonical: canonical,
-            expectedVersion: expectedVersion
+            expectedVersion: expectedVersion,
+            replacingAppRegistration: false
         )
     }
 
@@ -156,7 +158,8 @@ final class DaemonServiceManager {
             _ = try await replace(
                 verifiedRecords: [],
                 canonical: canonical,
-                expectedVersion: canonical.appVersion
+                expectedVersion: canonical.appVersion,
+                replacingAppRegistration: false
             )
         case .appManagedCurrent, .appManagedStale:
             _ = try await ensureRunning(expectedVersion: canonical.appVersion)
@@ -239,7 +242,8 @@ final class DaemonServiceManager {
     private func replace(
         verifiedRecords: [LaunchdJobRecord],
         canonical: VerifiedAppInstallation,
-        expectedVersion: String
+        expectedVersion: String,
+        replacingAppRegistration: Bool
     ) async throws -> OperatorHandshake {
         guard verifiedRecords.allSatisfy({ $0.programURL != nil }) else {
             throw DaemonServiceError.invalidJobEvidence
@@ -248,10 +252,18 @@ final class DaemonServiceManager {
         let paused = backend.pauseConnectors()
         defer { backend.resumeConnectors(paused) }
 
-        for record in verifiedRecords {
-            try await backend.bootOut(record)
+        // SMAppService owns app-managed jobs. Unregister it while the service
+        // still knows the old registration; booting the launchd job out first
+        // can make `status` flip while leaving Background Task Management tied
+        // to the previous bundle build, which then fails every new spawn.
+        if replacingAppRegistration {
+            try await backend.unregisterAgent()
+        } else {
+            for record in verifiedRecords {
+                try await backend.bootOut(record)
+            }
+            if backend.enabled { try await backend.unregisterAgent() }
         }
-        if backend.enabled { try await backend.unregisterAgent() }
         if !backend.enabled { try backend.registerAgent() }
         guard backend.enabled else { throw DaemonServiceError.registrationDisabled }
 
@@ -296,7 +308,8 @@ final class DaemonServiceManager {
         return try await replace(
             verifiedRecords: [record],
             canonical: canonical,
-            expectedVersion: expectedVersion
+            expectedVersion: expectedVersion,
+            replacingAppRegistration: true
         )
     }
 

@@ -1,72 +1,203 @@
 import PlugIPC
 import SwiftUI
 
+/// What Plug has been doing. A log table answered "what fields exist"; this
+/// answers "what happened, and is anything going wrong repeatedly?" — so
+/// failures are countable and grouped by day, and every row has a real time on
+/// it instead of a bare latency number.
 struct ActivityView: View {
     let model: AppModel
-    @State private var failuresOnly = false
+    @State private var scope: Scope = .everything
+    @State private var search = ""
+
+    enum Scope: String, CaseIterable, Identifiable {
+        case everything = "Everything"
+        case problems = "Problems"
+        var id: Self { self }
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            PageHeader(
-                title: "Activity",
-                subtitle: "Recent calls through Plug",
-                metrics: [
-                    (String(model.activities.count), "Calls"),
-                    (String(failureCount), "Issues")
-                ]
-            )
-            if filteredActivities.isEmpty {
-                ContentUnavailableView(
-                    failuresOnly ? "No recent issues" : "No recent activity",
-                    systemImage: failuresOnly ? "checkmark.circle" : "waveform.path.ecg",
-                    description: Text(failuresOnly ? "Recent calls completed successfully." : "Tool calls will appear here as clients use Plug.")
+        Group {
+            if model.activities.isEmpty {
+                EmptyPage(
+                    title: "Nothing yet",
+                    message: "Every tool call made through Plug shows up here.",
+                    symbol: "clock.arrow.circlepath"
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if visible.isEmpty {
+                EmptyPage(
+                    title: scope == .problems ? "No problems" : "No matches",
+                    message: scope == .problems
+                        ? "Every recent call went through cleanly."
+                        : "Nothing recent matches that search.",
+                    symbol: scope == .problems ? "checkmark.circle" : "magnifyingglass"
+                )
             } else {
-                Table(filteredActivities) {
-                    TableColumn("Method", value: \.method)
-                    TableColumn("Client") { OptionalActivityValue(value: $0.client) }
-                    TableColumn("Server") { OptionalActivityValue(value: $0.server) }
-                    TableColumn("Time") { Text("\($0.latencyMs) ms").monospacedDigit() }
-                    TableColumn("Result") { ActivityResultLabel(outcome: $0.outcome) }
+                List {
+                    ForEach(groups, id: \.title) { group in
+                        Section(group.title) {
+                            ForEach(group.events) { event in
+                                ActivityRow(event: event)
+                            }
+                        }
+                    }
+                    // History is a bounded ring in the service, so the end of
+                    // this list is the end of what exists, not the end of a
+                    // page. Saying so is better than an empty scroll.
+                    if model.activityIsCapped {
+                        Text("This is the most recent \(AppModel.activityLimit) calls. Older ones are not kept.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .listRowSeparator(.hidden)
+                    }
                 }
+                .listStyle(.inset)
+            }
+        }
+        .searchable(text: $search, placement: .toolbar, prompt: "Search calls")
+        .toolbar {
+            ToolbarItem {
+                Picker("Show", selection: $scope) {
+                    ForEach(Scope.allCases) { scope in
+                        Text(scope == .problems ? problemsLabel : scope.rawValue).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 200)
             }
         }
         .navigationTitle("Activity")
-        .toolbar {
-            Toggle("Issues only", isOn: $failuresOnly)
-                .toggleStyle(.button)
+    }
+
+    private var problemsLabel: String {
+        let count = model.activities.filter { $0.outcome != "success" }.count
+        return count == 0 ? "Problems" : "Problems (\(count))"
+    }
+
+    private var visible: [ActivityEvent] {
+        let query = search.trimmingCharacters(in: .whitespaces)
+        return model.activities
+            .filter { scope == .everything || $0.outcome != "success" }
+            .filter { event in
+                guard !query.isEmpty else { return true }
+                return event.method.localizedCaseInsensitiveContains(query)
+                    || (event.tool ?? "").localizedCaseInsensitiveContains(query)
+                    || (event.server ?? "").localizedCaseInsensitiveContains(query)
+                    || (event.clientLabel ?? "").localizedCaseInsensitiveContains(query)
+                    || (event.clientType ?? "").localizedCaseInsensitiveContains(query)
+            }
+            .sorted { $0.sequence > $1.sequence }
+    }
+
+    private struct DayGroup {
+        let title: String
+        let events: [ActivityEvent]
+    }
+
+    /// Grouped by day so a long list stays legible without a date column.
+    private var groups: [DayGroup] {
+        let calendar = Calendar.current
+        var order: [String] = []
+        var buckets: [String: [ActivityEvent]] = [:]
+        for event in visible {
+            let date = Date(timeIntervalSince1970: Double(event.occurredAtMs) / 1_000)
+            let title: String
+            if calendar.isDateInToday(date) {
+                title = "Today"
+            } else if calendar.isDateInYesterday(date) {
+                title = "Yesterday"
+            } else {
+                title = date.formatted(.dateTime.weekday(.wide).month().day())
+            }
+            if buckets[title] == nil {
+                order.append(title)
+                buckets[title] = []
+            }
+            buckets[title]?.append(event)
         }
-    }
-
-    private var filteredActivities: [PlugIPC.ActivityEvent] {
-        model.activities.filter { !failuresOnly || $0.outcome != "success" }
-    }
-
-    private var failureCount: Int {
-        model.activities.filter { $0.outcome != "success" }.count
+        return order.map { DayGroup(title: $0, events: buckets[$0] ?? []) }
     }
 }
 
-private struct OptionalActivityValue: View {
-    let value: String?
+private struct ActivityRow: View {
+    let event: ActivityEvent
 
     var body: some View {
-        if let value { Text(value) }
-        else { Text("—").foregroundStyle(.secondary) }
-    }
-}
-
-private struct ActivityResultLabel: View {
-    let outcome: String
-
-    var body: some View {
-        if outcome == "success" {
-            Label("Success", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.secondary)
-        } else {
-            Label(outcome.capitalized, systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+        HStack(spacing: Metric.snug) {
+            // The calling app's own icon, so a long list can be scanned by
+            // picture rather than read line by line.
+            AppGlyph(
+                target: AppIcons.target(forClientType: event.clientType ?? ""),
+                name: appName ?? "",
+                size: 20
+            )
+            Image(systemName: succeeded ? "checkmark.circle" : "exclamationmark.triangle.fill")
+                .font(.callout)
+                .foregroundStyle(succeeded ? Color.secondary : .orange)
+                .frame(width: 18)
+                .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(headline).font(.body.monospaced()).lineLimit(1).truncationMode(.middle)
+                Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: Metric.tight)
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text(latency).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+            }
         }
+        .padding(.vertical, Metric.tight - 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var succeeded: Bool { event.outcome == "success" }
+
+    /// What was called. The tool name is the useful part; `tools/call` is not.
+    private var headline: String {
+        guard let tool = event.tool, !tool.isEmpty else { return event.method }
+        return tool
+    }
+
+    /// Who called it. Names the app, and separately the window or session
+    /// inside that app, because two Claude Code windows are two callers.
+    private var context: String {
+        var parts: [String] = []
+        if let app = appName { parts.append(app) }
+        if let session = sessionTag { parts.append(session) }
+        if let server = event.server, !server.isEmpty { parts.append(server) }
+        if parts.isEmpty { parts.append("Plug") }
+        let joined = parts.joined(separator: " · ")
+        return succeeded ? joined : "\(joined) · \(event.outcome)"
+    }
+
+    private var appName: String? {
+        if let label = event.clientLabel, !label.isEmpty { return label }
+        guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {
+            return nil
+        }
+        return type
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+    }
+
+    /// A short, stable stand-in for one connection of that app. The full value
+    /// is a UUID nobody can read; the leading characters are enough to tell two
+    /// open windows apart, which is the only thing it is for.
+    private var sessionTag: String? {
+        guard let client = event.client, !client.isEmpty else { return nil }
+        return "session \(client.prefix(4))"
+    }
+
+    private var time: String {
+        Date(timeIntervalSince1970: Double(event.occurredAtMs) / 1_000)
+            .formatted(date: .omitted, time: .shortened)
+    }
+
+    private var latency: String {
+        event.latencyMs >= 1_000
+            ? String(format: "%.1fs", Double(event.latencyMs) / 1_000)
+            : "\(event.latencyMs) ms"
     }
 }

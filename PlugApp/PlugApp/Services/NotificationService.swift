@@ -45,7 +45,16 @@ final class NotificationService {
         }
     }
 
+    /// Notifications are the one thing Plug does that interrupts. Settings can
+    /// switch them off, and the default is on.
+    private var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: NotificationService.preferenceKey) as? Bool ?? true
+    }
+
+    static let preferenceKey = "notificationsEnabled"
+
     private func post(id: String, title: String, body: String) {
+        guard isEnabled else { return }
         sink(id, title, body)
     }
 

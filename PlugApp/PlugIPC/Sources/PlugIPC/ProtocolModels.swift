@@ -102,11 +102,83 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
     public var id: UInt64 { sequence }
     public let sequence: UInt64
     public let occurredAtMs: UInt64
+    /// Per-connection identity. For a local editor this is a per-process UUID,
+    /// so it separates one window from another but means nothing to a reader.
     public let client: String?
     public let method: String
     public let server: String?
+    public let tool: String?
+    public let clientType: String?
+    public let clientLabel: String?
     public let latencyMs: UInt64
     public let outcome: String
+
+    public init(
+        sequence: UInt64,
+        occurredAtMs: UInt64,
+        client: String?,
+        method: String,
+        server: String?,
+        tool: String? = nil,
+        clientType: String? = nil,
+        clientLabel: String? = nil,
+        latencyMs: UInt64,
+        outcome: String
+    ) {
+        self.sequence = sequence
+        self.occurredAtMs = occurredAtMs
+        self.client = client
+        self.method = method
+        self.server = server
+        self.tool = tool
+        self.clientType = clientType
+        self.clientLabel = clientLabel
+        self.latencyMs = latencyMs
+        self.outcome = outcome
+    }
+}
+
+public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
+    public var id: String { name }
+    /// Merged name downstream clients call, already server-prefixed.
+    public let name: String
+    public let serverId: String
+    public let description: String?
+    public let title: String?
+    /// Hidden from downstream clients by a `disabled_tools` entry.
+    public let disabled: Bool
+    /// Set when a wildcard, rather than this tool's own name, is what hides it.
+    public let disabledByPattern: String?
+
+    public init(
+        name: String,
+        serverId: String,
+        description: String? = nil,
+        title: String? = nil,
+        disabled: Bool = false,
+        disabledByPattern: String? = nil
+    ) {
+        self.name = name
+        self.serverId = serverId
+        self.description = description
+        self.title = title
+        self.disabled = disabled
+        self.disabledByPattern = disabledByPattern
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, serverId, description, title, disabled, disabledByPattern
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        serverId = try container.decode(String.self, forKey: .serverId)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        disabled = try container.decodeIfPresent(Bool.self, forKey: .disabled) ?? false
+        disabledByPattern = try container.decodeIfPresent(String.self, forKey: .disabledByPattern)
+    }
 }
 
 public struct ServerConfig: Codable, Equatable, Sendable {
@@ -128,8 +200,8 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public var circuitBreakerEnabled = true
     public var enrichment = false
     public var toolRenames: [String: String] = [:]
-    public var toolGroups: [String] = []
-    public var sandbox: String?
+    public var toolGroups: [ToolGroupRule] = []
+    public var sandbox: StdioSandboxConfig?
 
     public static func command(_ command: String, args: [String]) -> Self {
         Self(command: command, args: args, transport: "stdio")
@@ -140,22 +212,73 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     }
 }
 
+extension ServerConfig {
+    private enum CodingKeys: String, CodingKey {
+        case command, args, env, enabled, transport, protocolMode = "protocol", url, authToken
+        case auth, oauthClientID, oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
+        case healthCheckIntervalSecs, circuitBreakerEnabled, enrichment, toolRenames, toolGroups
+        case sandbox
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        command = try c.decodeIfPresent(String.self, forKey: .command)
+        args = try c.decodeIfPresent([String].self, forKey: .args) ?? []
+        env = try c.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        transport = try c.decodeIfPresent(String.self, forKey: .transport) ?? "stdio"
+        protocolMode = try c.decodeIfPresent(String.self, forKey: .protocolMode) ?? "legacy"
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        authToken = try c.decodeIfPresent(String.self, forKey: .authToken)
+        auth = try c.decodeIfPresent(String.self, forKey: .auth)
+        oauthClientID = try c.decodeIfPresent(String.self, forKey: .oauthClientID)
+        oauthScopes = try c.decodeIfPresent([String].self, forKey: .oauthScopes)
+        timeoutSecs = try c.decodeIfPresent(Int.self, forKey: .timeoutSecs) ?? 30
+        callTimeoutSecs = try c.decodeIfPresent(Int.self, forKey: .callTimeoutSecs) ?? 300
+        maxConcurrent = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) ?? 1
+        healthCheckIntervalSecs = try c.decodeIfPresent(Int.self, forKey: .healthCheckIntervalSecs) ?? 60
+        circuitBreakerEnabled = try c.decodeIfPresent(Bool.self, forKey: .circuitBreakerEnabled) ?? true
+        enrichment = try c.decodeIfPresent(Bool.self, forKey: .enrichment) ?? false
+        toolRenames = try c.decodeIfPresent([String: String].self, forKey: .toolRenames) ?? [:]
+        toolGroups = try c.decodeIfPresent([ToolGroupRule].self, forKey: .toolGroups) ?? []
+        sandbox = try c.decodeIfPresent(StdioSandboxConfig.self, forKey: .sandbox)
+    }
+}
+
+public struct ToolGroupRule: Codable, Equatable, Sendable {
+    public var prefix: String
+    public var contains: [String]
+    public var strip: [String] = []
+}
+
+public struct StdioSandboxConfig: Codable, Equatable, Sendable {
+    public var enabled = false
+    public var allowNetwork = false
+    public var allowRead: [String] = []
+    public var allowWrite: [String] = []
+    public var profilePath: String?
+}
+
 public enum IPCRequest: Encodable, Equatable, Sendable {
     case handshake(clientVersion: String, ipcMin: UInt16, ipcMax: UInt16)
     case snapshot(authToken: String)
+    case serverConfig(authToken: String, name: String)
     case activity(authToken: String, afterSequence: UInt64, limit: Int, failuresOnly: Bool)
     case validateServer(authToken: String, name: String, server: ServerConfig)
     case addServer(authToken: String, name: String, server: ServerConfig)
     case updateServer(authToken: String, name: String, server: ServerConfig)
     case removeServer(authToken: String, name: String)
     case setServerEnabled(authToken: String, name: String, enabled: Bool)
+    case listTools
+    case setToolEnabled(authToken: String, tool: String, enabled: Bool)
     case restartServer(authToken: String, serverID: String)
+    case reload(authToken: String)
     case revokeClient(authToken: String, clientID: String)
     case shutdown(authToken: String)
 
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
-        case name, server, enabled, serverID, clientID
+        case name, server, enabled, serverID, clientID, tool
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -166,6 +289,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode(min, forKey: .ipcMin); try c.encode(max, forKey: .ipcMax)
         case let .snapshot(token):
             try c.encode("OperatorSnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
+        case let .serverConfig(token, name):
+            try c.encode("GetServerConfig", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(name, forKey: .name)
         case let .activity(token, after, limit, failures):
             try c.encode("ActivitySnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(after, forKey: .afterSequence); try c.encode(limit, forKey: .limit)
@@ -184,9 +310,16 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .setServerEnabled(token, name, enabled):
             try c.encode("SetServerEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(enabled, forKey: .enabled)
+        case .listTools:
+            try c.encode("ListTools", forKey: .type)
+        case let .setToolEnabled(token, tool, enabled):
+            try c.encode("SetToolEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(tool, forKey: .tool); try c.encode(enabled, forKey: .enabled)
         case let .restartServer(token, serverID):
             try c.encode("RestartServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(serverID, forKey: .serverID)
+        case let .reload(token):
+            try c.encode("Reload", forKey: .type); try c.encode(token, forKey: .authToken)
         case let .revokeClient(token, clientID):
             try c.encode("RevokeDownstreamClient", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(clientID, forKey: .clientID)
@@ -196,17 +329,60 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     }
 }
 
+/// What reloading the configuration from disk changed.
+public struct ReloadSummary: Decodable, Equatable, Sendable {
+    public let added: [String]
+    public let removed: [String]
+    public let changed: [String]
+    public let errors: [String]
+
+    public init(added: [String] = [], removed: [String] = [], changed: [String] = [], errors: [String] = []) {
+        self.added = added
+        self.removed = removed
+        self.changed = changed
+        self.errors = errors
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case added, removed, changed, errors
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        added = try container.decodeIfPresent([String].self, forKey: .added) ?? []
+        removed = try container.decodeIfPresent([String].self, forKey: .removed) ?? []
+        changed = try container.decodeIfPresent([String].self, forKey: .changed) ?? []
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
+    }
+
+    /// One line a person can read, naming what actually moved.
+    public var summary: String {
+        var parts: [String] = []
+        if !added.isEmpty { parts.append("\(added.count) added") }
+        if !removed.isEmpty { parts.append("\(removed.count) removed") }
+        if !changed.isEmpty { parts.append("\(changed.count) changed") }
+        if parts.isEmpty { return "Nothing changed" }
+        return parts.joined(separator: ", ")
+    }
+}
+
 public enum IPCResponse: Decodable, Sendable {
     case handshake(OperatorHandshake)
     case snapshot(OperatorSnapshot)
+    case serverConfig(name: String, server: ServerConfig)
     case activity([ActivityEvent])
+    case tools([ToolInfo])
     case validated
     case mutation
     case revoked(String)
+    /// What a reload changed, so the app can say something specific about it.
+    case reloaded(ReloadSummary)
     case ok
     case error(code: String, message: String)
 
-    private enum CodingKeys: String, CodingKey { case type, handshake, snapshot, events, clientId, code, message }
+    private enum CodingKeys: String, CodingKey {
+        case type, handshake, snapshot, events, tools, clientId, code, message, report, name, server
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -214,10 +390,16 @@ public enum IPCResponse: Decodable, Sendable {
         switch type {
         case "OperatorHandshake": self = .handshake(try c.decode(OperatorHandshake.self, forKey: .handshake))
         case "OperatorSnapshot": self = .snapshot(try c.decode(OperatorSnapshot.self, forKey: .snapshot))
+        case "ServerConfig": self = .serverConfig(
+            name: try c.decode(String.self, forKey: .name),
+            server: try c.decode(ServerConfig.self, forKey: .server)
+        )
         case "ActivitySnapshot": self = .activity(try c.decode([ActivityEvent].self, forKey: .events))
+        case "Tools": self = .tools(try c.decode([ToolInfo].self, forKey: .tools))
         case "ServerValidated": self = .validated
         case "OperatorMutation": self = .mutation
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
+        case "Reloaded": self = .reloaded(try c.decode(ReloadSummary.self, forKey: .report))
         case "Ok": self = .ok
         case "Error": self = .error(code: try c.decode(String.self, forKey: .code), message: try c.decode(String.self, forKey: .message))
         default: throw PlugIPCError.unexpectedResponse(type)
