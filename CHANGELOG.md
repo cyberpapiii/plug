@@ -7,6 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-25
+
+### Fixed
+
+- Fixed first-run reconciliation when the daemon is stopped. The app now
+  accepts Doctor's valid machine-readable failure report and continues into
+  daemon adoption instead of stopping before startup.
+
 ## [0.7.1] - 2026-08-25
 
 ### Fixed
@@ -256,7 +264,8 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/cyberpapiii/plug/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/cyberpapiii/plug/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/cyberpapiii/plug/compare/v0.6.4...v0.7.0
 [0.5.2]: https://github.com/cyberpapiii/plug/compare/v0.5.1...v0.5.2

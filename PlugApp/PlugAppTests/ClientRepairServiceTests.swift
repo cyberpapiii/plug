@@ -34,6 +34,17 @@ final class ClientRepairServiceTests: XCTestCase {
         XCTAssertEqual(calls.map(\.arguments), [["doctor", "--output", "json"]])
     }
 
+    func testInspectAcceptsColdDaemonDoctorFailureReport() async throws {
+        let runner = RecordingRepairRunner(
+            result: .success(.doctor(clientRepairNeeded: false, status: 1))
+        )
+        let service = ClientRepairService(runner: runner)
+
+        let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
+
+        XCTAssertFalse(needsRepair)
+    }
+
     func testRepairAllInvokesVerifiedCanonicalExecutableAndDecodesStableReport() async throws {
         let runner = RecordingRepairRunner(
             result: .success(.report(changed: [true, false, false]))
