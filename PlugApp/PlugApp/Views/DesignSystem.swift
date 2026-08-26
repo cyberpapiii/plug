@@ -300,21 +300,29 @@ extension View {
     /// readable material hierarchy on the app's macOS 14–15 floor.
     @ViewBuilder
     func nativeGlassSurface(tint: Color? = nil) -> some View {
+#if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             glassEffect(.regular.tint(tint), in: .rect(cornerRadius: Metric.corner))
         } else {
             background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
         }
+#else
+        background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
+#endif
     }
 
     /// Native glass controls belong on the small action cluster, not on every
     /// row. That keeps the hierarchy calm while making the controls unmistakable.
     @ViewBuilder
     func nativeGlassButton() -> some View {
+#if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             buttonStyle(.glass)
         } else {
             buttonStyle(.bordered)
         }
+#else
+        buttonStyle(.bordered)
+#endif
     }
 }
