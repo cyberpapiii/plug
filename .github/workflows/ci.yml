@@ -19,8 +19,41 @@ env:
   MSRV: "1.88.0"
 
 jobs:
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: paths
+        name: Decide whether full validation is needed
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # Fail safe: an unknown base runs the complete suite.
+          if [[ -z "${BASE_SHA}" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          code_changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              docs/*|*.md) ;;
+              *) code_changed=true; break ;;
+            esac
+          done < <(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$GITHUB_SHA")
+          echo "code=$code_changed" >> "$GITHUB_OUTPUT"
+
   check:
     name: Check (fmt + clippy)
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -33,7 +66,8 @@ jobs:
 
   msrv:
     name: MSRV check (1.88.0)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: classify
+    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -45,6 +79,8 @@ jobs:
 
   test-linux:
     name: Test (ubuntu)
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -54,6 +90,8 @@ jobs:
 
   browser-oauth:
     name: Browser OAuth
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -74,7 +112,8 @@ jobs:
 
   test-macos:
     name: Test (macos)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: classify
+    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -84,7 +123,8 @@ jobs:
 
   test-macos-app:
     name: Test (Plug.app)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: classify
+    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -128,7 +168,8 @@ jobs:
 
   cross-check:
     name: Cross-check (${{ matrix.target }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: classify
+    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -150,7 +191,8 @@ jobs:
 
   binary-size:
     name: Binary size gate
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: classify
+    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -170,6 +212,8 @@ jobs:
 
   deny:
     name: cargo deny
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
