@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through merge commit `1a73a5f` on 2026-08-26.
+Baseline: `main` through merge commit `e2e99d2` on 2026-08-26.
 
 This is the canonical current-state doc for the project.
 
@@ -164,10 +164,13 @@ PlugApp XCTest suite runs in the `Test (Plug.app)` CI gate (signed
 reconciliation fixtures excepted), so app-side regressions no longer pass with
 green checks.
 
-CI through PR #117 starts all independent gates immediately, strips debug
+CI through PRs #117 and #119 starts all independent gates immediately, strips debug
 symbols from CI-only dev/test profiles, caches Playwright browsers, and verifies
 release artifacts with delegation disabled so it always executes the exact
-binary under test. No validation gate was removed.
+binary under test. Documentation-only changes finish after a six-second,
+fail-safe path classification instead of running the full build matrix. Any
+code, configuration, dependency, script, or workflow change still runs every
+validation gate.
 
 Releases `v0.7.0` through `v0.7.4` are superseded. They established
 the unified distribution and delegation model but each exposed installed-only
