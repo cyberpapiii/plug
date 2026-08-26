@@ -846,14 +846,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn embedded_version_probe_does_not_reenter_app_delegation() {
-        let command = super::version_probe_command(Path::new(
-            "/Applications/Plug.app/Contents/Resources/plug",
+        use std::os::unix::fs::PermissionsExt;
+
+        let probe = std::env::temp_dir().join(format!(
+            "plug-version-probe-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
         ));
-        let plug_dev = command
-            .get_envs()
-            .find(|(name, _)| *name == std::ffi::OsStr::new("PLUG_DEV"))
-            .and_then(|(_, value)| value);
-        assert_eq!(plug_dev, Some(std::ffi::OsStr::new("1")));
+        std::fs::write(
+            &probe,
+            "#!/bin/sh\nif [ \"${PLUG_DEV:-}\" = 1 ]; then echo 'plug 0.7.1'; exit 0; fi\nexec \"$0\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(super::executable_version(&probe).unwrap(), "0.7.1");
+        std::fs::remove_file(probe).unwrap();
     }
 
     #[cfg(unix)]
