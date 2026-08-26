@@ -93,6 +93,13 @@ struct ToolCatalog: Equatable, Sendable {
             .sorted { $0.server.localizedStandardCompare($1.server) == .orderedAscending }
     }
 
+    /// Every tool a wildcard holds off. A pattern is the only way a tool can be
+    /// off without being named, so the panel that explains one has to be able
+    /// to list what else it took.
+    func tools(coveredBy pattern: String) -> [ToolFacts] {
+        tools.filter { $0.lockedByPattern == pattern }.sorted { $0.shortName < $1.shortName }
+    }
+
     func tools(for server: String) -> [ToolFacts] {
         tools.filter { $0.server == server }.sorted { $0.shortName < $1.shortName }
     }

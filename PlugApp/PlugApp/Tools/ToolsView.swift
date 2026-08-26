@@ -8,6 +8,7 @@ import SwiftUI
 /// off without touching the server it belongs to.
 struct ToolsView: View {
     let model: AppModel
+    @Bindable var router: Router
     let run: (PlugIntent) -> Void
 
     @State private var query = ""
@@ -37,7 +38,7 @@ struct ToolsView: View {
                     symbol: "magnifyingglass"
                 )
             } else {
-                List {
+                List(selection: $router.selectedTool) {
                     ForEach(groups) { group in
                         Section {
                             ForEach(group.tools) { tool in
@@ -49,6 +50,18 @@ struct ToolsView: View {
                     }
                 }
                 .listStyle(.inset)
+            }
+        }
+        .inspector(isPresented: inspectorShown) {
+            if let selected {
+                ToolDetailView(
+                    tool: selected,
+                    catalog: model.toolCatalog,
+                    canManage: model.canManageTools,
+                    router: router,
+                    run: run
+                )
+                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
             }
         }
         .searchable(text: $query, placement: .toolbar, prompt: "Search tools")
@@ -64,6 +77,19 @@ struct ToolsView: View {
         }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    /// Same rule as the server list: the inspector is open exactly when
+    /// something is selected, so the two cannot disagree.
+    private var inspectorShown: Binding<Bool> {
+        Binding(
+            get: { selected != nil },
+            set: { shown in if !shown { router.selectedTool = nil } }
+        )
+    }
+
+    private var selected: ToolFacts? {
+        model.toolCatalog.tools.first { $0.name == router.selectedTool }
     }
 }
 
@@ -100,7 +126,7 @@ struct ToolRow: View {
         HStack(alignment: .firstTextBaseline, spacing: Metric.snug) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(tool.shortName)
-                    .font(.callout)
+                    .font(.callout.monospaced())
                     .foregroundStyle(tool.isOn ? .primary : .secondary)
                 if let summary = tool.summary, !summary.isEmpty {
                     Text(summary)

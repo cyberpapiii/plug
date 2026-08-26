@@ -128,7 +128,7 @@ private struct ActivityRow: View {
                 .frame(width: 18)
                 .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
             VStack(alignment: .leading, spacing: 0) {
-                Text(headline).font(.body).lineLimit(1).truncationMode(.middle)
+                Text(headline).font(.body.monospaced()).lineLimit(1).truncationMode(.middle)
                 Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: Metric.tight)

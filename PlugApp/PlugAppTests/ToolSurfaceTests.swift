@@ -105,6 +105,20 @@ final class ToolCatalogTests: XCTestCase {
         XCTAssertTrue(facts.isOn)
         XCTAssertNil(facts.lockedByPattern)
     }
+
+    func testPatternListsEveryToolItCovers() {
+        let catalog = ToolCatalog([
+            ToolFacts(name: "notion__search", server: "notion", isOn: false, lockedByPattern: "notion__*"),
+            ToolFacts(name: "notion__append", server: "notion", isOn: false, lockedByPattern: "notion__*"),
+            ToolFacts(name: "figma__get_file", server: "figma"),
+            ToolFacts(name: "figma__delete", server: "figma", isOn: false),
+        ])
+        XCTAssertEqual(
+            catalog.tools(coveredBy: "notion__*").map(\.shortName),
+            ["append", "search"]
+        )
+        XCTAssertTrue(catalog.tools(coveredBy: "figma__*").isEmpty)
+    }
 }
 
 /// The app list comes from `plug clients --output json`. These pin the shape

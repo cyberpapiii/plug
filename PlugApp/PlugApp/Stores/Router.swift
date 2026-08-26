@@ -9,6 +9,8 @@ import SwiftUI
 final class Router {
     var section: AppSection = .servers
     var selectedServer: String?
+    /// The tool whose details are open, by its merged name.
+    var selectedTool: String?
     var isAddingServer = false
     /// The server whose settings are open for editing, if any.
     var editingServer: ServerName?

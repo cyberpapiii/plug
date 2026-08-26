@@ -48,6 +48,7 @@
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
 		D493DD449196A1E61453FA99 /* ToolsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA534EAE5C6EB28861A7201A /* ToolsView.swift */; };
+		F52CDB1A3EF50693E343C20D /* ToolDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FFA999A1C478ADCA0589429 /* ToolDetailView.swift */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
 		E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */; };
 		E8F55758CCD235C746771CD0 /* AppChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BB10ED3645727B693E33897 /* AppChrome.swift */; };
@@ -119,6 +120,7 @@
 		F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManagerTests.swift; sourceTree = "<group>"; };
 		F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigrator.swift; sourceTree = "<group>"; };
 		FA534EAE5C6EB28861A7201A /* ToolsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolsView.swift; sourceTree = "<group>"; };
+		7FFA999A1C478ADCA0589429 /* ToolDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolDetailView.swift; sourceTree = "<group>"; };
 		FBC2D67DE9038B09D240E689 /* PlugStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugStatus.swift; sourceTree = "<group>"; };
 		FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = com.plug.daemon.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -203,6 +205,7 @@
 			isa = PBXGroup;
 			children = (
 				FA534EAE5C6EB28861A7201A /* ToolsView.swift */,
+				7FFA999A1C478ADCA0589429 /* ToolDetailView.swift */,
 			);
 			path = Tools;
 			sourceTree = "<group>";
@@ -510,6 +513,7 @@
 				5BA8E9724BF22D7D0CB34DCB /* ToolCatalog.swift in Sources */,
 				B17C836FA833FAAB71C5A4FA /* AppIcons.swift in Sources */,
 				D493DD449196A1E61453FA99 /* ToolsView.swift in Sources */,
+				F52CDB1A3EF50693E343C20D /* ToolDetailView.swift in Sources */,
 				4CCD74568EADAD432672189D /* UpdateService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

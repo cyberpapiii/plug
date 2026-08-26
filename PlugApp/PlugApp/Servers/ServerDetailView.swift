@@ -164,7 +164,10 @@ struct ServerDetailView: View {
                         .font(.caption2)
                         .foregroundStyle(event.outcome == "success" ? Color.secondary : .orange)
                         .frame(width: 12)
-                    Text(event.method).font(.caption).lineLimit(1).truncationMode(.middle)
+                    Text(callName(event))
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Spacer(minLength: Metric.tight)
                     Text("\(event.latencyMs) ms")
                         .font(.caption.monospacedDigit())
@@ -172,6 +175,13 @@ struct ServerDetailView: View {
                 }
             }
         }
+    }
+
+    /// The tool that ran. `tools/call` is the transport's word for it and says
+    /// nothing about what happened, so the tool name wins when there is one.
+    private func callName(_ event: ActivityEvent) -> String {
+        guard let tool = event.tool, !tool.isEmpty else { return event.method }
+        return tool
     }
 
     // MARK: - Actions

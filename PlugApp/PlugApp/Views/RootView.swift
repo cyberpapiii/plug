@@ -44,7 +44,7 @@ struct RootView: View {
             case .servers:
                 ServersView(model: model, router: router, run: run)
             case .tools:
-                ToolsView(model: model, run: run)
+                ToolsView(model: model, router: router, run: run)
             case .connections:
                 ConnectionsView(model: model, run: run)
             case .activity:
