@@ -182,6 +182,7 @@ struct ServerDetailView: View {
             } else {
                 Button("Turn On") { run(.setServerEnabled(server.name, true)) }
             }
+            Button("Edit Settings…") { run(.editServer(server.name)) }
             Button("Remove Server…", role: .destructive) { confirmRemoval = true }
         }
     }

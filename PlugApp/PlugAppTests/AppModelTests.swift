@@ -216,7 +216,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.connectionState, .incompatible)
         XCTAssertEqual(
             model.connectionRecoveryDetail,
-            "The app and daemon need compatible versions and IPC support."
+            "The app and its background service are running different versions."
         )
     }
 
@@ -227,7 +227,7 @@ final class AppModelTests: XCTestCase {
             state: .healthy(makeInstallationSnapshot()),
             events: events
         )
-        let server = try! OperatorFixtureServer(events: events, ipcMin: 5, ipcMax: 6)
+        let server = try! OperatorFixtureServer(events: events, ipcMin: 6, ipcMax: 7)
         defer { server.stop() }
 
         let model = AppModel(
@@ -241,7 +241,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.isHealthy)
         XCTAssertEqual(
             model.connectionRecoveryDetail,
-            "The app and daemon need compatible versions and IPC support."
+            "The app and its background service are running different versions."
         )
 
         await model.retryConnection()
@@ -259,7 +259,7 @@ final class AppModelTests: XCTestCase {
         )
         let oldServer = try OperatorFixtureServer(
             events: events,
-            ipcMin: 5,
+            ipcMin: 6,
             ipcMax: 6,
             socketURL: socketURL
         )

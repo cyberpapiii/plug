@@ -102,11 +102,83 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
     public var id: UInt64 { sequence }
     public let sequence: UInt64
     public let occurredAtMs: UInt64
+    /// Per-connection identity. For a local editor this is a per-process UUID,
+    /// so it separates one window from another but means nothing to a reader.
     public let client: String?
     public let method: String
     public let server: String?
+    public let tool: String?
+    public let clientType: String?
+    public let clientLabel: String?
     public let latencyMs: UInt64
     public let outcome: String
+
+    public init(
+        sequence: UInt64,
+        occurredAtMs: UInt64,
+        client: String?,
+        method: String,
+        server: String?,
+        tool: String? = nil,
+        clientType: String? = nil,
+        clientLabel: String? = nil,
+        latencyMs: UInt64,
+        outcome: String
+    ) {
+        self.sequence = sequence
+        self.occurredAtMs = occurredAtMs
+        self.client = client
+        self.method = method
+        self.server = server
+        self.tool = tool
+        self.clientType = clientType
+        self.clientLabel = clientLabel
+        self.latencyMs = latencyMs
+        self.outcome = outcome
+    }
+}
+
+public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
+    public var id: String { name }
+    /// Merged name downstream clients call, already server-prefixed.
+    public let name: String
+    public let serverId: String
+    public let description: String?
+    public let title: String?
+    /// Hidden from downstream clients by a `disabled_tools` entry.
+    public let disabled: Bool
+    /// Set when a wildcard, rather than this tool's own name, is what hides it.
+    public let disabledByPattern: String?
+
+    public init(
+        name: String,
+        serverId: String,
+        description: String? = nil,
+        title: String? = nil,
+        disabled: Bool = false,
+        disabledByPattern: String? = nil
+    ) {
+        self.name = name
+        self.serverId = serverId
+        self.description = description
+        self.title = title
+        self.disabled = disabled
+        self.disabledByPattern = disabledByPattern
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, serverId, description, title, disabled, disabledByPattern
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        serverId = try container.decode(String.self, forKey: .serverId)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        disabled = try container.decodeIfPresent(Bool.self, forKey: .disabled) ?? false
+        disabledByPattern = try container.decodeIfPresent(String.self, forKey: .disabledByPattern)
+    }
 }
 
 public struct ServerConfig: Codable, Equatable, Sendable {
@@ -149,13 +221,15 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case updateServer(authToken: String, name: String, server: ServerConfig)
     case removeServer(authToken: String, name: String)
     case setServerEnabled(authToken: String, name: String, enabled: Bool)
+    case listTools
+    case setToolEnabled(authToken: String, tool: String, enabled: Bool)
     case restartServer(authToken: String, serverID: String)
     case revokeClient(authToken: String, clientID: String)
     case shutdown(authToken: String)
 
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
-        case name, server, enabled, serverID, clientID
+        case name, server, enabled, serverID, clientID, tool
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -184,6 +258,11 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .setServerEnabled(token, name, enabled):
             try c.encode("SetServerEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(enabled, forKey: .enabled)
+        case .listTools:
+            try c.encode("ListTools", forKey: .type)
+        case let .setToolEnabled(token, tool, enabled):
+            try c.encode("SetToolEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(tool, forKey: .tool); try c.encode(enabled, forKey: .enabled)
         case let .restartServer(token, serverID):
             try c.encode("RestartServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(serverID, forKey: .serverID)
@@ -200,13 +279,16 @@ public enum IPCResponse: Decodable, Sendable {
     case handshake(OperatorHandshake)
     case snapshot(OperatorSnapshot)
     case activity([ActivityEvent])
+    case tools([ToolInfo])
     case validated
     case mutation
     case revoked(String)
     case ok
     case error(code: String, message: String)
 
-    private enum CodingKeys: String, CodingKey { case type, handshake, snapshot, events, clientId, code, message }
+    private enum CodingKeys: String, CodingKey {
+        case type, handshake, snapshot, events, tools, clientId, code, message
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -215,6 +297,7 @@ public enum IPCResponse: Decodable, Sendable {
         case "OperatorHandshake": self = .handshake(try c.decode(OperatorHandshake.self, forKey: .handshake))
         case "OperatorSnapshot": self = .snapshot(try c.decode(OperatorSnapshot.self, forKey: .snapshot))
         case "ActivitySnapshot": self = .activity(try c.decode([ActivityEvent].self, forKey: .events))
+        case "Tools": self = .tools(try c.decode([ToolInfo].self, forKey: .tools))
         case "ServerValidated": self = .validated
         case "OperatorMutation": self = .mutation
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))

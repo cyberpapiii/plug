@@ -97,6 +97,17 @@ pub struct ClientMetadata {
     pub version: Arc<str>,
 }
 
+impl ClientMetadata {
+    /// Name and version joined for operator display. Never used for routing.
+    pub fn display_label(&self) -> String {
+        if self.version.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{} {}", self.name, self.version)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MethodFamily {

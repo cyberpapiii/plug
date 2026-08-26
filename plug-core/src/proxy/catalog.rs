@@ -534,6 +534,16 @@ impl super::ToolRouter {
         })
     }
 
+    /// Resolve the upstream server that owns a merged tool name.
+    pub fn server_for_tool(&self, name: &str) -> Option<String> {
+        let snapshot = self.cache.load();
+        snapshot
+            .routes
+            .get(name)
+            .or_else(|| snapshot.routes_lower.get(&name.to_ascii_lowercase()))
+            .map(|(server, _)| server.clone())
+    }
+
     /// List all tools with their source server IDs.
     pub fn list_all_tools(&self) -> Vec<(String, Tool)> {
         let snapshot = self.cache.load();

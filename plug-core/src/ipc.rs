@@ -44,7 +44,7 @@ impl fmt::Debug for IpcCancellationCapability {
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const OPERATOR_IPC_MIN: u16 = 3;
-pub const OPERATOR_IPC_MAX: u16 = 4;
+pub const OPERATOR_IPC_MAX: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +62,9 @@ pub enum OperatorCapability {
     AuthMutation,
     ConfigMutation,
     ActivityStream,
+    /// Operator clients may turn individual merged tools on and off.
+    /// Added in operator IPC v5.
+    ToolMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +151,12 @@ pub enum IpcRequest {
     SetServerEnabled {
         auth_token: String,
         name: String,
+        enabled: bool,
+    },
+    /// Turn one merged tool on or off by editing `disabled_tools`.
+    SetToolEnabled {
+        auth_token: String,
+        tool: String,
         enabled: bool,
     },
 
@@ -334,6 +343,12 @@ impl fmt::Debug for IpcRequest {
                 .field("name", name)
                 .field("enabled", enabled)
                 .finish(),
+            Self::SetToolEnabled { tool, enabled, .. } => f
+                .debug_struct("SetToolEnabled")
+                .field("auth_token", &"[REDACTED]")
+                .field("tool", tool)
+                .field("enabled", enabled)
+                .finish(),
             Self::RestartServer { server_id, .. } => f
                 .debug_struct("RestartServer")
                 .field("server_id", server_id)
@@ -473,6 +488,16 @@ pub struct IpcToolInfo {
     pub server_id: String,
     pub description: Option<String>,
     pub title: Option<String>,
+    /// True when `disabled_tools` hides this tool from downstream clients.
+    /// The listing itself is unfiltered so operators can see and undo the
+    /// choice.
+    #[serde(default)]
+    pub disabled: bool,
+    /// The `disabled_tools` entry responsible, when it is a wildcard rather
+    /// than this tool's exact name. A single tool inside a wildcard cannot be
+    /// turned back on without removing the pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_by_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<Icon>>,
     #[serde(default)]
@@ -880,6 +905,27 @@ pub enum DaemonToProxyMessage {
 /// Admin operations (RestartServer, Reload, Shutdown) require it.
 /// MCP proxy operations (Register, Deregister, McpRequest) rely on
 /// Unix socket file permissions for access control instead.
+/// True when `disabled_tools` hides `tool_name` from downstream clients.
+pub fn tool_is_disabled(patterns: &[String], tool_name: &str) -> bool {
+    crate::proxy::is_disabled_tool(patterns, tool_name)
+}
+
+/// The wildcard `disabled_tools` entry hiding `tool_name`, if the tool is not
+/// listed by its exact name. Operator surfaces use this to explain why a
+/// single tool cannot be switched back on by itself.
+pub fn disabling_wildcard(patterns: &[String], tool_name: &str) -> Option<String> {
+    if patterns
+        .iter()
+        .any(|pattern| pattern.eq_ignore_ascii_case(tool_name))
+    {
+        return None;
+    }
+    patterns
+        .iter()
+        .find(|pattern| crate::proxy::is_disabled_tool(std::slice::from_ref(*pattern), tool_name))
+        .cloned()
+}
+
 pub fn requires_auth(request: &IpcRequest) -> bool {
     matches!(
         request,
@@ -895,6 +941,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::UpdateServer { .. }
             | IpcRequest::RemoveServer { .. }
             | IpcRequest::SetServerEnabled { .. }
+            | IpcRequest::SetToolEnabled { .. }
     )
 }
 
@@ -912,7 +959,8 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::AddServer { auth_token, .. }
         | IpcRequest::UpdateServer { auth_token, .. }
         | IpcRequest::RemoveServer { auth_token, .. }
-        | IpcRequest::SetServerEnabled { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::SetServerEnabled { auth_token, .. }
+        | IpcRequest::SetToolEnabled { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -1209,6 +1257,8 @@ mod tests {
                 tools: vec![IpcToolInfo {
                     name: "Imessage__send".to_string(),
                     server_id: "imessage".to_string(),
+                    disabled: false,
+                    disabled_by_pattern: None,
                     description: Some("Send an iMessage".to_string()),
                     title: Some("iMessage: Send".to_string()),
                     icons: Some(vec![
@@ -1299,6 +1349,8 @@ mod tests {
             tools: vec![IpcToolInfo {
                 name: "Imessage__send".to_string(),
                 server_id: "imessage".to_string(),
+                disabled: false,
+                disabled_by_pattern: None,
                 description: None,
                 title: Some("iMessage: Send".to_string()),
                 icons: Some(vec![

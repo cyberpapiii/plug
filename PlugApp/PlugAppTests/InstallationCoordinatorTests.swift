@@ -360,7 +360,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [healthyService(), healthyService()],
                 handshakes: [handshake(
                     version: canonical.appVersion,
-                    ipcMin: 5,
+                    ipcMin: 6,
                     ipcMax: 6
                 )]
             ),

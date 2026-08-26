@@ -1,10 +1,12 @@
 import SwiftUI
 
-/// The three things worth a window. Everything that used to be a fourth
-/// section — signing in to a server — now lives on the server itself, because
-/// a problem should be fixable where it is seen.
+/// What the window is for. Signing in to a server used to be its own section;
+/// it now lives on the server itself, because a problem should be fixable
+/// where it is seen. Tools are their own section because they are what a
+/// connected app actually gets, and they are switched on and off one by one.
 enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case servers = "Servers"
+    case tools = "Tools"
     case connections = "Connections"
     case activity = "Activity"
 
@@ -13,6 +15,7 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
     var symbol: String {
         switch self {
         case .servers: "shippingbox"
+        case .tools: "wrench.and.screwdriver"
         case .connections: "app.connected.to.app.below.fill"
         case .activity: "clock.arrow.circlepath"
         }
@@ -40,6 +43,8 @@ struct RootView: View {
             switch router.section {
             case .servers:
                 ServersView(model: model, router: router, run: run)
+            case .tools:
+                ToolsView(model: model, run: run)
             case .connections:
                 ConnectionsView(model: model, run: run)
             case .activity:
@@ -55,7 +60,7 @@ struct RootView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(minWidth: 260)
+                .frame(minWidth: 330)
             }
         }
         .navigationTitle("Plug")

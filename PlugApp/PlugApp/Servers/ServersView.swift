@@ -43,6 +43,9 @@ struct ServersView: View {
         .sheet(isPresented: $router.isAddingServer) {
             AddServerView(model: model)
         }
+        .sheet(item: $router.editingServer) { target in
+            EditServerView(model: model, name: target.id)
+        }
     }
 
     /// The inspector is open exactly when a server is selected, and closing it
@@ -174,5 +177,6 @@ struct ServerActions: View {
         } else {
             Button("Turn On") { run(.setServerEnabled(server.name, true)) }
         }
+        Button("Edit Settings…") { run(.editServer(server.name)) }
     }
 }

@@ -97,14 +97,25 @@ pub async fn dispatch_tools_call(
     params: CallToolRequestParams,
 ) -> Result<ToolCallOutcome, McpError> {
     let started = std::time::Instant::now();
-    let client = ctx.downstream_call_context().client_id.to_string();
+    let downstream = ctx.downstream_call_context();
+    let client = downstream.client_id.to_string();
+    let client_type = downstream.client_type.to_string();
+    let client_label = downstream
+        .client_metadata
+        .as_ref()
+        .map(crate::protocol::ClientMetadata::display_label);
+    let tool = params.name.to_string();
+    let server = router.server_for_tool(&tool);
     let result = dispatch_tools_call_inner(router, ctx, params).await;
     router.record_activity(crate::activity::ActivityEvent {
         sequence: 0,
         occurred_at_ms: 0,
         client: Some(client),
-        server: None,
+        server,
         method: "tools/call".to_string(),
+        tool: Some(tool),
+        client_type: Some(client_type),
+        client_label,
         latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         outcome: if result.is_ok() {
             crate::activity::ActivityOutcome::Success

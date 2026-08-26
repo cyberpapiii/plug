@@ -14,7 +14,7 @@ struct ConnectionsView: View {
 
     var body: some View {
         Group {
-            if sessions.isEmpty && grants.isEmpty {
+            if sessions.isEmpty && grants.isEmpty && model.connectableApps.isEmpty {
                 EmptyPage(
                     title: "Nothing is connected",
                     message: "When an AI app connects through Plug it shows up here, along with everything it can reach.",
@@ -22,6 +22,23 @@ struct ConnectionsView: View {
                 )
             } else {
                 List {
+                    if !model.connectableApps.isEmpty {
+                        Section {
+                            ForEach(model.connectableApps) { app in
+                                AppLinkRow(
+                                    app: app,
+                                    isBusy: model.busyApps.contains(app.target),
+                                    run: run
+                                )
+                            }
+                        } header: {
+                            Text("Apps on this Mac")
+                        } footer: {
+                            Text("Turning an app on writes Plug into its settings. It picks up the change the next time it starts.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                     if !sessions.isEmpty {
                         Section("Connected now") {
                             ForEach(sessions) { session in
@@ -47,6 +64,9 @@ struct ConnectionsView: View {
             }
         }
         .navigationTitle("Connections")
+        .task { await model.loadConnectableApps() }
+        .onAppear { model.setWatching(true) }
+        .onDisappear { model.setWatching(false) }
     }
 
     private func sessionRow(_ session: LiveSession) -> some View {
@@ -110,6 +130,62 @@ struct ConnectionsView: View {
             .first { $0.sessionId == session.sessionId }?
             .visibleToolCount ?? 0
         return count == 1 ? "1 tool" : "\(count) tools"
+    }
+}
+
+/// An AI app on this Mac, and whether Plug is wired into it.
+private struct AppLinkRow: View {
+    let app: LinkableApp
+    let isBusy: Bool
+    let run: (PlugIntent) -> Void
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            Image(systemName: app.detected ? "app.badge.checkmark" : "app.dashed")
+                .font(.title3)
+                .foregroundStyle(app.detected ? .primary : .tertiary)
+                .frame(width: 22)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(app.name)
+                    .font(.body)
+                    .foregroundStyle(app.detected ? .primary : .secondary)
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: Metric.tight)
+            if isBusy {
+                ProgressView().controlSize(.small)
+            } else if app.detected {
+                Toggle(
+                    "Use Plug",
+                    isOn: Binding(
+                        get: { app.linked },
+                        set: { run($0 ? .linkApp(app.target) : .unlinkApp(app.target)) }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+            }
+        }
+        .padding(.vertical, Metric.tight - 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(app.name), \(status)")
+    }
+
+    private var status: String {
+        guard app.detected else { return "Not installed" }
+        guard app.linked else { return "Not using Plug" }
+        if app.live {
+            return app.sessions == 1 ? "Using Plug · 1 session open" : "Using Plug · \(app.sessions) sessions open"
+        }
+        switch app.transport?.lowercased() {
+        case "stdio": return "Using Plug on this Mac"
+        case "http": return "Using Plug over the network"
+        default: return "Using Plug"
+        }
     }
 }
 

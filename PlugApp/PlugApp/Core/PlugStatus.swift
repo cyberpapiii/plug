@@ -30,7 +30,7 @@ enum ServerHealth: Equatable, Sendable {
     /// Words a person reads. Never protocol vocabulary.
     var label: String {
         switch self {
-        case .working: "Working"
+        case .working: "Running"
         case .starting: "Starting"
         case .signInNeeded: "Sign-in needed"
         case .down: "Down"
@@ -149,7 +149,11 @@ enum PlugIntent: Equatable, Sendable {
     case signIn(server: String)
     case restartServer(String)
     case setServerEnabled(String, Bool)
+    case editServer(String)
     case removeServer(String)
+    case setToolEnabled(String, Bool)
+    case linkApp(String)
+    case unlinkApp(String)
     case revokeClient(id: String)
     case addServer
     case openWindow(AppSection)
@@ -254,14 +258,14 @@ enum PlugVerdict {
                 tone: .busy,
                 symbol: "bolt.horizontal.circle",
                 title: "Setting up…",
-                detail: "This takes a moment."
+                detail: "Finishing installation."
             )
         case .needsPermission:
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.badge.checkmark",
-                title: "Let Plug run in the background",
-                detail: "Your AI apps can only reach your servers while Plug is running.",
+                title: "Background running is off",
+                detail: "Plug serves connected apps only while it runs in the background.",
                 primary: .init("Turn On", .allowBackgroundRunning)
             )
         case let .needsRepair(detail):
@@ -276,7 +280,7 @@ enum PlugVerdict {
             return Verdict(
                 tone: .blocked,
                 symbol: "bolt.trianglebadge.exclamationmark",
-                title: "Plug can't finish setting up",
+                title: "Setup incomplete",
                 detail: detail,
                 primary: .init("Try Again", .repairInstallation),
                 secondary: hasLog ? .init("Show Log", .showRepairLog) : nil
@@ -293,22 +297,22 @@ enum PlugVerdict {
                 tone: .busy,
                 symbol: "bolt.horizontal.circle",
                 title: "Starting…",
-                detail: "Connecting to your servers."
+                detail: "Connecting to servers."
             )
         case .stopped:
             return Verdict(
                 tone: .blocked,
                 symbol: "bolt.slash",
-                title: "Plug isn't running",
-                detail: "Your AI apps can't reach any servers right now.",
+                title: "Plug is not running",
+                detail: "Connected apps cannot reach any servers.",
                 primary: .init("Start Plug", .reconnect)
             )
         case .versionMismatch:
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.badge.clock",
-                title: "Restart to finish updating",
-                detail: "The new version is installed and waiting.",
+                title: "Restart required to finish update",
+                detail: "The new version is installed.",
                 primary: .init("Restart Plug", .reconnect)
             )
         }
@@ -322,8 +326,8 @@ enum PlugVerdict {
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.horizontal.circle",
-                title: "No servers yet",
-                detail: "Add one to give your AI apps something to use.",
+                title: "No servers configured",
+                detail: "Add a server to make tools available.",
                 primary: .init("Add Server", .addServer)
             )
         }
@@ -334,8 +338,10 @@ enum PlugVerdict {
                 return Verdict(
                     tone: .attention,
                     symbol: "bolt.badge.checkmark",
-                    title: "\(only.name) needs you to sign in",
-                    detail: only.isSigningIn ? "Finish in your browser." : "Everything else is working.",
+                    title: "\(only.name) needs sign-in",
+                    detail: only.isSigningIn
+                        ? "Sign-in is open in the browser."
+                        : "All other servers are running.",
                     primary: only.isSigningIn ? nil : .init("Sign In", .signIn(server: only.name))
                 )
             default:
@@ -343,7 +349,7 @@ enum PlugVerdict {
                     tone: .attention,
                     symbol: "bolt.trianglebadge.exclamationmark",
                     title: "\(only.name) is \(only.health.label.lowercased())",
-                    detail: only.error ?? "Everything else is working.",
+                    detail: only.error ?? "All other servers are running.",
                     primary: .init("Restart", .restartServer(only.name))
                 )
             }
@@ -352,12 +358,12 @@ enum PlugVerdict {
         if troubled.count > 1 {
             let signIns = troubled.filter { $0.health == .signInNeeded }.count
             let detail: String = signIns == troubled.count
-                ? "They're all waiting for you to sign in."
-                : "\(situation.workingServers.count) of \(active.count) servers are still working."
+                ? "All are waiting for sign-in."
+                : "\(situation.workingServers.count) of \(active.count) servers running."
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.trianglebadge.exclamationmark",
-                title: "\(troubled.count) servers need you",
+                title: "\(troubled.count) servers need attention",
                 detail: detail
             )
         }
@@ -366,7 +372,7 @@ enum PlugVerdict {
             return Verdict(
                 tone: .busy,
                 symbol: "bolt.horizontal.circle",
-                title: "Starting your servers…",
+                title: "Starting servers…",
                 detail: "\(situation.workingServers.count) of \(active.count) ready."
             )
         }
@@ -374,7 +380,7 @@ enum PlugVerdict {
         return Verdict(
             tone: .good,
             symbol: "bolt.fill",
-            title: "Everything's working",
+            title: "All servers running",
             detail: readyDetail(for: situation)
         )
     }
@@ -383,9 +389,9 @@ enum PlugVerdict {
         let servers = situation.activeServers.count
         let serverWord = servers == 1 ? "server" : "servers"
         let tools = situation.totalTools
-        guard tools > 0 else { return "\(servers) \(serverWord) ready" }
+        guard tools > 0 else { return "\(servers) \(serverWord)" }
         let toolWord = tools == 1 ? "tool" : "tools"
-        return "\(servers) \(serverWord) · \(tools) \(toolWord) ready"
+        return "\(servers) \(serverWord) · \(tools) \(toolWord)"
     }
 
     /// Problems worth listing, each paired with the button that resolves it.
@@ -397,7 +403,7 @@ enum PlugVerdict {
                     id: server.name,
                     symbol: "person.badge.key",
                     title: server.name,
-                    detail: server.isSigningIn ? "Finish in your browser" : "Needs you to sign in",
+                    detail: server.isSigningIn ? "Sign-in open in browser" : "Sign-in needed",
                     button: server.isSigningIn ? nil : .init("Sign In", .signIn(server: server.name)),
                     isWorking: server.isSigningIn
                 )

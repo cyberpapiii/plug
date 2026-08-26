@@ -34,6 +34,7 @@ final class AppModel {
 
     private let ipc: PlugIPCClient
     private let coordinator: any InstallationCoordinating
+    private let appLinker: any AppLinking
     private let tokenURL: URL
     private let clientVersion: String
     private var monitoringTask: Task<Void, Never>?
@@ -50,6 +51,14 @@ final class AppModel {
     private(set) var installationState: InstallationState
     private(set) var showsReconciliationProgress = false
     private(set) var signingInServers: Set<String> = []
+    private(set) var toolCatalog = ToolCatalog()
+    private(set) var connectableApps: [LinkableApp] = []
+    private(set) var busyApps: Set<String> = []
+    private var capabilities: Set<String> = []
+
+    /// The daemon accepts per-tool switches. Older daemons do not, and the
+    /// interface hides the switches rather than offering a button that fails.
+    var canManageTools: Bool { capabilities.contains("tool_mutation") }
     /// Someone is looking at Plug right now, so refresh briskly. Nothing is
     /// visible otherwise, and a background poll every few seconds is rude to
     /// a laptop battery for information no one is reading.
@@ -72,12 +81,14 @@ final class AppModel {
         ipc: PlugIPCClient? = nil,
         coordinator: any InstallationCoordinating = InstallationCoordinator(),
         clientVersion: String = AppModel.defaultClientVersion,
-        tokenURL: URL = PlugIPCClient.defaultTokenURL
+        tokenURL: URL = PlugIPCClient.defaultTokenURL,
+        appLinker: any AppLinking = AppLinkService()
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
         self.coordinator = coordinator
         self.tokenURL = tokenURL
+        self.appLinker = appLinker
         installationState = coordinator.state
     }
 
@@ -177,7 +188,7 @@ final class AppModel {
     }
 
     var connectionRecoveryDetail: String {
-        "The app and daemon need compatible versions and IPC support."
+        "The app and its background service are running different versions."
     }
 
     var installationFailure: InstallationFailure? {
@@ -249,7 +260,8 @@ final class AppModel {
             if connectionState != .ready { connectionState = .connecting }
             do {
                 let handshake = try await ipc.connect()
-                guard handshake.ipcMin <= 4, handshake.ipcMax >= 3 else {
+                capabilities = Set(handshake.capabilities)
+                guard handshake.ipcMin <= 5, handshake.ipcMax >= 3 else {
                     connectionState = .incompatible
                     lastError = nil
                     return
@@ -274,6 +286,9 @@ final class AppModel {
                 if case let .activity(events) = try await ipc.request(
                     .activity(authToken: token, afterSequence: 0, limit: 200, failuresOnly: false)
                 ) { activities = events }
+                if case let .tools(tools) = try await ipc.request(.listTools) {
+                    toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
+                }
                 connectionState = .ready
                 lastError = nil
             } catch {
@@ -291,6 +306,39 @@ final class AppModel {
             let token = try String(contentsOf: tokenURL, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             _ = try await ipc.request(request(token))
+            await refresh()
+        } catch { lastError = error.localizedDescription }
+    }
+
+    /// Tools of one server, for its detail view.
+    func tools(for server: String) -> [ToolFacts] { toolCatalog.tools(for: server) }
+
+    func setToolEnabled(_ tool: String, _ enabled: Bool) async {
+        await perform { .setToolEnabled(authToken: $0, tool: tool, enabled: enabled) }
+    }
+
+    func updateServer(name: String, config: ServerConfig) async {
+        await perform { .updateServer(authToken: $0, name: name, server: config) }
+    }
+
+    /// Which AI apps are wired into Plug. Read from the client configuration
+    /// files on disk rather than the daemon, which does not own them.
+    func loadConnectableApps() async {
+        do { connectableApps = try await appLinker.apps() } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func setAppLinked(_ target: String, _ linked: Bool) async {
+        guard busyApps.insert(target).inserted else { return }
+        defer { busyApps.remove(target) }
+        do {
+            if linked {
+                try await appLinker.link(target: target)
+            } else {
+                try await appLinker.unlink(target: target)
+            }
+            await loadConnectableApps()
             await refresh()
         } catch { lastError = error.localizedDescription }
     }

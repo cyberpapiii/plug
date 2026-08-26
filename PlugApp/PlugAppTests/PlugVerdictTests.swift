@@ -32,8 +32,8 @@ final class PlugVerdictTests: XCTestCase {
             )
         )
         XCTAssertEqual(verdict.tone, .good)
-        XCTAssertEqual(verdict.title, "Everything's working")
-        XCTAssertEqual(verdict.detail, "2 servers · 7 tools ready")
+        XCTAssertEqual(verdict.title, "All servers running")
+        XCTAssertEqual(verdict.detail, "2 servers · 7 tools")
         XCTAssertNil(verdict.primary)
     }
 
@@ -69,13 +69,13 @@ final class PlugVerdictTests: XCTestCase {
         let verdict = PlugVerdict.verdict(
             for: PlugSituation(runtime: .stopped, servers: [server("a", health: .down)])
         )
-        XCTAssertEqual(verdict.title, "Plug isn't running")
+        XCTAssertEqual(verdict.title, "Plug is not running")
         XCTAssertEqual(verdict.primary?.intent, .reconnect)
     }
 
     func testVersionMismatchAsksForARestartInPlainWords() {
         let verdict = PlugVerdict.verdict(for: PlugSituation(runtime: .versionMismatch))
-        XCTAssertEqual(verdict.title, "Restart to finish updating")
+        XCTAssertEqual(verdict.title, "Restart required to finish update")
         XCTAssertEqual(verdict.primary?.intent, .reconnect)
     }
 
@@ -86,7 +86,7 @@ final class PlugVerdictTests: XCTestCase {
                 servers: [server("Notion", health: .signInNeeded), server("Figma")]
             )
         )
-        XCTAssertEqual(verdict.title, "Notion needs you to sign in")
+        XCTAssertEqual(verdict.title, "Notion needs sign-in")
         XCTAssertEqual(verdict.primary?.intent, .signIn(server: "Notion"))
     }
 
@@ -98,7 +98,7 @@ final class PlugVerdictTests: XCTestCase {
             )
         )
         XCTAssertNil(verdict.primary)
-        XCTAssertEqual(verdict.detail, "Finish in your browser.")
+        XCTAssertEqual(verdict.detail, "Sign-in is open in the browser.")
     }
 
     func testSingleDownServerOffersRestart() {
@@ -123,7 +123,7 @@ final class PlugVerdictTests: XCTestCase {
             ]
         )
         let verdict = PlugVerdict.verdict(for: situation)
-        XCTAssertEqual(verdict.title, "2 servers need you")
+        XCTAssertEqual(verdict.title, "2 servers need attention")
         XCTAssertNil(verdict.primary)
         XCTAssertEqual(PlugVerdict.attention(for: situation).count, 2)
     }
@@ -136,7 +136,7 @@ final class PlugVerdictTests: XCTestCase {
             )
         )
         XCTAssertEqual(verdict.tone, .good)
-        XCTAssertEqual(verdict.detail, "1 server · 10 tools ready")
+        XCTAssertEqual(verdict.detail, "1 server · 10 tools")
     }
 
     func testStartingServersReadAsBusyNotBroken() {

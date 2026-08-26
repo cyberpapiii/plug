@@ -21,7 +21,7 @@ struct ActivityView: View {
             if model.activities.isEmpty {
                 EmptyPage(
                     title: "Nothing yet",
-                    message: "Every tool call your AI apps make through Plug will show up here.",
+                    message: "Every tool call made through Plug shows up here.",
                     symbol: "clock.arrow.circlepath"
                 )
             } else if visible.isEmpty {
@@ -72,8 +72,10 @@ struct ActivityView: View {
             .filter { event in
                 guard !query.isEmpty else { return true }
                 return event.method.localizedCaseInsensitiveContains(query)
+                    || (event.tool ?? "").localizedCaseInsensitiveContains(query)
                     || (event.server ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.client ?? "").localizedCaseInsensitiveContains(query)
+                    || (event.clientLabel ?? "").localizedCaseInsensitiveContains(query)
+                    || (event.clientType ?? "").localizedCaseInsensitiveContains(query)
             }
             .sorted { $0.sequence > $1.sequence }
     }
@@ -119,7 +121,7 @@ private struct ActivityRow: View {
                 .frame(width: 18)
                 .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
             VStack(alignment: .leading, spacing: 0) {
-                Text(event.method).font(.body).lineLimit(1).truncationMode(.middle)
+                Text(headline).font(.body).lineLimit(1).truncationMode(.middle)
                 Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
@@ -134,11 +136,41 @@ private struct ActivityRow: View {
 
     private var succeeded: Bool { event.outcome == "success" }
 
+    /// What was called. The tool name is the useful part; `tools/call` is not.
+    private var headline: String {
+        guard let tool = event.tool, !tool.isEmpty else { return event.method }
+        return tool
+    }
+
+    /// Who called it. Names the app, and separately the window or session
+    /// inside that app, because two Claude Code windows are two callers.
     private var context: String {
-        let parts = [event.client, event.server].compactMap { $0 }.filter { !$0.isEmpty }
-        if parts.isEmpty { return succeeded ? "Plug" : event.outcome.capitalized }
-        let joined = parts.joined(separator: " → ")
+        var parts: [String] = []
+        if let app = appName { parts.append(app) }
+        if let session = sessionTag { parts.append(session) }
+        if let server = event.server, !server.isEmpty { parts.append(server) }
+        if parts.isEmpty { parts.append("Plug") }
+        let joined = parts.joined(separator: " · ")
         return succeeded ? joined : "\(joined) · \(event.outcome)"
+    }
+
+    private var appName: String? {
+        if let label = event.clientLabel, !label.isEmpty { return label }
+        guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {
+            return nil
+        }
+        return type
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+    }
+
+    /// A short, stable stand-in for one connection of that app. The full value
+    /// is a UUID nobody can read; the leading characters are enough to tell two
+    /// open windows apart, which is the only thing it is for.
+    private var sessionTag: String? {
+        guard let client = event.client, !client.isEmpty else { return nil }
+        return "session \(client.prefix(4))"
     }
 
     private var time: String {

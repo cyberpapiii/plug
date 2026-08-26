@@ -10,6 +10,13 @@ final class Router {
     var section: AppSection = .servers
     var selectedServer: String?
     var isAddingServer = false
+    /// The server whose settings are open for editing, if any.
+    var editingServer: ServerName?
+
+    /// A server name that a sheet can be presented from.
+    struct ServerName: Identifiable, Equatable, Sendable {
+        let id: String
+    }
 
     func reveal(server: String) {
         section = .servers
@@ -41,6 +48,16 @@ struct PlugIntentRunner {
             perform { .restartServer(authToken: $0, serverID: name) }
         case let .setServerEnabled(name, enabled):
             perform { .setServerEnabled(authToken: $0, name: name, enabled: enabled) }
+        case let .editServer(name):
+            router.section = .servers
+            router.editingServer = Router.ServerName(id: name)
+            showWindow()
+        case let .setToolEnabled(tool, enabled):
+            Task { await model.setToolEnabled(tool, enabled) }
+        case let .linkApp(target):
+            Task { await model.setAppLinked(target, true) }
+        case let .unlinkApp(target):
+            Task { await model.setAppLinked(target, false) }
         case let .removeServer(name):
             if router.selectedServer == name { router.selectedServer = nil }
             perform { .removeServer(authToken: $0, name: name) }

@@ -22,9 +22,22 @@ pub enum ActivityOutcome {
 pub struct ActivityEvent {
     pub sequence: u64,
     pub occurred_at_ms: u64,
+    /// Stable per-connection client identity. For `plug connect` this is a
+    /// per-process UUID, which is what distinguishes one editor window from
+    /// another; it is not meant to be shown to a person on its own.
     pub client: Option<String>,
     pub server: Option<String>,
     pub method: String,
+    /// Merged tool name for `tools/call`, absent for every other method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Detected client family (`claude-code`, `cursor`, ...) recorded at call
+    /// time so an event stays attributable after its session disconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
+    /// Client-declared name and version from MCP initialize, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_label: Option<String>,
     pub latency_ms: u64,
     pub outcome: ActivityOutcome,
 }
@@ -106,10 +119,39 @@ mod tests {
             occurred_at_ms: 0,
             client: Some("codex".into()),
             server: Some("fixture".into()),
-            method: format!("tools/call/{index}"),
+            method: "tools/call".to_string(),
+            tool: Some(format!("fixture__tool_{index}")),
+            client_type: Some("codex-cli".into()),
+            client_label: Some("codex 1.0".into()),
             latency_ms: 1,
             outcome: ActivityOutcome::Success,
         }
+    }
+
+    #[test]
+    fn tool_calls_carry_attribution_without_payload_metadata() {
+        let store = ActivityStore::default();
+        store.record(event(0));
+        let recorded = store.snapshot(&ActivityFilter::default()).remove(0);
+        assert_eq!(recorded.tool.as_deref(), Some("fixture__tool_0"));
+        assert_eq!(recorded.client_type.as_deref(), Some("codex-cli"));
+        assert_eq!(recorded.client_label.as_deref(), Some("codex 1.0"));
+        assert_eq!(recorded.server.as_deref(), Some("fixture"));
+    }
+
+    #[test]
+    fn non_tool_events_omit_tool_attribution_from_the_wire() {
+        let store = ActivityStore::default();
+        store.record(ActivityEvent {
+            method: "resources/list".to_string(),
+            tool: None,
+            client_type: None,
+            client_label: None,
+            ..event(0)
+        });
+        let json = serde_json::to_string(&store.snapshot(&ActivityFilter::default())).unwrap();
+        assert!(!json.contains("\"tool\""), "{json}");
+        assert!(!json.contains("client_type"), "{json}");
     }
 
     #[test]

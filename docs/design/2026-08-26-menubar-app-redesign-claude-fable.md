@@ -1,7 +1,10 @@
 # Plug.app design review and overhaul — 2026-08-26 (claude-fable)
 
-Status: implemented on this branch. Scope is the macOS app's interface only. No
-daemon, IPC, installation, or release behaviour changed.
+Status: implemented on this branch. Round one was the macOS app's interface
+only. Round two added operator capability the interface needed — a tool
+mutation, tool listing detail, and activity attribution — so it also touches
+`plug-core` and the daemon's IPC surface. Installation and release behaviour are
+unchanged.
 
 ## What the app was
 
@@ -88,10 +91,10 @@ counts them and each gets its own row with its own button.
 fixes, then a quiet list of running servers, then connected apps, then a
 three-affordance footer. Most visits end here.
 
-### Three sections, not four
+### Four sections
 
-**Servers · Connections · Activity**, chosen with a segmented control in the
-toolbar rather than a permanent sidebar column. **Auth** was dissolved: an
+**Servers · Tools · Connections · Activity**, chosen with a segmented control in
+the toolbar rather than a permanent sidebar column. **Auth** was dissolved: an
 account belongs to the server that needs it, so signing in happens on the server
 row and in the server's detail. Remote grants moved next to the live sessions
 they authorize, under one question — who can use Plug — with revoke in reach.
@@ -99,9 +102,21 @@ they authorize, under one question — who can use Plug — with revoke in reach
 ### Words a person would use
 
 `ServerHealth` normalizes the daemon's strings once, at the boundary, and owns
-the words: Working, Starting, Sign-in needed, Down, Off. Transports became
+the words: Running, Starting, Sign-in needed, Down, Off. Transports became
 "Runs on this Mac" / "Remote server". No interface string says reconciliation,
 converge, ownership, daemon, or IPC.
+
+The verdict strings are plain product copy, not narrative. They state what is
+true and, when something is wrong, what it is:
+
+| Situation | String |
+| --- | --- |
+| Everything healthy | "All servers running" / "2 servers · 7 tools" |
+| One server needs an account | "Notion needs sign-in" |
+| Sign-in in progress | "Signing in" / "Sign-in is open in the browser." |
+| Several problems | "2 servers need attention" |
+| Service stopped | "Plug is not running" |
+| Update staged | "Restart required to finish update" |
 
 ### Shape, not colour
 
@@ -135,11 +150,51 @@ Installation, adoption, launchd ownership, IPC, notifications, Sparkle updates,
 and every service and coordinator behind them. `AppModel`'s existing surface is
 intact and its tests are untouched.
 
+## Round two: the same power as the CLI
+
+The first pass made the app calm. It did not make it capable. Round two closed
+the gap between what a person can do in the terminal and what they can do in the
+interface, keeping the same voice.
+
+### Tools are named, and can be switched off one at a time
+
+The daemon already listed tools over IPC; Swift simply never modelled them.
+`ToolCatalog` groups the merged catalog by server, strips the `server__` prefix
+for display, and searches across name, server and description — so typing
+"figma" shows what Figma can do rather than nothing.
+
+Switching a tool off is a new operator mutation, `SetToolEnabled`, carried by
+IPC version 5 behind the `tool_mutation` capability and written through the
+existing atomic config path. Enabling refuses to widen a covering wildcard: the
+config format cannot express "this pattern except one tool", so a tool hidden by
+`figma__*` shows as Off with the pattern named, instead of the app quietly
+switching on 118 tools nobody asked for. Older daemons simply do not advertise
+the capability, and the switches render read-only.
+
+### Servers can be edited, not only added and removed
+
+`EditServerView` prefills the real fields — command and arguments, or URL and
+token, plus environment — validates through `ValidateServer`, then writes with
+`UpdateServer`, which had been in the protocol without an interface.
+
+### Activity says which tool, from which app, in which session
+
+`ActivityEvent` gained `tool`, `client_type` and `client_label`, all optional
+and default-tolerant, filled at the single emit site in `dispatch_tools_call`.
+The client id is minted per `plug connect` process, so it is the per-window
+session discriminator; a row now reads as the tool name over "Claude Code ·
+session 8f21 · figma". The labels are copied onto the event so attribution
+survives the session disconnecting.
+
+### Apps can be wired up from the app
+
+Connections gained "Apps on this Mac": each detected client with a switch that
+runs `plug link` / `plug unlink`. That wiring lives in each client's own
+configuration file, which the daemon does not own, so the app shells the bundled
+binary — the same pattern `ClientRepairService` and `AuthFlowService` use.
+
 ## Known gaps, deliberately left
 
-- **Tool names are not shown.** The IPC snapshot carries only `toolCount`, so
-  "what can my AI actually do right now?" cannot be answered honestly yet. It
-  wants a protocol addition, not an invented list.
-- **Server editing** is still add and remove; `UpdateServer` exists in the
-  protocol and has no interface.
+- **Import, export, doctor, reload, `auth logout`, and `config path/resolved`**
+  are still terminal-only. They are the next parity slice.
 - **Activity is capped at 200 events** with no paging.
