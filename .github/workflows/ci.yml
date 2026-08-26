@@ -92,14 +92,24 @@ jobs:
       - run: brew install xcodegen
       - run: swift test --package-path PlugApp/PlugIPC
       - run: xcodegen generate --spec PlugApp/project.yml
-      # Hosted UI tests cannot query an embedded SMAppService on GitHub's
-      # ephemeral runner. The portable IPC suite runs above; this gate proves
-      # the complete app and login-service bundle compile together.
+      # This gate proves the complete app and login-service bundle compile
+      # together, then runs the PlugApp unit suite. The signed fixture class
+      # needs a Developer ID host bundle and an embedded SMAppService, which
+      # GitHub's ephemeral runner cannot provide, so it is skipped here and
+      # runs in the release build instead.
       - run: >-
           xcodebuild build
           -project PlugApp/PlugApp.xcodeproj
           -scheme PlugApp
           -destination 'generic/platform=macOS'
+          CODE_SIGNING_ALLOWED=NO
+      - run: >-
+          xcodebuild test
+          -project PlugApp/PlugApp.xcodeproj
+          -scheme PlugApp
+          -destination 'platform=macOS'
+          -only-testing:PlugAppTests
+          -skip-testing:PlugAppTests/UnifiedReconciliationFixtureTests
           CODE_SIGNING_ALLOWED=NO
 
   cross-check:
