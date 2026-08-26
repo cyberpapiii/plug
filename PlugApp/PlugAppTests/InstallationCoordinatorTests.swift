@@ -124,6 +124,78 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
     }
 
+    func testEnabledAppServiceAutomaticallyReclaimsLegacyDaemon() async {
+        let events = EventLog()
+        let legacyRecord = LaunchdJobRecord(
+            label: "com.plug.daemon",
+            programURL: URL(fileURLWithPath: "/Users/me/.local/bin/plug"),
+            parentBundleIdentifier: nil,
+            parentBundleVersion: nil,
+            loaded: true
+        )
+        let legacyService = DaemonServiceSnapshot(
+            ownership: .recognizedLegacy([legacyRecord]),
+            daemonVersion: canonical.appVersion,
+            daemonExecutable: legacyRecord.programURL
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [emptyLegacy(), emptyLegacy()]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [legacyService, healthyService()],
+                handshakes: [handshake(version: canonical.appVersion)],
+                appServiceEnabled: true
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case .healthy = coordinator.state else {
+            return XCTFail("Expected automatic recovery after prior app-service consent, got \(coordinator.state)")
+        }
+        let eventValues = await events.values
+        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
+    }
+
+    func testEnabledAppServiceAutomaticallyRecoversMissingJob() async {
+        let events = EventLog()
+        let unmanaged = DaemonServiceSnapshot(
+            ownership: .unmanaged,
+            daemonVersion: nil,
+            daemonExecutable: nil
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [emptyLegacy(), emptyLegacy()]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [unmanaged, healthyService()],
+                handshakes: [handshake(version: canonical.appVersion)],
+                appServiceEnabled: true
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case .healthy = coordinator.state else {
+            return XCTFail("Expected automatic recovery for enabled app service, got \(coordinator.state)")
+        }
+        let eventValues = await events.values
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
+        XCTAssertTrue(eventValues.contains("daemon.ensureRunning"))
+    }
+
     func testExplicitAdoptionConvergesAfterRequiredState() async {
         let events = EventLog()
         let legacyRecord = LaunchdJobRecord(
@@ -797,15 +869,18 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
     private let events: EventLog
     private var inspections: [DaemonServiceSnapshot]
     private var handshakes: [OperatorHandshake]
+    let appServiceEnabled: Bool
 
     init(
         events: EventLog,
         inspections: [DaemonServiceSnapshot] = [],
-        handshakes: [OperatorHandshake] = []
+        handshakes: [OperatorHandshake] = [],
+        appServiceEnabled: Bool = false
     ) {
         self.events = events
         self.inspections = inspections
         self.handshakes = handshakes
+        self.appServiceEnabled = appServiceEnabled
     }
 
     func inspect(
