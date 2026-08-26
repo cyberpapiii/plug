@@ -60,7 +60,10 @@ if [[ ! "$APP_BUILD" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-BINARY_OUTPUT="$($EMBEDDED_PLUG --version)"
+# Verify this exact artifact. A release binary normally delegates to an already
+# installed Plug.app, which is correct for users but would let a stale local app
+# answer this build-contract check.
+BINARY_OUTPUT="$(PLUG_DEV=1 "$EMBEDDED_PLUG" --version)"
 BINARY_VERSION="${BINARY_OUTPUT##* }"
 if [[ "$BINARY_VERSION" != "$WORKSPACE_VERSION" ]]; then
   echo "release contract: embedded plug version '$BINARY_VERSION' does not match workspace version '$WORKSPACE_VERSION'" >&2
