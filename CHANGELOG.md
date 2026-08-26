@@ -7,6 +7,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-08-25
+
+### Fixed
+
+- Ignore unrelated launchd jobs whose labels merely contain `plug`; only proven
+  Plug ownership participates in daemon adoption. The exact
+  `com.plug.daemon` label and jobs with Plug executable or ServiceManagement
+  evidence remain fail-closed.
+
 ## [0.7.2] - 2026-08-25
 
 ### Fixed

@@ -48,6 +48,22 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(state, .unknown([unrelated]))
     }
 
+    func testPlugSubstringLabelWithUnrelatedProgramDoesNotClaimDaemonOwnership() async throws {
+        let unrelated = record(
+            label: "local.claude-rc.plug",
+            program: URL(fileURLWithPath: "/Users/me/.local/share/claude/versions/2.1.246"),
+            parentID: nil,
+            parentVersion: nil
+        )
+
+        let state = try await LaunchdJobInspector(records: { [unrelated] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+
+        XCTAssertEqual(state, .unmanaged)
+    }
+
     func testBroadEnumerationFindsPlugProgramBehindUnrelatedLabel() async throws {
         let runner = RecordingLaunchctlRunner()
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)

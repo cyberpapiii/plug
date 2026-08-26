@@ -39,7 +39,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let canonicalPath = Self.resolvedPath(canonical.executableURL)
         let legacyPaths = Set(recognizedLegacyPaths.map(Self.resolvedPath))
         let relevant = allRecords.filter { record in
-            record.label.localizedCaseInsensitiveContains("plug")
+            record.label == "com.plug.daemon"
                 || record.programURL?.lastPathComponent == "plug"
                 || record.programIdentifier == Self.appProgramIdentifier
                 || record.arguments.first == Self.appProgramIdentifier
