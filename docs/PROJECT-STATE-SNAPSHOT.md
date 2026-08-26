@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through merge commit `6dcfc1b` on 2026-08-25.
+Baseline: `main` through merge commit `1a73a5f` on 2026-08-26.
 
 This is the canonical current-state doc for the project.
 
@@ -141,19 +141,54 @@ Synthesized multi-upstream catalog pages emit conservative cache directives
 
 ## Release Status
 
-Release `v0.6.1` is the currently published predecessor to the 0.6.2 command
-lookup repair. Its public checksums verify, the
-universal `Plug.app` and embedded daemon are Developer ID signed with hardened
-runtime, and both the app and DMG are notarized and stapled.
+Release `v0.7.5` is the current unified macOS release. Plug.app contains the
+matching universal CLI/runtime, owns daemon lifecycle after first-run adoption,
+repairs the canonical `~/.local/bin/plug` link, and redirects older stray CLIs
+into the signed bundle. Homebrew, GitHub, and website installs therefore
+converge on one app, one version, and one runtime.
+
+`v0.7.5` closes the remaining split-ownership path found after the 0.7.4
+reconciliation repair. When the verified app is installed, `plug connect`
+opens Plug.app instead of recreating a CLI launchd service; Plug.app may recover
+legacy or unmanaged ownership automatically only after the user has already
+granted ServiceManagement consent; and production `plug serve --daemon`
+rejects foreign supervisors. One signed bundle is therefore the sole runtime
+authority while `PLUG_DEV=1` preserves an explicit development escape hatch.
+
+The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
+Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
+RunningBoard process from daemon ownership, carries the repaired shell link
+forward as migration evidence, and no longer counts that canonical link as a
+competing install. The drift banner names the exact disagreeing check. The
+PlugApp XCTest suite runs in the `Test (Plug.app)` CI gate (signed
+reconciliation fixtures excepted), so app-side regressions no longer pass with
+green checks.
+
+CI through PR #117 starts all independent gates immediately, strips debug
+symbols from CI-only dev/test profiles, caches Playwright browsers, and verifies
+release artifacts with delegation disabled so it always executes the exact
+binary under test. No validation gate was removed.
+
+Releases `v0.7.0` through `v0.7.4` are superseded. They established
+the unified distribution and delegation model but each exposed installed-only
+regressions: recursive version probing, cold-daemon preflight rejection,
+unrelated launchd-label ownership classification, adoption/convergence defects,
+or a remaining second-owner path.
+
+Release `v0.6.1` is the historical predecessor to the unified macOS line. Its
+public checksums verify, the universal `Plug.app` and embedded daemon are
+Developer ID signed with hardened runtime, and both the app and DMG are
+notarized and stapled.
 
 The app's ServiceManagement registration is live under
-`com.cyberpapiii.plug`: launchd owns the bundled 0.6.1 daemon as a PID-1 child,
-with parent bundle version 9. First-run adoption now completes without the Swift
-6 actor-isolation crash found in 0.6.0. The app presents one stable sidebar and
-full-width Servers, Clients, Activity, and Authentication workspaces; polling
-preserves the last good snapshot instead of flashing a disconnected state.
-Fresh installed-runtime certification initialized a real stdio MCP client,
-listed tools, and called `Agent-admin__admin_capabilities` successfully. The
+`com.cyberpapiii.plug`: launchd owns the bundled daemon as a PID-1 child from
+`/Applications/Plug.app/Contents/Resources/plug`, with parent bundle version 25.
+The installed app, CLI, and runtime all report 0.7.5; all 13 enabled upstreams
+are healthy with 486 routed tools; the canonical shell link resolves into the
+bundle; and the obsolete CLI LaunchAgent plist is absent. The app reports
+"Running normally" without a reconciliation banner. Fresh installed-runtime
+certification initialized a real stdio MCP client, listed tools, and completed
+a routed `Context7__resolve_library_id` call successfully. The
 public OAuth resource metadata advertises the operator-pinned six-scope grant.
 Production enables modern downstream HTTP only; modern upstream remains
 legacy-compatible by design for the currently observed clients and servers.
