@@ -60,6 +60,8 @@ forwarding work:
 - signed/notarized/stapled DMG distribution, Sparkle 2 signed updates, and a Homebrew cask sharing the same app artifact (PR #96)
 - daemon operator IPC with compatibility-range negotiation, inventory/activity snapshots, server mutations, OAuth actions, and downstream grant revocation (PR #96)
 - official prerelease MCP 2026 server conformance at 22/22, with request-scoped progress, concrete resource-template routing, and prefix-disabled routing fixes (PR #96)
+- unified macOS distribution: Plug.app is the only supported install, bundles the CLI/runtime, owns daemon lifecycle and canonical command links, and redirects stray CLIs into the signed bundle; reliable first-run adoption and a false-warning-free convergence check shipped in `v0.7.4`, the sole-owner enforcement shipped in `v0.7.5`, and the PlugApp XCTest suite now runs in CI (PRs #113–#116)
+- faster CI without reduced coverage: independent gates start immediately, CI-only Rust dev/test profiles omit debug symbols, Playwright browsers are cached, and release verification executes the exact embedded binary with delegation disabled (PR #117)
 - public `v0.6.1` release with independently verified checksums, Developer ID signatures, notarized/stapled universal app + DMG, and signed Sparkle feed; the calm single-sidebar redesign shipped in PR #104 and its live ServiceManagement adoption repair in PR #105. The 0.6.2 source line additionally resolves bare stdio commands through the user's login shell under app-owned launchd and makes `plug doctor` use the same lookup
 
 ## What Exists Today
@@ -127,15 +129,25 @@ Optional future scope only:
 - further low-priority simplification of internal reload/session/SSE helper structure
 - further optional modern follow-through behind gates (`subscriptions/listen`, mixed-era MRTR, task+MRTR) when production clients speak 2026
 
-Current operator rollout: this Mac enables the independently certified modern
-downstream HTTP path while keeping modern upstream negotiation off and every
-configured upstream pinned to `legacy`. App-owned launchd adoption is complete:
-the live daemon runs from
-the bundled binary under `com.cyberpapiii.plug`, reports 0.6.1, and fresh stdio
-initialization, tool listing, and a real routed tool call pass. The operator UI
+Current operator rollout: this Mac runs the unified `v0.7.5` macOS
+distribution. Plug.app, the CLI, and the daemon runtime ship as one
+signed/notarized artifact; the app owns daemon lifecycle and the canonical
+`~/.local/bin/plug` link after adoption; and older stray CLIs delegate to the
+signed bundle instead of creating a second runtime authority. Releases
+`v0.7.0` through `v0.7.4` are superseded by the adoption, convergence, and
+sole-owner fixes in `v0.7.5`.
+
+This Mac enables the independently certified modern downstream HTTP path while
+keeping modern upstream negotiation off and every configured upstream pinned to
+`legacy`. App-owned launchd adoption is complete: the live daemon runs from the
+bundled binary under `com.cyberpapiii.plug`, reports 0.7.5, and fresh stdio
+initialization, tool listing, and a real routed tool call pass. All 13 enabled
+upstreams are healthy with 486 routed tools; the canonical shell link points
+into Plug.app; the obsolete CLI LaunchAgent plist is absent; and the app reports
+"Running normally" without a reconciliation banner. The operator UI
 uses one stable sidebar with full-width Servers, Clients, Activity, and Auth
-workspaces; the 0.6.0 adoption crash is fixed in 0.6.1. The official prerelease
-MCP `2026-07-28` server suite remains recorded at 22/22 for this release line.
+workspaces. The official prerelease MCP `2026-07-28` server suite remains
+recorded at 22/22 for this release line.
 
 ## Modernization And Prior Program Phases
 
