@@ -9,22 +9,26 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
         var snapshot = try await fixture.migrator.inspect(canonical: canonical)
         XCTAssertEqual(snapshot.shellLink, .absent)
+        XCTAssertFalse(snapshot.recognizedPaths.contains(fixture.shellLink))
 
         try fixture.createSymlink(at: fixture.shellLink, target: canonical.executableURL)
         snapshot = try await fixture.migrator.inspect(canonical: canonical)
         XCTAssertEqual(snapshot.shellLink, .canonical(canonical.executableURL))
+        XCTAssertTrue(snapshot.recognizedPaths.contains(fixture.shellLink))
 
         try FileManager.default.removeItem(at: fixture.shellLink)
         let missing = fixture.root.appending(path: "missing/plug")
         try fixture.createSymlink(at: fixture.shellLink, target: missing)
         snapshot = try await fixture.migrator.inspect(canonical: canonical)
         XCTAssertEqual(snapshot.shellLink, .repairable(missing))
+        XCTAssertTrue(snapshot.recognizedPaths.contains(fixture.shellLink))
 
         try FileManager.default.removeItem(at: fixture.shellLink)
         try Data("do not replace".utf8).write(to: fixture.shellLink)
         snapshot = try await fixture.migrator.inspect(canonical: canonical)
         XCTAssertEqual(snapshot.shellLink, .unrelated(fixture.shellLink))
         XCTAssertTrue(snapshot.unknownPaths.contains(fixture.shellLink))
+        XCTAssertFalse(snapshot.recognizedPaths.contains(fixture.shellLink))
     }
 
     func testRepairsBrokenShellLinkAtomicallyButRefusesRegularFile() async throws {

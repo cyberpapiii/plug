@@ -8,6 +8,15 @@ private let currentTestAppVersion = PlugIPCClient.clientVersion(
     from: Bundle.main.infoDictionary ?? [:]
 )
 
+/// The operator token normally lives in the user's Application Support
+/// directory. Tests that must reach `.ready` write their own so the suite
+/// does not depend on a real Plug installation on the host.
+private func makeFixtureTokenURL() throws -> URL {
+    let url = URL(fileURLWithPath: "/tmp/plug-app-model-token-\(UUID().uuidString)")
+    try "fixture-token".write(to: url, atomically: true, encoding: .utf8)
+    return url
+}
+
 final class AppModelTests: XCTestCase {
     @MainActor func testEmptyModelIsQuietlyDisconnected() {
         let model = AppModel()
@@ -38,7 +47,8 @@ final class AppModelTests: XCTestCase {
 
         let model = AppModel(
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator
+            coordinator: coordinator,
+            tokenURL: try! makeFixtureTokenURL()
         )
         await model.start()
         XCTAssertTrue(model.isHealthy)
@@ -268,7 +278,8 @@ final class AppModelTests: XCTestCase {
         )
         let model = AppModel(
             ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
         )
         await model.start()
         XCTAssertEqual(model.connectionState, .incompatible)

@@ -34,6 +34,7 @@ final class AppModel {
 
     private let ipc: PlugIPCClient
     private let coordinator: any InstallationCoordinating
+    private let tokenURL: URL
     private let clientVersion: String
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
@@ -53,11 +54,13 @@ final class AppModel {
     init(
         ipc: PlugIPCClient? = nil,
         coordinator: any InstallationCoordinating = InstallationCoordinator(),
-        clientVersion: String = AppModel.defaultClientVersion
+        clientVersion: String = AppModel.defaultClientVersion,
+        tokenURL: URL = PlugIPCClient.defaultTokenURL
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
         self.coordinator = coordinator
+        self.tokenURL = tokenURL
         installationState = coordinator.state
     }
 
@@ -176,7 +179,7 @@ final class AppModel {
                     return
                 }
                 attemptedSkewRecovery = false
-                let token = try String(contentsOf: PlugIPCClient.defaultTokenURL, encoding: .utf8)
+                let token = try String(contentsOf: tokenURL, encoding: .utf8)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
                     throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
@@ -200,7 +203,7 @@ final class AppModel {
 
     func perform(_ request: (String) -> IPCRequest) async {
         do {
-            let token = try String(contentsOf: PlugIPCClient.defaultTokenURL, encoding: .utf8)
+            let token = try String(contentsOf: tokenURL, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             _ = try await ipc.request(request(token))
             await refresh()

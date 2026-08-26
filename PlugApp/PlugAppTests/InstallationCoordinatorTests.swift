@@ -430,6 +430,122 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
     }
 
+    func testCanonicalShellLinkInRecognizedPathsStillConvergesHealthy() async {
+        // `LegacyInstallMigrator` keeps the repaired shell link in
+        // `recognizedPaths` so legacy launchd jobs can be adopted. That link is
+        // the canonical command, not a competing install.
+        let events = EventLog()
+        let shellLink = URL(fileURLWithPath: "/Users/me/.local/bin/plug")
+        let legacySnapshot = LegacyInstallSnapshot(
+            formulaInstalled: false,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [shellLink],
+            unknownPaths: []
+        )
+        let service = healthyService()
+        let app = RecordingAppInspector(events: events, values: [canonical, canonical])
+        let legacy = RecordingLegacyMigrator(events: events, values: [legacySnapshot, legacySnapshot])
+        let clients = RecordingClientRepairer(events: events, values: [false, false])
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [service, service],
+            handshakes: [handshake(version: canonical.appVersion)]
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: app,
+            legacyMigrator: legacy,
+            clientRepairer: clients,
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .healthy(snapshot) = coordinator.state else {
+            return XCTFail("Canonical shell link must not block convergence, got \(coordinator.state)")
+        }
+        XCTAssertTrue(snapshot.shadowInstalls.isEmpty)
+        XCTAssertEqual(snapshot.shellLink, .canonical(canonical.executableURL))
+    }
+
+    func testRepairableShellLinkInRecognizedPathsRemainsShadowInstall() async {
+        let events = EventLog()
+        let shellLink = URL(fileURLWithPath: "/Users/me/.local/bin/plug")
+        let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
+        let legacySnapshot = LegacyInstallSnapshot(
+            formulaInstalled: false,
+            cargoBinary: nil,
+            shellLink: .repairable(cargo),
+            recognizedPaths: [shellLink],
+            unknownPaths: []
+        )
+        let service = healthyService()
+        let app = RecordingAppInspector(events: events, values: [canonical, canonical])
+        let legacy = RecordingLegacyMigrator(events: events, values: [legacySnapshot, legacySnapshot])
+        let clients = RecordingClientRepairer(events: events, values: [false, false])
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [service, service],
+            handshakes: [handshake(version: canonical.appVersion)]
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: app,
+            legacyMigrator: legacy,
+            clientRepairer: clients,
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .repairableDrift(drift) = coordinator.state else {
+            return XCTFail("Unrepaired shell link must not report healthy, got \(coordinator.state)")
+        }
+        XCTAssertTrue(drift.detail.contains(shellLink.path), drift.detail)
+    }
+
+    func testFinalDisagreementDetailNamesTheFailedCheck() async {
+        let events = EventLog()
+        let current = healthyService()
+        let staleRecord = LaunchdJobRecord(
+            label: "com.plug.daemon",
+            programURL: canonical.executableURL,
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: "19",
+            loaded: true
+        )
+        let stale = DaemonServiceSnapshot(
+            ownership: .appManagedStale(staleRecord),
+            daemonVersion: "0.0.1",
+            daemonExecutable: canonical.executableURL
+        )
+        let app = RecordingAppInspector(events: events, values: [canonical, canonical])
+        let legacy = RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()])
+        let clients = RecordingClientRepairer(events: events, values: [false, false])
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [current, stale],
+            handshakes: [handshake(version: canonical.appVersion)]
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: app,
+            legacyMigrator: legacy,
+            clientRepairer: clients,
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .repairableDrift(drift) = coordinator.state else {
+            return XCTFail("Expected repairable drift, got \(coordinator.state)")
+        }
+        XCTAssertTrue(drift.detail.contains("not owned by this app build"), drift.detail)
+        XCTAssertTrue(drift.detail.contains("0.0.1"), drift.detail)
+        XCTAssertFalse(drift.detail.contains("shell command"), drift.detail)
+    }
+
     func testFinalHandshakeExecutableMismatchNeverReportsHealthy() async {
         let events = EventLog()
         let wrongExecutable = URL(fileURLWithPath: "/Applications/Other Plug.app/Contents/Resources/plug")

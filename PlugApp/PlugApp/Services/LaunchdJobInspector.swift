@@ -43,7 +43,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 || record.programURL?.lastPathComponent == "plug"
                 || record.programIdentifier == Self.appProgramIdentifier
                 || record.arguments.first == Self.appProgramIdentifier
-                || record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
         }
         guard !relevant.isEmpty else { return .unmanaged }
 
@@ -91,6 +90,13 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 arguments: ["print", "gui/\(userID)/\(label)"],
                 timeout: .seconds(5)
             )
+            if detail.status != 0, label != "com.plug.daemon" {
+                // `launchctl list` includes transient jobs that can disappear
+                // before `print`. Their absence proves there is nothing left
+                // to inspect or mutate. Plug's exact service remains
+                // fail-closed below.
+                continue
+            }
             guard detail.status == 0 else {
                 throw LaunchdJobInspectionError.printFailed(
                     label: label,
