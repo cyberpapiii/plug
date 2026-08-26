@@ -27,7 +27,7 @@ jobs:
           # Windows disabled: the daemon uses Unix sockets.
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -125,7 +125,7 @@ jobs:
     name: Build Plug.app
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read workspace release version
         shell: bash
@@ -271,7 +271,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -386,7 +386,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download prepared release bundle
         uses: actions/download-artifact@v4
@@ -395,7 +395,7 @@ jobs:
           path: artifacts
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: cyberpapiii/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
