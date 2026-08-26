@@ -32,8 +32,8 @@ struct EditServerView: View {
             }
 
             Picker("Kind", selection: $isRemote) {
-                Text("Runs on this Mac").tag(false)
-                Text("Remote server").tag(true)
+                Label("Runs on this Mac", systemImage: "desktopcomputer").tag(false)
+                Label("Remote server", systemImage: "globe").tag(true)
             }
             .pickerStyle(.segmented)
             .labelsHidden()

@@ -89,6 +89,32 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         self.tokenExpiresInSecs = tokenExpiresInSecs
         self.authWarnings = authWarnings
     }
+
+    /// Where the server runs, as a picture. A person recognizes the difference
+    /// between "on this Mac" and "somewhere on the internet" faster from a
+    /// screen and a globe than from either sentence.
+    var transportSymbol: String {
+        switch transport.lowercased() {
+        case "stdio": "desktopcomputer"
+        case "http", "sse", "streamable_http": "globe"
+        default: "questionmark.square.dashed"
+        }
+    }
+
+    /// What the row's second line is about, so the icon matches the words.
+    var subtitleSymbol: String {
+        if health.needsAttention, let error, !error.isEmpty { return "exclamationmark.triangle" }
+        if !enabled { return "circle.slash" }
+        return transportSymbol
+    }
+
+    var transportLabel: String {
+        switch transport.lowercased() {
+        case "stdio": "Runs on this Mac"
+        case "http", "sse", "streamable_http": "Remote server"
+        default: transport.capitalized
+        }
+    }
 }
 
 /// The complete input to every status decision the interface makes. Keeping it
@@ -160,6 +186,11 @@ enum PlugIntent: Equatable, Sendable {
     case reveal(server: String)
     case checkForUpdates
     case openSettings
+    /// Restart the background service through the same path the installer
+    /// uses. Nothing in the app ever kills it directly.
+    case restartService
+    case reloadConfiguration
+    case openLogs
     case quit
 }
 

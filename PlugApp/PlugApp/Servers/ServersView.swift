@@ -115,7 +115,7 @@ private struct ServerListRow: View {
             StatusGlyph(health: server.health)
             VStack(alignment: .leading, spacing: 0) {
                 Text(server.name).font(.body)
-                Text(subtitle)
+                Label(subtitle, systemImage: server.subtitleSymbol)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -141,16 +141,7 @@ private struct ServerListRow: View {
             return error.split(separator: "\n").first.map(String.init) ?? error
         }
         if !server.enabled { return "Switched off" }
-        return transportLabel
-    }
-
-    private var transportLabel: String {
-        switch server.transport.lowercased() {
-        case "stdio": "Runs on this Mac"
-        case "sse": "Remote server"
-        case "http": "Remote server"
-        default: server.transport.capitalized
-        }
+        return server.transportLabel
     }
 
     private var fix: Verdict.Button? {

@@ -103,9 +103,13 @@ struct ServerDetailView: View {
     private var details: some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
             SectionLabel(text: "Details")
-            detailRow("Kind", transportLabel)
-            detailRow("Tools", server.health == .working ? "\(server.toolCount)" : "—")
-            detailRow("Account", accountLabel)
+            detailRow("Kind", server.transportLabel, symbol: server.transportSymbol)
+            detailRow(
+                "Tools",
+                server.health == .working ? "\(server.toolCount)" : "—",
+                symbol: "wrench.and.screwdriver"
+            )
+            detailRow("Account", accountLabel, symbol: accountSymbol)
             ForEach(server.authWarnings, id: \.self) { warning in
                 Label(warning, systemImage: "exclamationmark.circle")
                     .font(.caption)
@@ -115,9 +119,9 @@ struct ServerDetailView: View {
         }
     }
 
-    private func detailRow(_ label: String, _ value: String) -> some View {
+    private func detailRow(_ label: String, _ value: String, symbol: String) -> some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(label).font(.callout).foregroundStyle(.secondary)
+            Label(label, systemImage: symbol).font(.callout).foregroundStyle(.secondary)
             Spacer(minLength: Metric.regular)
             Text(value)
                 .font(.callout)
@@ -126,12 +130,11 @@ struct ServerDetailView: View {
         }
     }
 
-    private var transportLabel: String {
-        switch server.transport.lowercased() {
-        case "stdio": "Runs on this Mac"
-        case "http", "sse": "Remote server"
-        default: server.transport.capitalized
-        }
+    /// The account line's own glyph, so "needs sign-in" is visible before the
+    /// words are read.
+    private var accountSymbol: String {
+        guard server.usesOAuth else { return "person.slash" }
+        return server.health == .signInNeeded ? "person.badge.key.fill" : "person.badge.shield.checkmark"
     }
 
     private var accountLabel: String {

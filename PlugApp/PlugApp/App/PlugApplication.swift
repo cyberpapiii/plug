@@ -54,7 +54,7 @@ struct PlugApplication: App {
             }
         }
 
-        Settings { SettingsView(model: model) }
+        Settings { SettingsView(model: model, run: runner.run) }
     }
 
     private static let windowID = "main"

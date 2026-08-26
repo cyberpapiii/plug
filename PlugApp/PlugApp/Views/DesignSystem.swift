@@ -273,6 +273,23 @@ struct QuietRowButtonStyle: ButtonStyle {
     }
 }
 
+/// A square, quiet button for a control whose icon is the label.
+struct QuietIconButtonStyle: ButtonStyle {
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.secondary)
+            .frame(width: 26, height: 24)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : (hovering ? 0.07 : 0)))
+            )
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+    }
+}
+
 extension View {
     /// Standard inset for popover content blocks.
     func popoverInset() -> some View {

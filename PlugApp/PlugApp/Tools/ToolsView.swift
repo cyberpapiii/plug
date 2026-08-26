@@ -55,8 +55,8 @@ struct ToolsView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Picker("Show", selection: $showsOffOnly) {
-                    Text("All \(model.toolCatalog.tools.count)").tag(false)
-                    Text("Off \(model.toolCatalog.offCount)").tag(true)
+                    Label("All \(model.toolCatalog.tools.count)", systemImage: "square.grid.2x2").tag(false)
+                    Label("Off \(model.toolCatalog.offCount)", systemImage: "circle.slash").tag(true)
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 160)
@@ -72,6 +72,9 @@ private struct ToolGroupHeader: View {
 
     var body: some View {
         HStack(spacing: Metric.tight) {
+            Image(systemName: group.isFullyOff ? "shippingbox" : "shippingbox.fill")
+                .foregroundStyle(group.isFullyOff ? .tertiary : .secondary)
+                .accessibilityHidden(true)
             Text(group.server)
             Spacer(minLength: Metric.tight)
             Text(summary)
@@ -126,7 +129,7 @@ struct ToolRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } else if let pattern = tool.lockedByPattern {
-            Text("Off")
+            Label("Off", systemImage: "lock.fill")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .help("The pattern \(pattern) covers this tool. Remove it to switch this tool back on.")

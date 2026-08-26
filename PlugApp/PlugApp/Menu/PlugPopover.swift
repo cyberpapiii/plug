@@ -120,11 +120,12 @@ struct PlugPopover: View {
     private var footer: some View {
         HStack(spacing: Metric.tight) {
             Button { run(.addServer) } label: {
-                Label("Add Server", systemImage: "plus")
+                Label("Add Server", systemImage: "plus.circle")
                     .font(.callout)
             }
             .buttonStyle(QuietRowButtonStyle())
             .fixedSize()
+            .help("Add a server")
 
             Button { run(.openWindow(.servers)) } label: {
                 Label("Open Plug", systemImage: "macwindow")
@@ -132,21 +133,31 @@ struct PlugPopover: View {
             }
             .buttonStyle(QuietRowButtonStyle())
             .fixedSize()
+            .help("Open the Plug window")
 
             Spacer(minLength: 0)
 
-            Menu {
-                Button("Check for Updates…") { run(.checkForUpdates) }
-                SettingsLink { Text("Settings…") }
-                Divider()
-                Button("Quit Plug") { run(.quit) }
-            } label: {
-                Image(systemName: "ellipsis")
+            // Settings and Quit are what people look for in a menu bar app, so
+            // they are visible controls rather than entries inside a menu. Both
+            // are icon-only: the picture is the label, and the tooltip and the
+            // accessibility label carry the words.
+            SettingsLink {
+                Image(systemName: "gearshape")
+                    .font(.callout)
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
+            .buttonStyle(QuietIconButtonStyle())
             .fixedSize()
-            .accessibilityLabel("More")
+            .help("Settings")
+            .accessibilityLabel("Settings")
+
+            Button { run(.quit) } label: {
+                Image(systemName: "power")
+                    .font(.callout)
+            }
+            .buttonStyle(QuietIconButtonStyle())
+            .fixedSize()
+            .help("Quit Plug. Your servers keep running.")
+            .accessibilityLabel("Quit Plug")
         }
         .padding(.horizontal, Metric.snug)
         .padding(.vertical, Metric.tight)

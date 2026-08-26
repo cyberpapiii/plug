@@ -54,13 +54,26 @@ struct RootView: View {
         .animation(.snappy(duration: 0.2), value: model.verdict)
         .toolbar {
             ToolbarItem(placement: .principal) {
+                // Icon and word together: the picture is what people aim at
+                // after the first visit, the word is what makes the first visit
+                // work.
                 Picker("Section", selection: $router.section) {
                     ForEach(AppSection.allCases) { section in
-                        Text(section.rawValue).tag(section)
+                        Label(section.rawValue, systemImage: section.symbol).tag(section)
                     }
                 }
                 .pickerStyle(.segmented)
                 .frame(minWidth: 330)
+            }
+
+            // Plug has no menu bar of its own — it is an accessory app — so the
+            // window carries the way into Settings itself.
+            ToolbarItem {
+                SettingsLink {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+                .accessibilityLabel("Settings")
             }
         }
         .navigationTitle("Plug")

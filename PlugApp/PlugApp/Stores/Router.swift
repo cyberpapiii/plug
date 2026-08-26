@@ -77,6 +77,23 @@ struct PlugIntentRunner {
             UpdateService.shared.checkForUpdates()
         case .openSettings:
             NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        case .restartService:
+            // The sanctioned restart: connectors are paused, the service is
+            // kickstarted, and the app never signals the process itself.
+            Task {
+                do {
+                    try await DaemonServiceManager.shared.restart()
+                    await model.refresh()
+                } catch {
+                    await model.retryConnection()
+                }
+            }
+        case .reloadConfiguration:
+            perform { .reload(authToken: $0) }
+        case .openLogs:
+            NSWorkspace.shared.open(
+                URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory)
+            )
         case .quit:
             NSApp.terminate(nil)
         }

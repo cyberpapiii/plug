@@ -193,8 +193,68 @@ runs `plug link` / `plug unlink`. That wiring lives in each client's own
 configuration file, which the daemon does not own, so the app shells the bundled
 binary — the same pattern `ClientRepairService` and `AuthFlowService` use.
 
+## Round three: the ordinary things, and pictures instead of sentences
+
+Two more review notes: the app was missing the basics any Mac app has, and it
+leaned on words where a picture would land faster.
+
+### Settings is a real place
+
+Three tabs, each answering one question.
+
+- **General** — open at login, whether Plug is allowed to interrupt with a
+  notification, and whether it looks for updates on its own. The notification
+  switch is new: `NotificationService` now reads a preference before posting,
+  defaulting to on.
+- **Service** — whether the background service is running, Restart, Reload
+  settings, and a checkup. Restart goes through `DaemonServiceManager.restart()`,
+  the same path installation uses, so nothing in the app ever signals the
+  process itself. Reload is the existing `Reload` IPC request, which the Swift
+  protocol did not model until now; its report comes back as `ReloadSummary` and
+  says what moved.
+- **About** — version, servers on, tools available, Check for Updates, and Quit.
+
+The checkup runs `plug doctor --output json` and shows the same checks the
+terminal prints, one row each, trouble first, with each check's identifier
+turned into a title a person can read (`config_permissions` becomes "Settings
+file is private"). A checkup that finds problems exits non-zero; that is the
+answer, not a failure, so the exit status is deliberately ignored.
+
+### Quit and Settings are visible
+
+Both were inside an ellipsis menu, which is where controls go to be lost. They
+are now icon buttons in the popover footer, with tooltips and accessibility
+labels carrying the words. The window has its own Settings button, because Plug
+is an accessory app and has no menu bar of its own.
+
+Quitting says what it costs: the servers keep running, and connected apps keep
+working. Only the menu bar icon goes away.
+
+### Real app icons
+
+`AppIcons` resolves an app's own icon from this Mac — by bundle identifier for
+the apps Plug knows, then by name under `/Applications` — and falls back to a
+symbol that still says what kind of thing it is (a terminal for command line
+tools, an editor glyph for editors). Connections and Activity now show Claude's
+icon, Cursor's icon, VS Code's icon. A row is recognized before it is read.
+
+### Icons carry state everywhere else
+
+- A server's second line is prefixed by where it runs: a screen for this Mac, a
+  globe for a remote server, a warning triangle when the line is an error, a
+  slashed circle when it is switched off.
+- A tool held off by a wildcard shows a padlock, not just the word "Off".
+- Tool group headers carry a filled box, hollow when the whole server is off.
+- The section picker shows icon and word together.
+- Every check in the checkup has a green tick, an orange triangle, or a red
+  cross, with the outcome also spoken in its accessibility label.
+
+Colour is never the only carrier: every glyph is a distinct shape, and every one
+has words behind it for VoiceOver and for anyone who does not read colour.
+
 ## Known gaps, deliberately left
 
-- **Import, export, doctor, reload, `auth logout`, and `config path/resolved`**
-  are still terminal-only. They are the next parity slice.
+- **Importing servers from other apps** (`plug import`) and **signing out of a
+  server** (`plug auth logout`) are still terminal-only. Doctor, reload, and the
+  config path arrived in Settings; these two did not.
 - **Activity is capped at 200 events** with no paging.

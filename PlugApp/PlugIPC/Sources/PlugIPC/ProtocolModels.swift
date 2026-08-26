@@ -224,6 +224,7 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case listTools
     case setToolEnabled(authToken: String, tool: String, enabled: Bool)
     case restartServer(authToken: String, serverID: String)
+    case reload(authToken: String)
     case revokeClient(authToken: String, clientID: String)
     case shutdown(authToken: String)
 
@@ -266,12 +267,51 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .restartServer(token, serverID):
             try c.encode("RestartServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(serverID, forKey: .serverID)
+        case let .reload(token):
+            try c.encode("Reload", forKey: .type); try c.encode(token, forKey: .authToken)
         case let .revokeClient(token, clientID):
             try c.encode("RevokeDownstreamClient", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(clientID, forKey: .clientID)
         case let .shutdown(token):
             try c.encode("Shutdown", forKey: .type); try c.encode(token, forKey: .authToken)
         }
+    }
+}
+
+/// What reloading the configuration from disk changed.
+public struct ReloadSummary: Decodable, Equatable, Sendable {
+    public let added: [String]
+    public let removed: [String]
+    public let changed: [String]
+    public let errors: [String]
+
+    public init(added: [String] = [], removed: [String] = [], changed: [String] = [], errors: [String] = []) {
+        self.added = added
+        self.removed = removed
+        self.changed = changed
+        self.errors = errors
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case added, removed, changed, errors
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        added = try container.decodeIfPresent([String].self, forKey: .added) ?? []
+        removed = try container.decodeIfPresent([String].self, forKey: .removed) ?? []
+        changed = try container.decodeIfPresent([String].self, forKey: .changed) ?? []
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
+    }
+
+    /// One line a person can read, naming what actually moved.
+    public var summary: String {
+        var parts: [String] = []
+        if !added.isEmpty { parts.append("\(added.count) added") }
+        if !removed.isEmpty { parts.append("\(removed.count) removed") }
+        if !changed.isEmpty { parts.append("\(changed.count) changed") }
+        if parts.isEmpty { return "Nothing changed" }
+        return parts.joined(separator: ", ")
     }
 }
 
@@ -283,11 +323,13 @@ public enum IPCResponse: Decodable, Sendable {
     case validated
     case mutation
     case revoked(String)
+    /// What a reload changed, so the app can say something specific about it.
+    case reloaded(ReloadSummary)
     case ok
     case error(code: String, message: String)
 
     private enum CodingKeys: String, CodingKey {
-        case type, handshake, snapshot, events, tools, clientId, code, message
+        case type, handshake, snapshot, events, tools, clientId, code, message, report
     }
 
     public init(from decoder: Decoder) throws {
@@ -301,6 +343,7 @@ public enum IPCResponse: Decodable, Sendable {
         case "ServerValidated": self = .validated
         case "OperatorMutation": self = .mutation
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
+        case "Reloaded": self = .reloaded(try c.decode(ReloadSummary.self, forKey: .report))
         case "Ok": self = .ok
         case "Error": self = .error(code: try c.decode(String.self, forKey: .code), message: try c.decode(String.self, forKey: .message))
         default: throw PlugIPCError.unexpectedResponse(type)

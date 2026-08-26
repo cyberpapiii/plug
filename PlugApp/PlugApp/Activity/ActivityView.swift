@@ -115,6 +115,13 @@ private struct ActivityRow: View {
 
     var body: some View {
         HStack(spacing: Metric.snug) {
+            // The calling app's own icon, so a long list can be scanned by
+            // picture rather than read line by line.
+            AppGlyph(
+                target: AppIcons.target(forClientType: event.clientType ?? ""),
+                name: appName ?? "",
+                size: 20
+            )
             Image(systemName: succeeded ? "checkmark.circle" : "exclamationmark.triangle.fill")
                 .font(.callout)
                 .foregroundStyle(succeeded ? Color.secondary : .orange)

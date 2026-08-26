@@ -71,11 +71,10 @@ struct ConnectionsView: View {
 
     private func sessionRow(_ session: LiveSession) -> some View {
         HStack(spacing: Metric.snug) {
-            Image(systemName: symbol(for: session))
-                .font(.title3)
-                .foregroundStyle(.secondary)
-                .frame(width: 22)
-                .accessibilityHidden(true)
+            AppGlyph(
+                target: AppIcons.target(forClientType: session.clientType),
+                name: displayName(session)
+            )
             VStack(alignment: .leading, spacing: 0) {
                 Text(displayName(session)).font(.body)
                 Text(connectionDescription(session))
@@ -97,14 +96,6 @@ struct ConnectionsView: View {
             .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")
             .capitalized
-    }
-
-    private func symbol(for session: LiveSession) -> String {
-        let value = session.clientType.lowercased()
-        if value.contains("cursor") { return "cursorarrow.rays" }
-        if value.contains("desktop") || value.contains("claude") { return "sparkles" }
-        if value.contains("code") { return "chevron.left.forwardslash.chevron.right" }
-        return "terminal"
     }
 
     /// Says how it reached Plug in words, not transport identifiers.
@@ -141,18 +132,16 @@ private struct AppLinkRow: View {
 
     var body: some View {
         HStack(spacing: Metric.snug) {
-            Image(systemName: app.detected ? "app.badge.checkmark" : "app.dashed")
-                .font(.title3)
-                .foregroundStyle(app.detected ? .primary : .tertiary)
-                .frame(width: 22)
-                .accessibilityHidden(true)
+            AppGlyph(target: app.target, name: app.name)
+                .opacity(app.detected ? 1 : 0.4)
             VStack(alignment: .leading, spacing: 0) {
                 Text(app.name)
                     .font(.body)
                     .foregroundStyle(app.detected ? .primary : .secondary)
-                Text(status)
+                Label(status, systemImage: statusSymbol)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(app.linked ? Color.green : Color.secondary)
+                    .labelStyle(.titleAndIcon)
             }
             Spacer(minLength: Metric.tight)
             if isBusy {
@@ -173,6 +162,14 @@ private struct AppLinkRow: View {
         .padding(.vertical, Metric.tight - 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(app.name), \(status)")
+    }
+
+    /// The state as a glyph, so linked and not-linked are told apart before
+    /// the sentence is read.
+    private var statusSymbol: String {
+        guard app.detected else { return "questionmark.app.dashed" }
+        guard app.linked else { return "circle" }
+        return app.live ? "bolt.fill" : "checkmark.circle.fill"
     }
 
     private var status: String {
