@@ -11,6 +11,7 @@ enum ReconciliationTrigger: Equatable, Sendable {
 
 @MainActor
 protocol DaemonServiceManaging: AnyObject {
+    var appServiceEnabled: Bool { get }
     func inspect(
         canonical: VerifiedAppInstallation,
         legacyPaths: Set<URL>
@@ -218,7 +219,7 @@ final class InstallationCoordinator {
     ) async throws -> OperatorHandshake {
         switch snapshot.ownership {
         case .recognizedLegacy:
-            guard trigger == .explicitAdoption else {
+            guard trigger == .explicitAdoption || daemonManager.appServiceEnabled else {
                 state = .adoptionRequired(
                     makeSnapshot(
                         app: canonical,
@@ -236,7 +237,7 @@ final class InstallationCoordinator {
             )
 
         case .unmanaged:
-            guard trigger == .explicitAdoption else {
+            guard trigger == .explicitAdoption || daemonManager.appServiceEnabled else {
                 state = .adoptionRequired(
                     makeSnapshot(
                         app: canonical,

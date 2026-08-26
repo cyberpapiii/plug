@@ -28,6 +28,25 @@ pub enum ServiceOwnership {
     AppManaged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAction {
+    KickstartApp,
+    OpenApp,
+    RepairCli,
+    InstallCli,
+}
+
+fn startup_action(app_installed: bool, ownership: ServiceOwnership) -> StartupAction {
+    match (app_installed, ownership) {
+        (_, ServiceOwnership::AppManaged) => StartupAction::KickstartApp,
+        (true, ServiceOwnership::CliManaged | ServiceOwnership::Unmanaged) => {
+            StartupAction::OpenApp
+        }
+        (false, ServiceOwnership::CliManaged) => StartupAction::RepairCli,
+        (false, ServiceOwnership::Unmanaged) => StartupAction::InstallCli,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceState {
     pub ownership: ServiceOwnership,
@@ -360,15 +379,16 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     }
     let uid = user_id()?;
     let state = inspect()?;
-    match state.ownership {
-        ServiceOwnership::AppManaged => {
+    let verified_app = crate::install::resolve_verified_app()?;
+    match startup_action(verified_app.is_some(), state.ownership) {
+        StartupAction::KickstartApp => {
             launchctl(&[
                 "kickstart".into(),
                 "-k".into(),
                 format!("gui/{uid}/{LABEL}"),
             ])?;
         }
-        ServiceOwnership::CliManaged => {
+        StartupAction::RepairCli => {
             if state.loaded {
                 launchctl(&["bootout".into(), format!("gui/{uid}/{LABEL}")])?;
             }
@@ -384,7 +404,7 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
                 format!("gui/{uid}/{LABEL}"),
             ])?;
         }
-        ServiceOwnership::Unmanaged => {
+        StartupAction::InstallCli => {
             install_cli_plist(&state.plist_path, config_path)?;
             launchctl(&[
                 "bootstrap".into(),
@@ -397,15 +417,28 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
                 format!("gui/{uid}/{LABEL}"),
             ])?;
         }
+        StartupAction::OpenApp => {
+            let app = verified_app.expect("app-owned startup requires a verified app");
+            let output = Command::new("/usr/bin/open")
+                .args(["-gj"])
+                .arg(&app.bundle_path)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Plug.app owns daemon startup but could not be opened: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
     }
-    for delay in [100, 200, 400, 800, 1_600] {
+    for delay in [100, 200, 400, 800, 1_600, 2_500, 2_500] {
         if crate::daemon::connect_to_daemon().await.is_some() {
             return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     anyhow::bail!(
-        "daemon did not start; view {}",
+        "daemon did not start; open Plug.app to finish setup, then view {}",
         crate::daemon::log_dir().display()
     )
 }
@@ -413,6 +446,30 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_app_never_creates_or_repairs_cli_service() {
+        assert_eq!(
+            startup_action(true, ServiceOwnership::AppManaged),
+            StartupAction::KickstartApp
+        );
+        assert_eq!(
+            startup_action(true, ServiceOwnership::CliManaged),
+            StartupAction::OpenApp
+        );
+        assert_eq!(
+            startup_action(true, ServiceOwnership::Unmanaged),
+            StartupAction::OpenApp
+        );
+        assert_eq!(
+            startup_action(false, ServiceOwnership::CliManaged),
+            StartupAction::RepairCli
+        );
+        assert_eq!(
+            startup_action(false, ServiceOwnership::Unmanaged),
+            StartupAction::InstallCli
+        );
+    }
 
     #[test]
     fn alternate_label_targeting_current_app_is_recognized() {

@@ -7,6 +7,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-08-25
+
+### Fixed
+
+- Make Plug.app the sole macOS daemon starter whenever a verified app is
+  installed. `plug connect` now opens Plug.app for recovery instead of
+  recreating the legacy command-line LaunchAgent.
+- Automatically reclaim missing or legacy daemon ownership after the user has
+  already enabled Plug.app's ServiceManagement agent. First-run adoption still
+  requires the original explicit consent.
+- Reject production `plug serve --daemon` processes launched outside the
+  app-owned launchd job, preventing external supervisors from becoming a
+  competing runtime owner. `PLUG_DEV=1` and app-free installs retain their
+  development and Linux behavior.
+
 ## [0.7.4] - 2026-08-25
 
 ### Fixed

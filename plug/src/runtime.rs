@@ -1592,6 +1592,7 @@ pub(crate) async fn cmd_start(
 }
 
 pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    require_canonical_daemon_owner()?;
     // Claim daemon ownership before Engine::start() can read Keychain entries
     // or spawn upstream processes. Concurrent `plug connect` auto-starts lose
     // here and simply retry the winning daemon's socket.
@@ -1637,6 +1638,51 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         _ = daemon::shutdown_signal(cancel) => {}
     }
     engine.shutdown().await;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn daemon_invocation_is_canonical(
+    app_installed: bool,
+    app_managed: bool,
+    parent_is_launchd: bool,
+    development: bool,
+) -> bool {
+    development || !app_installed || (app_managed && parent_is_launchd)
+}
+
+#[cfg(target_os = "macos")]
+fn require_canonical_daemon_owner() -> anyhow::Result<()> {
+    #[cfg(test)]
+    return Ok(());
+
+    #[cfg(not(test))]
+    {
+        let development =
+            std::env::var_os("PLUG_DEV").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let app_installed = crate::install::resolve_verified_app()?.is_some();
+        let app_managed =
+            crate::service::inspect()?.ownership == crate::service::ServiceOwnership::AppManaged;
+        let parent = std::process::Command::new("/bin/ps")
+            .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+            .output()?;
+        let parent_is_launchd =
+            parent.status.success() && String::from_utf8_lossy(&parent.stdout).trim() == "1";
+        anyhow::ensure!(
+            daemon_invocation_is_canonical(
+                app_installed,
+                app_managed,
+                parent_is_launchd,
+                development,
+            ),
+            "Plug.app owns daemon startup; open Plug.app to start or repair the service"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn require_canonical_daemon_owner() -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -1746,6 +1792,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsConnector;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn installed_app_rejects_foreign_daemon_spawners() {
+        assert!(daemon_invocation_is_canonical(true, true, true, false));
+        assert!(!daemon_invocation_is_canonical(true, true, false, false));
+        assert!(!daemon_invocation_is_canonical(true, false, true, false));
+        assert!(daemon_invocation_is_canonical(true, false, false, true));
+        assert!(daemon_invocation_is_canonical(false, false, false, false));
+    }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

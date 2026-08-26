@@ -54,6 +54,7 @@ final class DaemonServiceManager {
     }
 
     var status: SMAppService.Status { backend.serviceStatus }
+    var appServiceEnabled: Bool { backend.enabled }
 
     // Temporary bridge while AppModel moves to the asynchronous installation snapshot.
     // It never authorizes replacement; every mutation below re-inspects evidence.
