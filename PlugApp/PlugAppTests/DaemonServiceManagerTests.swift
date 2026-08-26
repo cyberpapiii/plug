@@ -118,7 +118,7 @@ final class DaemonServiceManagerTests: XCTestCase {
             XCTAssertEqual(error, .verificationFailed(expectedVersion: "0.7.0", actualVersion: "0.6.4"))
         }
 
-        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 3)
+        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 1)
         XCTAssertEqual(backend.events.last, .resume([101, 102]))
     }
 
@@ -262,7 +262,29 @@ final class DaemonServiceManagerTests: XCTestCase {
         }
 
         XCTAssertEqual(backend.events.filter { $0 == .handshake }.count, 4)
-        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 3)
+        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 1)
+        XCTAssertEqual(backend.events.last, .resume([101, 102]))
+    }
+
+    func testColdStartIsKickstartedOnceWhileHandshakeBecomesReady() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: [handshake("0.7.0")],
+            handshakeFailures: [
+                PlugIPCError.systemCall("connect", ECONNREFUSED),
+                PlugIPCError.systemCall("connect", ECONNREFUSED),
+                PlugIPCError.systemCall("connect", ECONNREFUSED),
+            ]
+        )
+        let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 3)
+
+        let result = try await manager.ensureRunning(expectedVersion: "0.7.0")
+
+        XCTAssertEqual(result.daemonVersion, "0.7.0")
+        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 1)
+        XCTAssertEqual(backend.events.filter { $0 == .sleep }.count, 3)
         XCTAssertEqual(backend.events.last, .resume([101, 102]))
     }
 
