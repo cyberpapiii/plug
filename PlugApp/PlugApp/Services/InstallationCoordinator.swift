@@ -304,19 +304,54 @@ final class InstallationCoordinator {
         if case .unknown = snapshot.service.ownership {
             throw CoordinatorError.unknownOwnership
         }
-        guard snapshot.app == canonical,
-              snapshot.daemonVersion == canonical.appVersion,
-              !snapshot.clientRepairNeeded,
-              isCanonical(snapshot.shellLink, executable: canonical.executableURL),
-              snapshot.service.daemonVersion == canonical.appVersion,
-              snapshot.service.daemonExecutable.map { samePath($0, canonical.executableURL) } == true,
-              isAppManagedCurrent(snapshot.service.ownership, canonical: canonical),
-              snapshot.shadowInstalls.isEmpty
-        else {
+        let disagreements = finalDisagreements(snapshot, expected: canonical)
+        guard disagreements.isEmpty else {
             throw CoordinatorError.finalDisagreement(
-                "Final app, command, client, or daemon evidence disagrees with the verified installation."
+                "Final evidence disagrees with the verified installation: "
+                    + disagreements.joined(separator: " ")
             )
         }
+    }
+
+    /// Names every final check that failed so the drift banner can say what
+    /// actually disagreed instead of listing every possible cause.
+    private func finalDisagreements(
+        _ snapshot: InstallationSnapshot,
+        expected canonical: VerifiedAppInstallation
+    ) -> [String] {
+        var failures: [String] = []
+        if snapshot.app != canonical {
+            failures.append("The app bundle changed during reconciliation.")
+        }
+        if snapshot.daemonVersion != canonical.appVersion {
+            failures.append(
+                "The daemon reports version \(snapshot.daemonVersion ?? "unknown"), expected \(canonical.appVersion)."
+            )
+        }
+        if snapshot.clientRepairNeeded {
+            failures.append("A linked client still needs repair.")
+        }
+        if !isCanonical(snapshot.shellLink, executable: canonical.executableURL) {
+            failures.append("The shell command does not point at \(canonical.executableURL.path).")
+        }
+        if snapshot.service.daemonVersion != canonical.appVersion {
+            failures.append(
+                "The login service reports version \(snapshot.service.daemonVersion ?? "unknown"), expected \(canonical.appVersion)."
+            )
+        }
+        if snapshot.service.daemonExecutable.map({ samePath($0, canonical.executableURL) }) != true {
+            failures.append(
+                "The daemon runs from \(snapshot.service.daemonExecutable?.path ?? "an unknown path"), expected \(canonical.executableURL.path)."
+            )
+        }
+        if !isAppManagedCurrent(snapshot.service.ownership, canonical: canonical) {
+            failures.append("The daemon is not owned by this app build.")
+        }
+        if !snapshot.shadowInstalls.isEmpty {
+            let paths = snapshot.shadowInstalls.map(\.url.path).joined(separator: ", ")
+            failures.append("Other Plug installs remain: \(paths).")
+        }
+        return failures
     }
 
     private func makeSnapshot(
@@ -331,13 +366,18 @@ final class InstallationCoordinator {
             service: service,
             daemonVersion: service.daemonVersion,
             clientRepairNeeded: clientRepairNeeded,
-            shadowInstalls: shadowInstalls(legacy: legacy, service: service)
+            shadowInstalls: shadowInstalls(
+                legacy: legacy,
+                service: service,
+                canonicalExecutable: app.executableURL
+            )
         )
     }
 
     private func shadowInstalls(
         legacy: LegacyInstallSnapshot,
-        service: DaemonServiceSnapshot
+        service: DaemonServiceSnapshot,
+        canonicalExecutable: URL
     ) -> [ShadowInstall] {
         var shadows: [ShadowInstall] = []
         var knownPaths = Set<URL>()
@@ -345,8 +385,18 @@ final class InstallationCoordinator {
             shadows.append(ShadowInstall(kind: .cargo, url: cargo))
             knownPaths.insert(cargo)
         }
+        // The shell link stays in `recognizedPaths` so legacy launchd jobs
+        // that recorded it can be adopted. Once it points at the bundled
+        // executable it is the canonical command, not a competing install.
+        let canonicalShellLink: Bool
+        if case let .canonical(target) = legacy.shellLink {
+            canonicalShellLink = samePath(target, canonicalExecutable)
+        } else {
+            canonicalShellLink = false
+        }
         for path in legacy.recognizedPaths.map(\.standardizedFileURL) {
             guard knownPaths.insert(path).inserted else { continue }
+            if canonicalShellLink, path.path.hasSuffix("/.local/bin/plug") { continue }
             let kind: ShadowInstall.Kind
             if path.path.hasSuffix("/.cargo/bin/plug") {
                 kind = .cargo

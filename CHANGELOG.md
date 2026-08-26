@@ -18,6 +18,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   evidence, so the open app cannot block adoption of its background service.
 - Preserve the verified `~/.local/bin/plug` shell-link location as legacy
   launchd evidence, allowing the app to adopt the old CLI-managed daemon.
+- Stop counting the canonical `~/.local/bin/plug` link as a competing
+  install once it points at the bundled executable, so a fully repaired
+  installation no longer shows a false "did not converge" warning.
+- Name the exact final check that disagreed in the installation drift banner
+  instead of listing every possible cause.
 
 ## [0.7.3] - 2026-08-25
 
