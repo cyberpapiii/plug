@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-26
+
+### Fixed
+
+- Let an app-managed daemon finish one bounded cold start instead of force-
+  restarting it every 250 milliseconds while its upstream servers initialize.
+
 ## [0.8.0] - 2026-08-26
 
 ### Added

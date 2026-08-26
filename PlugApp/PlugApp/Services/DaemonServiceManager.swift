@@ -44,7 +44,7 @@ final class DaemonServiceManager {
         launchdInspector: any LaunchdJobInspecting = LaunchdJobInspector(),
         backend: any DaemonServiceBackend = SystemDaemonServiceBackend(),
         legacyPaths: Set<URL> = DaemonServiceManager.defaultLegacyPaths,
-        retryLimit: Int = 3
+        retryLimit: Int = 180
     ) {
         self.appInspector = appInspector
         self.launchdInspector = launchdInspector
@@ -267,9 +267,14 @@ final class DaemonServiceManager {
         if !backend.enabled { try backend.registerAgent() }
         guard backend.enabled else { throw DaemonServiceError.registrationDisabled }
 
+        // Starting every configured upstream can take tens of seconds. A
+        // force-kickstart inside this verification loop kills that healthy
+        // cold start before it can bind the IPC socket, creating a permanent
+        // restart cycle. Start exactly once, then give the same process a
+        // bounded window to prove its version and executable.
+        try await backend.kickstartAgent()
         var actualVersion: String?
         for _ in 0..<retryLimit {
-            try await backend.kickstartAgent()
             await backend.waitBeforeRetry()
             let inspection = try await inspectWithHandshake(
                 canonical: canonical,
@@ -411,7 +416,7 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func waitBeforeRetry() async {
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(500))
     }
 
     func openLoginItemSettings() {
