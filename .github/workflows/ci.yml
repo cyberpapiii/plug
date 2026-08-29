@@ -212,3 +212,38 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources advisories
+
+  ci-complete:
+    # One always-running check that branch protection can require. Requiring the
+    # lane jobs directly would wedge every pull request that legitimately skips
+    # one, which is most of them now that lanes are path-selected.
+    name: CI complete
+    if: always()
+    needs:
+      - classify
+      - check
+      - msrv
+      - test-linux
+      - browser-oauth
+      - test-macos
+      - test-macos-app
+      - cross-check
+      - binary-size
+      - deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any lane failed or was cancelled
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          bad=$(jq -r 'to_entries
+            | map(select(.value.result == "failure" or .value.result == "cancelled"))
+            | map("\(.key): \(.value.result)")
+            | join(", ")' <<<"$RESULTS")
+          if [[ -n "$bad" ]]; then
+            echo "failing lanes: $bad" >&2
+            exit 1
+          fi
+          echo "all lanes succeeded or were skipped"
