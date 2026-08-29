@@ -5,6 +5,21 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `scripts/install-release.sh` now swaps the app bundle by rename instead of
+  deleting it in place. Every MCP client's `plug connect` re-execs the bundle's
+  binary, and macOS aborts a running process whose signed executable is
+  unlinked underneath it, so installing 0.8.3 killed six live client processes.
+  The superseded bundle waits outside `/Applications` until its last clients
+  exit, and is swept on the next install.
+- The release workflow moved to `actions/upload-artifact@v6` and
+  `actions/download-artifact@v7`, the first majors that actually default to
+  Node 24. The v5 majors advertised Node 24 support but still declared
+  `runs.using: node20`, so the deprecation warning survived the first bump.
+
 ## [0.8.3] - 2026-08-29
 
 ### Fixed

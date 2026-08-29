@@ -9,7 +9,10 @@
 # for the daemon to answer before it reports success. Nothing here needs a click.
 #
 # Replacing the bundle is the one destructive step, so it happens only after the
-# download is verified, and only once the running app has quit on its own.
+# download is verified, and only once the running app has quit on its own. The
+# swap moves the old bundle aside rather than deleting it, because every MCP
+# client's `plug connect` re-execs the bundle's binary and macOS aborts a running
+# process whose signed executable is unlinked underneath it.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,6 +33,9 @@ version="${version#v}"
 tag="v$version"
 
 app="/Applications/Plug.app"
+# Retired bundles wait here for their last clients to exit. Outside /Applications
+# so a superseded copy never shows up in Spotlight or Launchpad.
+attic="${TMPDIR:-/tmp}/plug-retired-bundles"
 staging="$(mktemp -d)"
 mount_point=""
 cleanup() {
@@ -83,12 +89,26 @@ if [[ -f "$legacy_plist" ]]; then
 fi
 
 echo "install: replacing $app"
-rm -rf "$app"
-ditto "$staged_app" "$app"
+# Stage the new bundle beside the old one, then swap by rename. `rm -rf` here
+# would kill every `plug connect` currently running the old bundle's binary:
+# they die with SIGABRT the moment their signed executable is unlinked. A rename
+# keeps that inode reachable, so those clients live until they exit on their own.
+incoming="/Applications/.Plug.app.incoming.$$"
+retired="$attic/Plug.app.$(date +%Y%m%d-%H%M%S)"
+rm -rf "$incoming"
+ditto "$staged_app" "$incoming"
+if [[ -d "$app" ]]; then
+  mkdir -p "$attic"
+  mv "$app" "$retired"
+fi
+mv "$incoming" "$app"
 hdiutil detach "$mount_point" -quiet
 mount_point=""
 
 open -a "$app"
+
+# Yesterday's retired bundles have no processes left to protect.
+find "$attic" -maxdepth 1 -name 'Plug.app.*' -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
 echo "install: waiting for the daemon"
 socket="$HOME/Library/Application Support/plug/plug.sock"
