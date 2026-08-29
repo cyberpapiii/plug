@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- The CLI now allows a cold daemon start the same 90 seconds Plug.app allows,
+  and waits instead of force-restarting when another process already holds the
+  daemon's runtime lock. Both halves drive one daemon; the CLI's previous
+  8-second budget meant a `plug connect` could kill the cold start Plug.app was
+  waiting on, and a second client would kill the next one.
+- Operator requests and `plug connect` session setup now time out instead of
+  waiting forever. A daemon whose engine is stuck still accepts connections, so
+  every status command and every connecting client used to hang with nothing
+  reported.
+- A crashed daemon is restarted by launchd. Both plists now carry
+  `KeepAlive`/`SuccessfulExit=false`, so a panic or a kill self-heals while idle
+  grace-period shutdown and `plug stop` still stay stopped.
+- A fatal daemon startup error is written to the daemon log. It previously
+  reached only stderr, which the app-owned LaunchAgent redirects nowhere.
+
 ### Changed
 
 - Debug and test builds now emit line tables instead of full DWARF, and

@@ -156,8 +156,10 @@ pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
 ///
 /// This probe never creates or rewrites the PID file. Auto-start callers use it
 /// to distinguish a failed child from a child that correctly lost to another
-/// daemon which is still booting.
-#[cfg(test)]
+/// daemon which is still booting. `cmd_daemon` claims the lock before
+/// `Engine::start`, and the IPC socket is not bound until every configured
+/// upstream is up, so a held lock with no socket is the signature of a healthy
+/// cold start rather than a dead one.
 pub(crate) fn runtime_lock_is_held() -> bool {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -2138,8 +2140,22 @@ pub async fn connect_to_daemon() -> Option<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(&sock).await.ok()
 }
 
+/// How long an operator request may wait for the daemon to answer. Generous,
+/// because a request can land while the daemon is refreshing credentials, but
+/// bounded, because an unbounded wait reports nothing at all.
+const IPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Send a request to the daemon and read the response.
 pub async fn ipc_request(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
+    ipc_request_with_timeout(request, IPC_REQUEST_TIMEOUT).await
+}
+
+/// The body of [`ipc_request`], with the wait made explicit so it can be proven
+/// to end.
+pub(crate) async fn ipc_request_with_timeout(
+    request: &IpcRequest,
+    timeout: std::time::Duration,
+) -> anyhow::Result<IpcResponse> {
     let stream = connect_to_daemon()
         .await
         .ok_or_else(|| anyhow::anyhow!("no plug daemon running"))?;
@@ -2150,9 +2166,18 @@ pub async fn ipc_request(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
     let payload = serde_json::to_vec(request)?;
     ipc::write_frame(&mut writer, &payload).await?;
 
-    // Read response
-    let frame = ipc::read_frame(&mut reader)
-        .await?
+    // Read response. A daemon that accepted the connection but cannot answer,
+    // because its engine is stuck on an upstream or a Keychain read, would
+    // otherwise hang the caller forever with nothing to report.
+    let frame = tokio::time::timeout(timeout, ipc::read_frame(&mut reader))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "daemon did not answer within {}s; see {}",
+                timeout.as_secs(),
+                log_dir().display()
+            )
+        })??
         .ok_or_else(|| anyhow::anyhow!("daemon closed connection"))?;
 
     let response: IpcResponse = serde_json::from_slice(&frame)?;
@@ -2169,6 +2194,51 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon whose engine is stuck still accepts connections, so an
+    /// unbounded read turns `plug status`, `plug doctor` and every app checkup
+    /// into a spinner with nothing to report. The wait has to end.
+    #[tokio::test]
+    async fn operator_request_gives_up_on_a_daemon_that_never_answers() {
+        let _guard = runtime_paths_test_lock().lock().await;
+        // Short and directly under /tmp: a Unix socket path has to fit in
+        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/plug-q{}{:x}",
+            std::process::id(),
+            uuid::Uuid::new_v4().as_fields().0
+        ));
+        set_test_runtime_paths(root.clone(), root.clone());
+        let socket = socket_path();
+        std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
+            .expect("create runtime dir");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
+        // Accept and hold the connection open without ever replying.
+        let silent = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+
+        let error = ipc_request_with_timeout(
+            &IpcRequest::Shutdown {
+                auth_token: "unused".to_string(),
+            },
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a silent daemon must not be waited on forever");
+
+        silent.abort();
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            error.to_string().contains("did not answer"),
+            "unexpected error: {error}"
+        );
+    }
+
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
     use std::collections::HashMap;

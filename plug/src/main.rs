@@ -461,7 +461,14 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Connect) => runtime::cmd_connect(cli.config.as_ref()).await?,
         Some(Commands::Serve { daemon }) => {
             if daemon {
-                runtime::cmd_daemon(cli.config.as_ref()).await?;
+                // Stderr is the only place this error would otherwise land, and
+                // the app-owned LaunchAgent redirects stderr nowhere. Record the
+                // reason in the daemon log so a restart loop can be diagnosed.
+                runtime::cmd_daemon(cli.config.as_ref())
+                    .await
+                    .inspect_err(|error| {
+                        tracing::error!(error = %error, "daemon exited with a fatal error");
+                    })?;
             } else {
                 runtime::cmd_serve(cli.config.as_ref()).await?;
             }

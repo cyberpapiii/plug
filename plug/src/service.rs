@@ -338,6 +338,9 @@ pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String
 {arguments}
   </array>
   <key>RunAtLoad</key><true/>
+  <!-- Restart only on a non-zero exit. Idle grace-period shutdown and
+       `plug stop` exit 0 and stay stopped; a panic or a kill self-heals. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -372,6 +375,53 @@ fn launchctl(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long a cold start may take before it is treated as failed.
+///
+/// Starting every configured upstream takes tens of seconds, and each one can
+/// involve a Keychain read or a network round trip. Plug.app allows the same 90
+/// seconds (`DaemonServiceManager.retryLimit`, 180 attempts at 500ms). The CLI
+/// and the app drive one daemon, so two different amounts of patience is not a
+/// tuning difference: the impatient half kills what the patient half is waiting
+/// for.
+const STARTUP_BUDGET: Duration = Duration::from_secs(90);
+
+/// Wait for the daemon's IPC socket, distinguishing a slow start from a dead one.
+///
+/// `already_starting` says the caller has already seen the runtime lock held, so
+/// a subsequent disappearance of that lock is conclusive rather than the gap
+/// before a freshly kickstarted daemon claims it.
+async fn wait_for_daemon_socket(started: bool, already_starting: bool) -> anyhow::Result<bool> {
+    let deadline = std::time::Instant::now() + STARTUP_BUDGET;
+    let mut saw_lock = already_starting;
+    let mut delay = Duration::from_millis(100);
+    loop {
+        if crate::daemon::connect_to_daemon().await.is_some() {
+            return Ok(started);
+        }
+        if crate::daemon::runtime_lock_is_held() {
+            saw_lock = true;
+        } else if saw_lock {
+            // The lock was held and is now gone with no socket to show for it.
+            // The daemon exited during startup, so waiting out the rest of the
+            // budget would only delay the report.
+            anyhow::bail!(
+                "daemon exited during startup; see {}",
+                crate::daemon::log_dir().display()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
+    }
+    anyhow::bail!(
+        "daemon did not start within {}s; open Plug.app to finish setup, then view {}",
+        STARTUP_BUDGET.as_secs(),
+        crate::daemon::log_dir().display()
+    )
+}
+
 pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> {
     if crate::daemon::connect_to_daemon().await.is_some() {
         return Ok(false);
@@ -379,6 +429,15 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     #[cfg(test)]
     if crate::daemon::test_runtime_paths_active() {
         anyhow::bail!("test daemon unavailable; refusing to mutate launchd");
+    }
+    // A held runtime lock means a daemon claimed the singleton and is inside
+    // `Engine::start`, which runs before the IPC socket is bound. Kickstarting
+    // now would SIGKILL that healthy cold start and begin it again, and a second
+    // client arriving would do it once more. Plug.app stopped force-kickstarting
+    // inside its verification loop for this reason; the CLI drives the same
+    // daemon and needs the same restraint.
+    if crate::daemon::runtime_lock_is_held() {
+        return wait_for_daemon_socket(false, true).await;
     }
     let uid = user_id()?;
     let state = inspect()?;
@@ -434,16 +493,7 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
             }
         }
     }
-    for delay in [100, 200, 400, 800, 1_600, 2_500, 2_500] {
-        if crate::daemon::connect_to_daemon().await.is_some() {
-            return Ok(true);
-        }
-        tokio::time::sleep(Duration::from_millis(delay)).await;
-    }
-    anyhow::bail!(
-        "daemon did not start; open Plug.app to finish setup, then view {}",
-        crate::daemon::log_dir().display()
-    )
+    wait_for_daemon_socket(true, false).await
 }
 
 #[cfg(test)]
@@ -740,6 +790,92 @@ arguments = {
             ),
             ServiceOwnership::CliManaged
         );
+    }
+
+    /// The CLI plist and the app plist describe the same launchd job. They are
+    /// written in two languages, in two directories, by two different
+    /// installers, which is exactly the shape of thing that drifts. Restart
+    /// policy is the field that matters most: one half restarting a crashed
+    /// daemon while the other leaves it dead is a difference an operator would
+    /// experience as "sometimes it comes back".
+    #[test]
+    fn cli_and_app_plists_agree_on_crash_only_restart() {
+        const CRASH_ONLY: &str =
+            "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>";
+
+        let cli = render_cli_plist(Path::new("/tmp/plug"), None);
+        assert!(
+            cli.contains(CRASH_ONLY),
+            "CLI plist lost its crash-only restart policy"
+        );
+
+        let app_plist = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../PlugApp/PlugApp/Resources/com.plug.daemon.plist");
+        let app = std::fs::read_to_string(&app_plist)
+            .unwrap_or_else(|error| panic!("read {}: {error}", app_plist.display()));
+        assert!(
+            app.contains(CRASH_ONLY),
+            "app plist lost its crash-only restart policy"
+        );
+    }
+
+    /// A daemon that claimed the runtime lock and then exited without binding a
+    /// socket has failed, and the caller should hear that immediately rather
+    /// than after the full cold-start budget.
+    #[tokio::test]
+    async fn wait_reports_a_daemon_that_died_during_startup() {
+        let _guard = crate::daemon::runtime_paths_test_lock().lock().await;
+        let root = std::env::temp_dir().join(format!(
+            "plug-service-startup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create runtime root");
+        crate::daemon::set_test_runtime_paths(root.clone(), root.clone());
+
+        let started = std::time::Instant::now();
+        let error = wait_for_daemon_socket(false, true)
+            .await
+            .expect_err("a vanished startup lock must not be reported as success");
+
+        crate::daemon::clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < STARTUP_BUDGET,
+            "a dead startup should not consume the whole cold-start budget"
+        );
+    }
+
+    /// The socket appearing is the only success signal, and it is what a slow
+    /// cold start eventually produces.
+    #[tokio::test]
+    async fn wait_succeeds_once_the_socket_appears() {
+        let _guard = crate::daemon::runtime_paths_test_lock().lock().await;
+        // Short and directly under /tmp: a Unix socket path has to fit in
+        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/plug-s{}{:x}",
+            std::process::id(),
+            uuid::Uuid::new_v4().as_fields().0
+        ));
+        crate::daemon::set_test_runtime_paths(root.clone(), root.clone());
+        let socket = crate::daemon::socket_path();
+        std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
+            .expect("create runtime dir");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
+
+        let started = wait_for_daemon_socket(true, false).await;
+
+        drop(listener);
+        crate::daemon::clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(started.expect("socket present means started"));
     }
 
     #[test]
