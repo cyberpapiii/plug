@@ -16,6 +16,7 @@ protocol DaemonServiceManaging: AnyObject {
         canonical: VerifiedAppInstallation,
         legacyPaths: Set<URL>
     ) async throws -> DaemonServiceSnapshot
+    func bootOutRecognizedLegacy(_ snapshot: DaemonServiceSnapshot) async throws
     func adoptRecognizedLegacy(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
@@ -120,12 +121,24 @@ final class InstallationCoordinator {
 
             try rejectUnknownLegacyState(legacy)
 
+            var inspectTimeLegacyPaths = Set<URL>()
+            var leftoverAdoptSnapshot: DaemonServiceSnapshot?
             if legacy.formulaInstalled {
+                let preUninstallDaemon = try await daemonManager.inspect(
+                    canonical: canonical,
+                    legacyPaths: legacy.recognizedPaths
+                )
+                inspectTimeLegacyPaths = programURLs(from: preUninstallDaemon)
+                if case .recognizedLegacy = preUninstallDaemon.ownership {
+                    leftoverAdoptSnapshot = preUninstallDaemon
+                }
+                try await bootOutHomebrewLegacyIfNeeded(preUninstallDaemon)
                 publish(.removingLegacyFormula)
                 try await legacyMigrator.removeRecognizedFormula(legacy)
                 legacy = legacySnapshot(
                     legacy,
-                    formulaInstalled: false
+                    formulaInstalled: false,
+                    recognizedPaths: legacy.recognizedPaths.union(inspectTimeLegacyPaths)
                 )
             }
 
@@ -152,9 +165,13 @@ final class InstallationCoordinator {
                 clientsNeedRepair = false
             }
 
-            let daemonSnapshot = try await daemonManager.inspect(
+            let liveDaemon = try await daemonManager.inspect(
                 canonical: canonical,
-                legacyPaths: legacy.recognizedPaths
+                legacyPaths: legacy.recognizedPaths.union(inspectTimeLegacyPaths)
+            )
+            let daemonSnapshot = adoptionSnapshot(
+                live: liveDaemon,
+                leftover: leftoverAdoptSnapshot
             )
             let handshake = try await reconcileDaemon(
                 snapshot: daemonSnapshot,
@@ -428,17 +445,59 @@ final class InstallationCoordinator {
         return shadows.sorted { $0.url.path < $1.url.path }
     }
 
+    private func adoptionSnapshot(
+        live: DaemonServiceSnapshot,
+        leftover: DaemonServiceSnapshot?
+    ) -> DaemonServiceSnapshot {
+        switch live.ownership {
+        case .unmanaged:
+            if let leftover, case .recognizedLegacy = leftover.ownership {
+                return leftover
+            }
+            return live
+        case .recognizedLegacy, .appManagedCurrent, .appManagedStale, .unknown:
+            return live
+        }
+    }
+
+    private func bootOutHomebrewLegacyIfNeeded(_ snapshot: DaemonServiceSnapshot) async throws {
+        switch snapshot.ownership {
+        case let .recognizedLegacy(records):
+            let hasHomebrewJob = records.contains { record in
+                record.programURL.map(LegacyPlugProgram.isHomebrew) == true
+            }
+            guard hasHomebrewJob else { return }
+            try await daemonManager.bootOutRecognizedLegacy(snapshot)
+        case .appManagedCurrent, .appManagedStale, .unmanaged:
+            return
+        case .unknown:
+            throw CoordinatorError.unknownOwnership
+        }
+    }
+
+    private func programURLs(from snapshot: DaemonServiceSnapshot) -> Set<URL> {
+        switch snapshot.ownership {
+        case let .recognizedLegacy(records), let .unknown(records):
+            return Set(records.compactMap { $0.programURL?.standardizedFileURL })
+        case let .appManagedCurrent(record), let .appManagedStale(record):
+            return Set([record.programURL].compactMap { $0?.standardizedFileURL })
+        case .unmanaged:
+            return []
+        }
+    }
+
     private func legacySnapshot(
         _ snapshot: LegacyInstallSnapshot,
         formulaInstalled: Bool? = nil,
-        shellLink: ShellLinkState? = nil
+        shellLink: ShellLinkState? = nil,
+        recognizedPaths: Set<URL>? = nil
     ) -> LegacyInstallSnapshot {
         LegacyInstallSnapshot(
             formulaInstalled: formulaInstalled ?? snapshot.formulaInstalled,
             cargoBinary: snapshot.cargoBinary,
             cargoBinaryIdentity: snapshot.cargoBinaryIdentity,
             shellLink: shellLink ?? snapshot.shellLink,
-            recognizedPaths: snapshot.recognizedPaths,
+            recognizedPaths: recognizedPaths ?? snapshot.recognizedPaths,
             unknownPaths: snapshot.unknownPaths
         )
     }

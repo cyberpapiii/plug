@@ -113,11 +113,15 @@ struct LaunchdJobRecord: Equatable, Sendable {
 enum LegacyPlugProgram {
     static func isRecognized(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path
-        if isHomebrewInstall(path) {
+        if isHomebrew(url) {
             return true
         }
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         return path == "\(home)/.cargo/bin/plug" || path == "\(home)/.local/bin/plug"
+    }
+
+    static func isHomebrew(_ url: URL) -> Bool {
+        isHomebrewInstall(url.standardizedFileURL.path)
     }
 
     private static func isHomebrewInstall(_ path: String) -> Bool {

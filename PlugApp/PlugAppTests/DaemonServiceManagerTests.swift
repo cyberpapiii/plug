@@ -16,6 +16,57 @@ final class DaemonServiceManagerTests: XCTestCase {
         teamID: "HJF7LN64XX"
     )
 
+    func testAdoptRecognizedLegacyReinspectsWithInspectTimeProgramURLs() async throws {
+        let cellar = record(
+            label: "com.plug.daemon",
+            path: "/opt/homebrew/Cellar/plug/0.6.3/bin/plug",
+            build: nil
+        )
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector([
+            .recognizedLegacy([cellar]),
+            .recognizedLegacy([cellar]),
+            .appManagedCurrent(current),
+        ])
+        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.3"), handshake("0.7.0")])
+        let manager = makeManager(inspector: inspector, backend: backend)
+        let snapshot = try await manager.inspect(canonical: canonical, legacyPaths: [])
+
+        let result = try await manager.adoptRecognizedLegacy(snapshot: snapshot, expectedVersion: "0.7.0")
+
+        XCTAssertEqual(result.daemonVersion, "0.7.0")
+        let pathSets = await inspector.recognizedPathSets
+        XCTAssertTrue(
+            pathSets.contains { $0.contains(cellar.programURL!) },
+            "adoptRecognizedLegacy must re-inspect with the inspect-time Cellar URL, not only defaultLegacyPaths"
+        )
+    }
+
+    func testAdoptRecognizedLegacyRegistersWhenReinspectIsUnmanaged() async throws {
+        let cellar = record(
+            label: "com.plug.daemon",
+            path: "/opt/homebrew/Cellar/plug/0.6.3/bin/plug",
+            build: nil
+        )
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector([
+            .recognizedLegacy([cellar]),
+            .unmanaged,
+            .appManagedCurrent(current),
+        ])
+        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.3"), handshake("0.7.0")])
+        let manager = makeManager(inspector: inspector, backend: backend)
+        let snapshot = try await manager.inspect(canonical: canonical, legacyPaths: [])
+
+        let result = try await manager.adoptRecognizedLegacy(snapshot: snapshot, expectedVersion: "0.7.0")
+
+        XCTAssertEqual(result.daemonVersion, "0.7.0")
+        XCTAssertFalse(backend.events.contains { if case .bootOut = $0 { true } else { false } })
+        XCTAssertTrue(backend.events.contains(.register))
+        let pathSets = await inspector.recognizedPathSets
+        XCTAssertTrue(pathSets.contains { $0.contains(cellar.programURL!) })
+    }
+
     func testFirstLegacyAdoptionRequiresExplicitOperatorAction() async throws {
         let legacy = record(label: "local.claude-rc.plug", path: "/Users/me/.cargo/bin/plug", build: nil)
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
@@ -337,6 +388,7 @@ private struct StaticAppInspector: AppInstallationInspecting {
 
 private actor SequenceLaunchdInspector: LaunchdJobInspecting {
     private var states: [DaemonOwnershipState]
+    private(set) var recognizedPathSets: [Set<URL>] = []
 
     init(_ states: [DaemonOwnershipState]) {
         self.states = states
@@ -346,6 +398,7 @@ private actor SequenceLaunchdInspector: LaunchdJobInspecting {
         canonical: VerifiedAppInstallation,
         recognizedLegacyPaths: Set<URL>
     ) async throws -> DaemonOwnershipState {
+        recognizedPathSets.append(recognizedLegacyPaths)
         guard !states.isEmpty else { throw CocoaError(.fileReadUnknown) }
         if states.count == 1 { return states[0] }
         return states.removeFirst()
