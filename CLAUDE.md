@@ -190,6 +190,14 @@ branches, pushes through the gate, opens a pull request, and arms auto-merge. It
 never stages untracked files, which is what keeps private notes and local
 credentials out of a commit.
 
+Release with `./scripts/release.sh [version]`. It bumps the workspace version,
+renames the changelog's `## [Unreleased]` heading, ships and waits for the pull
+request to merge, tags, watches the release build, installs the signed DMG onto
+this Mac, and sweeps the build caches. Write the changelog entries first; it
+will not invent release notes. `./scripts/install-release.sh [version]` does the
+install half alone, checking the DMG against the release checksums and refusing
+anything Gatekeeper rejects.
+
 Build artifacts are governed by `scripts/clean-build-artifacts.sh`. `--guard`
 reclaims regenerable caches when `target/` exceeds 10 GB or this project's Xcode
 DerivedData exceeds 5 GB, and is silent otherwise. It costs about 40
