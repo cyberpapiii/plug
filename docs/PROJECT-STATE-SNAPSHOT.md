@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `66768c7` (`refactor: collapse duplicated ownership, path, and config-load logic (#136)`) on 2026-08-29, plus the workflow change that carries this revision.
+Baseline: `main` through `1eaed81` (`fix: keep a status probe from defeating a daemon start (#142)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -166,6 +166,32 @@ kickstarts `com.plug.daemon` once, then waits up to 90 seconds for the bundled
 runtime and all configured upstreams instead of repeatedly killing a healthy
 startup while it is still initializing. The delayed-readiness behavior is
 covered by focused app tests.
+
+A reliability pass on 2026-08-29 (PRs #139 through #142) closed the failure
+class behind that lifecycle fix rather than the one instance of it. The daemon
+claims its runtime lock before `Engine::start` and binds the IPC socket only
+once every upstream is up, so a healthy cold start is indistinguishable from an
+absent daemon for tens of seconds. The CLI allowed 8 seconds for that where
+Plug.app allows 90, and force-kickstarted with no check for a start already in
+flight, so a `plug connect` could kill the cold start the app was waiting on.
+Both halves now share the same 90-second budget and consult the runtime lock
+first, `plug`, `plug client list` and `plug servers` report that window as
+starting rather than stopped, and reading the lock can no longer defeat the
+start it is describing. Operator requests and `plug connect` session setup are
+bounded, both plists restart the daemon on a non-zero exit, and a fatal startup
+error reaches the daemon log instead of a stderr nobody redirects.
+
+The same pass hardened the app's side of that seam. Sign-in and sign-out ran
+`plug auth` through a second, worse copy of the process-running code that waited
+for the child before draining its pipes, so a talkative CLI deadlocked the app;
+they now go through `ProcessRunner`, which leaves no hand-rolled `Process` in
+the app at all. A handshake reporting `unknown` ownership blocks instead of
+publishing repairable drift, since drift is retried on every trigger and
+`unknown` is an absence of evidence rather than a disagreement. Booting a legacy
+launchd job out re-reads the job's program first, because `launchctl bootout`
+addresses a job by label and a label is not an identity. The socket-bind
+ordering that produced all of this is recorded in `docs/RISKS.md`; the damage is
+contained, not removed.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
