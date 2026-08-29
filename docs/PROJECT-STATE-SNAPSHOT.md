@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `a65209b` (`perf: bound OAuth metadata discovery on the server start path (#150)`) on 2026-08-29, plus the change that carries this revision.
+Baseline: `main` through `e2daf23` (`perf(app): fetch the tool catalog only when the daemon says it changed (#151)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -279,6 +279,17 @@ handshake for the life of the descriptor, clearing it on the disconnect that
 every failed request already performs. Same thirty seconds now costs roughly
 469 KiB across 30 round trips. Nothing the app displays changed; the catalog is
 still refetched the moment the daemon says it would answer differently.
+
+With the catalog gone from the steady state, the snapshot itself became the
+whole cost, and a live capture named what was in it. A 32,776-byte snapshot was
+22,382 bytes of `servers`, and one server's entry was 11,733 bytes: an upstream
+that advertises a base64 PNG in its `icons` metadata. Two such servers were
+carrying roughly half the snapshot, fifteen times per thirty seconds, for
+branding no operator client reads. The operator snapshot now clears
+`upstream.icons` from its server statuses, which takes the same capture to
+17,344 bytes. Tool listings still carry icons, which is where a client renders
+them, and `plug servers --output json` is unaffected because it reads the
+unmodified statuses from the separate `Status` request.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
