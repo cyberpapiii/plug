@@ -128,7 +128,7 @@ final class InstallationCoordinator {
                     canonical: canonical,
                     legacyPaths: legacy.recognizedPaths
                 )
-                inspectTimeLegacyPaths = programURLs(from: preUninstallDaemon)
+                inspectTimeLegacyPaths = preUninstallDaemon.ownership.programURLs
                 if case .recognizedLegacy = preUninstallDaemon.ownership {
                     leftoverAdoptSnapshot = preUninstallDaemon
                 }
@@ -167,7 +167,7 @@ final class InstallationCoordinator {
 
             let liveDaemon = try await daemonManager.inspect(
                 canonical: canonical,
-                legacyPaths: legacy.recognizedPaths.union(inspectTimeLegacyPaths)
+                legacyPaths: legacy.recognizedPaths
             )
             let daemonSnapshot = adoptionSnapshot(
                 live: liveDaemon,
@@ -462,27 +462,12 @@ final class InstallationCoordinator {
 
     private func bootOutHomebrewLegacyIfNeeded(_ snapshot: DaemonServiceSnapshot) async throws {
         switch snapshot.ownership {
-        case let .recognizedLegacy(records):
-            let hasHomebrewJob = records.contains { record in
-                record.programURL.map(LegacyPlugProgram.isHomebrew) == true
-            }
-            guard hasHomebrewJob else { return }
+        case .recognizedLegacy:
             try await daemonManager.bootOutRecognizedLegacy(snapshot)
         case .appManagedCurrent, .appManagedStale, .unmanaged:
             return
         case .unknown:
             throw CoordinatorError.unknownOwnership
-        }
-    }
-
-    private func programURLs(from snapshot: DaemonServiceSnapshot) -> Set<URL> {
-        switch snapshot.ownership {
-        case let .recognizedLegacy(records), let .unknown(records):
-            return Set(records.compactMap { $0.programURL?.standardizedFileURL })
-        case let .appManagedCurrent(record), let .appManagedStale(record):
-            return Set([record.programURL].compactMap { $0?.standardizedFileURL })
-        case .unmanaged:
-            return []
         }
     }
 

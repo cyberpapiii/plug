@@ -370,16 +370,7 @@ final class DaemonServiceManager {
     }
 
     private func inspectionPaths(including snapshot: DaemonServiceSnapshot) -> Set<URL> {
-        let inspectTime: Set<URL>
-        switch snapshot.ownership {
-        case let .recognizedLegacy(records), let .unknown(records):
-            inspectTime = Set(records.compactMap { $0.programURL?.standardizedFileURL })
-        case let .appManagedCurrent(record), let .appManagedStale(record):
-            inspectTime = Set([record.programURL].compactMap { $0?.standardizedFileURL })
-        case .unmanaged:
-            inspectTime = []
-        }
-        return legacyPaths.union(inspectTime)
+        legacyPaths.union(snapshot.ownership.programURLs)
     }
 
     private func verifiedApp(expectedVersion: String) async throws -> VerifiedAppInstallation {

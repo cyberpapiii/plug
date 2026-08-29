@@ -80,6 +80,17 @@ enum DaemonOwnershipState: Equatable, Sendable {
     case recognizedLegacy([LaunchdJobRecord])
     case unmanaged
     case unknown([LaunchdJobRecord])
+
+    var programURLs: Set<URL> {
+        switch self {
+        case let .recognizedLegacy(records), let .unknown(records):
+            Set(records.compactMap { $0.programURL?.standardizedFileURL })
+        case let .appManagedCurrent(record), let .appManagedStale(record):
+            Set([record.programURL].compactMap { $0?.standardizedFileURL })
+        case .unmanaged:
+            []
+        }
+    }
 }
 
 struct LaunchdJobRecord: Equatable, Sendable {
@@ -113,7 +124,7 @@ struct LaunchdJobRecord: Equatable, Sendable {
 enum LegacyPlugProgram {
     static func isRecognized(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path
-        if isHomebrew(url) {
+        if isHomebrewInstall(path) {
             return true
         }
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path

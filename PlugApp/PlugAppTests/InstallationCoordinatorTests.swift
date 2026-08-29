@@ -881,9 +881,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         guard case let .healthy(snapshot) = coordinator.state else {
             return XCTFail("Unloaded leftover must still adopt from the pre-uninstall snapshot, got \(coordinator.state)")
         }
-        if case .blocked = coordinator.state {
-            XCTFail("Unloaded leftover must not evidenceChanged-abort")
-        }
         XCTAssertEqual(snapshot.service.ownership, healthyService().ownership)
         XCTAssertEqual(daemon.adoptedSnapshots.map(\.ownership), [.recognizedLegacy([cellar])])
         let eventValues = await events.values
@@ -967,9 +964,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         let eventValues = await events.values
         XCTAssertTrue(eventValues.contains("daemon.bootOutLegacy"))
         XCTAssertFalse(eventValues.contains("legacy.removeFormula"))
-        if case .healthy = coordinator.state {
-            XCTFail("Bootout failure must not report healthy")
-        }
     }
 
     func testOpenLogUsesBlockedFailureLogURL() async {

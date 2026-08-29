@@ -57,7 +57,7 @@ pub struct ServiceState {
     pub ownership: ServiceOwnership,
     pub loaded: bool,
     pub plist_path: PathBuf,
-    launchctl_output: String,
+    parent_bundle_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +98,8 @@ pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
 
     let is_cargo_binary =
         dirs::home_dir().is_some_and(|home| program == home.join(".cargo/bin/plug"));
+    let is_local_bin =
+        dirs::home_dir().is_some_and(|home| program == home.join(".local/bin/plug"));
     let is_formula_cellar_binary = [
         Path::new("/opt/homebrew/Cellar/plug"),
         Path::new("/usr/local/Cellar/plug"),
@@ -111,6 +113,7 @@ pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
     });
 
     is_cargo_binary
+        || is_local_bin
         || program == Path::new("/opt/homebrew/bin/plug")
         || program == Path::new("/usr/local/bin/plug")
         || program == Path::new("/opt/homebrew/opt/plug/bin/plug")
@@ -118,7 +121,6 @@ pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
         || is_formula_cellar_binary
 }
 
-#[allow(dead_code)] // Consumed by unified installation diagnosis in the next rollout task.
 pub fn classify_launchd_program(
     job: &LaunchdJobRecord,
     current_app_executable: Option<&Path>,
@@ -304,7 +306,7 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
         ownership: classify_launchctl_output(&text, plist_path.exists()),
         loaded: output.status.success(),
         plist_path,
-        launchctl_output: text,
+        parent_bundle_version: launchctl_field(&text, "parent bundle version ="),
     })
 }
 
@@ -324,14 +326,11 @@ fn launchctl_field(output: &str, prefix: &str) -> Option<String> {
         .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim).map(str::to_owned))
 }
 
-fn app_managed_registration_stale(launchctl_output: &str, current_build: Option<&str>) -> bool {
-    let Some(parent_build) = launchctl_field(launchctl_output, "parent bundle version =") else {
-        return false;
-    };
-    let Some(current_build) = current_build else {
-        return false;
-    };
-    parent_build != current_build
+fn app_managed_registration_stale(parent_build: Option<&str>, current_build: Option<&str>) -> bool {
+    match (parent_build, current_build) {
+        (Some(parent_build), Some(current_build)) => parent_build != current_build,
+        _ => false,
+    }
 }
 
 fn verified_app_build_version() -> Option<String> {
@@ -355,7 +354,7 @@ pub fn ipc_ownership_state() -> IpcOwnershipState {
         Ok(state) => {
             let stale = state.ownership == ServiceOwnership::AppManaged
                 && app_managed_registration_stale(
-                    &state.launchctl_output,
+                    state.parent_bundle_version.as_deref(),
                     verified_app_build_version().as_deref(),
                 );
             IpcOwnershipState {
@@ -624,6 +623,34 @@ mod tests {
     }
 
     #[test]
+    fn homebrew_bin_and_local_bin_programs_are_recognized() {
+        assert!(is_recognized_legacy_program(Path::new(
+            "/opt/homebrew/bin/plug"
+        )));
+        assert!(is_recognized_legacy_program(Path::new(
+            "/usr/local/bin/plug"
+        )));
+        let local_bin = dirs::home_dir().unwrap().join(".local/bin/plug");
+        let job = LaunchdJobRecord {
+            label: "legacy.plug".to_string(),
+            program: local_bin.clone(),
+        };
+        assert!(is_recognized_legacy_program(&local_bin));
+        assert_eq!(
+            classify_launchd_program(&job, None),
+            LaunchdProgramOwnership::RecognizedLegacyPlug
+        );
+        let brew_bin = LaunchdJobRecord {
+            label: "legacy.plug".to_string(),
+            program: PathBuf::from("/opt/homebrew/bin/plug"),
+        };
+        assert_eq!(
+            classify_launchd_program(&brew_bin, None),
+            LaunchdProgramOwnership::RecognizedLegacyPlug
+        );
+    }
+
+    #[test]
     fn inspect_error_maps_to_unknown_not_unmanaged() {
         let ownership = match Result::<ServiceState, anyhow::Error>::Err(anyhow::anyhow!(
             "launchctl unavailable"
@@ -637,10 +664,10 @@ mod tests {
 
     #[test]
     fn app_managed_registration_stale_when_parent_bundle_version_differs() {
-        let output = "managed_by = com.apple.xpc.ServiceManagement\nparent bundle identifier = com.cyberpapiii.plug\nparent bundle version = 19\n";
-        assert!(app_managed_registration_stale(output, Some("20")));
-        assert!(!app_managed_registration_stale(output, Some("19")));
-        assert!(!app_managed_registration_stale(output, None));
+        assert!(app_managed_registration_stale(Some("19"), Some("20")));
+        assert!(!app_managed_registration_stale(Some("19"), Some("19")));
+        assert!(!app_managed_registration_stale(Some("19"), None));
+        assert!(!app_managed_registration_stale(None, Some("20")));
     }
 
     #[test]

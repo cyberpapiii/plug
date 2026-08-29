@@ -18,24 +18,26 @@ final class GoldenPayloadTests: XCTestCase {
             .deletingLastPathComponent()
         let url = repoRoot.appending(path: "testdata/ipc/\(name)")
         guard FileManager.default.fileExists(atPath: url.path) else {
-            throw XCTSkip("missing shared golden fixture at \(url.path)")
+            struct MissingGolden: Error {}
+            XCTFail("missing shared golden fixture at \(url.path)", file: file, line: line)
+            throw MissingGolden()
         }
         return try Data(contentsOf: url)
     }
 
-    private func goldenJSONObject(_ name: String) throws -> [String: Any] {
-        let data = try goldenData(name)
+    private func goldenJSON(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws -> (Data, [String: Any]) {
+        let data = try goldenData(name, file: file, line: line)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            XCTFail("golden \(name) must be a JSON object")
-            return [:]
+            XCTFail("golden \(name) must be a JSON object", file: file, line: line)
+            return (data, [:])
         }
-        return object
+        return (data, object)
     }
 
     func testGoldenOperatorHandshakeResponseDecodesInSwift() throws {
-        let payload = try goldenData("operator_handshake_response.json")
+        let (payload, object) = try goldenJSON("operator_handshake_response.json")
         try assertExactKeys(
-            try goldenJSONObject("operator_handshake_response.json"),
+            object,
             expected: ["type", "handshake"],
             context: "operator handshake response"
         )
@@ -47,16 +49,16 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(handshake.daemonVersion, "0.7.0")
         XCTAssertEqual(handshake.ipcMin, 3)
         XCTAssertEqual(handshake.ipcMax, 6)
-        XCTAssertEqual(handshake.ownership, "unknown")
+        XCTAssertEqual(handshake.ownership, "app_managed")
         XCTAssertTrue(handshake.stale)
         XCTAssertTrue(handshake.capabilities.contains("server_config_read"))
         XCTAssertTrue(handshake.capabilities.contains("server_mutation"))
     }
 
     func testGoldenGetServerConfigRequestDecodesThroughFrameCodec() throws {
-        let payload = try goldenData("get_server_config_request.json")
+        let (payload, object) = try goldenJSON("get_server_config_request.json")
         try assertExactKeys(
-            try goldenJSONObject("get_server_config_request.json"),
+            object,
             expected: ["type", "auth_token", "name"],
             context: "GetServerConfig request"
         )
@@ -73,9 +75,9 @@ final class GoldenPayloadTests: XCTestCase {
     }
 
     func testGoldenGetServerConfigResponseDecodesInSwift() throws {
-        let payload = try goldenData("get_server_config_response.json")
+        let (payload, object) = try goldenJSON("get_server_config_response.json")
         try assertExactKeys(
-            try goldenJSONObject("get_server_config_response.json"),
+            object,
             expected: ["type", "name", "server"],
             context: "ServerConfig response"
         )
@@ -91,23 +93,13 @@ final class GoldenPayloadTests: XCTestCase {
     }
 
     func testRenamedHandshakeFieldFailsExactKeyContract() throws {
-        var object = try goldenJSONObject("operator_handshake_response.json")
+        let (_, object) = try goldenJSON("operator_handshake_response.json")
         guard var handshake = object["handshake"] as? [String: Any] else {
             return XCTFail("handshake object expected")
         }
 
-        handshake.removeValue(forKey: "daemon_version")
-        handshake["version"] = "0.7.0"
-        object["handshake"] = handshake
-        let mutated = try JSONSerialization.data(withJSONObject: object)
-
-        XCTAssertThrowsError(try decoder.decode(IPCResponse.self, from: mutated)) { error in
-            XCTAssertTrue(error is DecodingError, "renamed snake_case field must fail Swift decode")
-        }
-
-        let handshakeObject = try goldenJSONObject("operator_handshake_response.json")["handshake"] as! [String: Any]
         try assertExactKeys(
-            handshakeObject,
+            handshake,
             expected: [
                 "daemon_version",
                 "ipc_min",
@@ -118,6 +110,16 @@ final class GoldenPayloadTests: XCTestCase {
             ],
             context: "operator handshake body"
         )
+
+        handshake.removeValue(forKey: "daemon_version")
+        handshake["version"] = "0.7.0"
+        var mutatedObject = object
+        mutatedObject["handshake"] = handshake
+        let mutated = try JSONSerialization.data(withJSONObject: mutatedObject)
+
+        XCTAssertThrowsError(try decoder.decode(IPCResponse.self, from: mutated)) { error in
+            XCTAssertTrue(error is DecodingError, "renamed snake_case field must fail Swift decode")
+        }
     }
 
     private func assertExactKeys(

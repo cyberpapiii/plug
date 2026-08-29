@@ -44,6 +44,18 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(state, .recognizedLegacy([leftover]))
     }
 
+    func testLeftoverLocalBinJobIsRecognizedWithoutRecognizedPaths() async throws {
+        let localBin = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".local/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: localBin, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
     func testLeftoverHomebrewOptPlugJobIsRecognized() async throws {
         let optPlug = URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")
         let leftover = record(label: "com.plug.daemon", program: optPlug, parentID: nil, parentVersion: nil)

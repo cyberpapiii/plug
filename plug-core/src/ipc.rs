@@ -1912,7 +1912,7 @@ mod tests {
                     daemon_executable: None,
                     ipc_min: OPERATOR_IPC_MIN,
                     ipc_max: OPERATOR_IPC_MAX,
-                    ownership: DaemonOwnershipMode::Unknown,
+                    ownership: DaemonOwnershipMode::AppManaged,
                     stale: true,
                     capabilities: vec![
                         OperatorCapability::ServerMutation,
@@ -2015,7 +2015,7 @@ mod tests {
             let IpcResponse::OperatorHandshake { handshake } = response else {
                 panic!("expected operator handshake response");
             };
-            assert_eq!(handshake.ownership, DaemonOwnershipMode::Unknown);
+            assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
             assert!(handshake.stale);
             assert!(handshake
                 .capabilities

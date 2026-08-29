@@ -218,14 +218,10 @@ final class EditServerEnvironmentTests: XCTestCase {
     }
 
     func testMissingCapabilityCopyIsRestartUpdateNotParseError() {
-        XCTAssertEqual(
-            EditServerView.missingCapabilityCopy,
-            AppModel.serverConfigReadRequiredCopy
-        )
-        XCTAssertTrue(EditServerView.missingCapabilityCopy.contains("Restart"))
-        XCTAssertTrue(EditServerView.missingCapabilityCopy.contains("update"))
-        XCTAssertFalse(EditServerView.missingCapabilityCopy.contains("PARSE_ERROR"))
-        XCTAssertFalse(EditServerView.missingCapabilityCopy.contains("could not be loaded"))
+        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("Restart"))
+        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("update"))
+        XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("PARSE_ERROR"))
+        XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("could not be loaded"))
     }
 
     func testArgumentsRoundTripThroughTheDisplayedCommandLine() {

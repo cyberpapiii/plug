@@ -4,7 +4,7 @@
     "daemon_version": "0.7.0",
     "ipc_min": 3,
     "ipc_max": 6,
-    "ownership": "unknown",
+    "ownership": "app_managed",
     "stale": true,
     "capabilities": [
       "server_mutation",

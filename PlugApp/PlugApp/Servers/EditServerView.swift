@@ -29,7 +29,7 @@ struct EditServerView: View {
                 Text("Edit \(name)").font(.title2.weight(.semibold))
                 Text(model.canReadServerConfig
                     ? "Changes take effect as soon as you save."
-                    : Self.missingCapabilityCopy)
+                    : AppModel.serverConfigReadRequiredCopy)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -86,8 +86,6 @@ struct EditServerView: View {
         .task { await load() }
     }
 
-    static let missingCapabilityCopy = AppModel.serverConfigReadRequiredCopy
-
     static func canSave(
         canReadServerConfig: Bool,
         loaded: Bool,
@@ -108,7 +106,7 @@ struct EditServerView: View {
     private func load() async {
         guard !loaded else { return }
         guard model.canReadServerConfig else {
-            failure = Self.missingCapabilityCopy
+            failure = AppModel.serverConfigReadRequiredCopy
             return
         }
         do {
@@ -133,7 +131,7 @@ struct EditServerView: View {
         saving = true
         failure = nil
         guard model.canReadServerConfig else {
-            failure = Self.missingCapabilityCopy
+            failure = AppModel.serverConfigReadRequiredCopy
             saving = false
             return
         }
