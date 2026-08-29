@@ -23,37 +23,63 @@ jobs:
     name: Classify changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.paths.outputs.code }}
+      rust: ${{ steps.paths.outputs.rust }}
+      app: ${{ steps.paths.outputs.app }}
+      e2e: ${{ steps.paths.outputs.e2e }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: paths
-        name: Decide whether full validation is needed
+        name: Decide which validation lanes are needed
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
-          # Fail safe: an unknown base runs the complete suite.
+          # Fail safe: an unknown base runs every lane.
           if [[ -z "${BASE_SHA}" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "app=true" >> "$GITHUB_OUTPUT"
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          code_changed=false
+          rust=false
+          app=false
+          e2e=false
           while IFS= read -r path; do
             case "$path" in
               docs/*|*.md) ;;
-              *) code_changed=true; break ;;
+              PlugApp/*) app=true ;;
+              testdata/ipc/*|testdata/legacy_plug_programs.json)
+                rust=true
+                app=true
+                ;;
+              package.json|package-lock.json|playwright.config.*|e2e/*|tests/e2e/*)
+                e2e=true
+                ;;
+              plug-core/src/downstream_oauth/*|plug-core/src/http/*|plug-core/src/oauth.rs)
+                rust=true
+                e2e=true
+                ;;
+              scripts/check-app-architecture.sh) app=true ;;
+              .github/workflows/*)
+                rust=true
+                app=true
+                e2e=true
+                ;;
+              *) rust=true ;;
             esac
           done < <(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$GITHUB_SHA")
-          echo "code=$code_changed" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "e2e=$e2e" >> "$GITHUB_OUTPUT"
 
   check:
     name: Check (fmt + clippy)
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -67,7 +93,7 @@ jobs:
   msrv:
     name: MSRV check (1.88.0)
     needs: classify
-    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.classify.outputs.rust == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -80,7 +106,7 @@ jobs:
   test-linux:
     name: Test (ubuntu)
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -91,7 +117,7 @@ jobs:
   browser-oauth:
     name: Browser OAuth
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: needs.classify.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -113,7 +139,9 @@ jobs:
   test-macos:
     name: Test (macos)
     needs: classify
-    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    # Duplicate of Test (ubuntu) except for macOS cfg. Catch that on main,
+    # not on every PR; Plug.app covers Swift and the bundled daemon.
+    if: needs.classify.outputs.rust == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -124,7 +152,7 @@ jobs:
   test-macos-app:
     name: Test (Plug.app)
     needs: classify
-    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.classify.outputs.app == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -170,7 +198,7 @@ jobs:
   cross-check:
     name: Cross-check (${{ matrix.target }})
     needs: classify
-    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.classify.outputs.rust == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -193,7 +221,7 @@ jobs:
   binary-size:
     name: Binary size gate
     needs: classify
-    if: needs.classify.outputs.code == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.classify.outputs.rust == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -214,7 +242,7 @@ jobs:
   deny:
     name: cargo deny
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
