@@ -182,9 +182,21 @@ pub fn maybe_delegate_to_app() -> Result<()> {
             return Ok(());
         }
 
-        let app = resolve_verified_app()?;
         let current =
             std::env::current_exe().context("could not resolve the running executable")?;
+
+        // Verification exists to choose which binary should run. When the
+        // running executable is already a bundle executable, there is nothing
+        // left to choose: verifying would re-prove the code executing this
+        // line, and it costs a codesign walk plus two subprocess spawns on
+        // every single invocation. Bundle integrity is owned by `plug doctor`
+        // and by the app's own installation reconciliation, both of which
+        // still run the full check.
+        if running_as_bundle_executable(&current) {
+            return Ok(());
+        }
+
+        let app = resolve_verified_app()?;
         let loop_marker = std::env::var_os(LOOP_MARKER).is_some();
 
         match delegation_decision_with_loop(&current, app.as_ref(), false, loop_marker)? {
@@ -216,6 +228,19 @@ pub fn maybe_delegate_to_app() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     Ok(())
+}
+
+/// Whether the running executable is the embedded executable of some Plug.app.
+///
+/// Local bundle paths are checked before the LaunchServices query because the
+/// canonical install is one of them, and answering from a path comparison
+/// alone keeps the common case free of any system call beyond `canonicalize`.
+#[cfg(target_os = "macos")]
+fn running_as_bundle_executable(current: &Path) -> bool {
+    fallback_bundle_paths()
+        .into_iter()
+        .chain(registered_bundle_paths())
+        .any(|bundle| paths_match(current, &bundle.join(BUNDLE_EXECUTABLE)))
 }
 
 /// Whether two paths name the same file once symlinks are resolved.
@@ -977,5 +1002,18 @@ mod tests {
         };
         assert!(!super::is_plug_launchd_candidate(&unrelated));
         assert!(super::is_plug_launchd_candidate(&unknown_plug));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn bundle_executables_skip_delegation_verification() {
+        for bundle in super::fallback_bundle_paths() {
+            assert!(super::running_as_bundle_executable(
+                &bundle.join(super::BUNDLE_EXECUTABLE)
+            ));
+        }
+        assert!(!super::running_as_bundle_executable(std::path::Path::new(
+            "/usr/local/bin/plug"
+        )));
     }
 }

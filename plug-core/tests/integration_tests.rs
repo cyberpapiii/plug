@@ -1920,7 +1920,7 @@ fn test_config_loading_defaults() {
     assert_eq!(cfg.log_level, "info");
     assert_eq!(cfg.prefix_delimiter, "__");
     assert!(cfg.enable_prefix);
-    assert_eq!(cfg.startup_concurrency, 3);
+    assert_eq!(cfg.startup_concurrency, 12);
     assert!(cfg.servers.is_empty());
 }
 

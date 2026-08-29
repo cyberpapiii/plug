@@ -20,6 +20,11 @@ pub struct Config {
     /// Tool names are always prefixed in v0.1 to avoid collisions.
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
+    ///
+    /// Starting a server is process spawn and protocol handshake, so it spends
+    /// almost all of its time waiting rather than computing. A low cap mostly
+    /// buys wall-clock time on a cold start; the knob stays for machines that
+    /// cannot afford the spawn burst.
     pub startup_concurrency: usize,
     /// Enable client-aware tool filtering (default: true).
     #[serde(default = "default_true")]
@@ -72,7 +77,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             prefix_delimiter: "__".to_string(),
             enable_prefix: true,
-            startup_concurrency: 3,
+            startup_concurrency: 12,
             tool_filter_enabled: true,
             tool_description_max_chars: None,
             tool_search_threshold: 50,
@@ -1221,7 +1226,7 @@ mod tests {
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.prefix_delimiter, "__");
         assert!(cfg.enable_prefix);
-        assert_eq!(cfg.startup_concurrency, 3);
+        assert_eq!(cfg.startup_concurrency, 12);
         assert_eq!(cfg.lazy_tools.mode, LazyToolSetting::Auto);
         assert!(cfg.lazy_tools.clients.is_empty());
         assert_eq!(
