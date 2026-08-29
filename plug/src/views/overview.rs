@@ -333,6 +333,8 @@ pub(crate) async fn cmd_overview(
         "Service",
         if daemon_running {
             style("running").green().bold()
+        } else if crate::runtime::daemon_starting() {
+            style("starting").yellow().bold()
         } else {
             style("stopped").yellow().bold()
         },

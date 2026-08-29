@@ -26,9 +26,10 @@ healthy but indistinguishable from absent to anything that probes the socket.
 
 The damage this used to cause is now contained rather than removed. Callers
 consult the runtime lock to tell a booting daemon from a dead one, wait 90
-seconds for it, and no longer force-restart what is already starting. What
-remains is that no client can talk to the daemon during startup, and no client
-can be told why it is waiting.
+seconds for it, and no longer force-restart what is already starting, and the
+status surfaces say "starting" rather than "stopped" for the same reason. What
+remains is that no client can talk to the daemon during startup, so nothing that
+needs an answer from the engine can get one until the engine is up.
 
 Binding the listener before `Engine::start` and answering "starting" until the
 engine is ready would close it properly. That is a real change to daemon

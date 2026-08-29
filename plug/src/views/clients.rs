@@ -247,6 +247,8 @@ pub(crate) async fn cmd_client_list(
     loop {
         let daemon_error = if daemon_running().await {
             None
+        } else if crate::runtime::daemon_starting() {
+            Some("daemon is starting".to_string())
         } else {
             Some("daemon not running".to_string())
         };

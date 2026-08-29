@@ -276,6 +276,8 @@ pub(crate) async fn cmd_server_list(
                         names.len(),
                         if availability.daemon_reachable() {
                             "runtime inspection failed"
+                        } else if crate::runtime::daemon_starting() {
+                            "daemon is starting"
                         } else {
                             "daemon not running"
                         }

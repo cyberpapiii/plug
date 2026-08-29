@@ -41,6 +41,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Pausing downstream connectors no longer blocks the main thread. It shelled out
   to `ps` synchronously with no timeout, so a wedged `ps` froze the whole app;
   it now goes through `ProcessRunner` with the rest.
+- A status command can no longer defeat a daemon start. Reading the runtime lock
+  takes it and lets it go again, and a start that collided with that momentary
+  hold failed outright with "another plug daemon is already running". The start
+  now outwaits a probe-length hold before drawing that conclusion.
+- `plug`, `plug client list`, and `plug servers` now report the daemon as
+  starting rather than stopped while a cold start is in flight. The socket is
+  bound only once every upstream is up, so for tens of seconds a healthy daemon
+  looked absent, which invited a repair that fought the start.
 
 ### Changed
 
