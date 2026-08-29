@@ -143,6 +143,28 @@ struct InitializedNotificationCompatHttpClient {
     last_session_id: Arc<std::sync::Mutex<Option<Arc<str>>>>,
 }
 
+/// How long an upstream HTTP connect may take before it is abandoned.
+///
+/// DNS, TCP and TLS to a reachable host settle well inside a second even
+/// across an ocean, so a connect still running after this is not slow, it is
+/// not happening. Without a bound it runs until the per-server start timeout
+/// expires — thirty seconds by default — and startup readiness waits on it,
+/// which is how one unreachable remote server delays every other one. The
+/// downstream OAuth metadata client has always bounded its connects; this is
+/// the same bound on the path that carries every upstream call.
+pub(crate) const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn upstream_http_client() -> reqwest::Client {
+    // Building a TLS-capable client panics without a crypto provider, and the
+    // callers that used to guarantee one are elsewhere in the start path.
+    // Claiming it here makes this function correct on its own.
+    crate::tls::ensure_rustls_provider_installed();
+    reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 impl InitializedNotificationCompatHttpClient {
     fn new(
         server_name: Arc<str>,
@@ -150,7 +172,7 @@ impl InitializedNotificationCompatHttpClient {
         tool_router: std::sync::Weak<ToolRouter>,
     ) -> Self {
         Self {
-            inner: reqwest::Client::new(),
+            inner: upstream_http_client(),
             server_name,
             connection,
             tool_router,
@@ -5107,5 +5129,25 @@ mod tests {
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(router.tool_count(), 2);
+    }
+
+    /// An upstream that never answers a connect must not hold startup for the
+    /// whole per-server start timeout, which defaults to thirty seconds and
+    /// which every other server's readiness waits behind.
+    #[tokio::test]
+    async fn upstream_http_connect_is_bounded_well_under_the_start_timeout() {
+        // RFC 5737 TEST-NET-1: reserved for documentation, routed nowhere.
+        let started = std::time::Instant::now();
+        let result = upstream_http_client()
+            .get("http://192.0.2.1:80/mcp")
+            .send()
+            .await;
+
+        assert!(result.is_err(), "a reserved address should never answer");
+        assert!(
+            started.elapsed() < UPSTREAM_CONNECT_TIMEOUT + Duration::from_secs(5),
+            "connect took {:?}, which is not bounded by the connect timeout",
+            started.elapsed()
+        );
     }
 }
