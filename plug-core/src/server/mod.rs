@@ -1545,7 +1545,7 @@ impl ServerManager {
 
                     // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
                     let auth_token = if config.auth.as_deref() == Some("oauth") {
-                        match crate::oauth::verified_access_token_for_resource(name, url).await {
+                        match crate::oauth::verified_access_token_for_resource(name, url, Duration::from_secs(config.timeout_secs)).await {
                             Ok(Some(token)) => Some(token),
                             Err(error) => {
                                 return Err(anyhow::anyhow!(
@@ -1700,7 +1700,13 @@ impl ServerManager {
 
         // Resolve auth token: OAuth token from cache, or static bearer token
         let auth_token_value = if config.auth.as_deref() == Some("oauth") {
-            match crate::oauth::verified_access_token_for_resource(name, url).await {
+            match crate::oauth::verified_access_token_for_resource(
+                name,
+                url,
+                Duration::from_secs(config.timeout_secs),
+            )
+            .await
+            {
                 Ok(Some(token)) => Some(token),
                 Err(error) => {
                     return Err(anyhow::anyhow!(
