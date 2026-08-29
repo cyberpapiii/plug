@@ -338,6 +338,125 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
+    func testCanReadServerConfigFollowsHandshakeCapability() async throws {
+        let withCapability = try OperatorFixtureServer(
+            events: LockedEvents(),
+            ipcMax: 6,
+            capabilities: ["server_config_read"]
+        )
+        defer { withCapability.stop() }
+        let readable = AppModel(
+            ipc: PlugIPCClient(socketURL: withCapability.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(
+                state: .healthy(makeInstallationSnapshot()),
+                events: LockedEvents()
+            ),
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await readable.start()
+        XCTAssertTrue(readable.canReadServerConfig)
+
+        let withoutCapability = try OperatorFixtureServer(events: LockedEvents())
+        defer { withoutCapability.stop() }
+        let blocked = AppModel(
+            ipc: PlugIPCClient(socketURL: withoutCapability.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(
+                state: .healthy(makeInstallationSnapshot()),
+                events: LockedEvents()
+            ),
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await blocked.start()
+        XCTAssertFalse(blocked.canReadServerConfig)
+    }
+
+    @MainActor
+    func testServerConfigLoadsWhenCapabilityIsPresent() async throws {
+        let events = LockedEvents()
+        let server = try OperatorFixtureServer(
+            events: events,
+            ipcMax: 6,
+            capabilities: ["server_config_read"]
+        )
+        defer { server.stop() }
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(
+                state: .healthy(makeInstallationSnapshot()),
+                events: events
+            ),
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+
+        let config = try await model.serverConfig(name: "workspace")
+        XCTAssertEqual(config.command, "npx")
+        XCTAssertTrue(events.values.contains("ipc.getServerConfig"))
+    }
+
+    @MainActor
+    func testServerConfigDoesNotFireWithoutCapability() async throws {
+        let events = LockedEvents()
+        let server = try OperatorFixtureServer(events: events)
+        defer { server.stop() }
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(
+                state: .healthy(makeInstallationSnapshot()),
+                events: events
+            ),
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        XCTAssertFalse(model.canReadServerConfig)
+
+        do {
+            _ = try await model.serverConfig(name: "workspace")
+            XCTFail("GetServerConfig must not succeed without server_config_read")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                AppModel.serverConfigReadRequiredCopy
+            )
+            XCTAssertFalse(
+                error.localizedDescription.contains("PARSE_ERROR"),
+                "missing capability must not surface as a parse failure"
+            )
+        }
+        XCTAssertFalse(events.values.contains("ipc.getServerConfig"))
+    }
+
+    @MainActor
+    func testOlderHandshakeWithoutV6BlocksGetServerConfig() async throws {
+        let events = LockedEvents()
+        let server = try OperatorFixtureServer(
+            events: events,
+            ipcMin: 3,
+            ipcMax: 4
+        )
+        defer { server.stop() }
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(
+                state: .healthy(makeInstallationSnapshot()),
+                events: events
+            ),
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        XCTAssertEqual(model.connectionState, .ready)
+        XCTAssertFalse(model.canReadServerConfig)
+
+        do {
+            _ = try await model.serverConfig(name: "workspace")
+            XCTFail("older handshake without v6 must not load server config")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, AppModel.serverConfigReadRequiredCopy)
+        }
+        XCTAssertFalse(events.values.contains("ipc.getServerConfig"))
+    }
+
+    @MainActor
     private func makeInstallationSnapshot() -> InstallationSnapshot {
         let executable = URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug")
         let app = VerifiedAppInstallation(
@@ -488,6 +607,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     private let daemonVersion: String
     private let ipcMin: UInt16
     private let ipcMax: UInt16
+    private let capabilities: [String]
     private let lock = NSLock()
     private let serveStopped = DispatchSemaphore(value: 0)
     private(set) var clientVersion: String?
@@ -499,12 +619,14 @@ private final class OperatorFixtureServer: @unchecked Sendable {
         daemonVersion: String = currentTestAppVersion,
         ipcMin: UInt16 = 3,
         ipcMax: UInt16 = 4,
+        capabilities: [String] = [],
         socketURL providedSocketURL: URL? = nil
     ) throws {
         self.events = events
         self.daemonVersion = daemonVersion
         self.ipcMin = ipcMin
         self.ipcMax = ipcMax
+        self.capabilities = capabilities
         self.socketURL = providedSocketURL
             ?? URL(fileURLWithPath: "/tmp/plug-app-model-\(UUID().uuidString).sock")
         listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -578,7 +700,18 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                         "type": "OperatorHandshake",
                         "handshake": [
                             "daemon_version": daemonVersion, "ipc_min": ipcMin, "ipc_max": ipcMax,
-                            "ownership": "app", "capabilities": [],
+                            "ownership": "app", "capabilities": capabilities,
+                        ],
+                    ], to: accepted)
+                case "GetServerConfig":
+                    events.append("ipc.getServerConfig")
+                    send(response: [
+                        "type": "ServerConfig",
+                        "name": object["name"] as? String ?? "",
+                        "server": [
+                            "command": "npx",
+                            "args": ["-y", "linear-mcp"],
+                            "transport": "stdio",
                         ],
                     ], to: accepted)
                 case "OperatorSnapshot":
