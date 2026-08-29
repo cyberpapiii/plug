@@ -130,9 +130,9 @@ Optional future scope only:
 - further low-priority simplification of internal reload/session/SSE helper structure
 - further optional modern follow-through behind gates (`subscriptions/listen`, mixed-era MRTR, task+MRTR) when production clients speak 2026
 
-Exists off-main, not done on `main`: PR #124 (`fix/leftover-homebrew-launchd-adopt`, HEAD `3faa312`) leftover Homebrew launchd adopt, shared classify, handshake `unknown`/`stale`, app-side `GetServerConfig` gate, doctor adopt copy, persist comment pin, PlugIPC goldens.
+Done on `main` via PR #124 (`a02ab18`): leftover Homebrew launchd adopt, shared leftover-path classify, handshake inspect errors mapped to `unknown` (fail-closed, never `Unmanaged`), app-managed staleness kept launchd-local with no handshake `stale` field, app-side `GetServerConfig` gate, doctor leftover copy, persist comment pin, PlugIPC goldens.
 
-Still remaining after that lands: live ChatGPT, Codex, Cursor, OpenCode, and WebKit passkey ceremonies; file splits of `misc.rs` / `clients.rs` / `ipc.rs`.
+Still remaining: live formula rehearsal before the next tag; live ChatGPT, Codex, Cursor, OpenCode, and WebKit passkey ceremonies; file splits of `misc.rs` / `clients.rs` / `ipc.rs`; #125 credential redaction (decision); #126 and #127 post-merge cleanups; #129 generated leftover-path tables.
 
 Current operator rollout: this Mac runs the unified `v0.8.1` macOS
 distribution. Plug.app, the CLI, and the daemon runtime ship as one

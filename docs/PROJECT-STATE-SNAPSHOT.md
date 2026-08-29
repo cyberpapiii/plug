@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `66b8d7a` (`docs: record live v0.8.1 rollout`, PR #123) on 2026-08-26.
+Baseline: `main` through `a02ab18` (`Merge pull request #124 from cyberpapiii/fix/leftover-homebrew-launchd-adopt`) on 2026-08-28.
 
 This is the canonical current-state doc for the project.
 
@@ -110,7 +110,8 @@ Implemented on `main`:
 - native macOS 14+ Plug.app with one shared verdict model, a glanceable menu-bar surface, and full operator workspaces for servers, tools, connections, activity, settings, and upstream reauthorization
 - human/CLI feature parity for normal operation: server add/import/edit/remove and enablement, per-tool enablement with wildcard-safe behavior, local client linking, remote-grant revocation, activity attribution, checkup, reload, restart, logs, and sign-out
 - daemon operator IPC for version negotiation, health/inventory snapshots, bounded activity history, server lifecycle mutations, and downstream grant revocation; the app and CLI remain clients of the same daemon authority
-- app-owned launchd lifecycle with first-run adoption of legacy daemon installs, single-flight startup, visible bounded failure handling, and a bundled universal Plug daemon so the app is standalone
+- app-owned launchd lifecycle with first-run adoption of legacy daemon installs, leftover Homebrew Cellar/bin launchd adopt after formula uninstall, shared leftover-path classify pinned by `testdata/legacy_plug_programs.json`, handshake inspect errors mapped to `unknown` (fail-closed, never `Unmanaged`), app-managed staleness kept launchd-local with no handshake `stale` field, single-flight startup, visible bounded failure handling, and a bundled universal Plug daemon so the app is standalone
+- Edit Server `GetServerConfig` gated on app-side `server_config_read`; operator IPC overlap documented with `OPERATOR_IPC_MIN` at 3; doctor leftover copy; `persist_config_atomic` comment drop; PlugIPC golden payloads (PR #124)
 - direct Developer ID distribution as a signed, notarized, stapled DMG with Sparkle 2 signed updates and a Homebrew cask using the identical artifact
 - official prerelease MCP 2026 server conformance at 22 passed, 0 failed, including request-scoped progress streaming, concrete resource-template routing, and `enable_prefix = false` behavior
 
@@ -122,7 +123,7 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-PR #124 (`fix/leftover-homebrew-launchd-adopt`, HEAD `3faa312`) exists off-main. It is not done on `main`. The stack adopts leftover Homebrew Cellar/bin launchd after formula uninstall, shares one leftover path table, maps launchctl inspect errors to handshake `unknown` (never `Unmanaged`), adds handshake `stale`, gates Edit Server `GetServerConfig` on app-side `server_config_read`, documents operator IPC overlap with `MIN=3`, aligns doctor leftover copy with Turn On/adopt, pins `persist_config_atomic` comment drop, and adds PlugIPC golden payloads.
+No roadmap-affecting work currently exists off-main.
 
 The native operator app, its daemon API and lifecycle ownership, distribution automation,
 and the 22/22 official modern server conformance fixes landed on `main` in
@@ -131,8 +132,10 @@ PR #96 (`52b2c7b`); the public-install daemon-adoption repair landed in PR #101
 (`b045000`), and the Swift 6-safe ServiceManagement adoption repair landed in
 PR #105 (`6dcfc1b`). The complete menu-bar/operator overhaul landed in PR #121
 (`163bc87`), the real cold-start lifecycle repair landed in PR #122
-(`a197f65`), and the live v0.8.1 rollout record landed in PR #123
-(`66b8d7a`).
+(`a197f65`), the live v0.8.1 rollout record landed in PR #123
+(`66b8d7a`), and leftover Homebrew launchd adopt plus fail-closed ownership
+`unknown` landed in PR #124 (`a02ab18`). App-managed staleness stays
+launchd-local; handshake `stale` is not on the wire.
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. This Mac enables only the proven
@@ -385,7 +388,9 @@ Use docs by role:
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
 6. live client certs still missing: ChatGPT, Codex, Cursor, OpenCode, and a real WebKit platform-passkey ceremony
-7. after leftover-adopt U1–U5 land on `main`: split doctor/unified snapshot out of `plug/src/commands/misc.rs` (2328), `clients.rs` (1870), and `plug-core/src/ipc.rs` (1788). Diagnosis does not belong in `misc.rs`
+7. live formula rehearsal before the next tag: install formula, let the daemon start, brew uninstall, open Plug.app, Turn On. CI doubles do not prove that race
+8. split doctor/unified snapshot out of `plug/src/commands/misc.rs`, `clients.rs`, and `plug-core/src/ipc.rs`. Diagnosis does not belong in `misc.rs`
+9. #125 is a live secret-exposure decision (`GetServerConfig` returns full credential material to any auth-token holder), not a versioning question. #126 and #127 are post-merge cleanups and do not gate a release. #129 is generating leftover-path classify tables from the shared fixture
 
 ## Audit Artifacts
 
