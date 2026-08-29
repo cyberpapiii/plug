@@ -117,6 +117,7 @@ impl LegacySseClientTransport {
     pub fn from_config(config: LegacySseTransportConfig) -> Self {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(crate::server::UPSTREAM_CONNECT_TIMEOUT)
             .build()
             .expect("build reqwest client");
         Self(WorkerTransport::spawn(LegacySseWorker { client, config }))
