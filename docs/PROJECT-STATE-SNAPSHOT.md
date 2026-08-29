@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `9c60617` (`perf: cut per-invocation, launchd, and startup work out of the hot paths (#144)`) on 2026-08-29, plus the change that carries this revision.
+Baseline: `main` through `9695a09` (`fix: bind the daemon IPC socket before upstream startup (#146)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -189,9 +189,7 @@ the app at all. A handshake reporting `unknown` ownership blocks instead of
 publishing repairable drift, since drift is retried on every trigger and
 `unknown` is an absence of evidence rather than a disagreement. Booting a legacy
 launchd job out re-reads the job's program first, because `launchctl bootout`
-addresses a job by label and a label is not an identity. The socket-bind
-ordering that produced all of this is recorded in `docs/RISKS.md`; the damage is
-contained, not removed.
+addresses a job by label and a label is not an identity.
 
 A performance pass on the same day (PR #144) removed work from three hot paths
 by subtraction. `maybe_delegate_to_app` runs before Clap parsing on every
@@ -210,8 +208,22 @@ starts with `chunks(startup_concurrency)`, which made every server in a batch
 wait for the slowest one before the next batch could begin, and now uses one
 `JoinSet` behind a semaphore so a freed permit goes straight to the next server;
 `startup_concurrency` defaults to 12 rather than 3, because a start is process
-spawn and handshake rather than computation. Total cold start is still bounded
-by the slowest upstream, since the socket-bind ordering above is unchanged.
+spawn and handshake rather than computation.
+
+PR #146 then removed the ordering that produced the whole reliability pass.
+`cmd_daemon` claimed the runtime lock, ran `Engine::start` to completion, and
+only then bound the Unix socket, so a healthy cold start was indistinguishable
+from an absent daemon for as long as the slowest upstream took. `Engine::start`
+now runs alongside the daemon and the IPC socket binds immediately, so the
+daemon is discoverable the moment it owns the lock.
+
+No answer goes out early. Capability negotiation happens once per session and is
+never revisited, so a client told the daemon has no tools would have no way to
+learn otherwise; that answer and every MCP request wait on an `Engine` readiness
+signal instead, and the client-visible contract is unchanged. Downstream HTTP
+deliberately keeps the old ordering, because a remote client cannot be told the
+catalog grew. Total cold start is therefore still bounded by the slowest
+upstream: a multiplexer cannot describe a catalog it has not finished reading.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
