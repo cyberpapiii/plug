@@ -5,7 +5,7 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.2] - 2026-08-29
 
 ### Fixed
 
@@ -49,6 +49,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   starting rather than stopped while a cold start is in flight. The socket is
   bound only once every upstream is up, so for tens of seconds a healthy daemon
   looked absent, which invited a repair that fought the start.
+- One unreachable server can no longer hold up every other server's startup.
+  The HTTP and legacy SSE upstream clients were built without a connect
+  timeout, so a host that never answers ran until the per-server start timeout
+  expired; both now use a ten-second connect bound. OAuth metadata discovery on
+  the start path is bounded too, at a sixth of that server's own start budget,
+  because the client rmcp builds for it carries a thirty-second timeout and no
+  connect bound — exactly the default start timeout, so one unreachable OAuth
+  host could consume a server's entire budget. A recorded cold start took
+  32.65 s across thirteen servers, of which one server spent 30.18 s inside
+  discovery.
 
 ### Changed
 
@@ -56,6 +66,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   dependencies emit no debug info at all. Panic backtraces still resolve to
   file and line. A cold `cargo build --workspace --all-targets` drops from 40
   to 31 seconds and from 5.05 GB to 3.34 GB.
+- Plug.app asks the daemon for the tool list only when it would answer
+  differently. The daemon now reports a tool catalog revision on the cheap
+  status snapshot; the app used to refetch the whole catalog on a fifteen-second
+  timer because it assembled its own fingerprint from server fields and so could
+  not see a tool disabled from the CLI. The app also reuses the handshake it
+  already negotiated on an open connection instead of renegotiating on every
+  poll.
+- The operator status snapshot no longer carries upstream branding icons. An
+  icon is a base64 data URI, and two servers advertising large ones were about
+  half of a snapshot that is polled every couple of seconds. Tool listings still
+  carry icons, which is where a client renders them, and `plug servers --output
+  json` is unchanged. Together with the catalog change, thirty seconds of app
+  polling drops from roughly 1918 KiB across 45 round trips to roughly 262 KiB
+  across 30.
 
 ## [0.8.1] - 2026-08-26
 
