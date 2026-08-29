@@ -430,12 +430,12 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     if crate::daemon::test_runtime_paths_active() {
         anyhow::bail!("test daemon unavailable; refusing to mutate launchd");
     }
-    // A held runtime lock means a daemon claimed the singleton and is inside
-    // `Engine::start`, which runs before the IPC socket is bound. Kickstarting
-    // now would SIGKILL that healthy cold start and begin it again, and a second
-    // client arriving would do it once more. Plug.app stopped force-kickstarting
-    // inside its verification loop for this reason; the CLI drives the same
-    // daemon and needs the same restraint.
+    // A held runtime lock with no socket means a daemon claimed the singleton
+    // and has not finished binding yet. Kickstarting now would SIGKILL that
+    // healthy cold start and begin it again, and a second client arriving would
+    // do it once more. Plug.app stopped force-kickstarting inside its
+    // verification loop for this reason; the CLI drives the same daemon and
+    // needs the same restraint.
     if crate::daemon::runtime_lock_is_held() {
         return wait_for_daemon_socket(false, true).await;
     }
