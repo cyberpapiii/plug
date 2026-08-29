@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `1eaed81` (`fix: keep a status probe from defeating a daemon start (#142)`) on 2026-08-29, plus the change that carries this revision.
+Baseline: `main` through `9c60617` (`perf: cut per-invocation, launchd, and startup work out of the hot paths (#144)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -192,6 +192,26 @@ launchd job out re-reads the job's program first, because `launchctl bootout`
 addresses a job by label and a label is not an identity. The socket-bind
 ordering that produced all of this is recorded in `docs/RISKS.md`; the damage is
 contained, not removed.
+
+A performance pass on the same day (PR #144) removed work from three hot paths
+by subtraction. `maybe_delegate_to_app` runs before Clap parsing on every
+invocation, and delegation exists only to choose which binary should run; when
+the running executable is already a bundle executable there is nothing left to
+choose, so it now returns on a path comparison instead of spending a `codesign`
+walk and two subprocess spawns re-proving the code already executing. Bundle
+integrity stays covered by `plug doctor` and by the app's own reconciliation. A
+bundle executable measured 68.8 ms per invocation before and 7.7 ms after, which
+matters most for `plug connect`, the path every local MCP client takes. The
+app's launchd inspection ran `launchctl print` over every label `launchctl list`
+returned, and Apple reserves the `com.apple.` namespace for OS services that no
+Plug install path has ever used; excluding it took a real login session from 563
+prints and 1.117 s to 59 prints and 0.115 s. `Engine::start_all` batched server
+starts with `chunks(startup_concurrency)`, which made every server in a batch
+wait for the slowest one before the next batch could begin, and now uses one
+`JoinSet` behind a semaphore so a freed permit goes straight to the next server;
+`startup_concurrency` defaults to 12 rather than 3, because a start is process
+spawn and handshake rather than computation. Total cold start is still bounded
+by the slowest upstream, since the socket-bind ordering above is unchanged.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
