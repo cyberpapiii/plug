@@ -296,7 +296,18 @@ Then clean build/deploy artifacts with:
 scripts/clean-build-artifacts.sh --yes
 ```
 
-Use `--runtime-cache` only when old `plug://artifact/...` result files are no longer needed. The cleanup script never removes Plug config, OAuth tokens, sockets, PID files, or installed binaries.
+Use `--runtime-cache` only when old `plug://artifact/...` result files are no longer needed. The cleanup script never removes Plug config, OAuth tokens, sockets, PID files, installed binaries, or the shared `~/.cargo/registry`.
+
+Narrower modes exist when a full clean is more than you want:
+
+| Mode | Removes |
+| --- | --- |
+| `--guard` | regenerable caches, and only when `target/` is over budget. Silent otherwise, so it is safe to run after every build. `scripts/dev.sh` and the pre-push hook call it for you. |
+| `--incremental` | `target/*/incremental` |
+| `--litter` | `*.profraw`, `*.profdata`, `.DS_Store`, `/tmp/plug-*` audit directories |
+| `--xcode` | this project's Xcode DerivedData |
+
+The `--guard` budget defaults to 10 GB against a measured 4.2 GB steady-state working set. Override it with `PLUG_TARGET_BUDGET_GB`.
 
 For local source reinstalls, the cleanup can be folded into the reinstall command:
 
