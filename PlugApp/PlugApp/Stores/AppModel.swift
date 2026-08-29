@@ -68,6 +68,13 @@ final class AppModel {
     /// The daemon accepts per-tool switches. Older daemons do not, and the
     /// interface hides the switches rather than offering a button that fails.
     var canManageTools: Bool { capabilities.contains("tool_mutation") }
+    /// The daemon can return one complete server definition. Older daemons
+    /// cannot, and Edit Server must not send GetServerConfig until they can.
+    var canReadServerConfig: Bool { capabilities.contains("server_config_read") }
+    /// Same restart/update sentence Edit Server shows when that capability is
+    /// missing, so a Save that never fires is not mistaken for a parse error.
+    nonisolated static let serverConfigReadRequiredCopy =
+        "Restart required to finish update. The app and its background service are running different versions."
     /// Someone is looking at Plug right now, so refresh briskly. Nothing is
     /// visible otherwise, and a background poll every few seconds is rude to
     /// a laptop battery for information no one is reading.
@@ -357,6 +364,9 @@ final class AppModel {
     }
 
     func serverConfig(name: String) async throws -> ServerConfig {
+        guard canReadServerConfig else {
+            throw ServerConfigReadRequiredError()
+        }
         let token = try String(contentsOf: tokenURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard case let .serverConfig(returnedName, config) = try await ipc.request(
@@ -445,4 +455,8 @@ final class AppModel {
         reconciliationTask = task
         await task.value
     }
+}
+
+private struct ServerConfigReadRequiredError: LocalizedError {
+    var errorDescription: String? { AppModel.serverConfigReadRequiredCopy }
 }

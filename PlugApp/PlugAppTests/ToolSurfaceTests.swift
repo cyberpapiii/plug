@@ -198,6 +198,32 @@ final class EditServerEnvironmentTests: XCTestCase {
         XCTAssertTrue(EditServerView.parseEnvironment("   \n ").isEmpty)
     }
 
+    func testSaveStaysDisabledWithoutServerConfigRead() {
+        XCTAssertFalse(
+            EditServerView.canSave(
+                canReadServerConfig: false,
+                loaded: true,
+                isComplete: true,
+                saving: false
+            )
+        )
+        XCTAssertTrue(
+            EditServerView.canSave(
+                canReadServerConfig: true,
+                loaded: true,
+                isComplete: true,
+                saving: false
+            )
+        )
+    }
+
+    func testMissingCapabilityCopyIsRestartUpdateNotParseError() {
+        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("Restart"))
+        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("update"))
+        XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("PARSE_ERROR"))
+        XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("could not be loaded"))
+    }
+
     func testArgumentsRoundTripThroughTheDisplayedCommandLine() {
         let arguments = ["-y", "a package", "", "it's-safe", #"a\"quote"#]
         XCTAssertEqual(

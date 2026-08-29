@@ -36,6 +36,7 @@
 		763622F2CD115FC4B56D8537 /* ConnectionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4421712FD919B5174C54F8E1 /* ConnectionsView.swift */; };
 		8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */; };
 		9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */; };
+		9263B9DB0E85D3D9246BCB9C /* legacy_plug_programs.json in Resources */ = {isa = PBXBuildFile; fileRef = 4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */; };
 		B2857C070B5C6292A2B38282 /* AppInstallationInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */; };
 		B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */; };
 		B4705E82E33B265C78BAB13A /* PlugIPC in Frameworks */ = {isa = PBXBuildFile; productRef = 17AE7DC1CCB3C84D1993523B /* PlugIPC */; };
@@ -92,6 +93,7 @@
 		406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspectorTests.swift; sourceTree = "<group>"; };
 		4421712FD919B5174C54F8E1 /* ConnectionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionsView.swift; sourceTree = "<group>"; };
 		44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PlugApp.entitlements; sourceTree = "<group>"; };
+		4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = legacy_plug_programs.json; sourceTree = "<group>"; };
 		588717CF2790EF93C4710EE6 /* EditServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerView.swift; sourceTree = "<group>"; };
 		59D35A236F003E96A80E9E08 /* ToolSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolSurfaceTests.swift; sourceTree = "<group>"; };
 		64E2869334004AD1B34ADA93 /* InstallationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationState.swift; sourceTree = "<group>"; };
@@ -208,6 +210,15 @@
 			path = PlugAppTests;
 			sourceTree = "<group>";
 		};
+		557E637F362ACE0FA43BA7C8 /* testdata */ = {
+			isa = PBXGroup;
+			children = (
+				4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */,
+			);
+			name = testdata;
+			path = ../testdata;
+			sourceTree = "<group>";
+		};
 		6B86EBCEF490E4D63DAFD1A6 /* Tools */ = {
 			isa = PBXGroup;
 			children = (
@@ -258,6 +269,7 @@
 				04A36C8D6B6A4C24BB4D517B /* Packages */,
 				CE4F4A93CF523388BD54586E /* PlugApp */,
 				4D7C2B22591EE4E275C9260F /* PlugAppTests */,
+				557E637F362ACE0FA43BA7C8 /* testdata */,
 				7AA042891B4B51AA69A0DAFB /* Products */,
 			);
 			sourceTree = "<group>";
@@ -358,6 +370,7 @@
 			buildConfigurationList = 063499F74E51D70A39A9CE5B /* Build configuration list for PBXNativeTarget "PlugAppTests" */;
 			buildPhases = (
 				514056FA5DC4AF9DB353FB22 /* Sources */,
+				B60F98F8DCA18488B8E18A9C /* Resources */,
 			);
 			buildRules = (
 			);
@@ -433,6 +446,14 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		B60F98F8DCA18488B8E18A9C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9263B9DB0E85D3D9246BCB9C /* legacy_plug_programs.json in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		C366AFBEA8B4A0A39020327B /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;

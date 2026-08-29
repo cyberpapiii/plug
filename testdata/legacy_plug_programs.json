@@ -1,0 +1,22 @@
+{
+  "recognized": [
+    "/opt/homebrew/bin/plug",
+    "/usr/local/bin/plug",
+    "/opt/homebrew/opt/plug/bin/plug",
+    "/usr/local/opt/plug/bin/plug",
+    "/opt/homebrew/Cellar/plug/0.6.3/bin/plug",
+    "/usr/local/Cellar/plug/0.7.0/bin/plug"
+  ],
+  "home_recognized_suffixes": [
+    ".cargo/bin/plug",
+    ".local/bin/plug"
+  ],
+  "unrecognized": [
+    "/tmp/not-plug",
+    "/tmp/attacker/.cargo/bin/plug",
+    "/tmp/attacker/.local/bin/plug",
+    "/opt/homebrew/Cellar/wget/1.0/bin/plug",
+    "/opt/homebrew/Cellar/plug/0.6.3/lib/plug",
+    "/opt/homebrew/Cellar/plug/0.6.3/bin/other"
+  ]
+}

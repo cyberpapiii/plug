@@ -90,6 +90,29 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(snapshot.downstreamClients.first?.clientId, "remote-1")
     }
 
+    func testOperatorHandshakeDecodesUnknownOwnership() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let unknownPayload = Data(#"""
+        {
+          "type": "OperatorHandshake",
+          "handshake": {
+            "daemon_version": "0.7.0",
+            "ipc_min": 3,
+            "ipc_max": 6,
+            "ownership": "unknown",
+            "capabilities": []
+          }
+        }
+        """#.utf8)
+
+        guard case let .handshake(unknown) = try decoder.decode(IPCResponse.self, from: unknownPayload) else {
+            return XCTFail("handshake response expected")
+        }
+        XCTAssertEqual(unknown.ownership, "unknown")
+    }
+
     func testServerConfigRequestAndResponseRoundTripAdvancedFields() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let request = IPCRequest.serverConfig(authToken: "secret", name: "workspace")

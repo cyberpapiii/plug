@@ -68,6 +68,20 @@ final class DaemonServiceManager {
         try await inspectWithHandshake(canonical: canonical, legacyPaths: legacyPaths).snapshot
     }
 
+    func bootOutRecognizedLegacy(_ snapshot: DaemonServiceSnapshot) async throws {
+        guard case let .recognizedLegacy(records) = snapshot.ownership else { return }
+        let homebrew = records.filter { record in
+            record.programURL.map(LegacyPlugProgram.isHomebrew) == true
+        }
+        guard !homebrew.isEmpty else { return }
+        guard homebrew.allSatisfy({ $0.programURL != nil }) else {
+            throw DaemonServiceError.invalidJobEvidence
+        }
+        for record in homebrew {
+            try await backend.bootOut(record)
+        }
+    }
+
     func adoptRecognizedLegacy(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
@@ -76,16 +90,31 @@ final class DaemonServiceManager {
             throw DaemonServiceError.adoptionRequired
         }
         let canonical = try await verifiedApp(expectedVersion: expectedVersion)
+        let inspectionPaths = inspectionPaths(including: snapshot)
         let current = try await launchdInspector.daemonJobs(
             canonical: canonical,
-            recognizedLegacyPaths: legacyPaths
+            recognizedLegacyPaths: inspectionPaths
         )
-        guard current == snapshot.ownership else { throw DaemonServiceError.evidenceChanged }
+        let bootOutLoadedJobs: Bool
+        switch current {
+        case .unmanaged:
+            // Formula uninstall or a prior bootout may have already dropped
+            // the leftover job. Register from the inspect-time snapshot.
+            bootOutLoadedJobs = false
+        case .recognizedLegacy:
+            bootOutLoadedJobs = true
+        case .unknown:
+            throw DaemonServiceError.unknownOwnership
+        case .appManagedCurrent, .appManagedStale:
+            throw DaemonServiceError.unknownOwnership
+        }
         return try await replace(
             verifiedRecords: records,
             canonical: canonical,
             expectedVersion: expectedVersion,
-            replacingAppRegistration: false
+            replacingAppRegistration: false,
+            inspectionPaths: inspectionPaths,
+            bootOutLoadedJobs: bootOutLoadedJobs
         )
     }
 
@@ -159,7 +188,9 @@ final class DaemonServiceManager {
                 verifiedRecords: [],
                 canonical: canonical,
                 expectedVersion: canonical.appVersion,
-                replacingAppRegistration: false
+                replacingAppRegistration: false,
+                inspectionPaths: inspectionPaths(including: snapshot),
+                bootOutLoadedJobs: true
             )
         case .appManagedCurrent, .appManagedStale:
             _ = try await ensureRunning(expectedVersion: canonical.appVersion)
@@ -243,7 +274,9 @@ final class DaemonServiceManager {
         verifiedRecords: [LaunchdJobRecord],
         canonical: VerifiedAppInstallation,
         expectedVersion: String,
-        replacingAppRegistration: Bool
+        replacingAppRegistration: Bool,
+        inspectionPaths: Set<URL>,
+        bootOutLoadedJobs: Bool
     ) async throws -> OperatorHandshake {
         guard verifiedRecords.allSatisfy({ $0.programURL != nil }) else {
             throw DaemonServiceError.invalidJobEvidence
@@ -259,8 +292,10 @@ final class DaemonServiceManager {
         if replacingAppRegistration {
             try await backend.unregisterAgent()
         } else {
-            for record in verifiedRecords {
-                try await backend.bootOut(record)
+            if bootOutLoadedJobs {
+                for record in verifiedRecords {
+                    try await backend.bootOut(record)
+                }
             }
             if backend.enabled { try await backend.unregisterAgent() }
         }
@@ -278,7 +313,7 @@ final class DaemonServiceManager {
             await backend.waitBeforeRetry()
             let inspection = try await inspectWithHandshake(
                 canonical: canonical,
-                legacyPaths: legacyPaths
+                legacyPaths: inspectionPaths
             )
             actualVersion = inspection.snapshot.daemonVersion
             if case let .appManagedCurrent(record) = inspection.snapshot.ownership,
@@ -314,7 +349,9 @@ final class DaemonServiceManager {
             verifiedRecords: [record],
             canonical: canonical,
             expectedVersion: expectedVersion,
-            replacingAppRegistration: true
+            replacingAppRegistration: true,
+            inspectionPaths: inspectionPaths(including: snapshot),
+            bootOutLoadedJobs: true
         )
     }
 
@@ -330,6 +367,10 @@ final class DaemonServiceManager {
             && record.parentBundleVersion == canonical.buildVersion
             && handshake.daemonExecutable.map { resolved($0) == resolved(canonical.executableURL) } == true
             && handshake.daemonVersion == expectedVersion
+    }
+
+    private func inspectionPaths(including snapshot: DaemonServiceSnapshot) -> Set<URL> {
+        legacyPaths.union(snapshot.ownership.programURLs)
     }
 
     private func verifiedApp(expectedVersion: String) async throws -> VerifiedAppInstallation {
@@ -349,6 +390,8 @@ final class DaemonServiceManager {
         url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
     }
 
+    /// Existence probes for leftover files still on disk. Not the classify table.
+    /// Cellar and brew-bin shapes are classified by `LegacyPlugProgram` even after uninstall.
     private static var defaultLegacyPaths: Set<URL> {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return [

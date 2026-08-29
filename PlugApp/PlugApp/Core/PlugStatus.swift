@@ -296,6 +296,8 @@ enum PlugVerdict {
                 detail: "Finishing installation."
             )
         case .needsPermission:
+            // Leftover launchd still lands here. CLI leftover copy is
+            // LEFTOVER_LAUNCHD_ADOPT_SENTENCE, not this verdict.
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.badge.checkmark",

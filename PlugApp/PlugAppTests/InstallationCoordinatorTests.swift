@@ -67,6 +67,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             [
                 "app.inspect",
                 "legacy.inspect",
+                "daemon.inspect",
                 "legacy.removeFormula",
                 "legacy.repairShell",
                 "clients.inspect",
@@ -360,8 +361,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [healthyService(), healthyService()],
                 handshakes: [handshake(
                     version: canonical.appVersion,
-                    ipcMin: 6,
-                    ipcMax: 6
+                    ipcMin: 7,
+                    ipcMax: 7
                 )]
             ),
             openURL: { _ in }
@@ -691,6 +692,280 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
     }
 
+    func testCellarLeftoverAfterFormulaUninstallIsRecognizedLegacyAndOffersAdopt() async {
+        let events = EventLog()
+        let cellar = cellarJob()
+        let leftover = leftoverService(cellar)
+        let initialLegacy = LegacyInstallSnapshot(
+            formulaInstalled: true,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
+            unknownPaths: []
+        )
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [leftover, leftover]
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .adoptionRequired(snapshot) = coordinator.state else {
+            return XCTFail("Expected leftover Cellar adopt offer, got \(coordinator.state)")
+        }
+        XCTAssertEqual(snapshot.service.ownership, .recognizedLegacy([cellar]))
+        let eventValues = await events.values
+        XCTAssertTrue(eventValues.contains("legacy.removeFormula"))
+        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertLessThan(
+            eventValues.firstIndex(of: "daemon.inspect")!,
+            eventValues.firstIndex(of: "legacy.removeFormula")!
+        )
+    }
+
+    func testBrewBinLeftoverWithEmptyRecognizedPathsIsRecognizedLegacyAndOffersAdopt() async {
+        let events = EventLog()
+        let brewBin = leftoverJob(path: "/opt/homebrew/bin/plug")
+        let leftover = leftoverService(brewBin)
+        let initialLegacy = LegacyInstallSnapshot(
+            formulaInstalled: true,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [],
+            unknownPaths: []
+        )
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [leftover, leftover]
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .adoptionRequired(snapshot) = coordinator.state else {
+            return XCTFail("Expected leftover brew-bin adopt offer, got \(coordinator.state)")
+        }
+        XCTAssertEqual(snapshot.service.ownership, .recognizedLegacy([brewBin]))
+        XCTAssertEqual(daemon.inspectedLegacyPaths.first, [])
+        XCTAssertTrue(daemon.inspectedLegacyPaths.contains { $0.contains(brewBin.programURL!) })
+    }
+
+    func testUnknownTmpProgramOnPlugDaemonStaysUnknown() async {
+        let events = EventLog()
+        let unknown = leftoverJob(path: "/tmp/not-plug")
+        let unknownService = DaemonServiceSnapshot(
+            ownership: .unknown([unknown]),
+            daemonVersion: nil,
+            daemonExecutable: unknown.programURL
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events, inspections: [unknownService]),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .blocked(failure) = coordinator.state else {
+            return XCTFail("Unknown leftover must stay blocked, got \(coordinator.state)")
+        }
+        XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
+        let eventValues = await events.values
+        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
+    }
+
+    func testFormulaAndCellarJobUninstallDoesNotLeaveLoadedCellarProgramAfterAdopt() async {
+        let events = EventLog()
+        let cellar = cellarJob()
+        let daemon = CellarLeftoverDaemonManager(
+            events: events,
+            cellar: cellar,
+            healthy: healthyService(),
+            handshake: handshake(version: canonical.appVersion),
+            appServiceEnabled: true
+        )
+        let initialLegacy = LegacyInstallSnapshot(
+            formulaInstalled: true,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
+            unknownPaths: []
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [initialLegacy, emptyLegacy()]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .healthy(snapshot) = coordinator.state else {
+            return XCTFail("Expected healthy after Cellar adopt replace, got \(coordinator.state)")
+        }
+        XCTAssertFalse(daemon.leftoverLoaded)
+        XCTAssertNotEqual(snapshot.service.ownership, .recognizedLegacy([cellar]))
+        if case let .appManagedCurrent(record) = snapshot.service.ownership {
+            XCTAssertNotEqual(record.programURL, cellar.programURL)
+        } else {
+            XCTFail("Expected app-managed current service, got \(snapshot.service.ownership)")
+        }
+        let eventValues = await events.values
+        XCTAssertLessThan(
+            eventValues.firstIndex(of: "daemon.inspect")!,
+            eventValues.firstIndex(of: "legacy.removeFormula")!
+        )
+        XCTAssertLessThan(
+            eventValues.firstIndex(of: "daemon.bootOutLegacy")!,
+            eventValues.firstIndex(of: "legacy.removeFormula")!
+        )
+        XCTAssertTrue(eventValues.contains("daemon.adopt") || eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(daemon.inspectedLegacyPaths.contains { $0.contains(cellar.programURL!) })
+    }
+
+    func testFormulaUninstallUnloadingCellarJobAdoptsFromPreUninstallSnapshot() async {
+        let events = EventLog()
+        let cellar = cellarJob()
+        let leftover = leftoverService(cellar)
+        let unloaded = DaemonServiceSnapshot(
+            ownership: .unmanaged,
+            daemonVersion: nil,
+            daemonExecutable: nil
+        )
+        let initialLegacy = LegacyInstallSnapshot(
+            formulaInstalled: true,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
+            unknownPaths: []
+        )
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [leftover, unloaded, healthyService()],
+            handshakes: [handshake(version: canonical.appVersion)],
+            appServiceEnabled: true
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [initialLegacy, emptyLegacy()]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .healthy(snapshot) = coordinator.state else {
+            return XCTFail("Unloaded leftover must still adopt from the pre-uninstall snapshot, got \(coordinator.state)")
+        }
+        XCTAssertEqual(snapshot.service.ownership, healthyService().ownership)
+        XCTAssertEqual(daemon.adoptedSnapshots.map(\.ownership), [.recognizedLegacy([cellar])])
+        let eventValues = await events.values
+        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
+        XCTAssertLessThan(
+            eventValues.firstIndex(of: "daemon.inspect")!,
+            eventValues.firstIndex(of: "legacy.removeFormula")!
+        )
+    }
+
+    func testFormulaInstalledWithoutLaunchdJobUninstallsAndLeavesOwnershipUnmanaged() async {
+        let events = EventLog()
+        let unmanaged = DaemonServiceSnapshot(
+            ownership: .unmanaged,
+            daemonVersion: nil,
+            daemonExecutable: nil
+        )
+        let initialLegacy = LegacyInstallSnapshot(
+            formulaInstalled: true,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
+            unknownPaths: []
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events, inspections: [unmanaged]),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .adoptionRequired(snapshot) = coordinator.state else {
+            return XCTFail("Expected unmanaged adopt offer after formula-only uninstall, got \(coordinator.state)")
+        }
+        XCTAssertEqual(snapshot.service.ownership, .unmanaged)
+        let eventValues = await events.values
+        XCTAssertTrue(eventValues.contains("legacy.removeFormula"))
+        XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
+        XCTAssertLessThan(
+            eventValues.firstIndex(of: "daemon.inspect")!,
+            eventValues.firstIndex(of: "legacy.removeFormula")!
+        )
+    }
+
+    func testHomebrewLegacyBootoutFailureStaysBlockedAndDoesNotUninstall() async {
+        let events = EventLog()
+        let cellar = cellarJob()
+        let leftover = leftoverService(cellar)
+        let initialLegacy = LegacyInstallSnapshot(
+            formulaInstalled: true,
+            cargoBinary: nil,
+            shellLink: .canonical(canonical.executableURL),
+            recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
+            unknownPaths: []
+        )
+        let daemon = RecordingDaemonManager(
+            events: events,
+            inspections: [leftover],
+            bootOutError: DaemonServiceError.commandFailed("bootout denied")
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: daemon,
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .blocked(failure) = coordinator.state else {
+            return XCTFail("Bootout failure must stay blocked, got \(coordinator.state)")
+        }
+        XCTAssertEqual(failure.summary, "Plug installation reconciliation failed")
+        XCTAssertTrue(failure.detail.contains("bootout denied"), failure.detail)
+        let eventValues = await events.values
+        XCTAssertTrue(eventValues.contains("daemon.bootOutLegacy"))
+        XCTAssertFalse(eventValues.contains("legacy.removeFormula"))
+    }
+
     func testOpenLogUsesBlockedFailureLogURL() async {
         let events = EventLog()
         let opened = OpenedURL()
@@ -708,6 +983,28 @@ final class InstallationCoordinatorTests: XCTestCase {
         coordinator.openLog()
 
         XCTAssertEqual(opened.value, logURL)
+    }
+
+    private func cellarJob() -> LaunchdJobRecord {
+        leftoverJob(path: "/opt/homebrew/Cellar/plug/0.6.3/bin/plug")
+    }
+
+    private func leftoverJob(path: String) -> LaunchdJobRecord {
+        LaunchdJobRecord(
+            label: "com.plug.daemon",
+            programURL: URL(fileURLWithPath: path),
+            parentBundleIdentifier: nil,
+            parentBundleVersion: nil,
+            loaded: true
+        )
+    }
+
+    private func leftoverService(_ record: LaunchdJobRecord) -> DaemonServiceSnapshot {
+        DaemonServiceSnapshot(
+            ownership: .recognizedLegacy([record]),
+            daemonVersion: "0.6.3",
+            daemonExecutable: record.programURL
+        )
     }
 
     private func emptyLegacy() -> LegacyInstallSnapshot {
@@ -870,17 +1167,22 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
     private var inspections: [DaemonServiceSnapshot]
     private var handshakes: [OperatorHandshake]
     let appServiceEnabled: Bool
+    private let bootOutError: Error?
+    private(set) var inspectedLegacyPaths: [Set<URL>] = []
+    private(set) var adoptedSnapshots: [DaemonServiceSnapshot] = []
 
     init(
         events: EventLog,
         inspections: [DaemonServiceSnapshot] = [],
         handshakes: [OperatorHandshake] = [],
-        appServiceEnabled: Bool = false
+        appServiceEnabled: Bool = false,
+        bootOutError: Error? = nil
     ) {
         self.events = events
         self.inspections = inspections
         self.handshakes = handshakes
         self.appServiceEnabled = appServiceEnabled
+        self.bootOutError = bootOutError
     }
 
     func inspect(
@@ -888,8 +1190,14 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
         legacyPaths: Set<URL>
     ) async throws -> DaemonServiceSnapshot {
         await events.append("daemon.inspect")
+        inspectedLegacyPaths.append(legacyPaths)
         if inspections.count > 1 { return inspections.removeFirst() }
         return inspections.first ?? DaemonServiceSnapshot(ownership: .unmanaged, daemonVersion: nil, daemonExecutable: nil)
+    }
+
+    func bootOutRecognizedLegacy(_ snapshot: DaemonServiceSnapshot) async throws {
+        await events.append("daemon.bootOutLegacy")
+        if let bootOutError { throw bootOutError }
     }
 
     func adoptRecognizedLegacy(
@@ -897,6 +1205,7 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
         expectedVersion: String
     ) async throws -> OperatorHandshake {
         await events.append("daemon.adoptLegacy")
+        adoptedSnapshots.append(snapshot)
         return handshakes.removeFirst()
     }
 
@@ -917,6 +1226,88 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
 
     func adopt() async throws {
         await events.append("daemon.adopt")
+    }
+}
+
+@MainActor
+private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
+    private let events: EventLog
+    private let cellar: LaunchdJobRecord
+    private let healthy: DaemonServiceSnapshot
+    private let handshake: OperatorHandshake
+    let appServiceEnabled: Bool
+    private(set) var leftoverLoaded: Bool
+    private(set) var adopted = false
+    private(set) var inspectedLegacyPaths: [Set<URL>] = []
+    private(set) var adoptedSnapshots: [DaemonServiceSnapshot] = []
+
+    init(
+        events: EventLog,
+        cellar: LaunchdJobRecord,
+        healthy: DaemonServiceSnapshot,
+        handshake: OperatorHandshake,
+        appServiceEnabled: Bool
+    ) {
+        self.events = events
+        self.cellar = cellar
+        self.healthy = healthy
+        self.handshake = handshake
+        self.appServiceEnabled = appServiceEnabled
+        leftoverLoaded = true
+    }
+
+    func inspect(
+        canonical: VerifiedAppInstallation,
+        legacyPaths: Set<URL>
+    ) async throws -> DaemonServiceSnapshot {
+        await events.append("daemon.inspect")
+        inspectedLegacyPaths.append(legacyPaths)
+        if leftoverLoaded {
+            return DaemonServiceSnapshot(
+                ownership: .recognizedLegacy([cellar]),
+                daemonVersion: "0.6.3",
+                daemonExecutable: cellar.programURL
+            )
+        }
+        if adopted {
+            return healthy
+        }
+        return DaemonServiceSnapshot(ownership: .unmanaged, daemonVersion: nil, daemonExecutable: nil)
+    }
+
+    func bootOutRecognizedLegacy(_ snapshot: DaemonServiceSnapshot) async throws {
+        await events.append("daemon.bootOutLegacy")
+        leftoverLoaded = false
+    }
+
+    func adoptRecognizedLegacy(
+        snapshot: DaemonServiceSnapshot,
+        expectedVersion: String
+    ) async throws -> OperatorHandshake {
+        await events.append("daemon.adoptLegacy")
+        adoptedSnapshots.append(snapshot)
+        leftoverLoaded = false
+        adopted = true
+        return handshake
+    }
+
+    func replaceStaleAppService(
+        snapshot: DaemonServiceSnapshot,
+        expectedVersion: String
+    ) async throws -> OperatorHandshake {
+        await events.append("daemon.replaceStale")
+        return handshake
+    }
+
+    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
+        await events.append("daemon.ensureRunning")
+        return handshake
+    }
+
+    func adopt() async throws {
+        await events.append("daemon.adopt")
+        leftoverLoaded = false
+        adopted = true
     }
 }
 

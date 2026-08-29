@@ -21,6 +21,12 @@ pub enum LaunchdProgramOwnership {
     Unknown,
 }
 
+/// CLI leftover-launchd sentence. The app leftover path still uses the generic
+/// "Background running is off" / Turn On verdict, not this string.
+#[cfg(any(target_os = "macos", test))]
+pub const LEFTOVER_LAUNCHD_ADOPT_SENTENCE: &str =
+    "Open Plug.app and tap Turn On to adopt the leftover launchd daemon.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceOwnership {
     Unmanaged,
@@ -79,13 +85,16 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn is_recognized_legacy_program(program: &Path) -> bool {
+/// Keep in lockstep with `LegacyPlugProgram.isRecognized` in Plug.app.
+/// Both are pinned by `testdata/legacy_plug_programs.json`.
+pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
     if program.file_name().and_then(|name| name.to_str()) != Some("plug") {
         return false;
     }
 
     let is_cargo_binary =
         dirs::home_dir().is_some_and(|home| program == home.join(".cargo/bin/plug"));
+    let is_local_bin = dirs::home_dir().is_some_and(|home| program == home.join(".local/bin/plug"));
     let is_formula_cellar_binary = [
         Path::new("/opt/homebrew/Cellar/plug"),
         Path::new("/usr/local/Cellar/plug"),
@@ -99,12 +108,14 @@ fn is_recognized_legacy_program(program: &Path) -> bool {
     });
 
     is_cargo_binary
+        || is_local_bin
         || program == Path::new("/opt/homebrew/bin/plug")
         || program == Path::new("/usr/local/bin/plug")
+        || program == Path::new("/opt/homebrew/opt/plug/bin/plug")
+        || program == Path::new("/usr/local/opt/plug/bin/plug")
         || is_formula_cellar_binary
 }
 
-#[allow(dead_code)] // Consumed by unified installation diagnosis in the next rollout task.
 pub fn classify_launchd_program(
     job: &LaunchdJobRecord,
     current_app_executable: Option<&Path>,
@@ -285,7 +296,7 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
     let output = Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{LABEL}")])
         .output()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(ServiceState {
         ownership: classify_launchctl_output(&text, plist_path.exists()),
         loaded: output.status.success(),
@@ -293,11 +304,18 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
     })
 }
 
+fn map_service_ownership(ownership: ServiceOwnership) -> plug_core::ipc::DaemonOwnershipMode {
+    match ownership {
+        ServiceOwnership::AppManaged => plug_core::ipc::DaemonOwnershipMode::AppManaged,
+        ServiceOwnership::CliManaged => plug_core::ipc::DaemonOwnershipMode::CliManaged,
+        ServiceOwnership::Unmanaged => plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+    }
+}
+
 pub fn ipc_ownership() -> plug_core::ipc::DaemonOwnershipMode {
-    match inspect().map(|state| state.ownership) {
-        Ok(ServiceOwnership::AppManaged) => plug_core::ipc::DaemonOwnershipMode::AppManaged,
-        Ok(ServiceOwnership::CliManaged) => plug_core::ipc::DaemonOwnershipMode::CliManaged,
-        Ok(ServiceOwnership::Unmanaged) | Err(_) => plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+    match inspect() {
+        Err(_) => plug_core::ipc::DaemonOwnershipMode::Unknown,
+        Ok(state) => map_service_ownership(state.ownership),
     }
 }
 
@@ -542,6 +560,91 @@ mod tests {
             classify_launchd_program(&job, None),
             LaunchdProgramOwnership::Unknown
         );
+    }
+
+    #[test]
+    fn opt_plug_program_is_recognized() {
+        assert!(is_recognized_legacy_program(Path::new(
+            "/opt/homebrew/opt/plug/bin/plug"
+        )));
+        assert!(is_recognized_legacy_program(Path::new(
+            "/usr/local/opt/plug/bin/plug"
+        )));
+    }
+
+    #[test]
+    fn homebrew_bin_and_local_bin_programs_are_recognized() {
+        assert!(is_recognized_legacy_program(Path::new(
+            "/opt/homebrew/bin/plug"
+        )));
+        assert!(is_recognized_legacy_program(Path::new(
+            "/usr/local/bin/plug"
+        )));
+        let local_bin = dirs::home_dir().unwrap().join(".local/bin/plug");
+        let job = LaunchdJobRecord {
+            label: "legacy.plug".to_string(),
+            program: local_bin.clone(),
+        };
+        assert!(is_recognized_legacy_program(&local_bin));
+        assert_eq!(
+            classify_launchd_program(&job, None),
+            LaunchdProgramOwnership::RecognizedLegacyPlug
+        );
+        let brew_bin = LaunchdJobRecord {
+            label: "legacy.plug".to_string(),
+            program: PathBuf::from("/opt/homebrew/bin/plug"),
+        };
+        assert_eq!(
+            classify_launchd_program(&brew_bin, None),
+            LaunchdProgramOwnership::RecognizedLegacyPlug
+        );
+    }
+
+    #[test]
+    fn inspect_error_maps_to_unknown_not_unmanaged() {
+        let ownership = match Result::<ServiceState, anyhow::Error>::Err(anyhow::anyhow!(
+            "launchctl unavailable"
+        )) {
+            Err(_) => plug_core::ipc::DaemonOwnershipMode::Unknown,
+            Ok(state) => map_service_ownership(state.ownership),
+        };
+        assert_eq!(ownership, plug_core::ipc::DaemonOwnershipMode::Unknown);
+        assert_ne!(ownership, plug_core::ipc::DaemonOwnershipMode::Unmanaged);
+    }
+
+    #[test]
+    fn recognized_legacy_programs_match_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            recognized: Vec<String>,
+            home_recognized_suffixes: Vec<String>,
+            unrecognized: Vec<String>,
+        }
+
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../testdata/legacy_plug_programs.json"))
+                .expect("shared leftover-path fixture");
+        for path in fixture.recognized {
+            assert!(
+                is_recognized_legacy_program(Path::new(&path)),
+                "expected recognized: {path}"
+            );
+        }
+        let home = dirs::home_dir().expect("home directory");
+        for suffix in fixture.home_recognized_suffixes {
+            let path = home.join(&suffix);
+            assert!(
+                is_recognized_legacy_program(&path),
+                "expected recognized: {}",
+                path.display()
+            );
+        }
+        for path in fixture.unrecognized {
+            assert!(
+                !is_recognized_legacy_program(Path::new(&path)),
+                "expected unrecognized: {path}"
+            );
+        }
     }
 
     #[test]

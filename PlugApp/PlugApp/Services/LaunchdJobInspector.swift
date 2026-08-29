@@ -57,8 +57,11 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         }
 
         let recognized = relevant.filter { record in
-            guard let program = record.programURL.map(Self.resolvedPath) else { return false }
+            guard let programURL = record.programURL else { return false }
+            let program = Self.resolvedPath(programURL)
             return legacyPaths.contains(program)
+                || LegacyPlugProgram.isRecognized(programURL)
+                || LegacyPlugProgram.isRecognized(program)
         }
         if recognized.count == relevant.count {
             return .recognizedLegacy(recognized)

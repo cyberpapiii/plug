@@ -27,7 +27,9 @@ struct EditServerView: View {
         VStack(alignment: .leading, spacing: Metric.regular) {
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text("Edit \(name)").font(.title2.weight(.semibold))
-                Text("Changes take effect as soon as you save.")
+                Text(model.canReadServerConfig
+                    ? "Changes take effect as soon as you save."
+                    : AppModel.serverConfigReadRequiredCopy)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -71,12 +73,26 @@ struct EditServerView: View {
                 Button(saving ? "Saving…" : "Save") { save() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(saving || !loaded || !isComplete)
+                    .disabled(!Self.canSave(
+                        canReadServerConfig: model.canReadServerConfig,
+                        loaded: loaded,
+                        isComplete: isComplete,
+                        saving: saving
+                    ))
             }
         }
         .padding(Metric.roomy)
         .frame(width: 520)
         .task { await load() }
+    }
+
+    nonisolated static func canSave(
+        canReadServerConfig: Bool,
+        loaded: Bool,
+        isComplete: Bool,
+        saving: Bool
+    ) -> Bool {
+        canReadServerConfig && loaded && isComplete && !saving
     }
 
     private var isComplete: Bool {
@@ -89,6 +105,10 @@ struct EditServerView: View {
     /// value, so advanced settings the compact form does not show stay intact.
     private func load() async {
         guard !loaded else { return }
+        guard model.canReadServerConfig else {
+            failure = AppModel.serverConfigReadRequiredCopy
+            return
+        }
         do {
             let config = try await model.serverConfig(name: name)
             loadedConfig = config
@@ -110,6 +130,11 @@ struct EditServerView: View {
     private func save() {
         saving = true
         failure = nil
+        guard model.canReadServerConfig else {
+            failure = AppModel.serverConfigReadRequiredCopy
+            saving = false
+            return
+        }
         guard var config = loadedConfig else {
             failure = "The server settings could not be loaded."
             return

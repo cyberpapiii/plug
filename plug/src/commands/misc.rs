@@ -377,19 +377,36 @@ fn unified_install_check_from_snapshot(
             .collect::<Vec<_>>();
         drift.push(format!("shadow installations: {}", paths.join(", ")));
     }
-    let unexpected_jobs = snapshot
-        .launchd_jobs
-        .iter()
-        .filter(|job| {
-            !install_paths_match(&job.program, &app.executable_path)
-                || job.label != "com.plug.daemon"
-        })
-        .map(|job| format!("{} ({})", job.label, job.program.display()))
-        .collect::<Vec<_>>();
-    if !unexpected_jobs.is_empty() {
+    let app_executable = app.executable_path.as_path();
+    let mut leftover_legacy_jobs = Vec::new();
+    let mut unknown_launchd_jobs = Vec::new();
+    for job in &snapshot.launchd_jobs {
+        let is_expected_current =
+            job.label == "com.plug.daemon" && install_paths_match(&job.program, app_executable);
+        if is_expected_current {
+            continue;
+        }
+        let formatted = format!("{} ({})", job.label, job.program.display());
+        match crate::service::classify_launchd_program(job, Some(app_executable)) {
+            crate::service::LaunchdProgramOwnership::RecognizedLegacyPlug => {
+                leftover_legacy_jobs.push(formatted);
+            }
+            crate::service::LaunchdProgramOwnership::CurrentApp
+            | crate::service::LaunchdProgramOwnership::Unknown => {
+                unknown_launchd_jobs.push(formatted);
+            }
+        }
+    }
+    if !leftover_legacy_jobs.is_empty() {
         drift.push(format!(
-            "unknown or legacy launchd jobs left untouched: {}",
-            unexpected_jobs.join(", ")
+            "leftover launchd jobs require adoption: {}",
+            leftover_legacy_jobs.join(", ")
+        ));
+    }
+    if !unknown_launchd_jobs.is_empty() {
+        drift.push(format!(
+            "unknown launchd jobs left untouched: {}",
+            unknown_launchd_jobs.join(", ")
         ));
     }
 
@@ -405,7 +422,11 @@ fn unified_install_check_from_snapshot(
             name: "unified_install".to_string(),
             status: CheckStatus::Warn,
             message: drift.join("; "),
-            fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
+            fix_suggestion: Some(if leftover_legacy_jobs.is_empty() {
+                "Open Plug.app and retry reconciliation.".to_string()
+            } else {
+                crate::service::LEFTOVER_LAUNCHD_ADOPT_SENTENCE.to_string()
+            }),
         }
     }
 }
@@ -489,11 +510,11 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
         Ok(_) => {
             inspection_errors
                 .push("daemon operator handshake returned an unexpected response".to_string());
-            (None, None, DaemonOwnershipMode::Unmanaged, false)
+            (None, None, DaemonOwnershipMode::Unknown, false)
         }
         Err(error) => {
             inspection_errors.push(format!("daemon inspection failed: {error}"));
-            (None, None, DaemonOwnershipMode::Unmanaged, false)
+            (None, None, DaemonOwnershipMode::Unknown, false)
         }
     };
     let live_sessions = bounded_ipc_probe(
@@ -1327,6 +1348,74 @@ mod tests {
                 Some("Open Plug.app and retry reconciliation.")
             );
         }
+    }
+
+    #[test]
+    fn unified_install_leftover_legacy_launchd_uses_adopt_sentence() {
+        let mut snapshot = unified_snapshot();
+        snapshot.launchd_jobs = vec![
+            crate::service::LaunchdJobRecord {
+                label: "com.plug.daemon".to_string(),
+                program: std::path::PathBuf::from("/Applications/Plug.app/Contents/Resources/plug"),
+            },
+            crate::service::LaunchdJobRecord {
+                label: "com.plug.daemon".to_string(),
+                program: std::path::PathBuf::from("/opt/homebrew/Cellar/plug/0.6.3/bin/plug"),
+            },
+        ];
+
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(
+            result
+                .message
+                .contains("leftover launchd jobs require adoption")
+        );
+        assert!(result.message.contains("com.plug.daemon"));
+        assert!(
+            result
+                .message
+                .contains("/opt/homebrew/Cellar/plug/0.6.3/bin/plug")
+        );
+        assert!(!result.message.contains("unknown or legacy"));
+        assert_eq!(
+            result.fix_suggestion.as_deref(),
+            Some(crate::service::LEFTOVER_LAUNCHD_ADOPT_SENTENCE)
+        );
+        assert!(
+            result
+                .fix_suggestion
+                .as_deref()
+                .is_some_and(|sentence| sentence.contains("Turn On") && sentence.contains("adopt"))
+        );
+    }
+
+    #[test]
+    fn unified_install_unknown_launchd_stays_distinct_from_leftover_legacy() {
+        let mut snapshot = unified_snapshot();
+        snapshot
+            .launchd_jobs
+            .push(crate::service::LaunchdJobRecord {
+                label: "local.plug.lookalike".to_string(),
+                program: std::path::PathBuf::from("/Applications/Other.app/other"),
+            });
+
+        let result = super::unified_install_check_from_snapshot(&snapshot);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(
+            result
+                .message
+                .contains("unknown launchd jobs left untouched")
+        );
+        assert!(
+            !result
+                .message
+                .contains("leftover launchd jobs require adoption")
+        );
+        assert_eq!(
+            result.fix_suggestion.as_deref(),
+            Some("Open Plug.app and retry reconciliation.")
+        );
     }
 
     #[test]

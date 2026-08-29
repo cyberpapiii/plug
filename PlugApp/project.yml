@@ -55,7 +55,11 @@ targets:
   PlugAppTests:
     type: bundle.unit-test
     platform: macOS
-    sources: [PlugAppTests]
+    sources:
+      - path: PlugAppTests
+      - path: ../testdata/legacy_plug_programs.json
+        type: file
+        buildPhase: resources
     dependencies:
       - target: PlugApp
     settings:

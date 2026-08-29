@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through merge commit `a197f65` on 2026-08-26.
+Baseline: `main` through `66b8d7a` (`docs: record live v0.8.1 rollout`, PR #123) on 2026-08-26.
 
 This is the canonical current-state doc for the project.
 
@@ -122,15 +122,17 @@ Partial on `main`:
 
 ## What Exists Off-Main
 
-No roadmap-relevant implementation currently exists only off-main. The native
-operator app, its daemon API and lifecycle ownership, distribution automation,
+PR #124 (`fix/leftover-homebrew-launchd-adopt`, HEAD `3faa312`) exists off-main. It is not done on `main`. The stack adopts leftover Homebrew Cellar/bin launchd after formula uninstall, shares one leftover path table, maps launchctl inspect errors to handshake `unknown` (never `Unmanaged`), adds handshake `stale`, gates Edit Server `GetServerConfig` on app-side `server_config_read`, documents operator IPC overlap with `MIN=3`, aligns doctor leftover copy with Turn On/adopt, pins `persist_config_atomic` comment drop, and adds PlugIPC golden payloads.
+
+The native operator app, its daemon API and lifecycle ownership, distribution automation,
 and the 22/22 official modern server conformance fixes landed on `main` in
 PR #96 (`52b2c7b`); the public-install daemon-adoption repair landed in PR #101
 (`9fdae06`). The calm single-sidebar operator redesign landed in PR #104
 (`b045000`), and the Swift 6-safe ServiceManagement adoption repair landed in
 PR #105 (`6dcfc1b`). The complete menu-bar/operator overhaul landed in PR #121
-(`163bc87`), and the real cold-start lifecycle repair landed in PR #122
-(`a197f65`).
+(`163bc87`), the real cold-start lifecycle repair landed in PR #122
+(`a197f65`), and the live v0.8.1 rollout record landed in PR #123
+(`66b8d7a`).
 
 The MCP `2026-07-28` modernization is done on `main` via PR #68. Both global
 modern protocol gates still default to off. This Mac enables only the proven
@@ -382,6 +384,8 @@ Use docs by role:
 3. consider low-priority simplification/perf cleanup in reload/session/SSE helper structure if the maintenance bar expands
 4. keep all off-main work clearly marked as candidate future state only
 5. preserve the CE adapter layer (`AGENTS.md`, `CLAUDE.md`, workflow guide) so future agents start in the right place
+6. live client certs still missing: ChatGPT, Codex, Cursor, OpenCode, and a real WebKit platform-passkey ceremony
+7. after leftover-adopt U1–U5 land on `main`: split doctor/unified snapshot out of `plug/src/commands/misc.rs` (2328), `clients.rs` (1870), and `plug-core/src/ipc.rs` (1788). Diagnosis does not belong in `misc.rs`
 
 ## Audit Artifacts
 

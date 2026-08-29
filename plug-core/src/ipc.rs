@@ -41,8 +41,18 @@ impl fmt::Debug for IpcCancellationCapability {
         fmt::Debug::fmt(&self.0, f)
     }
 }
+
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
+
+/// Inclusive operator IPC compatibility band advertised by the daemon.
+///
+/// Compatibility is range overlap, not a selected version. A client that
+/// advertises 3-4 still overlaps a daemon on this band. Handshake responses
+/// advertise these constants and ignore the client's range.
+///
+/// [`OPERATOR_IPC_MIN`] stays 3 until a capability is removed. The first
+/// removal must raise `MIN` and add a test that the retired band is rejected.
 pub const OPERATOR_IPC_MIN: u16 = 3;
 pub const OPERATOR_IPC_MAX: u16 = 6;
 
@@ -50,6 +60,7 @@ pub const OPERATOR_IPC_MAX: u16 = 6;
 #[serde(rename_all = "snake_case")]
 pub enum DaemonOwnershipMode {
     Unmanaged,
+    Unknown,
     CliManaged,
     AppManaged,
 }
@@ -1204,6 +1215,50 @@ mod tests {
     }
 
     #[test]
+    fn operator_handshake_ignores_client_range_when_client_3_4_overlaps_daemon_3_6() {
+        let request = IpcRequest::OperatorHandshake {
+            client_version: "0.5.0".to_string(),
+            ipc_min: 3,
+            ipc_max: 4,
+        };
+        let response = IpcResponse::OperatorHandshake {
+            handshake: OperatorHandshake {
+                daemon_version: "0.5.0".to_string(),
+                daemon_executable: None,
+                ipc_min: OPERATOR_IPC_MIN,
+                ipc_max: OPERATOR_IPC_MAX,
+                ownership: DaemonOwnershipMode::AppManaged,
+                capabilities: vec![],
+            },
+        };
+
+        let IpcRequest::OperatorHandshake {
+            ipc_min: client_min,
+            ipc_max: client_max,
+            ..
+        } = request
+        else {
+            panic!("expected operator handshake request");
+        };
+        let IpcResponse::OperatorHandshake { handshake } = response else {
+            panic!("expected operator handshake response");
+        };
+
+        // Characterization: handshake advertises the daemon band, not a selected
+        // version derived from the client range.
+        assert_eq!(OPERATOR_IPC_MIN, 3);
+        assert_eq!(handshake.ipc_min, OPERATOR_IPC_MIN);
+        assert_eq!(handshake.ipc_max, OPERATOR_IPC_MAX);
+        assert_ne!(
+            (handshake.ipc_min, handshake.ipc_max),
+            (client_min, client_max)
+        );
+
+        // Client 3-4 still overlaps daemon 3-6.
+        assert!(client_min <= handshake.ipc_max && client_max >= handshake.ipc_min);
+    }
+
+    #[test]
     fn operator_handshake_round_trips_with_compatibility_range() {
         let response = IpcResponse::OperatorHandshake {
             handshake: OperatorHandshake {
@@ -1232,6 +1287,48 @@ mod tests {
             ))
         );
         assert_eq!(handshake.ipc_max, 4);
+        assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
+    }
+
+    #[test]
+    fn operator_handshake_decodes_unknown_ownership() {
+        let response = serde_json::json!({
+            "type": "OperatorHandshake",
+            "handshake": {
+                "daemon_version": "0.7.0",
+                "ipc_min": 3,
+                "ipc_max": 6,
+                "ownership": "unknown",
+                "capabilities": []
+            }
+        });
+
+        let decoded: IpcResponse =
+            serde_json::from_value(response).expect("unknown ownership must decode");
+        let IpcResponse::OperatorHandshake { handshake } = decoded else {
+            panic!("expected operator handshake");
+        };
+        assert_eq!(handshake.ownership, DaemonOwnershipMode::Unknown);
+    }
+
+    #[test]
+    fn operator_handshake_ignores_legacy_stale_field() {
+        let leftover = serde_json::json!({
+            "type": "OperatorHandshake",
+            "handshake": {
+                "daemon_version": "0.7.0",
+                "ipc_min": 3,
+                "ipc_max": 6,
+                "ownership": "app_managed",
+                "stale": true,
+                "capabilities": []
+            }
+        });
+        let decoded: IpcResponse =
+            serde_json::from_value(leftover).expect("unknown stale key must be ignored");
+        let IpcResponse::OperatorHandshake { handshake } = decoded else {
+            panic!("expected operator handshake");
+        };
         assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
     }
 
@@ -1784,5 +1881,163 @@ mod tests {
         let resp_json = serde_json::to_value(resp).unwrap();
         assert_eq!(resp_json["type"], "Capabilities");
         assert!(resp_json["capabilities"]["tools"].is_object());
+    }
+
+    mod golden_ipc_fixtures {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn golden_dir() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("testdata")
+                .join("ipc")
+        }
+
+        fn read_golden(name: &str) -> String {
+            std::fs::read_to_string(golden_dir().join(name))
+                .unwrap_or_else(|e| panic!("read golden {name}: {e}"))
+        }
+
+        fn canonical_handshake_response() -> IpcResponse {
+            IpcResponse::OperatorHandshake {
+                handshake: OperatorHandshake {
+                    daemon_version: "0.7.0".to_string(),
+                    daemon_executable: None,
+                    ipc_min: OPERATOR_IPC_MIN,
+                    ipc_max: OPERATOR_IPC_MAX,
+                    ownership: DaemonOwnershipMode::AppManaged,
+                    capabilities: vec![
+                        OperatorCapability::ServerMutation,
+                        OperatorCapability::ServerConfigRead,
+                    ],
+                },
+            }
+        }
+
+        fn canonical_get_server_config_request() -> IpcRequest {
+            IpcRequest::GetServerConfig {
+                auth_token: "golden-auth-token".to_string(),
+                name: "workspace".to_string(),
+            }
+        }
+
+        fn canonical_server_config() -> crate::config::ServerConfig {
+            crate::config::ServerConfig {
+                command: Some("uvx".to_string()),
+                args: vec!["workspace-mcp".to_string()],
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                protocol_mode: Default::default(),
+                url: None,
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+                sandbox: None,
+            }
+        }
+
+        fn canonical_get_server_config_response() -> IpcResponse {
+            IpcResponse::ServerConfig {
+                name: "workspace".to_string(),
+                server: Box::new(canonical_server_config()),
+            }
+        }
+
+        fn assert_json_matches_canonical<T>(canonical: &T, golden_name: &str)
+        where
+            T: Serialize + for<'de> Deserialize<'de>,
+        {
+            let golden_text = read_golden(golden_name);
+            let golden_value: serde_json::Value =
+                serde_json::from_str(&golden_text).expect("golden must be valid JSON");
+            let canonical_value =
+                serde_json::to_value(canonical).expect("canonical value must serialize");
+            assert_eq!(
+                canonical_value, golden_value,
+                "golden {golden_name} drifted from current Rust IPC types"
+            );
+
+            let round_trip: T = serde_json::from_value(golden_value).expect("golden must decode");
+            assert_eq!(
+                serde_json::to_value(&round_trip).unwrap(),
+                canonical_value,
+                "golden {golden_name} must round-trip through Rust IPC types"
+            );
+        }
+
+        #[test]
+        #[ignore = "run manually to regenerate shared IPC golden JSON fixtures"]
+        fn write_golden_ipc_fixtures() {
+            std::fs::create_dir_all(golden_dir()).expect("create golden dir");
+            let fixtures = [
+                (
+                    "operator_handshake_response.json",
+                    serde_json::to_string_pretty(&canonical_handshake_response()).unwrap(),
+                ),
+                (
+                    "get_server_config_request.json",
+                    serde_json::to_string_pretty(&canonical_get_server_config_request()).unwrap(),
+                ),
+                (
+                    "get_server_config_response.json",
+                    serde_json::to_string_pretty(&canonical_get_server_config_response()).unwrap(),
+                ),
+            ];
+            for (name, contents) in fixtures {
+                std::fs::write(golden_dir().join(name), format!("{contents}\n"))
+                    .unwrap_or_else(|e| panic!("write golden {name}: {e}"));
+            }
+        }
+
+        #[test]
+        fn golden_operator_handshake_response_matches_rust_types() {
+            let response = canonical_handshake_response();
+            assert_json_matches_canonical(&response, "operator_handshake_response.json");
+
+            let IpcResponse::OperatorHandshake { handshake } = response else {
+                panic!("expected operator handshake response");
+            };
+            assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
+            assert!(
+                handshake
+                    .capabilities
+                    .contains(&OperatorCapability::ServerConfigRead)
+            );
+        }
+
+        #[test]
+        fn golden_get_server_config_request_matches_rust_types() {
+            let request = canonical_get_server_config_request();
+            assert_json_matches_canonical(&request, "get_server_config_request.json");
+
+            let IpcRequest::GetServerConfig { name, .. } = request else {
+                panic!("expected GetServerConfig request");
+            };
+            assert_eq!(name, "workspace");
+        }
+
+        #[test]
+        fn golden_get_server_config_response_matches_rust_types() {
+            let response = canonical_get_server_config_response();
+            assert_json_matches_canonical(&response, "get_server_config_response.json");
+
+            let IpcResponse::ServerConfig { name, server } = response else {
+                panic!("expected ServerConfig response");
+            };
+            assert_eq!(name, "workspace");
+            assert_eq!(server.command.as_deref(), Some("uvx"));
+        }
     }
 }

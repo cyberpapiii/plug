@@ -22,6 +22,80 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(staleState, .appManagedStale(stale))
     }
 
+    func testLegacyPlugProgramMatchesSharedFixture() throws {
+        guard let url = Bundle(for: LaunchdJobInspectorTests.self)
+            .url(forResource: "legacy_plug_programs", withExtension: "json")
+        else {
+            return XCTFail("missing bundled leftover-path fixture")
+        }
+        let fixture = try JSONDecoder().decode(LegacyPlugProgramFixture.self, from: Data(contentsOf: url))
+        for path in fixture.recognized {
+            XCTAssertTrue(
+                LegacyPlugProgram.isRecognized(URL(fileURLWithPath: path)),
+                "expected recognized: \(path)"
+            )
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        for suffix in fixture.homeRecognizedSuffixes {
+            let path = "\(home)/\(suffix)"
+            XCTAssertTrue(
+                LegacyPlugProgram.isRecognized(URL(fileURLWithPath: path)),
+                "expected recognized: \(path)"
+            )
+        }
+        for path in fixture.unrecognized {
+            XCTAssertFalse(
+                LegacyPlugProgram.isRecognized(URL(fileURLWithPath: path)),
+                "expected unrecognized: \(path)"
+            )
+        }
+    }
+
+    func testLeftoverHomebrewCellarJobIsRecognizedAfterFormulaPathsDisappear() async throws {
+        let cellar = URL(fileURLWithPath: "/opt/homebrew/Cellar/plug/0.6.3/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: cellar, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
+    func testLeftoverHomebrewBinJobIsRecognizedWithoutResolvedOptPath() async throws {
+        let brewBin = URL(fileURLWithPath: "/opt/homebrew/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: brewBin, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
+    func testLeftoverLocalBinJobIsRecognizedWithoutRecognizedPaths() async throws {
+        let localBin = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".local/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: localBin, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
+    func testLeftoverHomebrewOptPlugJobIsRecognized() async throws {
+        let optPlug = URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: optPlug, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
     func testAlternateLabelAtKnownPlugPathIsRecognizedLegacy() async throws {
         let legacyURL = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
         let legacy = record(label: "local.claude-rc.plug", program: legacyURL, parentID: nil, parentVersion: nil)
@@ -261,6 +335,18 @@ final class LaunchdJobInspectorTests: XCTestCase {
         }
         XCTAssertNil(record.programURL)
         XCTAssertEqual(record.programIdentifier, programIdentifier)
+    }
+}
+
+private struct LegacyPlugProgramFixture: Decodable {
+    let recognized: [String]
+    let homeRecognizedSuffixes: [String]
+    let unrecognized: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case recognized
+        case homeRecognizedSuffixes = "home_recognized_suffixes"
+        case unrecognized
     }
 }
 

@@ -147,6 +147,13 @@ fn set_tool_enabled(config: &mut Config, tool: &str, enabled: bool) -> anyhow::R
     Ok(())
 }
 
+/// Atomically replace `path` with a pretty-printed `Config`.
+///
+/// This is the only persist path for operator mutations. Load goes through
+/// figment into `Config`, then this writes `toml::to_string_pretty` of that
+/// struct. Comments, unknown keys, and original key order cannot survive that
+/// round-trip. `toml_edit` is not a workspace dependency; do not add a second
+/// TOML stack here just to keep comments.
 pub fn persist_config_atomic(path: &Path, config: &Config) -> anyhow::Result<()> {
     let errors = validate_config(config);
     if !errors.is_empty() {
@@ -293,5 +300,83 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn mutation_persists_changed_server_and_tool() {
+        let path = fixture_path();
+        std::fs::write(
+            &path,
+            "[servers.search]\ncommand = \"echo\"\nenabled = true\n",
+        )
+        .unwrap();
+
+        let (config, result) = apply_operator_mutation(
+            &path,
+            OperatorMutation::SetServerEnabled {
+                name: "search".into(),
+                enabled: false,
+            },
+        )
+        .unwrap();
+        assert!(!config.servers["search"].enabled);
+        assert!(!result.server.as_ref().unwrap().enabled);
+
+        let (config, result) = apply_operator_mutation(
+            &path,
+            OperatorMutation::SetToolEnabled {
+                tool: "search__lookup".into(),
+                enabled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(config.disabled_tools, vec!["search__lookup".to_string()]);
+        assert_eq!(
+            result.disabled_tools,
+            Some(vec!["search__lookup".to_string()])
+        );
+
+        let reloaded = load_editable_config(&path).unwrap();
+        assert!(!reloaded.servers["search"].enabled);
+        assert_eq!(reloaded.disabled_tools, vec!["search__lookup".to_string()]);
+    }
+
+    #[test]
+    fn persist_config_atomic_drops_toml_comments() {
+        let path = fixture_path();
+        std::fs::write(
+            &path,
+            concat!(
+                "# keep this document comment\n",
+                "[servers.search]\n",
+                "# keep this server comment\n",
+                "command = \"echo\" # command note\n",
+                "enabled = true\n",
+            ),
+        )
+        .unwrap();
+
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::SetServerEnabled {
+                name: "search".into(),
+                enabled: false,
+            },
+        )
+        .unwrap();
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !rewritten.contains("# keep this document comment"),
+            "{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("# keep this server comment"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("# command note"), "{rewritten}");
+
+        let reloaded = load_editable_config(&path).unwrap();
+        assert!(!reloaded.servers["search"].enabled);
     }
 }

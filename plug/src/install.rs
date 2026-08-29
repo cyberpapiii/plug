@@ -678,21 +678,23 @@ fn codesign_requirement_argument() -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn bundle_version(bundle_path: &Path) -> Result<String> {
+fn read_bundle_plist_string(bundle_path: &Path, key: &str, label: &str) -> Result<String> {
     let output = Command::new("/usr/bin/plutil")
-        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
+        .args(["-extract", key, "raw", "-o", "-"])
         .arg(bundle_path.join("Contents/Info.plist"))
         .output()
-        .context("could not read Plug.app bundle version")?;
-    ensure!(
-        output.status.success(),
-        "Plug.app has no readable bundle version"
-    );
-    let version =
-        String::from_utf8(output.stdout).context("Plug.app bundle version was not UTF-8")?;
-    let version = version.trim();
-    ensure!(!version.is_empty(), "Plug.app bundle version was empty");
-    Ok(version.to_owned())
+        .with_context(|| format!("could not read Plug.app {label}"))?;
+    ensure!(output.status.success(), "Plug.app has no readable {label}");
+    let value = String::from_utf8(output.stdout)
+        .with_context(|| format!("Plug.app {label} was not UTF-8"))?;
+    let value = value.trim();
+    ensure!(!value.is_empty(), "Plug.app {label} was empty");
+    Ok(value.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_version(bundle_path: &Path) -> Result<String> {
+    read_bundle_plist_string(bundle_path, "CFBundleShortVersionString", "bundle version")
 }
 
 #[cfg(target_os = "macos")]
