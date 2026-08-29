@@ -3,6 +3,13 @@ import Foundation
 
 public actor PlugIPCClient {
     private var descriptor: Int32 = -1
+    /// The handshake this connection already negotiated.
+    ///
+    /// The answer describes the daemon behind the open descriptor, so it can
+    /// only change when that descriptor does. Every failed request closes it,
+    /// which clears this, so a re-handshake happens exactly when the connection
+    /// is new and never on a poll that had one already.
+    private var negotiated: OperatorHandshake?
     private let socketURL: URL
     private let clientVersion: String
     private let requestTimeout: TimeInterval
@@ -57,11 +64,13 @@ public actor PlugIPCClient {
     }
 
     public func connect() throws -> OperatorHandshake {
+        if descriptor >= 0, let negotiated { return negotiated }
         if descriptor < 0 {
             descriptor = try Self.openSocket(path: socketURL.path, requestTimeout: requestTimeout)
         }
         let response = try request(.handshake(clientVersion: clientVersion, ipcMin: 3, ipcMax: 6))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
+        negotiated = handshake
         return handshake
     }
 
@@ -91,6 +100,7 @@ public actor PlugIPCClient {
 
     public func disconnect() {
         if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 }
+        negotiated = nil
     }
 
     static func openSocket(path: String, requestTimeout: TimeInterval = 3) throws -> Int32 {

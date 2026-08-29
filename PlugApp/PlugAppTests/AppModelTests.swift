@@ -115,6 +115,61 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.installationFailure)
     }
 
+    /// The handshake describes the daemon behind an open descriptor, so a poll
+    /// that already has one is asking a question it holds the answer to. At two
+    /// seconds a poll, that was a wasted round trip every two seconds.
+    @MainActor
+    func testPollingDoesNotRenegotiateAnOpenConnection() async {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try! OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try! makeFixtureTokenURL()
+        )
+        await model.start()
+        await model.refresh()
+        await model.refresh()
+
+        let handshakes = coordinator.events.values.filter { $0 == "ipc.handshake" }
+        XCTAssertEqual(handshakes.count, 1)
+        let snapshots = coordinator.events.values.filter { $0 == "ipc.snapshot" }
+        XCTAssertGreaterThan(snapshots.count, 1, "the polls themselves must still have happened")
+    }
+
+    /// The tool list is by far the largest thing the daemon can be asked for.
+    /// It used to be refetched on a timer; the snapshot now reports when it
+    /// would answer differently, so a poll that sees the same revision must not
+    /// ask for it again.
+    @MainActor
+    func testUnchangedCatalogRevisionSkipsTheToolList() async {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try! OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try! makeFixtureTokenURL()
+        )
+        await model.start()
+        await model.refresh()
+        await model.refresh()
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
+
+        server.catalogRevision = 2
+        await model.refresh()
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
+    }
+
     @MainActor
     func testUsePlugIsExplicitCoordinatorAction() async {
         let coordinator = RecordingInstallationCoordinator(
@@ -611,6 +666,13 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     private let lock = NSLock()
     private let serveStopped = DispatchSemaphore(value: 0)
     private(set) var clientVersion: String?
+    /// Bumped by a test to say the daemon's tool catalog would now answer
+    /// differently. Read from the serve thread, written from the test thread.
+    var catalogRevision: UInt64 {
+        get { lock.lock(); defer { lock.unlock() }; return storedCatalogRevision }
+        set { lock.lock(); storedCatalogRevision = newValue; lock.unlock() }
+    }
+    private var storedCatalogRevision: UInt64 = 1
     private var connection: Int32 = -1
     private var didStop = false
 
@@ -720,9 +782,19 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                         "type": "OperatorSnapshot",
                         "snapshot": [
                             "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app",
+                            "tool_catalog_revision": catalogRevision,
                             "configured_servers": [], "servers": [], "live_sessions": [],
                             "client_visibility": [], "upstream_auth": [], "downstream_clients": [],
                         ],
+                    ], to: accepted)
+                case "ListTools":
+                    events.append("ipc.listTools")
+                    send(response: [
+                        "type": "Tools",
+                        "tools": [[
+                            "name": "demo__echo", "server_id": "demo", "description": "Echo.",
+                            "title": "Echo", "disabled": false,
+                        ]],
                     ], to: accepted)
                 case "ActivitySnapshot":
                     events.append("ipc.activity")

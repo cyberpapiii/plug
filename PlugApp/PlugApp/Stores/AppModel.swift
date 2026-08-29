@@ -62,8 +62,7 @@ final class AppModel {
     private(set) var connectableApps: [LinkableApp] = []
     private(set) var busyApps: Set<String> = []
     private var capabilities: Set<String> = []
-    private var toolCatalogFingerprint = ""
-    private var lastToolRefreshAt: Date?
+    private var toolCatalogRevision: UInt64?
 
     /// The daemon accepts per-tool switches. Older daemons do not, and the
     /// interface hides the switches rather than offering a button that fails.
@@ -319,16 +318,18 @@ final class AppModel {
                         activities = Array(merged.suffix(Self.activityLimit))
                     }
                 }
-                let fingerprint = Self.catalogFingerprint(for: value)
-                let catalogAge = lastToolRefreshAt.map { Date().timeIntervalSince($0) } ?? .infinity
-                let catalogRefreshInterval = watcherCount > 0 ? 15.0 : 60.0
-                if forceCatalog || toolCatalog.isEmpty || fingerprint != toolCatalogFingerprint
-                    || catalogAge >= catalogRefreshInterval,
+                // The tool list is nearly a megabyte and the snapshot above
+                // already reports when it would answer differently, so ask for
+                // it only then. This used to refetch on a timer as well,
+                // because the fingerprint was assembled here from server
+                // fields and could not see a tool disabled from the CLI. The
+                // daemon reports that now.
+                let revision = value.toolCatalogRevision
+                if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
                    case let .tools(tools) = try await ipc.request(.listTools)
                 {
                     toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
-                    toolCatalogFingerprint = fingerprint
-                    lastToolRefreshAt = Date()
+                    toolCatalogRevision = revision
                 }
                 connectionState = .ready
                 lastError = nil
@@ -347,7 +348,6 @@ final class AppModel {
             let token = try String(contentsOf: tokenURL, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             _ = try await ipc.request(request(token))
-            lastToolRefreshAt = nil
             await refresh(forceCatalog: true)
         } catch { lastError = error.localizedDescription }
     }
@@ -375,16 +375,6 @@ final class AppModel {
             throw PlugIPCError.unexpectedResponse("ServerConfig")
         }
         return config
-    }
-
-    nonisolated private static func catalogFingerprint(for snapshot: OperatorSnapshot) -> String {
-        let configured = snapshot.configuredServers
-            .map { "\($0.name):\($0.enabled):\($0.transport)" }
-            .sorted()
-        let runtime = snapshot.servers
-            .map { "\($0.serverId):\($0.health):\($0.toolCount)" }
-            .sorted()
-        return (configured + runtime).joined(separator: "|")
     }
 
     /// Which AI apps are wired into Plug. Read from the client configuration

@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `3c36ca5` (`docs: record the upstream connect bound in the snapshot (#149)`) on 2026-08-29, plus the change that carries this revision.
+Baseline: `main` through `a65209b` (`perf: bound OAuth metadata discovery on the server start path (#150)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -258,6 +258,27 @@ batch barriers: roughly 5 s where the recorded run took 32.65 s. That figure is
 a projection from measured parts, not a second measured run — the per-server
 durations and the batch removal are measured, the five-second cap is pinned by
 test, and the composition of the two is arithmetic.
+
+The menu bar app's polling was the other measured waste, and it was not on the
+tool path at all. Every poll called `connect()`, which re-sent a handshake over
+a descriptor that had already negotiated one, and the tool catalog was refetched
+on a fifteen-second timer because the app assembled its own catalog fingerprint
+from server fields and so could not see a tool disabled from the CLI. Over
+thirty seconds of visible polling that came to roughly 1918 KiB across 45 round
+trips, of which two full tool-catalog fetches at 724.6 KiB each were 76%.
+
+`OperatorSnapshot` now carries a `tool_catalog_revision`. The router keeps a
+process-global revision that moves whenever a refreshed upstream catalog or a
+reload could change what a reader sees — global rather than per-router because a
+reload replaces the `ToolRouter`, and a per-instance counter restarting at zero
+would let a client that had already seen zero skip the refetch the reload just
+made necessary — and the daemon hashes `disabled_tools` in alongside it, since
+the operator tool list reads that straight from live configuration. The app asks
+for the tool list only when that value changed, and caches the negotiated
+handshake for the life of the descriptor, clearing it on the disconnect that
+every failed request already performs. Same thirty seconds now costs roughly
+469 KiB across 30 round trips. Nothing the app displays changed; the catalog is
+still refetched the moment the daemon says it would answer differently.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
