@@ -178,11 +178,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+Ship a change with `./scripts/ship.sh "message"`: it commits tracked edits,
+branches, pushes through the gate, opens a pull request, and arms auto-merge. It
+never stages untracked files, which is what keeps private notes and local
+credentials out of a commit.
+
 Build artifacts are governed by `scripts/clean-build-artifacts.sh`. `--guard`
-reclaims regenerable caches only when `target/` exceeds 10 GB and is silent
-otherwise, so `dev.sh` and the optional `.githooks/pre-push` hook call it after
-every run. `--yes` is a full `cargo clean`; a cold rebuild is about 31 seconds,
-so it is cheap.
+reclaims regenerable caches when `target/` exceeds 10 GB or this project's Xcode
+DerivedData exceeds 5 GB, and is silent otherwise. It costs about 40
+milliseconds, so `dev.sh` and the `post-commit`, `post-merge`, `post-checkout`
+and `pre-push` hooks all call it. `--yes` is a full `cargo clean`; a cold
+rebuild is about 31 seconds, so it is cheap.
+
+`./scripts/setup-dev.sh` wires a fresh clone up and is idempotent.
 
 ## Project Structure
 

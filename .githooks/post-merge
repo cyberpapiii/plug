@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Keep generated artifacts inside budget without anyone having to remember.
+# The guard is silent below budget and costs about 40 milliseconds, so it can
+# run on ordinary git activity rather than waiting for a cleanup ritual.
+set -euo pipefail
+[[ "${PLUG_SKIP_HOOKS:-0}" == "1" ]] && exit 0
+repo_root="$(git rev-parse --show-toplevel)"
+"$repo_root/scripts/clean-build-artifacts.sh" --guard || true

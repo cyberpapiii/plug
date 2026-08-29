@@ -10,7 +10,9 @@ Cleans generated Plug build/deploy artifacts. Default mode is a dry run.
 Modes:
   (none)            report sizes only, remove nothing
   --guard           remove regenerable caches only if the repo is over budget;
-                    silent when it is not. Safe to run after every build.
+                    silent when it is not. Also drops this project's Xcode
+                    DerivedData past its own budget. Safe to run after every
+                    build; git hooks and scripts/dev.sh call it for you.
   --litter          remove loose local droppings: *.profraw, .DS_Store,
                     /tmp/plug-* audit dirs, and the empty script/ stub
   --incremental     remove target/*/incremental (rebuilt on next build)
@@ -23,7 +25,8 @@ Modes combine. `--yes --xcode --runtime-cache` clears everything generated.
 Cost note: a cold `cargo build --workspace --all-targets` on this machine is
 roughly half a minute, so --yes is cheap. Dropping incremental costs less.
 
-The --guard budget defaults to 10 GB. Override with PLUG_TARGET_BUDGET_GB.
+The --guard budgets default to 10 GB for target/ and 5 GB for DerivedData.
+Override with PLUG_TARGET_BUDGET_GB and PLUG_DERIVED_BUDGET_GB.
 
 Never removed:
   - ~/Library/Application Support/plug
@@ -46,6 +49,11 @@ GUARD_BUDGET_GB="${PLUG_TARGET_BUDGET_GB:-10}"
 # drifted up by a few hundred megabytes, and a check people learn to ignore is
 # worse than no check.
 GUARD_ESCALATE_FACTOR=1.5
+
+# Xcode DerivedData for this project grows on its own schedule and Xcode
+# rebuilds it without being asked, so the guard treats it as a separate,
+# fully disposable budget rather than folding it into the cargo one.
+GUARD_DERIVED_BUDGET_GB="${PLUG_DERIVED_BUDGET_GB:-5}"
 
 confirm=false
 runtime_cache=false
@@ -142,6 +150,16 @@ remove_incremental() {
 # --guard runs after builds. It stays quiet unless the repo is over budget, and
 # only ever drops caches that cost a rebuild of nothing that still exists.
 if [[ "$guard" == true ]]; then
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    dir_gb="$(gb_of "$dir")"
+    if awk -v c="$dir_gb" -v b="$GUARD_DERIVED_BUDGET_GB" 'BEGIN {exit !(c > b)}'; then
+      rm -rf "$dir"
+      printf 'artifact guard: removed %s GB of Xcode DerivedData (budget %s GB). Xcode rebuilds it.\n' \
+        "$dir_gb" "$GUARD_DERIVED_BUDGET_GB"
+    fi
+  done < <(plugapp_derived_data)
+
   current="$(gb_of "$target_dir")"
   over=$(awk -v c="$current" -v b="$GUARD_BUDGET_GB" 'BEGIN {print (c > b) ? 1 : 0}')
   if [[ "$over" == "1" ]]; then
