@@ -1088,16 +1088,31 @@ fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)
     Ok((std::env::current_exe()?, false))
 }
 
+/// How long session setup may wait for one daemon reply. The daemon has already
+/// proven its socket by this point, so a reply that never arrives means a wedged
+/// engine, not a slow one. Without a bound, `plug connect` hangs forever and the
+/// host client shows a server that is neither ready nor failed.
+const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn read_pending_or_matching_response(
     reader: &mut tokio::net::unix::OwnedReadHalf,
     expected_client_id: &str,
     pending_notifications: &mut Vec<plug_core::ipc::IpcResponse>,
+    deadline: tokio::time::Instant,
     matcher: impl Fn(&plug_core::ipc::IpcResponse) -> Option<PendingIpcResponse>,
 ) -> anyhow::Result<PendingIpcResponse> {
     loop {
-        let frame = plug_core::ipc::read_frame(reader).await?.ok_or_else(|| {
-            anyhow::anyhow!("daemon closed connection while waiting for response")
-        })?;
+        let frame = tokio::time::timeout_at(deadline, plug_core::ipc::read_frame(reader))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "daemon did not complete session setup within {}s",
+                    SESSION_SETUP_TIMEOUT.as_secs()
+                )
+            })??
+            .ok_or_else(|| {
+                anyhow::anyhow!("daemon closed connection while waiting for response")
+            })?;
         let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)
             .map_err(|e| anyhow::anyhow!("invalid daemon response: {e}"))?;
 
@@ -1166,6 +1181,10 @@ pub(crate) async fn establish_daemon_proxy_session(
     };
 
     let (mut reader, mut writer) = stream.into_split();
+    // One budget for the whole handshake rather than one per step, so a daemon
+    // that answers each request just slowly enough cannot stretch setup without
+    // limit.
+    let setup_deadline = tokio::time::Instant::now() + SESSION_SETUP_TIMEOUT;
     let mut pending_notifications = Vec::new();
     let handshake_req = plug_core::ipc::IpcRequest::OperatorHandshake {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1178,6 +1197,7 @@ pub(crate) async fn establish_daemon_proxy_session(
         &mut reader,
         &client_id,
         &mut pending_notifications,
+        setup_deadline,
         |response| match response {
             plug_core::ipc::IpcResponse::OperatorHandshake { handshake } => {
                 Some(PendingIpcResponse::OperatorHandshake(handshake.clone()))
@@ -1208,6 +1228,7 @@ pub(crate) async fn establish_daemon_proxy_session(
             &mut reader,
             &client_id,
             &mut pending_notifications,
+            setup_deadline,
             |response| match response {
                 plug_core::ipc::IpcResponse::Registered {
                     session_id,
@@ -1247,6 +1268,7 @@ pub(crate) async fn establish_daemon_proxy_session(
         &mut reader,
         &client_id,
         &mut pending_notifications,
+        setup_deadline,
         |response| match response {
             plug_core::ipc::IpcResponse::Capabilities { capabilities } => {
                 serde_json::from_value(capabilities.clone())
@@ -2570,6 +2592,51 @@ mod tests {
         clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    /// `plug connect` reaches this path after the daemon has already proven its
+    /// socket, so a reply that never arrives means a wedged engine. Without a
+    /// bound the host client shows a server that is neither ready nor failed,
+    /// and no error is ever reported.
+    #[tokio::test]
+    async fn session_setup_gives_up_on_a_daemon_that_never_replies() {
+        // Short and directly under /tmp: a Unix socket path has to fit in
+        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/plug-h{}{:x}.sock",
+            std::process::id(),
+            uuid::Uuid::new_v4().as_fields().0
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let accepting = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect to silent daemon");
+        let (mut reader, _writer) = stream.into_split();
+        let mut pending = Vec::new();
+
+        let error = read_pending_or_matching_response(
+            &mut reader,
+            "client",
+            &mut pending,
+            tokio::time::Instant::now() + Duration::from_millis(200),
+            |_| None,
+        )
+        .await
+        .err()
+        .expect("a silent daemon must not stall session setup forever");
+
+        accepting.abort();
+        let _ = std::fs::remove_file(&socket);
+
+        assert!(
+            error.to_string().contains("did not complete session setup"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

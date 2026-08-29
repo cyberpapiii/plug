@@ -7,5 +7,8 @@
     <string>Contents/Resources/plug</string><string>serve</string><string>--daemon</string>
   </array>
   <key>RunAtLoad</key><true/>
+  <!-- Restart only on a non-zero exit. Idle grace-period shutdown and
+       `plug stop` exit 0 and stay stopped; a panic or a kill self-heals. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
 </dict></plist>

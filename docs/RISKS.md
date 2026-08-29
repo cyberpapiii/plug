@@ -13,6 +13,28 @@ This register lists only the current remaining risks on `main`.
 ambiguity rather than a known implementation defect: the project still needs an explicit decision on
 whether full live reconfiguration is required for the intended production-ready bar.
 
+### The IPC socket is bound only after the whole engine starts
+
+**Impact:** Medium
+**Likelihood:** High
+
+`cmd_daemon` claims the runtime lock, runs `Engine::start` to completion, and
+only then binds the Unix socket. Every configured upstream must connect first,
+and each one can involve a Keychain read or a network round trip, so on a cold
+start there is a window of tens of seconds in which the daemon is alive and
+healthy but indistinguishable from absent to anything that probes the socket.
+
+The damage this used to cause is now contained rather than removed. Callers
+consult the runtime lock to tell a booting daemon from a dead one, wait 90
+seconds for it, and no longer force-restart what is already starting. What
+remains is that no client can talk to the daemon during startup, and no client
+can be told why it is waiting.
+
+Binding the listener before `Engine::start` and answering "starting" until the
+engine is ready would close it properly. That is a real change to daemon
+structure, not a tuning fix, which is why it is recorded here rather than done
+alongside the containment.
+
 ## Medium
 
 ### Manual refresh command remains an open product decision
