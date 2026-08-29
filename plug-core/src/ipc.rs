@@ -41,8 +41,18 @@ impl fmt::Debug for IpcCancellationCapability {
         fmt::Debug::fmt(&self.0, f)
     }
 }
+
 /// Current daemon/client IPC protocol version.
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
+
+/// Inclusive operator IPC compatibility band advertised by the daemon.
+///
+/// Compatibility is range overlap, not a selected version. A client that
+/// advertises 3-4 still overlaps a daemon on this band. Handshake responses
+/// advertise these constants and ignore the client's range.
+///
+/// [`OPERATOR_IPC_MIN`] stays 3 until a capability is removed. The first
+/// removal must raise `MIN` and add a test that the retired band is rejected.
 pub const OPERATOR_IPC_MIN: u16 = 3;
 pub const OPERATOR_IPC_MAX: u16 = 6;
 
@@ -1201,6 +1211,50 @@ mod tests {
             let json2 = serde_json::to_string(&deserialized).unwrap();
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn operator_handshake_ignores_client_range_when_client_3_4_overlaps_daemon_3_6() {
+        let request = IpcRequest::OperatorHandshake {
+            client_version: "0.5.0".to_string(),
+            ipc_min: 3,
+            ipc_max: 4,
+        };
+        let response = IpcResponse::OperatorHandshake {
+            handshake: OperatorHandshake {
+                daemon_version: "0.5.0".to_string(),
+                daemon_executable: None,
+                ipc_min: OPERATOR_IPC_MIN,
+                ipc_max: OPERATOR_IPC_MAX,
+                ownership: DaemonOwnershipMode::AppManaged,
+                capabilities: vec![],
+            },
+        };
+
+        let IpcRequest::OperatorHandshake {
+            ipc_min: client_min,
+            ipc_max: client_max,
+            ..
+        } = request
+        else {
+            panic!("expected operator handshake request");
+        };
+        let IpcResponse::OperatorHandshake { handshake } = response else {
+            panic!("expected operator handshake response");
+        };
+
+        // Characterization: handshake advertises the daemon band, not a selected
+        // version derived from the client range.
+        assert_eq!(OPERATOR_IPC_MIN, 3);
+        assert_eq!(handshake.ipc_min, OPERATOR_IPC_MIN);
+        assert_eq!(handshake.ipc_max, OPERATOR_IPC_MAX);
+        assert_ne!(
+            (handshake.ipc_min, handshake.ipc_max),
+            (client_min, client_max)
+        );
+
+        // Client 3-4 still overlaps daemon 3-6.
+        assert!(client_min <= handshake.ipc_max && client_max >= handshake.ipc_min);
     }
 
     #[test]
