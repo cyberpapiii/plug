@@ -435,7 +435,7 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
         self.handshakeFailures = handshakeFailures
     }
 
-    func pauseConnectors() -> [Int32] {
+    func pauseConnectors() async -> [Int32] {
         events.append(.pause)
         return [101, 102]
     }

@@ -30,6 +30,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Both now go through `ProcessRunner`, the app's one process implementation,
   which drains both pipes concurrently and tears down the whole process group
   when a command runs long.
+- A daemon that cannot read its own launchd registration now blocks instead of
+  reporting repairable drift. `unknown` ownership is an absence of evidence, and
+  drift is retried on every trigger, so the app kept walking the adoption path
+  against a daemon nobody had proved was its own.
+- Booting a legacy launchd job out now re-reads the job's program path first.
+  `launchctl bootout` addresses a job by label, and a label reused by a
+  different program between inspection and teardown would have been booted out
+  on the strength of the earlier job's evidence.
+- Pausing downstream connectors no longer blocks the main thread. It shelled out
+  to `ps` synchronously with no timeout, so a wedged `ps` froze the whole app;
+  it now goes through `ProcessRunner` with the rest.
 
 ### Changed
 

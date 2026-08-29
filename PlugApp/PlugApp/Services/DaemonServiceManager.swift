@@ -18,7 +18,7 @@ enum DaemonServiceError: Error, Equatable {
 protocol DaemonServiceBackend: AnyObject {
     var enabled: Bool { get }
     var serviceStatus: SMAppService.Status { get }
-    func pauseConnectors() -> [Int32]
+    func pauseConnectors() async -> [Int32]
     func resumeConnectors(_ pids: [Int32])
     func bootOut(_ record: LaunchdJobRecord) async throws
     func unregisterAgent() async throws
@@ -282,7 +282,7 @@ final class DaemonServiceManager {
             throw DaemonServiceError.invalidJobEvidence
         }
 
-        let paused = backend.pauseConnectors()
+        let paused = await backend.pauseConnectors()
         defer { backend.resumeConnectors(paused) }
 
         // SMAppService owns app-managed jobs. Unregister it while the service
@@ -407,16 +407,18 @@ final class DaemonServiceManager {
 private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     private let agent = SMAppService.agent(plistName: "com.plug.daemon.plist")
     private let runner: any ProcessRunning
+    private let probe: LaunchdJobProbe
 
     init(runner: any ProcessRunning = ProcessRunner()) {
         self.runner = runner
+        probe = LaunchdJobProbe(runner: runner)
     }
 
     var enabled: Bool { agent.status == .enabled }
     var serviceStatus: SMAppService.Status { agent.status }
 
-    func pauseConnectors() -> [Int32] {
-        DaemonServiceManager.connectorPIDs(psOutput: currentUserProcessList()).compactMap { pid in
+    func pauseConnectors() async -> [Int32] {
+        DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()).compactMap { pid in
             kill(pid, SIGSTOP) == 0 ? pid : nil
         }
     }
@@ -427,7 +429,16 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
 
     func bootOut(_ record: LaunchdJobRecord) async throws {
         guard record.programURL != nil else { throw DaemonServiceError.invalidJobEvidence }
-        try await launchctl(["bootout", "gui/\(getuid())/\(record.label)"])
+        switch try await probe.verify(record) {
+        case .unchanged:
+            try await launchctl(["bootout", "gui/\(getuid())/\(record.label)"])
+        case .vanished:
+            // Already torn down, by a formula uninstall or an earlier bootout.
+            // The end state this call wanted is the state on the machine.
+            return
+        case .replaced:
+            throw DaemonServiceError.evidenceChanged
+        }
     }
 
     func unregisterAgent() async throws {
@@ -478,16 +489,16 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
         }
     }
 
-    private func currentUserProcessList() -> String {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-x", "-o", "pid=", "-o", "command="]
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return "" }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(decoding: data, as: UTF8.self)
+    /// Empty on failure. The caller pauses connectors as a courtesy before
+    /// replacing the daemon, so an unreadable process list costs a rougher
+    /// reconnect, never correctness.
+    private func currentUserProcessList() async -> String {
+        let result = try? await runner.run(
+            executable: URL(fileURLWithPath: "/bin/ps"),
+            arguments: ["-x", "-o", "pid=", "-o", "command="],
+            timeout: .seconds(5)
+        )
+        guard let result, result.status == 0 else { return "" }
+        return String(decoding: result.stdout, as: UTF8.self)
     }
 }

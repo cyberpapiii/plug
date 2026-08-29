@@ -1522,7 +1522,7 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
         self.connector = connector
     }
 
-    func pauseConnectors() -> [Int32] {
+    func pauseConnectors() async -> [Int32] {
         events.append(.pause)
         return connector.pause()
     }

@@ -337,6 +337,46 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
     }
 
+    /// A daemon that cannot read its own launchd registration proves nothing.
+    /// Repairable drift retries adoption on every trigger, so it has to block
+    /// and wait to be asked instead.
+    func testUnknownHandshakeOwnershipBlocksInsteadOfRetryingAdoption() async {
+        let events = EventLog()
+        let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [
+                    LegacyInstallSnapshot(
+                        formulaInstalled: false,
+                        cargoBinary: cargo,
+                        shellLink: .canonical(canonical.executableURL),
+                        recognizedPaths: [cargo],
+                        unknownPaths: []
+                    ),
+                    emptyLegacy(),
+                ]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [healthyService(), healthyService()],
+                handshakes: [handshake(version: canonical.appVersion, ownership: "unknown")]
+            ),
+            openURL: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .blocked(failure) = coordinator.state else {
+            return XCTFail("Unknown handshake ownership must block, got \(coordinator.state)")
+        }
+        XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
+        let eventValues = await events.values
+        XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
+    }
+
     func testIncompatibleHandshakePreservesCargoAndDoesNotReportHealthy() async {
         let events = EventLog()
         let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
