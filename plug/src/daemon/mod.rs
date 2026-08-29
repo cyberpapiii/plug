@@ -182,10 +182,10 @@ pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
 ///
 /// This probe never creates or rewrites the PID file. Auto-start callers use it
 /// to distinguish a failed child from a child that correctly lost to another
-/// daemon which is still booting. `cmd_daemon` claims the lock before
-/// `Engine::start`, and the IPC socket is not bound until every configured
-/// upstream is up, so a held lock with no socket is the signature of a healthy
-/// cold start rather than a dead one.
+/// daemon which is still booting. `cmd_daemon` claims the lock before it binds
+/// anything, so a held lock with no socket is the signature of a healthy cold
+/// start rather than a dead one. That window is now short, because the socket
+/// no longer waits for `Engine::start`.
 pub(crate) fn runtime_lock_is_held() -> bool {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -1659,6 +1659,12 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     message: "session is no longer active for this client".to_string(),
                 };
             }
+            // Capabilities are negotiated once per session and never
+            // revisited, so answering from a catalog that is still filling
+            // would tell a client the daemon has no tools and leave it with no
+            // way to learn otherwise. This is the one answer that must not be
+            // partial.
+            ctx.engine.wait_until_ready().await;
             let client_type = ctx
                 .client_registry
                 .client_info(session_id)
@@ -2769,6 +2775,73 @@ mod tests {
         clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    /// `run_daemon` must bind and serve without a started engine, which is what
+    /// lets `cmd_daemon` run `Engine::start` alongside it. `Engine::start` waits
+    /// on third-party server processes, so a socket bound after it makes a
+    /// healthy cold start look like an absent daemon for as long as the slowest
+    /// upstream takes.
+    #[tokio::test]
+    async fn ipc_socket_is_bound_while_upstream_startup_is_still_running() {
+        let _guard = runtime_paths_test_lock().lock().await;
+        // The bound socket lives under this root, and a Unix socket path has to
+        // fit in SUN_LEN, so keep the directory names short.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let runtime_root = std::env::temp_dir().join(format!("plug-eb-{}", &suffix[..8]));
+        let state_root = std::env::temp_dir().join(format!("plug-ebs-{}", &suffix[..8]));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+
+        // `/bin/sleep` never completes an MCP handshake, so this start stays in
+        // flight until the upstream timeout expires.
+        let mut server = ipc_harness_mock_config("noop");
+        server.command = Some("/bin/sleep".to_string());
+        server.args = vec!["30".to_string()];
+        server.timeout_secs = 20;
+        let mut config = plug_core::config::Config::default();
+        config.servers.insert("slow".to_string(), server);
+
+        let config_path = runtime_root.join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let engine = Arc::new(Engine::new(config));
+
+        let startup = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.start().await })
+        };
+        let daemon = {
+            let engine = engine.clone();
+            let config_path = config_path.clone();
+            tokio::spawn(async move { run_daemon(engine, config_path, 30, None).await })
+        };
+
+        let sock_path = socket_path();
+        let mut connected = false;
+        for _ in 0..50 {
+            if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        if !connected && daemon.is_finished() {
+            panic!("daemon exited early: {:?}", daemon.await);
+        }
+        assert!(connected, "socket never accepted a connection");
+        assert!(
+            !startup.is_finished(),
+            "upstream startup finished first, so this run proves nothing"
+        );
+
+        engine.cancel_token().cancel();
+        startup.abort();
+        daemon.abort();
+        clear_test_runtime_paths();
+        std::fs::remove_dir_all(runtime_root).ok();
+        std::fs::remove_dir_all(state_root).ok();
     }
 
     #[tokio::test]

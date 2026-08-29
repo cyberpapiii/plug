@@ -13,28 +13,28 @@ This register lists only the current remaining risks on `main`.
 ambiguity rather than a known implementation defect: the project still needs an explicit decision on
 whether full live reconfiguration is required for the intended production-ready bar.
 
-### The IPC socket is bound only after the whole engine starts
+### Downstream HTTP still binds only after the whole engine starts
 
-**Impact:** Medium
+**Impact:** Low
 **Likelihood:** High
 
-`cmd_daemon` claims the runtime lock, runs `Engine::start` to completion, and
-only then binds the Unix socket. Every configured upstream must connect first,
-and each one can involve a Keychain read or a network round trip, so on a cold
-start there is a window of tens of seconds in which the daemon is alive and
-healthy but indistinguishable from absent to anything that probes the socket.
+`cmd_daemon` used to run `Engine::start` to completion before binding anything,
+so on a cold start there was a window of tens of seconds in which the daemon was
+alive and healthy but indistinguishable from absent to anything that probed the
+socket. The IPC socket now binds first and `Engine::start` runs alongside it, so
+local clients reach the daemon immediately and see upstreams appear through the
+`list_changed` notifications the router already sends.
 
-The damage this used to cause is now contained rather than removed. Callers
-consult the runtime lock to tell a booting daemon from a dead one, wait 90
-seconds for it, and no longer force-restart what is already starting, and the
-status surfaces say "starting" rather than "stopped" for the same reason. What
-remains is that no client can talk to the daemon during startup, so nothing that
-needs an answer from the engine can get one until the engine is up.
+Downstream HTTP deliberately keeps the old ordering. A remote client cannot be
+told the catalog grew — the Claude Desktop connector does not subscribe to
+notifications — so for that path a bound port has to keep meaning a complete
+catalog. The cost is that a remote client which connects during a cold start is
+refused rather than served a partial catalog, which is the correct trade for a
+client that would otherwise never learn what it missed.
 
-Binding the listener before `Engine::start` and answering "starting" until the
-engine is ready would close it properly. That is a real change to daemon
-structure, not a tuning fix, which is why it is recorded here rather than done
-alongside the containment.
+Closing this properly means either a remote client that honors `list_changed` or
+a readiness answer richer than connection refused, and neither is worth doing
+before one is actually needed.
 
 ## Medium
 

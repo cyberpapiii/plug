@@ -1634,7 +1634,25 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     let config = plug_core::config::load_config(Some(&config_path))?;
     preflight_http_bind(&config.http)?;
     let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
-    engine.start().await?;
+
+    // Upstream startup no longer gates the IPC socket. `Engine::start` waits on
+    // third-party server processes, so it can run for tens of seconds, and
+    // binding the socket after it made a healthy cold start indistinguishable
+    // from an absent daemon for that whole window: `plug connect` retried, gave
+    // up, or force-kickstarted the very start it was waiting on. Local clients
+    // now reach a socket immediately and see servers appear through the
+    // `list_changed` notifications the router already sends.
+    //
+    // Downstream HTTP keeps the old ordering below. Remote clients cannot be
+    // told the catalog grew, so for them a bound port must continue to mean a
+    // complete catalog.
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+    let startup = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let _ = started_tx.send(engine.start().await);
+        })
+    };
     let http_runtime = build_configured_http_runtime(&engine.config(), &engine)?;
     let cancel = engine.cancel_token().clone();
     drop(plug_core::watcher::spawn_config_watcher(
@@ -1644,11 +1662,15 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         engine.tracker(),
     ));
     let http_config = engine.config().http.clone();
-    let http_future = serve_router(
-        http_runtime.router,
-        &http_config,
-        engine.cancel_token().clone(),
-    );
+    let http_cancel = engine.cancel_token().clone();
+    let http_router = http_runtime.router;
+    let http_future = async move {
+        match started_rx.await {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!("daemon startup ended without reporting a result"),
+        }
+        serve_router(http_router, &http_config, http_cancel).await
+    };
     tokio::pin!(http_future);
     let daemon_future = daemon::run_daemon_with_lock(
         engine.clone(),
@@ -1668,6 +1690,9 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         }
         _ = daemon::shutdown_signal(cancel) => {}
     }
+    // A cold start still in flight owns upstreams that shutdown has to retire,
+    // so give it a bounded chance to finish before anything is torn down.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), startup).await;
     engine.shutdown().await;
     Ok(())
 }

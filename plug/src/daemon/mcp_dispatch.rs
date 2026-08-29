@@ -149,6 +149,12 @@ pub(super) async fn dispatch_mcp_request(
     params: Option<&serde_json::Value>,
     request_context: Option<&IpcMcpRequestContext>,
 ) -> IpcResponse {
+    // The socket is bound before upstream startup finishes, so a request can
+    // arrive against a catalog that is still filling. Every answer here
+    // describes the merged surface, and a partial one is indistinguishable from
+    // a complete one to the client, so wait for the engine rather than reply
+    // with less than the daemon has.
+    ctx.engine.wait_until_ready().await;
     let tool_router = ctx.engine.tool_router();
 
     if let Some(response) =

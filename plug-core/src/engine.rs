@@ -15,6 +15,7 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -149,6 +150,13 @@ pub struct Engine {
     /// when the server returns to healthy.
     supervision_attempts: dashmap::DashMap<String, u32>,
     reload_lock: Mutex<()>,
+    /// Whether `start` has finished bringing every configured upstream up.
+    ///
+    /// The daemon binds its IPC socket before `start` runs, so callers that
+    /// need a complete picture of the merged surface — capability negotiation
+    /// above all, which a client performs exactly once and cannot repeat — have
+    /// to wait for this rather than answer from a half-built catalog.
+    ready: watch::Sender<bool>,
 }
 
 impl Engine {
@@ -179,6 +187,22 @@ impl Engine {
             recovery_task_flags: dashmap::DashMap::new(),
             supervision_attempts: dashmap::DashMap::new(),
             reload_lock: Mutex::new(()),
+            ready: watch::channel(false).0,
+        }
+    }
+
+    /// Whether `start` has finished.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Resolve once `start` has finished bringing every configured upstream up.
+    pub async fn wait_until_ready(&self) {
+        let mut ready = self.ready.subscribe();
+        while !*ready.borrow_and_update() {
+            if ready.changed().await.is_err() {
+                return;
+            }
         }
     }
 
@@ -248,6 +272,11 @@ impl Engine {
         );
 
         spawn_artifact_prune_loop(self.tool_router.clone(), self.cancel.clone(), &self.tracker);
+
+        // `send_replace` rather than `send`: the initial receiver is dropped at
+        // construction, and `send` refuses to update a channel with no
+        // receivers, which would leave every later subscriber waiting forever.
+        self.ready.send_replace(true);
 
         Ok(())
     }
@@ -2328,6 +2357,32 @@ mod tests {
             "HTTP 503 Service Unavailable: {{\"jsonrpc\":\"2.0\",\"error\":{{\"message\":\"Too many active sessions. Try again later.\"}}}}"
         );
         assert!(!is_retryable_reconnect_error(&err));
+    }
+
+    /// The daemon binds its socket before `start` runs and gates capability
+    /// negotiation on this signal, so a readiness flag that never flips would
+    /// hang every MCP request instead of answering late.
+    #[tokio::test]
+    async fn readiness_flips_once_start_finishes() {
+        let engine = Arc::new(Engine::new(Config::default()));
+        assert!(!engine.is_ready());
+
+        let waiting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.wait_until_ready().await })
+        };
+        engine.start().await.expect("engine start");
+
+        assert!(engine.is_ready());
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("waiter should resolve once start finishes")
+            .expect("waiter task");
+
+        // A subscriber created after the fact must see the same answer.
+        tokio::time::timeout(Duration::from_secs(5), engine.wait_until_ready())
+            .await
+            .expect("a late waiter should not block");
     }
 
     #[test]
