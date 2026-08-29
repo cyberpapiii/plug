@@ -1,0 +1,5 @@
+{
+  "type": "GetServerConfig",
+  "auth_token": "golden-auth-token",
+  "name": "workspace"
+}

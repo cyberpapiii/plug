@@ -1887,4 +1887,162 @@ mod tests {
         assert_eq!(resp_json["type"], "Capabilities");
         assert!(resp_json["capabilities"]["tools"].is_object());
     }
+
+    mod golden_ipc_fixtures {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn golden_dir() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("testdata")
+                .join("ipc")
+        }
+
+        fn read_golden(name: &str) -> String {
+            std::fs::read_to_string(golden_dir().join(name))
+                .unwrap_or_else(|e| panic!("read golden {name}: {e}"))
+        }
+
+        fn canonical_handshake_response() -> IpcResponse {
+            IpcResponse::OperatorHandshake {
+                handshake: OperatorHandshake {
+                    daemon_version: "0.7.0".to_string(),
+                    daemon_executable: None,
+                    ipc_min: OPERATOR_IPC_MIN,
+                    ipc_max: OPERATOR_IPC_MAX,
+                    ownership: DaemonOwnershipMode::Unknown,
+                    stale: true,
+                    capabilities: vec![
+                        OperatorCapability::ServerMutation,
+                        OperatorCapability::ServerConfigRead,
+                    ],
+                },
+            }
+        }
+
+        fn canonical_get_server_config_request() -> IpcRequest {
+            IpcRequest::GetServerConfig {
+                auth_token: "golden-auth-token".to_string(),
+                name: "workspace".to_string(),
+            }
+        }
+
+        fn canonical_server_config() -> crate::config::ServerConfig {
+            crate::config::ServerConfig {
+                command: Some("uvx".to_string()),
+                args: vec!["workspace-mcp".to_string()],
+                env: HashMap::new(),
+                enabled: true,
+                transport: crate::config::TransportType::Stdio,
+                protocol_mode: Default::default(),
+                url: None,
+                auth_token: None,
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 1,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+                sandbox: None,
+            }
+        }
+
+        fn canonical_get_server_config_response() -> IpcResponse {
+            IpcResponse::ServerConfig {
+                name: "workspace".to_string(),
+                server: Box::new(canonical_server_config()),
+            }
+        }
+
+        fn assert_json_matches_canonical<T>(canonical: &T, golden_name: &str)
+        where
+            T: Serialize + for<'de> Deserialize<'de>,
+        {
+            let golden_text = read_golden(golden_name);
+            let golden_value: serde_json::Value =
+                serde_json::from_str(&golden_text).expect("golden must be valid JSON");
+            let canonical_value =
+                serde_json::to_value(canonical).expect("canonical value must serialize");
+            assert_eq!(
+                canonical_value, golden_value,
+                "golden {golden_name} drifted from current Rust IPC types"
+            );
+
+            let round_trip: T = serde_json::from_value(golden_value).expect("golden must decode");
+            assert_eq!(
+                serde_json::to_value(&round_trip).unwrap(),
+                canonical_value,
+                "golden {golden_name} must round-trip through Rust IPC types"
+            );
+        }
+
+        #[test]
+        #[ignore = "run manually to regenerate shared IPC golden JSON fixtures"]
+        fn write_golden_ipc_fixtures() {
+            std::fs::create_dir_all(golden_dir()).expect("create golden dir");
+            let fixtures = [
+                (
+                    "operator_handshake_response.json",
+                    serde_json::to_string_pretty(&canonical_handshake_response()).unwrap(),
+                ),
+                (
+                    "get_server_config_request.json",
+                    serde_json::to_string_pretty(&canonical_get_server_config_request()).unwrap(),
+                ),
+                (
+                    "get_server_config_response.json",
+                    serde_json::to_string_pretty(&canonical_get_server_config_response()).unwrap(),
+                ),
+            ];
+            for (name, contents) in fixtures {
+                std::fs::write(golden_dir().join(name), format!("{contents}\n"))
+                    .unwrap_or_else(|e| panic!("write golden {name}: {e}"));
+            }
+        }
+
+        #[test]
+        fn golden_operator_handshake_response_matches_rust_types() {
+            let response = canonical_handshake_response();
+            assert_json_matches_canonical(&response, "operator_handshake_response.json");
+
+            let IpcResponse::OperatorHandshake { handshake } = response else {
+                panic!("expected operator handshake response");
+            };
+            assert_eq!(handshake.ownership, DaemonOwnershipMode::Unknown);
+            assert!(handshake.stale);
+            assert!(handshake
+                .capabilities
+                .contains(&OperatorCapability::ServerConfigRead));
+        }
+
+        #[test]
+        fn golden_get_server_config_request_matches_rust_types() {
+            let request = canonical_get_server_config_request();
+            assert_json_matches_canonical(&request, "get_server_config_request.json");
+
+            let IpcRequest::GetServerConfig { name, .. } = request else {
+                panic!("expected GetServerConfig request");
+            };
+            assert_eq!(name, "workspace");
+        }
+
+        #[test]
+        fn golden_get_server_config_response_matches_rust_types() {
+            let response = canonical_get_server_config_response();
+            assert_json_matches_canonical(&response, "get_server_config_response.json");
+
+            let IpcResponse::ServerConfig { name, server } = response else {
+                panic!("expected ServerConfig response");
+            };
+            assert_eq!(name, "workspace");
+            assert_eq!(server.command.as_deref(), Some("uvx"));
+        }
+    }
 }
