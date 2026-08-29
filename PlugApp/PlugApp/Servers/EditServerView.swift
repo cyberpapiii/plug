@@ -86,7 +86,7 @@ struct EditServerView: View {
         .task { await load() }
     }
 
-    static func canSave(
+    nonisolated static func canSave(
         canReadServerConfig: Bool,
         loaded: Bool,
         isComplete: Bool,

@@ -23,6 +23,7 @@ pub enum LaunchdProgramOwnership {
 
 /// Shared operator copy for leftover recognized-legacy launchd jobs.
 /// Matches Plug.app adoptionRequired / Turn On surfaces.
+#[cfg(any(target_os = "macos", test))]
 pub const LEFTOVER_LAUNCHD_ADOPT_SENTENCE: &str =
     "Open Plug.app and tap Turn On to adopt the leftover launchd daemon.";
 
@@ -98,8 +99,7 @@ pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
 
     let is_cargo_binary =
         dirs::home_dir().is_some_and(|home| program == home.join(".cargo/bin/plug"));
-    let is_local_bin =
-        dirs::home_dir().is_some_and(|home| program == home.join(".local/bin/plug"));
+    let is_local_bin = dirs::home_dir().is_some_and(|home| program == home.join(".local/bin/plug"));
     let is_formula_cellar_binary = [
         Path::new("/opt/homebrew/Cellar/plug"),
         Path::new("/usr/local/Cellar/plug"),
@@ -310,9 +310,7 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
     })
 }
 
-fn map_service_ownership(
-    ownership: ServiceOwnership,
-) -> plug_core::ipc::DaemonOwnershipMode {
+fn map_service_ownership(ownership: ServiceOwnership) -> plug_core::ipc::DaemonOwnershipMode {
     match ownership {
         ServiceOwnership::AppManaged => plug_core::ipc::DaemonOwnershipMode::AppManaged,
         ServiceOwnership::CliManaged => plug_core::ipc::DaemonOwnershipMode::CliManaged,
@@ -321,9 +319,12 @@ fn map_service_ownership(
 }
 
 fn launchctl_field(output: &str, prefix: &str) -> Option<String> {
-    output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim).map(str::to_owned))
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .map(str::to_owned)
+    })
 }
 
 fn app_managed_registration_stale(parent_build: Option<&str>, current_build: Option<&str>) -> bool {
@@ -337,7 +338,7 @@ fn verified_app_build_version() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let app = crate::install::resolve_verified_app().ok().flatten()?;
-        return crate::install::bundle_build_version(&app.bundle_path).ok();
+        crate::install::bundle_build_version(&app.bundle_path).ok()
     }
     #[cfg(not(target_os = "macos"))]
     {

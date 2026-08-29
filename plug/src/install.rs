@@ -684,10 +684,7 @@ fn read_bundle_plist_string(bundle_path: &Path, key: &str, label: &str) -> Resul
         .arg(bundle_path.join("Contents/Info.plist"))
         .output()
         .with_context(|| format!("could not read Plug.app {label}"))?;
-    ensure!(
-        output.status.success(),
-        "Plug.app has no readable {label}"
-    );
+    ensure!(output.status.success(), "Plug.app has no readable {label}");
     let value = String::from_utf8(output.stdout)
         .with_context(|| format!("Plug.app {label} was not UTF-8"))?;
     let value = value.trim();
@@ -702,11 +699,7 @@ pub(crate) fn bundle_build_version(bundle_path: &Path) -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn bundle_version(bundle_path: &Path) -> Result<String> {
-    read_bundle_plist_string(
-        bundle_path,
-        "CFBundleShortVersionString",
-        "bundle version",
-    )
+    read_bundle_plist_string(bundle_path, "CFBundleShortVersionString", "bundle version")
 }
 
 #[cfg(target_os = "macos")]

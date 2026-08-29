@@ -293,9 +293,9 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
     };
 
     let home = dirs::home_dir();
-    let is_home_legacy = home.as_ref().is_some_and(|home| {
-        path == home.join(".local/bin/plug")
-    });
+    let is_home_legacy = home
+        .as_ref()
+        .is_some_and(|home| path == home.join(".local/bin/plug"));
     let is_old_app = path == Path::new("/Applications/Plug.app/Contents/Resources/plug")
         || home
             .as_ref()
