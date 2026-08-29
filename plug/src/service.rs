@@ -21,6 +21,11 @@ pub enum LaunchdProgramOwnership {
     Unknown,
 }
 
+/// Shared operator copy for leftover recognized-legacy launchd jobs.
+/// Matches Plug.app adoptionRequired / Turn On surfaces.
+pub const LEFTOVER_LAUNCHD_ADOPT_SENTENCE: &str =
+    "Open Plug.app and tap Turn On to adopt the leftover launchd daemon.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceOwnership {
     Unmanaged,
