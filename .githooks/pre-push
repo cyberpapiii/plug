@@ -16,6 +16,22 @@ if [[ "${PLUG_SKIP_HOOKS:-0}" == "1" ]]; then
   exit 0
 fi
 
+# A branch deletion pushes an all-zero local sha and carries no commits to
+# check. Running the gate there would print noise for a no-op.
+#
+# `saw_ref` matters: git always feeds refs on stdin, so an empty read means this
+# hook was invoked some other way. That must run the gate, not skip it. A check
+# that silently passes when it cannot see its input is worse than no check.
+saw_ref=false
+only_deletions=true
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  saw_ref=true
+  [[ "$local_sha" =~ ^0+$ ]] || only_deletions=false
+done
+if [[ "$saw_ref" == true && "$only_deletions" == true ]]; then
+  exit 0
+fi
+
 upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo '')"
 if [[ -n "$upstream" ]]; then
   base="$upstream"
