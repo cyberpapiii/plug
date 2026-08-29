@@ -200,11 +200,10 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
     }
 
     private static func resolvedPath(_ url: URL) -> URL {
-        url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+        url.resolvedStandardized
     }
 
     private static func errorDetail(_ result: ProcessResult) -> String {
-        String(decoding: result.stderr, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        result.stderrText
     }
 }

@@ -227,6 +227,32 @@ final class InstallationCoordinator {
         }
     }
 
+    /// Both `.recognizedLegacy` and `.unmanaged` mean something other than this
+    /// app currently owns the daemon label. Taking it over changes a running
+    /// system, so it happens only when the user asked for it or has already
+    /// granted the app the service. This is the single definition on purpose:
+    /// two copies of an authorization check that can drift is how a daemon gets
+    /// adopted without consent.
+    private func requireAdoptionAuthorized(
+        snapshot: DaemonServiceSnapshot,
+        canonical: VerifiedAppInstallation,
+        legacy: LegacyInstallSnapshot,
+        clientRepairNeeded: Bool,
+        trigger: ReconciliationTrigger
+    ) throws {
+        guard trigger == .explicitAdoption || daemonManager.appServiceEnabled else {
+            state = .adoptionRequired(
+                makeSnapshot(
+                    app: canonical,
+                    legacy: legacy,
+                    service: snapshot,
+                    clientRepairNeeded: clientRepairNeeded
+                )
+            )
+            throw CoordinatorError.adoptionRequired
+        }
+    }
+
     private func reconcileDaemon(
         snapshot: DaemonServiceSnapshot,
         canonical: VerifiedAppInstallation,
@@ -236,17 +262,13 @@ final class InstallationCoordinator {
     ) async throws -> OperatorHandshake {
         switch snapshot.ownership {
         case .recognizedLegacy:
-            guard trigger == .explicitAdoption || daemonManager.appServiceEnabled else {
-                state = .adoptionRequired(
-                    makeSnapshot(
-                        app: canonical,
-                        legacy: legacy,
-                        service: snapshot,
-                        clientRepairNeeded: clientRepairNeeded
-                    )
-                )
-                throw CoordinatorError.adoptionRequired
-            }
+            try requireAdoptionAuthorized(
+                snapshot: snapshot,
+                canonical: canonical,
+                legacy: legacy,
+                clientRepairNeeded: clientRepairNeeded,
+                trigger: trigger
+            )
             publish(.replacingDaemon)
             return try await daemonManager.adoptRecognizedLegacy(
                 snapshot: snapshot,
@@ -254,17 +276,13 @@ final class InstallationCoordinator {
             )
 
         case .unmanaged:
-            guard trigger == .explicitAdoption || daemonManager.appServiceEnabled else {
-                state = .adoptionRequired(
-                    makeSnapshot(
-                        app: canonical,
-                        legacy: legacy,
-                        service: snapshot,
-                        clientRepairNeeded: clientRepairNeeded
-                    )
-                )
-                throw CoordinatorError.adoptionRequired
-            }
+            try requireAdoptionAuthorized(
+                snapshot: snapshot,
+                canonical: canonical,
+                legacy: legacy,
+                clientRepairNeeded: clientRepairNeeded,
+                trigger: trigger
+            )
             publish(.replacingDaemon)
             try await daemonManager.adopt()
             return try await daemonManager.ensureRunning(expectedVersion: canonical.appVersion)
@@ -549,8 +567,8 @@ final class InstallationCoordinator {
     }
 
     private func samePath(_ lhs: URL, _ rhs: URL) -> Bool {
-        lhs.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
-            == rhs.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+        lhs.resolvedStandardized
+            == rhs.resolvedStandardized
     }
 
     private func publish(_ phase: ReconciliationPhase) {

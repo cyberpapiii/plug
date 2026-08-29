@@ -135,8 +135,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
             timeout: .seconds(60)
         )
         guard result.status == 0 else {
-            let detail = String(decoding: result.stderr, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = result.stderrText
             throw LegacyInstallError.brewFailed(detail)
         }
     }
@@ -146,11 +145,13 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         if try await installedBrew() != nil {
             throw LegacyInstallError.formulaStillInstalled
         }
-        if case .unrelated = inspectShellLink(at: shellURL, canonical: executable) {
+        switch inspectShellLink(at: shellURL, canonical: executable) {
+        case .unrelated:
             throw LegacyInstallError.unrelatedShellCommand(shellURL)
-        }
-        if case .canonical = inspectShellLink(at: shellURL, canonical: executable) {
+        case .canonical:
             return .canonical(executable.standardizedFileURL)
+        case .absent, .repairable:
+            break
         }
 
         let parent = shellURL.deletingLastPathComponent()
@@ -256,7 +257,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     }
 
     private func resolved(_ url: URL) -> URL {
-        url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+        url.resolvedStandardized
     }
 
     private static func readLegacyBinaryIdentity(at url: URL) -> LegacyBinaryIdentity? {

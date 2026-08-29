@@ -137,8 +137,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
         let output = String(decoding: result.stdout, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard result.status == 0, let version = output.split(whereSeparator: \.isWhitespace).last else {
-            let detail = String(decoding: result.stderr, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = result.stderrText
             throw AppInstallationError.embeddedVersionFailure(detail)
         }
         return String(version)

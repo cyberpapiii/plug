@@ -13,7 +13,7 @@ struct AuthFlowService: Sendable {
     }
 
     private func run(_ arguments: [String], failure: String) async throws {
-        guard let executable = Bundle.main.url(forResource: "plug", withExtension: nil) else {
+        guard let executable = BundledPlug.executable else {
             throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "The bundled Plug service is missing."])
         }
         try await Task.detached {

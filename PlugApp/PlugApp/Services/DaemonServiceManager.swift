@@ -387,7 +387,7 @@ final class DaemonServiceManager {
     }
 
     private func resolved(_ url: URL) -> URL {
-        url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+        url.resolvedStandardized
     }
 
     /// Existence probes for leftover files still on disk. Not the classify table.
@@ -473,8 +473,7 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
             timeout: .seconds(10)
         )
         guard result.status == 0 else {
-            let detail = String(decoding: result.stderr, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = result.stderrText
             throw DaemonServiceError.commandFailed(detail)
         }
     }

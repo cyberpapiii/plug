@@ -75,16 +75,6 @@ fn cli_plist_path() -> PathBuf {
         .join(format!("{LABEL}.plist"))
 }
 
-fn paths_match(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
 /// Keep in lockstep with `LegacyPlugProgram.isRecognized` in Plug.app.
 /// Both are pinned by `testdata/legacy_plug_programs.json`.
 pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
@@ -120,7 +110,9 @@ pub fn classify_launchd_program(
     job: &LaunchdJobRecord,
     current_app_executable: Option<&Path>,
 ) -> LaunchdProgramOwnership {
-    if current_app_executable.is_some_and(|current| paths_match(&job.program, current)) {
+    if current_app_executable
+        .is_some_and(|current| crate::install::paths_match(&job.program, current))
+    {
         LaunchdProgramOwnership::CurrentApp
     } else if is_recognized_legacy_program(&job.program) {
         LaunchdProgramOwnership::RecognizedLegacyPlug
@@ -148,23 +140,20 @@ fn parse_launchd_labels(output: &str) -> Vec<String> {
     labels
 }
 
-fn parse_launchd_job(
-    label: &str,
-    output: &str,
-    verified_app_program: Option<&Path>,
-) -> Option<LaunchdJobRecord> {
-    if let Some(program) = output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("program = "))
-    {
-        let program = PathBuf::from(program.trim_matches('"'));
-        let program = std::fs::canonicalize(&program).unwrap_or(program);
-        return Some(LaunchdJobRecord {
-            label: label.to_string(),
-            program,
-        });
-    }
-
+/// Whether `launchctl print` output describes the daemon job Plug.app owns.
+///
+/// All four conditions must hold together. `managed_by` and the parent bundle
+/// identifier prove SMAppService registered the job on behalf of the app, and
+/// the program identifier and argument vector prove the job is the daemon
+/// rather than some other executable inside the bundle. A leftover Homebrew or
+/// cargo job satisfies none of them, which is the distinction the adopt path
+/// depends on.
+///
+/// This is the single definition on purpose. It used to be copied into
+/// `parse_launchd_job` and `classify_launchctl_output`, and two copies of the
+/// ownership test that can drift is exactly how the daemon and the app end up
+/// disagreeing about who owns `com.plug.daemon`.
+fn app_managed_launchd_evidence(output: &str) -> bool {
     let managed_by_service_management = output
         .lines()
         .any(|line| line.trim() == "managed_by = com.apple.xpc.ServiceManagement");
@@ -184,11 +173,30 @@ fn parse_launchd_job(
         && arguments.get(1).map(String::as_str) == Some("serve")
         && arguments.get(2).map(String::as_str) == Some("--daemon");
 
-    if managed_by_service_management
+    managed_by_service_management
         && parent_is_plug
         && program_identifier_is_plug
         && arguments_identify_daemon
+}
+
+fn parse_launchd_job(
+    label: &str,
+    output: &str,
+    verified_app_program: Option<&Path>,
+) -> Option<LaunchdJobRecord> {
+    if let Some(program) = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("program = "))
     {
+        let program = PathBuf::from(program.trim_matches('"'));
+        let program = std::fs::canonicalize(&program).unwrap_or(program);
+        return Some(LaunchdJobRecord {
+            label: label.to_string(),
+            program,
+        });
+    }
+
+    if app_managed_launchd_evidence(output) {
         let program = verified_app_program?;
         let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
         return Some(LaunchdJobRecord {
@@ -258,30 +266,7 @@ pub fn discover_launchd_jobs() -> anyhow::Result<Vec<LaunchdJobRecord>> {
 }
 
 pub fn classify_launchctl_output(output: &str, cli_plist_exists: bool) -> ServiceOwnership {
-    let managed_by_service_management = output
-        .lines()
-        .any(|line| line.trim() == "managed_by = com.apple.xpc.ServiceManagement");
-    let parent_is_plug = output
-        .lines()
-        .any(|line| line.trim() == "parent bundle identifier = com.cyberpapiii.plug");
-    let program_identifier_is_plug = output.lines().any(|line| {
-        line.trim()
-            .strip_prefix("program identifier = ")
-            .is_some_and(|value| {
-                value == "Contents/Resources/plug" || value.starts_with("Contents/Resources/plug (")
-            })
-    });
-    let arguments = parse_launchd_arguments(output);
-    let arguments_identify_daemon = arguments.first().map(String::as_str)
-        == Some("Contents/Resources/plug")
-        && arguments.get(1).map(String::as_str) == Some("serve")
-        && arguments.get(2).map(String::as_str) == Some("--daemon");
-
-    if managed_by_service_management
-        && parent_is_plug
-        && program_identifier_is_plug
-        && arguments_identify_daemon
-    {
+    if app_managed_launchd_evidence(output) {
         ServiceOwnership::AppManaged
     } else if !output.trim().is_empty() || cli_plist_exists {
         ServiceOwnership::CliManaged

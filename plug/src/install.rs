@@ -218,7 +218,12 @@ pub fn maybe_delegate_to_app() -> Result<()> {
     Ok(())
 }
 
-fn paths_match(left: &Path, right: &Path) -> bool {
+/// Whether two paths name the same file once symlinks are resolved.
+///
+/// The plain equality check first matters: `canonicalize` fails on a path that
+/// does not exist yet, and install decisions routinely compare against a
+/// destination that has not been created.
+pub(crate) fn paths_match(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
