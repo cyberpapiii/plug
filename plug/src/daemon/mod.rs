@@ -1116,6 +1116,23 @@ fn current_daemon_executable() -> Option<std::path::PathBuf> {
 }
 
 /// Dispatch a single IPC request to the appropriate Engine query.
+/// Drop upstream branding icons from an operator snapshot's server statuses.
+///
+/// An icon is a base64 data URI, and a server that advertises a large one makes
+/// its status entry dwarf every other server in the snapshot combined. The
+/// snapshot is polled every couple of seconds to show health, tool counts and
+/// live sessions; branding is not part of that and no operator client reads it
+/// here. Tool listings still carry icons, which is where a client renders them,
+/// and `plug servers --output json` reads the unmodified statuses from the
+/// separate `Status` request.
+fn strip_upstream_icons(statuses: &mut [plug_core::types::ServerStatus]) {
+    for status in statuses {
+        if let Some(upstream) = status.upstream.as_mut() {
+            upstream.icons = None;
+        }
+    }
+}
+
 /// A value that changes whenever `ListTools` would answer differently.
 ///
 /// The router's own revision covers the merged upstream catalog. It does not
@@ -1244,7 +1261,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                         .len(),
                 })
                 .collect();
-            let server_statuses = ctx.server_manager.server_statuses();
+            let mut server_statuses = ctx.server_manager.server_statuses();
+            strip_upstream_icons(&mut server_statuses);
             let upstream_auth = match auth_status_from_statuses(ctx, &server_statuses).await {
                 IpcResponse::AuthStatus { servers } => servers,
                 IpcResponse::Error { code, message } => {
@@ -2245,6 +2263,44 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One server advertising a large icon can outweigh every other server in
+    /// the snapshot, and the snapshot is polled every couple of seconds.
+    #[test]
+    fn operator_server_statuses_carry_no_upstream_icons() {
+        let icon = rmcp::model::Icon::new(format!("data:image/png;base64,{}", "A".repeat(8192)))
+            .with_mime_type("image/png");
+        let mut statuses = vec![plug_core::types::ServerStatus {
+            server_id: "branded".to_string(),
+            health: plug_core::types::ServerHealth::Healthy,
+            tool_count: 1,
+            auth_status: "none".to_string(),
+            upstream: Some(plug_core::types::UpstreamServerMetadata {
+                name: "branded".to_string(),
+                version: "1.0.0".to_string(),
+                title: Some("Branded".to_string()),
+                description: None,
+                website_url: None,
+                icons: Some(vec![icon]),
+                selected_protocol_version: None,
+            }),
+            metrics: None,
+            availability: plug_core::types::Availability::Healthy,
+            selected_protocol_era: None,
+            selected_protocol_version: None,
+            last_seen: None,
+        }];
+
+        strip_upstream_icons(&mut statuses);
+
+        let upstream = statuses[0].upstream.as_ref().expect("metadata is kept");
+        assert!(upstream.icons.is_none(), "icons must not ride the snapshot");
+        assert_eq!(upstream.title.as_deref(), Some("Branded"));
+        assert!(
+            serde_json::to_string(&statuses).expect("serialize").len() < 512,
+            "the entry must no longer be dominated by branding"
+        );
+    }
 
     /// A daemon whose engine is stuck still accepts connections, so an
     /// unbounded read turns `plug status`, `plug doctor` and every app checkup
