@@ -52,6 +52,13 @@ pub struct ServiceState {
     pub ownership: ServiceOwnership,
     pub loaded: bool,
     pub plist_path: PathBuf,
+    launchctl_output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcOwnershipState {
+    pub ownership: plug_core::ipc::DaemonOwnershipMode,
+    pub stale: bool,
 }
 
 fn user_id() -> anyhow::Result<String> {
@@ -79,7 +86,7 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn is_recognized_legacy_program(program: &Path) -> bool {
+pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
     if program.file_name().and_then(|name| name.to_str()) != Some("plug") {
         return false;
     }
@@ -101,6 +108,8 @@ fn is_recognized_legacy_program(program: &Path) -> bool {
     is_cargo_binary
         || program == Path::new("/opt/homebrew/bin/plug")
         || program == Path::new("/usr/local/bin/plug")
+        || program == Path::new("/opt/homebrew/opt/plug/bin/plug")
+        || program == Path::new("/usr/local/opt/plug/bin/plug")
         || is_formula_cellar_binary
 }
 
@@ -285,20 +294,75 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
     let output = Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{LABEL}")])
         .output()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(ServiceState {
         ownership: classify_launchctl_output(&text, plist_path.exists()),
         loaded: output.status.success(),
         plist_path,
+        launchctl_output: text,
     })
 }
 
-pub fn ipc_ownership() -> plug_core::ipc::DaemonOwnershipMode {
-    match inspect().map(|state| state.ownership) {
-        Ok(ServiceOwnership::AppManaged) => plug_core::ipc::DaemonOwnershipMode::AppManaged,
-        Ok(ServiceOwnership::CliManaged) => plug_core::ipc::DaemonOwnershipMode::CliManaged,
-        Ok(ServiceOwnership::Unmanaged) | Err(_) => plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+fn map_service_ownership(
+    ownership: ServiceOwnership,
+) -> plug_core::ipc::DaemonOwnershipMode {
+    match ownership {
+        ServiceOwnership::AppManaged => plug_core::ipc::DaemonOwnershipMode::AppManaged,
+        ServiceOwnership::CliManaged => plug_core::ipc::DaemonOwnershipMode::CliManaged,
+        ServiceOwnership::Unmanaged => plug_core::ipc::DaemonOwnershipMode::Unmanaged,
     }
+}
+
+fn launchctl_field(output: &str, prefix: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim).map(str::to_owned))
+}
+
+fn app_managed_registration_stale(launchctl_output: &str, current_build: Option<&str>) -> bool {
+    let Some(parent_build) = launchctl_field(launchctl_output, "parent bundle version =") else {
+        return false;
+    };
+    let Some(current_build) = current_build else {
+        return false;
+    };
+    parent_build != current_build
+}
+
+fn verified_app_build_version() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = crate::install::resolve_verified_app().ok().flatten()?;
+        return crate::install::bundle_build_version(&app.bundle_path).ok();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+pub fn ipc_ownership_state() -> IpcOwnershipState {
+    match inspect() {
+        Err(_) => IpcOwnershipState {
+            ownership: plug_core::ipc::DaemonOwnershipMode::Unknown,
+            stale: false,
+        },
+        Ok(state) => {
+            let stale = state.ownership == ServiceOwnership::AppManaged
+                && app_managed_registration_stale(
+                    &state.launchctl_output,
+                    verified_app_build_version().as_deref(),
+                );
+            IpcOwnershipState {
+                ownership: map_service_ownership(state.ownership),
+                stale,
+            }
+        }
+    }
+}
+
+pub fn ipc_ownership() -> plug_core::ipc::DaemonOwnershipMode {
+    ipc_ownership_state().ownership
 }
 
 fn xml_escape(value: &str) -> String {
@@ -542,6 +606,36 @@ mod tests {
             classify_launchd_program(&job, None),
             LaunchdProgramOwnership::Unknown
         );
+    }
+
+    #[test]
+    fn opt_plug_program_is_recognized() {
+        assert!(is_recognized_legacy_program(Path::new(
+            "/opt/homebrew/opt/plug/bin/plug"
+        )));
+        assert!(is_recognized_legacy_program(Path::new(
+            "/usr/local/opt/plug/bin/plug"
+        )));
+    }
+
+    #[test]
+    fn inspect_error_maps_to_unknown_not_unmanaged() {
+        let ownership = match Result::<ServiceState, anyhow::Error>::Err(anyhow::anyhow!(
+            "launchctl unavailable"
+        )) {
+            Err(_) => plug_core::ipc::DaemonOwnershipMode::Unknown,
+            Ok(state) => map_service_ownership(state.ownership),
+        };
+        assert_eq!(ownership, plug_core::ipc::DaemonOwnershipMode::Unknown);
+        assert_ne!(ownership, plug_core::ipc::DaemonOwnershipMode::Unmanaged);
+    }
+
+    #[test]
+    fn app_managed_registration_stale_when_parent_bundle_version_differs() {
+        let output = "managed_by = com.apple.xpc.ServiceManagement\nparent bundle identifier = com.cyberpapiii.plug\nparent bundle version = 19\n";
+        assert!(app_managed_registration_stale(output, Some("20")));
+        assert!(!app_managed_registration_stale(output, Some("19")));
+        assert!(!app_managed_registration_stale(output, None));
     }
 
     #[test]

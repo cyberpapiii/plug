@@ -279,8 +279,8 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 }
 
 fn is_recognized_legacy_plug_path(path: &Path) -> bool {
-    if path.file_name().and_then(|name| name.to_str()) != Some("plug") {
-        return false;
+    if crate::service::is_recognized_legacy_program(path) {
+        return true;
     }
 
     let path_components = path.components().collect::<Vec<_>>();
@@ -294,7 +294,7 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
 
     let home = dirs::home_dir();
     let is_home_legacy = home.as_ref().is_some_and(|home| {
-        path == home.join(".cargo/bin/plug") || path == home.join(".local/bin/plug")
+        path == home.join(".local/bin/plug")
     });
     let is_old_app = path == Path::new("/Applications/Plug.app/Contents/Resources/plug")
         || home
@@ -302,27 +302,9 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
             .is_some_and(|home| path == home.join("Applications/Plug.app/Contents/Resources/plug"));
 
     is_home_legacy
-        || path == Path::new("/opt/homebrew/bin/plug")
-        || path == Path::new("/usr/local/bin/plug")
-        || is_homebrew_cellar_path(path)
         || is_old_app
         || has_suffix(&["target", "debug", "plug"])
         || has_suffix(&["target", "release", "plug"])
-}
-
-fn is_homebrew_cellar_path(path: &Path) -> bool {
-    ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"]
-        .iter()
-        .any(|root| {
-            let Ok(relative) = path.strip_prefix(root) else {
-                return false;
-            };
-            let parts = relative.components().collect::<Vec<_>>();
-            parts.len() == 3
-                && !parts[0].as_os_str().is_empty()
-                && parts[1].as_os_str() == "bin"
-                && parts[2].as_os_str() == "plug"
-        })
 }
 
 pub(crate) fn is_detected(target: &str) -> bool {

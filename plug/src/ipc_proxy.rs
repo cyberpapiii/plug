@@ -2988,6 +2988,7 @@ mod tests {
                             ipc_min: ipc::OPERATOR_IPC_MIN,
                             ipc_max: ipc::OPERATOR_IPC_MAX,
                             ownership: ipc::DaemonOwnershipMode::Unmanaged,
+                            stale: false,
                             capabilities: Vec::new(),
                         },
                     },

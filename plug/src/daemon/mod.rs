@@ -1114,24 +1114,28 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
             }
         }
-        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
-            handshake: plug_core::ipc::OperatorHandshake {
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                daemon_executable: current_daemon_executable(),
-                ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
-                ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
-                ownership: crate::service::ipc_ownership(),
-                capabilities: vec![
-                    plug_core::ipc::OperatorCapability::ServerMutation,
-                    plug_core::ipc::OperatorCapability::ClientMutation,
-                    plug_core::ipc::OperatorCapability::AuthMutation,
-                    plug_core::ipc::OperatorCapability::ConfigMutation,
-                    plug_core::ipc::OperatorCapability::ActivityStream,
-                    plug_core::ipc::OperatorCapability::ToolMutation,
-                    plug_core::ipc::OperatorCapability::ServerConfigRead,
-                ],
-            },
-        },
+        IpcRequest::OperatorHandshake { .. } => {
+            let ownership = crate::service::ipc_ownership_state();
+            IpcResponse::OperatorHandshake {
+                handshake: plug_core::ipc::OperatorHandshake {
+                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                    daemon_executable: current_daemon_executable(),
+                    ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
+                    ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
+                    ownership: ownership.ownership,
+                    stale: ownership.stale,
+                    capabilities: vec![
+                        plug_core::ipc::OperatorCapability::ServerMutation,
+                        plug_core::ipc::OperatorCapability::ClientMutation,
+                        plug_core::ipc::OperatorCapability::AuthMutation,
+                        plug_core::ipc::OperatorCapability::ConfigMutation,
+                        plug_core::ipc::OperatorCapability::ActivityStream,
+                        plug_core::ipc::OperatorCapability::ToolMutation,
+                        plug_core::ipc::OperatorCapability::ServerConfigRead,
+                    ],
+                },
+            }
+        }
         IpcRequest::ActivitySnapshot {
             after_sequence,
             limit,

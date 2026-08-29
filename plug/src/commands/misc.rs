@@ -489,11 +489,11 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
         Ok(_) => {
             inspection_errors
                 .push("daemon operator handshake returned an unexpected response".to_string());
-            (None, None, DaemonOwnershipMode::Unmanaged, false)
+            (None, None, DaemonOwnershipMode::Unknown, false)
         }
         Err(error) => {
             inspection_errors.push(format!("daemon inspection failed: {error}"));
-            (None, None, DaemonOwnershipMode::Unmanaged, false)
+            (None, None, DaemonOwnershipMode::Unknown, false)
         }
     };
     let live_sessions = bounded_ipc_probe(

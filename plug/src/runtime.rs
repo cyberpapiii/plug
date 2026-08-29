@@ -3611,6 +3611,7 @@ mod tests {
             ipc_min: plug_core::ipc::IPC_PROTOCOL_VERSION,
             ipc_max: plug_core::ipc::IPC_PROTOCOL_VERSION,
             ownership,
+            stale: false,
             capabilities: Vec::new(),
         }
     }

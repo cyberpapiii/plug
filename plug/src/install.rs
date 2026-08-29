@@ -678,6 +678,23 @@ fn codesign_requirement_argument() -> String {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn bundle_build_version(bundle_path: &Path) -> Result<String> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleVersion", "raw", "-o", "-"])
+        .arg(bundle_path.join("Contents/Info.plist"))
+        .output()
+        .context("could not read Plug.app build version")?;
+    ensure!(
+        output.status.success(),
+        "Plug.app has no readable build version"
+    );
+    let version = String::from_utf8(output.stdout).context("Plug.app build version was not UTF-8")?;
+    let version = version.trim();
+    ensure!(!version.is_empty(), "Plug.app build version was empty");
+    Ok(version.to_owned())
+}
+
+#[cfg(target_os = "macos")]
 fn bundle_version(bundle_path: &Path) -> Result<String> {
     let output = Command::new("/usr/bin/plutil")
         .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
