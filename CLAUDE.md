@@ -158,12 +158,31 @@ Engineering guardrails:
 
 ## Development Commands
 
+`scripts/dev.sh` runs the CI lanes a change actually needs, selected by
+`scripts/classify-changes.sh` (the same file CI's `classify` job runs). Prefer
+it over the raw commands.
+
+```bash
+./scripts/dev.sh           # lanes the working tree touches, with tests
+./scripts/dev.sh --quick   # fmt and clippy only, about 20 seconds
+./scripts/dev.sh --all     # rust and app lanes regardless of what changed
+./scripts/dev.sh --e2e     # opt in to the Playwright browser lane
+```
+
+The underlying commands:
+
 ```bash
 cargo check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+Build artifacts are governed by `scripts/clean-build-artifacts.sh`. `--guard`
+reclaims regenerable caches only when `target/` exceeds 10 GB and is silent
+otherwise, so `dev.sh` and the optional `.githooks/pre-push` hook call it after
+every run. `--yes` is a full `cargo clean`; a cold rebuild is about 31 seconds,
+so it is cheap.
 
 ## Project Structure
 
