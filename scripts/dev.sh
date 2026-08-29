@@ -98,6 +98,7 @@ fi
 if [[ "$app" == true ]]; then
   step "PlugApp architecture" ./scripts/check-app-architecture.sh
   [[ "$quick" == true ]] || step "PlugIPC tests" swift test --package-path PlugApp/PlugIPC
+  [[ "$quick" == true ]] || step "PlugApp tests" ./scripts/test-app.sh
 fi
 
 if [[ "$e2e" == true ]]; then

@@ -169,6 +169,13 @@ it over the raw commands.
 ./scripts/dev.sh --e2e     # opt in to the Playwright browser lane
 ```
 
+The app lane runs the full `xcodebuild` PlugApp suite through
+`scripts/test-app.sh`, which needs `xcodegen` and takes about 30 seconds. CI runs
+that same script with `--unsigned`. Never call `xcodebuild` directly: the suite
+compares the host bundle version against the embedded daemon, so a bare run
+leaves `MARKETING_VERSION` empty and fails five fixture tests with
+`NSCocoaErrorDomain Code=259`.
+
 The underlying commands:
 
 ```bash

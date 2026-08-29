@@ -82,7 +82,7 @@ while IFS= read -r path; do
       rust=true
       e2e=true
       ;;
-    scripts/check-app-architecture.sh) app=true ;;
+    scripts/check-app-architecture.sh | scripts/test-app.sh) app=true ;;
     .github/workflows/* | scripts/classify-changes.sh)
       rust=true
       app=true
