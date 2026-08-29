@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `99cb07f` (`fix: bound the upstream HTTP connect so one unreachable server cannot hold startup (#148)`) on 2026-08-29, plus the change that carries this revision.
+Baseline: `main` through `3c36ca5` (`docs: record the upstream connect bound in the snapshot (#149)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -232,6 +232,28 @@ default, with every other server's readiness waiting behind it. Both now use a
 ten-second connect bound, matching the one the downstream OAuth metadata client
 has always carried. Reachable hosts settle well inside a second, so this changes
 nothing for a working server and only shortens the failure case.
+
+That left one unbounded wait, and a recorded cold start shows it was the whole
+story. On 2026-08-29 a real start took 32.65 s across thirteen servers. Twelve
+of them were up in between 0.006 s and 1.67 s. The thirteenth, `krisp`, spent
+30.18 s inside OAuth metadata discovery before failing: the client rmcp builds
+for discovery carries a thirty-second overall timeout and no connect bound,
+which is exactly the default per-server start timeout, so one unreachable OAuth
+host consumed a server's entire start budget while every other server's
+readiness waited behind it. Discovery on the start path is now bounded at five
+seconds. Applying it there and not to background token refresh is deliberate:
+refresh runs on its own schedule behind a transient-error retry, so a slow
+discovery there makes no caller wait. The bound is a `tokio::time::timeout`
+rather than a configured reqwest client because handing rmcp a client also
+switches its token-endpoint redirect policy from stop to follow, and waiting
+less should not change how a request is made.
+
+Against those recorded per-server timings, and with starts no longer batched, a
+cold start is bounded by the slowest single server rather than by the sum of
+batch barriers: roughly 5 s where the recorded run took 32.65 s. That figure is
+a projection from measured parts, not a second measured run — the per-server
+durations and the batch removal are measured, the five-second cap is pinned by
+test, and the composition of the two is arithmetic.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own

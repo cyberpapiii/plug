@@ -292,6 +292,40 @@ fn stored_access_token(credentials: &StoredCredentials) -> Option<String> {
         .map(|token| token.access_token().secret().to_string())
 }
 
+/// How long OAuth metadata discovery may take before it is abandoned.
+///
+/// Discovery is a handful of small HTTPS GETs against well-known paths, and a
+/// reachable authorization server answers them in well under a second. The
+/// client rmcp builds for it carries a thirty-second overall timeout and no
+/// connect bound, which is exactly the default per-server start timeout, so an
+/// unreachable OAuth host consumes a server's whole start budget and every
+/// other server's startup readiness waits behind it. A discovery still running
+/// after this is not slow, it is not happening.
+const METADATA_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run an OAuth discovery future under [`METADATA_DISCOVERY_TIMEOUT`].
+///
+/// The bound is applied here rather than by handing rmcp a configured client,
+/// because replacing that client also switches its token-endpoint redirect
+/// policy from stop to follow. Waiting less is the whole intent; nothing about
+/// how the request is made should change with it.
+///
+/// Only the start path uses this. Background token refresh discovers metadata
+/// too, but it runs on its own schedule with a transient-error retry behind it,
+/// so a slow discovery there costs no caller a wait and needs no bound.
+async fn bounded_discovery<T>(
+    label: &str,
+    discovery: impl std::future::Future<Output = Result<T, AuthError>>,
+) -> Result<T, AuthError> {
+    match tokio::time::timeout(METADATA_DISCOVERY_TIMEOUT, discovery).await {
+        Ok(result) => result,
+        Err(_) => Err(AuthError::InternalError(format!(
+            "OAuth metadata discovery for {label} did not answer within {}s",
+            METADATA_DISCOVERY_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// Resolve and verify OAuth authority without a credential store, then load a
 /// token only after the server's issuer/resource binding is established.
 pub async fn verified_access_token_for_resource(
@@ -301,7 +335,7 @@ pub async fn verified_access_token_for_resource(
     use rmcp::transport::auth::AuthorizationManager;
 
     let manager = AuthorizationManager::new(resource_url).await?;
-    let resolution = manager.resolve_metadata().await?;
+    let resolution = bounded_discovery(resource_url, manager.resolve_metadata()).await?;
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     let store = get_or_create_store(server_name);
     store.bind_verified_authority(&authority)?;
@@ -2795,5 +2829,20 @@ mod tests {
         assert_eq!(fallback.source, Some("keyring"));
 
         store.clear().await.unwrap();
+    }
+
+    /// An OAuth host that accepts a connection and then says nothing must not
+    /// hold a server's whole start budget. rmcp bounds its discovery client at
+    /// thirty seconds, the same as the default per-server start timeout, and
+    /// every other server's startup readiness waits behind that.
+    #[tokio::test(start_paused = true)]
+    async fn metadata_discovery_gives_up_well_before_a_server_start_times_out() {
+        let started = tokio::time::Instant::now();
+        let never_answers = std::future::pending::<Result<(), super::AuthError>>();
+
+        let result = super::bounded_discovery("https://example.test/mcp", never_answers).await;
+
+        assert!(result.is_err(), "an unanswered discovery must not succeed");
+        assert_eq!(started.elapsed(), super::METADATA_DISCOVERY_TIMEOUT);
     }
 }
