@@ -71,7 +71,7 @@ struct AppLinkService: AppLinking {
     init(
         runner: any ProcessRunning = ProcessRunner(),
         timeout: Duration = .seconds(30),
-        executable: URL? = Bundle.main.url(forResource: "plug", withExtension: nil)
+        executable: URL? = BundledPlug.executable
     ) {
         self.runner = runner
         self.timeout = timeout

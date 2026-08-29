@@ -121,7 +121,7 @@ struct CheckupService: CheckupRunning {
     init(
         runner: any ProcessRunning = ProcessRunner(),
         timeout: Duration = .seconds(60),
-        executable: URL? = Bundle.main.url(forResource: "plug", withExtension: nil)
+        executable: URL? = BundledPlug.executable
     ) {
         self.runner = runner
         self.timeout = timeout

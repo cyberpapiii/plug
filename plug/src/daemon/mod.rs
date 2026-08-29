@@ -38,7 +38,26 @@ mod registry;
 use registry::ClientRegistry;
 
 mod auth_status;
-use auth_status::dispatch_auth_status;
+use auth_status::{auth_status_from_statuses, dispatch_auth_status};
+
+/// Read the on-disk config for an operator request, or the error response to
+/// send back.
+///
+/// This is the editable form on purpose: it skips the `PLUG_` environment
+/// merge and env-reference expansion that `config::load_config` performs, so an
+/// operator surface shows and round-trips what the file actually says rather
+/// than baking expanded values into it on the next write.
+// `IpcResponse` is a wide enum, so a `Result` carrying one trips
+// `result_large_err`. Boxing it would push an allocation onto a path that
+// exists to report a config read failure. `plug_core::operator`'s own loader
+// makes the same call for the same reason.
+#[allow(clippy::result_large_err)]
+fn load_editable_config(path: &std::path::Path) -> Result<plug_core::config::Config, IpcResponse> {
+    plug_core::operator::load_editable_config(path).map_err(|error| IpcResponse::Error {
+        code: "CONFIG_READ_FAILED".to_string(),
+        message: error.to_string(),
+    })
+}
 
 mod notify;
 use notify::send_ipc_control_notification;
@@ -1147,14 +1166,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             ),
         },
         IpcRequest::OperatorSnapshot { .. } => {
-            let config = match plug_core::operator::load_editable_config(&ctx.config_path) {
+            let config = match load_editable_config(&ctx.config_path) {
                 Ok(config) => config,
-                Err(error) => {
-                    return IpcResponse::Error {
-                        code: "CONFIG_READ_FAILED".to_string(),
-                        message: error.to_string(),
-                    };
-                }
+                Err(response) => return response,
             };
             let mut configured_servers = config
                 .servers
@@ -1184,7 +1198,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                         .len(),
                 })
                 .collect();
-            let upstream_auth = match dispatch_auth_status(ctx).await {
+            let server_statuses = ctx.server_manager.server_statuses();
+            let upstream_auth = match auth_status_from_statuses(ctx, &server_statuses).await {
                 IpcResponse::AuthStatus { servers } => servers,
                 IpcResponse::Error { code, message } => {
                     return IpcResponse::Error { code, message };
@@ -1201,7 +1216,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     uptime_secs: ctx.started_at.elapsed().as_secs(),
                     ownership: crate::service::ipc_ownership(),
                     configured_servers,
-                    servers: ctx.server_manager.server_statuses(),
+                    servers: server_statuses,
                     live_sessions,
                     client_visibility,
                     upstream_auth,
@@ -1210,14 +1225,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
         IpcRequest::GetServerConfig { name, .. } => {
-            let config = match plug_core::operator::load_editable_config(&ctx.config_path) {
+            let config = match load_editable_config(&ctx.config_path) {
                 Ok(config) => config,
-                Err(error) => {
-                    return IpcResponse::Error {
-                        code: "CONFIG_READ_FAILED".to_string(),
-                        message: error.to_string(),
-                    };
-                }
+                Err(response) => return response,
             };
             match config.servers.get(name) {
                 Some(server) => IpcResponse::ServerConfig {

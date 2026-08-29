@@ -76,8 +76,7 @@ struct ClientRepairService: ClientRepairing {
     private func commandFailed(for process: ProcessResult) -> ClientRepairError {
         .commandFailed(
             status: process.status,
-            stderr: String(decoding: process.stderr, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            stderr: process.stderrText
         )
     }
 }

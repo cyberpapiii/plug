@@ -5,6 +5,13 @@ struct ProcessResult: Sendable {
     let status: Int32
     let stdout: Data
     let stderr: Data
+
+    /// Standard error as trimmed text, for the failure messages every caller
+    /// builds the same way.
+    var stderrText: String {
+        String(decoding: stderr, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 enum ProcessRunnerError: Error, Equatable {

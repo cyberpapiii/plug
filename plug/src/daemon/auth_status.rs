@@ -6,6 +6,18 @@ use super::ConnectionContext;
 
 /// Handle `AuthStatus` — return per-server OAuth state from config + credential stores.
 pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
+    auth_status_from_statuses(ctx, &ctx.server_manager.server_statuses()).await
+}
+
+/// The body of `AuthStatus`, against server statuses the caller already has.
+///
+/// `OperatorSnapshot` embeds this response and also returns the same statuses,
+/// and building them is a clone per configured server. Taking them as an
+/// argument keeps that work to once per request instead of once per use.
+pub(super) async fn auth_status_from_statuses(
+    ctx: &ConnectionContext,
+    statuses: &[plug_core::types::ServerStatus],
+) -> IpcResponse {
     use plug_core::oauth;
 
     let config = plug_core::config::load_config(Some(&ctx.config_path));
@@ -19,7 +31,6 @@ pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse
         }
     };
 
-    let statuses = ctx.server_manager.server_statuses();
     let status_map: std::collections::HashMap<&str, &plug_core::types::ServerStatus> =
         statuses.iter().map(|s| (s.server_id.as_str(), s)).collect();
 

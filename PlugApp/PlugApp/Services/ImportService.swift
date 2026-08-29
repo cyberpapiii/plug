@@ -52,7 +52,7 @@ struct ImportService: ImportScanning {
 
     init(
         runner: ProcessRunning = ProcessRunner(),
-        executable: URL? = Bundle.main.url(forResource: "plug", withExtension: nil)
+        executable: URL? = BundledPlug.executable
     ) {
         self.runner = runner
         self.executable = executable
