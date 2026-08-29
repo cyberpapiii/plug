@@ -21,6 +21,7 @@
 		2C730DB265AF0C768DE18BAF /* Router.swift in Sources */ = {isa = PBXBuildFile; fileRef = 246CCC51D3BBEE0246E4E96F /* Router.swift */; };
 		3033A18407F2E2063809099D /* ServerDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AF46523DEE1BB787D58EAEA /* ServerDetailView.swift */; };
 		30CD76E3B3CFFB219A05A76A /* AppIcons.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */; };
+		3A88F7B8DAA6D4AAF6FF0ED0 /* AuthFlowServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC27919600003A59354FBEF6 /* AuthFlowServiceTests.swift */; };
 		3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 907978AE95DA344593F3BCA3 /* AppModelTests.swift */; };
 		41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64E2869334004AD1B34ADA93 /* InstallationState.swift */; };
 		4CCD74568EADAD432672189D /* UpdateService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1B09D36EE0E0D152888537 /* UpdateService.swift */; };
@@ -132,6 +133,7 @@
 		F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigrator.swift; sourceTree = "<group>"; };
 		FA534EAE5C6EB28861A7201A /* ToolsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolsView.swift; sourceTree = "<group>"; };
 		FBC2D67DE9038B09D240E689 /* PlugStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugStatus.swift; sourceTree = "<group>"; };
+		FC27919600003A59354FBEF6 /* AuthFlowServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlowServiceTests.swift; sourceTree = "<group>"; };
 		FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = com.plug.daemon.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -197,6 +199,7 @@
 			children = (
 				C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */,
 				907978AE95DA344593F3BCA3 /* AppModelTests.swift */,
+				FC27919600003A59354FBEF6 /* AuthFlowServiceTests.swift */,
 				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
 				39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */,
@@ -497,6 +500,7 @@
 			files = (
 				ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */,
 				3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */,
+				3A88F7B8DAA6D4AAF6FF0ED0 /* AuthFlowServiceTests.swift in Sources */,
 				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
 				FD7472A76A6E545F5CAE7D78 /* ImportSurfaceTests.swift in Sources */,
