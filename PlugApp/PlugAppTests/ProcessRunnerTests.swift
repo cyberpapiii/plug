@@ -86,6 +86,25 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
     }
 
+    /// A child that writes past the 64 KB pipe buffer blocks on the write until
+    /// the parent reads. A runner that waits for exit before draining its pipes
+    /// deadlocks here and never returns.
+    func testCapturesOutputLargerThanThePipeBuffer() async throws {
+        let size = 512 * 1024
+        let result = try await runner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [
+                "-c",
+                "import sys; sys.stdout.write('o' * \(size)); sys.stderr.write('e' * \(size))",
+            ],
+            timeout: .seconds(10)
+        )
+
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.stdout.count, size)
+        XCTAssertEqual(result.stderr.count, size)
+    }
+
     @MainActor
     func testRunDoesNotBlockMainActor() async throws {
         let clock = ContinuousClock()

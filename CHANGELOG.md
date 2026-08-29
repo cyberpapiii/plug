@@ -23,6 +23,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   grace-period shutdown and `plug stop` still stay stopped.
 - A fatal daemon startup error is written to the daemon log. It previously
   reached only stderr, which the app-owned LaunchAgent redirects nowhere.
+- Sign-in and sign-out in Plug.app no longer deadlock on a talkative CLI. They
+  ran `plug auth` through their own copy of the process-running code, which
+  waited for the child to exit before reading its output; a child that filled
+  the 64 KB pipe buffer blocked on the write while the app blocked on the wait.
+  Both now go through `ProcessRunner`, the app's one process implementation,
+  which drains both pipes concurrently and tears down the whole process group
+  when a command runs long.
 
 ### Changed
 

@@ -14,8 +14,16 @@ struct ProcessResult: Sendable {
     }
 }
 
-enum ProcessRunnerError: Error, Equatable {
+enum ProcessRunnerError: Error, Equatable, LocalizedError {
     case timedOut
+
+    /// Every caller surfaces `localizedDescription` straight into the UI, and
+    /// the synthesized one for a bare enum reads as "error 0".
+    var errorDescription: String? {
+        switch self {
+        case .timedOut: "The command did not finish in time and was stopped."
+        }
+    }
 }
 
 protocol ProcessRunning: Sendable {
