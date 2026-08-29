@@ -2017,9 +2017,11 @@ mod tests {
             };
             assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
             assert!(handshake.stale);
-            assert!(handshake
-                .capabilities
-                .contains(&OperatorCapability::ServerConfigRead));
+            assert!(
+                handshake
+                    .capabilities
+                    .contains(&OperatorCapability::ServerConfigRead)
+            );
         }
 
         #[test]
