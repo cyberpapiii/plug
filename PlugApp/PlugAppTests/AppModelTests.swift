@@ -129,7 +129,8 @@ final class AppModelTests: XCTestCase {
 
         let model = AppModel(
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator
+            coordinator: coordinator,
+            tokenURL: try! makeFixtureTokenURL()
         )
         await model.start()
         await model.refresh()
@@ -156,7 +157,8 @@ final class AppModelTests: XCTestCase {
 
         let model = AppModel(
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator
+            coordinator: coordinator,
+            tokenURL: try! makeFixtureTokenURL()
         )
         await model.start()
         await model.refresh()
