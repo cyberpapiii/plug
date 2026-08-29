@@ -94,6 +94,47 @@ fn restore_token_file(
 /// Acquire an exclusive lock on the PID file, returning the locked file handle.
 ///
 /// The file handle MUST be held for the daemon's lifetime — dropping it releases the lock.
+/// How long to keep retrying a contended PID-file lock before concluding that
+/// another daemon owns it.
+///
+/// `runtime_lock_is_held` probes the same lock by taking it and letting it go
+/// again, and every status surface calls that probe. A real daemon holds the
+/// lock for its whole life, so retrying cannot mistake one for a probe; without
+/// the retry, a `plug status` that happened to land in the same microsecond as
+/// a cold start would fail that start outright.
+const LOCK_CONTENTION_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Take the singleton lock, tolerating the momentary contention a probe causes.
+///
+/// `WouldBlock` past the window means another daemon holds it; any other error
+/// is a real I/O failure and is surfaced as such.
+fn lock_with_retry(
+    file: &std::fs::File,
+    pid_path: &std::path::Path,
+    window: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        // Fully qualified: std's inherent `File::try_lock` (Rust 1.89+) would
+        // otherwise shadow the fs4 trait method depending on toolchain version.
+        match fs4::FileExt::try_lock(file) {
+            Ok(()) => return Ok(()),
+            Err(fs4::TryLockError::Error(e)) => {
+                return Err(e)
+                    .with_context(|| format!("failed to lock PID file: {}", pid_path.display()));
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "another plug daemon is already running (PID file locked)"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -102,22 +143,7 @@ fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File>
         .open(pid_path)
         .with_context(|| format!("failed to open PID file: {}", pid_path.display()))?;
 
-    // Fully qualified: std's inherent `File::try_lock` (Rust 1.89+) would
-    // otherwise shadow the fs4 trait method depending on toolchain version.
-    // Contention (`WouldBlock`) means another daemon holds the lock; any
-    // other error is a real I/O failure and is surfaced as such.
-    match fs4::FileExt::try_lock(&file) {
-        Ok(()) => {}
-        Err(fs4::TryLockError::WouldBlock) => {
-            return Err(anyhow::anyhow!(
-                "another plug daemon is already running (PID file locked)"
-            ));
-        }
-        Err(fs4::TryLockError::Error(e)) => {
-            return Err(e)
-                .with_context(|| format!("failed to lock PID file: {}", pid_path.display()));
-        }
-    }
+    lock_with_retry(&file, pid_path, LOCK_CONTENTION_WINDOW)?;
 
     // Write our PID
     use std::io::Write;
@@ -2580,6 +2606,64 @@ mod tests {
         );
 
         grace_cancel.cancel();
+    }
+
+    #[test]
+    fn pid_lock_survives_the_momentary_hold_a_status_probe_takes() {
+        // `runtime_lock_is_held` takes the lock and lets it go again, and every
+        // status surface calls it. A start that collided with one used to fail
+        // outright. The window is passed explicitly so the assertion is about
+        // retrying at all, not about how a loaded machine schedules threads.
+        let temp = std::env::temp_dir().join(format!(
+            "plug-daemon-pid-lock-probe-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let pid_file = temp.join("plug.pid");
+
+        let held = acquire_pid_lock(&pid_file).expect("probe holds the lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+        });
+
+        let claiming = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&pid_file)
+            .expect("open pid file");
+        let claimed = lock_with_retry(&claiming, &pid_file, std::time::Duration::from_secs(10));
+        releaser.join().expect("probe thread");
+        assert!(
+            claimed.is_ok(),
+            "a start must outwait a probe-length hold: {:?}",
+            claimed.err()
+        );
+
+        drop(claiming);
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn pid_lock_still_refuses_a_second_daemon_that_keeps_holding_it() {
+        let temp = std::env::temp_dir().join(format!(
+            "plug-daemon-pid-lock-held-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let pid_file = temp.join("plug.pid");
+
+        let _held = acquire_pid_lock(&pid_file).expect("first pid lock");
+        let error = acquire_pid_lock(&pid_file).expect_err("second pid lock must fail");
+        assert!(
+            error.to_string().contains("already running"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]

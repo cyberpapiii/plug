@@ -1554,6 +1554,15 @@ pub(crate) async fn daemon_running() -> bool {
     daemon::connect_to_daemon().await.is_some()
 }
 
+/// Whether a daemon start is in flight. The daemon claims the runtime lock
+/// before it starts the engine and binds the IPC socket only once every
+/// upstream is up, so for the tens of seconds in between it is neither
+/// reachable nor stopped. Reporting that gap as stopped invites a repair that
+/// fights the start it is describing.
+pub(crate) fn daemon_starting() -> bool {
+    daemon::runtime_lock_is_held()
+}
+
 pub(crate) async fn daemon_query<T>(
     request: &plug_core::ipc::IpcRequest,
     decode: impl FnOnce(plug_core::ipc::IpcResponse) -> Option<T>,
