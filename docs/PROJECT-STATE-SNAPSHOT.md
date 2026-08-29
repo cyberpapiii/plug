@@ -240,13 +240,17 @@ of them were up in between 0.006 s and 1.67 s. The thirteenth, `krisp`, spent
 for discovery carries a thirty-second overall timeout and no connect bound,
 which is exactly the default per-server start timeout, so one unreachable OAuth
 host consumed a server's entire start budget while every other server's
-readiness waited behind it. Discovery on the start path is now bounded at five
-seconds. Applying it there and not to background token refresh is deliberate:
-refresh runs on its own schedule behind a transient-error retry, so a slow
-discovery there makes no caller wait. The bound is a `tokio::time::timeout`
-rather than a configured reqwest client because handing rmcp a client also
-switches its token-endpoint redirect policy from stop to follow, and waiting
-less should not change how a request is made.
+readiness waited behind it. Discovery on the start path now gets at most a sixth
+of the server's own start budget, five seconds at the default thirty-second
+timeout, because the rest of that budget still has to cover the connect and the
+handshake that follow. Deriving the window from the configured timeout rather
+than hardcoding a number keeps a server told to wait longer actually waiting
+longer. Applying the bound on the start path and not to background token refresh
+is deliberate: refresh runs on its own schedule behind a transient-error retry,
+so a slow discovery there makes no caller wait. The bound is a
+`tokio::time::timeout` rather than a configured reqwest client because handing
+rmcp a client also switches its token-endpoint redirect policy from stop to
+follow, and waiting less should not change how a request is made.
 
 Against those recorded per-server timings, and with starts no longer batched, a
 cold start is bounded by the slowest single server rather than by the sum of
