@@ -77,6 +77,17 @@ fi
 # and lands without anyone watching for it to finish.
 gh pr merge "$branch" --squash --auto >/dev/null
 
+# Squash merges leave local branches that `git branch --merged` cannot detect,
+# because the squashed commit is not an ancestor of anything local. Ask GitHub
+# which pull requests actually landed instead of guessing from the graph.
+git fetch --prune -q origin || true
+while IFS= read -r stale; do
+  [[ -n "$stale" && "$stale" != "main" && "$stale" != "$branch" ]] || continue
+  if [[ "$(gh pr view "$stale" --json state --jq .state 2>/dev/null || true)" == "MERGED" ]]; then
+    git branch -qD "$stale" && echo "ship: removed merged branch $stale"
+  fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
 echo
 echo "ship: $url"
 echo "ship: auto-merge armed. It merges itself when CI is green, then deletes the branch."
