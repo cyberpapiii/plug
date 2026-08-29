@@ -5,6 +5,30 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-08-29
+
+### Fixed
+
+- Plug.app no longer crashes while reconciling its install. ServiceManagement
+  delivers the `SMAppService.unregister` reply on a background XPC queue, and
+  the completion handler was written inside a `@MainActor` type, so the Swift 6
+  toolchain the release runner uses treated it as main-actor isolated and
+  trapped on an executor check the moment the reply arrived. The crash left the
+  daemon unregistered and took every connected client down with it. The handler
+  is now explicitly `@Sendable`, which is what the callback contract has always
+  been.
+
+### Changed
+
+- `scripts/release.sh` takes a finished change all the way to a release
+  installed on this Mac: version bump, changelog heading, pull request,
+  auto-merge, tag, release build, signed install, and the build-cache sweep.
+  `scripts/install-release.sh` does the install half on its own, verifying the
+  DMG against the release checksums and refusing anything Gatekeeper rejects.
+- CI and release workflows moved to the artifact, cache, and Node actions that
+  run on Node 24. The Node 20 versions are deprecated and were already being
+  forced onto a newer runtime.
+
 ## [0.8.2] - 2026-08-29
 
 ### Fixed

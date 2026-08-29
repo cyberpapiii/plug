@@ -444,7 +444,15 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     func unregisterAgent() async throws {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, Error>) in
-            agent.unregister { error in
+            // ServiceManagement delivers this reply on an XPC background queue,
+            // never on the main queue. The closure is written inside a
+            // @MainActor type and `unregister(completionHandler:)` imports its
+            // handler as non-Sendable, so without the explicit `@Sendable` the
+            // compiler treats the body as MainActor-isolated and emits an
+            // executor check that traps the moment the reply arrives. Marking
+            // it `@Sendable` makes the body nonisolated, which is what the
+            // callback contract actually is.
+            agent.unregister { @Sendable error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
