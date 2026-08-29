@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `9695a09` (`fix: bind the daemon IPC socket before upstream startup (#146)`) on 2026-08-29, plus the change that carries this revision.
+Baseline: `main` through `99cb07f` (`fix: bound the upstream HTTP connect so one unreachable server cannot hold startup (#148)`) on 2026-08-29, plus the change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -224,6 +224,14 @@ signal instead, and the client-visible contract is unchanged. Downstream HTTP
 deliberately keeps the old ordering, because a remote client cannot be told the
 catalog grew. Total cold start is therefore still bounded by the slowest
 upstream: a multiplexer cannot describe a catalog it has not finished reading.
+
+PR #148 bounded what that slowest upstream can cost. The HTTP and legacy SSE
+upstream clients were built without a `connect_timeout`, so a server whose host
+never answers ran until its per-server start timeout expired — thirty seconds by
+default, with every other server's readiness waiting behind it. Both now use a
+ten-second connect bound, matching the one the downstream OAuth metadata client
+has always carried. Reachable hosts settle well inside a second, so this changes
+nothing for a working server and only shortens the failure case.
 
 The preceding 0.7.4 work ignores transient unrelated launchd jobs while keeping
 Plug's exact `com.plug.daemon` label fail-closed, excludes the app's own
