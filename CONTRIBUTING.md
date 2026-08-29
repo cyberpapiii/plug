@@ -15,10 +15,14 @@ Plug is a Rust MCP multiplexer. Changes should preserve the operator model: one 
 For a fresh source checkout, run the isolated development setup in this order:
 
 ```sh
+./scripts/setup-dev.sh
 ./scripts/setup-codesigning.sh
 ./scripts/dev-reinstall.sh
 PLUG_DEV=1 plug-dev status
 ```
+
+`scripts/setup-dev.sh` is idempotent and wires the workflow up: git hooks, and a
+check that GitHub auto-merge is enabled. Run it once per clone.
 
 The development reinstall installs `~/.cargo/bin/plug-dev` and leaves the
 production `plug` command owned by Plug.app unchanged. It also runs the
@@ -40,15 +44,12 @@ same file CI's `classify` job runs, so a docs-only change runs nothing and a
 ./scripts/dev.sh --e2e     # opt in to the Playwright browser lane
 ```
 
-Install the pre-push hook once and the quick gate runs itself, followed by the
-artifact guard:
+`scripts/setup-dev.sh` installs the hooks, after which this runs itself:
+`pre-push` runs the quick gate, and `post-commit`, `post-merge` and
+`post-checkout` run the artifact guard.
 
-```sh
-git config core.hooksPath .githooks
-```
-
-Bypass it with `git push --no-verify`; remove it with
-`git config --unset core.hooksPath`.
+Bypass once with `git push --no-verify` or `PLUG_SKIP_HOOKS=1`; remove the hooks
+with `git config --unset core.hooksPath`.
 
 The underlying commands, if you would rather run them directly:
 
@@ -62,6 +63,20 @@ cargo deny check advisories
 `dev.sh` does not run the full `xcodebuild` PlugApp suite. That needs
 `xcodegen` and several minutes, so CI owns it.
 
+## Shipping A Change
+
+```sh
+./scripts/ship.sh "fix: stop the daemon racing its own socket"
+```
+
+That stages tracked edits, branches off `main` if you are on it, commits, pushes
+through the pre-push gate, opens a pull request, and arms auto-merge. GitHub
+merges it once CI is green and deletes the branch. Nothing to come back to.
+
+It stages tracked modifications only. New files need an explicit `git add`,
+because untracked files in this repo include private notes and local
+credentials, and a script that swept them in would eventually publish one.
+
 For distribution changes, also run:
 
 ```sh
@@ -70,7 +85,10 @@ dist build --artifacts=global
 dist build --artifacts=local --target aarch64-apple-darwin
 ```
 
-These commands can produce large local artifacts. Use `scripts/clean-build-artifacts.sh` to inspect generated cleanup candidates and `scripts/clean-build-artifacts.sh --yes` after a release pass when the local build output is no longer needed.
+These commands can produce large local artifacts. The artifact guard handles the
+routine case on its own; use `scripts/clean-build-artifacts.sh` to inspect
+cleanup candidates and `scripts/clean-build-artifacts.sh --yes` after a release
+pass when the local build output is no longer needed.
 
 ## Multiplexor Mental Model
 
