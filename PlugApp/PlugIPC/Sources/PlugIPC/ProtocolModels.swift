@@ -84,6 +84,10 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
 public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let runtimeVersion: String
     public let uptimeSecs: UInt64
+    /// Changes when the daemon's tool list would answer differently. The
+    /// snapshot is cheap and polled often; the tool list is nearly a megabyte
+    /// and almost never changes between two polls.
+    public var toolCatalogRevision: UInt64?
     public let ownership: String
     public let configuredServers: [ConfiguredServer]
     public let servers: [ServerStatus]
@@ -93,8 +97,9 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let downstreamClients: [DownstreamClient]
 
     public static let empty = OperatorSnapshot(
-        runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged", configuredServers: [], servers: [],
-        liveSessions: [], clientVisibility: [], upstreamAuth: [], downstreamClients: []
+        runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",
+        configuredServers: [], servers: [], liveSessions: [], clientVisibility: [],
+        upstreamAuth: [], downstreamClients: []
     )
 }
 

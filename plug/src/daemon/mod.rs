@@ -1116,6 +1116,24 @@ fn current_daemon_executable() -> Option<std::path::PathBuf> {
 }
 
 /// Dispatch a single IPC request to the appropriate Engine query.
+/// A value that changes whenever `ListTools` would answer differently.
+///
+/// The router's own revision covers the merged upstream catalog. It does not
+/// cover `disabled_tools`, which the operator tool list reads straight from the
+/// live configuration and which the CLI can edit without any catalog refresh,
+/// so hash that in as well.
+fn tool_catalog_revision(ctx: &ConnectionContext) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ctx.engine
+        .tool_router()
+        .catalog_revision()
+        .hash(&mut hasher);
+    ctx.engine.config().disabled_tools.hash(&mut hasher);
+    hasher.finish()
+}
+
 async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     fn downstream_http_live_sessions(
         sessions: &dyn SessionStore,
@@ -1242,6 +1260,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 snapshot: Box::new(plug_core::ipc::OperatorSnapshot {
                     runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                     uptime_secs: ctx.started_at.elapsed().as_secs(),
+                    tool_catalog_revision: tool_catalog_revision(ctx),
                     ownership: crate::service::ipc_ownership(),
                     configured_servers,
                     servers: server_statuses,

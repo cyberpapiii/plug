@@ -103,6 +103,14 @@ pub struct OperatorClientVisibility {
 pub struct OperatorSnapshot {
     pub runtime_version: String,
     pub uptime_secs: u64,
+    /// Changes when the tool catalog could look different to a reader.
+    ///
+    /// The snapshot is polled every couple of seconds; the tool list is nearly
+    /// a megabyte and almost never changes between two polls. Carrying the
+    /// revision on the cheap request lets a reader refetch the expensive one
+    /// only when it would return something new.
+    #[serde(default)]
+    pub tool_catalog_revision: u64,
     pub ownership: DaemonOwnershipMode,
     pub configured_servers: Vec<crate::operator::OperatorServerSummary>,
     pub servers: Vec<ServerStatus>,
