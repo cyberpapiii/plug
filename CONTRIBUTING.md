@@ -29,7 +29,28 @@ Use `./scripts/dev-reinstall.sh --quick --clean` when you want to reinstall the 
 
 ## Required Checks
 
-Run these before opening a PR:
+Run the local gate. It selects lanes with `scripts/classify-changes.sh`, the
+same file CI's `classify` job runs, so a docs-only change runs nothing and a
+`PlugApp/` change runs the app lane:
+
+```sh
+./scripts/dev.sh           # lanes your working tree touches, with tests
+./scripts/dev.sh --quick   # formatting and lints only, about 20 seconds
+./scripts/dev.sh --all     # rust and app lanes regardless of what changed
+./scripts/dev.sh --e2e     # opt in to the Playwright browser lane
+```
+
+Install the pre-push hook once and the quick gate runs itself, followed by the
+artifact guard:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Bypass it with `git push --no-verify`; remove it with
+`git config --unset core.hooksPath`.
+
+The underlying commands, if you would rather run them directly:
 
 ```sh
 cargo fmt --all -- --check
@@ -37,6 +58,9 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo deny check advisories
 ```
+
+`dev.sh` does not run the full `xcodebuild` PlugApp suite. That needs
+`xcodegen` and several minutes, so CI owns it.
 
 For distribution changes, also run:
 

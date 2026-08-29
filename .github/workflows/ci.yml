@@ -35,46 +35,9 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          set -euo pipefail
-          # Fail safe: an unknown base runs every lane.
-          if [[ -z "${BASE_SHA}" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-            echo "app=true" >> "$GITHUB_OUTPUT"
-            echo "e2e=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          rust=false
-          app=false
-          e2e=false
-          while IFS= read -r path; do
-            case "$path" in
-              docs/*|*.md) ;;
-              PlugApp/*) app=true ;;
-              testdata/ipc/*|testdata/legacy_plug_programs.json)
-                rust=true
-                app=true
-                ;;
-              package.json|package-lock.json|playwright.config.*|e2e/*|tests/e2e/*)
-                e2e=true
-                ;;
-              plug-core/src/downstream_oauth/*|plug-core/src/http/*|plug-core/src/oauth.rs)
-                rust=true
-                e2e=true
-                ;;
-              scripts/check-app-architecture.sh) app=true ;;
-              .github/workflows/*)
-                rust=true
-                app=true
-                e2e=true
-                ;;
-              *) rust=true ;;
-            esac
-          done < <(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$GITHUB_SHA")
-          echo "rust=$rust" >> "$GITHUB_OUTPUT"
-          echo "app=$app" >> "$GITHUB_OUTPUT"
-          echo "e2e=$e2e" >> "$GITHUB_OUTPUT"
+        # Rules live in scripts/classify-changes.sh so the local `scripts/dev.sh`
+        # gate runs exactly the lanes this job would demand.
+        run: ./scripts/classify-changes.sh "${BASE_SHA}" "${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
   check:
     name: Check (fmt + clippy)

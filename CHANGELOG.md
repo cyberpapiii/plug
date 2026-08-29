@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Debug and test builds now emit line tables instead of full DWARF, and
+  dependencies emit no debug info at all. Panic backtraces still resolve to
+  file and line. A cold `cargo build --workspace --all-targets` drops from 40
+  to 31 seconds and from 5.05 GB to 3.34 GB.
+
 ## [0.8.1] - 2026-08-26
 
 ### Fixed

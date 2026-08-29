@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Catch locally what CI reds on, before a push spends three minutes proving it.
+#
+# Runs formatting and lints for the lanes this branch touches, then lets the
+# artifact guard reclaim regenerable caches. Tests are deliberately not here:
+# CI runs them, and a pre-push hook that costs minutes gets bypassed until it
+# is worthless.
+#
+# Bypass once:   git push --no-verify
+# Uninstall:     git config --unset core.hooksPath
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+if [[ "${PLUG_SKIP_HOOKS:-0}" == "1" ]]; then
+  exit 0
+fi
+
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo '')"
+if [[ -n "$upstream" ]]; then
+  base="$upstream"
+else
+  base="origin/main"
+fi
+
+if ! "$repo_root/scripts/dev.sh" --quick --base "$base"; then
+  echo
+  echo "pre-push: fix the above, or push with --no-verify to skip." >&2
+  exit 1
+fi
+
+"$repo_root/scripts/clean-build-artifacts.sh" --guard || true
