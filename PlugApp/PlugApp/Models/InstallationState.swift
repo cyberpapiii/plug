@@ -121,6 +121,8 @@ struct LaunchdJobRecord: Equatable, Sendable {
     }
 }
 
+/// Keep in lockstep with `is_recognized_legacy_program` in `plug/src/service.rs`.
+/// Both are pinned by `testdata/legacy_plug_programs.json`.
 enum LegacyPlugProgram {
     static func isRecognized(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path

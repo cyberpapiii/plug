@@ -5,7 +5,6 @@
     "ipc_min": 3,
     "ipc_max": 6,
     "ownership": "app_managed",
-    "stale": true,
     "capabilities": [
       "server_mutation",
       "server_config_read"

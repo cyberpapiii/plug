@@ -50,7 +50,6 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(handshake.ipcMin, 3)
         XCTAssertEqual(handshake.ipcMax, 6)
         XCTAssertEqual(handshake.ownership, "app_managed")
-        XCTAssertTrue(handshake.stale)
         XCTAssertTrue(handshake.capabilities.contains("server_config_read"))
         XCTAssertTrue(handshake.capabilities.contains("server_mutation"))
     }
@@ -105,7 +104,6 @@ final class GoldenPayloadTests: XCTestCase {
                 "ipc_min",
                 "ipc_max",
                 "ownership",
-                "stale",
                 "capabilities",
             ],
             context: "operator handshake body"

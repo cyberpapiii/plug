@@ -89,8 +89,6 @@ pub struct OperatorHandshake {
     pub ipc_min: u16,
     pub ipc_max: u16,
     pub ownership: DaemonOwnershipMode,
-    #[serde(default)]
-    pub stale: bool,
     pub capabilities: Vec<OperatorCapability>,
 }
 
@@ -1230,7 +1228,6 @@ mod tests {
                 ipc_min: OPERATOR_IPC_MIN,
                 ipc_max: OPERATOR_IPC_MAX,
                 ownership: DaemonOwnershipMode::AppManaged,
-                stale: false,
                 capabilities: vec![],
             },
         };
@@ -1272,7 +1269,6 @@ mod tests {
                 ipc_min: 3,
                 ipc_max: 4,
                 ownership: DaemonOwnershipMode::AppManaged,
-                stale: false,
                 capabilities: vec![OperatorCapability::ServerMutation],
             },
         };
@@ -1292,11 +1288,10 @@ mod tests {
         );
         assert_eq!(handshake.ipc_max, 4);
         assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
-        assert!(!handshake.stale);
     }
 
     #[test]
-    fn operator_handshake_decodes_unknown_ownership_and_stale_flag() {
+    fn operator_handshake_decodes_unknown_ownership() {
         let response = serde_json::json!({
             "type": "OperatorHandshake",
             "handshake": {
@@ -1304,7 +1299,6 @@ mod tests {
                 "ipc_min": 3,
                 "ipc_max": 6,
                 "ownership": "unknown",
-                "stale": false,
                 "capabilities": []
             }
         });
@@ -1315,9 +1309,11 @@ mod tests {
             panic!("expected operator handshake");
         };
         assert_eq!(handshake.ownership, DaemonOwnershipMode::Unknown);
-        assert!(!handshake.stale);
+    }
 
-        let stale_response = serde_json::json!({
+    #[test]
+    fn operator_handshake_ignores_legacy_stale_field() {
+        let leftover = serde_json::json!({
             "type": "OperatorHandshake",
             "handshake": {
                 "daemon_version": "0.7.0",
@@ -1329,12 +1325,11 @@ mod tests {
             }
         });
         let decoded: IpcResponse =
-            serde_json::from_value(stale_response).expect("stale handshake must decode");
+            serde_json::from_value(leftover).expect("unknown stale key must be ignored");
         let IpcResponse::OperatorHandshake { handshake } = decoded else {
             panic!("expected operator handshake");
         };
         assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
-        assert!(handshake.stale);
     }
 
     #[test]
@@ -1913,7 +1908,6 @@ mod tests {
                     ipc_min: OPERATOR_IPC_MIN,
                     ipc_max: OPERATOR_IPC_MAX,
                     ownership: DaemonOwnershipMode::AppManaged,
-                    stale: true,
                     capabilities: vec![
                         OperatorCapability::ServerMutation,
                         OperatorCapability::ServerConfigRead,
@@ -2016,7 +2010,6 @@ mod tests {
                 panic!("expected operator handshake response");
             };
             assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
-            assert!(handshake.stale);
             assert!(
                 handshake
                     .capabilities

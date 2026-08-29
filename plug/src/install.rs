@@ -693,11 +693,6 @@ fn read_bundle_plist_string(bundle_path: &Path, key: &str, label: &str) -> Resul
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn bundle_build_version(bundle_path: &Path) -> Result<String> {
-    read_bundle_plist_string(bundle_path, "CFBundleVersion", "build version")
-}
-
-#[cfg(target_os = "macos")]
 fn bundle_version(bundle_path: &Path) -> Result<String> {
     read_bundle_plist_string(bundle_path, "CFBundleShortVersionString", "bundle version")
 }

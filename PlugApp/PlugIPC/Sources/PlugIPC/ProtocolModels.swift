@@ -6,11 +6,10 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
     public let ipcMin: UInt16
     public let ipcMax: UInt16
     public let ownership: String
-    public let stale: Bool
     public let capabilities: [String]
 
     private enum CodingKeys: String, CodingKey {
-        case daemonVersion, daemonExecutable, ipcMin, ipcMax, ownership, stale, capabilities
+        case daemonVersion, daemonExecutable, ipcMin, ipcMax, ownership, capabilities
     }
 
     public init(from decoder: Decoder) throws {
@@ -26,7 +25,6 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
         ipcMin = try container.decode(UInt16.self, forKey: .ipcMin)
         ipcMax = try container.decode(UInt16.self, forKey: .ipcMax)
         ownership = try container.decode(String.self, forKey: .ownership)
-        stale = try container.decodeIfPresent(Bool.self, forKey: .stale) ?? false
         capabilities = try container.decode([String].self, forKey: .capabilities)
     }
 }

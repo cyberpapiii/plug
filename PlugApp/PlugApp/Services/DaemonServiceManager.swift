@@ -390,6 +390,8 @@ final class DaemonServiceManager {
         url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
     }
 
+    /// Existence probes for leftover files still on disk. Not the classify table.
+    /// Cellar and brew-bin shapes are classified by `LegacyPlugProgram` even after uninstall.
     private static var defaultLegacyPaths: Set<URL> {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return [

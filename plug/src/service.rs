@@ -21,8 +21,8 @@ pub enum LaunchdProgramOwnership {
     Unknown,
 }
 
-/// Shared operator copy for leftover recognized-legacy launchd jobs.
-/// Matches Plug.app adoptionRequired / Turn On surfaces.
+/// CLI leftover-launchd sentence. The app leftover path still uses the generic
+/// "Background running is off" / Turn On verdict, not this string.
 #[cfg(any(target_os = "macos", test))]
 pub const LEFTOVER_LAUNCHD_ADOPT_SENTENCE: &str =
     "Open Plug.app and tap Turn On to adopt the leftover launchd daemon.";
@@ -58,13 +58,6 @@ pub struct ServiceState {
     pub ownership: ServiceOwnership,
     pub loaded: bool,
     pub plist_path: PathBuf,
-    parent_bundle_version: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IpcOwnershipState {
-    pub ownership: plug_core::ipc::DaemonOwnershipMode,
-    pub stale: bool,
 }
 
 fn user_id() -> anyhow::Result<String> {
@@ -92,6 +85,8 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Keep in lockstep with `LegacyPlugProgram.isRecognized` in Plug.app.
+/// Both are pinned by `testdata/legacy_plug_programs.json`.
 pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
     if program.file_name().and_then(|name| name.to_str()) != Some("plug") {
         return false;
@@ -306,7 +301,6 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
         ownership: classify_launchctl_output(&text, plist_path.exists()),
         loaded: output.status.success(),
         plist_path,
-        parent_bundle_version: launchctl_field(&text, "parent bundle version ="),
     })
 }
 
@@ -318,56 +312,11 @@ fn map_service_ownership(ownership: ServiceOwnership) -> plug_core::ipc::DaemonO
     }
 }
 
-fn launchctl_field(output: &str, prefix: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(prefix)
-            .map(str::trim)
-            .map(str::to_owned)
-    })
-}
-
-fn app_managed_registration_stale(parent_build: Option<&str>, current_build: Option<&str>) -> bool {
-    match (parent_build, current_build) {
-        (Some(parent_build), Some(current_build)) => parent_build != current_build,
-        _ => false,
-    }
-}
-
-fn verified_app_build_version() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let app = crate::install::resolve_verified_app().ok().flatten()?;
-        crate::install::bundle_build_version(&app.bundle_path).ok()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-pub fn ipc_ownership_state() -> IpcOwnershipState {
-    match inspect() {
-        Err(_) => IpcOwnershipState {
-            ownership: plug_core::ipc::DaemonOwnershipMode::Unknown,
-            stale: false,
-        },
-        Ok(state) => {
-            let stale = state.ownership == ServiceOwnership::AppManaged
-                && app_managed_registration_stale(
-                    state.parent_bundle_version.as_deref(),
-                    verified_app_build_version().as_deref(),
-                );
-            IpcOwnershipState {
-                ownership: map_service_ownership(state.ownership),
-                stale,
-            }
-        }
-    }
-}
-
 pub fn ipc_ownership() -> plug_core::ipc::DaemonOwnershipMode {
-    ipc_ownership_state().ownership
+    match inspect() {
+        Err(_) => plug_core::ipc::DaemonOwnershipMode::Unknown,
+        Ok(state) => map_service_ownership(state.ownership),
+    }
 }
 
 fn xml_escape(value: &str) -> String {
@@ -664,11 +613,38 @@ mod tests {
     }
 
     #[test]
-    fn app_managed_registration_stale_when_parent_bundle_version_differs() {
-        assert!(app_managed_registration_stale(Some("19"), Some("20")));
-        assert!(!app_managed_registration_stale(Some("19"), Some("19")));
-        assert!(!app_managed_registration_stale(Some("19"), None));
-        assert!(!app_managed_registration_stale(None, Some("20")));
+    fn recognized_legacy_programs_match_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            recognized: Vec<String>,
+            home_recognized_suffixes: Vec<String>,
+            unrecognized: Vec<String>,
+        }
+
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../testdata/legacy_plug_programs.json"))
+                .expect("shared leftover-path fixture");
+        for path in fixture.recognized {
+            assert!(
+                is_recognized_legacy_program(Path::new(&path)),
+                "expected recognized: {path}"
+            );
+        }
+        let home = dirs::home_dir().expect("home directory");
+        for suffix in fixture.home_recognized_suffixes {
+            let path = home.join(&suffix);
+            assert!(
+                is_recognized_legacy_program(&path),
+                "expected recognized: {}",
+                path.display()
+            );
+        }
+        for path in fixture.unrecognized {
+            assert!(
+                !is_recognized_legacy_program(Path::new(&path)),
+                "expected unrecognized: {path}"
+            );
+        }
     }
 
     #[test]
