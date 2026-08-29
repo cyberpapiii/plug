@@ -109,3 +109,29 @@ struct LaunchdJobRecord: Equatable, Sendable {
         self.arguments = arguments
     }
 }
+
+enum LegacyPlugProgram {
+    static func isRecognized(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        if isHomebrewInstall(path) {
+            return true
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        return path == "\(home)/.cargo/bin/plug" || path == "\(home)/.local/bin/plug"
+    }
+
+    private static func isHomebrewInstall(_ path: String) -> Bool {
+        path == "/opt/homebrew/bin/plug"
+            || path == "/usr/local/bin/plug"
+            || path == "/opt/homebrew/opt/plug/bin/plug"
+            || path == "/usr/local/opt/plug/bin/plug"
+            || isCellarBinary(path, root: "/opt/homebrew/Cellar/plug")
+            || isCellarBinary(path, root: "/usr/local/Cellar/plug")
+    }
+
+    private static func isCellarBinary(_ path: String, root: String) -> Bool {
+        guard path.hasPrefix(root + "/") else { return false }
+        let parts = path.dropFirst(root.count + 1).split(separator: "/")
+        return parts.count == 3 && parts[1] == "bin" && parts[2] == "plug"
+    }
+}

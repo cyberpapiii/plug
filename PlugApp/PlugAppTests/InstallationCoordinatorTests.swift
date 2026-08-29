@@ -360,8 +360,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [healthyService(), healthyService()],
                 handshakes: [handshake(
                     version: canonical.appVersion,
-                    ipcMin: 6,
-                    ipcMax: 6
+                    ipcMin: 7,
+                    ipcMax: 7
                 )]
             ),
             openURL: { _ in }

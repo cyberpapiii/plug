@@ -36,7 +36,7 @@ extension DaemonServiceManager: DaemonServiceManaging {}
 @MainActor @Observable
 final class InstallationCoordinator {
     private static let supportedIPCMin: UInt16 = 3
-    private static let supportedIPCMax: UInt16 = 4
+    private static let supportedIPCMax: UInt16 = 6
     private static let appManagedOwnership = "app_managed"
 
     private(set) var state: InstallationState

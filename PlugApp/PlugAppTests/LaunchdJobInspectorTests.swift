@@ -22,6 +22,28 @@ final class LaunchdJobInspectorTests: XCTestCase {
         XCTAssertEqual(staleState, .appManagedStale(stale))
     }
 
+    func testLeftoverHomebrewCellarJobIsRecognizedAfterFormulaPathsDisappear() async throws {
+        let cellar = URL(fileURLWithPath: "/opt/homebrew/Cellar/plug/0.6.3/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: cellar, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
+    func testLeftoverHomebrewBinJobIsRecognizedWithoutResolvedOptPath() async throws {
+        let brewBin = URL(fileURLWithPath: "/opt/homebrew/bin/plug")
+        let leftover = record(label: "com.plug.daemon", program: brewBin, parentID: nil, parentVersion: nil)
+
+        let state = try await LaunchdJobInspector(records: { [leftover] }).daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+        XCTAssertEqual(state, .recognizedLegacy([leftover]))
+    }
+
     func testAlternateLabelAtKnownPlugPathIsRecognizedLegacy() async throws {
         let legacyURL = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
         let legacy = record(label: "local.claude-rc.plug", program: legacyURL, parentID: nil, parentVersion: nil)
