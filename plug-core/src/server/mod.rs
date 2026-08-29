@@ -1231,7 +1231,7 @@ impl ServerManager {
         removed
     }
 
-    /// Start all enabled servers from config, batched by `config.startup_concurrency`.
+    /// Start all enabled servers from config, at most `config.startup_concurrency` at once.
     pub async fn start_all(&self, config: &Config) -> Result<(), anyhow::Error> {
         self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
@@ -1252,80 +1252,87 @@ impl ServerManager {
             "starting upstream servers"
         );
 
-        for chunk in enabled.chunks(config.startup_concurrency) {
-            let mut join_set = tokio::task::JoinSet::new();
+        // A permit pool rather than fixed batches. Batching makes every server
+        // in a batch wait for the slowest one before the next batch may start,
+        // so one slow upstream idles the rest of the pool. A permit freed by a
+        // finished start goes straight to the next server in line.
+        let permits = Arc::new(tokio::sync::Semaphore::new(
+            config.startup_concurrency.max(1),
+        ));
+        let mut join_set = tokio::task::JoinSet::new();
 
-            for (name, server_config) in chunk {
-                let name_clone = name.clone();
-                let sc = server_config.clone();
-                let tool_router = self.tool_router();
-                let modern_upstream_gate_state = self.modern_upstream_gate_state();
-                join_set.spawn(async move {
-                    let result = Self::start_server_with_router(
-                        &name_clone,
-                        &sc,
-                        tool_router,
-                        modern_upstream_gate_state,
-                    )
-                    .await;
-                    (name_clone, result)
-                });
-            }
+        for (name, server_config) in &enabled {
+            let permits = Arc::clone(&permits);
+            let name_clone = name.clone();
+            let sc = server_config.clone();
+            let tool_router = self.tool_router();
+            let modern_upstream_gate_state = self.modern_upstream_gate_state();
+            join_set.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                let result = Self::start_server_with_router(
+                    &name_clone,
+                    &sc,
+                    tool_router,
+                    modern_upstream_gate_state,
+                )
+                .await;
+                (name_clone, result)
+            });
+        }
 
-            while let Some(join_result) = join_set.join_next().await {
-                match join_result {
-                    Ok((name, Ok(upstream))) => {
-                        tracing::info!(
-                            server = %name,
-                            tools = upstream.tools.load().len(),
-                            "server started"
-                        );
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((name, Ok(upstream))) => {
+                    tracing::info!(
+                        server = %name,
+                        tools = upstream.tools.load().len(),
+                        "server started"
+                    );
 
-                        // Apply current effective log level to new server so all
-                        // upstreams converge to the same level regardless of start order.
-                        if upstream.capabilities.logging.is_some()
-                            && let Some(router) = self.tool_router().upgrade()
-                        {
-                            let level = router.log_level();
-                            let params = SetLevelRequestParams::new(level);
-                            if let Err(e) = upstream.client.peer().set_level(params).await {
-                                tracing::debug!(
-                                    server = %name,
-                                    error = %e,
-                                    "failed to apply initial log level"
-                                );
-                            }
-                        }
-
-                        let max_concurrent = upstream.config.max_concurrent;
-                        let cb_enabled = upstream.config.circuit_breaker_enabled;
-                        self.configured_auth.insert(
-                            name.clone(),
-                            Self::configured_auth_for_server(&upstream.config),
-                        );
-                        self.insert_upstream(name.clone(), Arc::new(upstream));
-
-                        self.health.insert(name.clone(), HealthState::new());
-                        self.semaphores.insert(
-                            name.clone(),
-                            Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-                        );
-                        if cb_enabled {
-                            self.circuit_breakers.insert(
-                                name.clone(),
-                                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+                    // Apply current effective log level to new server so all
+                    // upstreams converge to the same level regardless of start order.
+                    if upstream.capabilities.logging.is_some()
+                        && let Some(router) = self.tool_router().upgrade()
+                    {
+                        let level = router.log_level();
+                        let params = SetLevelRequestParams::new(level);
+                        if let Err(e) = upstream.client.peer().set_level(params).await {
+                            tracing::debug!(
+                                server = %name,
+                                error = %e,
+                                "failed to apply initial log level"
                             );
                         }
                     }
-                    Ok((name, Err(e))) => {
-                        tracing::error!(server = %name, error = %e, "failed to start server");
-                        if let Some(server_config) = config.servers.get(&name) {
-                            self.record_start_failure(&name, server_config, &e);
-                        }
+
+                    let max_concurrent = upstream.config.max_concurrent;
+                    let cb_enabled = upstream.config.circuit_breaker_enabled;
+                    self.configured_auth.insert(
+                        name.clone(),
+                        Self::configured_auth_for_server(&upstream.config),
+                    );
+                    self.insert_upstream(name.clone(), Arc::new(upstream));
+
+                    self.health.insert(name.clone(), HealthState::new());
+                    self.semaphores.insert(
+                        name.clone(),
+                        Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+                    );
+                    if cb_enabled {
+                        self.circuit_breakers.insert(
+                            name.clone(),
+                            Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+                        );
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "server start task panicked");
+                }
+                Ok((name, Err(e))) => {
+                    tracing::error!(server = %name, error = %e, "failed to start server");
+                    if let Some(server_config) = config.servers.get(&name) {
+                        self.record_start_failure(&name, server_config, &e);
                     }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "server start task panicked");
                 }
             }
         }

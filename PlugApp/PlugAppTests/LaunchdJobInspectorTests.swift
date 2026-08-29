@@ -171,7 +171,22 @@ final class LaunchdJobInspectorTests: XCTestCase {
         )
         XCTAssertEqual(state, .recognizedLegacy([legacy]))
         let printedLabels = await runner.printedLabels
-        XCTAssertEqual(printedLabels.sorted(), ["com.apple.unrelated", "unexpected.owner"])
+        XCTAssertEqual(printedLabels, ["unexpected.owner"])
+    }
+
+    func testAppleNamespaceLabelsAreNotInspected() {
+        let listing = """
+        PID\tStatus\tLabel
+        -\t0\tcom.apple.unrelated
+        1\t0\tcom.apple.plug.lookalike
+        2\t0\tcom.plug.daemon
+        3\t0\tunexpected.owner
+        """
+
+        XCTAssertEqual(
+            LaunchdJobInspector.parseLabels(listing),
+            ["com.plug.daemon", "unexpected.owner"]
+        )
     }
 
     func testLiveSMAppServiceShapeResolvesBundleRelativeDaemon() async throws {

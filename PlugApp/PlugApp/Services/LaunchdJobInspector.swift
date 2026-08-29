@@ -112,11 +112,20 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         return records
     }
 
-    private static func parseLabels(_ output: String) -> [String] {
+    /// The labels worth a `launchctl print`.
+    ///
+    /// Every label costs a subprocess, and a login session carries hundreds of
+    /// them. Apple reserves the `com.apple.` namespace for services shipped
+    /// with the OS, so no job in it can be a Plug daemon: the app registers
+    /// under its own bundle identifier, and every install path Plug has ever
+    /// used named its job `com.plug.*`. Excluding that namespace leaves a few
+    /// dozen labels to inspect instead of several hundred.
+    static func parseLabels(_ output: String) -> [String] {
         output.split(separator: "\n").compactMap { line in
             let fields = line.split(whereSeparator: \.isWhitespace)
             guard fields.count >= 3, fields.last != "Label" else { return nil }
-            return fields.last.map(String.init)
+            guard let label = fields.last.map(String.init) else { return nil }
+            return label.hasPrefix("com.apple.") ? nil : label
         }
     }
 
