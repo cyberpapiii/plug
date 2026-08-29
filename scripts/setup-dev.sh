@@ -34,6 +34,12 @@ else
   note "gh is not installed or not logged in; scripts/ship.sh needs it"
 fi
 
+if command -v xcodegen >/dev/null 2>&1; then
+  ok "xcodegen is installed, so the PlugApp lane can run"
+else
+  note "xcodegen is missing. The PlugApp lane in scripts/dev.sh needs it: brew install xcodegen"
+fi
+
 "$repo_root/scripts/clean-build-artifacts.sh" --guard || true
 ok "artifact guard checked (silent means everything is inside budget)"
 

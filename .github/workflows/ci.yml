@@ -126,37 +126,16 @@ jobs:
       - run: brew install xcodegen
       - run: swift test --package-path PlugApp/PlugIPC
       - run: ./scripts/check-app-architecture.sh
-      - run: xcodegen generate --spec PlugApp/project.yml
-      # This gate proves the complete app and login-service bundle compile
-      # together, then runs the PlugApp unit suite. The signed fixture class
-      # needs a Developer ID host bundle and an embedded SMAppService, which
-      # GitHub's ephemeral runner cannot provide, so it is skipped here and
-      # runs in the release build instead.
-      - run: >-
-          xcodebuild build
-          -project PlugApp/PlugApp.xcodeproj
-          -scheme PlugApp
-          -destination 'generic/platform=macOS'
-          CODE_SIGNING_ALLOWED=NO
-      # The unit suite compares the host bundle version against the embedded
-      # daemon, so the test build carries the workspace version like a release.
-      - name: Read workspace release version
-        shell: bash
-        run: |
-          set -euo pipefail
-          workspace_version="$(cargo metadata --no-deps --format-version 1 | \
-            python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "plug-mcp"))')"
-          echo "WORKSPACE_VERSION=${workspace_version}" >> "$GITHUB_ENV"
-      - run: >-
-          xcodebuild test
-          -project PlugApp/PlugApp.xcodeproj
-          -scheme PlugApp
-          -destination 'platform=macOS'
-          -only-testing:PlugAppTests
-          -skip-testing:PlugAppTests/UnifiedReconciliationFixtureTests
-          CODE_SIGNING_ALLOWED=NO
-          MARKETING_VERSION="$WORKSPACE_VERSION"
-          CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER"
+      # scripts/test-app.sh generates the project, proves the app and
+      # login-service bundle compile together, and runs the unit suite with the
+      # workspace version the suite expects. It is the same script
+      # scripts/dev.sh runs locally, so a green local app lane means this job is
+      # green too. --unsigned skips the signed fixture class, which needs a
+      # Developer ID host bundle and an embedded SMAppService that an ephemeral
+      # runner cannot provide; those run in the release build instead.
+      - run: ./scripts/test-app.sh --unsigned
+        env:
+          PLUG_APP_BUILD_NUMBER: ${{ github.run_number }}
 
   cross-check:
     name: Cross-check (${{ matrix.target }})

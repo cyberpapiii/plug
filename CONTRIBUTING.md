@@ -21,8 +21,9 @@ For a fresh source checkout, run the isolated development setup in this order:
 PLUG_DEV=1 plug-dev status
 ```
 
-`scripts/setup-dev.sh` is idempotent and wires the workflow up: git hooks, and a
-check that GitHub auto-merge is enabled. Run it once per clone.
+`scripts/setup-dev.sh` is idempotent and wires the workflow up: git hooks, a
+check that GitHub auto-merge is enabled, and a check that `xcodegen` is present
+for the app lane. Run it once per clone.
 
 The development reinstall installs `~/.cargo/bin/plug-dev` and leaves the
 production `plug` command owned by Plug.app unchanged. It also runs the
@@ -60,8 +61,13 @@ cargo clippy --workspace -- -D warnings
 cargo deny check advisories
 ```
 
-`dev.sh` does not run the full `xcodebuild` PlugApp suite. That needs
-`xcodegen` and several minutes, so CI owns it.
+The app lane runs the full `xcodebuild` PlugApp suite through
+`scripts/test-app.sh`, which takes about 30 seconds and needs `xcodegen`
+(`brew install xcodegen`). CI runs the same script with `--unsigned`, so a green
+local app lane means a green `Test (Plug.app)` job. Do not call `xcodebuild`
+directly: the suite compares the host bundle version against the embedded
+daemon, and a bare run leaves that version empty and fails five fixture tests
+with `NSCocoaErrorDomain Code=259`.
 
 ## Shipping A Change
 

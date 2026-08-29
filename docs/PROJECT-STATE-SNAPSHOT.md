@@ -1,6 +1,6 @@
 # Project State Snapshot
 
-Baseline: `main` through `a02ab18` (`Merge pull request #124 from cyberpapiii/fix/leftover-homebrew-launchd-adopt`) on 2026-08-28.
+Baseline: `main` through `66768c7` (`refactor: collapse duplicated ownership, path, and config-load logic (#136)`) on 2026-08-29, plus the workflow change that carries this revision.
 
 This is the canonical current-state doc for the project.
 
@@ -183,6 +183,37 @@ binary under test. Documentation-only changes finish after a six-second,
 fail-safe path classification instead of running the full build matrix. Any
 code, configuration, dependency, script, or workflow change still runs every
 validation gate.
+
+On 2026-08-28 and 2026-08-29 the developer workflow was rebuilt so that keeping
+the repo tidy and getting a change merged need no manual steps (PRs #131 through
+#136). The workspace had no `[profile.dev]`, so every dependency carried full
+debug info; `debug = "line-tables-only"` cut `target/` from 13 GB to 3.7 GB and a
+cold build from 40 to 31 seconds. Measurement also disproved the assumption
+behind the work: nothing in `target/` was stale, and fingerprint-based orphan
+detection found zero dead artifacts, so the problem was generation rate rather
+than garbage. `scripts/clean-build-artifacts.sh --guard` therefore enforces a
+budget instead of sweeping age (10 GB for `target/`, 5 GB for this project's
+Xcode DerivedData), costs about 40 milliseconds, and runs from `post-commit`,
+`post-merge`, `post-checkout`, `pre-push`, and `scripts/dev.sh`.
+
+`scripts/dev.sh` runs the lanes a change actually needs, selecting them with
+`scripts/classify-changes.sh` — the same file CI's `classify` job runs, so the
+local gate cannot disagree with the merge gate by construction.
+`scripts/test-app.sh` is the same arrangement for the app: one definition of the
+`xcodebuild` invocation, called by `dev.sh` locally and by the `Test (Plug.app)`
+job with `--unsigned`. It exists because that invocation previously lived only in
+`ci.yml`, and a hand-run `xcodebuild test` failed five fixture tests with an
+unhelpful `NSCocoaErrorDomain Code=259` for want of a `MARKETING_VERSION`.
+`scripts/ship.sh` takes a dirty tree to a merged pull request in one command and
+stages tracked modifications only, which is what keeps private notes and local
+credentials out of a commit. `scripts/setup-dev.sh` wires a fresh clone up and is
+idempotent.
+
+`main` is protected by exactly one required check, the `CI complete` aggregate
+job, which passes when no lane reported failure or cancellation. Requiring the
+individual lane jobs would wedge every pull request, because path selection skips
+most of them on most changes. `enforce_admins` is deliberately off so an
+emergency direct push is always possible.
 
 Releases `v0.7.0` through `v0.8.0` are superseded. They established
 the unified distribution and delegation model but each exposed installed-only
