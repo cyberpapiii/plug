@@ -39,6 +39,7 @@ final class InstallationCoordinator {
     private static let supportedIPCMin: UInt16 = 3
     private static let supportedIPCMax: UInt16 = 6
     private static let appManagedOwnership = "app_managed"
+    private static let unknownOwnership = "unknown"
 
     private(set) var state: InstallationState
 
@@ -521,6 +522,14 @@ final class InstallationCoordinator {
         canonical: VerifiedAppInstallation,
         shellLink: ShellLinkState
     ) throws {
+        // `unknown` is an absence of evidence, not a disagreement: the daemon
+        // could not read its own launchd registration. Repairable drift retries
+        // the whole adoption path on every trigger, so folding absence into
+        // drift would keep replacing a daemon nobody has proved is ours. Fail
+        // closed and wait to be asked.
+        if handshake.ownership == Self.unknownOwnership {
+            throw CoordinatorError.unknownOwnership
+        }
         guard proof.appManaged,
               handshake.ownership == Self.appManagedOwnership,
               isCompatible(handshake),

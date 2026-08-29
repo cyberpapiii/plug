@@ -120,7 +120,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         }
     }
 
-    private static func parseRecord(label: String, output: String) -> LaunchdJobRecord {
+    static func parseRecord(label: String, output: String) -> LaunchdJobRecord {
         var program: URL?
         var programIdentifier: String?
         var parentIdentifier: String?
@@ -199,11 +199,61 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         return String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
     }
 
-    private static func resolvedPath(_ url: URL) -> URL {
+    static func resolvedPath(_ url: URL) -> URL {
         url.resolvedStandardized
     }
 
     private static func errorDetail(_ result: ProcessResult) -> String {
         result.stderrText
+    }
+}
+
+/// Re-reads one launchd job in the moment before it is torn down.
+///
+/// `launchctl bootout` addresses a job by label, and a label is not an
+/// identity. Between the inspection that recognized a job and the bootout that
+/// removes it, the same label can come to belong to a different program, so
+/// the label alone is not evidence that the job about to be removed is the one
+/// the inspection authorized removing.
+struct LaunchdJobProbe: Sendable {
+    enum Outcome: Equatable {
+        /// The label still names the program the record described.
+        case unchanged
+        /// The job is already gone, so there is nothing left to tear down.
+        case vanished
+        /// The label now names a different program, or one that cannot be read.
+        case replaced(URL?)
+    }
+
+    private let runner: any ProcessRunning
+    private let userID: uid_t
+
+    init(runner: any ProcessRunning = ProcessRunner(), userID: uid_t = getuid()) {
+        self.runner = runner
+        self.userID = userID
+    }
+
+    func verify(_ record: LaunchdJobRecord) async throws -> Outcome {
+        guard let expected = record.programURL else {
+            throw DaemonServiceError.invalidJobEvidence
+        }
+        let result = try await runner.run(
+            executable: URL(fileURLWithPath: "/bin/launchctl"),
+            arguments: ["print", "gui/\(userID)/\(record.label)"],
+            timeout: .seconds(5)
+        )
+        guard result.status == 0 else { return .vanished }
+        let current = LaunchdJobInspector.parseRecord(
+            label: record.label,
+            output: String(decoding: result.stdout, as: UTF8.self)
+        )
+        // A job that reports no program path cannot be matched against the
+        // record, so it is treated as replaced rather than assumed unchanged.
+        // Only recognized-legacy jobs are ever booted out, and those always
+        // carry a concrete `program`.
+        guard let program = current.programURL else { return .replaced(nil) }
+        let same = LaunchdJobInspector.resolvedPath(program)
+            == LaunchdJobInspector.resolvedPath(expected)
+        return same ? .unchanged : .replaced(program)
     }
 }
