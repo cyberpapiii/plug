@@ -9,6 +9,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- An upstream that failed to start is now retried as soon as its health task
+  begins instead of one full `health_check_interval_secs` later. The task
+  consumed the interval's immediate first tick unconditionally, so a local
+  upstream that was merely slow to bind its port after a reboot stayed down for
+  the whole first interval even once it was ready: on a 60s interval this was
+  measured at 122 seconds of avoidable downtime for two loopback servers at
+  login. A server that started healthy still skips that first tick, since it
+  was just contacted.
 - `scripts/install-release.sh` now swaps the app bundle by rename instead of
   deleting it in place. Every MCP client's `plug connect` re-execs the bundle's
   binary, and macOS aborts a running process whose signed executable is
