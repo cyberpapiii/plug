@@ -75,7 +75,16 @@ pub fn spawn_health_check(
 
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        tick.tick().await;
+        // `interval` yields its first tick immediately. A server that started
+        // healthy was just contacted, so that tick would be a redundant ping and
+        // is consumed here. A server that is already missing an upstream is
+        // known-bad before the loop begins -- typically a local upstream still
+        // binding its port after a reboot -- so its first tick is left to fire
+        // now. Consuming it unconditionally used to leave such a server down for
+        // a whole interval after login even once it was ready to answer.
+        if server_manager.get_upstream(&name).is_some() {
+            tick.tick().await;
+        }
 
         loop {
             tokio::select! {
@@ -323,7 +332,71 @@ async fn health_check_server(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::config::{Config, ServerConfig, TransportType};
+    use crate::engine::Engine;
     use crate::types::{HealthState, ServerHealth};
+
+    fn unstartable_server_config(health_check_interval_secs: u64) -> ServerConfig {
+        ServerConfig {
+            command: Some("/nonexistent/plug-health-test-binary".to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+        }
+    }
+
+    /// A server that failed to start must be retried without first waiting out a
+    /// whole health-check interval. The common case is a local upstream that is
+    /// still binding its port when the daemon starts at login: it is ready
+    /// seconds later, but the daemon used to leave it down until the first tick.
+    #[tokio::test(start_paused = true)]
+    async fn startup_failure_is_retried_before_one_health_interval_elapses() {
+        const INTERVAL_SECS: u64 = 600;
+
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("dead".to_string(), unstartable_server_config(INTERVAL_SECS));
+
+        let engine = Arc::new(Engine::new(config));
+        engine.start().await.expect("a failed start is not fatal");
+
+        // Well past the health task's start jitter (<= 10s) but far short of the
+        // 600s interval, so only an unconsumed first tick can have fired.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let restarts = engine
+            .server_manager()
+            .metrics_snapshot_or_default("dead")
+            .restart_count;
+        assert!(
+            restarts >= 1,
+            "a server that failed to start should be retried within the first \
+             health interval, but no recovery episode ran in 60s of a {INTERVAL_SECS}s interval"
+        );
+
+        engine.shutdown().await;
+    }
 
     #[test]
     fn health_state_transitions_to_degraded() {
