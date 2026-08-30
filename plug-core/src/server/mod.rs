@@ -1254,7 +1254,17 @@ impl ServerManager {
     }
 
     /// Start all enabled servers from config, at most `config.startup_concurrency` at once.
-    pub async fn start_all(&self, config: &Config) -> Result<(), anyhow::Error> {
+    ///
+    /// `on_settled` is called with each server's name the moment that server's own
+    /// start attempt resolves, whether it succeeded or failed. The caller uses it to
+    /// begin per-server background work without waiting for the slowest upstream:
+    /// one server that takes a minute to spawn must not delay the health task that
+    /// would otherwise be reconnecting an upstream that is already back.
+    pub async fn start_all(
+        &self,
+        config: &Config,
+        on_settled: impl Fn(&str),
+    ) -> Result<(), anyhow::Error> {
         self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
@@ -1346,12 +1356,14 @@ impl ServerManager {
                             Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
                         );
                     }
+                    on_settled(&name);
                 }
                 Ok((name, Err(e))) => {
                     tracing::error!(server = %name, error = %e, "failed to start server");
                     if let Some(server_config) = config.servers.get(&name) {
                         self.record_start_failure(&name, server_config, &e);
                     }
+                    on_settled(&name);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "server start task panicked");
@@ -2490,6 +2502,75 @@ mod tests {
     use super::*;
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
+
+    fn stdio_test_config(command: &str, args: &[&str], timeout_secs: u64) -> ServerConfig {
+        ServerConfig {
+            command: Some(command.to_string()),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+        }
+    }
+
+    /// `start_all` reports each server the moment that server's own start attempt
+    /// resolves. Reporting only after every server settled meant one slow upstream
+    /// held back the health tasks of all the others, so an upstream that failed the
+    /// initial connect but came back moments later went unnoticed for that whole
+    /// time.
+    #[tokio::test]
+    async fn start_all_reports_each_server_as_it_settles() {
+        let mut config = Config::default();
+        config.servers.insert(
+            "fast".to_string(),
+            stdio_test_config("/nonexistent/plug-start-all-test-binary", &[], 30),
+        );
+        config.servers.insert(
+            "slow".to_string(),
+            stdio_test_config("/bin/sleep", &["30"], 30),
+        );
+
+        let manager = Arc::new(ServerManager::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let starting = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                let _ = manager
+                    .start_all(&config, move |name| {
+                        let _ = tx.send(name.to_string());
+                    })
+                    .await;
+            })
+        };
+
+        let settled = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the fast server settles without waiting for the slow one")
+            .expect("a settled server name is reported");
+        assert_eq!(settled, "fast");
+        assert!(
+            !starting.is_finished(),
+            "the slow server should still be starting when the fast one is reported"
+        );
+
+        starting.abort();
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

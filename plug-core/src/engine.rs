@@ -21,7 +21,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::circuit::CircuitState;
 use crate::config::{Config, ServerConfig};
-use crate::health::spawn_health_checks;
+use crate::health::{spawn_health_check, spawn_health_checks};
 use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::server_config_changed;
 use crate::server::{ServerManager, UpstreamServer, retire_upstream_owned};
@@ -218,7 +218,27 @@ impl Engine {
         // Wire up the Engine reference for session recovery in ToolRouter
         self.tool_router.set_engine(Arc::downgrade(self));
 
-        self.server_manager.start_all(&config).await?;
+        // Each server's health task starts as soon as that server's own start
+        // attempt settles, rather than after every server has settled. A single
+        // slow upstream used to hold back every other server's first health
+        // tick, so an upstream that failed the initial connect but came up
+        // moments later stayed down for the whole of the slow server's start.
+        self.server_manager
+            .start_all(&config, |name| {
+                if let Some(server_config) = config.servers.get(name) {
+                    spawn_health_check(
+                        self.server_manager.clone(),
+                        self.tool_router.clone(),
+                        Arc::clone(self),
+                        self.event_tx.clone(),
+                        self.cancel.clone(),
+                        name.to_string(),
+                        server_config.health_check_interval_secs,
+                        &self.tracker,
+                    );
+                }
+            })
+            .await?;
 
         // Startup failures are currently non-fatal. Preserve them in daemon
         // state so status output is honest and proactive recovery can retry
@@ -253,7 +273,9 @@ impl Engine {
             });
         }
 
-        // Spawn health checkers using TaskTracker (with Engine ref for proactive recovery)
+        // Safety net for any enabled server that `start_all` never reported as
+        // settled (a panicked start task). Servers that already have a task keep
+        // it; re-spawning would supersede a live task and reset its interval.
         spawn_health_checks(
             self.server_manager.clone(),
             self.tool_router.clone(),

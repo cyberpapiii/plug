@@ -41,6 +41,13 @@ pub fn spawn_health_checks(
         if !sc.enabled {
             continue;
         }
+        // A server whose start already settled has a live task. Spawning a
+        // second one would supersede it and hand the server a fresh full
+        // interval to wait out, which is exactly what this call is here to
+        // avoid for the servers that never settled.
+        if engine.current_health_task_generation(name).is_some() {
+            continue;
+        }
         spawn_health_check(
             server_manager.clone(),
             router.clone(),

@@ -5,6 +5,18 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Each upstream's health task now starts as soon as that upstream's own start
+  attempt settles, rather than after every upstream has settled. One slow server
+  used to hold back every other server's first health tick: measured after a
+  reboot, `imcp` took 55.7s to spawn, and two loopback upstreams that were ready
+  and reachable 44 seconds earlier went unnoticed for that whole stretch.
+  `ServerManager::start_all` reports each server as it resolves, and the bulk
+  spawn that follows now only covers servers it never heard about.
+
 ## [0.8.4] - 2026-08-30
 
 ### Fixed
