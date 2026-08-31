@@ -20,6 +20,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   and VS Code Copilot (128) were both re-verified against their documentation on
   2026-08-30 and still stand.
 
+## [Unreleased]
+
+### Fixed
+
+- `plug doctor` names the 100-tool ceiling after the product that publishes it:
+  Cognition acquired Windsurf, and the cap belongs to Cascade, now the legacy
+  agent inside Devin Desktop. Devin Local, the agent that replaced it as the
+  default, configures MCP through the Devin CLI and publishes no ceiling. The
+  export target keeps the Windsurf name because the file it writes still does.
+
 ## [0.8.5] - 2026-08-30
 
 ### Fixed
