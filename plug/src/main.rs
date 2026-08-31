@@ -146,6 +146,9 @@ enum Commands {
         targets: Vec<String>,
         #[arg(long)]
         all: bool,
+        /// Inspect repair needs without changing client configuration files
+        #[arg(long)]
+        dry_run: bool,
     },
     #[command(display_order = 6)]
     /// Internal: reload service config from disk
@@ -535,9 +538,11 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Some(Commands::Repair { targets, all }) => {
-            commands::misc::cmd_repair(cli.config.as_ref(), targets, all, &cli.output)?
-        }
+        Some(Commands::Repair {
+            targets,
+            all,
+            dry_run,
+        }) => commands::misc::cmd_repair(cli.config.as_ref(), targets, all, dry_run, &cli.output)?,
         Some(Commands::Setup { yes, transport }) => {
             commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
         }
@@ -607,6 +612,19 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Serve { daemon: true })
+        ));
+    }
+
+    #[test]
+    fn repair_command_accepts_dry_run_flag() {
+        let cli = Cli::try_parse_from(["plug", "repair", "--all", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Repair {
+                all: true,
+                dry_run: true,
+                ..
+            })
         ));
     }
 

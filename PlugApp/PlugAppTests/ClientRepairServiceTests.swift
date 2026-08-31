@@ -7,8 +7,8 @@ final class ClientRepairServiceTests: XCTestCase {
         fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"
     )
 
-    func testInspectReportsDriftFromReadOnlyDoctorContract() async throws {
-        let runner = RecordingRepairRunner(result: .success(.doctor(clientRepairNeeded: true, status: 2)))
+    func testInspectReportsDriftFromReadOnlyRepairContract() async throws {
+        let runner = RecordingRepairRunner(result: .success(.report(dispositions: ["recognized_legacy"])))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
@@ -18,31 +18,38 @@ final class ClientRepairServiceTests: XCTestCase {
         XCTAssertEqual(calls, [
             .init(
                 executable: canonicalExecutable,
-                arguments: ["doctor", "--output", "json"]
+                arguments: ["repair", "--all", "--dry-run", "--output", "json"]
             ),
         ])
     }
 
-    func testInspectReportsNoDriftFromDoctorContract() async throws {
-        let runner = RecordingRepairRunner(result: .success(.doctor(clientRepairNeeded: false)))
-        let service = ClientRepairService(runner: runner)
-
-        let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
-
-        XCTAssertFalse(needsRepair)
-        let calls = await runner.calls
-        XCTAssertEqual(calls.map(\.arguments), [["doctor", "--output", "json"]])
-    }
-
-    func testInspectAcceptsColdDaemonDoctorFailureReport() async throws {
+    func testInspectReportsNoDriftFromRepairContract() async throws {
         let runner = RecordingRepairRunner(
-            result: .success(.doctor(clientRepairNeeded: false, status: 1))
+            result: .success(.report(dispositions: ["canonical", "http", "missing"]))
         )
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
 
         XCTAssertFalse(needsRepair)
+        let calls = await runner.calls
+        XCTAssertEqual(calls.map(\.arguments), [["repair", "--all", "--dry-run", "--output", "json"]])
+    }
+
+    func testInspectRejectsNonzeroRepairStatus() async {
+        let runner = RecordingRepairRunner(
+            result: .success(.report(dispositions: ["canonical"], status: 1))
+        )
+        let service = ClientRepairService(runner: runner)
+
+        do {
+            _ = try await service.inspect(canonicalExecutable: canonicalExecutable)
+            XCTFail("Expected command failure")
+        } catch let error as ClientRepairError {
+            XCTAssertEqual(error, .commandFailed(status: 1, stderr: ""))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
     func testRepairAllInvokesVerifiedCanonicalExecutableAndDecodesStableReport() async throws {
@@ -83,11 +90,11 @@ final class ClientRepairServiceTests: XCTestCase {
         }
     }
 
-    func testInspectBlocksMalformedOrMissingDoctorJSON() async {
+    func testInspectBlocksMalformedOrIncompleteRepairJSON() async {
         let fixtures = [
             Data("not-json".utf8),
-            Data(#"{"unified_install":{}}"#.utf8),
-            Data(#"{"checks":[],"exit_code":0}"#.utf8),
+            Data(#"{"items":[{"changed":false}]}"#.utf8),
+            Data(#"{"canonical_command":"/tmp/plug"}"#.utf8),
         ]
 
         for fixture in fixtures {
@@ -98,7 +105,7 @@ final class ClientRepairServiceTests: XCTestCase {
 
             do {
                 _ = try await service.inspect(canonicalExecutable: canonicalExecutable)
-                XCTFail("Expected malformed doctor JSON failure")
+                XCTFail("Expected malformed repair JSON failure")
             } catch let error as ClientRepairError {
                 XCTAssertEqual(error, .malformedOutput)
             } catch {
@@ -115,7 +122,7 @@ final class ClientRepairServiceTests: XCTestCase {
         let original = "{\"mcpServers\":{\"plug\":{\"command\":\"legacy\"}}}"
         try Data(original.utf8).write(to: clientFile)
 
-        let runner = RecordingRepairRunner(result: .success(.doctor(clientRepairNeeded: true)))
+        let runner = RecordingRepairRunner(result: .success(.report(dispositions: ["recognized_legacy"])))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
@@ -123,7 +130,19 @@ final class ClientRepairServiceTests: XCTestCase {
 
         XCTAssertEqual(try String(contentsOf: clientFile, encoding: .utf8), original)
         let calls = await runner.calls
-        XCTAssertEqual(calls.map(\.arguments), [["doctor", "--output", "json"]])
+        XCTAssertEqual(calls.map(\.arguments), [["repair", "--all", "--dry-run", "--output", "json"]])
+    }
+
+    func testInspectFailsClosedForUnknownUnreadableAndFutureDispositions() async throws {
+        for disposition in ["unknown_command", "unreadable", "unrelated", "future_value"] {
+            let runner = RecordingRepairRunner(
+                result: .success(.report(dispositions: [disposition]))
+            )
+            let service = ClientRepairService(runner: runner)
+
+            let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
+            XCTAssertTrue(needsRepair)
+        }
     }
 }
 
@@ -147,16 +166,19 @@ private actor RecordingRepairRunner: ProcessRunning {
 }
 
 private extension ProcessResult {
-    static func doctor(clientRepairNeeded: Bool, status: Int32 = 0) -> ProcessResult {
-        let json = "{\"unified_install\":{\"client_repair_needed\":\(clientRepairNeeded)}}"
-        return ProcessResult(status: status, stdout: Data(json.utf8), stderr: Data())
-    }
-
     static func report(changed: [Bool]) -> ProcessResult {
         let items = changed.enumerated().map { index, changed in
             "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(changed ? "recognized_legacy" : "canonical")\",\"changed\":\(changed),\"message\":\"ok\"}"
         }.joined(separator: ",")
         let json = "{\"canonical_command\":\"/Applications/Plug.app/Contents/Resources/plug\",\"items\":[\(items)]}"
         return ProcessResult(status: 0, stdout: Data(json.utf8), stderr: Data())
+    }
+
+    static func report(dispositions: [String], status: Int32 = 0) -> ProcessResult {
+        let items = dispositions.enumerated().map { index, disposition in
+            "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(disposition)\",\"changed\":false,\"message\":\"ok\"}"
+        }.joined(separator: ",")
+        let json = "{\"canonical_command\":\"/Applications/Plug.app/Contents/Resources/plug\",\"items\":[\(items)]}"
+        return ProcessResult(status: status, stdout: Data(json.utf8), stderr: Data())
     }
 }

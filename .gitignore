@@ -41,3 +41,4 @@ id_ed25519*
 
 # Compound Engineering scratch reports are local-only.
 .superpowers/
+/.context/

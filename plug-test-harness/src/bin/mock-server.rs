@@ -270,6 +270,7 @@ struct MockServer {
     list_fail_flag_file: Option<String>,
     list_empty_flag_file: Option<String>,
     list_delay: std::time::Duration,
+    request_log_file: Option<String>,
 }
 
 impl MockServer {
@@ -323,6 +324,7 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
+            let _ = append_request_log(self.request_log_file.as_deref(), "tools/list").await;
             let tools: Vec<Tool> = self
                 .tool_names
                 .iter()
@@ -462,6 +464,7 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
+            let _ = append_request_log(self.request_log_file.as_deref(), "resources/list").await;
             // Hang on resource listing so tests can exercise the per-server
             // listing timeout in refresh_tools (a connected-but-stalled
             // upstream must not block the whole catalog refresh).
@@ -558,6 +561,9 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
         async move {
+            let _ =
+                append_request_log(self.request_log_file.as_deref(), "resources/templates/list")
+                    .await;
             if !self.list_delay.is_zero() {
                 tokio::time::sleep(self.list_delay).await;
             }
@@ -579,6 +585,7 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
+            let _ = append_request_log(self.request_log_file.as_deref(), "prompts/list").await;
             if !self.list_delay.is_zero() {
                 tokio::time::sleep(self.list_delay).await;
             }
@@ -1065,6 +1072,7 @@ async fn main() -> anyhow::Result<()> {
         list_fail_flag_file: args.list_fail_flag_file,
         list_empty_flag_file: args.list_empty_flag_file,
         list_delay: std::time::Duration::from_millis(args.list_delay_ms),
+        request_log_file: args.request_log_file,
     };
 
     let transport = rmcp::transport::io::stdio();
