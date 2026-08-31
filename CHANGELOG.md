@@ -10,11 +10,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Fixed
 
 - Opening Plug on a healthy Mac no longer claims it is installing itself. Every
-  launch begins by reading the installation, and that phase was sharing its
-  words with the phases that actually change it, so the menu bar greeted a
-  working install with "Setting up… Finishing installation." The reading phase
-  now says "Checking Plug… Making sure everything is in place." and only the
+  launch begins by reading the installation, and that read-only pass was sharing
+  its words with the phases that actually change it, so the menu bar greeted a
+  working install with "Setting up… Finishing installation." It now says
+  "Starting… Connecting to servers.", which is what is happening; only the
   phases that repair, replace, or clean up call themselves setup.
+- A repair in progress describes itself instead of the situation it started
+  from. The app kept a second copy of the installation state and refreshed it
+  only when reconciliation finished, with a timer to reveal a generic notice
+  while the copy was stale. Reading the coordinator's state directly retires
+  both the copy and the timer.
 
 ## [0.8.8] - 2026-08-31
 

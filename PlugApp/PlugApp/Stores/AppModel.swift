@@ -22,8 +22,6 @@ final class AppModel {
         from: Bundle.main.infoDictionary ?? [:]
     )
 
-    static let reconciliationNoticeDelay = Duration.milliseconds(300)
-
     struct ServerPresentation: Identifiable, Equatable {
         let configured: ConfiguredServer
         let runtime: ServerStatus?
@@ -40,11 +38,12 @@ final class AppModel {
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var reconciliationTask: Task<Void, Never>?
-    private var progressTask: Task<Void, Never>?
     private var hasStarted = false
     private var reconciliationInFlight = false
     private var attemptedSkewRecovery = false
-    private(set) var connectionState: ConnectionState = .disconnected
+    /// Not `.disconnected`: before the first handshake nobody has asked, and
+    /// "Plug is not running" is an answer, not a question.
+    private(set) var connectionState: ConnectionState = .connecting
     private(set) var snapshot: OperatorSnapshot = .empty
     private(set) var activities: [ActivityEvent] = []
     /// How far back the history goes. The daemon keeps a bounded ring, so this
@@ -55,8 +54,6 @@ final class AppModel {
     private(set) var activityWasTruncated = false
     var activityIsCapped: Bool { activityWasTruncated }
     private(set) var lastError: String?
-    private(set) var installationState: InstallationState
-    private(set) var showsReconciliationProgress = false
     private(set) var signingInServers: Set<String> = []
     private(set) var toolCatalog = ToolCatalog()
     private(set) var connectableApps: [LinkableApp] = []
@@ -104,8 +101,13 @@ final class AppModel {
         self.coordinator = coordinator
         self.tokenURL = tokenURL
         self.appLinker = appLinker
-        installationState = coordinator.state
     }
+
+    /// Read live rather than mirrored. A copy refreshed only when a
+    /// reconciliation ends reports the state the app was in before the work
+    /// started, which is how a repair in progress came to describe itself with
+    /// the pre-repair situation.
+    private var installationState: InstallationState { coordinator.state }
 
     var visibleServers: [ServerPresentation] {
         let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
@@ -161,17 +163,14 @@ final class AppModel {
     }
 
     private var setupState: PlugSituation.Setup {
-        // Mid-reconcile this model's own copy of the state is still the
-        // pre-flight one, so the phase has to come from the coordinator, which
-        // is the thing doing the work.
-        let state = showsReconciliationProgress ? coordinator.state : installationState
-        switch state {
-        case .healthy: return showsReconciliationProgress ? .checking : .ready
+        switch installationState {
+        case .healthy: return .ready
         case .adoptionRequired: return .needsPermission
-        // Inspecting only reads. Every launch passes through it, and calling
-        // that "Setting up…" tells a user an install is happening when nothing
-        // is being installed. The later phases do change the installation.
-        case let .reconcilingUpdate(phase): return phase == .inspecting ? .checking : .settingUp
+        // The first pass only reads the installation, and every launch runs it.
+        // Nothing is being set up there, so setup keeps quiet and the runtime
+        // verdict says the true thing: Plug is starting. The later phases do
+        // change the installation, and those are worth a word.
+        case let .reconcilingUpdate(phase): return phase == .inspecting ? .ready : .settingUp
         case let .repairableDrift(drift): return .needsRepair(detail: drift.detail)
         case let .blocked(failure): return .blocked(detail: failure.detail, hasLog: failure.logURL != nil)
         }
@@ -430,21 +429,9 @@ final class AppModel {
         }
 
         reconciliationInFlight = true
-        showsReconciliationProgress = false
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            self.progressTask = Task { @MainActor [weak self] in
-                do {
-                    try await Task.sleep(for: Self.reconciliationNoticeDelay)
-                    guard !Task.isCancelled else { return }
-                    self?.showsReconciliationProgress = true
-                } catch { }
-            }
             await operation()
-            self.installationState = self.coordinator.state
-            self.progressTask?.cancel()
-            self.progressTask = nil
-            self.showsReconciliationProgress = false
             self.reconciliationInFlight = false
             self.reconciliationTask = nil
         }

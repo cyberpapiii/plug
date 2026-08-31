@@ -18,9 +18,12 @@ private func makeFixtureTokenURL() throws -> URL {
 }
 
 final class AppModelTests: XCTestCase {
-    @MainActor func testEmptyModelIsQuietlyDisconnected() {
+    /// A model that has not asked yet reports `.connecting`, not
+    /// `.disconnected`. The difference is what the menu bar says while Plug
+    /// starts: "Starting…" rather than "Plug is not running".
+    @MainActor func testEmptyModelHasNotAskedYet() {
         let model = AppModel()
-        XCTAssertEqual(model.connectionState, .disconnected)
+        XCTAssertEqual(model.connectionState, .connecting)
         XCTAssertTrue(model.visibleServers.isEmpty)
     }
 
@@ -97,18 +100,18 @@ final class AppModelTests: XCTestCase {
     }
 
     /// The app opens in `.reconcilingUpdate(.inspecting)` on every launch,
-    /// before it has looked at anything. That phase only reads, so it must not
-    /// say an install is finishing; the phases that do change the install still
-    /// must.
+    /// before it has looked at anything. That phase only reads, so a working
+    /// install must not be told it is being set up; the phases that do change
+    /// the install still say so.
     @MainActor
-    func testLaunchInspectionReadsAsACheckNotAnInstall() {
+    func testLaunchInspectionSaysStartingNotInstalling() {
         let inspecting = AppModel(
             coordinator: RecordingInstallationCoordinator(
                 state: .reconcilingUpdate(.inspecting),
                 events: LockedEvents()
             )
         )
-        XCTAssertEqual(inspecting.verdict.title, "Checking Plug…")
+        XCTAssertEqual(inspecting.verdict.title, "Starting…")
 
         let installing = AppModel(
             coordinator: RecordingInstallationCoordinator(
@@ -134,7 +137,6 @@ final class AppModelTests: XCTestCase {
         )
         await model.start()
 
-        XCTAssertFalse(model.showsReconciliationProgress)
         XCTAssertNil(model.installationFailure)
     }
 
@@ -209,8 +211,12 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(coordinator.events.values, ["coordinator.adopt", "coordinator.reconcile"])
     }
 
+    /// Work in progress has to describe itself while it is in progress. The app
+    /// used to keep its own copy of the installation state and refresh it only
+    /// when reconciliation ended, so a repair spent its whole run describing the
+    /// situation from before it started.
     @MainActor
-    func testLongReconciliationShowsDelayedFinishingMessageAndPreservesSnapshot() async {
+    func testAReconciliationInProgressDescribesItselfAndPreservesSnapshot() async {
         let events = LockedEvents()
         let gate = AsyncGate()
         let coordinator = RecordingInstallationCoordinator(
@@ -227,17 +233,18 @@ final class AppModelTests: XCTestCase {
         await model.start()
         let originalSnapshot = model.snapshot
 
-        coordinator.operation = { await gate.wait() }
+        coordinator.operation = {
+            coordinator.state = .reconcilingUpdate(.replacingDaemon)
+            await gate.wait()
+        }
         let retry = Task { await model.retry() }
         await gate.enteredWait()
-        try? await Task.sleep(for: .milliseconds(80))
-        XCTAssertFalse(model.showsReconciliationProgress)
-        try? await Task.sleep(for: .milliseconds(400))
-        XCTAssertTrue(model.showsReconciliationProgress)
+        XCTAssertEqual(model.verdict.title, "Setting up…")
         XCTAssertEqual(model.snapshot, originalSnapshot)
+        coordinator.state = .healthy(makeInstallationSnapshot())
         await gate.release()
         await retry.value
-        XCTAssertFalse(model.showsReconciliationProgress)
+        XCTAssertNotEqual(model.verdict.title, "Setting up…")
     }
 
     @MainActor
