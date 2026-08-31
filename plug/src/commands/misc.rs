@@ -1191,13 +1191,33 @@ fn repair_text_summary(report: &ClientRepairReport, repaired_count: usize) -> St
     }
 }
 
+fn persist_client_repair(
+    path: &std::path::Path,
+    updated: &str,
+    dry_run: bool,
+) -> std::io::Result<bool> {
+    if dry_run {
+        return Ok(false);
+    }
+    std::fs::write(path, updated)?;
+    Ok(true)
+}
+
+fn repair_canonical_command(dry_run: bool) -> anyhow::Result<std::path::PathBuf> {
+    if dry_run {
+        return Ok(std::env::current_exe()?);
+    }
+    crate::install::canonical_client_command()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ClientRepairItem, ClientRepairReport, PlugLinkDisposition, doctor_check_details,
-        doctor_next_steps, repair_attention_messages, repair_client_content,
-        repair_export_endpoint, repair_targets, repair_text_summary, runtime_auth_checks,
-        runtime_health_checks_for_tests, synthesize_doctor_interpretation,
+        doctor_next_steps, persist_client_repair, repair_attention_messages,
+        repair_canonical_command, repair_client_content, repair_export_endpoint, repair_targets,
+        repair_text_summary, runtime_auth_checks, runtime_health_checks_for_tests,
+        synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
     use plug_core::ipc::IpcAuthServerInfo;
@@ -2274,16 +2294,39 @@ mod tests {
         assert!(repair_text_summary(&report, 0).contains("needing attention"));
         assert!(!repair_text_summary(&report, 0).contains("Successfully"));
     }
+
+    #[test]
+    fn dry_run_preserves_client_file_byte_for_byte() {
+        let path =
+            std::env::temp_dir().join(format!("plug-repair-dry-run-{}.json", uuid::Uuid::new_v4()));
+        let original = b"{\"mcpServers\":{\"plug\":{\"command\":\"legacy\"}}}\n";
+        std::fs::write(&path, original).unwrap();
+
+        let changed = persist_client_repair(&path, "replacement", true).unwrap();
+
+        assert!(!changed);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dry_run_inspection_uses_current_executable_without_app_discovery() {
+        assert_eq!(
+            repair_canonical_command(true).unwrap(),
+            std::env::current_exe().unwrap()
+        );
+    }
 }
 
 pub(crate) fn cmd_repair(
     config_path: Option<&std::path::PathBuf>,
     targets: Vec<String>,
     all: bool,
+    dry_run: bool,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let repair_targets = repair_targets(targets, all)?;
-    let canonical_command = crate::install::canonical_client_command()?;
+    let canonical_command = repair_canonical_command(dry_run)?;
     let mut report = ClientRepairReport {
         canonical_command: canonical_command.clone(),
         items: Vec::new(),
@@ -2295,7 +2338,12 @@ pub(crate) fn cmd_repair(
         println!(
             "{} {}",
             style("◆").cyan().bold(),
-            style("Repairing AI client configurations...").bold()
+            style(if dry_run {
+                "Inspecting AI client configurations..."
+            } else {
+                "Repairing AI client configurations..."
+            })
+            .bold()
         );
     }
 
@@ -2367,18 +2415,24 @@ pub(crate) fn cmd_repair(
             message: repair.message,
         };
         if let Some(updated) = repair.updated {
-            if let Err(error) = std::fs::write(&path, updated) {
-                item.message = format!("Could not repair recognized Plug command: {error}");
-            } else {
-                item.changed = true;
-                repaired_count += 1;
-                if matches!(output, OutputFormat::Text) {
-                    println!(
-                        "  {} Refreshing {}... {}",
-                        style("›").cyan().bold(),
-                        target,
-                        style("done").green()
-                    );
+            match persist_client_repair(&path, &updated, dry_run) {
+                Ok(false) => {
+                    item.message = "Recognized legacy Plug command needs repair.".to_string();
+                }
+                Err(error) => {
+                    item.message = format!("Could not repair recognized Plug command: {error}");
+                }
+                Ok(true) => {
+                    item.changed = true;
+                    repaired_count += 1;
+                    if matches!(output, OutputFormat::Text) {
+                        println!(
+                            "  {} Refreshing {}... {}",
+                            style("›").cyan().bold(),
+                            target,
+                            style("done").green()
+                        );
+                    }
                 }
             }
         }

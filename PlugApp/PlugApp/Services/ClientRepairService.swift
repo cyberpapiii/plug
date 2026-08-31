@@ -17,7 +17,7 @@ protocol ClientRepairing: Sendable {
 }
 
 struct ClientRepairService: ClientRepairing {
-    private static let inspectArguments = ["doctor", "--output", "json"]
+    private static let inspectArguments = ["repair", "--all", "--dry-run", "--output", "json"]
     private static let repairArguments = ["repair", "--all", "--output", "json"]
 
     private let runner: any ProcessRunning
@@ -37,16 +37,13 @@ struct ClientRepairService: ClientRepairing {
             arguments: Self.inspectArguments,
             timeout: timeout
         )
-        // Doctor uses 0 for healthy, 1 for failed checks, and 2 for warnings.
-        // All three still carry the same machine-readable inspection report.
-        guard (0...2).contains(process.status) else {
+        guard process.status == 0 else {
             throw commandFailed(for: process)
         }
 
         do {
-            return try JSONDecoder().decode(ParsedDoctorReport.self, from: process.stdout)
-                .unifiedInstall
-                .clientRepairNeeded
+            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
+                .repairNeeded
         } catch {
             throw ClientRepairError.malformedOutput
         }
@@ -81,24 +78,14 @@ struct ClientRepairService: ClientRepairing {
     }
 }
 
-private struct ParsedDoctorReport: Decodable {
-    let unifiedInstall: ParsedUnifiedInstall
-
-    private enum CodingKeys: String, CodingKey {
-        case unifiedInstall = "unified_install"
-    }
-}
-
-private struct ParsedUnifiedInstall: Decodable {
-    let clientRepairNeeded: Bool
-
-    private enum CodingKeys: String, CodingKey {
-        case clientRepairNeeded = "client_repair_needed"
-    }
-}
-
 private struct ParsedRepairReport: Decodable {
     let items: [ParsedRepairItem]
+
+    var repairNeeded: Bool {
+        items.contains { item in
+            !["canonical", "http", "missing"].contains(item.disposition)
+        }
+    }
 
     var result: ClientRepairResult {
         let repaired = items.count(where: \.changed)
@@ -116,8 +103,10 @@ private struct ParsedRepairReport: Decodable {
 
 private struct ParsedRepairItem: Decodable {
     let changed: Bool
+    let disposition: String
 
     private enum CodingKeys: String, CodingKey {
         case changed
+        case disposition
     }
 }
