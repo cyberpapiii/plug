@@ -22,39 +22,52 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// Four persistent destinations belong in the system sidebar. This keeps
-/// search, filters, and actions out of a crowded title-bar control.
+/// The window. No sidebar: three peers do not earn a permanent column, and the
+/// space is better spent on the content itself.
 struct RootView: View {
     let model: AppModel
     @Bindable var router: Router
     let run: (PlugIntent) -> Void
 
     var body: some View {
-        NavigationSplitView {
-            List(AppSection.allCases, selection: $router.section) { section in
-                Label(section.rawValue, systemImage: section.symbol)
-                    .tag(section)
+        VStack(spacing: 0) {
+            if model.verdict.tone != .good {
+                VerdictView(verdict: model.verdict, compact: true, run: run)
+                    .padding(.horizontal, Metric.roomy)
+                    .padding(.vertical, Metric.snug)
+                    .background(.bar)
+                    .overlay(alignment: .bottom) { Divider() }
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
-            .navigationTitle("Plug")
-            .navigationSplitViewColumnWidth(min: 168, ideal: 188, max: 220)
-        } detail: {
-            content
-                .navigationTitle(router.section.rawValue)
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    if model.verdict.tone != .good {
-                        VerdictView(verdict: model.verdict, compact: true, run: run)
-                            .padding(.horizontal, Metric.regular)
-                            .padding(.vertical, Metric.snug)
-                            .nativeGlassSurface()
-                            .padding(.horizontal, Metric.regular)
-                            .padding(.bottom, Metric.tight)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
-                }
+
+            switch router.section {
+            case .servers:
+                ServersView(model: model, router: router, run: run)
+            case .tools:
+                ToolsView(model: model, router: router, run: run)
+            case .connections:
+                ConnectionsView(model: model, run: run)
+            case .activity:
+                ActivityView(model: model)
+            }
         }
-        .navigationSplitViewStyle(.balanced)
         .animation(.snappy(duration: 0.2), value: model.verdict)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                // Icon and word together: the picture is what people aim at
+                // after the first visit, the word is what makes the first visit
+                // work.
+                Picker("Section", selection: $router.section) {
+                    ForEach(AppSection.allCases) { section in
+                        Label(section.rawValue, systemImage: section.symbol).tag(section)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(minWidth: 330)
+            }
+
+            // Plug has no menu bar of its own — it is an accessory app — so the
+            // window carries the way into Settings itself.
             ToolbarItem {
                 SettingsLink {
                     Image(systemName: "gearshape")
@@ -63,6 +76,8 @@ struct RootView: View {
                 .accessibilityLabel("Settings")
             }
         }
+        .navigationTitle("Plug")
+        .navigationSubtitle(model.situation.version.isEmpty ? "" : "Version \(model.situation.version)")
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
         .overlay(alignment: .bottom) {
@@ -70,19 +85,6 @@ struct RootView: View {
                 ErrorToast(message: error)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-        }
-    }
-
-    @ViewBuilder private var content: some View {
-        switch router.section {
-        case .servers:
-            ServersView(model: model, router: router, run: run)
-        case .tools:
-            ToolsView(model: model, router: router, run: run)
-        case .connections:
-            ConnectionsView(model: model, run: run)
-        case .activity:
-            ActivityView(model: model)
         }
     }
 }

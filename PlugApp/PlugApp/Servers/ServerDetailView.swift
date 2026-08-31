@@ -6,6 +6,7 @@ import SwiftUI
 struct ServerDetailView: View {
     let model: AppModel
     let server: ServerFacts
+    @Bindable var router: Router
     let run: (PlugIntent) -> Void
     @State private var confirmRemoval = false
     @State private var confirmSignOut = false
@@ -54,6 +55,13 @@ struct ServerDetailView: View {
                 Text(statusLine).font(.callout).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
+            Button {
+                router.selectedServer = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close details")
         }
     }
 
@@ -91,7 +99,7 @@ struct ServerDetailView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Metric.regular)
-        .nativeInsetSurface(AnyShapeStyle(.orange.opacity(0.1)))
+        .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: Metric.corner))
     }
 
     private var problemHeadline: String {
@@ -198,7 +206,7 @@ struct ServerDetailView: View {
             } else {
                 Button("Turn On") { run(.setServerEnabled(server.name, true)) }
             }
-            Button("Edit Server…") { run(.editServer(server.name)) }
+            Button("Edit Settings…") { run(.editServer(server.name)) }
             if server.usesOAuth, server.health != .signInNeeded {
                 Button("Sign Out…") { confirmSignOut = true }
             }

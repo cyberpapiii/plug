@@ -30,7 +30,7 @@ struct AddServerView: View {
                 .scrollContentBackground(.hidden)
                 .padding(Metric.snug)
                 .frame(height: 132)
-                .nativeInsetSurface(AnyShapeStyle(.quaternary.opacity(0.4)))
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Metric.corner))
                 .overlay(alignment: .topLeading) {
                     if pasted.isEmpty {
                         Text(Self.placeholder)
@@ -58,7 +58,7 @@ struct AddServerView: View {
                 Button(saving ? "Adding…" : "Add Server") { add() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(draft == nil || trimmedName.isEmpty || saving)
+                    .disabled(draft == nil || name.isEmpty || saving)
             }
         }
         .padding(Metric.roomy)
@@ -90,7 +90,10 @@ struct AddServerView: View {
     @ViewBuilder private var preview: some View {
         switch parse {
         case .empty:
-            EmptyView()
+            Text("Nothing pasted yet.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         case let .unreadable(reason):
             Label(reason, systemImage: "questionmark.circle")
                 .font(.callout)
@@ -121,7 +124,7 @@ struct AddServerView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(Metric.regular)
-            .nativeInsetSurface(AnyShapeStyle(.quaternary.opacity(0.3)))
+            .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: Metric.corner))
             .transition(.opacity)
         }
     }
@@ -129,10 +132,10 @@ struct AddServerView: View {
     // MARK: - Saving
 
     private func add() {
-        guard let draft, !trimmedName.isEmpty else { return }
+        guard let draft else { return }
         saving = true
         failure = nil
-        let finalName = trimmedName
+        let finalName = name.trimmingCharacters(in: .whitespaces)
         Task {
             await model.perform { .validateServer(authToken: $0, name: finalName, server: draft.config) }
             if let error = model.lastError {
@@ -148,9 +151,5 @@ struct AddServerView: View {
                 dismiss()
             }
         }
-    }
-
-    private var trimmedName: String {
-        name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

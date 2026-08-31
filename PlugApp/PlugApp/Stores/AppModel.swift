@@ -45,7 +45,6 @@ final class AppModel {
     /// "Plug is not running" is an answer, not a question.
     private(set) var connectionState: ConnectionState = .connecting
     private(set) var snapshot: OperatorSnapshot = .empty
-    private(set) var hasLoadedSnapshot = false
     private(set) var activities: [ActivityEvent] = []
     /// How far back the history goes. The daemon keeps a bounded ring, so this
     /// is the whole of what can be asked for, not a page of a longer list.
@@ -58,7 +57,6 @@ final class AppModel {
     private(set) var signingInServers: Set<String> = []
     private(set) var toolCatalog = ToolCatalog()
     private(set) var connectableApps: [LinkableApp] = []
-    private(set) var hasLoadedConnectableApps = false
     private(set) var busyApps: Set<String> = []
     private(set) var isRestartingService = false
     private var capabilities: Set<String> = []
@@ -199,10 +197,6 @@ final class AppModel {
         }
     }
 
-    var isLoadingInitialData: Bool {
-        !hasLoadedSnapshot && connectionState == .connecting
-    }
-
     /// Recent calls that touched one server, newest first.
     func recentActivity(for server: String, limit: Int = 12) -> [ActivityEvent] {
         activities
@@ -313,7 +307,6 @@ final class AppModel {
                 let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
                 let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
                 snapshot = value
-                hasLoadedSnapshot = true
                 NotificationService.shared.observe(value)
                 if case let .activity(events) = try await ipc.request(
                     .activity(
@@ -395,7 +388,6 @@ final class AppModel {
     /// Which AI apps are wired into Plug. Read from the client configuration
     /// files on disk rather than the daemon, which does not own them.
     func loadConnectableApps() async {
-        defer { hasLoadedConnectableApps = true }
         do { connectableApps = try await appLinker.apps() } catch {
             lastError = error.localizedDescription
         }

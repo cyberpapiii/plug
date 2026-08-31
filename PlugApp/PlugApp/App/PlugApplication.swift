@@ -23,7 +23,7 @@ struct PlugApplication: App {
         // carries the fix for whatever it just said, so most visits never open
         // a window at all.
         MenuBarExtra {
-            PlugPopover(model: model, section: router.section, run: runner.run)
+            PlugPopover(model: model, run: runner.run)
         } label: {
             // The label is the one view that exists from launch, so the
             // runtime connection starts here rather than in a window that may
@@ -38,11 +38,10 @@ struct PlugApplication: App {
         // auditing who is connected, reading history.
         Window("Plug", id: Self.windowID) {
             RootView(model: model, router: router, run: runner.run)
-                .frame(minWidth: 760, minHeight: 500)
+                .frame(minWidth: 680, minHeight: 460)
                 .task { await model.start() }
         }
-        .defaultSize(width: 920, height: 600)
-        .windowResizability(.contentMinSize)
+        .defaultSize(width: 820, height: 560)
         .windowToolbarStyle(.unified)
         .commands {
             // Plug refreshes itself, so a refresh button would be visual weight
