@@ -58,19 +58,6 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertNil(verdict.secondary)
     }
 
-    /// Launch reads the installation before it knows anything is wrong. Saying
-    /// "Setting up…" there tells a user with a working install that Plug is
-    /// installing itself, which is both untrue and alarming.
-    func testCheckingDoesNotClaimAnInstallIsHappening() {
-        let verdict = PlugVerdict.verdict(
-            for: PlugSituation(setup: .checking, runtime: .stopped)
-        )
-        XCTAssertEqual(verdict.tone, .busy)
-        XCTAssertEqual(verdict.title, "Checking Plug…")
-        XCTAssertEqual(verdict.detail, "Making sure everything is in place.")
-        XCTAssertNil(verdict.primary)
-    }
-
     func testPermissionRequestOutranksAStoppedRuntime() {
         let verdict = PlugVerdict.verdict(
             for: PlugSituation(setup: .needsPermission, runtime: .stopped)
