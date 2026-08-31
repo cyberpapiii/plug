@@ -71,18 +71,24 @@ pub fn apply_operator_mutation(
 ) -> anyhow::Result<(Config, OperatorMutationResult)> {
     let mut config = load_editable_config(path)?;
     let result = match mutation {
-        OperatorMutation::AddServer { name, server } => {
+        OperatorMutation::AddServer { name, mut server } => {
             if config.servers.contains_key(&name) {
                 anyhow::bail!("server `{name}` already exists");
             }
+            // A new server has nothing stored behind a placeholder, so this only
+            // drops one that came back from a redacted read of another server.
+            server.restore_redacted_secrets(None);
             let summary = OperatorServerSummary::from_config(name.clone(), &server);
             config.servers.insert(name, server);
             OperatorMutationResult::server(Some(summary))
         }
-        OperatorMutation::UpdateServer { name, server } => {
-            if !config.servers.contains_key(&name) {
+        OperatorMutation::UpdateServer { name, mut server } => {
+            let Some(stored) = config.servers.get(&name) else {
                 anyhow::bail!("unknown server `{name}`");
-            }
+            };
+            // Clients read this server redacted, so untouched secrets arrive as
+            // placeholders. Put the stored values back before they are written.
+            server.restore_redacted_secrets(Some(stored));
             let summary = OperatorServerSummary::from_config(name.clone(), &server);
             config.servers.insert(name, server);
             OperatorMutationResult::server(Some(summary))
@@ -202,6 +208,54 @@ mod tests {
 
     fn fixture_path() -> PathBuf {
         tempfile::tempdir().unwrap().keep().join("config.toml")
+    }
+
+    fn server_with_secrets() -> ServerConfig {
+        toml::from_str(
+            r#"
+transport = "http"
+url = "https://example.test/mcp"
+auth_token = "bearer-abc"
+
+[env]
+API_KEY = "sk-live-123"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn saving_a_redacted_read_back_keeps_the_stored_secrets() {
+        let path = fixture_path();
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::AddServer {
+                name: "figma".into(),
+                server: server_with_secrets(),
+            },
+        )
+        .unwrap();
+
+        // What an operator client sees, edited the way an editor edits it.
+        let mut edited = load_editable_config(&path).unwrap().servers["figma"].redacted();
+        edited.url = Some("https://example.test/v2".to_string());
+
+        let (config, _) = apply_operator_mutation(
+            &path,
+            OperatorMutation::UpdateServer {
+                name: "figma".into(),
+                server: edited,
+            },
+        )
+        .unwrap();
+
+        let saved = &config.servers["figma"];
+        assert_eq!(
+            saved.auth_token.as_ref().map(|token| token.as_str()),
+            Some("bearer-abc")
+        );
+        assert_eq!(saved.env["API_KEY"], "sk-live-123");
+        assert_eq!(saved.url.as_deref(), Some("https://example.test/v2"));
     }
 
     #[test]

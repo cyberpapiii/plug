@@ -1295,9 +1295,12 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 Err(response) => return response,
             };
             match config.servers.get(name) {
+                // Credentials never cross the socket. The client saves the
+                // placeholders back and `apply_operator_mutation` restores the
+                // stored values, so an edit round-trips without them.
                 Some(server) => IpcResponse::ServerConfig {
                     name: name.clone(),
-                    server: Box::new(server.clone()),
+                    server: Box::new(server.redacted()),
                 },
                 None => IpcResponse::Error {
                     code: "UNKNOWN_SERVER".to_string(),

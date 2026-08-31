@@ -461,9 +461,16 @@ fn cleanup_launchd_plan(
     }
 }
 
+/// Whether a launchd job is one plug could own.
+///
+/// Matching a label that merely *ends* in `.plug` sweeps in jobs that only
+/// mention plug: `local.claude-rc.plug` runs `claude remote-control` with this
+/// repo as its working directory, and `plug doctor` reported it as an unknown
+/// job on every run. A job plug owns either sits in plug's own label namespace
+/// or runs a binary called `plug`; the historical labels (`com.plug.daemon`,
+/// `com.plug.serve`) are both inside that namespace.
 pub fn is_plug_launchd_candidate(job: &crate::service::LaunchdJobRecord) -> bool {
-    job.label == "com.plug.daemon"
-        || job.label.to_ascii_lowercase().ends_with(".plug")
+    job.label.to_ascii_lowercase().starts_with("com.plug.")
         || job.program.file_name().and_then(|name| name.to_str()) == Some("plug")
 }
 
@@ -996,12 +1003,24 @@ mod tests {
             label: "com.apple.XprotectFramework.PluginService".to_string(),
             program: PathBuf::from("/System/Library/XProtectPluginService"),
         };
-        let unknown_plug = crate::service::LaunchdJobRecord {
+        // Named after the working directory it runs in, not after plug: the
+        // program is `claude`, so this job is nothing plug should report on.
+        let claude_remote_control = crate::service::LaunchdJobRecord {
             label: "local.claude-rc.plug".to_string(),
             program: PathBuf::from("/Users/example/.local/bin/claude"),
         };
+        let legacy_serve = crate::service::LaunchdJobRecord {
+            label: "com.plug.serve".to_string(),
+            program: PathBuf::from("/Users/example/.cargo/bin/plug"),
+        };
+        let relabelled = crate::service::LaunchdJobRecord {
+            label: "local.something.else".to_string(),
+            program: PathBuf::from("/Users/example/.local/bin/plug"),
+        };
         assert!(!super::is_plug_launchd_candidate(&unrelated));
-        assert!(super::is_plug_launchd_candidate(&unknown_plug));
+        assert!(!super::is_plug_launchd_candidate(&claude_remote_control));
+        assert!(super::is_plug_launchd_candidate(&legacy_serve));
+        assert!(super::is_plug_launchd_candidate(&relabelled));
     }
 
     #[test]

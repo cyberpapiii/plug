@@ -436,6 +436,63 @@ pub struct ServerConfig {
     pub sandbox: Option<StdioSandboxConfig>,
 }
 
+/// Stand-in the daemon sends in place of a stored secret. Operator clients hand
+/// it back untouched when they save, and [`ServerConfig::restore_redacted_secrets`]
+/// swaps the real value in again, so editing a server preserves credentials it
+/// never received. The value is deliberately legible in a text field: an editor
+/// that renders it shows the user that something is being kept, not lost.
+pub const REDACTED_SECRET: &str =
+    "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
+impl ServerConfig {
+    /// Copy with credential material replaced by [`REDACTED_SECRET`].
+    ///
+    /// Environment values are redacted wholesale rather than by key-name
+    /// heuristic, because a name-matching rule leaks every variable it fails to
+    /// recognize; the keys stay in the clear since that is what an editor needs
+    /// to render the list. `oauth_client_id` and `oauth_scopes` also stay: a
+    /// client ID is a public identifier and scopes are names, while the OAuth
+    /// secret lives in the credential store and never appears in this struct.
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.clone();
+        redacted.auth_token = self
+            .auth_token
+            .as_ref()
+            .map(|_| crate::types::SecretString::from(REDACTED_SECRET.to_string()));
+        for value in redacted.env.values_mut() {
+            REDACTED_SECRET.clone_into(value);
+        }
+        redacted
+    }
+
+    /// Swap [`REDACTED_SECRET`] placeholders back for the values `stored` holds.
+    ///
+    /// A placeholder with nothing stored behind it was never a real value, so it
+    /// is dropped rather than written to disk.
+    pub fn restore_redacted_secrets(&mut self, stored: Option<&Self>) {
+        if self
+            .auth_token
+            .as_ref()
+            .is_some_and(|token| token.as_str() == REDACTED_SECRET)
+        {
+            self.auth_token = stored.and_then(|stored| stored.auth_token.clone());
+        }
+        self.env.retain(|key, value| {
+            if value != REDACTED_SECRET {
+                return true;
+            }
+            match stored.and_then(|stored| stored.env.get(key)) {
+                Some(original) => {
+                    value.clone_from(original);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+}
+
 /// Opt-in sandbox policy for stdio upstream child processes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1099,6 +1156,104 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::types::ServerHealth;
+
+    fn server_with_secrets() -> ServerConfig {
+        toml::from_str(
+            r#"
+transport = "http"
+url = "https://example.test/mcp"
+auth_token = "bearer-abc"
+oauth_client_id = "public-client-id"
+
+[env]
+API_KEY = "sk-live-123"
+LOG_LEVEL = "debug"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn redaction_covers_every_env_value_and_the_bearer_token() {
+        let redacted = server_with_secrets().redacted();
+        assert_eq!(
+            redacted.auth_token.as_ref().map(|token| token.as_str()),
+            Some(REDACTED_SECRET)
+        );
+        // Every value, not the ones a name heuristic would have guessed at.
+        assert_eq!(redacted.env["API_KEY"], REDACTED_SECRET);
+        assert_eq!(redacted.env["LOG_LEVEL"], REDACTED_SECRET);
+        // Identifiers an editor needs are not credential material.
+        assert_eq!(redacted.url.as_deref(), Some("https://example.test/mcp"));
+        assert_eq!(
+            redacted.oauth_client_id.as_deref(),
+            Some("public-client-id")
+        );
+        assert_eq!(
+            redacted
+                .env
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["API_KEY".to_string(), "LOG_LEVEL".to_string()]
+                .iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn a_server_without_secrets_gains_no_placeholder() {
+        let mut plain = server_with_secrets();
+        plain.auth_token = None;
+        plain.env.clear();
+        let redacted = plain.redacted();
+        assert!(redacted.auth_token.is_none());
+        assert!(redacted.env.is_empty());
+    }
+
+    #[test]
+    fn restoring_an_edited_redaction_keeps_the_stored_secrets() {
+        let stored = server_with_secrets();
+        let mut edited = stored.redacted();
+        edited.url = Some("https://example.test/v2".to_string());
+        edited.restore_redacted_secrets(Some(&stored));
+
+        assert_eq!(
+            edited.auth_token.as_ref().map(|token| token.as_str()),
+            Some("bearer-abc")
+        );
+        assert_eq!(edited.env["API_KEY"], "sk-live-123");
+        assert_eq!(edited.env["LOG_LEVEL"], "debug");
+        assert_eq!(edited.url.as_deref(), Some("https://example.test/v2"));
+    }
+
+    #[test]
+    fn a_typed_value_wins_over_the_stored_secret() {
+        let stored = server_with_secrets();
+        let mut edited = stored.redacted();
+        edited.auth_token = Some(crate::types::SecretString::from("bearer-new".to_string()));
+        edited
+            .env
+            .insert("API_KEY".to_string(), "sk-live-456".to_string());
+        edited.restore_redacted_secrets(Some(&stored));
+
+        assert_eq!(
+            edited.auth_token.as_ref().map(|token| token.as_str()),
+            Some("bearer-new")
+        );
+        assert_eq!(edited.env["API_KEY"], "sk-live-456");
+    }
+
+    #[test]
+    fn a_placeholder_with_nothing_stored_behind_it_is_dropped() {
+        let mut edited = server_with_secrets().redacted();
+        edited
+            .env
+            .insert("INVENTED".to_string(), REDACTED_SECRET.to_string());
+        edited.restore_redacted_secrets(None);
+
+        assert!(edited.auth_token.is_none());
+        assert!(edited.env.is_empty());
+    }
 
     fn supervision_cfg() -> SupervisionConfig {
         SupervisionConfig {

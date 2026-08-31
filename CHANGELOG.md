@@ -19,16 +19,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   actually linked, and points at `plug status` for the real count. Windsurf (100)
   and VS Code Copilot (128) were both re-verified against their documentation on
   2026-08-30 and still stand.
-
-## [Unreleased]
-
-### Fixed
-
 - `plug doctor` names the 100-tool ceiling after the product that publishes it:
   Cognition acquired Windsurf, and the cap belongs to Cascade, now the legacy
   agent inside Devin Desktop. Devin Local, the agent that replaced it as the
   default, configures MCP through the Devin CLI and publishes no ceiling. The
   export target keeps the Windsurf name because the file it writes still does.
+- The daemon no longer sends upstream credentials back over the IPC socket.
+  `GetServerConfig` returned the stored `ServerConfig` whole, so every operator
+  client read each upstream's bearer token and full environment in plaintext.
+  Secrets are now replaced with a placeholder on the way out and restored from
+  the stored config on the way back in, so editing a server in Plug.app keeps
+  credentials it never received. `oauth_client_id` and `oauth_scopes` stay in
+  the clear: a client ID is a public identifier and scopes are names, and the
+  OAuth secret lives in the credential store, not in `ServerConfig`.
+
+### Changed
+
+- The leftover-path classify table is now pinned by
+  `testdata/legacy_plug_programs.json` itself, not only its cases. Rust's
+  `is_recognized_legacy_program` and Plug.app's `LegacyPlugProgram` each assert
+  their table against the fixture, so a path shape added to one language without
+  the other fails a test on both sides.
+- `plug doctor` and uninstall cleanup no longer treat every launchd label ending
+  in `.plug` as plug's own. `local.claude-rc.plug` runs `claude` with this repo
+  as its working directory and was reported as an unknown plug job on every
+  doctor run. A job qualifies now by sitting in the `com.plug.` label namespace
+  or by running a binary named `plug`.
 
 ## [0.8.5] - 2026-08-30
 
