@@ -285,11 +285,57 @@ pub struct ToolRouter {
     /// decisions made against a pre-publish snapshot with another pass's
     /// publish. Per-server listing/fetch work stays outside it.
     refresh_reconcile_lock: Mutex<()>,
+    /// Coalesces overlapping full-catalog refresh requests. One pass runs at
+    /// a time and requests arriving during that pass share one trailing pass,
+    /// preserving their expectation of observing work started after they
+    /// requested a refresh without multiplying upstream listings.
+    refresh_coordinator: RefreshCoordinator,
+    #[cfg(test)]
+    refresh_request_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    refresh_pass_count: std::sync::atomic::AtomicUsize,
     /// One-time indirection for upstream-owned modern requestState. The raw
     /// upstream token remains server-side and is bound to the route instance.
     continuation_registry: continuations::ContinuationRegistry<NativeContinuation>,
     #[cfg(test)]
     continuation_insert_gate: std::sync::Mutex<Option<Arc<ContinuationInsertGate>>>,
+}
+
+#[derive(Default)]
+struct RefreshCoordinator {
+    state: std::sync::Mutex<RefreshCoordinatorState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct RefreshCoordinatorState {
+    completed_generation: u64,
+    running_generation: Option<u64>,
+    trailing_requested: bool,
+}
+
+struct RefreshLeaderGuard<'a> {
+    coordinator: &'a RefreshCoordinator,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for RefreshLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("refresh coordinator mutex poisoned");
+        if state.running_generation == Some(self.generation) {
+            state.running_generation = None;
+        }
+        drop(state);
+        self.coordinator.changed.notify_waiters();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -866,6 +912,11 @@ impl ToolRouter {
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
             refresh_reconcile_lock: Mutex::new(()),
+            refresh_coordinator: RefreshCoordinator::default(),
+            #[cfg(test)]
+            refresh_request_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            refresh_pass_count: std::sync::atomic::AtomicUsize::new(0),
             continuation_registry,
             #[cfg(test)]
             continuation_insert_gate: std::sync::Mutex::new(None),
@@ -1837,6 +1888,92 @@ impl ToolRouter {
     /// refresh's upstream latency is the max of the three instead of their
     /// sum.
     pub async fn refresh_tools(&self) {
+        let (target_generation, mut leader_generation) = {
+            let mut state = self
+                .refresh_coordinator
+                .state
+                .lock()
+                .expect("refresh coordinator mutex poisoned");
+            match state.running_generation {
+                Some(running_generation) => {
+                    state.trailing_requested = true;
+                    (running_generation + 1, None)
+                }
+                None => {
+                    let generation = state.completed_generation + 1;
+                    state.running_generation = Some(generation);
+                    (generation, Some(generation))
+                }
+            }
+        };
+        #[cfg(test)]
+        self.refresh_request_count.fetch_add(1, Ordering::SeqCst);
+
+        loop {
+            if let Some(generation) = leader_generation.take() {
+                let mut guard = RefreshLeaderGuard {
+                    coordinator: &self.refresh_coordinator,
+                    generation,
+                    armed: true,
+                };
+                self.refresh_tools_once().await;
+
+                let mut state = self
+                    .refresh_coordinator
+                    .state
+                    .lock()
+                    .expect("refresh coordinator mutex poisoned");
+                state.completed_generation = generation;
+                if state.trailing_requested {
+                    state.trailing_requested = false;
+                    let next_generation = generation + 1;
+                    state.running_generation = Some(next_generation);
+                    guard.armed = false;
+                    leader_generation = Some(next_generation);
+                } else {
+                    state.running_generation = None;
+                    guard.armed = false;
+                }
+                drop(state);
+                self.refresh_coordinator.changed.notify_waiters();
+
+                if leader_generation.is_some() {
+                    continue;
+                }
+                return;
+            }
+
+            let changed = self.refresh_coordinator.changed.notified();
+            let wait_action = {
+                let mut state = self
+                    .refresh_coordinator
+                    .state
+                    .lock()
+                    .expect("refresh coordinator mutex poisoned");
+                if state.completed_generation >= target_generation {
+                    None
+                } else if state.running_generation.is_none() {
+                    let generation = state.completed_generation + 1;
+                    state.running_generation = Some(generation);
+                    Some(Some(generation))
+                } else {
+                    Some(None)
+                }
+            };
+            let Some(new_leader) = wait_action else {
+                return;
+            };
+            if let Some(generation) = new_leader {
+                leader_generation = Some(generation);
+                continue;
+            }
+            changed.await;
+        }
+    }
+
+    async fn refresh_tools_once(&self) {
+        #[cfg(test)]
+        self.refresh_pass_count.fetch_add(1, Ordering::SeqCst);
         let upstream_tools = self.server_manager.get_tools().await;
         let (resources_result, resource_templates_result, prompts_result) = tokio::join!(
             self.server_manager.get_resources(),

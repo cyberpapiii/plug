@@ -2627,6 +2627,9 @@ impl SubGate {
 /// subscribe/unsubscribe call logs plus gates.
 struct SubscribableUpstreamState {
     resources: std::sync::Mutex<Vec<String>>,
+    list_calls: std::sync::atomic::AtomicUsize,
+    list_gate: std::sync::Mutex<Option<Arc<SubGate>>>,
+    list_entered: tokio::sync::Notify,
     subscribe_log: std::sync::Mutex<Vec<String>>,
     unsubscribe_log: std::sync::Mutex<Vec<String>>,
     subscribe_gates: std::sync::Mutex<HashMap<String, Arc<SubGate>>>,
@@ -2645,6 +2648,9 @@ impl SubscribableUpstreamState {
     fn new(resources: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             resources: std::sync::Mutex::new(resources.iter().map(|uri| uri.to_string()).collect()),
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+            list_gate: std::sync::Mutex::new(None),
+            list_entered: tokio::sync::Notify::new(),
             subscribe_log: std::sync::Mutex::new(Vec::new()),
             unsubscribe_log: std::sync::Mutex::new(Vec::new()),
             subscribe_gates: std::sync::Mutex::new(HashMap::new()),
@@ -2662,6 +2668,20 @@ impl SubscribableUpstreamState {
 
     fn set_resources(&self, resources: &[&str]) {
         *self.resources.lock().unwrap() = resources.iter().map(|uri| uri.to_string()).collect();
+    }
+
+    fn close_list_gate(&self) -> Arc<SubGate> {
+        let gate = SubGate::new_closed();
+        *self.list_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn clear_list_gate(&self) {
+        self.list_gate.lock().unwrap().take();
+    }
+
+    fn list_count(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
     }
 
     /// All subsequent `resources/subscribe` calls for `uri` park until the
@@ -2737,12 +2757,20 @@ impl ServerHandler for SubscribableUpstreamHandler {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        self.state.list_calls.fetch_add(1, Ordering::SeqCst);
         let uris = self.state.resources.lock().unwrap().clone();
-        std::future::ready(Ok(ListResourcesResult::with_all_items(
-            uris.iter()
-                .map(|uri| Resource::new(uri.as_str(), uri.as_str()))
-                .collect(),
-        )))
+        let gate = self.state.list_gate.lock().unwrap().clone();
+        self.state.list_entered.notify_waiters();
+        async move {
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            Ok(ListResourcesResult::with_all_items(
+                uris.iter()
+                    .map(|uri| Resource::new(uri.as_str(), uri.as_str()))
+                    .collect(),
+            ))
+        }
     }
 
     fn subscribe(
@@ -2981,6 +3009,120 @@ fn sub_target(id: &str) -> NotificationTarget {
     NotificationTarget::Stdio {
         client_id: Arc::from(id),
     }
+}
+
+#[tokio::test]
+async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&["memory://old"]);
+    sm.replace_server(
+        "mock",
+        connect_subscribable_upstream("mock", Arc::clone(&state)).await,
+    )
+    .await;
+    router.refresh_tools().await;
+    assert_eq!(state.list_count(), 1);
+
+    let gate = state.close_list_gate();
+    let entered = state.list_entered.notified();
+    let leader_router = Arc::clone(&router);
+    let leader = tokio::spawn(async move { leader_router.refresh_tools().await });
+    entered.await;
+
+    let followers_router = Arc::clone(&router);
+    let followers = tokio::spawn(async move {
+        futures::future::join_all((0..8).map(|_| followers_router.refresh_tools())).await;
+    });
+    for _ in 0..100 {
+        if router.refresh_request_count.load(Ordering::SeqCst) == 10 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(router.refresh_request_count.load(Ordering::SeqCst), 10);
+    assert!(
+        router
+            .refresh_coordinator
+            .state
+            .lock()
+            .unwrap()
+            .trailing_requested,
+        "overlapping callers must request one trailing refresh"
+    );
+
+    state.set_resources(&["memory://new"]);
+    state.clear_list_gate();
+    gate.open();
+    leader.await.unwrap();
+    followers.await.unwrap();
+
+    assert_eq!(router.refresh_request_count.load(Ordering::SeqCst), 10);
+    assert_eq!(router.refresh_pass_count.load(Ordering::SeqCst), 3);
+    assert_eq!(state.list_count(), 3, "initial + active + trailing");
+    assert!(
+        router
+            .list_resources()
+            .iter()
+            .any(|resource| resource.uri == "memory://new"),
+        "trailing pass must publish catalog state newer than active pass"
+    );
+    assert!(
+        !router
+            .list_resources()
+            .iter()
+            .any(|resource| resource.uri == "memory://old")
+    );
+}
+
+#[tokio::test]
+async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let state = SubscribableUpstreamState::new(&["memory://old"]);
+    sm.replace_server(
+        "mock",
+        connect_subscribable_upstream("mock", Arc::clone(&state)).await,
+    )
+    .await;
+    router.refresh_tools().await;
+
+    let gate = state.close_list_gate();
+    let entered = state.list_entered.notified();
+    let leader_router = Arc::clone(&router);
+    let leader = tokio::spawn(async move { leader_router.refresh_tools().await });
+    entered.await;
+
+    let waiter_router = Arc::clone(&router);
+    let waiter = tokio::spawn(async move { waiter_router.refresh_tools().await });
+    for _ in 0..100 {
+        if router
+            .refresh_coordinator
+            .state
+            .lock()
+            .unwrap()
+            .trailing_requested
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+
+    state.set_resources(&["memory://recovered"]);
+    state.clear_list_gate();
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("waiting refresh must recover leadership after cancellation")
+        .unwrap();
+    assert!(
+        router
+            .list_resources()
+            .iter()
+            .any(|resource| resource.uri == "memory://recovered")
+    );
 }
 
 /// Publish a snapshot whose `resource_routes` maps exactly `uri -> server`,
