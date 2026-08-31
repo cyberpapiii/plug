@@ -395,6 +395,16 @@ final class AppModelTests: XCTestCase {
 
     @MainActor
     func testNotificationsStaySilentInitiallyAndDeduplicateTransitions() {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: NotificationService.preferenceKey)
+        defaults.set(true, forKey: NotificationService.preferenceKey)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: NotificationService.preferenceKey)
+            } else {
+                defaults.removeObject(forKey: NotificationService.preferenceKey)
+            }
+        }
         var postedIDs: [String] = []
         let service = NotificationService { id, _, _ in postedIDs.append(id) }
         let empty = makeNotificationSnapshot()
@@ -420,6 +430,25 @@ final class AppModelTests: XCTestCase {
             postedIDs,
             ["upstream-reauth-alpha", "downstream-client-client-1"]
         )
+    }
+
+    @MainActor
+    func testNotificationsRequireExplicitOptIn() {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: NotificationService.preferenceKey)
+        defaults.removeObject(forKey: NotificationService.preferenceKey)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: NotificationService.preferenceKey)
+            }
+        }
+
+        var postedIDs: [String] = []
+        let service = NotificationService { id, _, _ in postedIDs.append(id) }
+        service.observe(makeNotificationSnapshot(authenticated: true))
+        service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
+
+        XCTAssertTrue(postedIDs.isEmpty)
     }
 
     @MainActor

@@ -18,7 +18,9 @@ struct ActivityView: View {
 
     var body: some View {
         Group {
-            if model.activities.isEmpty {
+            if model.isLoadingInitialData {
+                LoadingPage(message: "Loading activity…")
+            } else if model.activities.isEmpty {
                 EmptyPage(
                     title: "Nothing yet",
                     message: "Every tool call made through Plug shows up here.",

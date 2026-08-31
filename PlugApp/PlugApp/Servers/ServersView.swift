@@ -11,7 +11,9 @@ struct ServersView: View {
 
     var body: some View {
         Group {
-            if model.situation.servers.isEmpty {
+            if model.isLoadingInitialData {
+                LoadingPage(message: "Loading servers…")
+            } else if model.situation.servers.isEmpty {
                 EmptyPage(
                     title: "No servers yet",
                     message: "Add one and every AI app connected to Plug can use it right away.",
@@ -47,7 +49,7 @@ struct ServersView: View {
         }
         .inspector(isPresented: inspectorShown) {
             if let selected {
-                ServerDetailView(model: model, server: selected, router: router, run: run)
+                ServerDetailView(model: model, server: selected, run: run)
                     .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
             }
         }
@@ -182,6 +184,6 @@ struct ServerActions: View {
         } else {
             Button("Turn On") { run(.setServerEnabled(server.name, true)) }
         }
-        Button("Edit Settings…") { run(.editServer(server.name)) }
+        Button("Edit Server…") { run(.editServer(server.name)) }
     }
 }

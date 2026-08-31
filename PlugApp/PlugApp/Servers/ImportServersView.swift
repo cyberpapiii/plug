@@ -37,7 +37,7 @@ struct ImportServersView: View {
                         .lineLimit(2)
                 }
                 Spacer(minLength: 0)
-                Button(scan == nil ? "Cancel" : "Done") { dismiss() }
+                Button(scan?.isEmpty == true ? "Done" : "Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 if let scan, !scan.isEmpty {
                     Button(importTitle) { importChosen() }
@@ -60,7 +60,14 @@ struct ImportServersView: View {
     // MARK: - What was found
 
     @ViewBuilder private var content: some View {
-        if let scan {
+        if failure != nil, scan == nil {
+            ContentUnavailableView(
+                "Couldn’t scan other apps",
+                systemImage: "exclamationmark.triangle",
+                description: Text("Try again after checking that their settings files are readable.")
+            )
+            .frame(maxWidth: .infinity, minHeight: 120)
+        } else if let scan {
             if scan.isEmpty {
                 VStack(alignment: .leading, spacing: Metric.tight) {
                     Label("Nothing new to import", systemImage: "checkmark.circle")
@@ -71,7 +78,7 @@ struct ImportServersView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(Metric.regular)
-                .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: Metric.corner))
+                .nativeInsetSurface(AnyShapeStyle(.quaternary.opacity(0.3)))
             } else {
                 found(scan)
             }
@@ -165,7 +172,6 @@ struct ImportServersView: View {
             // wants their servers, not a checklist.
             chosen = Set(result.servers.map(\.id))
         } catch {
-            scan = ImportScan()
             failure = error.localizedDescription
         }
     }

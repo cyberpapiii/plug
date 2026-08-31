@@ -13,6 +13,25 @@ struct SettingsView: View {
     let run: (PlugIntent) -> Void
 
     var body: some View {
+        Group {
+            if #available(macOS 15.0, *) {
+                TabView {
+                    Tab("General", systemImage: "gearshape") { GeneralSettings() }
+                    Tab("Service", systemImage: "bolt.horizontal.circle") {
+                        ServiceSettings(model: model, run: run)
+                    }
+                    Tab("About", systemImage: "info.circle") {
+                        AboutSettings(model: model, run: run)
+                    }
+                }
+            } else {
+                legacyTabs
+            }
+        }
+        .frame(width: 520, height: 460)
+    }
+
+    private var legacyTabs: some View {
         TabView {
             GeneralSettings()
                 .tabItem { Label("General", systemImage: "gearshape") }
@@ -21,7 +40,6 @@ struct SettingsView: View {
             AboutSettings(model: model, run: run)
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 480)
     }
 }
 
@@ -29,7 +47,7 @@ struct SettingsView: View {
 
 private struct GeneralSettings: View {
     @AppStorage("launchAtLogin") private var launchAtLogin = true
-    @AppStorage(NotificationService.preferenceKey) private var notify = true
+    @AppStorage(NotificationService.preferenceKey) private var notify = false
     @State private var loginItemFailed = false
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
 
@@ -59,6 +77,9 @@ private struct GeneralSettings: View {
                 Toggle(isOn: $notify) {
                     Label("Tell me when a server needs attention", systemImage: "bell")
                 }
+                .onChange(of: notify) { _, enabled in
+                    if enabled { NotificationService.shared.requestAuthorization() }
+                }
                 Toggle(isOn: $automaticUpdates) {
                     Label("Check for updates automatically", systemImage: "arrow.down.circle")
                 }
@@ -75,7 +96,6 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(height: 250)
         .task {
             launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
         }
@@ -92,31 +112,24 @@ private struct ServiceSettings: View {
     @State private var checkup: Checkup?
     @State private var checking = false
     @State private var checkupError: String?
-    @State private var restarting = false
-
     var body: some View {
         Form {
             Section {
                 LabeledContent {
-                    Text(model.isHealthy ? "Running" : model.verdict.title)
-                        .foregroundStyle(model.isHealthy ? .primary : .secondary)
+                    Text(serviceStatus)
+                        .foregroundStyle(model.connectionState == .ready ? .primary : .secondary)
                 } label: {
-                    Label("Background service", systemImage: model.menuBarSymbol)
-                        .foregroundStyle(model.verdict.tone.color)
+                    Label("Background service", systemImage: serviceSymbol)
+                        .foregroundStyle(serviceColor)
                 }
 
                 HStack {
                     Button {
-                        restarting = true
                         run(.restartService)
-                        Task {
-                            try? await Task.sleep(for: .seconds(4))
-                            restarting = false
-                        }
                     } label: {
                         Label("Restart", systemImage: "arrow.clockwise")
                     }
-                    .disabled(restarting)
+                    .disabled(model.isRestartingService)
 
                     Button {
                         run(.reloadConfiguration)
@@ -124,7 +137,7 @@ private struct ServiceSettings: View {
                         Label("Reload settings", systemImage: "arrow.triangle.2.circlepath")
                     }
 
-                    if restarting { ProgressView().controlSize(.small) }
+                    if model.isRestartingService { ProgressView().controlSize(.small) }
                     Spacer()
                 }
             } footer: {
@@ -194,7 +207,33 @@ private struct ServiceSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(height: 480)
+    }
+
+    private var serviceStatus: String {
+        switch model.connectionState {
+        case .ready: "Running"
+        case .connecting: "Connecting"
+        case .incompatible: "Update required"
+        case .disconnected: "Not running"
+        }
+    }
+
+    private var serviceSymbol: String {
+        switch model.connectionState {
+        case .ready: "checkmark.circle.fill"
+        case .connecting: "circle.dotted"
+        case .incompatible: "arrow.triangle.2.circlepath"
+        case .disconnected: "xmark.circle.fill"
+        }
+    }
+
+    private var serviceColor: Color {
+        switch model.connectionState {
+        case .ready: .green
+        case .connecting: .secondary
+        case .incompatible: .orange
+        case .disconnected: .red
+        }
     }
 
     private func runCheckup() async {
@@ -278,16 +317,6 @@ private struct AboutSettings: View {
                 } label: {
                     Label("Version", systemImage: "number")
                 }
-                LabeledContent {
-                    Text("\(model.situation.activeServers.count)")
-                } label: {
-                    Label("Servers on", systemImage: "shippingbox")
-                }
-                LabeledContent {
-                    Text("\(model.situation.totalTools)")
-                } label: {
-                    Label("Tools available", systemImage: "wrench.and.screwdriver")
-                }
                 HStack {
                     Button {
                         run(.checkForUpdates)
@@ -296,19 +325,13 @@ private struct AboutSettings: View {
                     }
                     .disabled(!UpdateService.shared.canCheckForUpdates)
                     Spacer()
-                    Button(role: .destructive) {
-                        run(.quit)
-                    } label: {
-                        Label("Quit Plug", systemImage: "power")
-                    }
                 }
             } footer: {
-                Text("Quitting closes the menu bar icon. Your servers keep running, and connected apps keep working.")
+                Text("Plug keeps your MCP servers available to every connected AI app.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(height: 250)
     }
 }

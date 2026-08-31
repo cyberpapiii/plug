@@ -10,6 +10,7 @@ import SwiftUI
 /// belongs here has been moved there.
 struct PlugPopover: View {
     let model: AppModel
+    let section: AppSection
     let run: (PlugIntent) -> Void
 
     private var situation: PlugSituation { model.situation }
@@ -23,17 +24,7 @@ struct PlugPopover: View {
                 .padding(.bottom, Metric.regular)
 
             if !attention.isEmpty {
-                VStack(spacing: Metric.tight) {
-                    ForEach(attention.prefix(3)) { item in
-                        AttentionRow(item: item, run: run)
-                    }
-                    if attention.count > 3 {
-                        Button("Show all \(attention.count)") { run(.openWindow(.servers)) }
-                            .buttonStyle(.link)
-                            .font(.caption)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
+                attentionList
                 .popoverInset()
                 .padding(.bottom, Metric.regular)
             }
@@ -74,9 +65,36 @@ struct PlugPopover: View {
     // MARK: - Servers
 
     /// Only servers meant to be running. Anything switched off is deliberate,
-    /// so it is not news and does not belong in a status panel.
+    /// so it is not news and does not belong in a status panel. Servers already
+    /// shown as problems above are not repeated.
     private var listedServers: [ServerFacts] {
-        situation.activeServers
+        situation.activeServers.filter { !$0.health.needsAttention }
+    }
+
+    @ViewBuilder private var attentionList: some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: Metric.tight) { attentionContent }
+        } else {
+            attentionContent
+        }
+#else
+        attentionContent
+#endif
+    }
+
+    private var attentionContent: some View {
+        VStack(spacing: Metric.tight) {
+            ForEach(attention.prefix(3)) { item in
+                AttentionRow(item: item, run: run)
+            }
+            if attention.count > 3 {
+                Button("Show all \(attention.count)") { run(.openWindow(.servers)) }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
     }
 
     private var serverList: some View {
@@ -117,7 +135,19 @@ struct PlugPopover: View {
 
     // MARK: - Footer
 
-    private var footer: some View {
+    @ViewBuilder private var footer: some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: Metric.tight) { footerControls }
+        } else {
+            footerControls
+        }
+#else
+        footerControls
+#endif
+    }
+
+    private var footerControls: some View {
         HStack(spacing: Metric.tight) {
             Button { run(.addServer) } label: {
                 Label("Add Server", systemImage: "plus")
@@ -128,7 +158,7 @@ struct PlugPopover: View {
             .fixedSize()
             .help("Add a server")
 
-            Button { run(.openWindow(.servers)) } label: {
+            Button { run(.openWindow(section)) } label: {
                 Label("Open Plug", systemImage: "macwindow")
                     .font(.callout)
             }
@@ -139,29 +169,23 @@ struct PlugPopover: View {
 
             Spacer(minLength: 0)
 
-            // Settings and Quit are what people look for in a menu bar app, so
-            // they are visible controls rather than entries inside a menu. Both
-            // are icon-only: the picture is the label, and the tooltip and the
-            // accessibility label carry the words.
-            SettingsLink {
-                Image(systemName: "gearshape")
-                    .font(.callout)
+            Menu {
+                SettingsLink {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+                Divider()
+                Button { run(.quit) } label: {
+                    Label("Quit Plug", systemImage: "power")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.callout.weight(.semibold))
             }
             .nativeGlassButton()
             .controlSize(.small)
             .fixedSize()
-            .help("Settings")
-            .accessibilityLabel("Settings")
-
-            Button { run(.quit) } label: {
-                Image(systemName: "power")
-                    .font(.callout)
-            }
-            .nativeGlassButton()
-            .controlSize(.small)
-            .fixedSize()
-            .help("Quit Plug. Your servers keep running.")
-            .accessibilityLabel("Quit Plug")
+            .help("More")
+            .accessibilityLabel("More")
         }
         .padding(.horizontal, Metric.snug)
         .padding(.vertical, Metric.tight)

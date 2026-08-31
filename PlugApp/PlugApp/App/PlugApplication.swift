@@ -4,7 +4,6 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        NotificationService.shared.requestAuthorization()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -24,7 +23,7 @@ struct PlugApplication: App {
         // carries the fix for whatever it just said, so most visits never open
         // a window at all.
         MenuBarExtra {
-            PlugPopover(model: model, run: runner.run)
+            PlugPopover(model: model, section: router.section, run: runner.run)
         } label: {
             // The label is the one view that exists from launch, so the
             // runtime connection starts here rather than in a window that may
@@ -39,10 +38,11 @@ struct PlugApplication: App {
         // auditing who is connected, reading history.
         Window("Plug", id: Self.windowID) {
             RootView(model: model, router: router, run: runner.run)
-                .frame(minWidth: 680, minHeight: 460)
+                .frame(minWidth: 760, minHeight: 500)
                 .task { await model.start() }
         }
-        .defaultSize(width: 820, height: 560)
+        .defaultSize(width: 920, height: 600)
+        .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified)
         .commands {
             // Plug refreshes itself, so a refresh button would be visual weight

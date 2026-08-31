@@ -11,10 +11,21 @@ struct ConnectionsView: View {
 
     private var sessions: [LiveSession] { model.snapshot.liveSessions }
     private var grants: [DownstreamClient] { model.snapshot.downstreamClients }
+    private var apps: [LinkableApp] {
+        model.connectableApps.filter { $0.detected || $0.linked || $0.live }
+    }
+    private var unmatchedSessions: [LiveSession] {
+        sessions.filter { session in
+            let target = AppIcons.target(forClientType: session.clientType)
+            return !apps.contains { $0.target == target }
+        }
+    }
 
     var body: some View {
         Group {
-            if sessions.isEmpty && grants.isEmpty && model.connectableApps.isEmpty {
+            if model.isLoadingInitialData || !model.hasLoadedConnectableApps {
+                LoadingPage(message: "Loading connections…")
+            } else if unmatchedSessions.isEmpty && grants.isEmpty && apps.isEmpty {
                 EmptyPage(
                     title: "Nothing is connected",
                     message: "When an AI app connects through Plug it shows up here, along with everything it can reach.",
@@ -22,9 +33,9 @@ struct ConnectionsView: View {
                 )
             } else {
                 List {
-                    if !model.connectableApps.isEmpty {
+                    if !apps.isEmpty {
                         Section {
-                            ForEach(model.connectableApps) { app in
+                            ForEach(apps) { app in
                                 AppLinkRow(
                                     app: app,
                                     isBusy: model.busyApps.contains(app.target),
@@ -32,16 +43,16 @@ struct ConnectionsView: View {
                                 )
                             }
                         } header: {
-                            Text("Apps on this Mac")
+                            Text("Apps")
                         } footer: {
                             Text("Turning an app on writes Plug into its settings. It picks up the change the next time it starts.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    if !sessions.isEmpty {
-                        Section("Connected now") {
-                            ForEach(sessions) { session in
+                    if !unmatchedSessions.isEmpty {
+                        Section("Other connections") {
+                            ForEach(unmatchedSessions) { session in
                                 sessionRow(session)
                             }
                         }
@@ -65,8 +76,6 @@ struct ConnectionsView: View {
         }
         .navigationTitle("Connections")
         .task { await model.loadConnectableApps() }
-        .onAppear { model.setWatching(true) }
-        .onDisappear { model.setWatching(false) }
     }
 
     private func sessionRow(_ session: LiveSession) -> some View {
@@ -117,9 +126,10 @@ struct ConnectionsView: View {
     }
 
     private func toolsText(_ session: LiveSession) -> String {
-        let count = model.snapshot.clientVisibility
-            .first { $0.sessionId == session.sessionId }?
-            .visibleToolCount ?? 0
+        guard let count = model.snapshot.clientVisibility
+            .first(where: { $0.sessionId == session.sessionId })?
+            .visibleToolCount
+        else { return "—" }
         return count == 1 ? "1 tool" : "\(count) tools"
     }
 }

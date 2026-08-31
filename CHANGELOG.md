@@ -7,6 +7,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Plug's app and menu bar interface now use a quieter native macOS structure:
+  a real sidebar replaces the crowded title-bar picker, related Liquid Glass
+  controls share containers, window sizing is stable, and redundant status,
+  connection, settings, and inspector controls have been consolidated.
+- Initial loading, notification permission, service restart, connection counts,
+  and empty states now reflect real app state instead of showing premature,
+  duplicated, or simulated feedback. The development launcher also preserves
+  bundle versions and no longer requests duplicate app instances.
+
 ### Fixed
 
 - Opening Plug on a healthy Mac no longer claims it is installing itself. Every

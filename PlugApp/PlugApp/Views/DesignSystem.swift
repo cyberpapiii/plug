@@ -273,23 +273,6 @@ struct QuietRowButtonStyle: ButtonStyle {
     }
 }
 
-/// A square, quiet button for a control whose icon is the label.
-struct QuietIconButtonStyle: ButtonStyle {
-    @State private var hovering = false
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .foregroundStyle(.secondary)
-            .frame(width: 26, height: 24)
-            .background(
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : (hovering ? 0.07 : 0)))
-            )
-            .contentShape(Rectangle())
-            .onHover { hovering = $0 }
-    }
-}
-
 extension View {
     /// Standard inset for popover content blocks.
     func popoverInset() -> some View {
@@ -302,7 +285,7 @@ extension View {
     func nativeGlassSurface(tint: Color? = nil) -> some View {
 #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
-            glassEffect(.regular.tint(tint), in: .rect(cornerRadius: Metric.corner))
+            glassEffect(.regular.tint(tint), in: ContainerRelativeShape())
         } else {
             background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
         }
@@ -323,6 +306,20 @@ extension View {
         }
 #else
         buttonStyle(.bordered)
+#endif
+    }
+
+    /// Quiet content cards follow the window's corner geometry on macOS 26.
+    @ViewBuilder
+    func nativeInsetSurface(_ fill: AnyShapeStyle) -> some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            background(fill, in: ContainerRelativeShape())
+        } else {
+            background(fill, in: RoundedRectangle(cornerRadius: Metric.corner))
+        }
+#else
+        background(fill, in: RoundedRectangle(cornerRadius: Metric.corner))
 #endif
     }
 }
