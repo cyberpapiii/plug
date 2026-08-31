@@ -45,6 +45,11 @@ const MAX_ACCESS_TOKENS_PER_CLIENT: usize = 10;
 const MAX_REGISTRATION_RATE_KEYS: usize = 10_000;
 const MAX_METADATA_DOCUMENT_BYTES: usize = 64 * 1024;
 const PARENT_DIR_SYNC_ATTEMPTS: usize = 3;
+/// Attempts to take the issuer state lock, spread over
+/// [`STATE_LOCK_RETRY_INTERVAL`]. Long enough to outlast a departing writer's
+/// close, short enough that a genuinely occupied lock still fails startup fast.
+const STATE_LOCK_ATTEMPTS: usize = 10;
+const STATE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CURSOR_NATIVE_REDIRECT: &str = "cursor://anysphere.cursor-mcp/oauth/callback";
 
 #[derive(Debug, Clone)]
@@ -2793,13 +2798,34 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
     #[cfg(unix)]
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    fs4::FileExt::try_lock(&file).map_err(|error| {
-        DownstreamOauthError::Persistence(format!(
-            "downstream OAuth issuer state writer is already active for {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(file)
+    // A restart that races the previous writer's exit is not a second writer.
+    // The old process can still be closing its descriptor when the new one asks,
+    // and refusing there turns an ordinary daemon restart into a startup failure
+    // that only a second restart clears. A live writer still holds the lock well
+    // past this window, so the guard keeps its meaning.
+    for attempt in 0..STATE_LOCK_ATTEMPTS {
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Ok(file),
+            // An I/O error will not resolve itself by waiting.
+            Err(error @ fs4::TryLockError::Error(_)) => {
+                return Err(lock_held_error(path, &error));
+            }
+            Err(error @ fs4::TryLockError::WouldBlock) => {
+                if attempt + 1 == STATE_LOCK_ATTEMPTS {
+                    return Err(lock_held_error(path, &error));
+                }
+            }
+        }
+        std::thread::sleep(STATE_LOCK_RETRY_INTERVAL);
+    }
+    Err(lock_held_error(path, &fs4::TryLockError::WouldBlock))
+}
+
+fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> DownstreamOauthError {
+    DownstreamOauthError::Persistence(format!(
+        "downstream OAuth issuer state writer is already active for {}: {error}",
+        path.display()
+    ))
 }
 
 fn sync_parent_dir_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
@@ -5403,6 +5429,22 @@ mod tests {
         drop(first);
         DownstreamOauthManager::new_with_state_path(test_config(), path)
             .expect("writer lock is released with manager");
+    }
+
+    #[test]
+    fn a_departing_writer_hands_the_lock_over_instead_of_failing_the_restart() {
+        let path = temp_state_path();
+        let outgoing = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
+            .expect("first writer acquires issuer lock");
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(STATE_LOCK_RETRY_INTERVAL * 2);
+            drop(outgoing);
+        });
+
+        DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("a restart waits out the previous writer's close");
+        release.join().expect("the outgoing writer thread finishes");
     }
 
     #[tokio::test]
