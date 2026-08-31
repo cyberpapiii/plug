@@ -513,14 +513,22 @@ struct ClientToolLimit {
 ///   versions use Dynamic Context Discovery and publish no ceiling;
 ///   <https://cursor.com/docs/context/mcp> states no limit.
 /// - **Claude Code, Codex CLI.** No published ceiling.
+/// - **Devin Local**, the agent that replaced Cascade as the Devin Desktop
+///   default. It configures MCP through the Devin CLI rather than the Cascade
+///   config plug writes, and publishes no ceiling;
+///   <https://docs.devin.ai/cli/extensibility/mcp/configuration> (2026-08-30).
 const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[
     ClientToolLimit {
-        client: "Windsurf",
+        client: "Cascade (Devin Desktop, formerly Windsurf)",
+        // The export target keeps the Windsurf name because the file it writes
+        // still does: ~/.codeium/windsurf/mcp_config.json is Cascade's own
+        // config, which is what makes this the right ceiling to raise for it.
         target: "windsurf",
         limit: 100,
         verified: "2026-08-30",
         // "Cascade has a limit of 100 total tools that it has access to at any
-        // given time." (docs.windsurf.com now redirects here.)
+        // given time." Cognition acquired Windsurf, so docs.windsurf.com now
+        // redirects here and the page calls Cascade the legacy agent.
         source: "https://docs.devin.ai/desktop/cascade/mcp",
     },
     ClientToolLimit {
