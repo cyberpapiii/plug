@@ -91,7 +91,7 @@ step() {
 
 if [[ "$rust" == true ]]; then
   step "cargo fmt" cargo fmt --check
-  step "cargo clippy" cargo clippy --workspace --all-targets -- -D warnings
+  step "cargo clippy" env -u RUSTFLAGS cargo clippy --workspace --all-targets -- -D warnings
   [[ "$quick" == true ]] || step "cargo test" cargo test --workspace
 fi
 
