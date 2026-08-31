@@ -484,6 +484,9 @@ async fn check_tool_collisions(config: &Config) -> CheckResult {
 /// A published ceiling on how many MCP tools one client will accept at once.
 struct ClientToolLimit {
     client: &'static str,
+    /// `ExportTarget` name, so the ceiling is only raised for a client that is
+    /// actually pointed at plug.
+    target: &'static str,
     limit: usize,
     /// Date this entry was last checked against `source`, `YYYY-MM-DD`.
     verified: &'static str,
@@ -513,71 +516,125 @@ struct ClientToolLimit {
 const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[
     ClientToolLimit {
         client: "Windsurf",
+        target: "windsurf",
         limit: 100,
-        verified: "2026-08-08",
+        verified: "2026-08-30",
         // "Cascade has a limit of 100 total tools that it has access to at any
         // given time." (docs.windsurf.com now redirects here.)
         source: "https://docs.devin.ai/desktop/cascade/mcp",
     },
     ClientToolLimit {
         client: "VS Code Copilot",
+        target: "vscode",
         limit: 128,
-        verified: "2026-08-08",
+        verified: "2026-08-30",
         // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
         // itself caps at 128, and extra tools are deferred behind `activate_*` stubs.
         source: "https://github.com/microsoft/vscode/issues/290356",
     },
 ];
 
-/// Tools per server assumed when estimating a total from config alone.
+/// Number of plug entries a client config file declares.
 ///
-/// A blunt guess, and often a large undercount — this check runs against config
-/// without connecting to anything, so it cannot see that one stdio server might
-/// expose 118 tools by itself. Treat a pass as "no obvious problem", never as
-/// "measured and fine"; `plug status` reports the real total.
-const ASSUMED_TOOLS_PER_SERVER: usize = 10;
+/// More than one is a duplicate to repair; at least one means the client is
+/// pointed at plug. Shared so both readings come from the same parse.
+fn plug_entry_count(content: &str, extension: Option<&str>) -> usize {
+    match extension {
+        Some("toml") => content
+            .lines()
+            .filter(|l| l.trim() == "[mcp_servers.plug]")
+            .count(),
+        // Goose keys its extensions by name.
+        Some("yaml") | Some("yml") => content.lines().filter(|l| l.trim() == "plug:").count(),
+        _ => {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+                return 0;
+            };
+            let mut count = 0;
+            for key in ["mcpServers", "context_servers"] {
+                if json.get(key).and_then(|v| v.get("plug")).is_some() {
+                    count += 1;
+                }
+            }
+            for path in [["mcp", "servers"], ["tools", "mcpServers"]] {
+                if json
+                    .get(path[0])
+                    .and_then(|v| v.get(path[1]))
+                    .and_then(|s| s.get("plug"))
+                    .is_some()
+                {
+                    count += 1;
+                }
+            }
+            count
+        }
+    }
+}
 
-/// Check 7: warn if total tool count might exceed known client limits.
-async fn check_client_limits(config: &Config) -> CheckResult {
+/// Whether `target`'s own config points at plug, globally or per project.
+fn client_is_linked_to_plug(target: &str) -> bool {
+    let Ok(target_enum) = target.parse::<crate::export::ExportTarget>() else {
+        return false;
+    };
+    [
+        crate::export::default_config_path(target_enum, false),
+        crate::export::default_config_path(target_enum, true),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|path| {
+        std::fs::read_to_string(&path).is_ok_and(|content| {
+            plug_entry_count(&content, path.extension().and_then(|e| e.to_str())) > 0
+        })
+    })
+}
+
+/// Check 7: report published tool ceilings for the clients actually using plug.
+///
+/// Doctor never starts a server, so it cannot know how many tools plug merges.
+/// This check used to multiply the enabled-server count by an assumed ten tools
+/// each and warn when that product cleared a ceiling, which is wrong in both
+/// directions: thirteen small servers invented 130 tools and warned, while four
+/// large ones hid a real 600. The one thing doctor can read from disk is which
+/// clients are pointed at plug, so that is what it reports. The real total is
+/// `plug status`, which counts tools the servers actually returned.
+async fn check_client_limits(_config: &Config) -> CheckResult {
     let name = "client_limits".to_string();
-    let server_count = config.servers.values().filter(|s| s.enabled).count();
 
-    let estimated_tools = server_count * ASSUMED_TOOLS_PER_SERVER;
-    let warnings: Vec<String> = KNOWN_CLIENT_TOOL_LIMITS
+    let linked: Vec<&ClientToolLimit> = KNOWN_CLIENT_TOOL_LIMITS
         .iter()
-        .filter(|entry| estimated_tools > entry.limit)
+        .filter(|entry| client_is_linked_to_plug(entry.target))
+        .collect();
+
+    if linked.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "No linked client publishes a tool-count ceiling".to_string(),
+            fix_suggestion: None,
+        };
+    }
+
+    let ceilings: Vec<String> = linked
+        .iter()
         .map(|entry| {
             // Printing the source alongside the number is the whole
             // anti-rot mechanism: a reader who doubts the figure can check it
             // without going and finding this table first.
             format!(
-                "{} limit is {} tools (verified {}, {})",
+                "{} caps at {} tools (verified {}, {})",
                 entry.client, entry.limit, entry.verified, entry.source
             )
         })
         .collect();
 
-    if warnings.is_empty() {
-        CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: format!(
-                "{server_count} servers configured — no known client limit exceeded by the ~{estimated_tools}-tool estimate"
-            ),
-            fix_suggestion: None,
-        }
-    } else {
-        CheckResult {
-            name,
-            status: CheckStatus::Warn,
-            message: format!(
-                "Estimated ~{estimated_tools} tools from {server_count} servers may exceed: {}",
-                warnings.join("; ")
-            ),
-            fix_suggestion: Some(
-                "Only affects clients with a published ceiling; run `plug status` for the real tool count, and use tool_filter_enabled and priority_tools if a linked client needs fewer".to_string(),
-            ),
-        }
+    CheckResult {
+        name,
+        status: CheckStatus::Warn,
+        message: format!("Linked clients with a tool ceiling: {}", ceilings.join("; ")),
+        fix_suggestion: Some(
+            "Compare against the tool total from `plug status`, and use tool_filter_enabled and priority_tools if a linked client needs fewer".to_string(),
+        ),
     }
 }
 
@@ -882,86 +939,41 @@ async fn check_client_configs() -> CheckResult {
 
             let ext = path.extension().and_then(|e| e.to_str());
 
-            if ext == Some("toml") {
-                // Count occurrences of [mcp_servers.plug]
-                let count = content
-                    .lines()
-                    .filter(|l| l.trim() == "[mcp_servers.plug]")
-                    .count();
-                if count > 1 {
-                    issues.push(format!(
-                        "{} (duplicate entries in {})",
-                        target,
-                        path.display()
-                    ));
-                }
-                // Also check if it's even valid TOML
-                if let Err(e) = validate_toml_document(&content) {
-                    issues.push(format!(
-                        "{} (invalid TOML in {}: {})",
-                        target,
-                        path.display(),
-                        e
-                    ));
-                }
-            } else if ext == Some("yaml") || ext == Some("yml") {
-                // For YAML (Goose), check for duplicate "plug:" keys under extensions
-                let count = content.lines().filter(|l| l.trim() == "plug:").count();
-                if count > 1 {
-                    issues.push(format!(
-                        "{} (duplicate entries in {})",
-                        target,
-                        path.display()
-                    ));
-                }
-                if let Err(e) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                    issues.push(format!(
-                        "{} (invalid YAML in {}: {})",
-                        target,
-                        path.display(),
-                        e
-                    ));
-                }
-            } else {
-                // For JSON, check for multiple "plug" keys in valid MCP locations
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let mut plug_locations = 0;
+            if plug_entry_count(&content, ext) > 1 {
+                issues.push(format!(
+                    "{} (duplicate entries in {})",
+                    target,
+                    path.display()
+                ));
+            }
 
-                    // Location 1: mcpServers / context_servers
-                    for key in ["mcpServers", "context_servers"] {
-                        if json.get(key).and_then(|v| v.get("plug")).is_some() {
-                            plug_locations += 1;
-                        }
-                    }
-                    // Location 2: mcp.servers
-                    if json
-                        .get("mcp")
-                        .and_then(|v| v.get("servers"))
-                        .and_then(|s| s.get("plug"))
-                        .is_some()
-                    {
-                        plug_locations += 1;
-                    }
-                    // Location 3: tools.mcpServers
-                    if json
-                        .get("tools")
-                        .and_then(|v| v.get("mcpServers"))
-                        .and_then(|s| s.get("plug"))
-                        .is_some()
-                    {
-                        plug_locations += 1;
-                    }
-
-                    if plug_locations > 1 {
+            // A file plug cannot parse is worth reporting on its own: a
+            // duplicate hiding inside it would go uncounted above.
+            match ext {
+                Some("toml") => {
+                    if let Err(e) = validate_toml_document(&content) {
                         issues.push(format!(
-                            "{} ({} duplicate plug entries in {})",
+                            "{} (invalid TOML in {}: {})",
                             target,
-                            plug_locations,
-                            path.display()
+                            path.display(),
+                            e
                         ));
                     }
-                } else {
-                    issues.push(format!("{} (invalid JSON in {})", target, path.display()));
+                }
+                Some("yaml") | Some("yml") => {
+                    if let Err(e) = serde_norway::from_str::<serde_norway::Value>(&content) {
+                        issues.push(format!(
+                            "{} (invalid YAML in {}: {})",
+                            target,
+                            path.display(),
+                            e
+                        ));
+                    }
+                }
+                _ => {
+                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                        issues.push(format!("{} (invalid JSON in {})", target, path.display()));
+                    }
                 }
             }
         }
@@ -1745,41 +1757,20 @@ command = "example-server"
     // -- check_client_limits --
 
     #[tokio::test]
-    async fn client_limits_ok_with_few_servers() {
+    async fn client_limits_pass_when_no_capped_client_is_linked() {
+        // The suite does not write client configs, so nothing under
+        // KNOWN_CLIENT_TOOL_LIMITS is linked from this environment.
         let mut config = test_config();
-        config.servers.insert("a".to_string(), stdio_server("echo"));
-        let result = check_client_limits(&config).await;
-        assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[tokio::test]
-    async fn client_limits_warns_only_past_the_lowest_published_ceiling() {
-        let lowest = KNOWN_CLIENT_TOOL_LIMITS
-            .iter()
-            .map(|entry| entry.limit)
-            .min()
-            .expect("at least one known client limit");
-
-        // Exactly at the lowest ceiling is still fine — the check warns on
-        // strictly exceeding it, not on reaching it.
-        let mut config = test_config();
-        for i in 0..(lowest / ASSUMED_TOOLS_PER_SERVER) {
+        for i in 0..50 {
             config
                 .servers
                 .insert(format!("server_{i}"), stdio_server("echo"));
         }
-        assert_eq!(check_client_limits(&config).await.status, CheckStatus::Pass);
-
-        config
-            .servers
-            .insert("one_more".to_string(), stdio_server("echo"));
         let result = check_client_limits(&config).await;
-        assert_eq!(result.status, CheckStatus::Warn);
-        assert!(
-            KNOWN_CLIENT_TOOL_LIMITS
-                .iter()
-                .any(|entry| result.message.contains(entry.client)),
-            "warning should name the client it applies to: {}",
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "server count must not decide this check: {}",
             result.message
         );
     }
@@ -1802,7 +1793,46 @@ command = "example-server"
                 entry.verified
             );
             assert!(entry.limit > 0, "{} has a meaningless limit", entry.client);
+            assert!(
+                entry.target.parse::<crate::export::ExportTarget>().is_ok(),
+                "{} names an export target that does not exist: {}",
+                entry.client,
+                entry.target
+            );
         }
+    }
+
+    #[test]
+    fn plug_entry_count_reads_every_supported_client_layout() {
+        assert_eq!(
+            plug_entry_count("[mcp_servers.plug]\ncommand = \"plug\"\n", Some("toml")),
+            1
+        );
+        assert_eq!(plug_entry_count("extensions:\n  plug:\n", Some("yaml")), 1);
+        assert_eq!(
+            plug_entry_count(r#"{"mcpServers":{"plug":{}}}"#, Some("json")),
+            1
+        );
+        assert_eq!(
+            plug_entry_count(r#"{"mcp":{"servers":{"plug":{}}}}"#, Some("json")),
+            1
+        );
+        assert_eq!(
+            plug_entry_count(r#"{"tools":{"mcpServers":{"plug":{}}}}"#, Some("json")),
+            1
+        );
+
+        // Two locations in one file is the duplicate `plug repair` cleans up.
+        assert_eq!(
+            plug_entry_count(
+                r#"{"mcpServers":{"plug":{}},"mcp":{"servers":{"plug":{}}}}"#,
+                Some("json")
+            ),
+            2
+        );
+
+        assert_eq!(plug_entry_count(r#"{"mcpServers":{"other":{}}}"#, None), 0);
+        assert_eq!(plug_entry_count("not json at all", Some("json")), 0);
     }
 
     // -- check_pid_staleness --

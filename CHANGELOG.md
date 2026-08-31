@@ -5,6 +5,21 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `plug doctor`'s `client_limits` check no longer guesses a tool count. It used
+  to multiply the enabled-server count by an assumed ten tools each and warn
+  whenever that product cleared a published client ceiling, which is wrong in
+  both directions: thirteen small servers invented 130 tools and warned, while
+  four large ones could hide a real 600 and pass. Doctor never starts a server,
+  so it cannot know the total; what it can read from disk is which clients are
+  pointed at plug. The check now reports a ceiling only for a client that is
+  actually linked, and points at `plug status` for the real count. Windsurf (100)
+  and VS Code Copilot (128) were both re-verified against their documentation on
+  2026-08-30 and still stand.
+
 ## [0.8.5] - 2026-08-30
 
 ### Fixed
