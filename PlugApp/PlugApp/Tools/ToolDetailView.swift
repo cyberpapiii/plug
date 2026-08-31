@@ -8,7 +8,6 @@ struct ToolDetailView: View {
     let tool: ToolFacts
     let catalog: ToolCatalog
     let canManage: Bool
-    @Bindable var router: Router
     let run: (PlugIntent) -> Void
 
     var body: some View {
@@ -39,13 +38,6 @@ struct ToolDetailView: View {
                 Text(tool.server).font(.callout).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            Button {
-                router.selectedTool = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Close details")
         }
     }
 
@@ -77,9 +69,8 @@ struct ToolDetailView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Metric.regular)
-        .background(
+        .nativeInsetSurface(
             tool.isOn ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.orange.opacity(0.1)),
-            in: RoundedRectangle(cornerRadius: Metric.corner)
         )
     }
 

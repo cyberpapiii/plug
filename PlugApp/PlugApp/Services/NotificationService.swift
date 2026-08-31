@@ -45,10 +45,10 @@ final class NotificationService {
         }
     }
 
-    /// Notifications are the one thing Plug does that interrupts. Settings can
-    /// switch them off, and the default is on.
+    /// Notifications interrupt, so they remain off until the person explicitly
+    /// asks for them in Settings.
     private var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: NotificationService.preferenceKey) as? Bool ?? true
+        UserDefaults.standard.object(forKey: NotificationService.preferenceKey) as? Bool ?? false
     }
 
     static let preferenceKey = "notificationsEnabled"

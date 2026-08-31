@@ -25,7 +25,9 @@ struct ToolsView: View {
 
     var body: some View {
         Group {
-            if model.toolCatalog.isEmpty {
+            if model.isLoadingInitialData {
+                LoadingPage(message: "Loading tools…")
+            } else if model.toolCatalog.isEmpty {
                 EmptyPage(
                     title: "No tools yet",
                     message: "Tools appear here once a server is running.",
@@ -33,9 +35,11 @@ struct ToolsView: View {
                 )
             } else if groups.isEmpty {
                 EmptyPage(
-                    title: "Nothing matches",
-                    message: "No tool matches “\(query)”.",
-                    symbol: "magnifyingglass"
+                    title: emptyTitle,
+                    message: emptyMessage,
+                    symbol: query.trimmingCharacters(in: .whitespaces).isEmpty
+                        ? "checkmark.circle"
+                        : "magnifyingglass"
                 )
             } else {
                 List(selection: $router.selectedTool) {
@@ -58,7 +62,6 @@ struct ToolsView: View {
                     tool: selected,
                     catalog: model.toolCatalog,
                     canManage: model.canManageTools,
-                    router: router,
                     run: run
                 )
                 .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
@@ -75,8 +78,19 @@ struct ToolsView: View {
                 .frame(width: 160)
             }
         }
-        .onAppear { model.setWatching(true) }
-        .onDisappear { model.setWatching(false) }
+    }
+
+    private var emptyTitle: String {
+        query.trimmingCharacters(in: .whitespaces).isEmpty && showsOffOnly
+            ? "Every tool is on"
+            : "Nothing matches"
+    }
+
+    private var emptyMessage: String {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty
+            ? "No tools are switched off."
+            : "No tool matches “\(trimmed)”."
     }
 
     /// Same rule as the server list: the inspector is open exactly when

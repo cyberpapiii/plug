@@ -87,13 +87,14 @@ struct PlugIntentRunner {
         case .openSettings:
             NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
         case .restartService:
-            // The sanctioned restart: connectors are paused, the service is
-            // kickstarted, and the app never signals the process itself.
+            guard model.beginServiceRestart() else { return }
             Task {
                 do {
                     try await DaemonServiceManager.shared.restart()
+                    model.finishServiceRestart()
                     await model.refresh()
                 } catch {
+                    model.finishServiceRestart(error: error)
                     await model.retryConnection()
                 }
             }

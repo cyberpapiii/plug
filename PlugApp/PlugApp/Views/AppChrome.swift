@@ -12,8 +12,23 @@ struct ErrorToast: View {
             .padding(.horizontal, Metric.regular)
             .padding(.vertical, Metric.snug)
             .nativeGlassSurface(tint: .red.opacity(0.08))
-            .shadow(radius: 8, y: 2)
             .padding()
+    }
+}
+
+struct LoadingPage: View {
+    let message: String
+
+    var body: some View {
+        VStack(spacing: Metric.snug) {
+            ProgressView()
+                .controlSize(.small)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -31,15 +46,19 @@ struct EmptyPage: View {
 
     var body: some View {
         VStack(spacing: Metric.snug) {
-            Image(systemName: symbol)
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.tertiary)
-            Text(title).font(.title3.weight(.medium))
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
+            VStack(spacing: Metric.snug) {
+                Image(systemName: symbol)
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+                Text(title).font(.title3.weight(.medium))
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 320)
+            }
+            .accessibilityElement(children: .combine)
             if actionTitle != nil || secondaryTitle != nil {
                 HStack(spacing: Metric.snug) {
                     if let actionTitle, let actionIntent {
@@ -54,6 +73,5 @@ struct EmptyPage: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .combine)
     }
 }
