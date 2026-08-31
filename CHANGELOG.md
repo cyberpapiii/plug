@@ -5,6 +5,17 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Opening Plug on a healthy Mac no longer claims it is installing itself. Every
+  launch begins by reading the installation, and that phase was sharing its
+  words with the phases that actually change it, so the menu bar greeted a
+  working install with "Setting up… Finishing installation." The reading phase
+  now says "Checking Plug… Making sure everything is in place." and only the
+  phases that repair, replace, or clean up call themselves setup.
+
 ## [0.8.8] - 2026-08-31
 
 ### Fixed
