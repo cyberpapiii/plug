@@ -7,7 +7,9 @@ use std::time::Instant;
 use plug_core::config::{Config, ServerConfig, TransportType};
 use plug_core::engine::Engine;
 
-const BURST_SIZE: usize = 8;
+const REPRESENTATIVE_BURST: usize = 8;
+const WORST_CASE_BURST: usize = 32;
+const SUSTAINED_ROUNDS: usize = 10;
 
 fn mock_server_config(request_log: &std::path::Path) -> ServerConfig {
     ServerConfig {
@@ -65,40 +67,32 @@ async fn catalog_refresh_burst_measurement() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    std::fs::write(&request_log, "").expect("clear startup request log");
     let router = Arc::clone(engine.tool_router());
-    let started = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..BURST_SIZE {
-        let router = Arc::clone(&router);
-        tasks.spawn(async move { router.refresh_tools().await });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.expect("refresh task");
-    }
-    let burst_wall_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-    let log = std::fs::read_to_string(&request_log).expect("read request log");
-    let resource_calls = log.lines().filter(|line| *line == "resources/list").count();
-    let template_calls = log
-        .lines()
-        .filter(|line| *line == "resources/templates/list")
-        .count();
-    let prompt_calls = log.lines().filter(|line| *line == "prompts/list").count();
-    let family_calls = resource_calls + template_calls + prompt_calls;
+    let representative = run_scenario(&router, &request_log, REPRESENTATIVE_BURST, 1).await;
+    let worst_case = run_scenario(&router, &request_log, WORST_CASE_BURST, 1).await;
+    let sustained = run_scenario(
+        &router,
+        &request_log,
+        REPRESENTATIVE_BURST,
+        SUSTAINED_ROUNDS,
+    )
+    .await;
     let catalog_correct = router.list_resources().len() == 1
         && router.list_resource_templates().len() == 1
         && router.list_prompts().len() == 1;
 
     let result = serde_json::json!({
-        "family_calls": family_calls,
-        "burst_wall_ms": burst_wall_ms,
+        "representative_family_calls": representative.family_calls,
+        "worst_family_calls": worst_case.family_calls,
+        "sustained_family_calls": sustained.family_calls,
+        "representative_wall_ms": representative.wall_ms,
+        "worst_wall_ms": worst_case.wall_ms,
+        "sustained_wall_ms": sustained.wall_ms,
         "probe_passed": 1,
         "catalog_correct": usize::from(catalog_correct),
-        "resource_calls": resource_calls,
-        "template_calls": template_calls,
-        "prompt_calls": prompt_calls,
-        "burst_size": BURST_SIZE,
+        "representative_burst_size": REPRESENTATIVE_BURST,
+        "worst_burst_size": WORST_CASE_BURST,
+        "sustained_rounds": SUSTAINED_ROUNDS,
     });
     std::fs::write(
         result_path,
@@ -107,4 +101,44 @@ async fn catalog_refresh_burst_measurement() {
     .expect("write result");
 
     engine.shutdown().await;
+}
+
+struct ScenarioResult {
+    family_calls: usize,
+    wall_ms: f64,
+}
+
+async fn run_scenario(
+    router: &Arc<plug_core::proxy::ToolRouter>,
+    request_log: &std::path::Path,
+    burst_size: usize,
+    rounds: usize,
+) -> ScenarioResult {
+    std::fs::write(request_log, "").expect("clear request log");
+    let started = Instant::now();
+    for _ in 0..rounds {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..burst_size {
+            let router = Arc::clone(router);
+            tasks.spawn(async move { router.refresh_tools().await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.expect("refresh task");
+        }
+    }
+    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let family_calls = std::fs::read_to_string(request_log)
+        .expect("read request log")
+        .lines()
+        .filter(|line| {
+            matches!(
+                *line,
+                "resources/list" | "resources/templates/list" | "prompts/list"
+            )
+        })
+        .count();
+    ScenarioResult {
+        family_calls,
+        wall_ms,
+    }
 }
