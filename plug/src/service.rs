@@ -75,35 +75,44 @@ fn cli_plist_path() -> PathBuf {
         .join(format!("{LABEL}.plist"))
 }
 
+/// The leftover-path classify table, shared with `LegacyPlugProgram` in
+/// Plug.app. `testdata/legacy_plug_programs.json` pins the table itself as well
+/// as the cases, so a shape added to one language without the other fails a
+/// test on both sides.
+const LEGACY_EXACT_PROGRAMS: [&str; 4] = [
+    "/opt/homebrew/bin/plug",
+    "/usr/local/bin/plug",
+    "/opt/homebrew/opt/plug/bin/plug",
+    "/usr/local/opt/plug/bin/plug",
+];
+const LEGACY_HOME_RELATIVE_PROGRAMS: [&str; 2] = [".cargo/bin/plug", ".local/bin/plug"];
+const LEGACY_CELLAR_ROOTS: [&str; 2] = ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"];
+
 /// Keep in lockstep with `LegacyPlugProgram.isRecognized` in Plug.app.
-/// Both are pinned by `testdata/legacy_plug_programs.json`.
 pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {
     if program.file_name().and_then(|name| name.to_str()) != Some("plug") {
         return false;
     }
-
-    let is_cargo_binary =
-        dirs::home_dir().is_some_and(|home| program == home.join(".cargo/bin/plug"));
-    let is_local_bin = dirs::home_dir().is_some_and(|home| program == home.join(".local/bin/plug"));
-    let is_formula_cellar_binary = [
-        Path::new("/opt/homebrew/Cellar/plug"),
-        Path::new("/usr/local/Cellar/plug"),
-    ]
-    .iter()
-    .any(|prefix| {
-        program.strip_prefix(prefix).is_ok_and(|relative| {
+    if LEGACY_EXACT_PROGRAMS
+        .iter()
+        .any(|candidate| program == Path::new(candidate))
+    {
+        return true;
+    }
+    if dirs::home_dir().is_some_and(|home| {
+        LEGACY_HOME_RELATIVE_PROGRAMS
+            .iter()
+            .any(|suffix| program == home.join(suffix))
+    }) {
+        return true;
+    }
+    // A Cellar binary is a shape, not a path: `<root>/<version>/bin/plug`.
+    LEGACY_CELLAR_ROOTS.iter().any(|root| {
+        program.strip_prefix(root).is_ok_and(|relative| {
             let parts = relative.components().collect::<Vec<_>>();
             parts.len() == 3 && parts[1].as_os_str() == "bin" && parts[2].as_os_str() == "plug"
         })
-    });
-
-    is_cargo_binary
-        || is_local_bin
-        || program == Path::new("/opt/homebrew/bin/plug")
-        || program == Path::new("/usr/local/bin/plug")
-        || program == Path::new("/opt/homebrew/opt/plug/bin/plug")
-        || program == Path::new("/usr/local/opt/plug/bin/plug")
-        || is_formula_cellar_binary
+    })
 }
 
 pub fn classify_launchd_program(
@@ -651,14 +660,37 @@ mod tests {
     fn recognized_legacy_programs_match_shared_fixture() {
         #[derive(serde::Deserialize)]
         struct Fixture {
+            rules: Rules,
             recognized: Vec<String>,
             home_recognized_suffixes: Vec<String>,
             unrecognized: Vec<String>,
         }
 
+        #[derive(serde::Deserialize)]
+        struct Rules {
+            exact: Vec<String>,
+            home_relative: Vec<String>,
+            cellar_roots: Vec<String>,
+        }
+
         let fixture: Fixture =
             serde_json::from_str(include_str!("../../testdata/legacy_plug_programs.json"))
                 .expect("shared leftover-path fixture");
+
+        // The table, not only the cases: a shape added here but not to the
+        // fixture never reaches Plug.app's copy of the same rules.
+        assert_eq!(
+            fixture.rules.exact,
+            LEGACY_EXACT_PROGRAMS.map(str::to_string)
+        );
+        assert_eq!(
+            fixture.rules.home_relative,
+            LEGACY_HOME_RELATIVE_PROGRAMS.map(str::to_string)
+        );
+        assert_eq!(
+            fixture.rules.cellar_roots,
+            LEGACY_CELLAR_ROOTS.map(str::to_string)
+        );
         for path in fixture.recognized {
             assert!(
                 is_recognized_legacy_program(Path::new(&path)),

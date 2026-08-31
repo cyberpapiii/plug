@@ -122,15 +122,26 @@ struct LaunchdJobRecord: Equatable, Sendable {
 }
 
 /// Keep in lockstep with `is_recognized_legacy_program` in `plug/src/service.rs`.
-/// Both are pinned by `testdata/legacy_plug_programs.json`.
+/// `testdata/legacy_plug_programs.json` pins the table itself as well as the
+/// cases, so a shape added to one language without the other fails a test on
+/// both sides.
 enum LegacyPlugProgram {
+    static let exactPaths = [
+        "/opt/homebrew/bin/plug",
+        "/usr/local/bin/plug",
+        "/opt/homebrew/opt/plug/bin/plug",
+        "/usr/local/opt/plug/bin/plug",
+    ]
+    static let homeRelativePaths = [".cargo/bin/plug", ".local/bin/plug"]
+    static let cellarRoots = ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"]
+
     static func isRecognized(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path
         if isHomebrewInstall(path) {
             return true
         }
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
-        return path == "\(home)/.cargo/bin/plug" || path == "\(home)/.local/bin/plug"
+        return homeRelativePaths.contains { path == "\(home)/\($0)" }
     }
 
     static func isHomebrew(_ url: URL) -> Bool {
@@ -138,14 +149,10 @@ enum LegacyPlugProgram {
     }
 
     private static func isHomebrewInstall(_ path: String) -> Bool {
-        path == "/opt/homebrew/bin/plug"
-            || path == "/usr/local/bin/plug"
-            || path == "/opt/homebrew/opt/plug/bin/plug"
-            || path == "/usr/local/opt/plug/bin/plug"
-            || isCellarBinary(path, root: "/opt/homebrew/Cellar/plug")
-            || isCellarBinary(path, root: "/usr/local/Cellar/plug")
+        exactPaths.contains(path) || cellarRoots.contains { isCellarBinary(path, root: $0) }
     }
 
+    /// A Cellar binary is a shape, not a path: `<root>/<version>/bin/plug`.
     private static func isCellarBinary(_ path: String, root: String) -> Bool {
         guard path.hasPrefix(root + "/") else { return false }
         let parts = path.dropFirst(root.count + 1).split(separator: "/")

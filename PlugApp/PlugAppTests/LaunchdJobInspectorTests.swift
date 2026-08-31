@@ -29,6 +29,13 @@ final class LaunchdJobInspectorTests: XCTestCase {
             return XCTFail("missing bundled leftover-path fixture")
         }
         let fixture = try JSONDecoder().decode(LegacyPlugProgramFixture.self, from: Data(contentsOf: url))
+
+        // The table, not only the cases: a shape added here but not to the
+        // fixture never reaches the Rust copy of the same rules.
+        XCTAssertEqual(fixture.rules.exact, LegacyPlugProgram.exactPaths)
+        XCTAssertEqual(fixture.rules.homeRelative, LegacyPlugProgram.homeRelativePaths)
+        XCTAssertEqual(fixture.rules.cellarRoots, LegacyPlugProgram.cellarRoots)
+
         for path in fixture.recognized {
             XCTAssertTrue(
                 LegacyPlugProgram.isRecognized(URL(fileURLWithPath: path)),
@@ -354,11 +361,25 @@ final class LaunchdJobInspectorTests: XCTestCase {
 }
 
 private struct LegacyPlugProgramFixture: Decodable {
+    let rules: Rules
     let recognized: [String]
     let homeRecognizedSuffixes: [String]
     let unrecognized: [String]
 
+    struct Rules: Decodable {
+        let exact: [String]
+        let homeRelative: [String]
+        let cellarRoots: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case exact
+            case homeRelative = "home_relative"
+            case cellarRoots = "cellar_roots"
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
+        case rules
         case recognized
         case homeRecognizedSuffixes = "home_recognized_suffixes"
         case unrecognized

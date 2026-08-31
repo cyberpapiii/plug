@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 priority: p3
 issue_id: "069"
 tags: [macos, codesign, notarization, release, distribution, developer-experience]
@@ -164,3 +164,31 @@ or GUI surface starts shipping.
 
 **Status:** the discovery fix is implemented; the todo stays open only to track the
 rescoped Developer ID question, which is deferred by choice.
+
+## Closed 2026-08-30 — the rescoped Developer ID question is answered
+
+**By:** Claude Opus 5
+
+The retriage left this open only to track Developer ID signing for a quarantined
+artifact, to be revisited "if a `.mcpb`, `.pkg`, or GUI surface starts shipping."
+One did: Plug.app ships as a DMG through a Homebrew cask and Sparkle, and the
+pipeline that builds it signs and notarizes.
+
+Verified on `main` and on this machine:
+
+- `.github/workflows/release.yml:185` runs `scripts/sign-notarize-macos-app.sh`,
+  so signing and notarization happen in CI rather than by hand.
+- `scripts/install-release.sh:64` runs `spctl --assess --type execute` on the
+  staged app and refuses anything Gatekeeper rejects.
+- `spctl --assess -vv /Applications/Plug.app` reports `source=Notarized Developer
+  ID`, `origin=Developer ID Application: Robert Dezendorf (HJF7LN64XX)`, and
+  `codesign -dv --verbose=4` reports `Notarization Ticket=stapled` with the
+  hardened runtime enabled.
+- `/Applications/Plug.app/Contents/Resources/plug` — the binary launchd runs as
+  the daemon and that `plug connect` execs into — carries the same signature, so
+  the Keychain ACL binds to a stable Developer ID rather than a per-build hash.
+
+`cargo install plug-mcp` from crates.io still compiles locally and stays ad-hoc.
+That is unchanged and out of scope by the retriage's own reasoning: `plug
+codesign-setup` is the answer there, and `plug doctor`'s `codesign_identity`
+check still nudges toward it.

@@ -1,4 +1,20 @@
 {
+  "rules": {
+    "exact": [
+      "/opt/homebrew/bin/plug",
+      "/usr/local/bin/plug",
+      "/opt/homebrew/opt/plug/bin/plug",
+      "/usr/local/opt/plug/bin/plug"
+    ],
+    "home_relative": [
+      ".cargo/bin/plug",
+      ".local/bin/plug"
+    ],
+    "cellar_roots": [
+      "/opt/homebrew/Cellar/plug",
+      "/usr/local/Cellar/plug"
+    ]
+  },
   "recognized": [
     "/opt/homebrew/bin/plug",
     "/usr/local/bin/plug",
