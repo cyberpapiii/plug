@@ -3118,6 +3118,8 @@ fn json_response_for_era(
         .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
     if era == crate::protocol::ProtocolEra::Legacy {
         crate::protocol::rewrite_legacy_response(&mut value, false);
+    } else {
+        crate::protocol::rewrite_modern_response(&mut value);
     }
     let body = serde_json::to_vec(&value)
         .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
@@ -3189,7 +3191,11 @@ fn modern_sse_response(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    payloads.push(serde_json::to_string(response_message).map_err(|error| {
+    let mut response_value = serde_json::to_value(response_message).map_err(|error| {
+        HttpError::Internal(format!("failed to serialize SSE response: {error}"))
+    })?;
+    crate::protocol::rewrite_modern_response(&mut response_value);
+    payloads.push(serde_json::to_string(&response_value).map_err(|error| {
         HttpError::Internal(format!("failed to serialize SSE response: {error}"))
     })?);
 
@@ -4258,6 +4264,48 @@ mod tests {
             allowed_value.get("error").is_none(),
             "default-grant token must not be denied logging/setLevel, got {allowed_value}"
         );
+    }
+
+    // A tools/call answer proxied from a `2025-11-25` upstream reaches the
+    // serializer with no `resultType`, because that field did not exist on the
+    // revision the upstream answered on. Plug advertises `2026-07-28`
+    // downstream, where the field is mandatory and the absent-means-complete
+    // bridge no longer applies, so a strict modern client rejects the whole
+    // response unless this seam fills it in.
+    #[test]
+    fn modern_era_completes_a_result_proxied_from_a_legacy_upstream() {
+        let mut proxied =
+            ServerResult::CallToolResult(CallToolResult::success(vec![ContentBlock::text("ok")]));
+        proxied.strip_result_type_for_legacy_peer();
+        let message = ServerJsonRpcMessage::response(proxied, RequestId::Number(1));
+
+        let response =
+            json_response_for_era(&message, crate::protocol::ProtocolEra::Modern).unwrap();
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["result"]["resultType"], "complete");
+        assert_eq!(value["result"]["content"][0]["text"], "ok");
+    }
+
+    // The legacy era keeps its historical wire shape: no modern discriminator.
+    #[test]
+    fn legacy_era_still_omits_the_modern_result_discriminator() {
+        let message = ServerJsonRpcMessage::response(
+            ServerResult::CallToolResult(CallToolResult::success(vec![ContentBlock::text("ok")])),
+            RequestId::Number(1),
+        );
+
+        let response =
+            json_response_for_era(&message, crate::protocol::ProtocolEra::Legacy).unwrap();
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(value["result"].get("resultType").is_none());
     }
 
     #[tokio::test]

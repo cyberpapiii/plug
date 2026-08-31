@@ -9,6 +9,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Tool calls over HTTP no longer fail for every server once modern downstream is
+  enabled. Revision `2026-07-28` makes `resultType` mandatory on every result and
+  limits the absent-means-complete bridge to servers on earlier revisions. Plug
+  advertises that revision downstream while deliberately negotiating `2025-11-25`
+  with its upstreams, so a proxied result reached the client with the field
+  missing and strict clients rejected the whole response, taking down every
+  configured server at once rather than one. The HTTP JSON and SSE seams now mark
+  a proxied result complete, which is the meaning the bridge would have given it.
+  Legacy sessions keep their existing wire shape.
+
 - Opening Plug on a healthy Mac no longer claims it is installing itself. Every
   launch begins by reading the installation, and that read-only pass was sharing
   its words with the phases that actually change it, so the menu bar greeted a

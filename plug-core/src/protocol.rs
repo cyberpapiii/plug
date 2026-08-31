@@ -11,6 +11,10 @@ use crate::types::PrincipalId;
 
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const ANNOUNCED_FUTURE_PROTOCOL_VERSION: &str = "2026-07-28";
+/// SEP-2322 discriminator for a fully materialized result. A proxied upstream
+/// result carries no pagination or task state, so this is the value a modern
+/// client would infer from an absent field on an earlier-revision server.
+pub const RESULT_TYPE_COMPLETE: &str = "complete";
 
 /// Classify an HTTP JSON-RPC envelope before any era-specific rewriting or
 /// typed deserialization occurs.
@@ -606,6 +610,34 @@ pub fn rewrite_legacy_result(value: &mut serde_json::Value, task_response: bool)
     }
 }
 
+/// Complete the 2026 wire vocabulary on a response bound for a modern peer.
+///
+/// Protocol revision `2026-07-28` makes `resultType` mandatory on every result,
+/// and the absent-means-complete bridge that clients apply is scoped to servers
+/// on earlier revisions. Plug advertises `2026-07-28` downstream while
+/// deliberately negotiating `2025-11-25` with its upstreams, so a proxied result
+/// reaches this seam without the discriminator and a strict modern client
+/// rejects the whole response. A result that carries no pagination or task state
+/// is complete by definition, which is the meaning the bridge would have given
+/// it anyway.
+pub fn rewrite_modern_response(value: &mut serde_json::Value) {
+    let Some(result) = value.get_mut("result") else {
+        return;
+    };
+    rewrite_modern_result(result);
+}
+
+/// Same conversion as [`rewrite_modern_response`] on a bare MCP result payload,
+/// for callers that hold the result without its JSON-RPC envelope.
+pub fn rewrite_modern_result(value: &mut serde_json::Value) {
+    let Some(result) = value.as_object_mut() else {
+        return;
+    };
+    result
+        .entry("resultType")
+        .or_insert_with(|| serde_json::Value::String(RESULT_TYPE_COMPLETE.to_string()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +931,49 @@ mod tests {
         assert!(value.get("ttlMs").is_none());
         assert!(value.get("cacheScope").is_none());
         assert_eq!(value["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn modern_response_rewrite_completes_a_proxied_legacy_result() {
+        let mut value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": false
+            }
+        });
+
+        rewrite_modern_response(&mut value);
+
+        assert_eq!(value["result"]["resultType"], RESULT_TYPE_COMPLETE);
+        assert_eq!(value["result"]["isError"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn modern_response_rewrite_preserves_a_meaningful_discriminator() {
+        let mut value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"resultType": "input_required", "message": "pick one"}
+        });
+
+        rewrite_modern_response(&mut value);
+
+        assert_eq!(value["result"]["resultType"], "input_required");
+    }
+
+    #[test]
+    fn modern_response_rewrite_leaves_errors_alone() {
+        let mut value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32601, "message": "method not found"}
+        });
+
+        rewrite_modern_response(&mut value);
+
+        assert!(value.get("result").is_none());
+        assert!(value["error"].get("resultType").is_none());
     }
 }
