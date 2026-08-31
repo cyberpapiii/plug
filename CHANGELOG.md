@@ -5,6 +5,22 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The downstream OAuth issuer state lock now waits briefly before declaring a
+  second writer. The lock is what keeps two processes from racing state
+  publication, but a daemon restarted the moment its predecessor exits could
+  find the lock still held by a descriptor the old process had not finished
+  closing, and fail startup with an error that only a second restart cleared.
+  Acquisition now retries for up to a quarter second; a genuinely live writer
+  holds the lock far longer than that, so the guard keeps its meaning, and an
+  I/O error still fails immediately rather than waiting out the retries. This
+  also addresses a rare Linux CI failure in
+  `revoke_sync_failure_degrades_lifecycle_and_restart_stays_revoked`, whose
+  exact mechanism was never reproduced on macOS.
+
 ## [0.8.6] - 2026-08-31
 
 ### Fixed
