@@ -13,25 +13,6 @@ struct SettingsView: View {
     let run: (PlugIntent) -> Void
 
     var body: some View {
-        Group {
-            if #available(macOS 15.0, *) {
-                TabView {
-                    Tab("General", systemImage: "gearshape") { GeneralSettings() }
-                    Tab("Service", systemImage: "bolt.horizontal.circle") {
-                        ServiceSettings(model: model, run: run)
-                    }
-                    Tab("About", systemImage: "info.circle") {
-                        AboutSettings(model: model, run: run)
-                    }
-                }
-            } else {
-                legacyTabs
-            }
-        }
-        .frame(width: 520, height: 460)
-    }
-
-    private var legacyTabs: some View {
         TabView {
             GeneralSettings()
                 .tabItem { Label("General", systemImage: "gearshape") }
@@ -40,6 +21,7 @@ struct SettingsView: View {
             AboutSettings(model: model, run: run)
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
+        .frame(width: 480)
     }
 }
 
@@ -96,6 +78,7 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
+        .frame(height: 250)
         .task {
             launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
         }
@@ -207,6 +190,7 @@ private struct ServiceSettings: View {
             }
         }
         .formStyle(.grouped)
+        .frame(height: 480)
     }
 
     private var serviceStatus: String {
@@ -317,6 +301,16 @@ private struct AboutSettings: View {
                 } label: {
                     Label("Version", systemImage: "number")
                 }
+                LabeledContent {
+                    Text("\(model.situation.activeServers.count)")
+                } label: {
+                    Label("Servers on", systemImage: "shippingbox")
+                }
+                LabeledContent {
+                    Text("\(model.situation.totalTools)")
+                } label: {
+                    Label("Tools available", systemImage: "wrench.and.screwdriver")
+                }
                 HStack {
                     Button {
                         run(.checkForUpdates)
@@ -325,13 +319,19 @@ private struct AboutSettings: View {
                     }
                     .disabled(!UpdateService.shared.canCheckForUpdates)
                     Spacer()
+                    Button(role: .destructive) {
+                        run(.quit)
+                    } label: {
+                        Label("Quit Plug", systemImage: "power")
+                    }
                 }
             } footer: {
-                Text("Plug keeps your MCP servers available to every connected AI app.")
+                Text("Quitting closes the menu bar icon. Your servers keep running, and connected apps keep working.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+        .frame(height: 250)
     }
 }
