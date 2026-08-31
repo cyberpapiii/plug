@@ -5,6 +5,24 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Upgrading the daemon no longer strands a running `plug connect`. The IPC
+  handshake refuses a mixed-version session, which is right, but a client that
+  was already running when the daemon was replaced kept answering every call
+  with `daemon reconnect failed: daemon/client version mismatch` forever, and no
+  MCP host recovers from that on its own. A running process cannot re-exec
+  itself into a newer binary, so the client now exits when it sees that
+  mismatch on reconnect and lets the host spawn a fresh one from the installed
+  binary. It exits only when the daemon is running the client's own executable
+  file, which is exactly the case a respawn fixes; a client installed against a
+  different copy of plug reports the mismatch instead, with a message saying a
+  restart will not help, rather than exiting into a loop. A mismatch on the very
+  first handshake still fails outright, since a process spawned moments ago is
+  not the stale one.
+
 ## [0.8.7] - 2026-08-31
 
 ### Fixed

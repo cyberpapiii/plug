@@ -1018,17 +1018,58 @@ fn paths_resolve_to_same_file(left: &std::path::Path, right: &std::path::Path) -
     }
 }
 
+/// A version mismatch reported by the daemon, carried as a typed error so a
+/// reconnect can tell the two cases apart. A running process cannot re-exec
+/// itself into a newer binary, so the only cure is the host spawning
+/// `plug connect` again — and that only helps when the file this process came
+/// from is the one the daemon is now running.
+#[derive(Debug)]
+pub(crate) struct DaemonVersionMismatch {
+    pub(crate) daemon_version: String,
+    pub(crate) client_version: &'static str,
+    /// True when this process's own executable file is the daemon's, so the
+    /// file on disk already carries the daemon's version and a respawn matches.
+    pub(crate) respawn_resolves: bool,
+}
+
+impl std::fmt::Display for DaemonVersionMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon/client version mismatch: daemon={}, client={}",
+            self.daemon_version, self.client_version
+        )?;
+        if !self.respawn_resolves {
+            write!(
+                formatter,
+                " (this client runs a different binary than the daemon, so restarting it will not help; reinstall plug so both come from one install)"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DaemonVersionMismatch {}
+
 fn validate_proxy_daemon_handshake(
     handshake: &plug_core::ipc::OperatorHandshake,
     expected_executable: &std::path::Path,
     require_app_ownership: bool,
 ) -> anyhow::Result<()> {
     if handshake.daemon_version != env!("CARGO_PKG_VERSION") {
-        anyhow::bail!(
-            "daemon/client version mismatch: daemon={}, client={}",
-            handshake.daemon_version,
-            env!("CARGO_PKG_VERSION")
-        );
+        let respawn_resolves = std::env::current_exe().is_ok_and(|client_executable| {
+            handshake
+                .daemon_executable
+                .as_deref()
+                .is_some_and(|daemon_executable| {
+                    paths_resolve_to_same_file(&client_executable, daemon_executable)
+                })
+        });
+        return Err(anyhow::Error::new(DaemonVersionMismatch {
+            daemon_version: handshake.daemon_version.clone(),
+            client_version: env!("CARGO_PKG_VERSION"),
+            respawn_resolves,
+        }));
     }
     if handshake.ipc_min > plug_core::ipc::IPC_PROTOCOL_VERSION
         || handshake.ipc_max < plug_core::ipc::IPC_PROTOCOL_VERSION
@@ -3755,5 +3796,51 @@ mod tests {
         handshake.ipc_min = plug_core::ipc::IPC_PROTOCOL_VERSION + 1;
         handshake.ipc_max = plug_core::ipc::IPC_PROTOCOL_VERSION + 1;
         assert!(validate_proxy_daemon_handshake(&handshake, expected, false).is_err());
+    }
+
+    #[test]
+    fn a_version_mismatch_says_whether_a_respawn_would_fix_it() {
+        let client_executable = std::env::current_exe().expect("test executable path");
+
+        // The daemon runs this client's own binary, so the file on disk already
+        // carries the daemon's version and the host respawning us picks it up.
+        let mut upgraded = proxy_handshake(
+            client_executable.to_str(),
+            plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+        );
+        upgraded.daemon_version = "0.0.0".to_string();
+        let error = validate_proxy_daemon_handshake(&upgraded, &client_executable, false)
+            .expect_err("a version mismatch must fail the handshake");
+        let mismatch = error
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("the mismatch is reported as a typed error");
+        assert!(mismatch.respawn_resolves);
+        assert_eq!(mismatch.daemon_version, "0.0.0");
+        assert_eq!(
+            mismatch.to_string(),
+            format!(
+                "daemon/client version mismatch: daemon=0.0.0, client={}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+
+        // A daemon running some other install is real skew. Restarting this
+        // client would exec the same stale binary, so the message says so.
+        let mut foreign = proxy_handshake(
+            Some("/nonexistent/other/plug"),
+            plug_core::ipc::DaemonOwnershipMode::Unmanaged,
+        );
+        foreign.daemon_version = "0.0.0".to_string();
+        let error = validate_proxy_daemon_handshake(
+            &foreign,
+            std::path::Path::new("/nonexistent/other/plug"),
+            false,
+        )
+        .expect_err("a version mismatch must fail the handshake");
+        let mismatch = error
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("the mismatch is reported as a typed error");
+        assert!(!mismatch.respawn_resolves);
+        assert!(mismatch.to_string().contains("will not help"));
     }
 }
