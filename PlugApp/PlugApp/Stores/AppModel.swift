@@ -161,11 +161,17 @@ final class AppModel {
     }
 
     private var setupState: PlugSituation.Setup {
-        if showsReconciliationProgress { return .settingUp }
-        switch installationState {
-        case .healthy: return .ready
+        // Mid-reconcile this model's own copy of the state is still the
+        // pre-flight one, so the phase has to come from the coordinator, which
+        // is the thing doing the work.
+        let state = showsReconciliationProgress ? coordinator.state : installationState
+        switch state {
+        case .healthy: return showsReconciliationProgress ? .checking : .ready
         case .adoptionRequired: return .needsPermission
-        case .reconcilingUpdate: return .settingUp
+        // Inspecting only reads. Every launch passes through it, and calling
+        // that "Setting up…" tells a user an install is happening when nothing
+        // is being installed. The later phases do change the installation.
+        case let .reconcilingUpdate(phase): return phase == .inspecting ? .checking : .settingUp
         case let .repairableDrift(drift): return .needsRepair(detail: drift.detail)
         case let .blocked(failure): return .blocked(detail: failure.detail, hasLog: failure.logURL != nil)
         }

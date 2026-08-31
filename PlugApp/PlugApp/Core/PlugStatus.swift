@@ -124,6 +124,9 @@ struct PlugSituation: Equatable, Sendable {
     enum Setup: Equatable, Sendable {
         case ready
         case needsPermission
+        /// Reading the installation without changing it. Every launch does
+        /// this, so it must not sound like an install is under way.
+        case checking
         case settingUp
         case needsRepair(detail: String)
         case blocked(detail: String, hasLog: Bool)
@@ -288,6 +291,13 @@ enum PlugVerdict {
         switch setup {
         case .ready:
             return nil
+        case .checking:
+            return Verdict(
+                tone: .busy,
+                symbol: "bolt.horizontal.circle",
+                title: "Checking Plug…",
+                detail: "Making sure everything is in place."
+            )
         case .settingUp:
             return Verdict(
                 tone: .busy,

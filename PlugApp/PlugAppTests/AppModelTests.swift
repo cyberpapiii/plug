@@ -96,6 +96,29 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(events.values.prefix(2), ["coordinator.reconcile", "ipc.handshake"])
     }
 
+    /// The app opens in `.reconcilingUpdate(.inspecting)` on every launch,
+    /// before it has looked at anything. That phase only reads, so it must not
+    /// say an install is finishing; the phases that do change the install still
+    /// must.
+    @MainActor
+    func testLaunchInspectionReadsAsACheckNotAnInstall() {
+        let inspecting = AppModel(
+            coordinator: RecordingInstallationCoordinator(
+                state: .reconcilingUpdate(.inspecting),
+                events: LockedEvents()
+            )
+        )
+        XCTAssertEqual(inspecting.verdict.title, "Checking Plug…")
+
+        let installing = AppModel(
+            coordinator: RecordingInstallationCoordinator(
+                state: .reconcilingUpdate(.replacingDaemon),
+                events: LockedEvents()
+            )
+        )
+        XCTAssertEqual(installing.verdict.title, "Setting up…")
+    }
+
     @MainActor
     func testHealthyStartupStaysQuiet() async {
         let coordinator = RecordingInstallationCoordinator(
