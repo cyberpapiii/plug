@@ -90,6 +90,45 @@ struct SharedConnection {
     modern_downstream_enabled: std::sync::atomic::AtomicBool,
 }
 
+/// What a failed reconnect can actually do about itself.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectRecovery {
+    /// The daemon was upgraded under a client still running the old image.
+    /// Exiting hands the problem to the host, which spawns a fresh
+    /// `plug connect` from the installed binary.
+    RespawnClient,
+    /// Nothing a restart fixes. Surface it to the caller.
+    ReportError,
+}
+
+fn reconnect_recovery(error: &anyhow::Error) -> ReconnectRecovery {
+    match error.downcast_ref::<crate::runtime::DaemonVersionMismatch>() {
+        Some(mismatch) if mismatch.respawn_resolves => ReconnectRecovery::RespawnClient,
+        _ => ReconnectRecovery::ReportError,
+    }
+}
+
+fn reconnect_error(error: anyhow::Error) -> McpError {
+    if reconnect_recovery(&error) == ReconnectRecovery::RespawnClient {
+        tracing::error!(
+            %error,
+            "the daemon was upgraded under this client; exiting so the host respawns `plug connect` from the installed binary"
+        );
+        // A reconnect only happens after a handshake that matched, so the
+        // versions parted because the file on disk changed, not because this
+        // client was installed against the wrong one: the respawn lands on the
+        // new binary. Without this the process stays up and answers every call
+        // with the same mismatch forever, which no client recovers from.
+        //
+        // Exit zero deliberately. A supervisor that reads a non-zero exit as
+        // "stop retrying" would wedge the client permanently, which is the
+        // state this exists to end. Closing stdout is the EOF the host waits
+        // for.
+        std::process::exit(0);
+    }
+    McpError::internal_error(format!("daemon reconnect failed: {error}"), None)
+}
+
 #[derive(Clone)]
 struct CancellationIdentity {
     session_id: String,
@@ -614,7 +653,7 @@ impl IpcProxyHandler {
             conn.client_info.clone(),
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("daemon reconnect failed: {e}"), None))?;
+        .map_err(reconnect_error)?;
         if let Ok(mut caps) = self.shared.capabilities.write() {
             *caps = session.capabilities.clone();
         }
@@ -644,7 +683,7 @@ impl IpcProxyHandler {
             conn.client_info.clone(),
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("daemon reconnect failed: {e}"), None))?;
+        .map_err(reconnect_error)?;
         if let Ok(mut caps) = shared.capabilities.write() {
             *caps = session.capabilities.clone();
         }
@@ -4582,5 +4621,32 @@ mod tests {
 
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
+    }
+    #[test]
+    fn a_reconnect_exits_only_when_a_respawn_would_land_on_the_new_binary() {
+        let upgraded = anyhow::Error::new(crate::runtime::DaemonVersionMismatch {
+            daemon_version: "9.9.9".to_string(),
+            client_version: env!("CARGO_PKG_VERSION"),
+            respawn_resolves: true,
+        });
+        assert_eq!(
+            reconnect_recovery(&upgraded),
+            ReconnectRecovery::RespawnClient
+        );
+
+        // A client built against a different install gains nothing from a
+        // restart, so it must report instead of exiting into a loop.
+        let skewed = anyhow::Error::new(crate::runtime::DaemonVersionMismatch {
+            daemon_version: "9.9.9".to_string(),
+            client_version: env!("CARGO_PKG_VERSION"),
+            respawn_resolves: false,
+        });
+        assert_eq!(reconnect_recovery(&skewed), ReconnectRecovery::ReportError);
+
+        let unrelated = anyhow::anyhow!("socket closed");
+        assert_eq!(
+            reconnect_recovery(&unrelated),
+            ReconnectRecovery::ReportError
+        );
     }
 }
