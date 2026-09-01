@@ -7,6 +7,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/dev-install.sh` builds Plug.app from the working tree, signs it with
+  the Developer ID already in the login keychain, and installs it in place.
+  About two minutes cold and seconds warm, with no network, notarization,
+  version bump, or commit. It stamps the current time as the build number so
+  the app replaces its own daemon and Sparkle never offers a downgrade. This is
+  the loop for trying a change on this Mac; releases stay on `release.sh`.
+
 ### Changed
 
 - Each app section now opens with one page header that carries its title, a
