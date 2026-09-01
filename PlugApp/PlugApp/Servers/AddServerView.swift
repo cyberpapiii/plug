@@ -14,7 +14,9 @@ struct AddServerView: View {
     @State private var nameEdited = false
     @State private var saving = false
     @State private var failure: String?
-    @FocusState private var pasteFocused: Bool
+    @FocusState private var focus: Field?
+
+    private enum Field { case paste, name }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
@@ -29,7 +31,7 @@ struct AddServerView: View {
                 .font(.system(.callout, design: .monospaced))
                 .scrollContentBackground(.hidden)
                 .padding(Metric.snug)
-                .frame(height: 132)
+                .frame(height: 144)
                 .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Metric.corner))
                 .overlay(alignment: .topLeading) {
                     if pasted.isEmpty {
@@ -40,7 +42,7 @@ struct AddServerView: View {
                             .allowsHitTesting(false)
                     }
                 }
-                .focused($pasteFocused)
+                .focused($focus, equals: .paste)
                 .accessibilityLabel("Server definition")
 
             preview
@@ -58,12 +60,13 @@ struct AddServerView: View {
                 Button(saving ? "Adding…" : "Add Server") { add() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(draft == nil || name.isEmpty || saving)
+                    .disabled(draft == nil || trimmedName.isEmpty || saving)
             }
         }
         .padding(Metric.roomy)
         .frame(width: 520)
-        .onAppear { pasteFocused = true }
+        .defaultFocus($focus, .paste)
+        .interactiveDismissDisabled(saving)
         .onChange(of: pasted) { _, _ in
             failure = nil
             if !nameEdited, let draft { name = draft.name }
@@ -90,10 +93,7 @@ struct AddServerView: View {
     @ViewBuilder private var preview: some View {
         switch parse {
         case .empty:
-            Text("Nothing pasted yet.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            EmptyView()
         case let .unreadable(reason):
             Label(reason, systemImage: "questionmark.circle")
                 .font(.callout)
@@ -102,11 +102,15 @@ struct AddServerView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         case let .draft(draft):
             VStack(alignment: .leading, spacing: Metric.snug) {
+                SectionLabel(text: "Detected server")
                 HStack(spacing: Metric.snug) {
                     Text("Name").font(.callout).foregroundStyle(.secondary)
                     TextField("Name", text: $name)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: name) { _, _ in nameEdited = true }
+                        .focused($focus, equals: .name)
+                        .onChange(of: name) { _, _ in
+                            if focus == .name { nameEdited = true }
+                        }
                 }
                 ForEach(draft.facts) { fact in
                     HStack(alignment: .firstTextBaseline, spacing: Metric.snug) {
@@ -131,24 +135,32 @@ struct AddServerView: View {
 
     // MARK: - Saving
 
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func add() {
         guard let draft else { return }
         saving = true
         failure = nil
-        let finalName = name.trimmingCharacters(in: .whitespaces)
-        Task {
-            await model.perform { .validateServer(authToken: $0, name: finalName, server: draft.config) }
-            if let error = model.lastError {
-                failure = error
-                saving = false
-                return
-            }
-            await model.perform { .addServer(authToken: $0, name: finalName, server: draft.config) }
+        let finalName = trimmedName
+        guard !finalName.isEmpty else {
             saving = false
-            if let error = model.lastError {
-                failure = error
-            } else {
+            return
+        }
+        Task {
+            do {
+                try await model.performOperation {
+                    .validateServer(authToken: $0, name: finalName, server: draft.config)
+                }
+                try await model.performOperation {
+                    .addServer(authToken: $0, name: finalName, server: draft.config)
+                }
+                saving = false
                 dismiss()
+            } catch {
+                failure = error.localizedDescription
+                saving = false
             }
         }
     }

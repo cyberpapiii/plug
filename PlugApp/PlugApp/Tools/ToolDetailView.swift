@@ -8,6 +8,7 @@ struct ToolDetailView: View {
     let tool: ToolFacts
     let catalog: ToolCatalog
     let canManage: Bool
+    let isBusy: Bool
     @Bindable var router: Router
     let run: (PlugIntent) -> Void
 
@@ -43,9 +44,11 @@ struct ToolDetailView: View {
                 router.selectedTool = nil
             } label: {
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                    .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close details")
+            .help("Close details")
         }
     }
 
@@ -63,9 +66,14 @@ struct ToolDetailView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            } else if isBusy {
+                HStack(spacing: Metric.tight) {
+                    ProgressView().controlSize(.small)
+                    Text("Updating visibility…").foregroundStyle(.secondary)
+                }
             } else if canManage {
                 Toggle(
-                    tool.isOn ? "Connected apps can call this tool" : "Hidden from connected apps",
+                    "Available to connected apps",
                     isOn: Binding(
                         get: { tool.isOn },
                         set: { run(.setToolEnabled(tool.name, $0)) }
@@ -77,9 +85,8 @@ struct ToolDetailView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Metric.regular)
-        .background(
-            tool.isOn ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.orange.opacity(0.1)),
-            in: RoundedRectangle(cornerRadius: Metric.corner)
+        .nativeInsetSurface(
+            tool.isOn ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.orange.opacity(0.1))
         )
     }
 
@@ -111,10 +118,12 @@ struct ToolDetailView: View {
     }
 
     private func detailRow(_ label: String, _ value: String, symbol: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Label(label, systemImage: symbol).font(.callout).foregroundStyle(.secondary)
-            Spacer(minLength: Metric.regular)
+        LabeledContent {
             Text(value).font(.callout).textSelection(.enabled)
+        } label: {
+            Label(label, systemImage: symbol)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 

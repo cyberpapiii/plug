@@ -11,23 +11,17 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case activity = "Activity"
 
     var id: Self { self }
-
-    var symbol: String {
-        switch self {
-        case .servers: "shippingbox"
-        case .tools: "wrench.and.screwdriver"
-        case .connections: "app.connected.to.app.below.fill"
-        case .activity: "clock.arrow.circlepath"
-        }
-    }
 }
 
-/// The window. No sidebar: three peers do not earn a permanent column, and the
+/// The window. No sidebar: four peers do not earn a permanent column, and the
 /// space is better spent on the content itself.
 struct RootView: View {
     let model: AppModel
     @Bindable var router: Router
     let run: (PlugIntent) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var search = ""
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,34 +30,30 @@ struct RootView: View {
                     .padding(.horizontal, Metric.roomy)
                     .padding(.vertical, Metric.snug)
                     .background(.bar)
-                    .overlay(alignment: .bottom) { Divider() }
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
             }
 
             switch router.section {
             case .servers:
-                ServersView(model: model, router: router, run: run)
+                ServersView(model: model, router: router, search: $search, run: run)
             case .tools:
-                ToolsView(model: model, router: router, run: run)
+                ToolsView(model: model, router: router, query: $search, run: run)
             case .connections:
-                ConnectionsView(model: model, run: run)
+                ConnectionsView(model: model, search: $search, run: run)
             case .activity:
-                ActivityView(model: model)
+                ActivityView(model: model, search: $search, run: run)
             }
         }
-        .animation(.snappy(duration: 0.2), value: model.verdict)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.verdict)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                // Icon and word together: the picture is what people aim at
-                // after the first visit, the word is what makes the first visit
-                // work.
                 Picker("Section", selection: $router.section) {
                     ForEach(AppSection.allCases) { section in
-                        Label(section.rawValue, systemImage: section.symbol).tag(section)
+                        Text(section.rawValue).tag(section)
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(minWidth: 330)
+                .frame(minWidth: 280, idealWidth: 340, maxWidth: 340)
             }
 
             // Plug has no menu bar of its own — it is an accessory app — so the
@@ -75,16 +65,28 @@ struct RootView: View {
                 .help("Settings")
                 .accessibilityLabel("Settings")
             }
+
+            ToolbarItem {
+                TextField("Search", text: $search)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, idealWidth: 160, maxWidth: 160)
+                    .focused($searchFocused)
+                    .accessibilityLabel("Search \(router.section.rawValue.lowercased())")
+            }
         }
         .navigationTitle("Plug")
-        .navigationSubtitle(model.situation.version.isEmpty ? "" : "Version \(model.situation.version)")
+        .onChange(of: router.section) {
+            search = ""
+            searchFocused = false
+        }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
         .overlay(alignment: .bottom) {
             if let error = model.lastError, model.verdict.tone == .good {
                 ErrorToast(message: error)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
             }
         }
     }
+
 }

@@ -11,41 +11,30 @@ import SwiftUI
 struct PlugPopover: View {
     let model: AppModel
     let run: (PlugIntent) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openSettings) private var openSettings
 
     private var situation: PlugSituation { model.situation }
     private var attention: [AttentionItem] { model.attentionItems }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VerdictView(verdict: model.verdict, run: run)
+            VerdictView(verdict: model.verdict, run: send)
                 .popoverInset()
                 .padding(.top, Metric.regular)
                 .padding(.bottom, Metric.regular)
 
-            if !attention.isEmpty {
-                VStack(spacing: Metric.tight) {
-                    ForEach(attention.prefix(3)) { item in
-                        AttentionRow(item: item, run: run)
-                    }
-                    if attention.count > 3 {
-                        Button("Show all \(attention.count)") { run(.openWindow(.servers)) }
-                            .buttonStyle(.link)
-                            .font(.caption)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .popoverInset()
-                .padding(.bottom, Metric.regular)
+            if attention.count > 1 {
+                attentionContent
             }
 
             if !listedServers.isEmpty {
-                Divider()
                 serverList
             }
 
             if situation.connectedApps > 0 {
-                Divider()
-                Button { run(.openWindow(.connections)) } label: {
+                Button { send(.openWindow(.connections)) } label: {
                     DisclosureRow(
                         symbol: "app.connected.to.app.below.fill",
                         title: connectedAppsText,
@@ -57,70 +46,129 @@ struct PlugPopover: View {
                     }
                 }
                 .buttonStyle(QuietRowButtonStyle())
-                .padding(.horizontal, Metric.tight)
+                .popoverInset()
                 .padding(.vertical, Metric.tight)
             }
 
-            Divider()
             footer
         }
         .frame(width: Metric.popoverWidth)
-        .animation(.snappy(duration: 0.18), value: model.verdict)
-        .animation(.snappy(duration: 0.18), value: attention)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.18), value: model.verdict)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.18), value: attention)
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
     }
 
     // MARK: - Servers
 
-    /// Only servers meant to be running. Anything switched off is deliberate,
-    /// so it is not news and does not belong in a status panel.
+    @ViewBuilder private var attentionContent: some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: Metric.tight) { attentionRows }
+        } else {
+            attentionRows
+        }
+#else
+        attentionRows
+#endif
+    }
+
+    private var attentionRows: some View {
+        VStack(spacing: Metric.tight) {
+            ForEach(attention.prefix(3)) { item in
+                AttentionRow(item: item, run: send)
+            }
+            if attention.count > 3 {
+                Button("Show all \(attention.count) issues") { send(.openWindow(.servers)) }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .popoverInset()
+        .padding(.bottom, Metric.regular)
+    }
+
     private var listedServers: [ServerFacts] {
-        situation.activeServers
+        situation.activeServers.filter { !situation.troubledServers.contains($0) }
     }
 
     private var serverList: some View {
         VStack(alignment: .leading, spacing: Metric.tight) {
-            SectionLabel(text: "Servers", trailing: serversSummary)
-                .popoverInset()
-                .padding(.top, Metric.snug)
+            HStack(spacing: Metric.tight) {
+                Text(attention.isEmpty ? "Servers" : "Other servers")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if attention.isEmpty {
+                    Label(serversSummary, systemImage: serversSummarySymbol)
+                        .font(.caption)
+                        .foregroundStyle(serversSummaryColor)
+                }
+            }
+            .padding(.horizontal, Metric.tight)
 
             ScrollView {
-                VStack(spacing: 0) {
+                LazyVStack(spacing: Metric.hairline) {
                     ForEach(listedServers) { server in
-                        Button { run(.reveal(server: server.name)) } label: {
+                        Button { send(.reveal(server: server.name)) } label: {
                             ServerRow(server: server)
+                                .padding(.vertical, Metric.hairline)
                         }
                         .buttonStyle(QuietRowButtonStyle())
                     }
                 }
-                .padding(.horizontal, Metric.tight)
+                .padding(Metric.hairline)
             }
             .frame(height: listHeight)
             .scrollBounceBehavior(.basedOnSize)
-            .padding(.bottom, Metric.tight)
         }
+        .padding(.horizontal, Metric.regular)
+        .padding(.vertical, Metric.snug)
+        .padding(.bottom, Metric.tight)
     }
 
     private var listHeight: CGFloat {
-        min(CGFloat(listedServers.count) * 27, Metric.popoverMaxListHeight)
+        min(CGFloat(listedServers.count) * Metric.popoverRowHeight, Metric.popoverMaxListHeight)
     }
 
     private var serversSummary: String {
         let working = situation.workingServers.count
-        return working == listedServers.count ? "All working" : "\(working) of \(listedServers.count) working"
+        return working == listedServers.count ? "All working" : "\(working) of \(listedServers.count)"
+    }
+
+    private var serversSummarySymbol: String {
+        situation.workingServers.count == listedServers.count
+            ? "checkmark.circle.fill"
+            : "exclamationmark.circle.fill"
+    }
+
+    private var serversSummaryColor: Color {
+        situation.workingServers.count == listedServers.count ? .secondary : .orange
     }
 
     private var connectedAppsText: String {
-        situation.connectedApps == 1 ? "1 app connected" : "\(situation.connectedApps) apps connected"
+        situation.connectedApps == 1 ? "1 connected app" : "\(situation.connectedApps) connected apps"
     }
 
     // MARK: - Footer
 
-    private var footer: some View {
+    @ViewBuilder private var footer: some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: Metric.tight) { footerControls }
+        } else {
+            footerControls
+        }
+#else
+        footerControls
+#endif
+    }
+
+    private var footerControls: some View {
         HStack(spacing: Metric.tight) {
-            Button { run(.addServer) } label: {
-                Label("Add Server", systemImage: "plus")
+            Button { send(.addServer) } label: {
+                Label("Add", systemImage: "plus")
                     .font(.callout)
             }
             .nativeGlassButton()
@@ -128,8 +176,8 @@ struct PlugPopover: View {
             .fixedSize()
             .help("Add a server")
 
-            Button { run(.openWindow(.servers)) } label: {
-                Label("Open Plug", systemImage: "macwindow")
+            Button { send(.openCurrentWindow) } label: {
+                Label("Open", systemImage: "macwindow")
                     .font(.callout)
             }
             .nativeGlassButton()
@@ -143,7 +191,10 @@ struct PlugPopover: View {
             // they are visible controls rather than entries inside a menu. Both
             // are icon-only: the picture is the label, and the tooltip and the
             // accessibility label carry the words.
-            SettingsLink {
+            Button {
+                dismiss()
+                openSettings()
+            } label: {
                 Image(systemName: "gearshape")
                     .font(.callout)
             }
@@ -163,7 +214,20 @@ struct PlugPopover: View {
             .help("Quit Plug. Your servers keep running.")
             .accessibilityLabel("Quit Plug")
         }
-        .padding(.horizontal, Metric.snug)
+        .popoverInset()
         .padding(.vertical, Metric.tight)
+    }
+
+    /// Window-opening actions close the menu panel first. Otherwise its
+    /// floating window can remain above the sheet or inspector it opened.
+    private func send(_ intent: PlugIntent) {
+        switch intent {
+        case .addServer, .importServers, .editServer, .openWindow,
+             .openCurrentWindow, .reveal, .showRepairLog, .signIn:
+            dismiss()
+        default:
+            break
+        }
+        run(intent)
     }
 }

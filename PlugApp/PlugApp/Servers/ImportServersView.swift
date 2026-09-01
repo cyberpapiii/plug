@@ -17,6 +17,7 @@ struct ImportServersView: View {
     @State private var chosen: Set<String> = []
     @State private var failure: String?
     @State private var importing = false
+    @State private var scanFailed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
@@ -30,14 +31,14 @@ struct ImportServersView: View {
             content
 
             HStack(spacing: Metric.snug) {
-                if let failure {
+                if let failure, !scanFailed {
                     Label(failure, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .lineLimit(2)
                 }
                 Spacer(minLength: 0)
-                Button(scan == nil ? "Cancel" : "Done") { dismiss() }
+                Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 if let scan, !scan.isEmpty {
                     Button(importTitle) { importChosen() }
@@ -49,6 +50,7 @@ struct ImportServersView: View {
         }
         .padding(Metric.roomy)
         .frame(width: 520)
+        .interactiveDismissDisabled(importing)
         .task { await load() }
     }
 
@@ -60,7 +62,15 @@ struct ImportServersView: View {
     // MARK: - What was found
 
     @ViewBuilder private var content: some View {
-        if let scan {
+        if scanFailed {
+            VStack(alignment: .leading, spacing: Metric.snug) {
+                Label(failure ?? "Plug could not scan the other apps.", systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("Try Again") { Task { await load() } }
+            }
+            .frame(maxWidth: .infinity, minHeight: 120, alignment: .leading)
+        } else if let scan {
             if scan.isEmpty {
                 VStack(alignment: .leading, spacing: Metric.tight) {
                     Label("Nothing new to import", systemImage: "checkmark.circle")
@@ -88,11 +98,15 @@ struct ImportServersView: View {
 
     private func found(_ scan: ImportScan) -> some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
+            SectionLabel(
+                text: "Found in other apps",
+                trailing: scan.servers.count == 1 ? "1 server" : "\(scan.servers.count) servers"
+            )
             ScrollView {
                 VStack(spacing: 0) {
                     ForEach(sources(of: scan), id: \.self) { source in
                         SectionLabel(text: sourceName(source, in: scan))
-                            .padding(.top, Metric.snug)
+                            .padding(.top, Metric.regular)
                             .padding(.bottom, Metric.hairline)
                         ForEach(scan.servers.filter { $0.source == source }) { server in
                             row(server)
@@ -100,7 +114,7 @@ struct ImportServersView: View {
                     }
                 }
             }
-            .frame(height: 220)
+            .frame(height: 240)
             .scrollBounceBehavior(.basedOnSize)
 
             if !scan.unreadable.isEmpty {
@@ -121,8 +135,8 @@ struct ImportServersView: View {
                 AppGlyph(target: server.source, name: server.sourceName, size: 18)
                 VStack(alignment: .leading, spacing: 0) {
                     Text(server.name).font(.body)
-                    Text(server.detail)
-                        .font(.caption.monospaced())
+                    Text(serverDescription(server))
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -131,7 +145,20 @@ struct ImportServersView: View {
             }
         }
         .toggleStyle(.checkbox)
-        .padding(.vertical, Metric.tight - 2)
+        .padding(.vertical, Metric.snug - 2)
+        .help(server.detail)
+    }
+
+    private func serverDescription(_ server: DiscoveredServer) -> String {
+        if let url = server.config.url,
+           let host = URL(string: url)?.host
+        {
+            return "Remote server · \(host)"
+        }
+        if let command = server.config.command {
+            return "Runs on this Mac · \(URL(fileURLWithPath: command).lastPathComponent)"
+        }
+        return "Server configuration"
     }
 
     private func binding(for server: DiscoveredServer) -> Binding<Bool> {
@@ -158,14 +185,19 @@ struct ImportServersView: View {
     // MARK: - Work
 
     private func load() async {
+        scanFailed = false
+        failure = nil
+        scan = nil
         do {
             let result = try await scanner.scan()
             scan = result
+            scanFailed = false
             // Everything is ticked to begin with: someone who opens this sheet
             // wants their servers, not a checklist.
             chosen = Set(result.servers.map(\.id))
         } catch {
-            scan = ImportScan()
+            scan = nil
+            scanFailed = true
             failure = error.localizedDescription
         }
     }
@@ -178,10 +210,13 @@ struct ImportServersView: View {
         Task {
             var failed: [String] = []
             for server in wanted {
-                await model.perform {
-                    .addServer(authToken: $0, name: server.name, server: server.config)
+                do {
+                    try await model.performOperation {
+                        .addServer(authToken: $0, name: server.name, server: server.config)
+                    }
+                } catch {
+                    failed.append(server.name)
                 }
-                if model.lastError != nil { failed.append(server.name) }
             }
             importing = false
             if failed.isEmpty {

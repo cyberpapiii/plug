@@ -6,43 +6,53 @@ import SwiftUI
 struct ServersView: View {
     let model: AppModel
     @Bindable var router: Router
+    @Binding var search: String
     let run: (PlugIntent) -> Void
-    @State private var search = ""
 
     var body: some View {
-        Group {
-            if model.situation.servers.isEmpty {
-                EmptyPage(
-                    title: "No servers yet",
-                    message: "Add one and every AI app connected to Plug can use it right away.",
-                    symbol: "shippingbox",
-                    actionTitle: "Add Server",
-                    actionIntent: .addServer,
-                    secondaryTitle: "Import from Other Apps…",
-                    secondaryIntent: .importServers,
-                    run: run
-                )
-            } else {
-                list
+        VStack(spacing: 0) {
+            PageHeader(title: "Servers", detail: serverSummary) {
+                HStack(spacing: Metric.tight) {
+                    Button { run(.addServer) } label: {
+                        Label("Add Server", systemImage: "plus")
+                    }
+                    .keyboardShortcut("n", modifiers: .command)
+                    .help("Add a server")
+
+                    Button { run(.importServers) } label: {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    .help("Import servers from other apps")
+                    .accessibilityLabel("Import servers from other apps")
+                }
+                .disabled(!model.canMutate)
+            }
+
+            Group {
+                if model.isLoadingInitialData {
+                    LoadingPage(message: "Loading servers…")
+                } else if model.initialDataUnavailable {
+                    UnavailablePage(item: "Servers") { run(.reconnect) }
+                } else if model.situation.servers.isEmpty {
+                    EmptyPage(
+                        title: "No servers yet",
+                        message: "Add one and every AI app connected to Plug can use it right away.",
+                        symbol: "shippingbox",
+                        actionTitle: "Add Server",
+                        actionIntent: .addServer,
+                        secondaryTitle: "Import from Other Apps…",
+                        secondaryIntent: .importServers,
+                        run: run
+                    )
+                } else {
+                    list
+                }
             }
         }
-        .searchable(text: $search, placement: .toolbar, prompt: "Search servers")
-        .toolbar {
-            ToolbarItem {
-                // Adding is the common case, so pressing the button adds; the
-                // menu beside it carries the rarer way of getting servers in.
-                Menu {
-                    Button { run(.importServers) } label: {
-                        Label("Import from Other Apps…", systemImage: "square.and.arrow.down")
-                    }
-                } label: {
-                    Label("Add Server", systemImage: "plus")
-                } primaryAction: {
-                    run(.addServer)
-                }
-                .menuStyle(.button)
-                .keyboardShortcut("n", modifiers: .command)
-                .help("Add a server")
+        .onChange(of: search) {
+            Task { @MainActor in
+                await Task.yield()
+                router.selectedServer = nil
             }
         }
         .inspector(isPresented: inspectorShown) {
@@ -78,10 +88,13 @@ struct ServersView: View {
     private var list: some View {
         List(selection: $router.selectedServer) {
             group("Needs attention", servers: matching(model.situation.troubledServers))
+            group("Starting", servers: matching(startingServers))
             group("Running", servers: matching(runningServers))
             group("Off", servers: matching(offServers))
         }
         .listStyle(.inset)
+        .frame(maxWidth: Metric.contentMaxWidth)
+        .frame(maxWidth: .infinity)
         .overlay {
             if matching(model.situation.servers).isEmpty {
                 ContentUnavailableView.search(text: search)
@@ -92,18 +105,36 @@ struct ServersView: View {
     @ViewBuilder
     private func group(_ title: String, servers: [ServerFacts]) -> some View {
         if !servers.isEmpty {
-            Section(title) {
-                ForEach(servers) { server in
-                    ServerListRow(server: server, run: run)
-                        .tag(server.name)
-                        .contextMenu { ServerActions(server: server, run: run) }
-                }
+            SectionLabel(
+                text: title,
+                trailing: servers.count == 1 ? "1 server" : "\(servers.count) servers"
+            )
+                .padding(.top, Metric.regular)
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            ForEach(servers) { server in
+                ServerListRow(server: server, run: run)
+                    .tag(server.name)
+                    .listRowSeparator(.hidden)
+                    .contextMenu { ServerActions(server: server, run: run) }
             }
         }
     }
 
+    private var serverSummary: String? {
+        guard model.hasLoadedSnapshot else { return nil }
+        let count = model.situation.servers.count
+        let tools = model.situation.totalTools
+        let summary = "\(count) \(count == 1 ? "server" : "servers") · \(tools) \(tools == 1 ? "tool" : "tools")"
+        return model.dataIsStale ? "Last known · \(summary)" : summary
+    }
+
     private var runningServers: [ServerFacts] {
-        model.situation.activeServers.filter { !$0.health.needsAttention }
+        model.situation.activeServers.filter { $0.health == .working }
+    }
+
+    private var startingServers: [ServerFacts] {
+        model.situation.activeServers.filter { $0.health == .starting }
     }
 
     private var offServers: [ServerFacts] {
@@ -122,13 +153,12 @@ struct ServersView: View {
 private struct ServerListRow: View {
     let server: ServerFacts
     let run: (PlugIntent) -> Void
-    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: Metric.snug) {
             StatusGlyph(health: server.health)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(server.name).font(.body)
+            VStack(alignment: .leading, spacing: Metric.rowGap) {
+                Text(server.name).font(.callout.weight(.medium))
                 Label(subtitle, systemImage: server.subtitleSymbol)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -141,13 +171,13 @@ private struct ServerListRow: View {
                     .controlSize(.small)
             } else if server.health == .working {
                 Text(server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(hovering ? .secondary : .tertiary)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
             }
         }
-        .padding(.vertical, Metric.tight - 2)
+        .padding(.vertical, Metric.snug)
         .contentShape(Rectangle())
-        .onHover { hovering = $0 }
+        .accessibilityElement(children: .contain)
     }
 
     private var subtitle: String {
@@ -182,6 +212,6 @@ struct ServerActions: View {
         } else {
             Button("Turn On") { run(.setServerEnabled(server.name, true)) }
         }
-        Button("Edit Settings…") { run(.editServer(server.name)) }
+        Button("Edit Server…") { run(.editServer(server.name)) }
     }
 }

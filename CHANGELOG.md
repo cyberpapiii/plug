@@ -5,6 +5,23 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Each app section now opens with one page header that carries its title, a
+  live summary, and the section's controls, so the window toolbar holds only
+  search. Loading and unavailable states share one look, and every section has
+  a retry.
+- The menu bar panel closes itself before opening a window, sheet, or
+  inspector, so it no longer floats above what it just opened. Its attention
+  list and footer sit in glass containers on macOS 26, animations respect
+  Reduce Motion, and troubled servers no longer count twice.
+- Accessibility labels, header traits, and named actions cover the tool list,
+  server list, connections, settings, and the menu bar panel.
+- `plug clients` lists Devin under its current name while keeping the Windsurf
+  config target it still reads, and no longer lists RooCode.
+
 ## [0.8.10] - 2026-08-31
 
 ### Changed

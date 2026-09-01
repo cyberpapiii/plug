@@ -15,7 +15,11 @@ struct ServerDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Metric.roomy) {
                 header
-                if let problem { problemCard(problem) }
+                if server.health == .signInNeeded {
+                    signInCard
+                } else if let problem {
+                    problemCard(problem)
+                }
                 details
                 if !recentCalls.isEmpty { recent }
                 actions
@@ -59,9 +63,11 @@ struct ServerDetailView: View {
                 router.selectedServer = nil
             } label: {
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                    .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close details")
+            .help("Close details")
         }
     }
 
@@ -77,10 +83,30 @@ struct ServerDetailView: View {
 
     private var problem: Verdict.Button? {
         switch server.health {
-        case .signInNeeded: server.isSigningIn ? nil : .init("Sign In", .signIn(server: server.name))
         case .down, .unknown: .init("Restart", .restartServer(server.name))
         default: nil
         }
+    }
+
+    private var signInCard: some View {
+        VStack(alignment: .leading, spacing: Metric.snug) {
+            Text("This server needs you to sign in to your account.")
+                .font(.callout.weight(.medium))
+            if server.isSigningIn {
+                HStack(spacing: Metric.tight) {
+                    ProgressView().controlSize(.small)
+                    Text("Finish signing in in your browser.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Button("Sign In") { run(.signIn(server: server.name)) }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(Metric.regular)
+        .nativeInsetSurface(AnyShapeStyle(.orange.opacity(0.1)))
     }
 
     private func problemCard(_ button: Verdict.Button) -> some View {
@@ -99,7 +125,7 @@ struct ServerDetailView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Metric.regular)
-        .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: Metric.corner))
+        .nativeInsetSurface(AnyShapeStyle(.orange.opacity(0.1)))
     }
 
     private var problemHeadline: String {
@@ -120,7 +146,9 @@ struct ServerDetailView: View {
                 server.health == .working ? "\(server.toolCount)" : "—",
                 symbol: "wrench.and.screwdriver"
             )
-            detailRow("Account", accountLabel, symbol: accountSymbol)
+            if server.usesOAuth {
+                detailRow("Account", accountLabel, symbol: accountSymbol)
+            }
             ForEach(server.authWarnings, id: \.self) { warning in
                 Label(warning, systemImage: "exclamationmark.circle")
                     .font(.caption)
@@ -131,25 +159,25 @@ struct ServerDetailView: View {
     }
 
     private func detailRow(_ label: String, _ value: String, symbol: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Label(label, systemImage: symbol).font(.callout).foregroundStyle(.secondary)
-            Spacer(minLength: Metric.regular)
+        LabeledContent {
             Text(value)
                 .font(.callout)
                 .multilineTextAlignment(.trailing)
                 .textSelection(.enabled)
+        } label: {
+            Label(label, systemImage: symbol)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 
     /// The account line's own glyph, so "needs sign-in" is visible before the
     /// words are read.
     private var accountSymbol: String {
-        guard server.usesOAuth else { return "person.slash" }
         return server.health == .signInNeeded ? "person.badge.key.fill" : "person.badge.shield.checkmark"
     }
 
     private var accountLabel: String {
-        guard server.usesOAuth else { return "Not needed" }
         switch server.health {
         case .signInNeeded: return "Sign-in needed"
         default: break
@@ -200,17 +228,24 @@ struct ServerDetailView: View {
     private var actions: some View {
         VStack(alignment: .leading, spacing: Metric.tight) {
             SectionLabel(text: "Manage")
-            if server.enabled {
-                Button("Restart Server") { run(.restartServer(server.name)) }
-                Button("Turn Off") { run(.setServerEnabled(server.name, false)) }
-            } else {
-                Button("Turn On") { run(.setServerEnabled(server.name, true)) }
+            HStack(spacing: Metric.tight) {
+                if server.enabled {
+                    Button("Restart") { run(.restartServer(server.name)) }
+                } else {
+                    Button("Turn On") { run(.setServerEnabled(server.name, true)) }
+                }
+                Button("Edit…") { run(.editServer(server.name)) }
+                Menu("More") {
+                    if server.enabled {
+                        Button("Turn Off") { run(.setServerEnabled(server.name, false)) }
+                    }
+                    if server.usesOAuth, server.health != .signInNeeded {
+                        Button("Sign Out…") { confirmSignOut = true }
+                    }
+                    Button("Remove Server…", role: .destructive) { confirmRemoval = true }
+                }
             }
-            Button("Edit Settings…") { run(.editServer(server.name)) }
-            if server.usesOAuth, server.health != .signInNeeded {
-                Button("Sign Out…") { confirmSignOut = true }
-            }
-            Button("Remove Server…", role: .destructive) { confirmRemoval = true }
+            .controlSize(.small)
         }
     }
 }

@@ -183,9 +183,9 @@ enum PlugIntent: Equatable, Sendable {
     case revokeClient(id: String)
     case addServer
     case openWindow(AppSection)
+    case openCurrentWindow
     case reveal(server: String)
     case checkForUpdates
-    case openSettings
     /// Restart the background service through the same path the installer
     /// uses. Nothing in the app ever kills it directly.
     case restartService

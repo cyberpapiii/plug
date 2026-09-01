@@ -74,8 +74,19 @@ final class CheckupTests: XCTestCase {
 /// fallbacks matter as much as the real thing.
 final class AppIconTests: XCTestCase {
     func testCommandLineToolsGetATerminal() {
-        XCTAssertEqual(AppIcons.symbol(target: "claude-code", name: "Claude Code"), "terminal")
         XCTAssertEqual(AppIcons.symbol(target: "gemini-cli", name: "Gemini CLI"), "terminal")
+    }
+
+    func testClaudeAndCodexVariantsUseSharedVisualFallbacks() {
+        XCTAssertEqual(
+            AppIcons.symbol(target: "claude-code", name: "Claude Code"),
+            AppIcons.symbol(target: "claude-desktop", name: "Claude Desktop")
+        )
+        XCTAssertEqual(
+            AppIcons.symbol(target: "codex-cli", name: "Codex CLI"),
+            AppIcons.symbol(target: "codex", name: "Codex")
+        )
+        XCTAssertEqual(AppIcons.symbol(target: "goose", name: "Goose"), "bird.fill")
     }
 
     func testEditorsGetAnEditorGlyph() {
@@ -92,7 +103,14 @@ final class AppIconTests: XCTestCase {
     func testLiveSessionsAreMatchedToTheAppTheyBelongTo() {
         XCTAssertEqual(AppIcons.target(forClientType: "claude_code"), "claude-code")
         XCTAssertEqual(AppIcons.target(forClientType: "Claude Desktop"), "claude-desktop")
+        XCTAssertEqual(AppIcons.target(forClientType: "Codex CLI"), "codex-cli")
+        XCTAssertEqual(AppIcons.target(forClientType: "codex-mcp-client"), "codex-cli")
+        XCTAssertEqual(AppIcons.target(forClientType: "Devin"), "windsurf")
+        XCTAssertEqual(AppIcons.target(forClientType: "Cascade (Devin Desktop)"), "windsurf")
+        XCTAssertEqual(AppIcons.displayName(forTarget: "windsurf"), "Devin")
         XCTAssertEqual(AppIcons.target(forClientType: "cursor"), "cursor")
+        XCTAssertEqual(AppIcons.target(forClientType: "Hermes Agent"), "hermes-agent")
+        XCTAssertNil(AppIcons.displayName(forTarget: "hermes-agent"))
     }
 
     func testAnUnrecognizedClientTypeIsPassedThroughRatherThanGuessed() {
