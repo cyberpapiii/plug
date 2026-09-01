@@ -2,21 +2,13 @@
 set -euo pipefail
 
 usage() {
-    cat >&2 <<'EOF'
-usage: generate-release-metadata.sh --version <X.Y.Z> --dmg-sha <sha> \
-  --linux-arm-sha <sha> --linux-x64-sha <sha> --output <dir> \
-  [--cask-only|--formula-only]
-EOF
+    echo "usage: generate-release-metadata.sh --version <X.Y.Z> --dmg-sha <sha> --output <dir>" >&2
     exit 2
 }
 
 VERSION=""
 DMG_SHA=""
-LINUX_ARM_SHA=""
-LINUX_X64_SHA=""
 OUTPUT=""
-CASK_ONLY=false
-FORMULA_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,28 +22,10 @@ while [[ $# -gt 0 ]]; do
             DMG_SHA="$2"
             shift 2
             ;;
-        --linux-arm-sha)
-            [[ $# -ge 2 ]] || usage
-            LINUX_ARM_SHA="$2"
-            shift 2
-            ;;
-        --linux-x64-sha)
-            [[ $# -ge 2 ]] || usage
-            LINUX_X64_SHA="$2"
-            shift 2
-            ;;
         --output)
             [[ $# -ge 2 ]] || usage
             OUTPUT="$2"
             shift 2
-            ;;
-        --cask-only)
-            CASK_ONLY=true
-            shift
-            ;;
-        --formula-only)
-            FORMULA_ONLY=true
-            shift
             ;;
         -h|--help)
             usage
@@ -63,81 +37,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$CASK_ONLY" == true && "$FORMULA_ONLY" == true ]]; then
-    echo "error: --cask-only and --formula-only cannot be combined" >&2
-    exit 2
-fi
-
-[[ -n "$VERSION" && -n "$OUTPUT" ]] || usage
-if [[ "$FORMULA_ONLY" != true ]]; then
-    [[ -n "$DMG_SHA" ]] || usage
-fi
-if [[ "$CASK_ONLY" != true ]]; then
-    [[ -n "$LINUX_ARM_SHA" && -n "$LINUX_X64_SHA" ]] || usage
-fi
+[[ -n "$VERSION" && -n "$DMG_SHA" && -n "$OUTPUT" ]] || usage
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "error: version must match X.Y.Z: $VERSION" >&2
     exit 1
 fi
-
-if [[ "$FORMULA_ONLY" != true ]]; then
-    name=DMG_SHA
-    value="${!name}"
-    if [[ ! "$value" =~ ^[0-9A-Fa-f]{64}$ ]]; then
-        echo "error: $name must be a 64-character SHA-256 digest" >&2
-        exit 1
-    fi
-fi
-
-if [[ "$CASK_ONLY" != true ]]; then
-    for name in LINUX_ARM_SHA LINUX_X64_SHA; do
-        value="${!name}"
-        if [[ ! "$value" =~ ^[0-9A-Fa-f]{64}$ ]]; then
-            echo "error: $name must be a 64-character SHA-256 digest" >&2
-            exit 1
-        fi
-    done
+if [[ ! "$DMG_SHA" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "error: --dmg-sha must be a 64-character SHA-256 digest" >&2
+    exit 1
 fi
 
 mkdir -p "$OUTPUT"
 
-RELEASE_TAG="v${VERSION}"
-RELEASE_BASE_URL="https://github.com/cyberpapiii/plug/releases/download/${RELEASE_TAG}"
-
-if [[ "$CASK_ONLY" != true ]]; then
-    cat > "$OUTPUT/plug.rb" <<EOF
-class Plug < Formula
-  desc "MCP multiplexer - one config, every AI client connected, every server shared"
-  homepage "https://github.com/cyberpapiii/plug"
-  version "${VERSION}"
-  license "Apache-2.0"
-
-  depends_on :linux
-
-  on_linux do
-    if Hardware::CPU.arm?
-      url "${RELEASE_BASE_URL}/plug-mcp-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "${LINUX_ARM_SHA}"
-    else
-      url "${RELEASE_BASE_URL}/plug-mcp-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "${LINUX_X64_SHA}"
-    end
-  end
-
-  def install
-    bin.install "plug"
-  end
-
-  test do
-    assert_match "plug ${VERSION}", shell_output("#{bin}/plug --version")
-  end
-end
-EOF
-fi
-
-if [[ "$FORMULA_ONLY" != true ]]; then
-    cat > "$OUTPUT/plug-app.rb" <<EOF
+cat > "$OUTPUT/plug-app.rb" <<EOF
 cask "plug-app" do
   version "${VERSION}"
   sha256 "${DMG_SHA}"
@@ -157,4 +70,3 @@ cask "plug-app" do
   caveats "Open Plug once to finish command-line and background-service setup."
 end
 EOF
-fi

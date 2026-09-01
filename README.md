@@ -34,21 +34,15 @@ Headless macOS is unsupported.
 
 ### Linux
 
-Linux users can choose one standalone path:
+Build from source with a Rust toolchain:
 
-- Linux-only Homebrew Formula:
+```sh
+cargo install --git https://github.com/cyberpapiii/plug plug-mcp
+```
 
-  ```sh
-  brew install cyberpapiii/tap/plug
-  ```
-
-- Linux-only release shell installer:
-
-  ```sh
-  curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cyberpapiii/plug/releases/latest/download/plug-mcp-installer.sh | sh
-  ```
-
-- Linux release archive from the [GitHub Releases](https://github.com/cyberpapiii/plug/releases) page. Verify its SHA-256 checksum, then place `plug` in your PATH.
+The daemon, socket IPC, and HTTP server all run on Linux; only the app and its
+packaging are macOS-only. Prebuilt Linux archives stopped at 0.8.10 and will
+come back if someone asks.
 
 ### Source development
 
@@ -323,7 +317,7 @@ Notes:
 
 ## Design Principles
 
-1. **One install, one owner** — Plug.app on macOS; Formula, shell installer, or archive on Linux
+1. **One install, one owner** — Plug.app on macOS; a source build on Linux
 2. **Ruthlessly minimal** — if a feature can't be explained in one sentence, simplify it
 3. **Dual-audience UX** — every command works for humans (pretty) AND agents (`--output json`)
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering

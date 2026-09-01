@@ -49,8 +49,8 @@ gh release download "$tag" --dir "$staging" --pattern "Plug-$version.dmg" --patt
 dmg="$staging/Plug-$version.dmg"
 [[ -f "$dmg" ]] || { echo "install: $tag has no Plug-$version.dmg" >&2; exit 1; }
 
-# Check only the DMG line. The checksums file also covers Linux tarballs that
-# were never downloaded, and `shasum -c` fails on a missing file.
+# Check only the DMG line. The checksums file also covers the appcast and Cask,
+# which were not downloaded, and `shasum -c` fails on a missing file.
 ( cd "$staging" && grep " Plug-$version.dmg\$" checksums.sha256 | shasum -a 256 -c - )
 
 mount_point="$(mktemp -d)"

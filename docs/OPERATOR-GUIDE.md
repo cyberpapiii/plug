@@ -16,7 +16,7 @@ Open Plug.app once. First launch needs a logged-in GUI session for
 ServiceManagement and Keychain consent. Plug.app owns the GUI, `plug` command,
 background daemon, client links, and updates. Headless macOS is unsupported.
 
-Linux uses standalone Formula, shell-installer, or archive paths. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
+Linux builds from source. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
 
 ## Runtime Model
 
@@ -263,7 +263,7 @@ Current distribution names:
 
 - GitHub repo: `cyberpapiii/plug`
 - macOS app: signed `Plug.app` DMG and `plug-app` Homebrew Cask
-- Linux: `plug` Homebrew Formula, release shell installer, and standalone archives
+- Linux: source build only (`cargo install --git https://github.com/cyberpapiii/plug plug-mcp`)
 - Source development: `./scripts/dev-install.sh`
 
 `./scripts/release.sh <version>` runs the whole release; see `docs/RELEASING.md`.

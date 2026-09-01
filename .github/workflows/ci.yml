@@ -108,6 +108,26 @@ jobs:
         env:
           PLUG_APP_BUILD_NUMBER: ${{ github.run_number }}
 
+  warm-release-cache:
+    # release.yml runs on a tag, and a cache saved under one tag is invisible
+    # to the next, so every release used to build the universal daemon cold
+    # (about ten minutes). This job saves the same cache key from main after
+    # each merge; the release restores it. It gates nothing.
+    name: Warm release cache
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plug-app-universal
+      - run: |
+          cargo build --release -p plug-mcp --target aarch64-apple-darwin
+          cargo build --release -p plug-mcp --target x86_64-apple-darwin
+
   ci-complete:
     # One always-running check that branch protection can require. Requiring the
     # lane jobs directly would wedge every pull request that legitimately skips

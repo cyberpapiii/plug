@@ -152,6 +152,3 @@ panic = "abort"
 [profile.ci]
 inherits = "release"
 lto = "thin"
-
-[profile.dist]
-inherits = "release"

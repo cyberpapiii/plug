@@ -195,24 +195,22 @@ cmp -s "$CHECKSUMS_FILE" "$REMOTE_VERIFY_DIR/$(basename "$CHECKSUMS_FILE")" || \
   die "remote checksum manifest differs from staged manifest"
 (cd "$REMOTE_VERIFY_DIR" && sha256sum -c "$(basename "$CHECKSUMS_FILE")")
 
-FORMULA="$ARTIFACTS_DIR/plug.rb"
 CASK="$ARTIFACTS_DIR/plug-app.rb"
-[[ -f "$FORMULA" && -f "$CASK" ]] || die "Formula and Cask must be staged assets"
+[[ -f "$CASK" ]] || die "Cask must be a staged asset"
 mkdir -p "$TAP_DIR/Casks"
-cp "$FORMULA" "$TAP_DIR/plug.rb"
 cp "$CASK" "$TAP_DIR/Casks/plug-app.rb"
 
 tap_branch="$(git -C "$TAP_DIR" symbolic-ref --quiet --short HEAD)" || \
   die "tap checkout is not on a branch"
 git -C "$TAP_DIR" config user.name "github-actions[bot]"
 git -C "$TAP_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
-git -C "$TAP_DIR" add -- plug.rb Casks/plug-app.rb
+git -C "$TAP_DIR" add -- Casks/plug-app.rb
 
-if git -C "$TAP_DIR" diff --cached --quiet -- plug.rb Casks/plug-app.rb; then
-  echo "Tap Formula+Cask already identical; skipping tap commit"
+if git -C "$TAP_DIR" diff --cached --quiet -- Casks/plug-app.rb; then
+  echo "Tap Cask already identical; skipping tap commit"
 else
-  git -C "$TAP_DIR" commit --only -m "plug ${TAG#v}" -- plug.rb Casks/plug-app.rb
-  echo "Created one tap commit for Formula+Cask"
+  git -C "$TAP_DIR" commit --only -m "plug ${TAG#v}" -- Casks/plug-app.rb
+  echo "Created tap commit for Cask"
 fi
 
 tap_upstream="$(git -C "$TAP_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
