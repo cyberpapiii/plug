@@ -33,6 +33,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `CHANGELOG.md` section instead of a `git-cliff` rendering of commit
   subjects. The release build restores its Rust cache from a job that runs
   on every push to `main`, where before it compiled cold on every tag.
+- `scripts/ship.sh` returns to `main` after arming auto-merge and steps off a
+  ship branch whose pull request already merged, so a follow-up change can no
+  longer be pushed onto a dead branch.
 - The repository's agent and contributor instructions collapse into one short
   `CLAUDE.md`; `AGENTS.md` points at it. The project-state snapshot, plan,
   truth rules, workflow model, per-change doc-update checklists, finished
