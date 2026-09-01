@@ -7,7 +7,8 @@
 # What it does: stage tracked edits, branch off main if you are on main, commit,
 # push (which runs the pre-push gate), open a pull request, and turn on
 # auto-merge. GitHub merges it when CI goes green and deletes the branch. You do
-# not come back to it.
+# not come back to it: the script leaves you on main, so the next change starts
+# from a fresh branch instead of piling onto one that may already have landed.
 #
 # It stages tracked modifications only, never untracked files. New files need an
 # explicit `git add`. That boundary is deliberate: untracked files in this repo
@@ -29,6 +30,16 @@ esac
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
 
+# A ship branch whose pull request already merged is a dead end: pushing to it
+# updates nothing. Step back to main and continue as if you had started there.
+if [[ "$branch" != "main" ]] &&
+  [[ "$(gh pr view "$branch" --json state --jq .state 2>/dev/null || true)" == "MERGED" ]]; then
+  echo "ship: $branch already merged; starting a new branch from main"
+  git checkout -q main
+  git branch -qD "$branch" || true
+  branch=main
+fi
+
 slug() {
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
@@ -48,7 +59,11 @@ if [[ -n "$message" ]]; then
   if [[ "$branch" == "main" ]]; then
     branch="ship/$(slug "$message")"
     [[ "$branch" != "ship/" ]] || branch="ship/$(date +%Y%m%d-%H%M%S)"
-    git checkout -q -b "$branch"
+    # Branch from origin/main when possible so the pull request does not carry
+    # a stale base; fall back to the local main if the working tree's edits
+    # would collide with what has landed since.
+    git fetch -q origin main || true
+    git checkout -q -b "$branch" origin/main 2>/dev/null || git checkout -q -b "$branch"
   fi
 
   echo "ship: committing to $branch"
@@ -87,6 +102,10 @@ while IFS= read -r stale; do
     git branch -qD "$stale" && echo "ship: removed merged branch $stale"
   fi
 done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+# Back to main, brought up to date with origin, so the next ship starts clean.
+git checkout -q main
+git merge -q --ff-only origin/main 2>/dev/null || true
 
 echo
 echo "ship: $url"
