@@ -1,227 +1,52 @@
-# CLAUDE.md — plug
+# CLAUDE.md
 
-This repo uses **Compound Engineering (CE)** as its workflow operating system.
+Plug is a Rust MCP multiplexer: one local config serves every AI client on the
+Mac. `Plug.app` (SwiftUI, menu bar) bundles the daemon and owns its lifecycle
+through SMAppService. The `plug` CLI talks to that daemon over a Unix socket
+(`plug connect` for local stdio clients) and the daemon also serves remote
+clients over HTTP. One person maintains it; keep it small and reliable.
 
-This file is a repo-local CE adapter. It explains how to use CE safely here. It is not a parallel
-workflow.
+## Layout
 
-## What This Project Is
+- `plug-core/` runtime, config, routing, transports, OAuth, doctor
+- `plug/` CLI, daemon, IPC proxy
+- `PlugApp/` the app; embeds the daemon binary at build time
+- `plug-test-harness/` mock MCP server for tests
+- `scripts/` the commands below plus release plumbing
+- `docs/` user docs. `docs/archive/` is history; open it only when debugging
+  something it documents.
 
-`plug` is a daemon-capable MCP multiplexer written in Rust. It sits between AI clients and MCP servers so one local config can serve many clients without duplicated setup. Local stdio clients normally share the daemon runtime; `plug serve` starts its own engine for downstream HTTP access unless you explicitly run daemon mode.
+## The loop
 
-Current product surface:
-
-- a shared core runtime in `plug-core`
-- a guided CLI in `plug`
-- structured JSON output for agent use
-- downstream stdio via `plug connect`
-- downstream Streamable HTTP via `plug serve`
-
-The TUI is not part of the current product, and the old TUI dependencies have been removed from the
-active manifests.
-
-## Current Status
-
-This is an active codebase, not a pre-development repo.
-
-Implemented today:
-
-- upstream stdio, HTTP, and legacy SSE connections (with HTTP→SSE auto-fallback)
-- merged tool routing with client-aware filtering
-- daemon + Unix socket IPC
-- HTTP server for downstream clients
-- downstream HTTPS and bearer auth for non-loopback HTTP
-- logging forwarding
-- tools/resource/prompt list_changed forwarding for stdio, HTTP, and daemon IPC
-- progress and cancellation routing for stdio, HTTP, and daemon IPC
-- resources/prompts/templates forwarding
-- resource subscribe/unsubscribe lifecycle
-- completion forwarding across stdio, HTTP, and daemon IPC
-- meta-tool mode
-- roots forwarding with union cache across all transports
-- elicitation + sampling reverse-request forwarding across stdio, HTTP, and daemon IPC
-- OAuth 2.1 + PKCE upstream auth with credential storage, background refresh, zero-downtime token refresh, CLI commands, and doctor checks
-- import/export/doctor flows
-- startup recovery and health monitoring
-
-No current roadmap blockers remain on `main`.
-
-Out of scope for the current production-ready bar:
-
-- fully live runtime reconfiguration
-
-## Documentation Map
-
-Use these as the current source of truth:
-
-- `docs/PROJECT-STATE-SNAPSHOT.md`
-- `docs/TRUTH-RULES.md`
-- `docs/VISION.md`
-- `docs/UX-DESIGN.md`
-- `docs/ARCHITECTURE.md`
-- `docs/PLAN.md`
-- `docs/ROADMAP-AUDIT-2026-03-08.md`
-- `docs/RISKS.md`
-- `docs/CRATE-STACK.md`
-
-Agent workflow guide:
-
-- `AGENTS.md`
-- `docs/WORKFLOW-OPERATING-MODEL.md`
-- `CONCEPTS.md` — shared domain vocabulary
-- `docs/solutions/README.md` — compounded learnings by category (not current truth)
-
-Strategy / planning docs:
-
-- `docs/plans/` (dated implementation plans)
-- `todos/029-032`
-
-## Truth Workflow
-
-Before answering any question about project progress, roadmap state, or what is implemented:
-
-1. Read `docs/PROJECT-STATE-SNAPSHOT.md`
-2. Read `docs/PLAN.md` if more detail is needed
-3. Verify against code on `main` if the answer materially matters
-
-Do not answer from branch summaries, PR descriptions, plan docs, or prior agent outputs alone.
-
-Truth rules:
-
-- `main` is the only source of “done now”
-- branch/worktree code is never “done now” until merged to `main`
-- plans describe intended work, not current truth
-- historical/research/solution docs are compound knowledge, not current truth
-
-Use these labels for roadmap-relevant features:
-
-- `done on main`
-- `partial on main`
-- `exists off-main`
-- `missing`
-
-If uncertain, prefer `exists off-main` or `missing`, never `done on main`.
-
-## Repo-Specific CE Gotchas
-
-- there are many stale worktrees from prior development; do not confuse worktree state with `main`
-- `fix/subscription-rebind-confidence` is an extraction source, not a truth source
-- older `docs/plans/*` files may still be useful, but many are historical planning context
-- roadmap and progress answers must start from the snapshot, not from historical plans
-
-## Subagents
-
-Subagents are encouraged for bounded research, verification, review, branch/worktree audits, and
-git archaeology. This protects the main agent’s context window.
-
-Rules:
-
-- subagents gather evidence; they do not make final truth decisions
-- final status labels are assigned only in the main thread
-- every subagent finding should be framed as:
-  - verified on `main`
-  - verified off-main
-  - inferred
-
-Prefer one subagent per bounded question over large undifferentiated swarms.
-
-## Post-Merge Truth Pass
-
-Every roadmap-affecting PR should complete this checklist after merge:
-
-- [ ] merged code exists on `main`
-- [ ] `docs/PROJECT-STATE-SNAPSHOT.md` still matches `main`
-- [ ] `docs/PLAN.md` still matches `main`
-- [ ] branch-only wording removed or explicitly retained as branch-scoped
-- [ ] remaining-work lists revalidated
-
-## Tech Stack
-
-- Rust 2024 edition
-- `rmcp` 3.1.0 (exact workspace pin)
-- Tokio
-- Axum
-- DashMap
-- ArcSwap
-- Clap
-- Figment
-- `backon`
-- `notify` + `notify-debouncer-mini`
-- `tracing` + `tracing-subscriber` + `tracing-appender`
-
-Engineering guardrails:
-
-- workspace crate roots deny or forbid unsafe code
-- daemon IPC is length-prefixed JSON over Unix sockets
-- bearer-token comparisons use constant-time equality
-- broadcast-event string fields use `Arc<str>` for cheap fan-out clones
-
-## Development Commands
-
-`scripts/dev.sh` runs the CI lanes a change actually needs, selected by
-`scripts/classify-changes.sh` (the same file CI's `classify` job runs). Prefer
-it over the raw commands.
-
-```bash
-./scripts/dev.sh           # lanes the working tree touches, with tests
-./scripts/dev.sh --quick   # fmt and clippy only, about 20 seconds
-./scripts/dev.sh --all     # rust and app lanes regardless of what changed
-./scripts/dev.sh --e2e     # opt in to the Playwright browser lane
+```sh
+./scripts/dev-install.sh           build Plug.app from the tree and install it; the app swaps its daemon. 1-2 min
+./scripts/dev.sh --quick           fmt + clippy, 15s. pre-push runs this
+./scripts/dev.sh                   the lanes your change touches, with tests, about 2 min
+./scripts/ship.sh "type: message"  commit, push, PR, auto-merge. Add new files with git add first
+./scripts/release.sh [version]     only when asked to release. Write the CHANGELOG entry first
 ```
 
-The app lane runs the full `xcodebuild` PlugApp suite through
-`scripts/test-app.sh`, which needs `xcodegen` and takes about 30 seconds. CI runs
-that same script with `--unsigned`. Never call `xcodebuild` directly: the suite
-compares the host bundle version against the embedded daemon, so a bare run
-leaves `MARKETING_VERSION` empty and fails five fixture tests with
-`NSCocoaErrorDomain Code=259`.
+Try every change with `dev-install.sh` before shipping it. Do not call
+`xcodebuild` directly. Do not start, kill, or restart the daemon from a shell:
+a daemon started outside the login session hangs on the Keychain, and killing
+one with live clients spawns competitors. Do not `git stash`.
 
-The underlying commands:
+## Rules
 
-```bash
-cargo check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-```
+- `main` is truth. `CHANGELOG.md` is the record: every user-visible change
+  adds a line under `[Unreleased]` in the same PR. No other doc needs updating.
+- Open work lives in `docs/STATUS.md` and GitHub issues, nowhere else.
+- Tests accompany behavior changes. Do not write tests for shell scripts.
+- `rmcp` is pinned at 3.1.0. No `unsafe`. Bearer tokens compare in constant
+  time. Daemon IPC is length-prefixed JSON over a Unix socket.
+- Personal tool, not a platform: reliability over protocol surface, pass-through
+  first, finish before widening.
 
-Ship a change with `./scripts/ship.sh "message"`: it commits tracked edits,
-branches, pushes through the gate, opens a pull request, and arms auto-merge. It
-never stages untracked files, which is what keeps private notes and local
-credentials out of a commit.
+## Gotchas
 
-Release with `./scripts/release.sh [version]`. It bumps the workspace version,
-renames the changelog's `## [Unreleased]` heading, ships and waits for the pull
-request to merge, tags, watches the release build, installs the signed DMG onto
-this Mac, and sweeps the build caches. Write the changelog entries first; it
-will not invent release notes. `./scripts/install-release.sh [version]` does the
-install half alone, checking the DMG against the release checksums and refusing
-anything Gatekeeper rejects.
-
-Build artifacts are governed by `scripts/clean-build-artifacts.sh`. `--guard`
-reclaims regenerable caches when `target/` exceeds 10 GB or this project's Xcode
-DerivedData exceeds 5 GB, and is silent otherwise. It costs about 40
-milliseconds, so `dev.sh` and the `post-commit`, `post-merge`, `post-checkout`
-and `pre-push` hooks all call it. `--yes` is a full `cargo clean`; a cold
-rebuild is about 31 seconds, so it is cheap.
-
-`./scripts/setup-dev.sh` wires a fresh clone up and is idempotent.
-
-## Project Structure
-
-```text
-Cargo.toml          workspace root
-plug-core/          shared runtime, config, routing, HTTP, doctor, import/export
-plug/               CLI, daemon, IPC proxy, views
-plug-test-harness/  integration test support
-docs/               product docs, plans, research
-todos/              tracked work items
-```
-
-## Product Posture
-
-- personal tool, not enterprise control plane
-- CLI-first, not TUI-first
-- pass-through first, selective value-add second
-- reliability over protocol surface area
-- finish and stabilize before widening scope
+- Config `~/Library/Application Support/plug/config.toml`, logs
+  `~/Library/Logs/plug/`, socket next to the config.
+- The app and the CLI both verify `Plug.app` against the Developer ID team
+  requirement. Never sign it with anything else.
+- Untracked files in this repo include private notes and credentials. Never
+  add them; `ship.sh` refuses to on purpose.

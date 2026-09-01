@@ -1,6 +1,6 @@
 # Architecture
 
-Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for current implementation status. This
+`main` and `CHANGELOG.md` are the record of what is implemented; `docs/STATUS.md` lists open work. This
 document describes the architecture of the merged system, not branch-only or historical plan state.
 
 ## System Overview

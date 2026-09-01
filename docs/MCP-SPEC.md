@@ -32,7 +32,7 @@ consent need a logged-in GUI session.
 | 2025-11-25 | Nov 2025 | Tasks (experimental). OAuth 2.1 + PKCE. OIDC Discovery. CIMD. Icons metadata. Elicitation URL mode. Sampling with tool calling. M2M client-credentials. |
 | 2026-07-28 | Jul 2026 | Stateless core: `server/discover`, per-request `_meta`, no initialize/sessions/GET SSE; MRTR; required `resultType` and cache directives; Tasks as extension. |
 
-**Dual-era posture (PR #68):** Plug speaks both `2025-11-25` and gated `2026-07-28`. Global gates `http.modern_downstream_enabled` and `modern_upstream_enabled` default **off**. See `docs/testing/MCP-CONFORMANCE.md` and `docs/PROJECT-STATE-SNAPSHOT.md`.
+**Dual-era posture (PR #68):** Plug speaks both `2025-11-25` and gated `2026-07-28`. Global gates `http.modern_downstream_enabled` and `modern_upstream_enabled` default **off**. See `docs/testing/MCP-CONFORMANCE.md`.
 
 ---
 
