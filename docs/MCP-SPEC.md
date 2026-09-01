@@ -13,8 +13,8 @@ This document captures the MCP protocol details that directly affect Plug's impl
 This document describes MCP wire behavior, not a second executable package.
 On macOS, users install one signed `Plug.app` from the website/GitHub DMG or
 the Homebrew Cask, then open it once. The app owns the GUI, `plug` command,
-daemon, client links, and updates. Linux uses standalone Formula, shell
-installer, or archive paths. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
+daemon, client links, and updates. Linux builds from source.
+Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
 Headless macOS is unsupported because first-use ServiceManagement and Keychain
 consent need a logged-in GUI session.
 

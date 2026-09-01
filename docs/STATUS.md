@@ -5,10 +5,8 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## In progress
 
-- Development pipeline simplification, September 2026: local build-and-try loop
-  landed (`scripts/dev-install.sh`) and the unreferenced scripts, hooks, and
-  CI jobs are cut; next is fixing the release cache miss and dropping Linux
-  artifacts until a Linux user appears.
+- Nothing. The September 2026 pipeline simplification is done; the next
+  release (0.8.11) is the first on the trimmed workflow, so watch it once.
 
 ## Open
 
@@ -29,4 +27,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 - Fully live runtime reconfiguration.
 - Modern-era follow-through behind gates (`subscriptions/listen`, mixed-era
   MRTR) until production clients speak MCP 2026.
-- Homebrew formula and Linux tarballs, once removed, until someone asks.
+- Linux tarballs, the shell installer, and the `plug` Homebrew Formula; the
+  tap still carries the 0.8.10 formula and nothing updates it. Bring them back
+  when someone asks.

@@ -1,10 +1,13 @@
 # Releasing plug
 
-A release is a `v*` tag pushed to `main`. That tag triggers
-`.github/workflows/release.yml`, which builds Linux standalone archives and the
-universal macOS Plug.app, signs and notarizes its DMG, publishes a GitHub
-release, and updates the Homebrew tap. macOS is distributed through Plug.app;
-Darwin binaries ship only inside that app.
+`./scripts/release.sh <version>` is the whole release: it bumps the workspace
+version, dates the `## [Unreleased]` changelog section, ships that as a pull
+request, waits for it to merge, pushes the `v<version>` tag, watches the build,
+and installs the signed DMG on this Mac. The tag triggers
+`.github/workflows/release.yml`, which builds the universal macOS Plug.app,
+signs and notarizes its DMG, publishes a GitHub release with the changelog
+section as its notes, and updates the Homebrew Cask. Darwin binaries ship only
+inside that app.
 
 ## Installation paths
 
@@ -21,9 +24,8 @@ the ServiceManagement and Keychain consent that needs a logged-in macOS GUI
 session. Plug.app owns the GUI, `plug` command, daemon, client links, and
 Sparkle updates. Headless macOS is unsupported.
 
-Linux users choose one standalone path: the Linux-only Homebrew Formula, the
-Linux-only release shell installer, or a Linux release archive. These artifacts
-are not macOS installation paths. Source development runs `./scripts/dev-install.sh`, which builds a Developer
+Linux users build from source with `cargo install`; prebuilt Linux archives
+and the `plug` Formula stopped at 0.8.10. Source development runs `./scripts/dev-install.sh`, which builds a Developer
 ID signed `Plug.app` from the working tree and installs it in place; releases
 are only for sharing a build with other people.
 
@@ -31,9 +33,9 @@ are only for sharing a build with other people.
 
 1. `main` is green: `cargo test --workspace`, `cargo clippy --workspace
    --all-targets -- -D warnings`, `cargo fmt --check`.
-2. `CHANGELOG.md` covers everything since the previous tag. Release notes are
-   generated from the commit history by `git-cliff`, so the commit subjects are
-   the release notes; fix them before tagging, not after.
+2. `CHANGELOG.md` has a `## [Unreleased]` section covering everything since
+   the previous tag. That section becomes the GitHub release notes, and
+   `release.sh` refuses to run without it.
 3. `workspace.package.version` in the root `Cargo.toml` matches the tag you are
    about to push, and `Cargo.lock` has been regenerated to match.
 
@@ -55,9 +57,9 @@ as inputs to that app, then runs `scripts/sign-notarize-macos-app.sh`. It
 hard-fails when any secret is missing rather than falling back to an unsigned
 build, so a release cannot imply that an unsigned app is trusted.
 
-The cargo-dist shell installer and Linux standalone archives are Linux-only.
-The published `plug-mcp-installer.sh` exits before network or filesystem work
-on Darwin and directs users to the DMG or Homebrew Cask.
+The release build restores its Rust cache from the `warm-release-cache` job
+that `ci.yml` runs on every push to `main`; a cache saved under one tag is
+invisible to the next, so without that job every release compiled cold.
 
 ### Required repository secrets
 
@@ -84,9 +86,7 @@ password because it is scoped to notarization and can be revoked on its own.
 
 The Plug.app bundle and its embedded daemon are signed with the hardened
 runtime and secure timestamp. The DMG is notarized and stapled, so Gatekeeper
-can verify the downloaded app before first launch. The Linux archives and
-Linux-only cargo-dist installer are separate artifacts; they do not provide a
-macOS command-line installation path.
+can verify the downloaded app before first launch.
 
 Homebrew installs the same signed DMG through the `plug-app` Cask. Plug.app
 creates the command-line link and registers its background service on first

@@ -26,6 +26,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   nothing ran, seven of them tests of other scripts, are deleted, and the
   old `plug-dev` path (`dev-reinstall.sh`, `setup-codesigning.sh`) retires in
   favor of `dev-install.sh`. `plug doctor` points at the new loop.
+- Releases ship the macOS app only. The four Linux tarballs, the cargo-dist
+  shell installer, the source tarball, and the `plug` Homebrew Formula are no
+  longer built; Linux users build from source with `cargo install`, and the
+  tap's formula stays at 0.8.10. GitHub release notes are now the matching
+  `CHANGELOG.md` section instead of a `git-cliff` rendering of commit
+  subjects. The release build restores its Rust cache from a job that runs
+  on every push to `main`, where before it compiled cold on every tag.
 - The repository's agent and contributor instructions collapse into one short
   `CLAUDE.md`; `AGENTS.md` points at it. The project-state snapshot, plan,
   truth rules, workflow model, per-change doc-update checklists, finished

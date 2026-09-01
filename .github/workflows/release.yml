@@ -9,118 +9,6 @@ permissions:
   contents: write
 
 jobs:
-  build-linux:
-    name: Build Linux ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-22.04
-          # Windows disabled: the daemon uses Unix sockets.
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install cross (ARM musl)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        uses: taiki-e/install-action@cross
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build
-        if: matrix.target != 'aarch64-unknown-linux-musl'
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p plug-mcp
-
-      - name: Build ARM musl with cross
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --target aarch64-unknown-linux-musl -p plug-mcp
-
-      - name: Verify Linux ELF
-        shell: bash
-        run: |
-          set -euo pipefail
-          elf_path="target/${{ matrix.target }}/release/plug"
-          [[ -x "$elf_path" ]] || {
-            echo "release binary missing or not executable: $elf_path" >&2
-            exit 1
-          }
-          command -v readelf >/dev/null 2>&1 || {
-            echo "readelf is required for release ELF verification" >&2
-            exit 1
-          }
-          machine="$(readelf -h "$elf_path" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
-          case "${{ matrix.target }}" in
-            x86_64-*) expected_machine='Advanced Micro Devices X86-64' ;;
-            aarch64-*) expected_machine='AArch64' ;;
-            *)
-              echo "unsupported Linux release target: ${{ matrix.target }}" >&2
-              exit 1
-              ;;
-          esac
-          [[ "$machine" == "$expected_machine" ]] || {
-            echo "unexpected ELF machine for $elf_path: $machine" >&2
-            exit 1
-          }
-          interpreter="$(readelf -l "$elf_path" | \
-            sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-musl) expected_interpreter='ld-musl-x86_64.so.1' ;;
-            aarch64-unknown-linux-musl) expected_interpreter='ld-musl-aarch64.so.1' ;;
-            *) expected_interpreter='' ;;
-          esac
-          if [[ -n "$expected_interpreter" && -n "$interpreter" && \
-            "$interpreter" != *"/$expected_interpreter" ]]; then
-            echo "unexpected musl ELF interpreter for $elf_path: $interpreter" >&2
-            exit 1
-          fi
-
-      - name: Package cargo-dist-compatible archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="plug-mcp-${{ matrix.target }}.tar.gz"
-          staging="plug-mcp-${{ matrix.target }}"
-          mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/plug" "${staging}/"
-          cp README.md LICENSE CHANGELOG.md "${staging}/"
-          tar czf "${archive}" "${staging}"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload archive
-        uses: actions/upload-artifact@v6
-        with:
-          name: archive-${{ matrix.target }}
-          path: ${{ env.ARCHIVE }}
-
   build-app:
     name: Build Plug.app
     # Liquid Glass is compiled behind `#if compiler(>=6.2)`. macOS 15 runners
@@ -148,9 +36,14 @@ jobs:
           brew install xcodegen
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      # A cache saved on one tag is invisible to the next tag, so a release
+      # build could never hit its own cache. The warm-release-cache job in
+      # ci.yml saves this same key from main after every merge; restore it
+      # here and never save (a tag-scoped save would only be dead weight).
       - uses: Swatinem/rust-cache@v2
         with:
-          key: plug-app-universal
+          shared-key: plug-app-universal
+          save-if: false
 
       - name: Build universal daemon
         run: |
@@ -203,7 +96,6 @@ jobs:
           ./scripts/generate-release-metadata.sh \
             --version "$WORKSPACE_VERSION" \
             --dmg-sha "$app_sha" \
-            --cask-only \
             --output "$RUNNER_TEMP"
           ruby -c "$RUNNER_TEMP/plug-app.rb"
 
@@ -271,135 +163,46 @@ jobs:
             ${{ runner.temp }}/appcast.xml
             ${{ runner.temp }}/plug-app.rb
 
-  prepare-release:
-    name: Prepare release assets
-    needs: [build-linux, build-app]
+  publish-release:
+    name: Publish release
+    needs: build-app
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      - name: Download binary archives
-        uses: actions/download-artifact@v7
-        with:
-          path: artifacts
-          pattern: archive-*
-          merge-multiple: true
-
-      - name: Download app DMG
+      - name: Download app artifacts
         uses: actions/download-artifact@v7
         with:
           name: plug-app
           path: artifacts
-
-      - name: Install cargo-dist
-        shell: bash
-        run: |
-          curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Verify cargo-dist plan
-        shell: bash
-        run: |
-          set -euo pipefail
-          dist plan --no-local-paths
-
-      - name: Build global cargo-dist artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/distrib
-          cp artifacts/plug-mcp-*.tar.gz target/distrib/
-          dist build --artifacts=global --tag "$TAG"
-          ./scripts/patch-dist-installer.sh target/distrib/plug-mcp-installer.sh
-          cp target/distrib/plug-mcp-installer.sh artifacts/
-          cp target/distrib/source.tar.gz artifacts/
-          cp target/distrib/source.tar.gz.sha256 artifacts/
-
-      - name: Generate Homebrew Formula
-        shell: bash
-        run: |
-          set -euo pipefail
-          app_dmg="$(find artifacts -maxdepth 1 -type f -name 'Plug-*.dmg' -print -quit)"
-          test -n "$app_dmg"
-          ./scripts/generate-release-metadata.sh \
-            --version "${TAG#v}" \
-            --dmg-sha "$(sha256sum "$app_dmg" | awk '{print $1}')" \
-            --linux-arm-sha "$(sha256sum artifacts/plug-mcp-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')" \
-            --linux-x64-sha "$(sha256sum artifacts/plug-mcp-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')" \
-            --formula-only \
-            --output artifacts
-          ruby -c artifacts/plug.rb
-          ruby -c artifacts/plug-app.rb
 
       - name: Generate checksums
         shell: bash
         run: |
           set -euo pipefail
           cd artifacts
-          sha256sum \
-            plug-mcp-*.tar.gz \
-            Plug-*.dmg \
-            source.tar.gz \
-            source.tar.gz.sha256 \
-            plug-mcp-installer.sh \
-            plug.rb \
-            plug-app.rb \
-            appcast.xml > checksums.sha256
+          sha256sum Plug-*.dmg plug-app.rb appcast.xml > checksums.sha256
           cat checksums.sha256
 
-      - name: Generate release notes
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --latest --strip header
-        env:
-          OUTPUT: RELEASE_NOTES.md
-
-      - name: Verify prepared assets
+      # The release notes are the CHANGELOG section for this version, which
+      # scripts/release.sh renamed from "Unreleased" when it cut the release.
+      - name: Extract release notes from CHANGELOG.md
         shell: bash
         run: |
           set -euo pipefail
-          test -s artifacts/appcast.xml
-          test -f artifacts/plug-mcp-installer.sh
-          test -n "$(compgen -G 'artifacts/Plug-*.dmg')"
-          if command -v xmllint >/dev/null 2>&1; then
-            xmllint --noout artifacts/appcast.xml
+          version="${TAG#v}"
+          awk -v v="$version" '
+            /^## \[/ { printing = index($0, "## [" v "]") == 1; next }
+            printing { print }
+          ' CHANGELOG.md > artifacts/RELEASE_NOTES.md
+          if ! grep -q '[^[:space:]]' artifacts/RELEASE_NOTES.md; then
+            echo "CHANGELOG.md has no '## [$version]' section" >&2
+            exit 1
           fi
-          (cd artifacts && sha256sum -c checksums.sha256)
-          ruby -c artifacts/plug.rb
-          ruby -c artifacts/plug-app.rb
-
-      - name: Include release notes in prepared bundle
-        shell: bash
-        run: cp RELEASE_NOTES.md artifacts/RELEASE_NOTES.md
-
-      - name: Upload prepared release bundle
-        uses: actions/upload-artifact@v6
-        with:
-          name: prepared-release
-          path: artifacts
-
-  publish-release:
-    name: Publish release transaction
-    needs: prepare-release
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download prepared release bundle
-        uses: actions/download-artifact@v7
-        with:
-          name: prepared-release
-          path: artifacts
+          cat artifacts/RELEASE_NOTES.md
 
       - name: Checkout Homebrew tap
         uses: actions/checkout@v5
@@ -408,7 +211,7 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
-      - name: Publish staged release and tap transaction
+      - name: Publish release and update tap
         shell: bash
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
