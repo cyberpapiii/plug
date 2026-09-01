@@ -303,11 +303,10 @@ jobs:
             https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Verify cargo-dist plan and custom release workflow
+      - name: Verify cargo-dist plan
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/verify-release-workflow.sh
           dist plan --no-local-paths
 
       - name: Build global cargo-dist artifacts

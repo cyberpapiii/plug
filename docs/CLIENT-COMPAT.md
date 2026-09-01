@@ -39,10 +39,7 @@ invoke `plug connect`; they should not point at a separately installed binary.
 Headless macOS is unsupported because first-use ServiceManagement and Keychain
 consent need a logged-in GUI session.
 
-Linux uses standalone Formula, shell-installer, or archive paths. Fresh source
-development runs `./scripts/setup-codesigning.sh` before
-`./scripts/dev-reinstall.sh`, then invokes the installed binary as
-`PLUG_DEV=1 plug-dev`.
+Linux uses standalone Formula, shell-installer, or archive paths. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
 
 ---
 

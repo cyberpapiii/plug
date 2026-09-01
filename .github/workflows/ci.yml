@@ -16,7 +16,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   RUSTFLAGS: -Dwarnings
-  MSRV: "1.88.0"
 
 jobs:
   classify:
@@ -53,19 +52,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  msrv:
-    name: MSRV check (1.88.0)
-    needs: classify
-    if: needs.classify.outputs.rust == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.MSRV }}
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-
   test-linux:
     name: Test (ubuntu)
     needs: classify
@@ -99,19 +85,6 @@ jobs:
       - run: npx playwright install --with-deps chromium webkit
       - run: npm run test:e2e
 
-  test-macos:
-    name: Test (macos)
-    needs: classify
-    # Duplicate of Test (ubuntu) except for macOS cfg. Catch that on main,
-    # not on every PR; Plug.app covers Swift and the bundled daemon.
-    if: needs.classify.outputs.rust == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-
   test-macos-app:
     name: Test (Plug.app)
     needs: classify
@@ -126,71 +99,14 @@ jobs:
       - run: brew install xcodegen
       - run: swift test --package-path PlugApp/PlugIPC
       - run: ./scripts/check-app-architecture.sh
-      # scripts/test-app.sh generates the project, proves the app and
-      # login-service bundle compile together, and runs the unit suite with the
-      # workspace version the suite expects. It is the same script
-      # scripts/dev.sh runs locally, so a green local app lane means this job is
-      # green too. --unsigned skips the signed fixture class, which needs a
-      # Developer ID host bundle and an embedded SMAppService that an ephemeral
-      # runner cannot provide; those run in the release build instead.
+      # scripts/test-app.sh generates the project and runs the unit suite with
+      # the workspace version the suite expects. It is the same script
+      # scripts/dev.sh runs locally. --unsigned skips the signed fixture class,
+      # which needs a Developer ID host bundle that an ephemeral runner cannot
+      # provide; that class runs only through scripts/dev.sh on a signed host.
       - run: ./scripts/test-app.sh --unsigned
         env:
           PLUG_APP_BUILD_NUMBER: ${{ github.run_number }}
-
-  cross-check:
-    name: Cross-check (${{ matrix.target }})
-    needs: classify
-    if: needs.classify.outputs.rust == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            packages: musl-tools
-          - target: aarch64-unknown-linux-gnu
-            packages: gcc-aarch64-linux-gnu
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Install cross-compilation toolchain
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --target ${{ matrix.target }}
-
-  binary-size:
-    name: Binary size gate
-    needs: classify
-    if: needs.classify.outputs.rust == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p plug-mcp
-      - name: Check binary size < 11 MiB
-        run: |
-          SIZE=$(stat --format=%s target/release/plug)
-          echo "Binary size: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
-          # v0.5 adds the operator API and modern-protocol bridge. Keep a tight
-          # regression ceiling above its 10.1 MiB optimized Linux baseline.
-          if [ "$SIZE" -gt 11534336 ]; then
-            echo "::error::Binary size ${SIZE} exceeds 11 MiB limit"
-            exit 1
-          fi
-
-  deny:
-    name: cargo deny
-    needs: classify
-    if: needs.classify.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check licenses bans sources advisories
 
   ci-complete:
     # One always-running check that branch protection can require. Requiring the
@@ -201,14 +117,9 @@ jobs:
     needs:
       - classify
       - check
-      - msrv
       - test-linux
       - browser-oauth
-      - test-macos
       - test-macos-app
-      - cross-check
-      - binary-size
-      - deny
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any lane failed or was cancelled

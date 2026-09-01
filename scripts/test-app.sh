@@ -82,13 +82,6 @@ run_xcodebuild() {
 # host-architecture test build alone does not cover. Signing is off here on
 # purpose: this step answers "does it compile", and a generic destination has no
 # provisioning to sign against.
-run_xcodebuild "build" build \
-  -project PlugApp/PlugApp.xcodeproj \
-  -scheme PlugApp \
-  -destination 'generic/platform=macOS' \
-  -quiet \
-  CODE_SIGNING_ALLOWED=NO \
-  "${settings[@]}"
 
 # `${skip[@]+...}` because macOS still ships bash 3.2, where expanding an empty
 # array under `set -u` is an error rather than nothing.

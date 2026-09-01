@@ -20,7 +20,7 @@ else
   git config core.hooksPath .githooks
   ok "git hooks now point at .githooks"
 fi
-note "pre-push runs the quick gate; post-commit, post-merge and post-checkout run the artifact guard"
+note "pre-push runs the quick gate (fmt + clippy)"
 
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   settings="$(gh api "repos/${GITHUB_REPOSITORY:-cyberpapiii/plug}" \
@@ -40,15 +40,10 @@ else
   note "xcodegen is missing. The PlugApp lane in scripts/dev.sh needs it: brew install xcodegen"
 fi
 
-"$repo_root/scripts/clean-build-artifacts.sh" --guard || true
-ok "artifact guard checked (silent means everything is inside budget)"
-
 cat <<'NEXT'
 
 Day to day:
+  scripts/dev-install.sh      build Plug.app from this tree and install it
   scripts/dev.sh              run the checks this change needs
   scripts/ship.sh "message"   commit, push, open a pull request, auto-merge
-
-Everything else looks after itself. The artifact guard runs on every commit,
-merge, checkout and push, and stays quiet unless something has grown.
 NEXT

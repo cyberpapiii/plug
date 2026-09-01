@@ -16,10 +16,7 @@ Open Plug.app once. First launch needs a logged-in GUI session for
 ServiceManagement and Keychain consent. Plug.app owns the GUI, `plug` command,
 background daemon, client links, and updates. Headless macOS is unsupported.
 
-Linux uses standalone Formula, shell-installer, or archive paths. For a fresh
-source checkout, run `./scripts/setup-codesigning.sh` before
-`./scripts/dev-reinstall.sh`; invoke the installed development binary only as
-`PLUG_DEV=1 plug-dev`. It never replaces the production `plug` command.
+Linux uses standalone Formula, shell-installer, or archive paths. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
 
 ## Runtime Model
 
@@ -267,52 +264,19 @@ Current distribution names:
 - GitHub repo: `cyberpapiii/plug`
 - macOS app: signed `Plug.app` DMG and `plug-app` Homebrew Cask
 - Linux: `plug` Homebrew Formula, release shell installer, and standalone archives
-- Source development: isolated `PLUG_DEV=1 plug-dev`
+- Source development: `./scripts/dev-install.sh`
 
-Release checks before publishing:
-
-```sh
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo deny check advisories
-dist plan --no-local-paths
-dist build --artifacts=global
-```
-
+`./scripts/release.sh <version>` runs the whole release; see `docs/RELEASING.md`.
 The release workflow builds Darwin binaries only as inputs to the signed,
-universal Plug.app. It publishes Linux Formula, shell-installer, and archive
-artifacts separately. Do not turn those internal app inputs into a second
-macOS command-line install.
+universal Plug.app. Do not turn those internal app inputs into a second macOS
+command-line install.
 
-Build, package, and install checks can leave large generated directories behind. Before or after a release pass, inspect cleanup candidates with:
+## Build artifacts
 
-```sh
-scripts/clean-build-artifacts.sh
-```
-
-Then clean build/deploy artifacts with:
+`target/` and `PlugApp/.build` grow without bound. When disk matters:
 
 ```sh
-scripts/clean-build-artifacts.sh --yes
+cargo clean && rm -rf PlugApp/.build ~/Library/Developer/Xcode/DerivedData/PlugApp-*
 ```
 
-Use `--runtime-cache` only when old `plug://artifact/...` result files are no longer needed. The cleanup script never removes Plug config, OAuth tokens, sockets, PID files, installed binaries, or the shared `~/.cargo/registry`.
-
-Narrower modes exist when a full clean is more than you want:
-
-| Mode | Removes |
-| --- | --- |
-| `--guard` | regenerable caches when `target/` is over budget, and this project's Xcode DerivedData when it is over its own. Silent otherwise, so it is safe to run after every build. `scripts/dev.sh` and the git hooks call it for you. |
-| `--incremental` | `target/*/incremental` |
-| `--litter` | `*.profraw`, `*.profdata`, `.DS_Store`, `/tmp/plug-*` audit directories |
-| `--xcode` | this project's Xcode DerivedData |
-
-The `--guard` budgets default to 10 GB for `target/` against a measured 4.2 GB steady-state working set, and 5 GB for DerivedData. Override them with `PLUG_TARGET_BUDGET_GB` and `PLUG_DERIVED_BUDGET_GB`.
-
-For local source reinstalls, the cleanup can be folded into the reinstall command:
-
-```sh
-./scripts/setup-codesigning.sh
-./scripts/dev-reinstall.sh --quick --clean
-PLUG_DEV=1 plug-dev
-```
+A cold rebuild is about half a minute.

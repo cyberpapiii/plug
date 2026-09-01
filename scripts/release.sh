@@ -120,7 +120,6 @@ gh run watch "$run" --exit-status
 
 scripts/install-release.sh "$version"
 
-scripts/clean-build-artifacts.sh --guard
 
 echo
 echo "release: $tag published and installed"

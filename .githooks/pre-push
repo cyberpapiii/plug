@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Catch locally what CI reds on, before a push spends three minutes proving it.
 #
-# Runs formatting and lints for the lanes this branch touches, then lets the
-# artifact guard reclaim regenerable caches. Tests are deliberately not here:
+# Runs formatting and lints for the lanes this branch touches. Tests are
+# deliberately not here:
 # CI runs them, and a pre-push hook that costs minutes gets bypassed until it
 # is worthless.
 #
@@ -45,4 +45,3 @@ if ! "$repo_root/scripts/dev.sh" --quick --base "$base"; then
   exit 1
 fi
 
-"$repo_root/scripts/clean-build-artifacts.sh" --guard || true

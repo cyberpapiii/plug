@@ -23,21 +23,14 @@ Sparkle updates. Headless macOS is unsupported.
 
 Linux users choose one standalone path: the Linux-only Homebrew Formula, the
 Linux-only release shell installer, or a Linux release archive. These artifacts
-are not macOS installation paths. Source development uses an isolated command;
-it does not replace the production command owned by Plug.app. On a fresh
-checkout, create the local signing identity before the development install,
-then invoke `PLUG_DEV=1 plug-dev` only after that install:
-
-```sh
-./scripts/setup-codesigning.sh
-./scripts/dev-reinstall.sh --quick
-PLUG_DEV=1 plug-dev
-```
+are not macOS installation paths. Source development runs `./scripts/dev-install.sh`, which builds a Developer
+ID signed `Plug.app` from the working tree and installs it in place; releases
+are only for sharing a build with other people.
 
 ## Before tagging
 
 1. `main` is green: `cargo test --workspace`, `cargo clippy --workspace
-   --all-targets -- -D warnings`, `cargo fmt --check`, `cargo deny check`.
+   --all-targets -- -D warnings`, `cargo fmt --check`.
 2. `CHANGELOG.md` covers everything since the previous tag. Release notes are
    generated from the commit history by `git-cliff`, so the commit subjects are
    the release notes; fix them before tagging, not after.
@@ -108,10 +101,11 @@ a signature change, so macOS will prompt once more for access to Plug's stored
 upstream credentials. Choosing Always Allow at that prompt holds for every
 later Developer ID release.
 
-## Local development signing is a different thing
+## Local development builds use the same identity
 
-`scripts/setup-codesigning.sh` creates a self-signed identity used by the
-isolated `plug-dev` binary from `scripts/dev-reinstall.sh`. Its only job is to
-keep a locally-built development binary's signature stable across rebuilds so
-the Keychain stops re-prompting. It is not a distribution identity and must
-never be used to sign Plug.app or a release binary.
+`scripts/dev-install.sh` signs a working-tree build with the Developer ID
+certificate in the login keychain, so a development install carries the same
+signature family as a release and the Keychain never re-prompts between the
+two. It is not notarized, which is fine for a bundle that never leaves this
+Mac.
+

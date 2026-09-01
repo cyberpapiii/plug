@@ -1218,7 +1218,7 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
 /// Source-development repair sequence for the macOS code-signing warning.
 #[cfg(any(target_os = "macos", test))]
 fn codesign_fix_suggestion() -> &'static str {
-    "Install or open signed Plug.app for production. For source development, run `./scripts/setup-codesigning.sh`, then `./scripts/dev-reinstall.sh`, then `PLUG_DEV=1 plug-dev`; never re-sign Plug.app or a release executable."
+    "Install or open signed Plug.app for production. For source development, run `./scripts/dev-install.sh`, which builds a Developer ID signed Plug.app from the working tree and installs it; never re-sign Plug.app or a release executable by hand."
 }
 
 /// macOS only: warn when the running binary is ad-hoc signed *and* keychain-backed
@@ -1954,20 +1954,10 @@ command = "example-server"
     // -- DoctorReport --
 
     #[test]
-    fn codesign_fix_suggestion_preserves_source_setup_order() {
+    fn codesign_fix_suggestion_names_the_dev_install_loop() {
         let suggestion = codesign_fix_suggestion();
-        let setup = suggestion
-            .find("./scripts/setup-codesigning.sh")
-            .expect("setup script in doctor guidance");
-        let reinstall = suggestion
-            .find("./scripts/dev-reinstall.sh")
-            .expect("reinstall script in doctor guidance");
-        let invocation = suggestion
-            .find("PLUG_DEV=1 plug-dev")
-            .expect("development invocation in doctor guidance");
-
-        assert!(setup < reinstall && reinstall < invocation);
-        assert!(!suggestion.contains("codesign-setup"));
+        assert!(suggestion.contains("./scripts/dev-install.sh"));
+        assert!(suggestion.contains("never re-sign Plug.app"));
     }
 
     #[test]
