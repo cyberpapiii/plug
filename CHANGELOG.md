@@ -5,7 +5,7 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.11] - 2026-09-01
 
 ### Added
 
@@ -35,7 +35,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   on every push to `main`, where before it compiled cold on every tag.
 - `scripts/ship.sh` returns to `main` after arming auto-merge and steps off a
   ship branch whose pull request already merged, so a follow-up change can no
-  longer be pushed onto a dead branch.
+  longer be pushed onto a dead branch. `scripts/release.sh` then waits until
+  that prepare pull request actually lands before tagging, instead of treating
+  the return to `main` as proof the version bump is already there.
 - The repository's agent and contributor instructions collapse into one short
   `CLAUDE.md`; `AGENTS.md` points at it. The project-state snapshot, plan,
   truth rules, workflow model, per-change doc-update checklists, finished
