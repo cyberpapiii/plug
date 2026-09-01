@@ -78,24 +78,18 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   scripts/ship.sh "chore: prepare Plug $version release"
 fi
 
-branch="$(git rev-parse --abbrev-ref HEAD)"
-if [[ "$branch" != "main" ]]; then
-  echo "release: waiting for $branch to merge"
-  for _ in $(seq 1 180); do
-    state="$(gh pr view "$branch" --json state --jq .state 2>/dev/null || true)"
-    case "$state" in
-      MERGED) break ;;
-      CLOSED) echo "release: $branch was closed without merging" >&2; exit 1 ;;
-    esac
-    sleep 20
-  done
-  [[ "$(gh pr view "$branch" --json state --jq .state 2>/dev/null || true)" == "MERGED" ]] ||
-    { echo "release: $branch did not merge within an hour" >&2; exit 1; }
+# ship.sh returns to main immediately, so being on main does not mean the
+# prepare pull request has landed. Wait until origin/main carries this version.
+echo "release: waiting for $version to land on main"
+for _ in $(seq 1 180); do
+  git fetch -q --prune origin
   git checkout -q main
-fi
-
-git pull -q --ff-only
-git fetch -q --prune origin
+  git merge -q --ff-only origin/main
+  if [[ "$(workspace_version)" == "$version" ]]; then
+    break
+  fi
+  sleep 20
+done
 
 merged="$(workspace_version)"
 [[ "$merged" == "$version" ]] ||
