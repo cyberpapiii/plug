@@ -5,8 +5,7 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## In progress
 
-- Nothing. The September 2026 pipeline simplification is done; the next
-  release (0.8.11) is the first on the trimmed workflow, so watch it once.
+- Nothing.
 
 ## Open
 
