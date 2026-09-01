@@ -2,7 +2,7 @@
 
 This document reflects the dependency picture of the current merged codebase.
 
-Use `docs/PROJECT-STATE-SNAPSHOT.md` and `docs/PLAN.md` for overall project state. This file is
+`CHANGELOG.md` and `docs/STATUS.md` carry project state. This file is
 about dependency shape, not roadmap status.
 
 ## Off-Main OAuth Owner Candidate

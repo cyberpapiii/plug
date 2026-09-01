@@ -18,6 +18,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- The repository's agent and contributor instructions collapse into one short
+  `CLAUDE.md`; `AGENTS.md` points at it. The project-state snapshot, plan,
+  truth rules, workflow model, per-change doc-update checklists, finished
+  todos, plans, brainstorms, research, solution write-ups, audits, and
+  per-version release-notes files move under `docs/archive/`. Open work now
+  lives in `docs/STATUS.md`; `CHANGELOG.md` is the only change record.
 - Each app section now opens with one page header that carries its title, a
   live summary, and the section's controls, so the window toolbar holds only
   search. Loading and unavailable states share one look, and every section has
@@ -382,7 +388,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [0.7.0] - 2026-08-25
 
-Detailed notes: [Plug 0.7.0](docs/RELEASE-NOTES-0.7.0.md).
+Detailed notes: [Plug 0.7.0](docs/archive/release-notes/RELEASE-NOTES-0.7.0.md).
 
 ### Added
 
@@ -430,7 +436,7 @@ Detailed notes: [Plug 0.7.0](docs/RELEASE-NOTES-0.7.0.md).
 
 ## [0.5.2] - 2026-08-25
 
-Detailed notes: [Plug 0.5.2](docs/RELEASE-NOTES-0.5.2.md).
+Detailed notes: [Plug 0.5.2](docs/archive/release-notes/RELEASE-NOTES-0.5.2.md).
 
 ### Fixed
 
@@ -440,7 +446,7 @@ Detailed notes: [Plug 0.5.2](docs/RELEASE-NOTES-0.5.2.md).
 
 ## [0.5.1] - 2026-08-25
 
-Detailed notes: [Plug 0.5.1](docs/RELEASE-NOTES-0.5.1.md).
+Detailed notes: [Plug 0.5.1](docs/archive/release-notes/RELEASE-NOTES-0.5.1.md).
 
 ### Fixed
 
@@ -450,7 +456,7 @@ Detailed notes: [Plug 0.5.1](docs/RELEASE-NOTES-0.5.1.md).
 
 ## [0.5.0] - 2026-08-25
 
-Detailed notes: [Plug 0.5.0](docs/RELEASE-NOTES-0.5.0.md).
+Detailed notes: [Plug 0.5.0](docs/archive/release-notes/RELEASE-NOTES-0.5.0.md).
 
 ### Added
 
@@ -502,7 +508,7 @@ Detailed notes: [Plug 0.5.0](docs/RELEASE-NOTES-0.5.0.md).
 
 ## [0.4.0] - 2026-08-24
 
-Detailed notes: [MCP 2026 dual-era modernization](docs/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md), [multi-client OAuth](docs/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
+Detailed notes: [MCP 2026 dual-era modernization](docs/archive/release-notes/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md), [multi-client OAuth](docs/archive/release-notes/RELEASE-NOTES-2026-07-17-MULTI-CLIENT-OAUTH-codex-5.6-sol.md), [RMCP 2.2 upgrade](docs/archive/release-notes/RELEASE-NOTES-2026-07-13-RMCP-2.2-codex-5.6-sol.md), and [July 2026 reliability update](docs/archive/release-notes/RELEASE-NOTES-2026-07-12-codex-5.6-sol.md).
 
 ### Added
 

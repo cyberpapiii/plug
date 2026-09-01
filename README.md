@@ -52,22 +52,13 @@ Linux users can choose one standalone path:
 
 ### Source development
 
-Source builds use an isolated development command and never replace the
-production `plug` command owned by Plug.app:
-
-For a fresh checkout, set up local signing before the first development
-install. The setup script is idempotent and safely no-ops off macOS:
-
 ```sh
-./scripts/setup-codesigning.sh
-./scripts/dev-reinstall.sh --quick
-PLUG_DEV=1 plug-dev
+./scripts/dev-install.sh
 ```
 
-Use `./scripts/dev-reinstall.sh --quick --clean` when you also want generated
-build artifacts removed; invoke the installed development binary afterward with
-`PLUG_DEV=1 plug-dev`. Do not use development signing commands on Plug.app or
-release binaries.
+Builds `Plug.app` from the working tree, signs it with the Developer ID in
+your login keychain, installs it, and lets the app replace its daemon. See
+`CONTRIBUTING.md`.
 
 ### Connect Claude Desktop
 
@@ -173,7 +164,7 @@ synthesized list-cache directives yet.
 
 See the [MCP 2026 dual-era guide](docs/guides/mcp-2026-dual-era.md) for exact
 activation, verification, rollback, compatibility, and limitation details. See
-the [branch release notes](docs/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md)
+the [branch release notes](docs/archive/release-notes/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md)
 for the practical user and agent impact.
 
 ## Why plug?
@@ -319,18 +310,16 @@ Notes:
 
 | Document | Purpose |
 |----------|---------|
-| [PROJECT-STATE-SNAPSHOT.md](docs/PROJECT-STATE-SNAPSHOT.md) | Current state of what is implemented on `main` |
-| [PLAN.md](docs/PLAN.md) | Current state and remaining work |
-| [VISION.md](docs/VISION.md) | Core principles, design philosophy, non-negotiable rules |
+| [STATUS.md](docs/STATUS.md) | Open work |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical architecture, component design, data flow |
+| [VISION.md](docs/VISION.md) | Core principles, design philosophy, non-negotiable rules |
 | [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | AI client quirks, limits, and configuration |
 | [OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md) | Production operation: TLS, auth, observability, sandboxing |
+| [RELEASING.md](docs/RELEASING.md) | How a release is built, signed, and published |
 | [UX-DESIGN.md](docs/UX-DESIGN.md) | Guided CLI + agent UX patterns |
 | [CRATE-STACK.md](docs/CRATE-STACK.md) | Dependency decisions with rationale |
 | [MCP-SPEC.md](docs/MCP-SPEC.md) | MCP protocol reference relevant to implementation |
-| [USERS.md](docs/USERS.md) | User stories, personas, scenarios |
-| [COMPETITIVE.md](docs/COMPETITIVE.md) | Competitor analysis |
-| [RESEARCH-BREADCRUMBS.md](docs/RESEARCH-BREADCRUMBS.md) | Open questions and deeper research signals |
+| [archive/](docs/archive/) | Plans, research, audits, and release notes from before September 2026 |
 
 ## Design Principles
 

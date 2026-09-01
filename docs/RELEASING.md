@@ -41,8 +41,7 @@ PLUG_DEV=1 plug-dev
 2. `CHANGELOG.md` covers everything since the previous tag. Release notes are
    generated from the commit history by `git-cliff`, so the commit subjects are
    the release notes; fix them before tagging, not after.
-3. `docs/PROJECT-STATE-SNAPSHOT.md` matches `main`.
-4. `workspace.package.version` in the root `Cargo.toml` matches the tag you are
+3. `workspace.package.version` in the root `Cargo.toml` matches the tag you are
    about to push, and `Cargo.lock` has been regenerated to match.
 
 ## Tagging
