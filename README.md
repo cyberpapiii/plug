@@ -76,7 +76,9 @@ plug setup
 
 This discovers existing MCP servers, imports them into `plug`, and walks you through linking your AI clients.
 
-Or create a config file manually at `~/.config/plug/config.toml`:
+Or create a config file manually at
+`~/Library/Application Support/plug/config.toml` on macOS
+(`~/.config/plug/config.toml` on Linux):
 
 ```toml
 [servers.github]
@@ -120,16 +122,9 @@ For Cursor, Windsurf, Gemini CLI, and others — see [docs/CLIENT-COMPAT.md](doc
 
 **3. That's it.** All your servers are available through every client simultaneously.
 
-## MCP 2026 dual-era preview (development branch)
+## MCP 2026 dual-era preview
 
-This development branch adds an opt-in MCP `2026-07-28` path while preserving
-the legacy lifecycle used by today's installed Claude, Cursor, and Codex clients.
-It does not change an installed Plug binary until the branch is merged, released,
-and installed. Both modern-protocol gates default to `false` pending conformance
-testing with real independent peers.
-
-The two directions can be enabled independently. A cautious upstream-only canary
-looks like this:
+Both modern-protocol gates default to `false`. A cautious upstream-only canary:
 
 ```toml
 modern_upstream_enabled = true
@@ -143,23 +138,9 @@ url = "https://example.com/mcp"
 protocol = "auto"
 ```
 
-`protocol = "auto"` tries modern discovery and falls back to the legacy
-`initialize` lifecycle only when the server reports that discovery is not
-implemented. Use `protocol = "modern"` only for a server known to require the
-new lifecycle. Existing servers default to `protocol = "legacy"`.
-
-Across the proven modern paths, Plug supports durable tasks on eligible routes,
-preserves admitted extension metadata and W3C trace context, and protects
-native synchronous modern-to-modern tool continuations with principal-bound,
-expiring, single-use state. Task calls targeting modern upstreams remain
-suppressed until task input-required handling is complete. Plug also does not
-advertise listeners, mixed-era multi-round tool requests, MCP Apps/UI, or
-synthesized list-cache directives yet.
-
-See the [MCP 2026 dual-era guide](docs/guides/mcp-2026-dual-era.md) for exact
-activation, verification, rollback, compatibility, and limitation details. See
-the [branch release notes](docs/archive/release-notes/RELEASE-NOTES-2026-08-04-MCP-2026-DUAL-ERA-MODERNIZATION-codex-5.6-sol.md)
-for the practical user and agent impact.
+`protocol = "auto"` tries modern discovery and falls back to legacy `initialize`
+when the server does not implement it. Existing servers default to
+`protocol = "legacy"`. See [docs/guides/mcp-2026-dual-era.md](docs/guides/mcp-2026-dual-era.md).
 
 ## Why plug?
 
@@ -167,7 +148,7 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 
 **plug** fixes this:
 
-- **One config** — define your servers once in `~/.config/plug/config.toml`
+- **One config** — define your servers once (`~/Library/Application Support/plug/config.toml` on macOS)
 - **Every client** — Claude Code, Cursor, Gemini CLI, Codex, Windsurf, VS Code Copilot, OpenCode, Zed
 - **Shared connections** — N clients share 1 upstream connection per server (not N connections)
 - **Client-aware** — automatically respects per-client tool limits (Windsurf: 100, VS Code: 128)
@@ -204,7 +185,8 @@ plug serve --daemon            # Run the shared background service (IPC + HTTP)
 Full configuration reference:
 
 ```toml
-# ~/.config/plug/config.toml
+# macOS: ~/Library/Application Support/plug/config.toml
+# Linux: ~/.config/plug/config.toml
 
 # Global settings
 enable_prefix = true       # Legacy compatibility field; tool names are always prefixed
