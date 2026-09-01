@@ -5,6 +5,7 @@ import SwiftUI
 /// One spacing scale for the whole app. Every gap in Plug is one of these.
 enum Metric {
     static let hairline: CGFloat = 2
+    static let rowGap: CGFloat = 4
     static let tight: CGFloat = 6
     static let snug: CGFloat = 10
     static let regular: CGFloat = 14
@@ -12,6 +13,10 @@ enum Metric {
     static let corner: CGFloat = 10
     static let popoverWidth: CGFloat = 340
     static let popoverMaxListHeight: CGFloat = 268
+    static let popoverRowHeight: CGFloat = 36
+    /// Keep long management lists readable on wide displays without making
+    /// rows feel pinned to the window edges.
+    static let contentMaxWidth: CGFloat = 960
 }
 
 // MARK: - Tone
@@ -49,7 +54,7 @@ extension ServerHealth {
     /// Shape, not just colour, carries the state.
     var symbol: String {
         switch self {
-        case .working: "checkmark.circle.fill"
+        case .working: "circle.fill"
         case .starting: "circle.dotted"
         case .signInNeeded: "person.badge.key.fill"
         case .down: "exclamationmark.circle.fill"
@@ -66,30 +71,62 @@ extension ServerHealth {
 struct StatusGlyph: View {
     let health: ServerHealth
     var size: Font = .body
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var livePulse = false
 
     var body: some View {
-        Image(systemName: health.symbol)
-            .font(size)
-            .foregroundStyle(health.color)
-            .symbolRenderingMode(.hierarchical)
-            .accessibilityLabel(health.label)
+        Group {
+            if health == .working {
+                ZStack {
+                    Circle()
+                        .fill(health.color.opacity(livePulse ? 0.16 : 0.07))
+                        .frame(width: 16, height: 16)
+                        .scaleEffect(livePulse ? 1 : 0.72)
+                    Circle()
+                        .fill(health.color)
+                        .frame(width: 7, height: 7)
+                }
+                .animation(
+                    reduceMotion
+                        ? nil
+                        : .easeInOut(duration: 1.35).repeatForever(autoreverses: true),
+                    value: livePulse
+                )
+            } else {
+                Image(systemName: health.symbol)
+                    .font(size)
+                    .foregroundStyle(health.color)
+                    .symbolRenderingMode(.hierarchical)
+            }
+        }
+        .frame(width: 18, height: 18)
+        .accessibilityLabel(health.label)
+        .onAppear {
+            livePulse = health == .working && !reduceMotion
+        }
+        .onChange(of: health) { _, newHealth in
+            livePulse = newHealth == .working && !reduceMotion
+        }
+        .onChange(of: reduceMotion) { _, isReduced in
+            livePulse = health == .working && !isReduced
+        }
     }
 }
 
-/// A section title in the quiet, all-caps register used for grouping.
+/// A calm, readable section title shared by lists, inspectors, and history.
 struct SectionLabel: View {
     let text: String
     var trailing: String?
 
     var body: some View {
         HStack(spacing: Metric.tight) {
-            Text(text.uppercased())
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            Text(text)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.secondary)
             Spacer(minLength: 0)
             if let trailing {
                 Text(trailing)
-                    .font(.caption2)
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
         }
@@ -273,23 +310,6 @@ struct QuietRowButtonStyle: ButtonStyle {
     }
 }
 
-/// A square, quiet button for a control whose icon is the label.
-struct QuietIconButtonStyle: ButtonStyle {
-    @State private var hovering = false
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .foregroundStyle(.secondary)
-            .frame(width: 26, height: 24)
-            .background(
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : (hovering ? 0.07 : 0)))
-            )
-            .contentShape(Rectangle())
-            .onHover { hovering = $0 }
-    }
-}
-
 extension View {
     /// Standard inset for popover content blocks.
     func popoverInset() -> some View {
@@ -302,7 +322,7 @@ extension View {
     func nativeGlassSurface(tint: Color? = nil) -> some View {
 #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
-            glassEffect(.regular.tint(tint), in: .rect(cornerRadius: Metric.corner))
+            glassEffect(.regular.tint(tint), in: .rect(cornerRadius: Metric.corner, style: .continuous))
         } else {
             background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
         }
@@ -323,6 +343,20 @@ extension View {
         }
 #else
         buttonStyle(.bordered)
+#endif
+    }
+
+    /// Quiet inset content follows its container's corner geometry on macOS 26.
+    @ViewBuilder
+    func nativeInsetSurface(_ fill: AnyShapeStyle) -> some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            background(fill, in: .rect(cornerRadius: Metric.corner, style: .continuous))
+        } else {
+            background(fill, in: RoundedRectangle(cornerRadius: Metric.corner))
+        }
+#else
+        background(fill, in: RoundedRectangle(cornerRadius: Metric.corner))
 #endif
     }
 }

@@ -2,12 +2,22 @@ import AppKit
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    var showWindow: (() -> Void)?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag { showWindow?() }
+        return true
     }
 }
 
@@ -30,7 +40,10 @@ struct PlugApplication: App {
             // never be opened.
             Image(systemName: model.menuBarSymbol)
                 .accessibilityLabel("Plug: \(model.verdict.title)")
-                .task { await model.start() }
+                .task {
+                    appDelegate.showWindow = { runner.run(.openCurrentWindow) }
+                    await model.start()
+                }
         }
         .menuBarExtraStyle(.window)
 
@@ -38,10 +51,11 @@ struct PlugApplication: App {
         // auditing who is connected, reading history.
         Window("Plug", id: Self.windowID) {
             RootView(model: model, router: router, run: runner.run)
-                .frame(minWidth: 680, minHeight: 460)
+                .frame(minWidth: 820, minHeight: 500)
                 .task { await model.start() }
         }
         .defaultSize(width: 820, height: 560)
+        .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified)
         .commands {
             // Plug refreshes itself, so a refresh button would be visual weight

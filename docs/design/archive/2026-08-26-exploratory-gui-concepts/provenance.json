@@ -1,0 +1,106 @@
+{
+  "artifact_set": "Exploratory Plug GUI concepts",
+  "captured_at": "2026-08-28T07:42:11-04:00",
+  "classification": "design history; not current product truth",
+  "files": [
+    {
+      "allocated_bytes": 1114112,
+      "logical_bytes": 1112637,
+      "modified_time": "2026-08-26T23:21:39-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_21_32 PM.png",
+      "sha256": "f1d3c41354f6c02a5f0be6b7110913c88f99c1304fbbe308389df3853ee87edf",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_21_32 PM.png"
+    },
+    {
+      "allocated_bytes": 1134592,
+      "logical_bytes": 1131708,
+      "modified_time": "2026-08-26T23:21:44-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_21_42 PM.png",
+      "sha256": "2701d08a04d2600ec01c95f43676665ae7ae2aa117ec771b7879494f8331a969",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_21_42 PM.png"
+    },
+    {
+      "allocated_bytes": 1392640,
+      "logical_bytes": 1392292,
+      "modified_time": "2026-08-26T23:21:48-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_21_47 PM.png",
+      "sha256": "90875aad9d6e438ffb8d5b9c4a0eba4fcb4233d2629f8c83f18c42872277a8b9",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_21_47 PM.png"
+    },
+    {
+      "allocated_bytes": 1122304,
+      "logical_bytes": 1119118,
+      "modified_time": "2026-08-26T23:23:28-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_27 PM.png",
+      "sha256": "c94f650d795818cc814538443b7f7af10a15ad4c5479a0aae38f73019d6a70f4",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_27 PM.png"
+    },
+    {
+      "allocated_bytes": 1331200,
+      "logical_bytes": 1328583,
+      "modified_time": "2026-08-26T23:23:31-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_30 PM.png",
+      "sha256": "87fa78f546457821a06a7d64003c2307bf528546766a1c7331f98c0394e9fe25",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_30 PM.png"
+    },
+    {
+      "allocated_bytes": 1277952,
+      "logical_bytes": 1274554,
+      "modified_time": "2026-08-26T23:23:35-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_34 PM.png",
+      "sha256": "98f3ba50e6dfa8240d7781f8bfca472c86ccb33fdd0cb6c4e02420749ddbfede",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_34 PM.png"
+    },
+    {
+      "allocated_bytes": 1531904,
+      "logical_bytes": 1528367,
+      "modified_time": "2026-08-26T23:23:38-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_37 PM.png",
+      "sha256": "34835634fa2d7c0195083b2f56308cf5285f5db03fb94ee5e1102bb31a80b83e",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_37 PM.png"
+    },
+    {
+      "allocated_bytes": 1069056,
+      "logical_bytes": 1064984,
+      "modified_time": "2026-08-26T23:23:42-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_41 PM.png",
+      "sha256": "b430b1d6e86cebf8bd1dcd84a0779293f6bb451d6a20c7fa27d0579e5b97b497",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_41 PM.png"
+    },
+    {
+      "allocated_bytes": 1327104,
+      "logical_bytes": 1324761,
+      "modified_time": "2026-08-26T23:23:45-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_45 PM.png",
+      "sha256": "1525b62337a9e135c9e3ae8c041df6f2a47572133add03667edddc9c43139903",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_45 PM.png"
+    },
+    {
+      "allocated_bytes": 1224704,
+      "logical_bytes": 1222302,
+      "modified_time": "2026-08-26T23:23:48-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_48 PM.png",
+      "sha256": "ba38d4b987c3e3bae552a4d55c8630c174869237d942f478d78b105b3858bc3f",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_48 PM.png"
+    },
+    {
+      "allocated_bytes": 1024000,
+      "logical_bytes": 1023873,
+      "modified_time": "2026-08-26T23:23:52-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_52 PM.png",
+      "sha256": "8a656b4ae10245f4e8a1642eb47f097748a512057e82aa58f5a4fdfe79934a96",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_52 PM.png"
+    },
+    {
+      "allocated_bytes": 1220608,
+      "logical_bytes": 1219471,
+      "modified_time": "2026-08-26T23:23:55-04:00",
+      "repo_destination": "/Users/robdezendorf/Documents/GitHub/plug/docs/design/archive/2026-08-26-exploratory-gui-concepts/Codex Image Aug 26, 2026, 11_23_55 PM.png",
+      "sha256": "c6f4b9b14435cf58eda78ca868860f014ba03d6055db084eda53d609b7e41eed",
+      "source": "/Users/robdezendorf/Downloads/Codex Image Aug 26, 2026, 11_23_55 PM.png"
+    }
+  ],
+  "logical_bytes": 14742650,
+  "related_current_design": "../../2026-08-26-menubar-app-redesign-claude-fable.md",
+  "source_count": 12
+}

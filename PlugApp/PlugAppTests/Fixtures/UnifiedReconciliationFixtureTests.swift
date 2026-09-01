@@ -727,10 +727,11 @@ private actor FixtureProcessRunner: ProcessRunning {
         }
 
         if executable == canonicalExecutable {
-            if arguments == ["doctor", "--output", "json"] {
-                let json = "{\"unified_install\":{\"client_repair_needed\":\(clientNeedsRepair)}}"
+            if arguments == ["repair", "--all", "--dry-run", "--output", "json"] {
+                let disposition = clientNeedsRepair ? "recognized_legacy" : "canonical"
+                let json = "{\"items\":[{\"changed\":false,\"disposition\":\"\(disposition)\"}]}"
                 return ProcessResult(
-                    status: clientNeedsRepair ? 2 : 0,
+                    status: 0,
                     stdout: Data(json.utf8),
                     stderr: Data()
                 )
@@ -740,7 +741,7 @@ private actor FixtureProcessRunner: ProcessRunning {
                     try Data(canonicalClientContents.utf8).write(to: clientURL, options: .atomic)
                     clientNeedsRepair = false
                 }
-                let json = "{\"items\":[{\"changed\":true},{\"changed\":false}]}"
+                let json = "{\"items\":[{\"changed\":true,\"disposition\":\"canonical\"},{\"changed\":false,\"disposition\":\"canonical\"}]}"
                 return ProcessResult(status: 0, stdout: Data(json.utf8), stderr: Data())
             }
         }

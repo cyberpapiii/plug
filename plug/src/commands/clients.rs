@@ -70,14 +70,15 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Claude Code", "claude-code"),
         ("Cursor", "cursor"),
         ("VS Code Copilot", "vscode"),
-        ("Windsurf", "windsurf"),
+        // Devin is the current product name. Keep the Windsurf target because
+        // Devin still reads the legacy config path and client identifier.
+        ("Devin", "windsurf"),
         ("Gemini CLI", "gemini-cli"),
         ("Codex CLI", "codex-cli"),
         ("OpenCode", "opencode"),
         ("Zed", "zed"),
         ("Cline (VS Code)", "cline"),
         ("Cline CLI", "cline-cli"),
-        ("RooCode", "roocode"),
         ("Factory", "factory"),
         ("Nanobot", "nanobot"),
         ("JetBrains Junie", "junie"),
@@ -1848,5 +1849,12 @@ extensions:
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn client_inventory_uses_current_devin_name_and_omits_roocode() {
+        let clients = all_client_targets();
+        assert!(clients.contains(&("Devin", "windsurf")));
+        assert!(!clients.iter().any(|(_, target)| *target == "roocode"));
     }
 }

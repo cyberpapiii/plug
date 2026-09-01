@@ -45,6 +45,7 @@ final class AppModel {
     /// "Plug is not running" is an answer, not a question.
     private(set) var connectionState: ConnectionState = .connecting
     private(set) var snapshot: OperatorSnapshot = .empty
+    private(set) var hasLoadedSnapshot = false
     private(set) var activities: [ActivityEvent] = []
     /// How far back the history goes. The daemon keeps a bounded ring, so this
     /// is the whole of what can be asked for, not a page of a longer list.
@@ -57,7 +58,11 @@ final class AppModel {
     private(set) var signingInServers: Set<String> = []
     private(set) var toolCatalog = ToolCatalog()
     private(set) var connectableApps: [LinkableApp] = []
+    private(set) var hasLoadedConnectableApps = false
+    private(set) var isLoadingConnectableApps = false
+    private(set) var connectableAppsError: String?
     private(set) var busyApps: Set<String> = []
+    private(set) var busyTools: Set<String> = []
     private(set) var isRestartingService = false
     private var capabilities: Set<String> = []
     private var toolCatalogRevision: UInt64?
@@ -197,6 +202,20 @@ final class AppModel {
         }
     }
 
+    var isLoadingInitialData: Bool {
+        !hasLoadedSnapshot && connectionState == .connecting
+    }
+
+    var initialDataUnavailable: Bool {
+        !hasLoadedSnapshot && connectionState != .connecting
+    }
+
+    var dataIsStale: Bool {
+        hasLoadedSnapshot && connectionState != .ready
+    }
+
+    var canMutate: Bool { connectionState == .ready }
+
     /// Recent calls that touched one server, newest first.
     func recentActivity(for server: String, limit: Int = 12) -> [ActivityEvent] {
         activities
@@ -307,6 +326,7 @@ final class AppModel {
                 let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
                 let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
                 snapshot = value
+                hasLoadedSnapshot = true
                 NotificationService.shared.observe(value)
                 if case let .activity(events) = try await ipc.request(
                     .activity(
@@ -351,12 +371,18 @@ final class AppModel {
         refreshTask = nil
     }
 
+    func performOperation(_ request: (String) -> IPCRequest) async throws {
+        guard canMutate else { throw RuntimeUnavailableError() }
+        let token = try String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try await ipc.request(request(token))
+        lastError = nil
+        await refresh(forceCatalog: true)
+    }
+
     func perform(_ request: (String) -> IPCRequest) async {
         do {
-            let token = try String(contentsOf: tokenURL, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            _ = try await ipc.request(request(token))
-            await refresh(forceCatalog: true)
+            try await performOperation(request)
         } catch { lastError = error.localizedDescription }
     }
 
@@ -364,11 +390,9 @@ final class AppModel {
     func tools(for server: String) -> [ToolFacts] { toolCatalog.tools(for: server) }
 
     func setToolEnabled(_ tool: String, _ enabled: Bool) async {
+        guard busyTools.insert(tool).inserted else { return }
+        defer { busyTools.remove(tool) }
         await perform { .setToolEnabled(authToken: $0, tool: tool, enabled: enabled) }
-    }
-
-    func updateServer(name: String, config: ServerConfig) async {
-        await perform { .updateServer(authToken: $0, name: name, server: config) }
     }
 
     func serverConfig(name: String) async throws -> ServerConfig {
@@ -388,8 +412,17 @@ final class AppModel {
     /// Which AI apps are wired into Plug. Read from the client configuration
     /// files on disk rather than the daemon, which does not own them.
     func loadConnectableApps() async {
-        do { connectableApps = try await appLinker.apps() } catch {
-            lastError = error.localizedDescription
+        guard !isLoadingConnectableApps else { return }
+        isLoadingConnectableApps = true
+        defer {
+            isLoadingConnectableApps = false
+            hasLoadedConnectableApps = true
+        }
+        do {
+            connectableApps = try await appLinker.apps()
+            connectableAppsError = nil
+        } catch {
+            connectableAppsError = error.localizedDescription
         }
     }
 
@@ -456,4 +489,10 @@ final class AppModel {
 
 private struct ServerConfigReadRequiredError: LocalizedError {
     var errorDescription: String? { AppModel.serverConfigReadRequiredCopy }
+}
+
+private struct RuntimeUnavailableError: LocalizedError {
+    var errorDescription: String? {
+        "Plug is reconnecting. Try again when the background service is running."
+    }
 }

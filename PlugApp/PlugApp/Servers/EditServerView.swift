@@ -17,6 +17,7 @@ struct EditServerView: View {
     @State private var arguments = ""
     @State private var url = ""
     @State private var authToken = ""
+    @State private var clearAuthToken = false
     @State private var environment = ""
     @State private var saving = false
     @State private var failure: String?
@@ -34,31 +35,59 @@ struct EditServerView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Picker("Kind", selection: $isRemote) {
-                Label("Runs on this Mac", systemImage: "desktopcomputer").tag(false)
-                Label("Remote server", systemImage: "globe").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            Form {
-                if isRemote {
-                    TextField("Address", text: $url, prompt: Text("https://example.com/mcp"))
-                    SecureField("Access token", text: $authToken, prompt: Text("Optional"))
-                } else {
-                    TextField("Command", text: $command, prompt: Text("npx"))
-                    TextField("Arguments", text: $arguments, prompt: Text("-y linear-mcp"))
+            if loaded {
+                Picker("Kind", selection: $isRemote) {
+                    Label("Runs on this Mac", systemImage: "desktopcomputer").tag(false)
+                    Label("Remote server", systemImage: "globe").tag(true)
                 }
-                TextField(
-                    "Environment",
-                    text: $environment,
-                    prompt: Text("KEY=value, one per line"),
-                    axis: .vertical
-                )
-                .lineLimit(2...5)
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                Form {
+                    Section("Connection") {
+                        if isRemote {
+                            TextField("Address", text: $url, prompt: Text("https://example.com/mcp"))
+                                .listRowSeparator(.hidden)
+                            SecureField("New access token", text: $authToken, prompt: Text("Keep current token"))
+                                .listRowSeparator(.hidden)
+                                .onChange(of: authToken) { _, value in
+                                    if !value.isEmpty { clearAuthToken = false }
+                                }
+                            if loadedConfig?.authToken != nil {
+                                Toggle("Remove saved access token", isOn: $clearAuthToken)
+                                    .listRowSeparator(.hidden)
+                                    .disabled(!authToken.isEmpty)
+                            }
+                        } else {
+                            TextField("Command", text: $command, prompt: Text("npx"))
+                                .listRowSeparator(.hidden)
+                            TextField("Arguments", text: $arguments, prompt: Text("-y linear-mcp"))
+                                .listRowSeparator(.hidden)
+                        }
+                    }
+                    .listSectionSeparator(.hidden)
+
+                    Section("Environment variables") {
+                        TextField(
+                            "Variables",
+                            text: $environment,
+                            prompt: Text("KEY=value, one per line"),
+                            axis: .vertical
+                        )
+                        .lineLimit(2...5)
+                        .listRowSeparator(.hidden)
+                    }
+                    .listSectionSeparator(.hidden)
+                }
+                .formStyle(.grouped)
+                .frame(height: 260)
+            } else if failure == nil {
+                HStack(spacing: Metric.snug) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading server settings…").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 220, alignment: .center)
             }
-            .formStyle(.grouped)
-            .frame(height: 168)
 
             HStack(spacing: Metric.snug) {
                 if let failure {
@@ -83,6 +112,7 @@ struct EditServerView: View {
         }
         .padding(Metric.roomy)
         .frame(width: 520)
+        .interactiveDismissDisabled(saving)
         .task { await load() }
     }
 
@@ -116,7 +146,7 @@ struct EditServerView: View {
             command = config.command ?? ""
             arguments = Self.renderArguments(config.args)
             url = config.url ?? ""
-            authToken = config.authToken ?? ""
+            authToken = ""
             environment = config.env
                 .sorted { $0.key.localizedStandardCompare($1.key) == .orderedAscending }
                 .map { "\($0.key)=\($0.value)" }
@@ -137,6 +167,7 @@ struct EditServerView: View {
         }
         guard var config = loadedConfig else {
             failure = "The server settings could not be loaded."
+            saving = false
             return
         }
         if isRemote {
@@ -145,7 +176,11 @@ struct EditServerView: View {
             config.args = []
             config.url = url.trimmingCharacters(in: .whitespaces)
             let token = authToken.trimmingCharacters(in: .whitespaces)
-            config.authToken = token.isEmpty ? nil : token
+            if !token.isEmpty {
+                config.authToken = token
+            } else if clearAuthToken {
+                config.authToken = nil
+            }
         } else {
             config.transport = "stdio"
             config.command = command.trimmingCharacters(in: .whitespaces)
@@ -160,18 +195,18 @@ struct EditServerView: View {
         let saved = config
 
         Task {
-            await model.perform { .validateServer(authToken: $0, name: name, server: saved) }
-            if let error = model.lastError {
-                failure = error
+            do {
+                try await model.performOperation {
+                    .validateServer(authToken: $0, name: name, server: saved)
+                }
+                try await model.performOperation {
+                    .updateServer(authToken: $0, name: name, server: saved)
+                }
                 saving = false
-                return
-            }
-            await model.updateServer(name: name, config: saved)
-            saving = false
-            if let error = model.lastError {
-                failure = error
-            } else {
                 dismiss()
+            } catch {
+                failure = error.localizedDescription
+                saving = false
             }
         }
     }

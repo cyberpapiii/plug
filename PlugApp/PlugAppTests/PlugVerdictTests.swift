@@ -186,4 +186,8 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: false), .off)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true), .starting)
     }
+
+    func testWorkingHealthUsesLiveDotInsteadOfCompletionCheckmark() {
+        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).symbol, "circle.fill")
+    }
 }

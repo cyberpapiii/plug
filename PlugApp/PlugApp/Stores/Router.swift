@@ -79,13 +79,13 @@ struct PlugIntentRunner {
         case let .openWindow(section):
             router.section = section
             showWindow()
+        case .openCurrentWindow:
+            showWindow()
         case let .reveal(server):
             router.reveal(server: server)
             showWindow()
         case .checkForUpdates:
             UpdateService.shared.checkForUpdates()
-        case .openSettings:
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
         case .restartService:
             guard model.beginServiceRestart() else { return }
             Task {

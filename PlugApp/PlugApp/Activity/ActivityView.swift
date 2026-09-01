@@ -7,8 +7,9 @@ import SwiftUI
 /// it instead of a bare latency number.
 struct ActivityView: View {
     let model: AppModel
+    @Binding var search: String
+    let run: (PlugIntent) -> Void
     @State private var scope: Scope = .everything
-    @State private var search = ""
 
     enum Scope: String, CaseIterable, Identifiable {
         case everything = "Everything"
@@ -17,57 +18,75 @@ struct ActivityView: View {
     }
 
     var body: some View {
-        Group {
-            if model.activities.isEmpty {
-                EmptyPage(
-                    title: "Nothing yet",
-                    message: "Every tool call made through Plug shows up here.",
-                    symbol: "clock.arrow.circlepath"
-                )
-            } else if visible.isEmpty {
-                EmptyPage(
-                    title: scope == .problems ? "No problems" : "No matches",
-                    message: scope == .problems
-                        ? "Every recent call went through cleanly."
-                        : "Nothing recent matches that search.",
-                    symbol: scope == .problems ? "checkmark.circle" : "magnifyingglass"
-                )
-            } else {
-                List {
-                    ForEach(groups, id: \.title) { group in
-                        Section(group.title) {
-                            ForEach(group.events) { event in
-                                ActivityRow(event: event)
-                            }
+        VStack(spacing: 0) {
+            PageHeader(title: "Activity", detail: activitySummary) {
+                if !model.activities.isEmpty {
+                    Picker("Show", selection: $scope) {
+                        ForEach(Scope.allCases) { scope in
+                            Text(scope == .problems ? problemsLabel : scope.rawValue).tag(scope)
                         }
                     }
-                    // History is a bounded ring in the service, so the end of
-                    // this list is the end of what exists, not the end of a
-                    // page. Saying so is better than an empty scroll.
-                    if model.activityIsCapped {
-                        Text("This is the most recent \(AppModel.activityLimit) calls. Older ones are not kept.")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .listRowSeparator(.hidden)
-                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 190)
                 }
-                .listStyle(.inset)
+            }
+
+            Group {
+                if model.isLoadingInitialData {
+                    LoadingPage(message: "Loading activity…")
+                } else if model.initialDataUnavailable {
+                    UnavailablePage(item: "Activity") { run(.reconnect) }
+                } else if model.activities.isEmpty {
+                    EmptyPage(
+                        title: "No activity yet",
+                        message: "Tool calls will appear here with their app, server, time, and result.",
+                        symbol: "clock.arrow.circlepath"
+                    )
+                } else if visible.isEmpty {
+                    EmptyPage(
+                        title: scope == .problems ? "No problems" : "No matches",
+                        message: scope == .problems
+                            ? "Every recent call went through cleanly."
+                            : "Nothing recent matches that search.",
+                        symbol: scope == .problems ? "checkmark.circle" : "magnifyingglass"
+                    )
+                } else {
+                    List {
+                        ForEach(groups, id: \.title) { group in
+                            SectionLabel(
+                                text: group.title,
+                                trailing: group.events.count == 1 ? "1 call" : "\(group.events.count) calls"
+                            )
+                                .padding(.top, Metric.regular)
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                            ForEach(group.events) { event in
+                                ActivityRow(event: event)
+                                    .listRowSeparator(.hidden)
+                            }
+                        }
+                        if model.activityIsCapped {
+                            Text("This is the most recent \(AppModel.activityLimit) calls. Older ones are not kept.")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .listRowSeparator(.hidden)
+                        }
+                    }
+                    .listStyle(.inset)
+                    .frame(maxWidth: Metric.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                }
             }
         }
-        .searchable(text: $search, placement: .toolbar, prompt: "Search calls")
-        .toolbar {
-            ToolbarItem {
-                Picker("Show", selection: $scope) {
-                    ForEach(Scope.allCases) { scope in
-                        Text(scope == .problems ? problemsLabel : scope.rawValue).tag(scope)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 200)
-            }
-        }
-        .navigationTitle("Activity")
+    }
+
+    private var activitySummary: String? {
+        guard model.hasLoadedSnapshot else { return nil }
+        let count = model.activities.count
+        let summary = "\(count) recent \(count == 1 ? "call" : "calls")"
+        return model.dataIsStale ? "Last known · \(summary)" : summary
     }
 
     private var problemsLabel: String {
@@ -137,17 +156,17 @@ private struct ActivityRow: View {
                 .foregroundStyle(succeeded ? Color.secondary : .orange)
                 .frame(width: 18)
                 .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: Metric.rowGap) {
                 Text(headline).font(.body.monospaced()).lineLimit(1).truncationMode(.middle)
-                Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(context).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
-            VStack(alignment: .trailing, spacing: 0) {
+            VStack(alignment: .trailing, spacing: Metric.rowGap) {
                 Text(time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                Text(latency).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                Text(latency).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
             }
         }
-        .padding(.vertical, Metric.tight - 2)
+        .padding(.vertical, Metric.snug)
         .accessibilityElement(children: .combine)
     }
 

@@ -17,8 +17,17 @@ enum AppIcons {
     /// error, and the name lookup below catches most of the rest.
     private static let bundleIdentifiers: [String: String] = [
         "claude-desktop": "com.anthropic.claudefordesktop",
+        // Claude Code uses Claude's desktop identity when it has a GUI icon.
+        "claude-code": "com.anthropic.claudefordesktop",
+        // Codex CLI and the Codex desktop client share OpenAI's installed app
+        // identity on macOS (currently shipped as ChatGPT.app).
+        "codex": "com.openai.codex",
+        "codex-cli": "com.openai.codex",
         "cursor": "com.todesktop.230313mzl4w4u92",
         "vscode": "com.microsoft.VSCode",
+        "opencode": "ai.opencode.desktop",
+        // Cognition's Devin app retains this bundle identifier for backward
+        // compatibility with the former Windsurf desktop app.
         "windsurf": "com.exafunction.windsurf",
         "zed": "dev.zed.Zed",
         "antigravity": "com.google.antigravity",
@@ -29,7 +38,7 @@ enum AppIcons {
     /// Targets that are command line tools. They have no icon to show, and a
     /// terminal glyph says more about them than a generic app square would.
     private static let commandLineTargets: Set<String> = [
-        "claude-code", "codex-cli", "cline-cli", "gemini-cli",
+        "cline-cli", "gemini-cli",
         "goose", "opencode", "nanobot", "crush",
     ]
 
@@ -39,11 +48,26 @@ enum AppIcons {
     static func symbol(target: String, name: String = "") -> String {
         let key = target.lowercased()
         let text = "\(key) \(name.lowercased())"
+        // Keep Claude variants recognizable even when Claude.app is not
+        // installed. AppIcons.image uses the same installed icon when it is.
+        if key == "claude-code" || key == "claude-desktop" || text.contains("claude") {
+            return "sparkles"
+        }
+        // Codex has one visual identity across its CLI and desktop clients.
+        // The installed Codex app supplies the official artwork; this is the
+        // stable system fallback when that app is absent.
+        if key == "codex" || key == "codex-cli" || text.contains("codex") {
+            return "app.dashed"
+        }
+        // Goose is optional and often CLI-only. A bird is clearer than a
+        // terminal glyph while still remaining a system-provided fallback.
+        if key == "goose" || text.contains("goose") {
+            return "bird.fill"
+        }
         if commandLineTargets.contains(key) || text.contains("cli") { return "terminal" }
         if text.contains("code") || text.contains("cursor") || text.contains("zed") {
             return "chevron.left.forwardslash.chevron.right"
         }
-        if text.contains("claude") { return "sparkles" }
         return "app.dashed"
     }
 
@@ -69,12 +93,38 @@ enum AppIcons {
     ///
     /// Pure, so the matching rules are testable.
     static func target(forClientType clientType: String) -> String {
-        let value = clientType.lowercased().replacingOccurrences(of: "_", with: "-")
-        if value.contains("claude") && value.contains("code") { return "claude-code" }
-        if value.contains("claude") { return "claude-desktop" }
+        let value = clientType
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .joined(separator: "-")
+        let compact = value.replacingOccurrences(of: "-", with: "")
+        if compact.contains("claudecode") { return "claude-code" }
+        if compact.contains("claude") { return "claude-desktop" }
+        if compact.contains("codex") {
+            return "codex-cli"
+        }
+        if compact.contains("devin") || compact.contains("cascade") ||
+            compact.contains("windsurf") || compact.contains("codeium") {
+            return "windsurf"
+        }
         for target in bundleIdentifiers.keys where value.contains(target) { return target }
         for target in commandLineTargets where value.contains(target) { return target }
         return value
+    }
+
+    /// Canonical product name for live client sessions. Unknown clients stay
+    /// unknown; Plug must not turn an opaque client identifier into a guess.
+    static func displayName(forTarget target: String) -> String? {
+        switch target.lowercased() {
+        case "claude-desktop": return "Claude Desktop"
+        case "claude-code": return "Claude Code"
+        case "codex", "codex-cli": return "Codex CLI"
+        case "cursor": return "Cursor"
+        case "windsurf": return "Devin"
+        case "opencode": return "OpenCode"
+        case "goose": return "Goose"
+        default: return nil
+        }
     }
 }
 
