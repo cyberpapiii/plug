@@ -6,8 +6,8 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 ## In progress
 
 - Development pipeline simplification, September 2026: local build-and-try loop
-  landed (`scripts/dev-install.sh`); next are cutting unreferenced scripts,
-  hooks, and CI jobs, then fixing the release cache miss and dropping Linux
+  landed (`scripts/dev-install.sh`) and the unreferenced scripts, hooks, and
+  CI jobs are cut; next is fixing the release cache miss and dropping Linux
   artifacts until a Linux user appears.
 
 ## Open

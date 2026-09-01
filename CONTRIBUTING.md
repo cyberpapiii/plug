@@ -25,7 +25,9 @@ everything.
 ./scripts/dev.sh --all     # every lane
 ```
 
-`./scripts/setup-dev.sh` installs the git hooks once per clone.
+`./scripts/setup-dev.sh` installs the git hooks once per clone. When
+`target/` gets big, `cargo clean && rm -rf PlugApp/.build`; a cold rebuild is
+about half a minute.
 
 ## Ship a change
 

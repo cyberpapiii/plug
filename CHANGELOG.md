@@ -18,6 +18,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- The development gate is lighter. Five CI jobs that gated nothing for a
+  single-developer tool (MSRV check, cargo deny, a macOS duplicate of the
+  Linux tests, a cross-compile check, and a binary-size ceiling) are gone,
+  along with the disk-space guard that ran on every commit, checkout, merge,
+  and push. The app test lane builds once instead of twice. Ten scripts that
+  nothing ran, seven of them tests of other scripts, are deleted, and the
+  old `plug-dev` path (`dev-reinstall.sh`, `setup-codesigning.sh`) retires in
+  favor of `dev-install.sh`. `plug doctor` points at the new loop.
 - The repository's agent and contributor instructions collapse into one short
   `CLAUDE.md`; `AGENTS.md` points at it. The project-state snapshot, plan,
   truth rules, workflow model, per-change doc-update checklists, finished

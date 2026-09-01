@@ -105,7 +105,6 @@ if [[ "$e2e" == true ]]; then
   step "browser OAuth" npm run test:e2e
 fi
 
-"$repo_root/scripts/clean-build-artifacts.sh" --guard || true
 
 if ((${#failed[@]} > 0)); then
   printf '\n\033[31m%d lane(s) failed:\033[0m %s\n' "${#failed[@]}" "${failed[*]}"
