@@ -116,9 +116,10 @@ jobs:
     name: Warm release cache
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: macos-26
-    # rust-cache folds every CARGO_* and RUST* variable into its key, and
-    # release.yml's build-app job sets none of them. Blank the workflow-level
-    # ones here so the two jobs hash to the same key.
+    # rust-cache folds every non-empty CARGO_* and RUST* variable into its
+    # key, and release.yml's build-app job sets none of them. Blank the
+    # workflow-level ones here so the two jobs hash to the same key; cargo
+    # rejects an empty CARGO_TERM_COLOR, so the build step unsets them again.
     env:
       CARGO_TERM_COLOR: ""
       CARGO_PROFILE_DEV_DEBUG: ""
@@ -131,6 +132,7 @@ jobs:
         with:
           shared-key: plug-app-universal
       - run: |
+          unset CARGO_TERM_COLOR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG RUSTFLAGS
           cargo build --release -p plug-mcp --target aarch64-apple-darwin
           cargo build --release -p plug-mcp --target x86_64-apple-darwin
 
