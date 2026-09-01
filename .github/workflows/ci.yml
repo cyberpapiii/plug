@@ -9,14 +9,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  # CI never debugs these binaries. Omitting DWARF materially reduces compile,
-  # link, cache, and upload time without changing the code under test.
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-  RUSTFLAGS: -Dwarnings
-
 jobs:
   classify:
     name: Classify changes
@@ -43,6 +35,15 @@ jobs:
     needs: classify
     if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
+    # link, cache, and upload time without changing the code under test. These
+    # live per job rather than at workflow level so warm-release-cache, which
+    # must hash the same rust-cache key as release.yml, inherits none of them.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -57,6 +58,15 @@ jobs:
     needs: classify
     if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
+    # link, cache, and upload time without changing the code under test. These
+    # live per job rather than at workflow level so warm-release-cache, which
+    # must hash the same rust-cache key as release.yml, inherits none of them.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -68,6 +78,15 @@ jobs:
     needs: classify
     if: needs.classify.outputs.e2e == 'true'
     runs-on: ubuntu-latest
+    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
+    # link, cache, and upload time without changing the code under test. These
+    # live per job rather than at workflow level so warm-release-cache, which
+    # must hash the same rust-cache key as release.yml, inherits none of them.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -90,6 +109,15 @@ jobs:
     needs: classify
     if: needs.classify.outputs.app == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: macos-15
+    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
+    # link, cache, and upload time without changing the code under test. These
+    # live per job rather than at workflow level so warm-release-cache, which
+    # must hash the same rust-cache key as release.yml, inherits none of them.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -115,16 +143,9 @@ jobs:
     # each merge; the release restores it. It gates nothing.
     name: Warm release cache
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # No env here on purpose: rust-cache folds every CARGO_* and RUST*
+    # variable into its key, and release.yml's build-app job sets none.
     runs-on: macos-26
-    # rust-cache folds every non-empty CARGO_* and RUST* variable into its
-    # key, and release.yml's build-app job sets none of them. Blank the
-    # workflow-level ones here so the two jobs hash to the same key; cargo
-    # rejects an empty CARGO_TERM_COLOR, so the build step unsets them again.
-    env:
-      CARGO_TERM_COLOR: ""
-      CARGO_PROFILE_DEV_DEBUG: ""
-      CARGO_PROFILE_TEST_DEBUG: ""
-      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v5
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -132,7 +153,6 @@ jobs:
         with:
           shared-key: plug-app-universal
       - run: |
-          unset CARGO_TERM_COLOR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG RUSTFLAGS
           cargo build --release -p plug-mcp --target aarch64-apple-darwin
           cargo build --release -p plug-mcp --target x86_64-apple-darwin
 
