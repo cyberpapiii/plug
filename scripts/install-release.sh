@@ -32,10 +32,9 @@ fi
 version="${version#v}"
 tag="v$version"
 
-app="/Applications/Plug.app"
-# Retired bundles wait here for their last clients to exit. Outside /Applications
-# so a superseded copy never shows up in Spotlight or Launchpad.
-attic="${TMPDIR:-/tmp}/plug-retired-bundles"
+# shellcheck source=scripts/lib/install-app.sh
+source "$repo_root/scripts/lib/install-app.sh"
+
 staging="$(mktemp -d)"
 mount_point=""
 cleanup() {
@@ -67,59 +66,6 @@ staged_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString'
 [[ "$staged_version" == "$version" ]] ||
   { echo "install: DMG contains $staged_version, expected $version" >&2; exit 1; }
 
-if pgrep -qf "$app/Contents/MacOS/Plug"; then
-  echo "install: quitting the running Plug.app"
-  osascript -e 'tell application "Plug" to quit' >/dev/null 2>&1 || true
-  for _ in $(seq 1 30); do
-    pgrep -qf "$app/Contents/MacOS/Plug" || break
-    sleep 1
-  done
-  pgrep -qf "$app/Contents/MacOS/Plug" &&
-    { echo "install: Plug.app is still running; not replacing it" >&2; exit 1; }
-fi
-
-# A hand-installed LaunchAgent for the daemon predates the app-owned era and
-# would keep launchd pointed at whatever binary it names. The app registers the
-# daemon through SMAppService, so leaving one behind means two owners.
-legacy_plist="$HOME/Library/LaunchAgents/com.plug.daemon.plist"
-if [[ -f "$legacy_plist" ]]; then
-  echo "install: removing the CLI-owned LaunchAgent"
-  launchctl bootout "gui/$(id -u)/com.plug.daemon" 2>/dev/null || true
-  rm -f "$legacy_plist"
-fi
-
-echo "install: replacing $app"
-# Stage the new bundle beside the old one, then swap by rename. `rm -rf` here
-# would kill every `plug connect` currently running the old bundle's binary:
-# they die with SIGABRT the moment their signed executable is unlinked. A rename
-# keeps that inode reachable, so those clients live until they exit on their own.
-incoming="/Applications/.Plug.app.incoming.$$"
-retired="$attic/Plug.app.$(date +%Y%m%d-%H%M%S)"
-rm -rf "$incoming"
-ditto "$staged_app" "$incoming"
-if [[ -d "$app" ]]; then
-  mkdir -p "$attic"
-  mv "$app" "$retired"
-fi
-mv "$incoming" "$app"
-hdiutil detach "$mount_point" -quiet
-mount_point=""
-
-open -a "$app"
-
-# Yesterday's retired bundles have no processes left to protect.
-find "$attic" -maxdepth 1 -name 'Plug.app.*' -mtime +0 -exec rm -rf {} + 2>/dev/null || true
-
-echo "install: waiting for the daemon"
-socket="$HOME/Library/Application Support/plug/plug.sock"
-for _ in $(seq 1 120); do
-  if [[ -S "$socket" ]] && "$app/Contents/Resources/plug" status >/dev/null 2>&1; then
-    echo "install: Plug $version is running"
-    exit 0
-  fi
-  sleep 1
-done
-
-echo "install: Plug $version is installed, but the daemon did not answer within 120s." >&2
-echo "install: check $HOME/Library/Logs/plug" >&2
-exit 1
+# The bundle stays mounted through the copy; the shared installer copies it
+# out before it touches /Applications.
+install_app_bundle "$staged_app" "$version"
