@@ -5,28 +5,6 @@ This document reflects the dependency picture of the current merged codebase.
 `CHANGELOG.md` and `docs/STATUS.md` carry project state. This file is
 about dependency shape, not roadmap status.
 
-## Off-Main OAuth Owner Candidate
-
-The following dependency changes `exist off-main` on
-`codex/oauth-owner-passkey-implementation`; they are not part of the current
-merged dependency picture:
-
-- `passkey-auth` `=0.1.3`
-  Exact-pinned WebAuthn server ceremonies with serializable registration and
-  authentication state for restart-safe owner enrollment and approval.
-
-- `hmac` `0.12`
-  HMAC-SHA256 request proofs for local operator endpoints, keeping the reusable
-  operator token out of HTTP requests.
-
-- test-only `ciborium`, `ed25519-dalek`, and `filetime`
-  Browser-authenticator fixtures, signed metadata fixtures, and persistence
-  timestamp tests.
-
-The locked candidate graph passes Rust 1.88, `cargo deny`, RustSec, Trivy, and
-both Linux CI target checks. Dependency guards confirm that `openssl-sys`,
-`aws-lc-sys`, `native-tls`, and `rsa` are absent.
-
 ## Core Runtime
 
 - `rmcp` `=3.1.0`
@@ -100,8 +78,11 @@ both Linux CI target checks. Dependency guards confirm that `openssl-sys`,
 - `fs4`
   PID file locking.
 
-- `subtle`, `hex`
-  Auth token generation and constant-time comparison helpers.
+- `subtle`, `hex`, `hmac`
+  Auth token generation, constant-time comparison, and operator request proofs.
+
+- `passkey-auth` `=0.1.3`
+  WebAuthn owner enrollment and approval ceremonies.
 
 ## CLI
 

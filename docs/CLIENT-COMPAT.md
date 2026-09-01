@@ -192,7 +192,7 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 - The old 40-tool limit only applies to pre-v2.3 Cursor
 - `clientInfo.name`: `cursor-vscode`
 
-**fanout implications**:
+**plug implications**:
 - No tool limit filtering needed for current Cursor versions
 - Still detect Cursor via `clientInfo.name` for any future version-aware behavior
 - Keep configurable tool limits as a safety valve
@@ -210,11 +210,12 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 // ~/.codeium/windsurf/mcp_config.json
 ```
 
-**BEHAVIOR — 100 TOOL LIMIT**:
+**BEHAVIOR — 100 TOOL LIMIT** (Devin is the current product name; the config
+path and `windsurf-client` identifier are unchanged):
 - Hard limit of 100 tools across all servers
 - Per-tool toggling IS available (Settings > Cascade)
 
-**fanout implications**:
+**plug implications**:
 - Detect from `clientInfo.name`
 - Filter to 100 tools maximum
 - Less critical than Cursor (100 is usually enough) but still enforce
@@ -230,8 +231,8 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 {
   "mcp": {
     "servers": {
-      "fanout": {
-        "command": "fanout",
+      "plug": {
+        "command": "plug",
         "args": ["connect"]
       }
     }
@@ -246,7 +247,7 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 - Auto-discovers tools from other installed extensions
 - `Configure Tools` UI allows budget management
 
-**fanout implications**:
+**plug implications**:
 - Detect and filter to 128
 - Support OAuth 2.1 passthrough for remote connections
 
@@ -276,7 +277,7 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 2. **Hardcoded 60s timeout** — Gemini CLI has a hardcoded 60-second timeout for MCP discovery that ignores any configured timeout. If all list operations don't complete within 60s, the server is considered unavailable.
 3. **Random OAuth callback ports** — if OAuth is used, callback ports are random and may not stay alive, causing `ERR_CONNECTION_REFUSED`
 
-**fanout implications**:
+**plug implications**:
 - `prompts/list` MUST respond instantly (< 100ms). Return cached or empty.
 - `tools/list` MUST also respond quickly. Pre-cache tool lists at startup.
 - Gemini can connect via stdio OR HTTP — both paths must work
@@ -296,7 +297,7 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 type = "stdio"
 command = "plug"
 args = ["connect"]
-# bearer_token_env_var = "FANOUT_TOKEN"  # for HTTP mode
+# bearer_token_env_var = "PLUG_TOKEN"  # for HTTP mode
 ```
 
 **CRITICAL BEHAVIOR**:
@@ -308,7 +309,7 @@ args = ["connect"]
 - Configurable `startup_timeout_sec` and `tool_timeout_sec`
 - Supports elicitation
 
-**fanout implications**:
+**plug implications**:
 - ALWAYS return `{"resources": []}` for `resources/list` if no upstream servers provide resources
 - Never return an error for `resources/list`
 - Test with Codex as part of compatibility validation
@@ -323,7 +324,7 @@ args = ["connect"]
 
 **UPDATED (2026-03-03)**: OpenCode now supports Streamable HTTP with auto-negotiation. Legacy SSE support remains for backwards compatibility but is no longer the only option.
 
-**fanout implications**:
+**plug implications**:
 - Default lazy mode: `bridge`
 - OpenCode can connect via Streamable HTTP (preferred) or legacy SSE
 - Legacy SSE endpoint (`/sse`) still useful for older OpenCode versions
@@ -343,8 +344,8 @@ args = ["connect"]
 - Cannot connect to remote servers
 - Protocol version may lag behind latest spec
 
-**fanout implications**:
-- Connect via `fanout connect` (stdio)
+**plug implications**:
+- Connect via `plug connect` (stdio)
 - Standard operation, no special handling
 
 ---
@@ -359,7 +360,7 @@ args = ["connect"]
 - Short default timeouts
 - Interactive `/mcp` UI for configuration
 
-**fanout implications**:
+**plug implications**:
 - Standard stdio connection
 - Be aware of short timeouts — respond quickly
 
@@ -381,7 +382,7 @@ This shows which features each client actually supports (not just what the spec 
 | Discovery | -- | -- | Yes | Yes | Yes | -- | -- | -- | -- |
 | Tool Search | Yes | -- | -- | -- | -- | -- | Native | Bridge | -- |
 
-**fanout implications**:
+**plug implications**:
 - Tools must work for ALL clients (universal support)
 - Resources and Prompts must pass through but gracefully degrade (return empty lists for clients that don't request them)
 - Advanced features (sampling, tasks, elicitation) are pass-through only — forward to the client that initiated the request
@@ -405,39 +406,9 @@ Detect client type from `clientInfo.name` in `InitializeRequest` using exact mat
 | OpenCode | `opencode` |
 | Zed | `Zed` |
 
-```rust
-fn detect_client(client_info: &ClientInfo) -> ClientType {
-    // Tier 1: Exact match (preferred — verified values)
-    match client_info.name.as_str() {
-        "claude-code" => return ClientType::ClaudeCode,
-        "claude-ai" => return ClientType::ClaudeDesktop,
-        "cursor-vscode" => return ClientType::Cursor,
-        "windsurf-client" => return ClientType::Windsurf,
-        "Visual-Studio-Code" => return ClientType::VSCodeCopilot,
-        "gemini-cli-mcp-client" => return ClientType::GeminiCli,
-        "opencode" => return ClientType::OpenCode,
-        "Zed" => return ClientType::Zed,
-        _ => {}
-    }
-
-    // Tier 2: Fuzzy fallback (for unknown client versions)
-    let name = client_info.name.to_lowercase();
-    match () {
-        _ if name.contains("claude-code") || name.contains("claude code") => ClientType::ClaudeCode,
-        _ if name.contains("claude") => ClientType::ClaudeDesktop,
-        _ if name.contains("cursor") => ClientType::Cursor,
-        _ if name.contains("windsurf") || name.contains("codeium") => ClientType::Windsurf,
-        _ if name.contains("copilot") || name.contains("vscode") => ClientType::VSCodeCopilot,
-        _ if name.contains("gemini") => ClientType::GeminiCli,
-        _ if name.contains("codex") => ClientType::CodexCli,
-        _ if name.contains("opencode") => ClientType::OpenCode,
-        _ if name.contains("zed") => ClientType::Zed,
-        _ => ClientType::Unknown,
-    }
-}
-```
-
-**Unknown clients get conservative defaults**: no tool limit, full tool list, standard timeouts.
+Detection is exact match first, then a lowercase fuzzy fallback, in
+`plug-core/src/client_detect.rs`. Unknown clients get no tool limit and the
+full catalog.
 
 **Source**: Apify MCP Client Capabilities Index, `docs/research/client-validation.md`
 
@@ -445,7 +416,7 @@ fn detect_client(client_info: &ClientInfo) -> ClientType {
 
 ## Config Auto-Import Locations
 
-fanout should scan these on first run:
+`plug setup` scans these on first run:
 
 | Client | Path | Format |
 |--------|------|--------|
@@ -457,4 +428,4 @@ fanout should scan these on first run:
 | Codex | `~/.codex/config.toml` | TOML |
 | Gemini | `~/.gemini/settings.json` | JSON |
 
-All of these store MCP server configs in slightly different JSON/TOML schemas. fanout needs a parser for each to extract server definitions and normalize into its own TOML format.
+All of these store MCP server configs in slightly different JSON/TOML schemas. Plug parses each and normalizes into its own TOML format.

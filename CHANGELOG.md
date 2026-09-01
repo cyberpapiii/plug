@@ -7,6 +7,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- The documented macOS config path is now
+  `~/Library/Application Support/plug/config.toml`. README and the operator
+  guide had been pointing at `~/.config/plug/`, which is the Linux location.
+
 ## [0.8.11] - 2026-09-01
 
 ### Added

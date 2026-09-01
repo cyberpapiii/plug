@@ -29,25 +29,11 @@ and the `plug` Formula stopped at 0.8.10. Source development runs `./scripts/dev
 ID signed `Plug.app` from the working tree and installs it in place; releases
 are only for sharing a build with other people.
 
-## Before tagging
+## Before running it
 
-1. `main` is green: `cargo test --workspace`, `cargo clippy --workspace
-   --all-targets -- -D warnings`, `cargo fmt --check`.
-2. `CHANGELOG.md` has a `## [Unreleased]` section covering everything since
-   the previous tag. That section becomes the GitHub release notes, and
-   `release.sh` refuses to run without it.
-3. `workspace.package.version` in the root `Cargo.toml` matches the tag you are
-   about to push, and `Cargo.lock` has been regenerated to match.
-
-## Tagging
-
-```bash
-version=0.5.0
-git tag -a "v$version" -m "plug $version" && git push origin "v$version"
-```
-
-The workflow does the rest. Watch it: a failed signing step stops the release
-before anything is published, which is the intended behaviour.
+Write the notes under `## [Unreleased]`. `release.sh` refuses to invent them,
+renames that heading to the version, ships the bump as a pull request, waits
+for it to land, then tags. Do not push a tag by hand.
 
 ## macOS code signing
 

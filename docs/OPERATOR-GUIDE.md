@@ -29,9 +29,9 @@ Plug has one configured upstream set and many downstream clients.
 
 Useful files:
 
-- Config: `~/.config/plug/config.toml`
+- macOS config and runtime: `~/Library/Application Support/plug/`
 - macOS logs: `~/Library/Logs/plug/`
-- macOS runtime state: `~/Library/Application Support/plug/`
+- Linux config: `~/.config/plug/`
 - Linux logs/state: `~/.local/state/plug/`
 
 Prefer `--output json` for automation:
@@ -138,12 +138,10 @@ refresh tokens. The former single-client `oauth_client_id`,
 `oauth_client_secret`, and shared redirect allowlist settings are intentionally
 unsupported; remove them and authorize each remote client again after upgrade.
 
-### Owner passkeys — off-main candidate
+### Owner passkeys
 
-The owner-passkey workflow in this section `exists off-main` on
-`codex/oauth-owner-passkey-implementation`; use it only after that work merges
-and a signed build is installed. OAuth mode must have a public HTTPS
-`public_base_url` whose origin and hostname are the WebAuthn origin and RP ID.
+OAuth mode must have a public HTTPS `public_base_url` whose origin and hostname
+are the WebAuthn origin and RP ID.
 
 Enroll, inspect, or remove owner passkeys from the machine running Plug:
 
@@ -162,13 +160,12 @@ stores at most five owner public credentials. Removing the final credential
 requires explicit confirmation and leaves new downstream OAuth grants blocked
 until another owner passkey is enrolled.
 
-The candidate's operator endpoints are separate from downstream MCP
-bearer/OAuth authentication. Local CLI requests use a reusable owner-only token
-to calculate short-lived, single-use HMAC proofs bound to the exact method,
-path, nonces, and final-credential-removal intent. The reusable token is never
-sent in an HTTP request or URL and is not printed or logged. Operator requests
-also require Plug's exact local listener authority and reject forwarded
-requests.
+Operator endpoints are separate from downstream MCP bearer/OAuth
+authentication. Local CLI requests use a reusable owner-only token to
+calculate short-lived, single-use HMAC proofs bound to the exact method, path,
+nonces, and final-credential-removal intent. The reusable token is never sent
+in an HTTP request or URL and is not printed or logged. Operator requests also
+require Plug's exact local listener authority and reject forwarded requests.
 
 ## Upstream OAuth
 
@@ -222,8 +219,8 @@ HTTP tracing:
 Operator inventory:
 
 - `plug tools --output json` includes source metadata, trust boundary, upstream-declared annotations, Plug-inferred annotations, and effective annotations.
-- `plug servers --output json` includes configured transport/auth/trust metadata without serializing secrets.
-- `/_plug/live-sessions` exposes active session inventory for local operator tooling. On the off-main owner-passkey candidate it requires the local HMAC request-proof exchange described above; current `main` uses its existing operator-token contract.
+- `plug servers --output json` includes transport/auth/trust metadata. Live daemon output does not serialize secrets.
+- `/_plug/live-sessions` exposes active session inventory for local operator tooling and requires the HMAC request-proof exchange above.
 
 ## Stdio Upstream Sandboxing
 

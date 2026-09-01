@@ -131,4 +131,4 @@ The architecture does **not** currently claim:
 - Tasks or other future-facing post-June-2026 MCP primitives
 - automated ACME / Let's Encrypt certificate management
 
-Those are the next major architecture questions after the `v0.2.0` boundary.
+Those remain out of scope.

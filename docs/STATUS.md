@@ -14,8 +14,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 - Live downstream OAuth certification is done only for Claude Desktop. ChatGPT,
   Codex, Cursor, OpenCode, and a real WebKit platform-passkey ceremony are
   unproven.
-- Doctor and unified snapshot code lives in `plug/src/commands/misc.rs`,
-  `clients.rs`, and `plug-core/src/ipc.rs`; diagnosis wants its own module.
 - The five signed PlugApp fixture tests run only on a Developer ID host, which
   today means one Mac.
 
