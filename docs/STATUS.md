@@ -11,8 +11,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as
   found; no sweep.
-- `GetServerConfig` returns full credential material to any auth-token holder
-  (#125). Decide whether to redact.
 - Live downstream OAuth certification is done only for Claude Desktop. ChatGPT,
   Codex, Cursor, OpenCode, and a real WebKit platform-passkey ceremony are
   unproven.
