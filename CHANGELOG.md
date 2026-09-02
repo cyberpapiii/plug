@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Starting an OAuth HTTP upstream no longer rediscovers authorization-server
+  metadata when a verified bound token for that resource already exists. A
+  hung well-known GET used to burn the start budget, then recovery paid the
+  same walk again on every retry. Restart and reconnect now share one
+  in-flight start so they cannot pile two handshakes on the same server.
 - The documented macOS config path is now
   `~/Library/Application Support/plug/config.toml`. README and the operator
   guide had been pointing at `~/.config/plug/`, which is the Linux location.
