@@ -46,6 +46,15 @@ pub fn next_call_id() -> u64 {
     NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Holds the per-server start slot claimed by restart or reconnect.
+struct UpstreamStartGuard(Arc<AtomicBool>);
+
+impl Drop for UpstreamStartGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Events emitted by the Engine for observability consumers (TUI, daemon, CLI).
 ///
 /// Uses `Arc<str>` for string fields — O(1) clone on broadcast fan-out
@@ -648,6 +657,17 @@ impl Engine {
             .clone();
         let protocol_gate_state = self.server_manager.modern_upstream_gate_state();
 
+        // Share the in-flight start with reconnect_server. A supervised or
+        // operator restart must not open a second handshake while recovery is
+        // already dialing the same upstream.
+        let Some(_start_guard) = self.try_claim_upstream_start(server_id) else {
+            tracing::info!(
+                server = %server_id,
+                "restart skipped: start already in progress"
+            );
+            return Ok(());
+        };
+
         let _ = self.event_tx.send(EngineEvent::ServerStopped {
             server_id: Arc::from(server_id),
         });
@@ -703,27 +723,25 @@ impl Engine {
     /// Uses an AtomicBool per-server to prevent concurrent reconnects —
     /// if another caller is already reconnecting, returns Ok immediately.
     pub async fn reconnect_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
-        let reconnecting = self.server_manager.get_reconnecting_flag(server_id);
+        let Some(_start_guard) = self.try_claim_upstream_start(server_id) else {
+            tracing::debug!(server = %server_id, "reconnect already in progress, skipping");
+            return Ok(());
+        };
 
-        // Try to claim the reconnect — if already in progress, return Ok
-        if reconnecting
+        self.do_reconnect(server_id).await
+    }
+
+    /// Claim the single in-flight start slot for `server_id` (restart and
+    /// reconnect share it). Drop the guard to release the slot.
+    fn try_claim_upstream_start(&self, server_id: &str) -> Option<UpstreamStartGuard> {
+        let flag = self.server_manager.get_reconnecting_flag(server_id);
+        if flag
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            tracing::debug!(server = %server_id, "reconnect already in progress, skipping");
-            return Ok(());
+            return None;
         }
-
-        // RAII guard ensures the flag is always cleared, even on panic or task cancellation.
-        struct ReconnectGuard(Arc<AtomicBool>);
-        impl Drop for ReconnectGuard {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _guard = ReconnectGuard(reconnecting);
-
-        self.do_reconnect(server_id).await
+        Some(UpstreamStartGuard(flag))
     }
 
     /// Internal reconnection logic shared by `reconnect_server`.
@@ -1746,6 +1764,16 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown server"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn restart_and_reconnect_share_one_in_flight_start() {
+        let engine = Engine::new(test_config());
+        let first = engine.try_claim_upstream_start("github");
+        assert!(first.is_some());
+        assert!(engine.try_claim_upstream_start("github").is_none());
+        drop(first);
+        assert!(engine.try_claim_upstream_start("github").is_some());
     }
 
     #[tokio::test]

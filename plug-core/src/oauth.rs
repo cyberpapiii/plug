@@ -342,8 +342,13 @@ async fn bounded_discovery<T>(
     }
 }
 
-/// Resolve and verify OAuth authority without a credential store, then load a
-/// token only after the server's issuer/resource binding is established.
+/// Load a token only after the server's issuer/resource binding is established.
+///
+/// A start or reconnect that already holds a verified bound pair for this
+/// resource uses that token and does not walk OAuth metadata again. MCP
+/// clients rediscover from a 401 `resource_metadata` challenge, not on every
+/// dial. Live discovery still runs when nothing is bound, the stored resource
+/// does not match, or the pair is incomplete.
 pub async fn verified_access_token_for_resource(
     server_name: &str,
     resource_url: &str,
@@ -351,11 +356,15 @@ pub async fn verified_access_token_for_resource(
 ) -> Result<Option<String>, AuthError> {
     use rmcp::transport::auth::AuthorizationManager;
 
+    let store = get_or_create_store(server_name);
+    if let Some(token) = store.bound_access_token_for_resource(resource_url) {
+        return Ok(Some(token));
+    }
+
     let manager = AuthorizationManager::new(resource_url).await?;
     let resolution =
         bounded_discovery(resource_url, start_budget, manager.resolve_metadata()).await?;
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
-    let store = get_or_create_store(server_name);
     store.bind_verified_authority(&authority)?;
     Ok(store
         .verified_bound_credentials()
@@ -697,6 +706,32 @@ impl CompositeCredentialStore {
                 None
             }
         }
+    }
+
+    /// Peek the file envelope without binding or waking Keychain.
+    fn peek_bound_file_envelope(&self) -> Option<BoundCredentialEnvelope> {
+        match serde_json::from_str::<PersistedCredentialEnvelope>(&self.raw_file_json()?).ok()? {
+            PersistedCredentialEnvelope::Bound(envelope) => Some(envelope),
+            PersistedCredentialEnvelope::Legacy(_) => None,
+        }
+    }
+
+    /// Return the access token from a complete bound pair only when it is
+    /// already bound to `resource_url`. A resource mismatch must not install
+    /// the stored binding, or a later live discovery for the new URL cannot
+    /// bind the new authority.
+    fn bound_access_token_for_resource(&self, resource_url: &str) -> Option<String> {
+        let configured = canonical_secure_url(resource_url, "OAuth resource").ok()?;
+        let envelope = self.peek_bound_file_envelope()?;
+        if envelope.binding.resource != configured {
+            // Drop the in-memory binding so a later live discovery can bind
+            // the configured resource. The file pair stays; probe rejects it
+            // once the new authority is bound.
+            self.binding.store(Arc::new(None));
+            return None;
+        }
+        self.verified_bound_credentials()
+            .and_then(|credentials| stored_access_token(&credentials))
     }
 
     fn encode_credentials(
@@ -2343,6 +2378,64 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("bound-access")
+        );
+        authority_task.abort();
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verified_runtime_lookup_uses_bound_pair_without_live_discovery() {
+        let name = format!("bound-no-discover-{}", uuid::Uuid::new_v4());
+        let authority = test_authority();
+        let store = get_or_create_store(&name);
+        store.bind_verified_authority(&authority).unwrap();
+        CredentialStore::save(
+            store.as_ref(),
+            make_test_token("cached-access", Some("refresh"), Some(3600)),
+        )
+        .await
+        .unwrap();
+
+        // No listener. Live discovery would hang or fail; the bound pair must
+        // still produce the token.
+        let token = verified_access_token_for_resource(
+            &name,
+            "https://mcp.example/mcp",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.as_deref(), Some("cached-access"));
+
+        store.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verified_runtime_lookup_does_not_reuse_a_pair_bound_to_another_resource() {
+        let name = format!("bound-wrong-resource-{}", uuid::Uuid::new_v4());
+        let authority = test_authority();
+        let store = get_or_create_store(&name);
+        store.bind_verified_authority(&authority).unwrap();
+        CredentialStore::save(
+            store.as_ref(),
+            make_test_token("wrong-resource-access", Some("refresh"), Some(3600)),
+        )
+        .await
+        .unwrap();
+
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let token =
+            verified_access_token_for_resource(&name, &resource_url, Duration::from_secs(30))
+                .await
+                .expect("discovery for the configured resource must still run");
+        assert_eq!(
+            token, None,
+            "a pair bound to a different resource must not be reused"
+        );
+        assert_eq!(
+            store.credential_binding().map(|binding| binding.resource),
+            Some(canonical_secure_url(&resource_url, "OAuth resource").unwrap()),
+            "live discovery must bind the configured resource, not keep the stored one"
         );
         authority_task.abort();
         store.clear().await.unwrap();
