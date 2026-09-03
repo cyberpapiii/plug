@@ -112,6 +112,18 @@ enum AppIcons {
         return value
     }
 
+    /// The distinct apps behind a set of live sessions, first seen first, so
+    /// a row of icons stays stable while sessions come and go.
+    ///
+    /// Pure, so the grouping is testable.
+    static func distinctTargets(forClientTypes clientTypes: [String]) -> [String] {
+        var seen = Set<String>()
+        return clientTypes.compactMap {
+            let target = target(forClientType: $0)
+            return seen.insert(target).inserted ? target : nil
+        }
+    }
+
     /// Canonical product name for live client sessions. Unknown clients stay
     /// unknown; Plug must not turn an opaque client identifier into a guess.
     static func displayName(forTarget target: String) -> String? {

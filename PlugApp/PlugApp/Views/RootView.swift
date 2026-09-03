@@ -21,7 +21,6 @@ struct RootView: View {
     let run: (PlugIntent) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var search = ""
-    @FocusState private var searchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -66,18 +65,17 @@ struct RootView: View {
                 .accessibilityLabel("Settings")
             }
 
-            ToolbarItem {
-                TextField("Search", text: $search)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 120, idealWidth: 160, maxWidth: 160)
-                    .focused($searchFocused)
-                    .accessibilityLabel("Search \(router.section.rawValue.lowercased())")
-            }
         }
+        // The system search field: it survives a narrow toolbar, carries the
+        // ⌘F shortcut, and clears itself the way every other Mac app does.
+        .searchable(
+            text: $search,
+            placement: .toolbar,
+            prompt: "Search \(router.section.rawValue.lowercased())"
+        )
         .navigationTitle("Plug")
         .onChange(of: router.section) {
             search = ""
-            searchFocused = false
         }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }

@@ -190,4 +190,17 @@ final class PlugVerdictTests: XCTestCase {
     func testWorkingHealthUsesLiveDotInsteadOfCompletionCheckmark() {
         XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).symbol, "circle.fill")
     }
+
+    func testConnectedAppsGroupSessionsByAppInFirstSeenOrder() {
+        let targets = AppIcons.distinctTargets(forClientTypes: [
+            "claude-code", "Codex CLI", "claude-code", "Claude Desktop"
+        ])
+        XCTAssertEqual(targets, ["claude-code", "codex-cli", "claude-desktop"])
+        let situation = PlugSituation(
+            runtime: .running,
+            connectedApps: targets.count,
+            connectedAppTargets: targets
+        )
+        XCTAssertEqual(situation.connectedApps, 3)
+    }
 }
