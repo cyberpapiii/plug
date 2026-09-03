@@ -208,7 +208,7 @@ struct ConnectionsView: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, Metric.snug)
+        .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
     }
 
@@ -297,7 +297,7 @@ private struct AppLinkRow: View {
                 .disabled(!app.detected && !app.linked)
             }
         }
-        .padding(.vertical, Metric.snug)
+        .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(app.name), \(status)")
     }
@@ -348,7 +348,7 @@ private struct GrantRow: View {
             Button("Revoke…", role: .destructive) { confirming = true }
                 .controlSize(.small)
         }
-        .padding(.vertical, Metric.snug)
+        .padding(.vertical, Metric.tight)
         .confirmationDialog(
             "Revoke \(grant.clientName)?",
             isPresented: $confirming,

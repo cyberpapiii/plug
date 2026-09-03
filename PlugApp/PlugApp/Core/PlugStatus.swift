@@ -141,6 +141,9 @@ struct PlugSituation: Equatable, Sendable {
     let runtime: Runtime
     let servers: [ServerFacts]
     let connectedApps: Int
+    /// The distinct apps behind `connectedApps`, as icon targets, so the
+    /// panel can show who is connected rather than only how many.
+    let connectedAppTargets: [String]
     let version: String
 
     init(
@@ -148,12 +151,14 @@ struct PlugSituation: Equatable, Sendable {
         runtime: Runtime = .stopped,
         servers: [ServerFacts] = [],
         connectedApps: Int = 0,
+        connectedAppTargets: [String] = [],
         version: String = ""
     ) {
         self.setup = setup
         self.runtime = runtime
         self.servers = servers
         self.connectedApps = connectedApps
+        self.connectedAppTargets = connectedAppTargets
         self.version = version
     }
 

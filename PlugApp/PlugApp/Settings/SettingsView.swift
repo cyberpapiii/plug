@@ -360,6 +360,7 @@ private struct AboutSettings: View {
                 Text(versionText)
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
             .accessibilityElement(children: .combine)
 

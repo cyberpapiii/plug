@@ -141,13 +141,14 @@ struct ToolsView: View {
             onSelect: { router.selectedTool = tool.name },
             run: run
         )
-        .padding(.horizontal, Metric.roomy)
+        .padding(.horizontal, Metric.snug)
         .frame(minHeight: tool.summary?.isEmpty == false ? 46 : 36)
         .background(
-            router.selectedTool == tool.name
-                ? Color.accentColor.opacity(0.12)
-                : Color.clear
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(router.selectedTool == tool.name ? Color.accentColor.opacity(0.14) : Color.clear)
         )
+        .hoverHighlight(cornerRadius: 7)
+        .padding(.horizontal, Metric.snug)
         .contentShape(Rectangle())
         .accessibilityAction(named: "Show details") {
             router.selectedTool = tool.name
@@ -211,8 +212,8 @@ struct ToolRow: View {
                         .truncationMode(.middle)
                     if let summary = tool.summary, !summary.isEmpty {
                         Text(summary)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
@@ -224,7 +225,7 @@ struct ToolRow: View {
             .accessibilityLabel("Show details for \(tool.shortName)")
             trailing
         }
-        .padding(.vertical, Metric.snug)
+        .padding(.vertical, Metric.tight)
         .help(tool.summary ?? tool.name)
         .accessibilityElement(children: .contain)
     }

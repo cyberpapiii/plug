@@ -116,6 +116,7 @@ struct ServersView: View {
                 ServerListRow(server: server, run: run)
                     .tag(server.name)
                     .listRowSeparator(.hidden)
+                    .listRowInsets(Metric.listRowInsets)
                     .contextMenu { ServerActions(server: server, run: run) }
             }
         }
@@ -172,10 +173,10 @@ private struct ServerListRow: View {
             } else if server.health == .working {
                 Text(server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools")
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, Metric.snug)
+        .padding(.vertical, Metric.tight)
         .contentShape(Rectangle())
         .accessibilityElement(children: .contain)
     }

@@ -7,6 +7,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- The menu bar panel is redesigned. A larger tinted headline says whether Plug
+  is working and carries its fix, a thin progress line shows servers settling
+  after launch, every enabled server stays in the list with its tool count,
+  troubled rows keep their place and carry an inline Restart or Sign In
+  button, and a row of connected app icons shows who is using Plug. Add
+  Server, Open Plug, Settings, and Quit sit in a flat footer.
+- The main window is tighter. Search lives in the toolbar as a native search
+  field, list rows are denser, tool rows highlight on hover, and Activity
+  rows show one app icon, the server and tool name split apart, which app
+  made the call, and turn the latency orange when a call took five seconds or
+  more.
+- The version in About can be selected and copied.
+
 ### Fixed
 
 - Starting an OAuth HTTP upstream no longer rediscovers authorization-server

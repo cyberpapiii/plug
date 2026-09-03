@@ -11,9 +11,13 @@ enum Metric {
     static let regular: CGFloat = 14
     static let roomy: CGFloat = 20
     static let corner: CGFloat = 10
+    /// Rows in the window's lists. The default inset list adds its own air
+    /// around every row; this keeps rows readable without a gap between them.
+    static let listRowInsets = EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12)
     static let popoverWidth: CGFloat = 340
-    static let popoverMaxListHeight: CGFloat = 268
-    static let popoverRowHeight: CGFloat = 36
+    static let popoverRowHeight: CGFloat = 34
+    /// Whole rows shown before the list scrolls.
+    static let popoverVisibleRows = 7
     /// Keep long management lists readable on wide displays without making
     /// rows feel pinned to the window edges.
     static let contentMaxWidth: CGFloat = 960
@@ -28,6 +32,17 @@ extension Verdict.Tone {
         case .busy: .secondary
         case .attention: .orange
         case .blocked: .red
+        }
+    }
+
+    /// The soft field behind the headline icon. Green stays a whisper so the
+    /// healthy panel reads calm; trouble is allowed to be louder.
+    var tint: Color {
+        switch self {
+        case .good: .green.opacity(0.14)
+        case .busy: .secondary.opacity(0.12)
+        case .attention: .orange.opacity(0.18)
+        case .blocked: .red.opacity(0.18)
         }
     }
 
@@ -134,20 +149,36 @@ struct SectionLabel: View {
     }
 }
 
-/// The headline. Rendered large in the popover, compact in the window banner,
-/// but always the same words, so the app cannot contradict itself.
+/// The headline. Rendered as a hero in the popover, compact in the window
+/// banner, but always the same words, so the app cannot contradict itself.
 struct VerdictView: View {
+    enum Style { case hero, regular, compact }
+
     let verdict: Verdict
-    var compact = false
+    var style: Style = .regular
     let run: (PlugIntent) -> Void
 
+    init(verdict: Verdict, style: Style = .regular, run: @escaping (PlugIntent) -> Void) {
+        self.verdict = verdict
+        self.style = style
+        self.run = run
+    }
+
+    init(verdict: Verdict, compact: Bool, run: @escaping (PlugIntent) -> Void) {
+        self.init(verdict: verdict, style: compact ? .compact : .regular, run: run)
+    }
+
+    private var compact: Bool { style == .compact }
+
     var body: some View {
-        HStack(alignment: .center, spacing: Metric.snug) {
+        HStack(alignment: .center, spacing: style == .hero ? Metric.regular : Metric.snug) {
             icon
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: style == .hero ? 2 : 1) {
                 Text(verdict.title)
-                    .font(compact ? .callout.weight(.medium) : .headline)
+                    .font(titleFont)
                     .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let detail = verdict.detail {
                     Text(detail)
                         .font(compact ? .caption : .subheadline)
@@ -163,18 +194,45 @@ struct VerdictView: View {
         .accessibilityLabel("\(verdict.title). \(verdict.detail ?? "")")
     }
 
+    private var titleFont: Font {
+        switch style {
+        case .hero: .title3.weight(.semibold)
+        case .regular: .headline
+        case .compact: .callout.weight(.medium)
+        }
+    }
+
     @ViewBuilder private var icon: some View {
-        if verdict.tone == .busy {
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: 22, height: 22)
-        } else {
-            Image(systemName: verdict.symbol)
-                .font(compact ? .body : .title3)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(verdict.tone.color)
-                .frame(width: 22, height: 22)
-                .accessibilityHidden(true)
+        switch style {
+        case .hero:
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(verdict.tone.tint)
+                if verdict.tone == .busy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: verdict.symbol)
+                        .font(.title3.weight(.medium))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(verdict.tone.color)
+                        .contentTransition(.symbolEffect(.replace))
+                }
+            }
+            .frame(width: 40, height: 40)
+            .accessibilityHidden(true)
+        case .regular, .compact:
+            if verdict.tone == .busy {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 22, height: 22)
+            } else {
+                Image(systemName: verdict.symbol)
+                    .font(compact ? .body : .title3)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(verdict.tone.color)
+                    .frame(width: 22, height: 22)
+                    .accessibilityHidden(true)
+            }
         }
     }
 
@@ -190,43 +248,6 @@ struct VerdictView: View {
                     .controlSize(compact ? .small : .regular)
             }
         }
-    }
-}
-
-/// A problem next to the button that fixes it.
-struct AttentionRow: View {
-    let item: AttentionItem
-    let run: (PlugIntent) -> Void
-
-    var body: some View {
-        HStack(spacing: Metric.snug) {
-            Image(systemName: item.symbol)
-                .font(.callout)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.orange)
-                .frame(width: 18)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(item.title)
-                    .font(.callout.weight(.medium))
-                Text(item.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer(minLength: Metric.tight)
-            if item.isWorking {
-                ProgressView().controlSize(.small)
-            } else if let button = item.button {
-                Button(button.title) { run(button.intent) }
-                    .controlSize(.small)
-            }
-        }
-        .padding(.vertical, Metric.tight)
-        .padding(.horizontal, Metric.snug)
-        .nativeGlassSurface(tint: .orange.opacity(0.12))
-        .accessibilityElement(children: .combine)
     }
 }
 
@@ -310,7 +331,28 @@ struct QuietRowButtonStyle: ButtonStyle {
     }
 }
 
+/// A soft field that appears under the pointer, so rows in a plain scroll
+/// view feel as alive as rows in a list.
+private struct HoverHighlight: ViewModifier {
+    let cornerRadius: CGFloat
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.05 : 0))
+            )
+            .animation(.easeOut(duration: 0.12), value: hovering)
+            .onHover { hovering = $0 }
+    }
+}
+
 extension View {
+    func hoverHighlight(cornerRadius: CGFloat = 7) -> some View {
+        modifier(HoverHighlight(cornerRadius: cornerRadius))
+    }
+
     /// Standard inset for popover content blocks.
     func popoverInset() -> some View {
         padding(.horizontal, Metric.regular)
@@ -328,21 +370,6 @@ extension View {
         }
 #else
         background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metric.corner))
-#endif
-    }
-
-    /// Native glass controls belong on the small action cluster, not on every
-    /// row. That keeps the hierarchy calm while making the controls unmistakable.
-    @ViewBuilder
-    func nativeGlassButton() -> some View {
-#if compiler(>=6.2)
-        if #available(macOS 26.0, *) {
-            buttonStyle(.glass)
-        } else {
-            buttonStyle(.bordered)
-        }
-#else
-        buttonStyle(.bordered)
 #endif
     }
 

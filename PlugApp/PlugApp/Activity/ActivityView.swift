@@ -64,6 +64,7 @@ struct ActivityView: View {
                             ForEach(group.events) { event in
                                 ActivityRow(event: event)
                                     .listRowSeparator(.hidden)
+                                    .listRowInsets(Metric.listRowInsets)
                             }
                         }
                         if model.activityIsCapped {
@@ -145,52 +146,83 @@ private struct ActivityRow: View {
     var body: some View {
         HStack(spacing: Metric.snug) {
             // The calling app's own icon, so a long list can be scanned by
-            // picture rather than read line by line.
-            AppGlyph(
-                target: AppIcons.target(forClientType: event.clientType ?? ""),
-                name: appName ?? "",
-                size: 20
-            )
-            Image(systemName: succeeded ? "checkmark.circle" : "exclamationmark.triangle.fill")
-                .font(.callout)
-                .foregroundStyle(succeeded ? Color.secondary : .orange)
-                .frame(width: 18)
-                .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
-            VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(headline).font(.body.monospaced()).lineLimit(1).truncationMode(.middle)
-                Text(context).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+            // picture rather than read line by line. Trouble replaces the
+            // icon with a warning, so a failure is visible from across the room.
+            ZStack {
+                if succeeded {
+                    AppGlyph(target: target, name: appName ?? "", size: 22)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.body)
+                        .foregroundStyle(.orange)
+                        .symbolRenderingMode(.hierarchical)
+                }
+            }
+            .frame(width: 22, height: 22)
+            .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: Metric.rowGap) {
+                    if let prefix = toolPrefix {
+                        Text(prefix)
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Text("·").foregroundStyle(.quaternary)
+                    }
+                    Text(headline)
+                        .font(.callout.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
-            VStack(alignment: .trailing, spacing: Metric.rowGap) {
+            VStack(alignment: .trailing, spacing: 1) {
                 Text(time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                Text(latency).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                Text(latency)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(slow ? Color.orange : Color.secondary.opacity(0.7))
             }
         }
-        .padding(.vertical, Metric.snug)
+        .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
     }
 
     private var succeeded: Bool { event.outcome == "success" }
+    private var slow: Bool { event.latencyMs >= 5_000 }
+    private var target: String { AppIcons.target(forClientType: event.clientType ?? "") }
 
-    /// What was called. The tool name is the useful part; `tools/call` is not.
-    private var headline: String {
-        guard let tool = event.tool, !tool.isEmpty else { return event.method }
-        return tool
+    /// Tool names arrive as `Server__tool`. The server half is shown once, as
+    /// a word; the tool half stays in code so it can be matched to a call.
+    private var toolParts: (prefix: String?, name: String) {
+        guard let tool = event.tool, !tool.isEmpty else { return (nil, event.method) }
+        guard let range = tool.range(of: "__"), !range.isEmpty, range.lowerBound > tool.startIndex else {
+            return (nil, tool)
+        }
+        return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))
     }
 
-    /// Who called it. Names the app, and separately the window or session
-    /// inside that app, because two Claude Code windows are two callers.
+    private var toolPrefix: String? { toolParts.prefix }
+    private var headline: String { toolParts.name }
+
+    /// Who called it, then where it went. Names the app, and separately the
+    /// window or session inside that app, because two Claude Code windows are
+    /// two callers.
     private var context: String {
         var parts: [String] = []
-        if let app = appName { parts.append(app) }
+        parts.append(appName ?? "Plug")
+        if let server = event.server, !server.isEmpty,
+           server.caseInsensitiveCompare(toolPrefix ?? "") != .orderedSame {
+            parts.append(server)
+        }
         if let session = sessionTag { parts.append(session) }
-        if let server = event.server, !server.isEmpty { parts.append(server) }
-        if parts.isEmpty { parts.append("Plug") }
         let joined = parts.joined(separator: " · ")
         return succeeded ? joined : "\(joined) · \(event.outcome)"
     }
 
+    /// The product name when Plug recognises the app; the app's own label
+    /// otherwise. A raw client type is the last resort, never the first.
     private var appName: String? {
+        if let name = AppIcons.displayName(forTarget: target) { return name }
         if let label = event.clientLabel, !label.isEmpty { return label }
         guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {
             return nil

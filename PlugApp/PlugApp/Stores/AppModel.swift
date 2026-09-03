@@ -132,11 +132,16 @@ final class AppModel {
             setup: setupState,
             runtime: runtimeState,
             servers: serverFacts,
-            connectedApps: Set(snapshot.liveSessions.map {
-                AppIcons.target(forClientType: $0.clientType)
-            }).count,
+            connectedApps: connectedAppTargets.count,
+            connectedAppTargets: connectedAppTargets,
             version: snapshot.runtimeVersion
         )
+    }
+
+    /// Distinct connected apps, first seen first, so the panel's icon row is
+    /// stable while sessions come and go.
+    private var connectedAppTargets: [String] {
+        AppIcons.distinctTargets(forClientTypes: snapshot.liveSessions.map(\.clientType))
     }
 
     /// The single sentence every surface renders.
