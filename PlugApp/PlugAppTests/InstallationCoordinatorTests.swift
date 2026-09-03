@@ -56,7 +56,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -113,7 +114,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -152,7 +154,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 handshakes: [handshake(version: canonical.appVersion)],
                 appServiceEnabled: true
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -184,7 +187,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 handshakes: [handshake(version: canonical.appVersion)],
                 appServiceEnabled: true
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -223,7 +227,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [legacyService, legacyService, healthyService()],
                 handshakes: [handshake(version: canonical.appVersion)]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -262,7 +267,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [staleService, healthyService()],
                 handshakes: [handshake(version: canonical.appVersion)]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -289,7 +295,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [healthyService()],
                 handshakes: [handshake(version: "0.6.4")]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -325,7 +332,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [healthyService(), healthyService()],
                 handshakes: [handshake(version: canonical.appVersion, ownership: "cli_managed")]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -364,7 +372,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [healthyService(), healthyService()],
                 handshakes: [handshake(version: canonical.appVersion, ownership: "unknown")]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -405,7 +414,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                     ipcMax: 7
                 )]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -430,7 +440,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         let first = Task { await coordinator.reconcile(trigger: .applicationLaunch) }
@@ -447,6 +458,120 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(callsAfterCoalescing, 2)
     }
 
+    func testTimedOutCommandRetriesOnItsOwnAndConvergesHealthy() async {
+        let events = EventLog()
+        let current = LaunchdJobRecord(
+            label: "com.plug.daemon",
+            programURL: canonical.executableURL,
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: canonical.buildVersion,
+            loaded: true
+        )
+        let service = DaemonServiceSnapshot(
+            ownership: .appManagedCurrent(current),
+            daemonVersion: canonical.appVersion,
+            daemonExecutable: canonical.executableURL
+        )
+        let app = FlakyAppInspector(
+            events: events,
+            failures: 2,
+            error: ProcessRunnerError.timedOut,
+            value: canonical
+        )
+        var phases: [InstallationState] = []
+        let coordinator = InstallationCoordinator(
+            appInspector: app,
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events, inspections: [service]),
+            openURL: { _ in },
+            retryDelay: .zero,
+            transientRetryLimit: 3,
+            sleep: { _ in },
+            logWriter: { _, _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+        phases.append(coordinator.state)
+        while let retry = coordinator.scheduledRetry {
+            await retry.value
+            phases.append(coordinator.state)
+        }
+
+        XCTAssertEqual(phases.first, .reconcilingUpdate(.waitingToRetry))
+        guard case .healthy = coordinator.state else {
+            return XCTFail("Expected healthy state after retries, got \(coordinator.state)")
+        }
+        let calls = await app.calls
+        XCTAssertEqual(calls, 4, "two timeouts, then the initial and final inspections")
+    }
+
+    func testTimeoutsBeyondTheBudgetBlockWithAReadableDetailAndALog() async throws {
+        let events = EventLog()
+        let logURL = FileManager.default.temporaryDirectory
+            .appending(path: "plug-tests-\(UUID().uuidString)/reconciliation.log")
+        defer { try? FileManager.default.removeItem(at: logURL.deletingLastPathComponent()) }
+        let app = FailingAppInspector(events: events, error: ProcessRunnerError.timedOut)
+        let coordinator = InstallationCoordinator(
+            appInspector: app,
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events),
+            logURL: logURL,
+            openURL: { _ in },
+            retryDelay: .zero,
+            transientRetryLimit: 2,
+            sleep: { _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+        while let retry = coordinator.scheduledRetry {
+            await retry.value
+        }
+
+        guard case let .blocked(failure) = coordinator.state else {
+            return XCTFail("Expected blocked state, got \(coordinator.state)")
+        }
+        XCTAssertEqual(failure.logURL, logURL)
+        XCTAssertTrue(failure.detail.contains("timed out 3 times"), failure.detail)
+        XCTAssertFalse(failure.detail.contains("timedOut"), "raw case name must not reach the panel")
+        let calls = await app.calls
+        XCTAssertEqual(calls, 3)
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(log.contains("timed out (attempt 1 of 2)"), log)
+        XCTAssertTrue(log.contains("giving up"), log)
+
+        // Try Again starts the budget over instead of failing on the first
+        // timeout because the old count is still standing.
+        await coordinator.retry()
+        XCTAssertEqual(coordinator.state, .reconcilingUpdate(.waitingToRetry))
+        while let retry = coordinator.scheduledRetry {
+            await retry.value
+        }
+    }
+
+    func testOperationalFailureDetailUsesTheErrorDescription() async {
+        let events = EventLog()
+        let coordinator = InstallationCoordinator(
+            appInspector: FailingAppInspector(
+                events: events,
+                error: ClientRepairError.commandFailed(status: 1, stderr: "boom")
+            ),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events),
+            openURL: { _ in },
+            logWriter: { _, _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        guard case let .blocked(failure) = coordinator.state else {
+            return XCTFail("Expected blocked state, got \(coordinator.state)")
+        }
+        XCTAssertFalse(failure.detail.isEmpty)
+    }
+
     func testBlockedStateDoesNotSelfRetryUntilExplicitRetry() async {
         let events = EventLog()
         let app = FailingAppInspector(events: events, error: TestFailure.operational)
@@ -455,7 +580,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -491,7 +617,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -533,7 +660,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -570,7 +698,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -607,7 +736,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -646,7 +776,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -682,7 +813,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 events: events,
                 inspections: [healthyService(), finalService]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -721,7 +853,8 @@ final class InstallationCoordinatorTests: XCTestCase {
                 ],
                 handshakes: [handshake(version: canonical.appVersion)]
             ),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -752,7 +885,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -790,7 +924,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -816,7 +951,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events, inspections: [unknownService]),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -855,7 +991,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             ),
             clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -913,7 +1050,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             ),
             clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -951,7 +1089,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events, inspections: [unmanaged]),
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -991,7 +1130,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: daemon,
-            openURL: { _ in }
+            openURL: { _ in },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1016,7 +1156,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events),
             logURL: logURL,
-            openURL: { url in opened.value = url }
+            openURL: { url in opened.value = url },
+            logWriter: { _, _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1147,6 +1288,31 @@ private actor FailingAppInspector: AppInstallationInspecting {
         calls += 1
         await events.append("app.inspect")
         throw error
+    }
+}
+
+private actor FlakyAppInspector: AppInstallationInspecting {
+    private let events: EventLog
+    private var failures: Int
+    private let error: Error
+    private let value: VerifiedAppInstallation
+    private(set) var calls = 0
+
+    init(events: EventLog, failures: Int, error: Error, value: VerifiedAppInstallation) {
+        self.events = events
+        self.failures = failures
+        self.error = error
+        self.value = value
+    }
+
+    func inspectCurrentApp() async throws -> VerifiedAppInstallation {
+        calls += 1
+        await events.append("app.inspect")
+        if failures > 0 {
+            failures -= 1
+            throw error
+        }
+        return value
     }
 }
 

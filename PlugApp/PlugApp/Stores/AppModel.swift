@@ -178,7 +178,8 @@ final class AppModel {
         // Nothing is being set up there, so setup keeps quiet and the runtime
         // verdict says the true thing: Plug is starting. The later phases do
         // change the installation, and those are worth a word.
-        case let .reconcilingUpdate(phase): return phase == .inspecting ? .ready : .settingUp
+        case .reconcilingUpdate(.inspecting), .reconcilingUpdate(.waitingToRetry): return .ready
+        case .reconcilingUpdate: return .settingUp
         case let .repairableDrift(drift): return .needsRepair(detail: drift.detail)
         case let .blocked(failure): return .blocked(detail: failure.detail, hasLog: failure.logURL != nil)
         }

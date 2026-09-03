@@ -9,6 +9,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Right after login the menu bar no longer shows "Setup incomplete" with the
+  detail "timedOut". A command that times out while the Mac is still busy now
+  waits five seconds and runs again, up to six times, before Plug reports a
+  problem, and the report says what timed out in plain words. The checks that
+  run at launch also get more time: reading the bundled command's version
+  allows fifteen seconds instead of three, asking launchd about each job
+  allows fifteen instead of five, and a slow answer about someone else's job
+  is skipped rather than treated as a failure.
+- Show Log on the setup banner opens a real file. Reconciliation now writes
+  `~/Library/Logs/Plug/installation-reconciliation.log`, one timestamped line
+  per step, so a failed setup can be read after the fact.
 - Starting an OAuth HTTP upstream no longer rediscovers authorization-server
   metadata when a verified bound token for that resource already exists. A
   hung well-known GET used to burn the start budget, then recovery paid the

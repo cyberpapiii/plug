@@ -7,6 +7,8 @@ enum ReconciliationTrigger: Equatable, Sendable {
     case applicationLaunch
     case retry
     case explicitAdoption
+    /// The coordinator's own follow-up after a command timed out.
+    case automaticRetry
 }
 
 @MainActor
@@ -49,7 +51,17 @@ final class InstallationCoordinator {
     private let daemonManager: any DaemonServiceManaging
     private let logURL: URL
     private let openURL: (URL) -> Void
+    private let retryDelay: Duration
+    private let transientRetryLimit: Int
+    private let sleep: @Sendable (Duration) async -> Void
+    private let logWriter: (URL, String) -> Void
     private var inFlight: Task<Void, Never>?
+    private var transientFailures = 0
+    private var retryGeneration = 0
+
+    /// The follow-up scheduled after a timeout. Tests await it; nothing else
+    /// needs to.
+    private(set) var scheduledRetry: Task<Void, Never>?
 
     static let defaultLogURL = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: "Library/Logs/Plug/installation-reconciliation.log")
@@ -61,7 +73,11 @@ final class InstallationCoordinator {
         daemonManager: any DaemonServiceManaging = DaemonServiceManager.shared,
         state: InstallationState = .reconcilingUpdate(.inspecting),
         logURL: URL = InstallationCoordinator.defaultLogURL,
-        openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) }
+        openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
+        retryDelay: Duration = .seconds(5),
+        transientRetryLimit: Int = 6,
+        sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
+        logWriter: @escaping (URL, String) -> Void = ReconciliationLog.append
     ) {
         self.appInspector = appInspector
         self.legacyMigrator = legacyMigrator
@@ -70,23 +86,37 @@ final class InstallationCoordinator {
         self.state = state
         self.logURL = logURL.standardizedFileURL
         self.openURL = openURL
+        self.retryDelay = retryDelay
+        self.transientRetryLimit = max(0, transientRetryLimit)
+        self.sleep = sleep
+        self.logWriter = logWriter
     }
 
     func reconcile(trigger: ReconciliationTrigger) async {
         guard shouldStart(trigger: trigger) else { return }
+        if trigger == .retry || trigger == .explicitAdoption {
+            // A person asked. Start the timeout budget over and drop any
+            // follow-up the coordinator had queued for itself.
+            transientFailures = 0
+            scheduledRetry?.cancel()
+            scheduledRetry = nil
+        }
 
         if let inFlight {
             await inFlight.value
             return
         }
 
+        // The task clears its own slot. Clearing it after `await task.value`
+        // left a window where the automatic retry saw a finished task, awaited
+        // it, and returned having done nothing.
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.performReconciliation(trigger: trigger)
+            self.inFlight = nil
         }
         inFlight = task
         await task.value
-        inFlight = nil
     }
 
     func adopt() async {
@@ -116,6 +146,7 @@ final class InstallationCoordinator {
     }
 
     private func performReconciliation(trigger: ReconciliationTrigger) async {
+        log("reconcile start trigger=\(trigger)")
         do {
             let canonical = try await appInspector.inspectCurrentApp()
             var legacy = try await legacyMigrator.inspect(canonical: canonical)
@@ -208,7 +239,12 @@ final class InstallationCoordinator {
             let final = try await inspectFinalState(expected: canonical)
             try requireHealthy(final, expected: canonical)
             state = final
+            transientFailures = 0
+            log("reconcile finished healthy")
+        } catch ProcessRunnerError.timedOut {
+            handleTimeout()
         } catch let error as CoordinatorError {
+            log("reconcile stopped: \(error.detail)")
             publish(error)
         } catch let error as DaemonServiceError {
             publishOperationalFailure(error)
@@ -581,7 +617,48 @@ final class InstallationCoordinator {
     }
 
     private func publish(_ phase: ReconciliationPhase) {
+        log("phase \(phase)")
         state = .reconcilingUpdate(phase)
+    }
+
+    /// A timed-out command is the one failure that fixes itself: right after
+    /// login every process is slow, and the same command finishes fine a few
+    /// seconds later. So the coordinator waits and tries again instead of
+    /// asking the person to, and only reports a block when the budget is
+    /// spent.
+    private func handleTimeout() {
+        transientFailures += 1
+        let attempt = transientFailures
+        guard attempt <= transientRetryLimit else {
+            log("timed out \(attempt) times; giving up until Try Again")
+            state = .blocked(
+                InstallationFailure(
+                    summary: "Plug installation reconciliation failed",
+                    detail: "Checking the installation timed out \(attempt) times in a row. "
+                        + "Commands can stay slow for a while after a restart. Try again in a minute.",
+                    logURL: logURL
+                )
+            )
+            return
+        }
+        log("timed out (attempt \(attempt) of \(transientRetryLimit)); retrying in \(retryDelay)")
+        publish(.waitingToRetry)
+        retryGeneration += 1
+        let generation = retryGeneration
+        scheduledRetry = Task { @MainActor [weak self, sleep, retryDelay] in
+            await sleep(retryDelay)
+            guard !Task.isCancelled, let self else { return }
+            await self.reconcile(trigger: .automaticRetry)
+            // The slot stays occupied until the retry has actually finished,
+            // and a newer retry scheduled from inside it keeps the slot.
+            if self.retryGeneration == generation {
+                self.scheduledRetry = nil
+            }
+        }
+    }
+
+    private func log(_ message: String) {
+        logWriter(logURL, message)
     }
 
     private func publish(_ error: CoordinatorError) {
@@ -628,13 +705,56 @@ final class InstallationCoordinator {
     }
 
     private func publishOperationalFailure(_ error: Error) {
+        let detail = Self.describe(error)
+        log("reconcile failed: \(detail)")
         state = .blocked(
             InstallationFailure(
                 summary: "Plug installation reconciliation failed",
-                detail: String(describing: error),
+                detail: detail,
                 logURL: logURL
             )
         )
+    }
+
+    /// The detail lands in the menu bar panel, so it has to read as a
+    /// sentence. Errors that wrote one are used as is; the rest fall back to
+    /// their case name, which at least says what happened.
+    private static func describe(_ error: Error) -> String {
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            return description
+        }
+        return String(describing: error)
+    }
+}
+
+/// The reconciliation log the panel's Show Log button opens. One line per
+/// event, appended in place, so the file reads as a timeline.
+enum ReconciliationLog {
+    private static let maxBytes = 256 * 1024
+
+    static func append(to url: URL, _ message: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = Data("\(stamp) \(message)\n".utf8)
+        let manager = FileManager.default
+        do {
+            try manager.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if let size = try? manager.attributesOfItem(atPath: url.path)[.size] as? Int, size > maxBytes {
+                try? manager.removeItem(at: url)
+            }
+            if !manager.fileExists(atPath: url.path) {
+                manager.createFile(atPath: url.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+        } catch {
+            // The log exists to help; failing to write it must not stop the
+            // work it describes.
+        }
     }
 }
 
