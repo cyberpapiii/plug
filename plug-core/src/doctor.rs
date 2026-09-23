@@ -409,6 +409,7 @@ fn extract_env_refs(input: &str) -> Vec<String> {
 async fn check_server_binaries(config: &Config) -> CheckResult {
     let name = "server_binaries".to_string();
     let mut missing: Vec<String> = Vec::new();
+    let login_path = crate::server::stdio_login_path().await;
 
     for (server_name, server) in &config.servers {
         if !server.enabled {
@@ -430,7 +431,7 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
                 }
             } else {
                 // Check PATH
-                if which(binary).is_none() {
+                if which(binary, login_path).is_none() {
                     missing.push(format!("{server_name}: {binary}"));
                 }
             }
@@ -457,8 +458,8 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
 }
 
 /// Simple which-like lookup in PATH.
-fn which(binary: &str) -> Option<std::path::PathBuf> {
-    let path = crate::server::resolve_stdio_command(binary);
+fn which(binary: &str, login_path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let path = crate::server::resolve_stdio_command(binary, login_path);
     path.is_file().then_some(path)
 }
 
@@ -778,13 +779,14 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
                 TransportType::Stdio => {
                     let command = server.command.clone();
                     Some(Box::pin(async move {
+                        let login_path = crate::server::stdio_login_path().await;
                         if let Some(cmd) = command {
                             let binary = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
                             if !binary.starts_with('$') {
                                 let found = if binary.starts_with('/') || binary.starts_with('.') {
                                     Path::new(&binary).exists()
                                 } else {
-                                    which(&binary).is_some()
+                                    which(&binary, login_path).is_some()
                                 };
                                 if !found {
                                     return Some(format!("{server_name}: binary not found"));
