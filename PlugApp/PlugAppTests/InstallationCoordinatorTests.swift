@@ -732,7 +732,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
     }
 
-    func testCellarLeftoverAfterFormulaUninstallIsRecognizedLegacyAndOffersAdopt() async {
+    func testLaunchWithHomebrewDaemonOffersAdoptWithoutStoppingItOrUninstalling() async {
         let events = EventLog()
         let cellar = cellarJob()
         let leftover = leftoverService(cellar)
@@ -762,12 +762,9 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(snapshot.service.ownership, .recognizedLegacy([cellar]))
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("legacy.removeFormula"))
+        XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
+        XCTAssertFalse(eventValues.contains("legacy.removeFormula"))
         XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
-        XCTAssertLessThan(
-            eventValues.firstIndex(of: "daemon.inspect")!,
-            eventValues.firstIndex(of: "legacy.removeFormula")!
-        )
     }
 
     func testBrewBinLeftoverWithEmptyRecognizedPathsIsRecognizedLegacyAndOffersAdopt() async {
@@ -932,7 +929,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
     }
 
-    func testFormulaInstalledWithoutLaunchdJobUninstallsAndLeavesOwnershipUnmanaged() async {
+    func testFormulaInstalledWithoutLaunchdJobWaitsForAdoptionBeforeUninstalling() async {
         let events = EventLog()
         let unmanaged = DaemonServiceSnapshot(
             ownership: .unmanaged,
@@ -961,13 +958,9 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(snapshot.service.ownership, .unmanaged)
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("legacy.removeFormula"))
+        XCTAssertFalse(eventValues.contains("legacy.removeFormula"))
         XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
         XCTAssertFalse(eventValues.contains("daemon.adopt"))
-        XCTAssertLessThan(
-            eventValues.firstIndex(of: "daemon.inspect")!,
-            eventValues.firstIndex(of: "legacy.removeFormula")!
-        )
     }
 
     func testHomebrewLegacyBootoutFailureStaysBlockedAndDoesNotUninstall() async {
@@ -984,6 +977,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let daemon = RecordingDaemonManager(
             events: events,
             inspections: [leftover],
+            appServiceEnabled: true,
             bootOutError: DaemonServiceError.commandFailed("bootout denied")
         )
         let coordinator = InstallationCoordinator(

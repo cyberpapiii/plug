@@ -8,8 +8,6 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(target_os = "macos")]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -242,13 +240,14 @@ fn build_stdio_command(
     command: &str,
     args: &[String],
     config: &ServerConfig,
+    login_path: Option<&OsStr>,
 ) -> Result<tokio::process::Command, anyhow::Error> {
-    let resolved_command = resolve_stdio_command(command);
+    let resolved_command = resolve_stdio_command(command, login_path);
     let sandbox = config.sandbox.as_ref().filter(|sandbox| sandbox.enabled);
     let Some(sandbox) = sandbox else {
         let mut cmd = tokio::process::Command::new(&resolved_command);
         cmd.args(args);
-        apply_stdio_environment(&mut cmd);
+        apply_stdio_environment(&mut cmd, login_path);
         return Ok(cmd);
     };
 
@@ -265,7 +264,7 @@ fn build_stdio_command(
         }
         cmd.arg(&resolved_command);
         cmd.args(args);
-        apply_stdio_environment(&mut cmd);
+        apply_stdio_environment(&mut cmd, login_path);
         Ok(cmd)
     }
 
@@ -278,7 +277,9 @@ fn build_stdio_command(
     }
 }
 
-pub(crate) fn resolve_stdio_command(command: &str) -> PathBuf {
+/// Resolve a bare stdio command through PATH, then through `login_path` (the
+/// user's login-shell PATH from [`stdio_login_path`]).
+pub(crate) fn resolve_stdio_command(command: &str, login_path: Option<&OsStr>) -> PathBuf {
     let configured = PathBuf::from(command);
     if configured.components().count() > 1 {
         return configured;
@@ -292,37 +293,70 @@ pub(crate) fn resolve_stdio_command(command: &str) -> PathBuf {
         return path;
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        // SMAppService launch agents intentionally receive launchd's minimal
-        // PATH. Resolve through the user's login PATH, which is also inherited
-        // by the child below so script launchers such as `#!/usr/bin/env node`
-        // can find their own interpreter.
-        if let Some(path) = macos_login_shell_path().and_then(|paths| {
-            std::env::split_paths(paths)
-                .map(|dir| dir.join(command))
-                .find(|path| path.is_file())
-        }) {
-            return path;
-        }
+    // SMAppService launch agents intentionally receive launchd's minimal
+    // PATH. Resolve through the user's login PATH, which is also inherited
+    // by the child below so script launchers such as `#!/usr/bin/env node`
+    // can find their own interpreter.
+    if let Some(path) = login_path.and_then(|paths| {
+        std::env::split_paths(paths)
+            .map(|dir| dir.join(command))
+            .find(|path| path.is_file())
+    }) {
+        return path;
     }
 
     configured
 }
 
+/// The user's login-shell PATH, probed once per process. `None` off macOS, or
+/// when the probe fails or times out; callers then fall back to the inherited
+/// PATH. A failed probe is cached too, so only the first start ever waits.
+pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
+    #[cfg(target_os = "macos")]
+    {
+        static LOGIN_SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> =
+            tokio::sync::OnceCell::const_new();
+        LOGIN_SHELL_PATH
+            .get_or_init(|| {
+                probe_login_shell_path(
+                    "/bin/zsh",
+                    &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
+                    LOGIN_SHELL_PROBE_TIMEOUT,
+                )
+            })
+            .await
+            .as_deref()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// An interactive login shell runs the user's dotfiles, which can hang. A stuck
+/// shell delays the first stdio start by at most this long, never forever.
 #[cfg(target_os = "macos")]
-fn macos_login_shell_path() -> Option<&'static OsStr> {
-    static LOGIN_SHELL_PATH: OnceLock<Option<OsString>> = OnceLock::new();
-    LOGIN_SHELL_PATH
-        .get_or_init(|| {
-            std::process::Command::new("/bin/zsh")
-                .args(["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| login_shell_path(&output.stdout))
-        })
-        .as_deref()
+const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+async fn probe_login_shell_path(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<OsString> {
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(timeout, output).await {
+        Ok(Ok(output)) if output.status.success() => login_shell_path(&output.stdout),
+        Ok(_) => None,
+        Err(_) => {
+            tracing::warn!(
+                "login shell PATH probe timed out after {timeout:?}; using inherited PATH"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -336,15 +370,11 @@ fn login_shell_path(stdout: &[u8]) -> Option<OsString> {
         .map(OsString::from)
 }
 
-#[cfg(target_os = "macos")]
-fn apply_stdio_environment(command: &mut tokio::process::Command) {
-    if let Some(path) = macos_login_shell_path() {
+fn apply_stdio_environment(command: &mut tokio::process::Command, login_path: Option<&OsStr>) {
+    if let Some(path) = login_path {
         command.env("PATH", path);
     }
 }
-
-#[cfg(not(target_os = "macos"))]
-fn apply_stdio_environment(_command: &mut tokio::process::Command) {}
 
 #[cfg(target_os = "macos")]
 fn build_macos_sandbox_profile(
@@ -1422,7 +1452,8 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("stdio transport requires a command"))?;
 
-                    let mut cmd = build_stdio_command(command, &config.args, config)?;
+                    let login_path = stdio_login_path().await;
+                    let mut cmd = build_stdio_command(command, &config.args, config, login_path)?;
                     // Suppress stderr at the OS level to prevent noisy server logs
                     cmd.stderr(std::process::Stdio::null());
 
@@ -2570,6 +2601,29 @@ mod tests {
         );
 
         starting.abort();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn login_shell_probe_gives_up_on_a_hung_shell() {
+        let started = std::time::Instant::now();
+        let path =
+            probe_login_shell_path("/bin/sh", &["-c", "sleep 30"], Duration::from_millis(200))
+                .await;
+        assert_eq!(path, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn login_shell_probe_reads_marked_path() {
+        let path = probe_login_shell_path(
+            "/bin/sh",
+            &["-c", "echo noise; echo __PLUG_STDIO_PATH__/bin:/opt/bin"],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(path, Some(OsString::from("/bin:/opt/bin")));
     }
 
     #[cfg(target_os = "macos")]

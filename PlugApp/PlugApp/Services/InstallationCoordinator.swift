@@ -133,18 +133,29 @@ final class InstallationCoordinator {
                 if case .recognizedLegacy = preUninstallDaemon.ownership {
                     leftoverAdoptSnapshot = preUninstallDaemon
                 }
-                try await bootOutHomebrewLegacyIfNeeded(preUninstallDaemon)
-                publish(.removingLegacyFormula)
-                try await legacyMigrator.removeRecognizedFormula(legacy)
+                // Stopping the Homebrew daemon and uninstalling its formula take
+                // over a running system, so they wait for the same consent as
+                // adoption. Without it, the formula stays and the daemon step
+                // below offers adoption.
+                if !Self.requiresAdoption(preUninstallDaemon) || isAdoptionAuthorized(trigger) {
+                    try await bootOutHomebrewLegacyIfNeeded(preUninstallDaemon)
+                    publish(.removingLegacyFormula)
+                    try await legacyMigrator.removeRecognizedFormula(legacy)
+                    legacy = legacySnapshot(legacy, formulaInstalled: false)
+                }
                 legacy = legacySnapshot(
                     legacy,
-                    formulaInstalled: false,
                     recognizedPaths: legacy.recognizedPaths.union(inspectTimeLegacyPaths)
                 )
             }
 
             let shellLink: ShellLinkState
             switch legacy.shellLink {
+            case .absent where legacy.formulaInstalled,
+                 .repairable where legacy.formulaInstalled:
+                // The formula still owns the command until adoption removes it,
+                // and the repair refuses while it is installed.
+                shellLink = legacy.shellLink
             case .absent, .repairable:
                 publish(.repairingCommand)
                 shellLink = try await legacyMigrator.repairShellLink(to: canonical.executableURL)
@@ -228,12 +239,7 @@ final class InstallationCoordinator {
         }
     }
 
-    /// Both `.recognizedLegacy` and `.unmanaged` mean something other than this
-    /// app currently owns the daemon label. Taking it over changes a running
-    /// system, so it happens only when the user asked for it or has already
-    /// granted the app the service. This is the single definition on purpose:
-    /// two copies of an authorization check that can drift is how a daemon gets
-    /// adopted without consent.
+    /// Publishes the adoption offer and stops when `isAdoptionAuthorized` says no.
     private func requireAdoptionAuthorized(
         snapshot: DaemonServiceSnapshot,
         canonical: VerifiedAppInstallation,
@@ -241,7 +247,7 @@ final class InstallationCoordinator {
         clientRepairNeeded: Bool,
         trigger: ReconciliationTrigger
     ) throws {
-        guard trigger == .explicitAdoption || daemonManager.appServiceEnabled else {
+        guard isAdoptionAuthorized(trigger) else {
             state = .adoptionRequired(
                 makeSnapshot(
                     app: canonical,
@@ -251,6 +257,27 @@ final class InstallationCoordinator {
                 )
             )
             throw CoordinatorError.adoptionRequired
+        }
+    }
+
+    /// Both `.recognizedLegacy` and `.unmanaged` mean something other than this
+    /// app currently owns the daemon label. Taking it over changes a running
+    /// system, so it happens only when the user asked for it or has already
+    /// granted the app the service. This is the single definition on purpose:
+    /// two copies of an authorization check that can drift is how a daemon gets
+    /// adopted without consent.
+    private func isAdoptionAuthorized(_ trigger: ReconciliationTrigger) -> Bool {
+        trigger == .explicitAdoption || daemonManager.appServiceEnabled
+    }
+
+    /// Ownership that `reconcileDaemon` takes over only after
+    /// `requireAdoptionAuthorized`.
+    private static func requiresAdoption(_ snapshot: DaemonServiceSnapshot) -> Bool {
+        switch snapshot.ownership {
+        case .recognizedLegacy, .unmanaged:
+            return true
+        case .appManagedCurrent, .appManagedStale, .unknown:
+            return false
         }
     }
 
