@@ -85,10 +85,13 @@ public actor PlugIPCClient {
                 to: descriptor,
                 deadline: deadline
             )
-            let header = try Self.readExact(4, from: descriptor, deadline: deadline)
-            let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-            guard length <= FrameCodec.maximumPayloadSize else { throw PlugIPCError.frameTooLarge(Int(length)) }
-            let payload = try Self.readExact(Int(length), from: descriptor, deadline: deadline)
+            let fd = descriptor
+            let payload = try Self.readResponsePayload(decoder: decoder) {
+                let header = try Self.readExact(4, from: fd, deadline: deadline)
+                let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
+                guard length <= FrameCodec.maximumPayloadSize else { throw PlugIPCError.frameTooLarge(Int(length)) }
+                return try Self.readExact(Int(length), from: fd, deadline: deadline)
+            }
             let response = try decoder.decode(IPCResponse.self, from: payload)
             if case let .error(code, message) = response { throw PlugIPCError.daemon(code, message) }
             return response
@@ -96,6 +99,43 @@ public actor PlugIPCClient {
             disconnect()
             throw error
         }
+    }
+
+    /// The daemon sends a response larger than one frame as a run of
+    /// `ResponseChunk` envelopes whose base64 payloads join into the response
+    /// JSON. Anything else is the response itself.
+    static func readResponsePayload(
+        decoder: JSONDecoder,
+        nextFrame: () throws -> Data
+    ) throws -> Data {
+        var joined = Data()
+        var nextIndex: UInt32 = 0
+        var expectedCount: UInt32?
+        while true {
+            let frame = try nextFrame()
+            guard let chunk = try? decoder.decode(ResponseChunk.self, from: frame),
+                  chunk.envelope == "ResponseChunk"
+            else {
+                guard expectedCount == nil else { throw PlugIPCError.unexpectedResponse("partial chunked response") }
+                return frame
+            }
+            guard chunk.chunkCount > 0,
+                  chunk.chunkIndex == nextIndex,
+                  expectedCount == nil || expectedCount == chunk.chunkCount,
+                  let bytes = Data(base64Encoded: chunk.payloadB64)
+            else { throw PlugIPCError.unexpectedResponse("invalid response chunk") }
+            expectedCount = chunk.chunkCount
+            joined.append(bytes)
+            nextIndex += 1
+            if nextIndex == chunk.chunkCount { return joined }
+        }
+    }
+
+    private struct ResponseChunk: Decodable {
+        let envelope: String
+        let chunkIndex: UInt32
+        let chunkCount: UInt32
+        let payloadB64: String
     }
 
     public func disconnect() {

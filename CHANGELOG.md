@@ -48,6 +48,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Plug capability".
 - A server the daemon reports as degraded now shows as running in the app
   instead of "Unknown" with a Restart button.
+- The app reads responses the daemon splits into chunks, so a server list or
+  tool list larger than 4 MiB no longer fails to load.
 
 ## [0.8.11] - 2026-09-01
 
