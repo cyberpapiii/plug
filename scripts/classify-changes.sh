@@ -21,13 +21,13 @@ emit() {
 }
 
 paths_from_working_tree() {
-  git diff --name-only --diff-filter=ACMRT HEAD
+  git diff --name-only --diff-filter=ACDMRT HEAD
   git ls-files --others --exclude-standard
 }
 
 paths_from_range() {
   local base="$1" head="$2"
-  git diff --name-only --diff-filter=ACMRT "$base" "$head"
+  git diff --name-only --diff-filter=ACDMRT "$base" "$head"
 }
 
 # `${1-...}` and not `${1:-...}`: an explicitly empty first argument is CI
