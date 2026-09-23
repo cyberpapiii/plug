@@ -175,6 +175,8 @@ fn scope_description(scope: &str) -> &'static str {
         "tasks:use" => "Run and manage long-running tasks through Plug",
         "subscriptions:listen" => "Receive change notifications from Plug",
         "logging:configure" => "Change the log verbosity of Plug and its servers",
+        "logging:read" => "Receive log output from Plug and its servers",
+        "continuations:complete" => "Answer follow-up questions from a tool while it runs",
         "offline_access" => "Stay connected after this browser window closes",
         _ => "Use the requested Plug capability",
     }
@@ -191,7 +193,19 @@ fn html_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::versioned_asset_url;
+    use super::{scope_description, versioned_asset_url};
+
+    #[test]
+    fn every_default_scope_has_a_specific_description() {
+        let fallback = scope_description("not-a-real-scope");
+        for scope in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
+            assert_ne!(
+                scope_description(scope),
+                fallback,
+                "{scope} is in the default grant but the consent page has no text for it"
+            );
+        }
+    }
 
     #[test]
     fn asset_url_fingerprint_changes_with_content() {

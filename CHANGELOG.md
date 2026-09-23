@@ -43,6 +43,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - The documented macOS config path is now
   `~/Library/Application Support/plug/config.toml`. README and the operator
   guide had been pointing at `~/.config/plug/`, which is the Linux location.
+- The passkey consent page now says what `logging:read` and
+  `continuations:complete` allow instead of the generic "Use the requested
+  Plug capability".
 
 ## [0.8.11] - 2026-09-01
 
