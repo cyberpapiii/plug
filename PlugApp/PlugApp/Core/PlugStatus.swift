@@ -18,7 +18,9 @@ enum ServerHealth: Equatable, Sendable {
             return
         }
         switch daemonValue {
-        case "Healthy": self = .working
+        // Degraded still routes calls, so it reads as running rather than
+        // as an unknown state that asks for attention.
+        case "Healthy", "Degraded": self = .working
         case "Starting", nil: self = .starting
         case "AuthRequired": self = .signInNeeded
         case "Failed": self = .down

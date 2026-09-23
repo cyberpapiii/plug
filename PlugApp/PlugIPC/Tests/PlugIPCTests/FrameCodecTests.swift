@@ -309,4 +309,45 @@ private final class AcceptedNeverReadServer: @unchecked Sendable {
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
     }
+    private func chunkFrames(_ payload: Data, pieceSize: Int) -> [Data] {
+        let pieces = stride(from: 0, to: payload.count, by: pieceSize).map {
+            payload.subdata(in: $0..<min($0 + pieceSize, payload.count))
+        }
+        return pieces.enumerated().map { index, piece in
+            Data("""
+            {"envelope":"ResponseChunk","chunk_index":\(index),"chunk_count":\(pieces.count),"payload_b64":"\(piece.base64EncodedString())"}
+            """.utf8)
+        }
+    }
+
+    private func readPayload(_ frames: [Data]) throws -> Data {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        var remaining = frames[...]
+        return try PlugIPCClient.readResponsePayload(decoder: decoder) {
+            guard let frame = remaining.popFirst() else { throw PlugIPCError.disconnected }
+            return frame
+        }
+    }
+
+    func testChunkedResponseReassemblesIntoOneResponse() throws {
+        let payload = Data(#"{"type":"DownstreamClientRevoked","client_id":"client-with-a-long-id"}"#.utf8)
+        let joined = try readPayload(chunkFrames(payload, pieceSize: 7))
+        XCTAssertEqual(joined, payload)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard case let .revoked(id) = try decoder.decode(IPCResponse.self, from: joined) else {
+            return XCTFail("expected revoked")
+        }
+        XCTAssertEqual(id, "client-with-a-long-id")
+    }
+
+    func testUnchunkedResponsePassesThrough() throws {
+        let payload = Data(#"{"type":"Ok"}"#.utf8)
+        XCTAssertEqual(try readPayload([payload]), payload)
+    }
+
+    func testOutOfOrderChunksAreRejected() {
+        let frames = chunkFrames(Data(#"{"type":"Ok"}"#.utf8), pieceSize: 4)
+        XCTAssertThrowsError(try readPayload([frames[1], frames[0]] + frames.dropFirst(2)))
+        XCTAssertThrowsError(try readPayload([frames[0], Data(#"{"type":"Ok"}"#.utf8)]))
+    }
 }
