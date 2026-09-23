@@ -317,19 +317,32 @@ pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
     {
         static LOGIN_SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> =
             tokio::sync::OnceCell::const_new();
-        LOGIN_SHELL_PATH
-            .get_or_init(|| {
-                probe_login_shell_path(
-                    "/bin/zsh",
-                    &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
-                    LOGIN_SHELL_PROBE_TIMEOUT,
-                )
-            })
-            .await
-            .as_deref()
+        init_detached(
+            &LOGIN_SHELL_PATH,
+            probe_login_shell_path(
+                "/bin/zsh",
+                &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
+                LOGIN_SHELL_PROBE_TIMEOUT,
+            ),
+        )
+        .await
     }
     #[cfg(not(target_os = "macos"))]
     None
+}
+
+/// Fills `cell` from a spawned task, so a caller cancelled mid-probe (a start
+/// timeout shorter than the probe's) cannot leave the cell unset and make the
+/// next start pay for the probe again.
+#[cfg(target_os = "macos")]
+async fn init_detached(
+    cell: &'static tokio::sync::OnceCell<Option<OsString>>,
+    init: impl Future<Output = Option<OsString>> + Send + 'static,
+) -> Option<&'static OsStr> {
+    if cell.get().is_none() {
+        let _ = tokio::spawn(async move { cell.get_or_init(|| init).await }).await;
+    }
+    cell.get().and_then(|path| path.as_deref())
 }
 
 /// An interactive login shell runs the user's dotfiles, which can hang. A stuck
@@ -2625,6 +2638,34 @@ mod tests {
         )
         .await;
         assert_eq!(path, Some(OsString::from("/bin:/opt/bin")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn login_shell_probe_survives_a_cancelled_caller() {
+        static CELL: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCell::const_new();
+        let probe = || {
+            probe_login_shell_path(
+                "/bin/sh",
+                &["-c", "sleep 0.3; echo __PLUG_STDIO_PATH__/bin"],
+                Duration::from_secs(5),
+            )
+        };
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), init_detached(&CELL, probe())).await;
+        assert!(cancelled.is_err(), "caller should time out mid-probe");
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            CELL.get(),
+            Some(&Some(OsString::from("/bin"))),
+            "the probe must finish and fill the cell after its caller is gone"
+        );
+        assert_eq!(
+            init_detached(&CELL, probe()).await,
+            Some(OsStr::new("/bin"))
+        );
     }
 
     #[cfg(target_os = "macos")]
