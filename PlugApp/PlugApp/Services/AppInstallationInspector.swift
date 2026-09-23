@@ -132,7 +132,9 @@ struct AppInstallationInspector: AppInstallationInspecting {
         let result = try await ProcessRunner().run(
             executable: executableURL,
             arguments: ["--version"],
-            timeout: .seconds(3)
+            // Right after login the first run of a fresh binary can wait on
+            // disk and on Gatekeeper for well over three seconds.
+            timeout: .seconds(15)
         )
         let output = String(decoding: result.stdout, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)

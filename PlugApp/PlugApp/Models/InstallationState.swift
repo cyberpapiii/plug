@@ -16,6 +16,9 @@ enum ReconciliationPhase: Equatable {
     case replacingDaemon
     case verifying
     case cleaningLegacyBinary
+    /// A command timed out, which right after login usually means the Mac is
+    /// still busy rather than broken. The coordinator tries again by itself.
+    case waitingToRetry
 }
 
 enum ShellLinkState: Equatable, Sendable {

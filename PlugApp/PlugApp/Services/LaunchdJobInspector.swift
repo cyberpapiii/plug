@@ -14,6 +14,7 @@ enum LaunchdJobInspectionError: Error, Equatable {
 }
 
 struct LaunchdJobInspector: LaunchdJobInspecting {
+    private static let daemonLabel = "com.plug.daemon"
     private static let appProgramIdentifier = "Contents/Resources/plug"
     private static let appArguments = [appProgramIdentifier, "serve", "--daemon"]
 
@@ -39,7 +40,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let canonicalPath = Self.resolvedPath(canonical.executableURL)
         let legacyPaths = Set(recognizedLegacyPaths.map(Self.resolvedPath))
         let relevant = allRecords.filter { record in
-            record.label == "com.plug.daemon"
+            record.label == Self.daemonLabel
                 || record.programURL?.lastPathComponent == "plug"
                 || record.programIdentifier == Self.appProgramIdentifier
                 || record.arguments.first == Self.appProgramIdentifier
@@ -88,12 +89,21 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let labels = parseLabels(String(decoding: listed.stdout, as: UTF8.self))
         var records: [LaunchdJobRecord] = []
         for label in labels {
-            let detail = try await runner.run(
-                executable: launchctl,
-                arguments: ["print", "gui/\(userID)/\(label)"],
-                timeout: .seconds(5)
-            )
-            if detail.status != 0, label != "com.plug.daemon" {
+            let detail: ProcessResult
+            do {
+                detail = try await runner.run(
+                    executable: launchctl,
+                    arguments: ["print", "gui/\(userID)/\(label)"],
+                    timeout: .seconds(15)
+                )
+            } catch ProcessRunnerError.timedOut where label != daemonLabel {
+                // launchd answers slowly for other people's jobs while the
+                // Mac is still logging in. Those jobs cannot be Plug's exact
+                // service, so a slow answer about one of them is not evidence
+                // about ownership. Plug's own label stays fail-closed.
+                continue
+            }
+            if detail.status != 0, label != daemonLabel {
                 // `launchctl list` includes transient jobs that can disappear
                 // before `print`. Their absence proves there is nothing left
                 // to inspect or mutate. Plug's exact service remains

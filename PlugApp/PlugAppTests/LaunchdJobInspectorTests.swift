@@ -299,6 +299,35 @@ final class LaunchdJobInspectorTests: XCTestCase {
         }
     }
 
+    func testSlowLaunchctlPrintForUnrelatedJobIsIgnored() async throws {
+        let inspector = LaunchdJobInspector(
+            runner: TimingOutLaunchctlRunner(slowLabel: "com.example.other"),
+            userID: 501
+        )
+
+        let state = try await inspector.daemonJobs(
+            canonical: canonical,
+            recognizedLegacyPaths: []
+        )
+
+        XCTAssertEqual(state, .unmanaged)
+    }
+
+    func testSlowLaunchctlPrintForPlugDaemonIsPropagated() async {
+        let inspector = LaunchdJobInspector(
+            runner: TimingOutLaunchctlRunner(slowLabel: "com.plug.daemon"),
+            userID: 501
+        )
+
+        do {
+            _ = try await inspector.daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+            XCTFail("Expected the daemon label's timeout to propagate")
+        } catch ProcessRunnerError.timedOut {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testVanishedUnrelatedLaunchdJobIsIgnored() async throws {
         let runner = VanishedUnrelatedLaunchctlRunner()
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
@@ -383,6 +412,32 @@ private struct LegacyPlugProgramFixture: Decodable {
         case recognized
         case homeRecognizedSuffixes = "home_recognized_suffixes"
         case unrecognized
+    }
+}
+
+private actor TimingOutLaunchctlRunner: ProcessRunning {
+    private let slowLabel: String
+
+    init(slowLabel: String) {
+        self.slowLabel = slowLabel
+    }
+
+    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        if arguments == ["list"] {
+            return ProcessResult(
+                status: 0,
+                stdout: Data("PID\tStatus\tLabel\n123\t0\t\(slowLabel)\n124\t0\tcom.example.fast\n".utf8),
+                stderr: Data()
+            )
+        }
+        if arguments.last?.hasSuffix(slowLabel) == true {
+            throw ProcessRunnerError.timedOut
+        }
+        return ProcessResult(
+            status: 113,
+            stdout: Data(),
+            stderr: Data("Could not find service".utf8)
+        )
     }
 }
 
