@@ -260,18 +260,17 @@ final class InstallationCoordinator {
         }
     }
 
-    /// Both `.recognizedLegacy` and `.unmanaged` mean something other than this
-    /// app currently owns the daemon label. Taking it over changes a running
-    /// system, so it happens only when the user asked for it or has already
-    /// granted the app the service. This is the single definition on purpose:
+    /// Taking over a daemon this app does not own changes a running system, so
+    /// it happens only when the user asked for it or has already granted the
+    /// app the service. This is the single definition on purpose:
     /// two copies of an authorization check that can drift is how a daemon gets
     /// adopted without consent.
     private func isAdoptionAuthorized(_ trigger: ReconciliationTrigger) -> Bool {
         trigger == .explicitAdoption || daemonManager.appServiceEnabled
     }
 
-    /// Ownership that `reconcileDaemon` takes over only after
-    /// `requireAdoptionAuthorized`.
+    /// Ownership that something other than this app holds, so taking it over
+    /// needs `isAdoptionAuthorized`.
     private static func requiresAdoption(_ snapshot: DaemonServiceSnapshot) -> Bool {
         switch snapshot.ownership {
         case .recognizedLegacy, .unmanaged:
@@ -288,8 +287,7 @@ final class InstallationCoordinator {
         clientRepairNeeded: Bool,
         trigger: ReconciliationTrigger
     ) async throws -> OperatorHandshake {
-        switch snapshot.ownership {
-        case .recognizedLegacy:
+        if Self.requiresAdoption(snapshot) {
             try requireAdoptionAuthorized(
                 snapshot: snapshot,
                 canonical: canonical,
@@ -297,6 +295,9 @@ final class InstallationCoordinator {
                 clientRepairNeeded: clientRepairNeeded,
                 trigger: trigger
             )
+        }
+        switch snapshot.ownership {
+        case .recognizedLegacy:
             publish(.replacingDaemon)
             return try await daemonManager.adoptRecognizedLegacy(
                 snapshot: snapshot,
@@ -304,13 +305,6 @@ final class InstallationCoordinator {
             )
 
         case .unmanaged:
-            try requireAdoptionAuthorized(
-                snapshot: snapshot,
-                canonical: canonical,
-                legacy: legacy,
-                clientRepairNeeded: clientRepairNeeded,
-                trigger: trigger
-            )
             publish(.replacingDaemon)
             try await daemonManager.adopt()
             return try await daemonManager.ensureRunning(expectedVersion: canonical.appVersion)
