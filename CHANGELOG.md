@@ -24,6 +24,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Toggling a tool or server from Plug.app or `plug servers` no longer
+  restarts every server whose config uses `$VAR` env references. The reload
+  compared the raw file against the expanded running config, saw every
+  `$VAR` as changed, and restarted those servers with the literal
+  placeholders instead of their values.
+- A login shell that hangs while Plug reads its PATH no longer stalls stdio
+  server starts. The probe now runs off the async workers and gives up after
+  five seconds, falling back to the inherited PATH.
+- Opening Plug.app no longer stops a Homebrew-installed daemon or uninstalls
+  the formula before you approve adoption. Both now wait for the same consent
+  as taking over the daemon.
 - Right after login the menu bar no longer shows "Setup incomplete" with the
   detail "timedOut". A command that times out while the Mac is still busy now
   waits five seconds and runs again, up to six times, before Plug reports a

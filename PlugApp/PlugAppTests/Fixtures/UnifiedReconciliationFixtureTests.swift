@@ -16,13 +16,15 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         await harness.coordinator.reconcile(trigger: .applicationLaunch)
 
         guard case let .adoptionRequired(beforeAdoption) = harness.coordinator.state else {
-            return XCTFail("Legacy daemon must require one explicit adoption")
+            return XCTFail("Legacy daemon must require one explicit adoption, got \(harness.coordinator.state)")
         }
         XCTAssertEqual(beforeAdoption.service.daemonVersion, fixture.legacyVersion)
         XCTAssertEqual(beforeAdoption.service.ownership, .recognizedLegacy([fixture.legacyJob]))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargoURL.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.formulaURL.path))
-        XCTAssertEqual(try fixture.shellDestination(), fixture.canonical.executableURL.path)
+        // Uninstalling the formula takes over a running system, so it waits
+        // for adoption, and the shell link with it.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.formulaURL.path))
+        XCTAssertEqual(try fixture.shellDestination(), fixture.cargoURL.path)
         XCTAssertEqual(
             try String(contentsOf: fixture.clientURL, encoding: .utf8),
             fixture.canonicalClientContents
@@ -151,7 +153,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
 
         await harness.coordinator.reconcile(trigger: .applicationLaunch)
         guard case .adoptionRequired = harness.coordinator.state else {
-            return XCTFail("Legacy fixture must pause at explicit adoption")
+            return XCTFail("Legacy fixture must pause at explicit adoption, got \(harness.coordinator.state)")
         }
 
         await harness.coordinator.adopt()

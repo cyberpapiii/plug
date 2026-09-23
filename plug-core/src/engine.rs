@@ -876,7 +876,10 @@ impl Engine {
         crate::reload::ReloadReport,
     )> {
         let _guard = self.reload_lock.lock().await;
-        let (config, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
+        let (_, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
+        // The mutation persists the raw file, `$VAR` refs and all. Reload what the
+        // daemon would load at startup, or every env-ref server looks changed.
+        let config = crate::config::load_config(Some(&config_path.to_path_buf()))?;
         let report = crate::reload::apply_reload(self, config).await?;
         Ok((result, report))
     }
@@ -1947,6 +1950,46 @@ mod tests {
                 .servers
                 .contains_key("fixture")
         );
+    }
+
+    #[tokio::test]
+    async fn operator_mutation_reloads_with_env_refs_expanded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[servers.fixture]
+command = "echo"
+enabled = false
+
+[servers.fixture.env]
+HOME_DIR = "$HOME"
+"#,
+        )
+        .unwrap();
+        let config = crate::config::load_config(Some(&path)).unwrap();
+        assert_ne!(config.servers["fixture"].env["HOME_DIR"], "$HOME");
+        let engine = Arc::new(Engine::new(config));
+
+        let (_, report) = engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::SetToolEnabled {
+                    tool: "fixture__noop".into(),
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            report.unchanged.contains(&"fixture".to_string()),
+            "an unrelated mutation must not restart a server with $VAR env: {report:?}"
+        );
+        assert_ne!(engine.config().servers["fixture"].env["HOME_DIR"], "$HOME");
+        let persisted = crate::operator::load_editable_config(&path).unwrap();
+        assert_eq!(persisted.servers["fixture"].env["HOME_DIR"], "$HOME");
     }
 
     #[tokio::test]
