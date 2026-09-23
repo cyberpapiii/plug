@@ -1,8 +1,9 @@
 #![allow(clippy::mutable_key_type)]
 
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::future::Future;
 #[cfg(target_os = "macos")]
 use std::path::Path;
