@@ -187,6 +187,12 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true), .starting)
     }
 
+    func testDegradedServerStillReadsAsRunning() {
+        let health = ServerHealth(daemonValue: "Degraded", enabled: true)
+        XCTAssertEqual(health, .working)
+        XCTAssertFalse(health.needsAttention)
+    }
+
     func testWorkingHealthUsesLiveDotInsteadOfCompletionCheckmark() {
         XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).symbol, "circle.fill")
     }
