@@ -1512,17 +1512,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 
         IpcRequest::Deregister { session_id } => {
             // Enforce session ownership — only deregister your own session
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             let removed_client_id = ctx.client_registry.client_id(session_id);
             ctx.client_registry.deregister(session_id);
@@ -1572,17 +1563,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             client_info,
         } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             if ctx
                 .client_registry
@@ -1603,17 +1585,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::Ping { session_id } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             IpcResponse::Pong
         }
@@ -1684,17 +1657,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             },
         },
         IpcRequest::Capabilities { session_id } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             // Capabilities are negotiated once per session and never
             // revisited, so answering from a catalog that is still filling
@@ -1721,17 +1685,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::ModernDownstreamGate { session_id } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             IpcResponse::ModernDownstreamGate {
                 enabled: ctx.engine.tool_router().modern_downstream_enabled(),
@@ -1740,17 +1695,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 
         IpcRequest::UpdateRoots { session_id, roots } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             match serde_json::from_value::<Vec<rmcp::model::Root>>(roots.clone()) {
                 Ok(parsed_roots) => {
@@ -1781,17 +1727,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             capabilities,
         } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             if ctx
                 .client_registry
@@ -1811,17 +1748,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::RestoreResourceSubscriptions { session_id, uris } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: Arc::from(session_id.as_str()),
@@ -1886,17 +1814,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             params,
         } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await
         }
@@ -1909,17 +1828,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         } => {
             // Context-bearing requests use the same connection ownership
             // rules as the legacy IPC request shape.
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await
         }
@@ -1966,6 +1876,25 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 
         IpcRequest::AuthStatus => dispatch_auth_status(ctx).await,
     }
+}
+
+/// Reject a request naming a session this connection does not own
+/// (`SESSION_MISMATCH`) or one a newer registration has replaced
+/// (`SESSION_REPLACED`).
+fn reject_unowned_session(ctx: &ConnectionContext, session_id: &str) -> Option<IpcResponse> {
+    if ctx.session_id.as_deref() != Some(session_id) {
+        return Some(IpcResponse::Error {
+            code: "SESSION_MISMATCH".to_string(),
+            message: "session_id does not match this connection".to_string(),
+        });
+    }
+    if !ctx.client_registry.session_exists(session_id) {
+        return Some(IpcResponse::Error {
+            code: "SESSION_REPLACED".to_string(),
+            message: "session is no longer active for this client".to_string(),
+        });
+    }
+    None
 }
 
 fn reject_invalid_cancellation_identity(
