@@ -330,7 +330,7 @@ final class AppModel {
         do {
             let handshake = try await ipc.connect()
             capabilities = Set(handshake.capabilities)
-            guard handshake.ipcMin <= 6, handshake.ipcMax >= 3 else {
+            guard handshake.sharesSupportedIPCVersion else {
                 connectionState = .incompatible
                 lastError = nil
                 return

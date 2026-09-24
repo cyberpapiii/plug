@@ -40,8 +40,6 @@ extension DaemonServiceManager: DaemonServiceManaging {}
 
 @MainActor @Observable
 final class InstallationCoordinator {
-    private static let supportedIPCMin: UInt16 = 3
-    private static let supportedIPCMax: UInt16 = 6
     private static let appManagedOwnership = "app_managed"
     private static let unknownOwnership = "unknown"
 
@@ -617,9 +615,7 @@ final class InstallationCoordinator {
     }
 
     private func isCompatible(_ handshake: OperatorHandshake) -> Bool {
-        guard handshake.ipcMin <= handshake.ipcMax else { return false }
-        return handshake.ipcMin <= Self.supportedIPCMax
-            && handshake.ipcMax >= Self.supportedIPCMin
+        handshake.sharesSupportedIPCVersion
     }
 
     private func isExactService(

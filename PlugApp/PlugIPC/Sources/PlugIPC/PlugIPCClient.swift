@@ -75,7 +75,11 @@ public actor PlugIPCClient {
         if descriptor < 0 {
             descriptor = try Self.openSocket(path: socketURL.path, requestTimeout: requestTimeout)
         }
-        let response = try request(.handshake(clientVersion: clientVersion, ipcMin: 3, ipcMax: 6))
+        let response = try request(.handshake(
+            clientVersion: clientVersion,
+            ipcMin: supportedIPCVersions.lowerBound,
+            ipcMax: supportedIPCVersions.upperBound
+        ))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         negotiated = handshake
         return handshake

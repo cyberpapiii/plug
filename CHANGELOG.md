@@ -90,6 +90,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   no longer inspects the app, the command, the clients and the daemon a
   second time after a pass that changed nothing, and it trusts the launchd
   inspection it just made, so the first refresh comes sooner.
+- The "Show Plug in the menu bar at login" toggle starts from what macOS
+  reports instead of a value Plug remembered separately.
 
 ## [0.8.11] - 2026-09-01
 
