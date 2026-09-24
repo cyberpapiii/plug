@@ -69,6 +69,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Through `plug connect`, an upstream error from reading a resource, getting
   a prompt, completing, or listing now reaches the client as that error (for
   example "resource not found") instead of "failed to parse".
+- Sending a client's roots to the daemon through `plug connect` no longer
+  leaves its reply behind for the next call to read when the daemon pushed a
+  notification first, and a wedged daemon during that send now trips the
+  read watchdog instead of hanging.
 
 ## [0.8.11] - 2026-09-01
 

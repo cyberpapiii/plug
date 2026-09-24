@@ -80,7 +80,7 @@ struct SharedConnection {
     ///
     /// Lock ordering: `conn` is always acquired before `replay` whenever
     /// both are needed. The only sites that need both are
-    /// `refresh_session_locked`/`refresh_session` (the reconnect path),
+    /// `refresh_session` (the reconnect path),
     /// which already hold `conn` when they lock `replay` for the replay
     /// round trips. Every other mutation site (`initialize`, `subscribe`,
     /// `unsubscribe`, `set_level`) locks `replay` alone, strictly after its
@@ -316,8 +316,21 @@ impl IpcProxyHandler {
     where
         F: Fn(&str) -> IpcRequest,
     {
-        let mut conn = self.shared.conn.lock().await;
-        let peer = self.shared.peer.get();
+        Self::shared_round_trip(&self.shared, retry_policy, build_request).await
+    }
+
+    /// `session_round_trip` for callers that hold only the shared connection,
+    /// such as the spawned roots refresh.
+    async fn shared_round_trip<F>(
+        shared: &SharedConnection,
+        retry_policy: RetryPolicy,
+        build_request: F,
+    ) -> Result<IpcResponse, McpError>
+    where
+        F: Fn(&str) -> IpcRequest,
+    {
+        let mut conn = shared.conn.lock().await;
+        let peer = shared.peer.get();
         let request = build_request(&conn.session_id);
         let payload = serde_json::to_vec(&request)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -326,14 +339,14 @@ impl IpcProxyHandler {
             &mut conn,
             &payload,
             peer,
-            &self.shared.modern_downstream_enabled,
+            &shared.modern_downstream_enabled,
         )
         .await
         {
             Ok(response) => Ok(response),
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon IPC connection lost; reconnecting");
-                self.reconnect_locked(&mut conn).await?;
+                Self::refresh_session(shared, &mut conn).await?;
                 match retry_policy {
                     RetryPolicy::SafeToRetry => {
                         let rebound = build_request(&conn.session_id);
@@ -343,7 +356,7 @@ impl IpcProxyHandler {
                             &mut conn,
                             &retry_payload,
                             peer,
-                            &self.shared.modern_downstream_enabled,
+                            &shared.modern_downstream_enabled,
                         )
                         .await
                         .map_err(|e| {
@@ -556,14 +569,6 @@ impl IpcProxyHandler {
         }
     }
 
-    async fn reconnect_locked(
-        &self,
-        conn: &mut crate::runtime::DaemonProxySession,
-    ) -> Result<(), McpError> {
-        self.refresh_session_locked(self.shared.config_path.as_ref(), conn)
-            .await
-    }
-
     async fn heartbeat_loop(shared: Arc<SharedConnection>) {
         let mut tick = tokio::time::interval(DAEMON_PING_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -615,39 +620,8 @@ impl IpcProxyHandler {
         }
     }
 
-    async fn refresh_session_locked(
-        &self,
-        config_path: Option<&PathBuf>,
-        conn: &mut crate::runtime::DaemonProxySession,
-    ) -> Result<(), McpError> {
-        let session = crate::runtime::establish_daemon_proxy_session(
-            config_path,
-            conn.client_id.clone(),
-            conn.client_info.clone(),
-        )
-        .await
-        .map_err(reconnect_error)?;
-        if let Ok(mut caps) = self.shared.capabilities.write() {
-            *caps = session.capabilities.clone();
-        }
-        self.shared.modern_downstream_enabled.store(
-            session.modern_downstream_enabled,
-            std::sync::atomic::Ordering::Release,
-        );
-        if let Ok(mut identity) = self.shared.cancellation_identity.write() {
-            *identity = CancellationIdentity {
-                session_id: session.session_id.clone(),
-                client_id: session.client_id.clone(),
-                cancellation_capability: session.cancellation_capability.clone(),
-            };
-        }
-        *conn = session;
-        Self::replay_session_state_locked(&self.shared, conn).await;
-        Ok(())
-    }
-
     async fn refresh_session(
-        shared: &Arc<SharedConnection>,
+        shared: &SharedConnection,
         conn: &mut crate::runtime::DaemonProxySession,
     ) -> Result<(), McpError> {
         let session = crate::runtime::establish_daemon_proxy_session(
@@ -680,7 +654,7 @@ impl IpcProxyHandler {
     /// `shared.conn`; use locked round trips only (see `SharedConnection::replay`).
     /// Replay failures are logged and do not fail reconnect.
     async fn replay_session_state_locked(
-        shared: &Arc<SharedConnection>,
+        shared: &SharedConnection,
         conn: &mut crate::runtime::DaemonProxySession,
     ) {
         let replay = shared.replay.lock().await;
@@ -730,7 +704,7 @@ impl IpcProxyHandler {
 
     /// Send a single replay request over the already-locked `conn` and
     /// classify the result as success/failure, without ever calling
-    /// `reconnect_locked`/`session_round_trip` (see
+    /// `refresh_session`/`session_round_trip` (see
     /// `replay_session_state_locked`).
     async fn send_replay_request(
         conn: &mut crate::runtime::DaemonProxySession,
@@ -1439,71 +1413,27 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
     }
 }
 
-/// Send `IpcRequest::UpdateRoots` and consume its reply.
+/// Send `IpcRequest::UpdateRoots` through the shared round trip, so the reply
+/// is read under the watchdog with push frames handled like any other call.
 async fn push_roots_to_daemon(shared: &SharedConnection, roots_json: serde_json::Value) {
-    let Some(peer) = shared.peer.get() else {
-        return;
-    };
-    let mut conn = shared.conn.lock().await;
-    let request = IpcRequest::UpdateRoots {
-        session_id: conn.session_id.clone(),
-        roots: roots_json,
-    };
-    let payload = match serde_json::to_vec(&request) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!(error = %e, "failed to serialize UpdateRoots");
-            return;
-        }
-    };
-    if let Err(e) = ipc::write_frame(&mut conn.writer, &payload).await {
-        tracing::debug!(error = %e, "failed to send UpdateRoots to daemon");
-        return;
-    }
-    // Read response while forwarding any interleaved daemon push traffic.
-    loop {
-        match ipc::read_frame(&mut conn.reader).await {
-            Ok(Some(frame)) => match serde_json::from_slice::<IpcResponse>(&frame) {
-                Ok(IpcResponse::LoggingNotification { params }) => {
-                    if let Ok(notif_params) =
-                        serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                    {
-                        let _ = peer.notify_logging_message(notif_params).await;
-                    }
-                    continue;
-                }
-                Ok(
-                    resp @ (IpcResponse::ToolListChangedNotification
-                    | IpcResponse::ResourceListChangedNotification
-                    | IpcResponse::ResourceUpdatedNotification { .. }
-                    | IpcResponse::PromptListChangedNotification
-                    | IpcResponse::ProgressNotification { .. }
-                    | IpcResponse::CancelledNotification { .. }
-                    | IpcResponse::AuthStateChanged { .. }),
-                ) => {
-                    forward_control_notification(Some(peer), resp).await;
-                    continue;
-                }
-                Ok(IpcResponse::Ok) => break,
-                Ok(IpcResponse::Error { code, message }) => {
-                    tracing::debug!(
-                        code = %code,
-                        message = %message,
-                        "daemon rejected UpdateRoots"
-                    );
-                    break;
-                }
-                Ok(_) => break,
-                Err(e) => {
-                    tracing::debug!(error = %e, "invalid UpdateRoots response");
-                    break;
-                }
-            },
-            Ok(None) => break,
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to read UpdateRoots response");
-                break;
+    let result =
+        IpcProxyHandler::shared_round_trip(shared, RetryPolicy::SafeToRetry, |session_id| {
+            IpcRequest::UpdateRoots {
+                session_id: session_id.to_string(),
+                roots: roots_json.clone(),
             }
+        })
+        .await;
+    match result {
+        Ok(IpcResponse::Ok) => {}
+        Ok(IpcResponse::Error { code, message }) => {
+            tracing::debug!(code = %code, message = %message, "daemon rejected UpdateRoots");
+        }
+        Ok(other) => {
+            tracing::debug!(response = ?other, "unexpected UpdateRoots response");
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to send UpdateRoots to daemon");
         }
     }
 }
@@ -3255,8 +3185,7 @@ mod tests {
 
         {
             let mut connection = proxy.shared.conn.lock().await;
-            proxy
-                .refresh_session_locked(None, &mut connection)
+            IpcProxyHandler::refresh_session(&proxy.shared, &mut connection)
                 .await
                 .expect("reconnect with disabled gate");
         }
@@ -4558,6 +4487,80 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
         assert!(error.message.contains("no such resource"), "{error:?}");
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn update_roots_consumes_its_reply_past_a_gate_push() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("roots-gate");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer, _seen) =
+                fake_daemon_handshake(stream, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read UpdateRoots")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse UpdateRoots");
+            assert!(
+                matches!(req, IpcRequest::UpdateRoots { .. }),
+                "expected UpdateRoots, got {req:?}"
+            );
+            // The daemon may push a gate change while a request is in flight.
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::ModernDownstreamGateChanged { enabled: true },
+            )
+            .await
+            .expect("send gate push");
+            ipc::send_response(&mut writer, &IpcResponse::Ok)
+                .await
+                .expect("send UpdateRoots ack");
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read Ping")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse Ping");
+            assert!(matches!(req, IpcRequest::Ping { .. }), "got {req:?}");
+            ipc::send_response(&mut writer, &IpcResponse::Pong)
+                .await
+                .expect("send pong");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, "client-roots".to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        push_roots_to_daemon(&proxy.shared, serde_json::json!([])).await;
+        assert!(
+            proxy
+                .shared
+                .modern_downstream_enabled
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the gate push must be applied, not treated as the UpdateRoots reply"
+        );
+        let response = proxy
+            .session_round_trip(RetryPolicy::SafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("ping after UpdateRoots");
+        assert!(
+            matches!(response, IpcResponse::Pong),
+            "the next call must read its own reply, got {response:?}"
+        );
 
         daemon_task.await.expect("daemon task join");
         clear_test_runtime_paths();
