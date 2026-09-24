@@ -1141,10 +1141,6 @@ impl ServerManager {
         }
     }
 
-    pub fn modern_upstream_enabled(&self) -> bool {
-        self.modern_upstream_gate_state.load(Ordering::Acquire) & 1 == 1
-    }
-
     pub(crate) fn modern_upstream_gate_state(&self) -> u64 {
         self.modern_upstream_gate_state.load(Ordering::Acquire)
     }
