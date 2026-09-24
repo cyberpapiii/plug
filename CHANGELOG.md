@@ -89,6 +89,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   It saved the token without binding it to the server's authorization
   server, the runtime refused it, and the server stayed "auth required". It
   now discovers and binds the authority first, as `plug auth login` does.
+- `plug doctor` no longer warns about the OAuth token file that every
+  signed-in server keeps. It now warns only when another user can read that
+  file, and suggests `chmod 600`.
+- `plug doctor` reports a missing stdio server program once, under server
+  programs, instead of also failing connectivity for the same server.
 
 ## [0.8.11] - 2026-09-01
 
