@@ -68,10 +68,10 @@ That means the connector failure was not "no tools exist"; it was "Claude did no
 
 **Downstream HTTP initialize path**
 
-- [`plug-core/src/http/server.rs:763`](../../plug-core/src/http/server.rs#L763) builds the initialize result
-- [`plug-core/src/http/server.rs:994`](../../plug-core/src/http/server.rs#L994) calls `InitializeResult::new(...)`
-- [`plug-core/src/http/server.rs:37`](../../plug-core/src/http/server.rs#L37) defines the HTTP-layer protocol constant as `2025-11-25`
-- [`plug-core/src/http/server.rs:1071`](../../plug-core/src/http/server.rs#L1071) only injected that value into the response header
+- [`plug-core/src/http/server.rs:763`](../../../plug-core/src/http/server.rs#L763) builds the initialize result
+- [`plug-core/src/http/server.rs:994`](../../../plug-core/src/http/server.rs#L994) calls `InitializeResult::new(...)`
+- [`plug-core/src/http/server.rs:37`](../../../plug-core/src/http/server.rs#L37) defines the HTTP-layer protocol constant as `2025-11-25`
+- [`plug-core/src/http/server.rs:1071`](../../../plug-core/src/http/server.rs#L1071) only injected that value into the response header
 
 ### rmcp default
 
@@ -119,7 +119,7 @@ overrides:
 
 The local patch for this was applied in:
 
-- [`plug-core/src/http/server.rs`](../../plug-core/src/http/server.rs)
+- [`plug-core/src/http/server.rs`](../../../plug-core/src/http/server.rs)
 
 with an added regression assertion in the HTTP tests verifying:
 

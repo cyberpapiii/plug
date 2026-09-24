@@ -1,28 +1,19 @@
 use dialoguer::console::style;
-use figment::Figment;
-use figment::providers::{Format, Serialized, Toml};
 
 use crate::ui::{
     print_banner, print_heading, print_label_value, print_success_line, print_warning_line,
 };
 use crate::{ConfigCommands, OutputFormat};
 
+/// Resolve the config path and load it the one way every editor does:
+/// defaults under the file, no environment overlay.
 pub(crate) fn load_editable_config(
     config_path: Option<&std::path::PathBuf>,
 ) -> anyhow::Result<(std::path::PathBuf, plug_core::config::Config)> {
     let path = config_path
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
-
-    let config = if path.exists() {
-        Figment::new()
-            .merge(Serialized::defaults(plug_core::config::Config::default()))
-            .merge(Toml::file(&path))
-            .extract()?
-    } else {
-        plug_core::config::Config::default()
-    };
-
+    let config = plug_core::operator::load_editable_config(&path)?;
     Ok((path, config))
 }
 

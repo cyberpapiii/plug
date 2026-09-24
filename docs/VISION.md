@@ -6,15 +6,13 @@ A power user in 2026 often uses 5-15 AI coding and agent clients: Claude Code, C
 
 ## The Solution
 
-`plug` is a single Rust binary that sits between AI clients and MCP servers. One install, one config, one place to reason about your MCP setup.
+`plug` is a Rust daemon that sits between AI clients and MCP servers. One install, one config, one place to reason about your MCP setup.
 
 Today, the product surface is:
 
-- a strong core multiplexer
-- a guided CLI for humans
-- structured output for agents
-
-The TUI is explicitly deferred until the CLI and backend are fully sorted out.
+- Plug.app, the menu bar app that bundles the daemon and owns its lifecycle
+- the `plug` CLI for scripting, agents, and advanced use
+- a strong core multiplexer behind both
 
 ---
 
@@ -23,7 +21,7 @@ The TUI is explicitly deferred until the CLI and backend are fully sorted out.
 `plug` is:
 
 - a personal tool, not an enterprise platform
-- a single binary, not a distributed system
+- one daemon, not a distributed system
 - a multiplexer, not a framework
 - operationally boring, not flashy
 - opinionated at the UX layer, but simple at the systems layer
@@ -86,15 +84,17 @@ Humans and agents are equal citizens.
 
 **Test**: Can a server fail without turning the whole product into a mystery?
 
-### 6. CLI First, TUI Later
+### 6. App First, CLI Underneath
 
-The current product is the backend plus the CLI.
+Plug.app is the product surface. It installs and runs the daemon, shows what
+is working, and fixes what is not.
 
-- Do not force a TUI back into the product before the command model is clean.
-- The CLI should feel like the control plane, not like a fallback.
-- Any future TUI must emerge from a strong command model, not compensate for a weak one.
+- Everyday jobs (add a server, sign in, see status, restart) belong in the app.
+- The CLI is for scripting, agents (`--output json`), and advanced use. It talks
+  to the same daemon and never needs the app window open.
+- Neither surface hides state the other can see.
 
-**Test**: If the TUI never shipped, would `plug` still be worth using?
+**Test**: Could someone use Plug for a week without opening a terminal?
 
 ---
 
@@ -105,7 +105,7 @@ Things `plug` should not do in this phase:
 1. Require Docker.
 2. Require a database.
 3. Require a cloud account.
-4. Pretend a deferred TUI already exists.
+4. Grow a second UI beside the app.
 5. Center transport plumbing in the user-facing story.
 6. Add enterprise features at the cost of simplicity.
 
@@ -142,7 +142,6 @@ Things `plug` should not do in this phase:
 
 ### Out of Scope For This Phase
 
-- Reviving the TUI before the CLI model is settled
 - Cloud management features
 - Multi-user or enterprise access control
 - Turning `plug` into an upstream server installer/manager

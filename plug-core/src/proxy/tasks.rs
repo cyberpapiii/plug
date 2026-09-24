@@ -1021,8 +1021,13 @@ impl super::ToolRouter {
                 "proxy background task tool call started"
             );
             let semaphore_timeout = Duration::from_secs(1);
-            let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
-                match tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned()).await {
+            let semaphore = self
+                .server_manager
+                .semaphores
+                .get(&server_id)
+                .map(|entry| Arc::clone(entry.value()));
+            let permit = if let Some(sem) = semaphore {
+                match tokio::time::timeout(semaphore_timeout, sem.acquire_owned()).await {
                     Ok(Ok(permit)) => Some(permit),
                     Ok(Err(_)) => {
                         self.task_store
