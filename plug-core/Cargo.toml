@@ -70,7 +70,13 @@ keyring.workspace = true
 keyring-core.workspace = true
 linux-keyutils-keyring-store.workspace = true
 
+[features]
+# Test-only entry points for tests outside this crate's unit tests. Only
+# dev-dependencies enable it; a shipped build never does.
+test-helpers = []
+
 [dev-dependencies]
+plug-core = { path = ".", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 plug-test-harness = { path = "../plug-test-harness" }

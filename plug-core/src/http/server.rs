@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -8,8 +7,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::rejection::{FormRejection, JsonRejection, QueryRejection};
-use axum::extract::{Form, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -25,11 +23,14 @@ use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
-use super::sse::sse_stream_with_heartbeat;
-use crate::downstream_oauth::{
-    AccessTokenClaims, AccessTokenValidation, AuthorizationRequest, ClientRegistrationRequest,
-    DownstreamOauthError, PublicKeyCredential, RegisterPublicKeyCredential, resource_scopes,
+use super::oauth::{
+    get_oauth_authorization_server_metadata, get_oauth_protected_resource_metadata,
+    oauth_authorize, oauth_consent_challenge, oauth_consent_decision, oauth_consent_javascript,
+    oauth_enroll_javascript, oauth_owner_enroll, oauth_owner_enroll_challenge,
+    oauth_owner_enroll_complete, oauth_register, oauth_token, protected_resource_metadata_url,
 };
+use super::sse::sse_stream_with_heartbeat;
+use crate::downstream_oauth::{AccessTokenClaims, AccessTokenValidation, resource_scopes};
 use crate::mcp_http_headers::{
     HEADER_MISMATCH_CODE, HeaderMismatch, inject_trace_context, validate_mirrored_headers,
     validate_required_mirrored_headers,
@@ -48,7 +49,7 @@ const TRACEPARENT_HEADER: &str = "traceparent";
 const PLUG_TRACE_ID_HEADER: &str = "x-plug-trace-id";
 
 /// The MCP protocol version we implement.
-const PROTOCOL_VERSION: &str = "2025-11-25";
+use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
 /// Shared state for all HTTP handlers.
 pub struct HttpState {
@@ -171,16 +172,7 @@ fn modern_http_call_context(
     if let Some(info) = client_info {
         context = context.with_client_metadata(info.name, info.version);
     }
-    match (auth_status, principal) {
-        (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-            .with_authorization(principal, claims.scopes.clone())
-            .with_principal_lifecycle(claims.principal_lifecycle.clone()),
-        (AuthStatus::Authenticated(None), Some(principal)) => {
-            context.with_local_principal(principal)
-        }
-        (AuthStatus::NoAuthRequired, _) => context.with_local_principal(http_loopback_principal()),
-        (AuthStatus::Authenticated(_), None) => context,
-    }
+    apply_http_auth(context, auth_status, oauth_issuer)
 }
 
 fn legacy_http_policy_context(
@@ -195,16 +187,29 @@ fn legacy_http_policy_context(
         crate::types::ClientType::Unknown,
         trace_id,
     );
-    match (
+    apply_http_auth(
+        context,
         auth_status,
-        http_principal(
-            auth_status,
-            state
-                .downstream_oauth
-                .as_ref()
-                .map(|manager| manager.base_url()),
-        ),
-    ) {
+        state
+            .downstream_oauth
+            .as_ref()
+            .map(|manager| manager.base_url()),
+    )
+}
+
+/// Attach what the request proved about its caller to a call context.
+///
+/// An OAuth token carries its granted scopes and principal lifecycle; a
+/// configured bearer is a local principal; an unauthenticated request can
+/// only exist on a loopback-only listener, so it gets the loopback principal.
+/// The trust comes from that listener, not from client-provided metadata, and
+/// holds in both protocol eras.
+fn apply_http_auth(
+    context: DownstreamCallContext,
+    auth_status: &AuthStatus,
+    oauth_issuer: Option<&str>,
+) -> DownstreamCallContext {
+    match (auth_status, http_principal(auth_status, oauth_issuer)) {
         (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
             .with_authorization(principal, claims.scopes.clone())
             .with_principal_lifecycle(claims.principal_lifecycle.clone()),
@@ -330,25 +335,9 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
         }
-        match (
-            &self.auth_status,
-            http_principal(&self.auth_status, self.oauth_issuer.as_deref()),
-        ) {
-            (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-                .with_authorization(principal, claims.scopes.clone())
-                .with_principal_lifecycle(claims.principal_lifecycle.clone()),
-            (AuthStatus::Authenticated(None), Some(principal)) => {
-                context.with_local_principal(principal)
-            }
-            (AuthStatus::NoAuthRequired, _) => {
-                // The trust comes from the loopback-only listener, not from
-                // client-provided metadata; ownership remains scoped to the
-                // server-minted session id in `task_owner`. Era-independent:
-                // a loopback listener is loopback in both revisions.
-                context.with_local_principal(http_loopback_principal())
-            }
-            (AuthStatus::Authenticated(_), None) => context,
-        }
+        // Unauthenticated ownership stays scoped to the server-minted session
+        // id in `task_owner`.
+        apply_http_auth(context, &self.auth_status, self.oauth_issuer.as_deref())
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
@@ -431,7 +420,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::ElicitRequest(ElicitRequest::new(request)),
-                Some(Duration::from_secs(600)), // 10-minute upper bound prevents resource leaks
+                Duration::from_secs(600), // 10-minute upper bound prevents resource leaks
             )
             .await?;
             match result {
@@ -463,7 +452,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::CreateMessageRequest(CreateMessageRequest::new(request)),
-                Some(Duration::from_secs(60)), // sampling has bounded timeout
+                Duration::from_secs(60), // sampling has bounded timeout
             )
             .await?;
             match result {
@@ -478,6 +467,39 @@ impl DownstreamBridge for HttpBridge {
 }
 
 impl HttpState {
+    /// Release everything the daemon holds for an HTTP session that has left
+    /// the session store, whether by `DELETE /mcp` or by idle expiry.
+    ///
+    /// Session-owned legacy task records end with the wire session. Durable
+    /// principal-owned records intentionally survive and can be resumed by a
+    /// later session authenticated as the same principal.
+    pub async fn teardown_session(&self, session_id: &str) {
+        let target = NotificationTarget::Http {
+            session_id: Arc::from(session_id),
+        };
+        self.router.cleanup_subscriptions_for_target(&target).await;
+        self.roots_capable_sessions.remove(session_id);
+        self.client_capabilities.remove(session_id);
+        // Dropping pending reverse-request senders wakes their receivers with
+        // RecvError instead of leaving them to time out.
+        self.pending_client_requests
+            .retain(|(pending_session_id, _), _| pending_session_id != session_id);
+        self.router.unregister_downstream_bridge(&target);
+        if self.router.clear_roots_for_target(&target) {
+            self.router.forward_roots_list_changed_to_upstreams().await;
+        }
+        // A stale per-client log level would keep the effective level
+        // permanently at a permissive value.
+        self.router.remove_client_log_level(session_id);
+        let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
+            crate::proxy::DownstreamTransport::Http,
+            session_id,
+        );
+        self.router.clear_lazy_session(&lazy_session_key);
+        let owner = crate::proxy::ToolRouter::task_owner_for_http_session(session_id);
+        self.router.cleanup_tasks_for_owner(&owner).await;
+    }
+
     pub fn spawn_notification_fanout(self: &Arc<Self>) {
         if self
             .notification_task_started
@@ -497,130 +519,59 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                // classify -> resolve -> per-notification-kind delivery below.
                                 // Unlike stdio/daemon (one fan-out task per client, comparing
                                 // target to "self"), this task is shared by every HTTP session,
-                                // so a `Targeted` resolution is used to look up which session to
-                                // route to rather than to answer "is this me?". See
+                                // so a targeted resolution names which session to route to
+                                // rather than answering "is this me?". See
                                 // plug-core/src/notifications.rs::fanout.
-                                let resolved_target: Option<NotificationTarget> = match crate::notifications::fanout::resolve(
-                                    crate::notifications::fanout::classify(&notification),
-                                ) {
-                                    crate::notifications::fanout::ResolvedDelivery::Broadcast => None,
-                                    crate::notifications::fanout::ResolvedDelivery::ToTarget(target) => {
-                                        Some(target.clone())
-                                    }
+                                use crate::notifications::fanout::{
+                                    NotificationClass, ResolvedDelivery, classify, resolve,
                                 };
-                                match notification {
-                                    ProtocolNotification::ToolListChanged => {
-                                        if let Some(message) = notification_to_sse_message(
-                                            ProtocolNotification::ToolListChanged,
-                                        ) {
-                                            state.sessions.broadcast(
-                                                message,
-                                                crate::session::BroadcastKind::ToolList,
-                                            );
+                                let class = classify(&notification);
+                                // Targeted classes carry no broadcast audience; the gate that
+                                // admitted the originating request already authorized the reply.
+                                let kind = match class {
+                                    NotificationClass::ToolListChanged => {
+                                        Some(crate::session::BroadcastKind::ToolList)
+                                    }
+                                    NotificationClass::ResourceListChanged => {
+                                        Some(crate::session::BroadcastKind::ResourceList)
+                                    }
+                                    NotificationClass::PromptListChanged => {
+                                        Some(crate::session::BroadcastKind::PromptList)
+                                    }
+                                    NotificationClass::Logging | NotificationClass::AuthState => {
+                                        Some(crate::session::BroadcastKind::Logging)
+                                    }
+                                    NotificationClass::ToolListChangedFor(_)
+                                    | NotificationClass::Progress(_)
+                                    | NotificationClass::Cancelled(_)
+                                    | NotificationClass::ResourceUpdated(_) => None,
+                                };
+                                match resolve(class) {
+                                    ResolvedDelivery::ToTarget(NotificationTarget::Http {
+                                        session_id,
+                                    }) => {
+                                        if let Some(message) =
+                                            notification_to_sse_message(&notification)
+                                        {
+                                            state.sessions.send_to_live_session(session_id, message);
                                         }
                                     }
-                                    ProtocolNotification::ToolListChangedFor { .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::ToolListChangedFor {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
+                                    ResolvedDelivery::ToTarget(_) => {}
+                                    ResolvedDelivery::Broadcast => {
+                                        if let Some(kind) = kind
+                                            && let Some(message) =
+                                                notification_to_sse_message(&notification)
+                                        {
+                                            state.sessions.broadcast(message, kind);
                                         }
-                                    }
-                                    ProtocolNotification::ResourceListChanged => {
-                                        if let Some(message) = notification_to_sse_message(
-                                            ProtocolNotification::ResourceListChanged,
-                                        ) {
-                                            state.sessions.broadcast(
-                                                message,
-                                                crate::session::BroadcastKind::ResourceList,
-                                            );
-                                        }
-                                    }
-                                    ProtocolNotification::PromptListChanged => {
-                                        if let Some(message) = notification_to_sse_message(
-                                            ProtocolNotification::PromptListChanged,
-                                        ) {
-                                            state.sessions.broadcast(
-                                                message,
-                                                crate::session::BroadcastKind::PromptList,
-                                            );
-                                        }
-                                    }
-                                    ProtocolNotification::Progress { params, .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::Progress {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                    params,
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
-                                        }
-                                    }
-                                    ProtocolNotification::Cancelled { params, .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::Cancelled {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                    params,
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
-                                        }
-                                    }
-                                    ProtocolNotification::ResourceUpdated { params, .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::ResourceUpdated {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                    params,
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
-                                        }
-                                    }
-                                    ref notification @ (
-                                        ProtocolNotification::LoggingMessage { .. }
-                                        | ProtocolNotification::TokenRefreshExchanged { .. }
-                                        | ProtocolNotification::AuthStateChanged { .. }
-                                    ) => {
-                                        if let Some(params) = notification.as_logging_message_params()
-                                            && let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::LoggingMessage { params },
-                                            ) {
-                                                state.sessions.broadcast(
-                                                    message,
-                                                    crate::session::BroadcastKind::Logging,
-                                                );
-                                            }
                                     }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
-                                if let Some(message) = notification_to_sse_message(
+                                if let Some(message) = notification_to_sse_message(&
                                     ProtocolNotification::LoggingMessage {
                                         params: ProtocolNotification::control_lagged_logging_params(
                                             skipped,
@@ -652,7 +603,7 @@ impl HttpState {
                     recv = log_rx.recv() => {
                         match recv {
                             Ok(notif @ ProtocolNotification::LoggingMessage { .. }) => {
-                                if let Some(message) = notification_to_sse_message(notif) {
+                                if let Some(message) = notification_to_sse_message(&notif) {
                                     log_state.sessions.broadcast(
                                         message,
                                         crate::session::BroadcastKind::Logging,
@@ -672,7 +623,7 @@ impl HttpState {
                                     )
                                     .with_logger("plug"),
                                 };
-                                if let Some(message) = notification_to_sse_message(synthetic) {
+                                if let Some(message) = notification_to_sse_message(&synthetic) {
                                     log_state.sessions.broadcast(
                                         message,
                                         crate::session::BroadcastKind::Logging,
@@ -688,7 +639,7 @@ impl HttpState {
     }
 }
 
-fn notification_to_sse_message(notification: ProtocolNotification) -> Option<SseMessage> {
+fn notification_to_sse_message(notification: &ProtocolNotification) -> Option<SseMessage> {
     SseMessage::from_json_value(notification.to_json_value())
         .map_err(|error| {
             tracing::error!(%error, "failed to serialize SSE notification payload");
@@ -775,47 +726,6 @@ fn check_bearer_token(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .is_some_and(|token| crate::auth::verify_auth_token(token, expected))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OAuthAuthorizeParams {
-    response_type: String,
-    client_id: String,
-    redirect_uri: String,
-    state: String,
-    code_challenge: String,
-    code_challenge_method: String,
-    scope: Option<String>,
-    resource: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OAuthConsentChallengeRequest {
-    consent_id: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "decision", rename_all = "snake_case")]
-enum OAuthConsentDecision {
-    Approve {
-        ceremony_id: String,
-        credential: PublicKeyCredential,
-    },
-    Deny {
-        consent_id: String,
-        csrf_token: String,
-    },
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OAuthOwnerEnrollmentChallengeRequest {
-    bootstrap: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OAuthOwnerEnrollmentCompleteRequest {
-    ceremony_id: String,
-    credential: RegisterPublicKeyCredential,
 }
 
 /// Validate bearer token for non-loopback HTTP servers.
@@ -1219,7 +1129,7 @@ fn validate_protocol_version_for_post(
             let version = value
                 .to_str()
                 .map_err(|_| HttpError::BadRequest("invalid MCP-Protocol-Version header".into()))?;
-            if version != PROTOCOL_VERSION {
+            if version != SUPPORTED_PROTOCOL_VERSION {
                 return Err(HttpError::UnsupportedProtocolVersion(version.to_string()));
             }
             Ok(())
@@ -1296,7 +1206,7 @@ async fn send_http_client_request(
     state: &HttpState,
     session_id: &str,
     request: ServerRequest,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<ClientResult, McpError> {
     let id = i64::try_from(state.reverse_request_counter.fetch_add(1, Ordering::SeqCst))
         .map_err(|_| McpError::internal_error("reverse request id overflow".to_string(), None))?;
@@ -1329,55 +1239,53 @@ async fn send_http_client_request(
     state
         .pending_client_requests
         .insert((session_id.to_string(), id), tx);
+    // From here on every exit, including the caller dropping this future
+    // (a cancelled elicitation or sampling call), releases the pending entry
+    // and the replay copy of the request.
+    let _pending = PendingReverseRequest {
+        state,
+        session_id,
+        id,
+    };
     match state.sessions.send_to_live_session(session_id, message) {
         SessionSendOutcome::Delivered | SessionSendOutcome::Queued => {}
         SessionSendOutcome::SessionNotFound => {
-            state
-                .pending_client_requests
-                .remove(&(session_id.to_string(), id));
             return Err(McpError::internal_error(
                 "HTTP client SSE stream could not accept reverse request delivery".to_string(),
                 None,
             ));
         }
     }
-    match timeout {
-        Some(duration) => match tokio::time::timeout(duration, rx).await {
-            Ok(Ok(result)) => {
-                state
-                    .sessions
-                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
-                Ok(result)
-            }
-            Ok(Err(_)) => Err(McpError::internal_error(
-                "HTTP client response channel closed".to_string(),
-                None,
-            )),
-            Err(_) => {
-                state
-                    .pending_client_requests
-                    .remove(&(session_id.to_string(), id));
-                state
-                    .sessions
-                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
-                Err(McpError::internal_error(
-                    "HTTP client request timed out".to_string(),
-                    None,
-                ))
-            }
-        },
-        None => match rx.await {
-            Ok(result) => {
-                state
-                    .sessions
-                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
-                Ok(result)
-            }
-            Err(_) => Err(McpError::internal_error(
-                "HTTP client response channel closed".to_string(),
-                None,
-            )),
-        },
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(McpError::internal_error(
+            "HTTP client response channel closed".to_string(),
+            None,
+        )),
+        Err(_) => Err(McpError::internal_error(
+            "HTTP client request timed out".to_string(),
+            None,
+        )),
+    }
+}
+
+/// Releases a reverse request's bookkeeping when its caller stops waiting,
+/// for whatever reason. Both removals are no-ops once the response handler
+/// has already taken them.
+struct PendingReverseRequest<'a> {
+    state: &'a HttpState,
+    session_id: &'a str,
+    id: i64,
+}
+
+impl Drop for PendingReverseRequest<'_> {
+    fn drop(&mut self) {
+        self.state
+            .pending_client_requests
+            .remove(&(self.session_id.to_string(), self.id));
+        self.state
+            .sessions
+            .remove_replay_events_by_key(self.session_id, &SseReplayKey::ReverseRequest(self.id));
     }
 }
 
@@ -1420,7 +1328,7 @@ fn maybe_request_http_roots(state: Arc<HttpState>, session_id: String) {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
-            Some(Duration::from_secs(10)),
+            Duration::from_secs(10),
         )
         .await
         {
@@ -1476,7 +1384,7 @@ async fn get_mcp(
     let session_store = Arc::clone(&state.sessions);
     let keepalive_session_id = session_id.clone();
     let sse = sse_stream_with_heartbeat(rx, state.cancel.clone(), move || {
-        let _ = session_store.touch(&keepalive_session_id);
+        let _ = session_store.validate(&keepalive_session_id);
     });
     let mut response = sse.into_response();
     response
@@ -1501,34 +1409,7 @@ async fn delete_mcp(
     let session_id = extract_session_id(&headers)?;
 
     if state.sessions.remove(&session_id) {
-        // Clean up resource subscriptions for this departing session
-        let target = NotificationTarget::Http {
-            session_id: Arc::from(session_id.as_str()),
-        };
-        state.router.cleanup_subscriptions_for_target(&target).await;
-        state.roots_capable_sessions.remove(&session_id);
-        state.client_capabilities.remove(&session_id);
-        // Drop pending reverse-request senders so receivers get RecvError
-        state
-            .pending_client_requests
-            .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
-        state.router.unregister_downstream_bridge(&target);
-        if state.router.clear_roots_for_target(&target) {
-            state.router.forward_roots_list_changed_to_upstreams().await;
-        }
-        // Clean up per-client log level to prevent stale entries from
-        // keeping the effective level permanently at a permissive value.
-        state.router.remove_client_log_level(&session_id);
-        let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
-            crate::proxy::DownstreamTransport::Http,
-            &session_id,
-        );
-        state.router.clear_lazy_session(&lazy_session_key);
-        // Session-owned legacy records end with the wire session. Durable
-        // principal-owned records intentionally survive and can be resumed
-        // by a later session authenticated as the same principal.
-        let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-        state.router.cleanup_tasks_for_owner(&owner).await;
+        state.teardown_session(&session_id).await;
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
@@ -1544,7 +1425,7 @@ async fn get_server_card(
     let mut remote = json!({
         "type": "streamable-http",
         "url": "/mcp",
-        "supportedProtocolVersions": [PROTOCOL_VERSION],
+        "supportedProtocolVersions": [SUPPORTED_PROTOCOL_VERSION],
     });
     if state.auth_mode == crate::config::DownstreamAuthMode::Oauth || state.auth_token.is_some() {
         remote["headers"] = json!([
@@ -1593,614 +1474,6 @@ async fn get_server_card(
         HeaderValue::from_static("nosniff"),
     );
     response
-}
-
-async fn get_oauth_authorization_server_metadata(
-    State(state): State<Arc<HttpState>>,
-) -> impl IntoResponse {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let base = manager.base_url();
-    let response = Json(json!({
-        "issuer": base,
-        "authorization_endpoint": manager.authorization_endpoint(),
-        "token_endpoint": manager.token_endpoint(),
-        "registration_endpoint": manager.registration_endpoint(),
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": manager.config.oauth_scopes,
-        "client_id_metadata_document_supported": true,
-    }));
-    (StatusCode::OK, response).into_response()
-}
-
-async fn get_oauth_protected_resource_metadata(
-    State(state): State<Arc<HttpState>>,
-) -> impl IntoResponse {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let base = manager.base_url();
-    let response = Json(json!({
-        "resource": format!("{base}/mcp"),
-        "authorization_servers": [base],
-        "scopes_supported": resource_scopes(&manager.config.oauth_scopes),
-        "bearer_methods_supported": ["header"],
-    }));
-    (StatusCode::OK, response).into_response()
-}
-
-async fn oauth_register(
-    State(state): State<Arc<HttpState>>,
-    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
-    headers: HeaderMap,
-    request: Result<Json<ClientRegistrationRequest>, JsonRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Json(request) = match request {
-        Ok(request) => request,
-        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidClientMetadata),
-    };
-    let rate_key = registration_rate_key(
-        peer.map(|axum::Extension(axum::extract::ConnectInfo(address))| address.ip()),
-        &headers,
-    );
-    match manager.register_client(request, &rate_key).await {
-        Ok(registration) => (StatusCode::CREATED, Json(registration)).into_response(),
-        Err(error) => oauth_error_response(&error),
-    }
-}
-
-async fn oauth_authorize(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    params: Result<Query<OAuthAuthorizeParams>, QueryRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Query(params) = match params {
-        Ok(params) => params,
-        Err(_) if accepts_html(&headers) => {
-            return oauth_authorization_error_response(
-                &DownstreamOauthError::InvalidAuthorizationRequest,
-            );
-        }
-        Err(_) => {
-            return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest);
-        }
-    };
-    match manager
-        .begin_authorization(AuthorizationRequest {
-            response_type: &params.response_type,
-            client_id: &params.client_id,
-            redirect_uri: &params.redirect_uri,
-            state: &params.state,
-            code_challenge: &params.code_challenge,
-            code_challenge_method: &params.code_challenge_method,
-            scope: params.scope.as_deref(),
-            resource: &params.resource,
-        })
-        .await
-    {
-        Ok(consent) => super::oauth_ui::consent_page(&consent, manager.owner_enrolled().await),
-        Err(error) => {
-            if !matches!(
-                error,
-                DownstreamOauthError::InvalidClient
-                    | DownstreamOauthError::InvalidClientMetadata
-                    | DownstreamOauthError::InvalidRedirectUri
-                    | DownstreamOauthError::MetadataFetch
-            ) && manager
-                .client_redirect_allowed(&params.client_id, &params.redirect_uri)
-                .await
-            {
-                let location =
-                    oauth_authorization_error_redirect(&params.redirect_uri, &params.state, &error);
-                if let Ok(location) = HeaderValue::from_str(&location) {
-                    let mut response = StatusCode::FOUND.into_response();
-                    response.headers_mut().insert(header::LOCATION, location);
-                    return response;
-                }
-            }
-            if accepts_html(&headers) {
-                oauth_authorization_error_response(&error)
-            } else {
-                oauth_error_response(&error)
-            }
-        }
-    }
-}
-
-async fn oauth_consent_javascript(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, false) {
-        return oauth_forbidden_response();
-    }
-    super::oauth_ui::javascript_asset(super::oauth_ui::CONSENT_JAVASCRIPT)
-}
-
-async fn oauth_enroll_javascript(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, false) {
-        return oauth_forbidden_response();
-    }
-    super::oauth_ui::javascript_asset(super::oauth_ui::ENROLL_JAVASCRIPT)
-}
-
-async fn oauth_owner_enroll(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, false) {
-        return oauth_forbidden_response();
-    }
-    super::oauth_ui::enrollment_page()
-}
-
-async fn oauth_consent_challenge(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    request: Result<Json<OAuthConsentChallengeRequest>, JsonRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
-        return oauth_forbidden_response();
-    }
-    let Json(request) = match request {
-        Ok(request) => request,
-        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
-    };
-    match manager.start_owner_approval(&request.consent_id).await {
-        Ok(challenge) => oauth_json_response(StatusCode::OK, challenge),
-        Err(error) => oauth_validated_callback_error_response(&error)
-            .unwrap_or_else(|| oauth_error_response(&error)),
-    }
-}
-
-async fn oauth_consent_decision(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    decision: Result<Json<OAuthConsentDecision>, JsonRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
-        return oauth_forbidden_response();
-    }
-    let Json(decision) = match decision {
-        Ok(decision) => decision,
-        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
-    };
-    let result = match decision {
-        OAuthConsentDecision::Approve {
-            ceremony_id,
-            credential,
-        } => {
-            manager
-                .finish_owner_approval(&ceremony_id, credential)
-                .await
-        }
-        OAuthConsentDecision::Deny {
-            consent_id,
-            csrf_token,
-        } => manager.deny_consent(&consent_id, &csrf_token).await,
-    };
-    match result {
-        Ok(redirect) => {
-            oauth_json_response(StatusCode::OK, json!({ "redirect_uri": redirect.location }))
-        }
-        Err(error) => oauth_validated_callback_error_response(&error)
-            .unwrap_or_else(|| oauth_error_response(&error)),
-    }
-}
-
-async fn oauth_owner_enroll_challenge(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    request: Result<Json<OAuthOwnerEnrollmentChallengeRequest>, JsonRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
-        return oauth_forbidden_response();
-    }
-    let Json(request) = match request {
-        Ok(request) => request,
-        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidOwnerBootstrap),
-    };
-    match manager.start_owner_registration(&request.bootstrap).await {
-        Ok(challenge) => oauth_json_response(StatusCode::OK, challenge),
-        Err(error) => oauth_error_response(&error),
-    }
-}
-
-async fn oauth_owner_enroll_complete(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    request: Result<Json<OAuthOwnerEnrollmentCompleteRequest>, JsonRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
-        return oauth_forbidden_response();
-    }
-    let Json(request) = match request {
-        Ok(request) => request,
-        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidOwnerAssertion),
-    };
-    match manager
-        .finish_owner_registration(&request.ceremony_id, request.credential)
-        .await
-    {
-        Ok(credential) => oauth_json_response(StatusCode::OK, credential),
-        Err(error) => oauth_error_response(&error),
-    }
-}
-
-async fn oauth_token(
-    State(state): State<Arc<HttpState>>,
-    params: Result<Form<HashMap<String, String>>, FormRejection>,
-) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Form(params) = match params {
-        Ok(params) => params,
-        Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
-    };
-    if params.contains_key("client_secret") {
-        return oauth_error_response(&DownstreamOauthError::UnsupportedClientAuthMethod);
-    }
-    let Some(client_id) = params.get("client_id") else {
-        return oauth_error_response(&DownstreamOauthError::InvalidClient);
-    };
-    let Some(resource) = params.get("resource") else {
-        return oauth_error_response(&DownstreamOauthError::InvalidResource);
-    };
-    let result = match params.get("grant_type").map(String::as_str) {
-        Some("authorization_code") => {
-            let (Some(code), Some(redirect_uri), Some(code_verifier)) = (
-                params.get("code"),
-                params.get("redirect_uri"),
-                params.get("code_verifier"),
-            ) else {
-                return oauth_error_response(&DownstreamOauthError::InvalidGrant);
-            };
-            manager
-                .exchange_authorization_code(client_id, code, redirect_uri, code_verifier, resource)
-                .await
-        }
-        Some("refresh_token") => {
-            let Some(refresh_token) = params.get("refresh_token") else {
-                return oauth_error_response(&DownstreamOauthError::InvalidGrant);
-            };
-            manager
-                .exchange_refresh_token(client_id, refresh_token, resource)
-                .await
-        }
-        _ => Err(DownstreamOauthError::UnsupportedGrantType),
-    };
-
-    match result {
-        Ok(token) => {
-            let mut body = json!({
-                "access_token": token.access_token,
-                "token_type": "Bearer",
-                "expires_in": token.expires_in,
-                "scope": token.scope,
-            });
-            if let Some(refresh_token) = token.refresh_token {
-                body["refresh_token"] = json!(refresh_token);
-            }
-            oauth_credential_response(body)
-        }
-        Err(error) => oauth_error_response(&error),
-    }
-}
-
-fn oauth_credential_response<T: serde::Serialize>(payload: T) -> Response {
-    let mut response = oauth_json_response(StatusCode::OK, payload);
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-        .headers_mut()
-        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    response
-}
-
-fn oauth_error_response(error: &DownstreamOauthError) -> Response {
-    let (status, code, description) = oauth_public_error(error);
-    oauth_json_response(
-        status,
-        json!({
-            "error": code,
-            "error_description": description,
-        }),
-    )
-}
-
-fn oauth_validated_callback_error_response(error: &DownstreamOauthError) -> Option<Response> {
-    let DownstreamOauthError::AuthorizationExpired(callback) = error else {
-        return None;
-    };
-    let location =
-        oauth_authorization_error_redirect(&callback.redirect_uri, &callback.state, error);
-    Some(oauth_json_response(
-        StatusCode::OK,
-        json!({ "redirect_uri": location }),
-    ))
-}
-
-fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
-    let mut response = (status, Json(payload)).into_response();
-    super::oauth_ui::apply_oauth_json_security_headers(&mut response);
-    response
-}
-
-fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str, &'static str) {
-    match error {
-        DownstreamOauthError::InvalidClient => (
-            StatusCode::UNAUTHORIZED,
-            "invalid_client",
-            "Plug could not recognize this client. Try connecting again from your MCP client.",
-        ),
-        DownstreamOauthError::InvalidClientMetadata | DownstreamOauthError::InvalidRedirectUri => (
-            StatusCode::BAD_REQUEST,
-            "invalid_client_metadata",
-            "The client registration details are invalid. Try connecting again from your MCP client.",
-        ),
-        DownstreamOauthError::InvalidScope => (
-            StatusCode::BAD_REQUEST,
-            "invalid_scope",
-            "The requested permission is not available. Try connecting again from your MCP client.",
-        ),
-        DownstreamOauthError::AccessDenied => (
-            StatusCode::BAD_REQUEST,
-            "access_denied",
-            "Authorization was not approved. Try connecting again and approve access in Plug.",
-        ),
-        DownstreamOauthError::InvalidGrant | DownstreamOauthError::PkceVerificationFailed => (
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "The authorization grant is invalid or expired. Try connecting again from your MCP client.",
-        ),
-        DownstreamOauthError::UnsupportedGrantType => (
-            StatusCode::BAD_REQUEST,
-            "unsupported_grant_type",
-            "This OAuth grant type is not supported. Try connecting again from your MCP client.",
-        ),
-        DownstreamOauthError::UnsupportedClientAuthMethod => (
-            StatusCode::BAD_REQUEST,
-            "invalid_client",
-            "This client authentication method is not supported. Try connecting again without a client secret.",
-        ),
-        DownstreamOauthError::RateLimited => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "temporarily_unavailable",
-            "There were too many authorization attempts. Wait a moment, then try connecting again.",
-        ),
-        DownstreamOauthError::RegistrationQuotaExceeded => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "temporarily_unavailable",
-            "The client registration limit was reached. Remove an unused connection, then try connecting again.",
-        ),
-        DownstreamOauthError::OwnerNotEnrolled => (
-            StatusCode::BAD_REQUEST,
-            "owner_not_enrolled",
-            "Finish Plug owner setup on the Mac running Plug.",
-        ),
-        DownstreamOauthError::InvalidOwnerBootstrap => (
-            StatusCode::BAD_REQUEST,
-            "invalid_owner_bootstrap",
-            "This owner enrollment link is invalid, expired, or already used. On the Mac running Plug, run `plug auth owner enroll` again.",
-        ),
-        DownstreamOauthError::OwnerChallengeExpired => (
-            StatusCode::BAD_REQUEST,
-            "owner_challenge_expired",
-            "Approval expired. Select Allow again.",
-        ),
-        DownstreamOauthError::InvalidOwnerAssertion => (
-            StatusCode::BAD_REQUEST,
-            "owner_verification_failed",
-            "Passkey verification failed. No access was granted.",
-        ),
-        DownstreamOauthError::OwnerCredentialLimit => (
-            StatusCode::BAD_REQUEST,
-            "owner_credential_limit",
-            "Plug already has five owner passkeys. Remove one locally before enrolling another.",
-        ),
-        DownstreamOauthError::OwnerCredentialNotFound => (
-            StatusCode::BAD_REQUEST,
-            "owner_credential_not_found",
-            "That owner passkey is no longer enrolled. Try another owner passkey.",
-        ),
-        DownstreamOauthError::InvalidResource
-        | DownstreamOauthError::InvalidAuthorizationRequest
-        | DownstreamOauthError::MetadataFetch => (
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "The authorization request could not be completed. Try connecting again from your MCP client.",
-        ),
-        DownstreamOauthError::AuthorizationExpired(_) => (
-            StatusCode::BAD_REQUEST,
-            "authorization_expired",
-            "This connection request expired. Return to your MCP client and select Connect again.",
-        ),
-        DownstreamOauthError::Persistence(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "Plug could not save this authorization. No access was granted.",
-        ),
-    }
-}
-
-fn accepts_html(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(html_media_range_is_acceptable)
-}
-
-fn html_media_range_is_acceptable(value: &str) -> bool {
-    let mut parts = value.split(';');
-    if !parts
-        .next()
-        .is_some_and(|media_range| media_range.trim().eq_ignore_ascii_case("text/html"))
-    {
-        return false;
-    }
-
-    let mut quality = 1.0;
-    for parameter in parts {
-        let Some((name, value)) = parameter.split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("q") {
-            quality = match value.trim().parse::<f32>() {
-                Ok(quality) if (0.0..=1.0).contains(&quality) => quality,
-                _ => return false,
-            };
-        }
-    }
-    quality > 0.0
-}
-
-fn oauth_authorization_error_response(error: &DownstreamOauthError) -> Response {
-    let (status, code, description) = oauth_public_error(error);
-    super::oauth_ui::authorization_error_page(status, code, description)
-}
-
-fn oauth_forbidden_response() -> Response {
-    let mut response = StatusCode::FORBIDDEN.into_response();
-    super::oauth_ui::apply_oauth_json_security_headers(&mut response);
-    response
-}
-
-fn public_browser_request_allowed(
-    manager: &crate::downstream_oauth::DownstreamOauthManager,
-    headers: &HeaderMap,
-    require_origin: bool,
-) -> bool {
-    if manager.durability_degraded() {
-        return false;
-    }
-    let Ok(base_url) = url::Url::parse(manager.base_url()) else {
-        return false;
-    };
-    let Some(host) = base_url.host_str() else {
-        return false;
-    };
-    let expected_host = match base_url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-    let mut hosts = headers.get_all(header::HOST).iter();
-    if hosts.next().and_then(|value| value.to_str().ok()) != Some(expected_host.as_str())
-        || hosts.next().is_some()
-    {
-        return false;
-    }
-    let mut origins = headers.get_all(header::ORIGIN).iter();
-    let origin = origins.next().and_then(|value| value.to_str().ok());
-    if origins.next().is_some() {
-        return false;
-    }
-    if !require_origin && origin.is_none() {
-        return true;
-    }
-    origin == Some(base_url.origin().ascii_serialization().as_str())
-}
-
-/// Bucket a registration attempt by caller.
-///
-/// The forwarding headers are attacker-controlled unless something trustworthy
-/// wrote them, so they are consulted only when the request arrived from a
-/// same-host reverse proxy — a loopback peer. That is the deployment plug
-/// actually has: `cloudflared` runs beside the daemon and connects over
-/// loopback. A caller reaching the listener directly is bucketed by the address
-/// it connected from, which it cannot forge.
-///
-/// Within a trusted hop the two headers are read differently on purpose.
-/// `cf-connecting-ip` is written by the edge and overwrites whatever the client
-/// sent. `x-forwarded-for` is *appended* to, so the leftmost entry is the value
-/// the client supplied and the rightmost is the one the nearest proxy added;
-/// only the rightmost is worth anything.
-fn registration_rate_key(peer: Option<std::net::IpAddr>, headers: &HeaderMap) -> String {
-    let Some(peer) = peer else {
-        // No connection info means no way to tell a proxy from a client, so
-        // neither source is trustworthy. One shared bucket is a worse rate
-        // limit than a per-caller one, and a safer one.
-        return "unknown-peer".to_string();
-    };
-    if !peer.is_loopback() {
-        return peer.to_string();
-    }
-    let forwarded = headers
-        .get("cf-connecting-ip")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.rsplit(',').next())
-                .map(str::trim)
-        })
-        .and_then(|value| value.parse::<std::net::IpAddr>().ok());
-    match forwarded {
-        Some(address) => address.to_string(),
-        None => peer.to_string(),
-    }
-}
-
-fn oauth_authorization_error_redirect(
-    redirect_uri: &str,
-    state: &str,
-    error: &DownstreamOauthError,
-) -> String {
-    let (_, code, description) = oauth_public_error(error);
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("error", code)
-        .append_pair("error_description", description)
-        .append_pair("state", state)
-        .finish();
-    format!(
-        "{redirect_uri}{}{query}",
-        if redirect_uri.contains('?') { '&' } else { '?' }
-    )
-}
-
-fn protected_resource_metadata_url(base_url: &str) -> String {
-    format!(
-        "{}/.well-known/oauth-protected-resource",
-        base_url.trim_end_matches('/')
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3231,7 +2504,7 @@ fn json_response_with_session(
     );
     response.headers_mut().insert(
         PROTOCOL_VERSION_HEADER,
-        HeaderValue::from_static(PROTOCOL_VERSION),
+        HeaderValue::from_static(SUPPORTED_PROTOCOL_VERSION),
     );
 
     Ok(response)
@@ -3239,11 +2512,19 @@ fn json_response_with_session(
 
 #[cfg(test)]
 mod tests {
+    use super::super::oauth::{
+        accepts_html, oauth_authorization_error_response, oauth_error_response, oauth_public_error,
+        registration_rate_key,
+    };
     use super::*;
     use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+    use crate::downstream_oauth::{
+        AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
+    };
     use crate::proxy::RouterSnapshot;
     use axum::body::Body;
     use http::Request as HttpRequest;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -3294,7 +2575,6 @@ mod tests {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: scopes,
                 local_port: 3282,
-                modern_downstream_enabled: false,
             },
             path,
         )
@@ -3900,7 +3180,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
             .header(SESSION_ID_HEADER, session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(
                 json!({
                     "jsonrpc": "2.0",
@@ -3924,7 +3204,7 @@ mod tests {
                     "id": 1,
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": PROTOCOL_VERSION,
+                        "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
                         "capabilities": {},
                         "clientInfo": { "name": "legacy-scope-test", "version": "1.0" }
                     }
@@ -4202,7 +3482,7 @@ mod tests {
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                 .header(SESSION_ID_HEADER, session_id)
-                .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+                .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
                 .body(Body::from(
                     json!({
                         "jsonrpc": "2.0",
@@ -4341,7 +3621,7 @@ mod tests {
         // tell a modern client that legacy support had been dropped.
         assert_eq!(
             value["result"]["supportedVersions"],
-            json!([PROTOCOL_VERSION, "2026-07-28"])
+            json!([SUPPORTED_PROTOCOL_VERSION, "2026-07-28"])
         );
         assert!(value["result"]["capabilities"]["extensions"].is_null());
         assert!(value["result"]["capabilities"]["experimental"].is_null());
@@ -4592,10 +3872,6 @@ mod tests {
             self.inner.validate(session_id)
         }
 
-        fn touch(&self, session_id: &str) -> Result<(), HttpError> {
-            self.inner.touch(session_id)
-        }
-
         fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
             self.inner.has_live_sse_sender(session_id)
         }
@@ -4635,10 +3911,6 @@ mod tests {
 
         fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
             self.inner.broadcast(message, kind);
-        }
-
-        fn send_to_session(&self, session_id: &str, message: SseMessage) {
-            self.inner.send_to_session(session_id, message);
         }
 
         fn send_to_live_session(
@@ -4766,7 +4038,7 @@ mod tests {
             resp.headers()
                 .get(PROTOCOL_VERSION_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            Some(PROTOCOL_VERSION)
+            Some(SUPPORTED_PROTOCOL_VERSION)
         );
     }
 
@@ -4857,7 +4129,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .header("Mcp-Method", "tools/call")
             .header("Mcp-Name", "spoofed_tool")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -5019,7 +4291,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&post_body).unwrap()))
             .unwrap();
         let post_app = app.clone();
@@ -5350,7 +4622,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -5368,7 +4640,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -5397,7 +4669,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -5423,7 +4695,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
 
@@ -5495,7 +4767,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -5554,7 +4826,7 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -5632,14 +4904,17 @@ mod tests {
             resp.headers()
                 .get(PROTOCOL_VERSION_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            Some(PROTOCOL_VERSION)
+            Some(SUPPORTED_PROTOCOL_VERSION)
         );
 
         let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-        assert_eq!(json["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(
+            json["result"]["protocolVersion"],
+            SUPPORTED_PROTOCOL_VERSION
+        );
         assert_eq!(json["result"]["serverInfo"]["name"], "plug");
         assert_initialize_icons_sequence(&json["result"]["serverInfo"]["icons"]);
         assert!(json["result"]["capabilities"]["tools"].is_null());
@@ -5740,7 +5015,7 @@ mod tests {
         assert_eq!(json["remotes"][0]["url"], "/mcp");
         assert_eq!(
             json["remotes"][0]["supportedProtocolVersions"],
-            serde_json::json!([PROTOCOL_VERSION])
+            serde_json::json!([SUPPORTED_PROTOCOL_VERSION])
         );
         assert!(json.get("tools").is_none());
         assert!(json.get("servers").is_none());
@@ -5794,12 +5069,58 @@ mod tests {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
-            Some(Duration::from_millis(50)),
+            Duration::from_millis(50),
         )
         .await;
 
         assert!(result.is_err());
         assert!(state.pending_client_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_reverse_request_releases_pending_entry_and_replay_copy() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        state
+            .sessions
+            .set_sse_sender(&session_id, tx, None)
+            .unwrap();
+
+        let state_for_request = Arc::clone(&state);
+        let session_id_for_request = session_id.clone();
+        let pending = tokio::spawn(async move {
+            send_http_client_request(
+                &state_for_request,
+                &session_id_for_request,
+                ServerRequest::ListRootsRequest(ListRootsRequest {
+                    method: Default::default(),
+                    extensions: Default::default(),
+                }),
+                Duration::from_secs(600),
+            )
+            .await
+        });
+        rx.recv().await.expect("reverse request delivered");
+        assert_eq!(state.pending_client_requests.len(), 1);
+
+        // The caller gives up, as a cancelled elicitation does.
+        pending.abort();
+        let _ = pending.await;
+
+        assert!(
+            state.pending_client_requests.is_empty(),
+            "an abandoned reverse request must not stay pending"
+        );
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel(4);
+        state
+            .sessions
+            .set_sse_sender(&session_id, reconnect_tx, Some(0))
+            .unwrap();
+        assert!(
+            reconnect_rx.try_recv().is_err(),
+            "an abandoned reverse request must not replay on reconnect"
+        );
     }
 
     #[tokio::test]
@@ -5843,7 +5164,7 @@ mod tests {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
-            Some(Duration::from_secs(1)),
+            Duration::from_secs(1),
         )
         .await
         .expect("reverse request should succeed");
@@ -5887,7 +5208,7 @@ mod tests {
                     method: Default::default(),
                     extensions: Default::default(),
                 }),
-                Some(Duration::from_secs(1)),
+                Duration::from_secs(1),
             )
             .await
         });
@@ -7180,7 +6501,6 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
-            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             config.clone(),
@@ -7526,7 +6846,6 @@ mod tests {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
                 local_port: 3282,
-                modern_downstream_enabled: false,
             },
             state_path.clone(),
         )
@@ -7894,7 +7213,6 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
-            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),
@@ -8051,7 +7369,7 @@ mod tests {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "matrix-client", "version": "1.0" }
             }
@@ -8274,7 +7592,6 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
-            modern_downstream_enabled: false,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),
@@ -8316,7 +7633,7 @@ mod tests {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "replay-client", "version": "1.0" }
             }

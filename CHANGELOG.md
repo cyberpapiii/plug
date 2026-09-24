@@ -21,6 +21,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   made the call, and turn the latency orange when a call took five seconds or
   more.
 - The version in About can be selected and copied.
+- Downstream OAuth state from before 0.4.0 (`issuer-v2-*.json`) is no
+  longer migrated at startup, and the one-time grant scope and token-family
+  backfills are gone. State written by 0.4.0 or later loads unchanged.
+- Downstream OAuth state writes no longer stall other requests on the same
+  daemon worker thread, and the state file is written as compact JSON.
 - Servers use the same words everywhere: the detail header says "Running · N
   tools" or "Off" like the rows do, a degraded server sorts with the working
   ones instead of above them, and the notification setting now says what it
@@ -76,6 +81,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- The OAuth client-metadata fetch now stops reading at its 64 KiB cap even
+  when the response has no `Content-Length`. A chunked body used to be
+  buffered in full for up to five seconds.
+- A remote client that cancels an elicitation or sampling request no longer
+  leaves the pending request behind. It used to stay registered, and replay
+  to the client on its next reconnect, until the session ended.
+- A remote HTTP session that sends a request just as the idle sweep runs no
+  longer loses its subscriptions, roots, and tasks while it stays open. The
+  sweep now rechecks expiry at the moment it removes a session.
 - Plug.app no longer leaks a socket each time it checks on the background
   service. Setup and repair checked several times per pass, and up to 180
   times while a new service started, without closing the connection.

@@ -55,6 +55,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWo
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
 
 [dev-dependencies]
+plug-core = { path = "../plug-core", features = ["test-helpers"] }
 rcgen = "0.14"
 tokio-rustls = { version = "0.26", default-features = false }
 plug-test-harness = { path = "../plug-test-harness" }
