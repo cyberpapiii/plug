@@ -680,6 +680,33 @@ async fn handle_ipc_connection(
     result
 }
 
+/// Resolves when the modern downstream gate may have changed. Never resolves
+/// once the sender is gone, so a closed channel cannot spin a select loop.
+async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if gate_rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Push `ModernDownstreamGateChanged` when the gate differs from the value
+/// this connection last reported.
+async fn push_modern_gate_change(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    gate_rx: &mut tokio::sync::watch::Receiver<bool>,
+    last_modern_gate: &mut bool,
+) -> anyhow::Result<()> {
+    let enabled = *gate_rx.borrow_and_update();
+    if enabled != *last_modern_gate {
+        ipc::send_response(
+            writer,
+            &IpcResponse::ModernDownstreamGateChanged { enabled },
+        )
+        .await?;
+        *last_modern_gate = enabled;
+    }
+    Ok(())
+}
+
 /// Inner loop for IPC connection handling.
 async fn handle_ipc_loop(
     reader: &mut FrameReader,
@@ -694,9 +721,10 @@ async fn handle_ipc_loop(
     // Protocol notification subscription — activated after Register so the daemon
     // can push list_changed, progress, and cancelled notifications to this IPC client.
     let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    let mut gate_tick = tokio::time::interval(Duration::from_millis(100));
-    gate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_modern_gate = ctx.engine.tool_router().modern_downstream_enabled();
+    // Modern downstream gate changes are pushed as they happen. The router
+    // outlives this connection, so the sender never closes under it.
+    let mut gate_rx = ctx.engine.tool_router().watch_modern_downstream();
+    let mut last_modern_gate = *gate_rx.borrow_and_update();
 
     loop {
         // Proxy connections (those that have Registered) are long-lived and should
@@ -724,16 +752,8 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                     }
-                    _ = gate_tick.tick() => {
-                        let enabled = ctx.engine.tool_router().modern_downstream_enabled();
-                        if enabled != last_modern_gate {
-                            ipc::send_response(
-                                writer,
-                                &IpcResponse::ModernDownstreamGateChanged { enabled },
-                            )
-                            .await?;
-                            last_modern_gate = enabled;
-                        }
+                    _ = modern_gate_changed(&mut gate_rx) => {
+                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
                     }
                     reverse = async {
                         if let Some(ref mut rx) = ctx.reverse_request_rx {
@@ -840,7 +860,6 @@ async fn handle_ipc_loop(
         // SESSION_REPLACED) early-returns without touching the bridge, and
         // the still-live channel must be restored as usual.
         let request_was_deregister = is_deregister_request(&request);
-        let gate_router = ctx.engine.tool_router().clone();
 
         let response = {
             use std::pin::pin;
@@ -893,16 +912,8 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
                     }
-                    _ = gate_tick.tick() => {
-                        let enabled = gate_router.modern_downstream_enabled();
-                        if enabled != last_modern_gate {
-                            ipc::send_response(
-                                writer,
-                                &IpcResponse::ModernDownstreamGateChanged { enabled },
-                            )
-                            .await?;
-                            last_modern_gate = enabled;
-                        }
+                    _ = modern_gate_changed(&mut gate_rx) => {
+                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
                     }
                 }
             }
@@ -3421,6 +3432,74 @@ mod tests {
         plug_core::ipc::write_frame(&mut stream, &serde_json::to_vec(&reply).unwrap())
             .await
             .expect("write reverse-request reply");
+
+        cancel.cancel();
+        drop(stream);
+        let _ = server_task.await;
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A registered connection hears about a modern downstream gate change
+    /// without sending another request.
+    #[tokio::test]
+    async fn registered_connection_is_pushed_modern_gate_changes() {
+        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        engine.start().await.expect("engine start");
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/plug-ipc-gate-push-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
+        let cancel = CancellationToken::new();
+        let (client_registry, _count_rx) = ClientRegistry::new();
+        let ctx = ConnectionContext {
+            cancel: cancel.clone(),
+            auth_token: Arc::from("test-token"),
+            server_manager: Arc::clone(engine.server_manager()),
+            engine: Arc::clone(&engine),
+            config_path: std::path::PathBuf::from("/tmp/plug-ipc-gate-push-config.toml"),
+            started_at: Instant::now(),
+            client_registry: Arc::new(client_registry),
+            http_sessions: None,
+            downstream_oauth: None,
+            session_id: Some("gate-push-session".to_string()),
+            reverse_request_rx: None,
+        };
+        let server_task = tokio::spawn(async move {
+            if let Ok((stream, _addr)) = listener.accept().await {
+                let _ = handle_ipc_connection(stream, ctx).await;
+            }
+        });
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("client connect");
+        // Enter the registered-idle loop.
+        write_ipc(&mut stream, &IpcRequest::Status).await;
+        let status = read_ipc_response(&mut stream).await;
+        assert!(matches!(status, IpcResponse::Status { .. }), "{status:?}");
+
+        for expected in [true, false] {
+            engine.tool_router().set_modern_downstream_enabled(expected);
+            let pushed = loop {
+                let frame = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    plug_core::ipc::read_frame(&mut stream),
+                )
+                .await
+                .expect("timed out waiting for the gate push")
+                .expect("read frame")
+                .expect("unexpected EOF");
+                let response: IpcResponse = serde_json::from_slice(&frame).expect("decode frame");
+                if let IpcResponse::ModernDownstreamGateChanged { enabled } = response {
+                    break enabled;
+                }
+            };
+            assert_eq!(pushed, expected);
+        }
 
         cancel.cancel();
         drop(stream);

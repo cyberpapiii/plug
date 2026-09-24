@@ -75,6 +75,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   leaves its reply behind for the next call to read when the daemon pushed a
   notification first, and a wedged daemon during that send now trips the
   read watchdog instead of hanging.
+- The daemon no longer wakes ten times a second for every connected
+  `plug connect` client to check whether the modern protocol gate changed.
+  Gate changes are now pushed the moment they happen.
 
 ## [0.8.11] - 2026-09-01
 
