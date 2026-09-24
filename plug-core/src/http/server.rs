@@ -171,16 +171,7 @@ fn modern_http_call_context(
     if let Some(info) = client_info {
         context = context.with_client_metadata(info.name, info.version);
     }
-    match (auth_status, principal) {
-        (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-            .with_authorization(principal, claims.scopes.clone())
-            .with_principal_lifecycle(claims.principal_lifecycle.clone()),
-        (AuthStatus::Authenticated(None), Some(principal)) => {
-            context.with_local_principal(principal)
-        }
-        (AuthStatus::NoAuthRequired, _) => context.with_local_principal(http_loopback_principal()),
-        (AuthStatus::Authenticated(_), None) => context,
-    }
+    apply_http_auth(context, auth_status, oauth_issuer)
 }
 
 fn legacy_http_policy_context(
@@ -195,16 +186,29 @@ fn legacy_http_policy_context(
         crate::types::ClientType::Unknown,
         trace_id,
     );
-    match (
+    apply_http_auth(
+        context,
         auth_status,
-        http_principal(
-            auth_status,
-            state
-                .downstream_oauth
-                .as_ref()
-                .map(|manager| manager.base_url()),
-        ),
-    ) {
+        state
+            .downstream_oauth
+            .as_ref()
+            .map(|manager| manager.base_url()),
+    )
+}
+
+/// Attach what the request proved about its caller to a call context.
+///
+/// An OAuth token carries its granted scopes and principal lifecycle; a
+/// configured bearer is a local principal; an unauthenticated request can
+/// only exist on a loopback-only listener, so it gets the loopback principal.
+/// The trust comes from that listener, not from client-provided metadata, and
+/// holds in both protocol eras.
+fn apply_http_auth(
+    context: DownstreamCallContext,
+    auth_status: &AuthStatus,
+    oauth_issuer: Option<&str>,
+) -> DownstreamCallContext {
+    match (auth_status, http_principal(auth_status, oauth_issuer)) {
         (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
             .with_authorization(principal, claims.scopes.clone())
             .with_principal_lifecycle(claims.principal_lifecycle.clone()),
@@ -330,25 +334,9 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
         }
-        match (
-            &self.auth_status,
-            http_principal(&self.auth_status, self.oauth_issuer.as_deref()),
-        ) {
-            (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-                .with_authorization(principal, claims.scopes.clone())
-                .with_principal_lifecycle(claims.principal_lifecycle.clone()),
-            (AuthStatus::Authenticated(None), Some(principal)) => {
-                context.with_local_principal(principal)
-            }
-            (AuthStatus::NoAuthRequired, _) => {
-                // The trust comes from the loopback-only listener, not from
-                // client-provided metadata; ownership remains scoped to the
-                // server-minted session id in `task_owner`. Era-independent:
-                // a loopback listener is loopback in both revisions.
-                context.with_local_principal(http_loopback_principal())
-            }
-            (AuthStatus::Authenticated(_), None) => context,
-        }
+        // Unauthenticated ownership stays scoped to the server-minted session
+        // id in `task_owner`.
+        apply_http_auth(context, &self.auth_status, self.oauth_issuer.as_deref())
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
