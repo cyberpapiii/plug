@@ -263,39 +263,6 @@ pub fn time_until_refresh_window(received_at: u64, expires_in: Option<u64>) -> D
     }
 }
 
-/// Get the current access token for a server from the in-memory cache.
-///
-/// Returns `None` if no token is cached for the server.
-pub fn current_access_token(server_name: &str) -> Option<String> {
-    let store = STORES.get(server_name)?;
-    let guard = store.cache.load();
-    let cached = guard.as_ref().as_ref()?;
-    Some(cached.access_token.clone())
-}
-
-pub fn credential_debug_snapshot(server_name: &str) -> CredentialDebugSnapshot {
-    get_or_create_store(server_name).credential_debug_snapshot()
-}
-
-/// Return the current access token for a server, hydrating the in-memory cache
-/// from persisted credentials on cache miss.
-///
-/// This lets a fresh daemon/runtime recover after a successful `plug auth login`
-/// without requiring an injected-token IPC path to populate the cache first.
-///
-/// When a mirrored token file contains newer credentials than the current
-/// in-memory cache, prefer the persisted credentials and refresh the cache.
-pub async fn current_or_stored_access_token(server_name: &str) -> Option<String> {
-    let store = get_or_create_store(server_name);
-    let creds = store.current_or_freshest_persisted_credentials().await?;
-
-    use oauth2::TokenResponse;
-    creds
-        .token_response
-        .as_ref()
-        .map(|tr| tr.access_token().secret().to_string())
-}
-
 fn stored_access_token(credentials: &StoredCredentials) -> Option<String> {
     use oauth2::TokenResponse;
     credentials
@@ -366,21 +333,31 @@ pub async fn verified_access_token_for_resource(
     resource_url: &str,
     start_budget: Duration,
 ) -> Result<Option<String>, AuthError> {
-    use rmcp::transport::auth::AuthorizationManager;
-
     let store = get_or_create_store(server_name);
     if let Some(token) = store.bound_access_token_for_resource(resource_url) {
         return Ok(Some(token));
     }
 
-    let manager = AuthorizationManager::new(resource_url).await?;
-    let resolution =
-        bounded_discovery(resource_url, start_budget, manager.resolve_metadata()).await?;
-    let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
-    store.bind_verified_authority(&authority)?;
+    bind_discovered_authority(&store, resource_url, start_budget).await?;
     Ok(store
         .verified_bound_credentials()
         .and_then(|credentials| stored_access_token(&credentials)))
+}
+
+/// Discover `resource_url`'s OAuth authority and bind `store` to it, so the
+/// next save writes an issuer/resource-bound pair the runtime will accept.
+/// Discovery is bounded by a share of `budget` like every start-path lookup.
+pub async fn bind_discovered_authority(
+    store: &CompositeCredentialStore,
+    resource_url: &str,
+    budget: Duration,
+) -> Result<(), AuthError> {
+    use rmcp::transport::auth::AuthorizationManager;
+
+    let manager = AuthorizationManager::new(resource_url).await?;
+    let resolution = bounded_discovery(resource_url, budget, manager.resolve_metadata()).await?;
+    let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
+    store.bind_verified_authority(&authority)
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +367,6 @@ pub async fn verified_access_token_for_resource(
 #[derive(Clone)]
 struct CachedCredentials {
     credentials: StoredCredentials,
-    access_token: String,
     /// Epoch seconds when the token was received. Used by refresh checks.
     token_received_at: u64,
     /// Token lifetime in seconds. Used by refresh checks.
@@ -552,7 +528,6 @@ impl std::fmt::Debug for CachedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedCredentials")
             .field("credentials", &"[REDACTED]")
-            .field("access_token", &"[REDACTED]")
             .field("token_received_at", &self.token_received_at)
             .field("expires_in", &self.expires_in)
             .finish()
@@ -659,7 +634,14 @@ impl CompositeCredentialStore {
                 .get(&self.server_name)
                 .cloned();
         }
-        self.keyring_entry()?.get_password().ok()
+        match self.keyring_entry()?.get_password() {
+            Ok(json) => Some(json),
+            Err(platform_keyring::Error::NoEntry) => None,
+            Err(e) => {
+                debug!(server = %self.server_name, error = %e, "keyring: load failed");
+                None
+            }
+        }
     }
 
     fn probe_bound_pair(&self) -> BoundPairProbe {
@@ -746,13 +728,15 @@ impl CompositeCredentialStore {
             .and_then(|credentials| stored_access_token(&credentials))
     }
 
-    fn encode_credentials(
+    /// The persisted shape of `credentials`: a bound envelope when an
+    /// authority is bound, the bare legacy record otherwise.
+    fn credential_envelope(
         &self,
         credentials: &StoredCredentials,
         generation: Option<&str>,
-    ) -> Result<String, AuthError> {
+    ) -> Result<serde_json::Value, AuthError> {
         match self.binding.load().as_ref().as_ref() {
-            Some(binding) => serde_json::to_string(&BoundCredentialEnvelope {
+            Some(binding) => serde_json::to_value(BoundCredentialEnvelope {
                 version: CREDENTIAL_ENVELOPE_VERSION,
                 generation: generation
                     .expect("bound credential writes require a transaction generation")
@@ -760,9 +744,19 @@ impl CompositeCredentialStore {
                 binding: binding.clone(),
                 credentials: credentials.clone(),
             }),
-            None => serde_json::to_string(credentials),
+            None => serde_json::to_value(credentials),
         }
         .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
+    }
+
+    fn encode_credentials(
+        &self,
+        credentials: &StoredCredentials,
+        generation: Option<&str>,
+    ) -> Result<String, AuthError> {
+        Ok(self
+            .credential_envelope(credentials, generation)?
+            .to_string())
     }
 
     fn credential_write_lock_path(&self) -> Result<PathBuf, AuthError> {
@@ -848,25 +842,13 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_load(&self) -> Option<StoredCredentials> {
-        if let Some(environment) = test_credential_environment() {
-            let json = environment
-                .keyring
-                .lock()
-                .expect("test keyring mutex poisoned")
-                .get(&self.server_name)
-                .cloned()?;
-            return self.decode_credentials(&json, "test keyring");
-        }
-
-        let entry = self.keyring_entry()?;
-        match entry.get_password() {
-            Ok(json) => self.decode_credentials(&json, "keyring"),
-            Err(platform_keyring::Error::NoEntry) => None,
-            Err(e) => {
-                debug!(server = %self.server_name, error = %e, "keyring: load failed");
-                None
-            }
-        }
+        let json = self.raw_keyring_json()?;
+        let source = if test_credential_environment().is_some() {
+            "test keyring"
+        } else {
+            "keyring"
+        };
+        self.decode_credentials(&json, source)
     }
 
     fn keyring_save(&self, creds: &StoredCredentials) -> bool {
@@ -1099,18 +1081,7 @@ impl CompositeCredentialStore {
         generation: Option<&str>,
     ) -> Result<(), AuthError> {
         let path = self.token_file_path()?;
-        let value = match self.binding.load().as_ref().as_ref() {
-            Some(binding) => serde_json::to_value(BoundCredentialEnvelope {
-                version: CREDENTIAL_ENVELOPE_VERSION,
-                generation: generation
-                    .expect("bound credential writes require a transaction generation")
-                    .to_string(),
-                binding: binding.clone(),
-                credentials: creds.clone(),
-            }),
-            None => serde_json::to_value(creds),
-        }
-        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))?;
+        let value = self.credential_envelope(creds, generation)?;
         self.save_json_file(path, &value, "token file")
     }
 
@@ -1139,12 +1110,10 @@ impl CompositeCredentialStore {
     fn update_cache(&self, creds: &StoredCredentials) {
         let cached = creds.token_response.as_ref().map(|tr| {
             use oauth2::TokenResponse;
-            let access_token = tr.access_token().secret().to_string();
             let expires_in = tr.expires_in().map(|d| d.as_secs());
             let token_received_at = creds.token_received_at.unwrap_or_else(unix_now);
             CachedCredentials {
                 credentials: creds.clone(),
-                access_token,
                 token_received_at,
                 expires_in,
             }
@@ -1289,13 +1258,7 @@ impl CompositeCredentialStore {
             && Self::token_identity(lhs) == Self::token_identity(rhs)
     }
 
-    pub fn backing_store_warnings(&self) -> Vec<String> {
-        let file = self.file_load();
-        let keyring = self.keyring_load();
-        Self::compute_backing_store_warnings(file.as_ref(), keyring.as_ref())
-    }
-
-    fn runtime_auth_snapshot_inner(&self) -> CredentialSnapshot {
+    pub fn runtime_auth_snapshot(&self) -> CredentialSnapshot {
         let cached = self.cached_credentials();
         let persisted_file = self.file_load();
 
@@ -1334,8 +1297,8 @@ impl CompositeCredentialStore {
         }
     }
 
-    fn fallback_auth_snapshot_inner(&self) -> CredentialSnapshot {
-        let runtime = self.runtime_auth_snapshot_inner();
+    pub fn fallback_auth_snapshot(&self) -> CredentialSnapshot {
+        let runtime = self.runtime_auth_snapshot();
         if runtime.credentials.is_some() {
             return runtime;
         }
@@ -1362,7 +1325,7 @@ impl CompositeCredentialStore {
         }
     }
 
-    fn credential_snapshot_inner(&self) -> CredentialSnapshot {
+    pub fn credential_snapshot(&self) -> CredentialSnapshot {
         let cached = self.cached_credentials();
         let persisted_file = self.file_load();
         let persisted_keyring = self.keyring_load();
@@ -1428,29 +1391,8 @@ impl CompositeCredentialStore {
         }
     }
 
-    pub fn credential_snapshot(&self) -> CredentialSnapshot {
-        self.credential_snapshot_inner()
-    }
-
-    pub fn fallback_auth_snapshot(&self) -> CredentialSnapshot {
-        self.fallback_auth_snapshot_inner()
-    }
-
-    /// Read only the in-memory cache and protected file mirror.
-    ///
-    /// Daemon request handlers use this path so an operator query cannot block
-    /// the async runtime behind a macOS Keychain authorization dialog. Normal
-    /// startup and explicit local diagnostics retain the keyring recovery path.
-    pub fn runtime_auth_snapshot(&self) -> CredentialSnapshot {
-        self.runtime_auth_snapshot_inner()
-    }
-
-    pub fn credential_debug_snapshot(&self) -> CredentialDebugSnapshot {
-        Self::debug_snapshot(self.credential_snapshot_inner())
-    }
-
     fn fallback_auth_debug_snapshot(&self) -> CredentialDebugSnapshot {
-        Self::debug_snapshot(self.fallback_auth_snapshot_inner())
+        Self::debug_snapshot(self.fallback_auth_snapshot())
     }
 
     fn debug_snapshot(snapshot: CredentialSnapshot) -> CredentialDebugSnapshot {
@@ -1480,20 +1422,6 @@ impl CompositeCredentialStore {
             warnings: snapshot.warnings,
         }
     }
-
-    /// Return the best currently-known credentials for this server.
-    ///
-    /// When cached credentials exist, prefer a newer mirrored token-file entry
-    /// over the in-memory copy. This lets a long-lived daemon recover from
-    /// fresher persisted credentials written by another process without
-    /// requiring a full restart to clear cache state.
-    async fn current_or_freshest_persisted_credentials(&self) -> Option<StoredCredentials> {
-        match self.probe_bound_pair() {
-            BoundPairProbe::Valid(credentials) => Some(*credentials),
-            BoundPairProbe::Invalid => None,
-            BoundPairProbe::NotBound => self.fallback_auth_snapshot_inner().credentials,
-        }
-    }
 }
 
 #[async_trait]
@@ -1506,8 +1434,8 @@ impl CredentialStore for CompositeCredentialStore {
         }
         // The normal runtime hot path must not wake the OS credential UI when
         // a protected token mirror is already available. Explicit diagnostics
-        // still use `credential_snapshot_inner` to compare both backends.
-        let snapshot = self.fallback_auth_snapshot_inner();
+        // still use `credential_snapshot` to compare both backends.
+        let snapshot = self.fallback_auth_snapshot();
         if snapshot.source == Some("keyring")
             && let Some(credentials) = snapshot.credentials.as_ref()
         {
@@ -2234,6 +2162,13 @@ mod tests {
         StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(now))
     }
 
+    fn cached_access_token(server_name: &str) -> Option<String> {
+        get_or_create_store(server_name)
+            .cached_credentials()
+            .as_ref()
+            .and_then(stored_access_token)
+    }
+
     fn test_authority() -> VerifiedOAuthAuthority {
         let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
         metadata.issuer = Some("https://auth.example/".to_string());
@@ -2340,10 +2275,7 @@ mod tests {
         CredentialStore::save(runtime_store.as_ref(), credentials)
             .await
             .unwrap();
-        assert_eq!(
-            current_access_token(&name).as_deref(),
-            Some("legacy-access")
-        );
+        assert_eq!(cached_access_token(&name).as_deref(), Some("legacy-access"));
         let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
 
         let token =
@@ -2367,7 +2299,7 @@ mod tests {
             0,
             "legacy file state must fail closed before touching Keychain"
         );
-        assert_eq!(current_access_token(&name), None);
+        assert_eq!(cached_access_token(&name), None);
         assert!(matches!(
             refresh_access_token(&name, &resource_url, None).await,
             RefreshResult::NoCredentials
@@ -2617,59 +2549,6 @@ mod tests {
         store.clear().await.unwrap();
     }
 
-    /// Persisted credentials should rehydrate the cache on first access after a
-    /// cold start / `AuthRequired` state.
-    #[tokio::test]
-    async fn test_current_or_stored_access_token_hydrates_cache() {
-        let name = format!("oauth-hydrate-{}", std::process::id());
-        let store = get_or_create_store(&name);
-
-        let creds = make_test_token("persisted-access", Some("persisted-refresh"), Some(3600));
-        store.save(creds).await.unwrap();
-        store.clear_cache();
-
-        assert!(current_access_token(&name).is_none());
-
-        let token = current_or_stored_access_token(&name).await;
-        assert_eq!(token.as_deref(), Some("persisted-access"));
-        assert_eq!(
-            current_access_token(&name).as_deref(),
-            Some("persisted-access")
-        );
-
-        store.clear().await.unwrap();
-    }
-
-    /// A long-lived daemon can hold stale cached credentials while another
-    /// process persists fresher credentials to disk. Reconnect-time token lookup
-    /// should prefer the newer persisted token and refresh the shared cache.
-    #[tokio::test]
-    async fn test_current_or_stored_access_token_prefers_newer_persisted_credentials() {
-        let name = format!("oauth-refresh-cache-{}", std::process::id());
-        let store = get_or_create_store(&name);
-
-        let mut stale = make_test_token("stale-access", Some("stale-refresh"), Some(3600));
-        stale.token_received_at = Some(100);
-        store.save(stale).await.unwrap();
-
-        let external_store = CompositeCredentialStore::new(name.clone());
-        let mut fresh = make_test_token("fresh-access", Some("fresh-refresh"), Some(3600));
-        fresh.token_received_at = Some(200);
-        external_store.save(fresh).await.unwrap();
-
-        assert_eq!(
-            current_access_token(&name).as_deref(),
-            Some("stale-access"),
-            "expected shared cache to remain stale before lookup"
-        );
-
-        let token = current_or_stored_access_token(&name).await;
-        assert_eq!(token.as_deref(), Some("fresh-access"));
-        assert_eq!(current_access_token(&name).as_deref(), Some("fresh-access"));
-
-        store.clear().await.unwrap();
-    }
-
     #[tokio::test]
     async fn test_load_prefers_in_memory_cache_before_backing_stores() {
         let name = format!("oauth-cache-first-{}", std::process::id());
@@ -2718,9 +2597,12 @@ mod tests {
         assert_eq!(debug_snapshot.source, Some("file"));
         store.clear_cache();
 
-        let token = current_or_stored_access_token(&name).await;
-        assert_eq!(token.as_deref(), Some("file-access"));
-        assert_eq!(current_access_token(&name).as_deref(), Some("file-access"));
+        let loaded = store.load().await.unwrap();
+        assert_eq!(
+            loaded.as_ref().and_then(stored_access_token).as_deref(),
+            Some("file-access")
+        );
+        assert_eq!(cached_access_token(&name).as_deref(), Some("file-access"));
 
         store.clear().await.unwrap();
     }
@@ -2819,7 +2701,7 @@ mod tests {
         store.file_save(&creds).unwrap();
         store.keyring_clear();
 
-        let warnings = store.backing_store_warnings();
+        let warnings = store.credential_snapshot().warnings;
         assert_eq!(
             warnings,
             vec!["token file mirror exists but keyring entry is missing".to_string()]

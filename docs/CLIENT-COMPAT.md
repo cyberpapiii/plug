@@ -39,7 +39,7 @@ invoke `plug connect`; they should not point at a separately installed binary.
 Headless macOS is unsupported because first-use ServiceManagement and Keychain
 consent need a logged-in GUI session.
 
-Linux builds from source. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
+For Linux and source builds, see the [operator guide](OPERATOR-GUIDE.md).
 
 ---
 
@@ -160,7 +160,7 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 - Does NOT open SSE stream (GET /mcp), so never receives `tools/list_changed` notifications
 - Workaround: set PAGE_SIZE large enough (500+) so all tools fit in a single page
 - After config changes (enabling/disabling upstream servers), remote clients must disconnect and reconnect to see updated tool lists
-- See: `docs/bug-reports/pagination-cursor-forwarding-and-remote-client-blanking.md`
+- See: `docs/archive/bug-reports/pagination-cursor-forwarding-and-remote-client-blanking.md`
 
 **plug implications**:
 - Standard stdio connection via `plug connect`

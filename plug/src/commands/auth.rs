@@ -999,22 +999,38 @@ async fn cmd_auth_complete(
 
 // inject
 
-async fn cmd_auth_inject(
-    config_path: Option<&PathBuf>,
+/// Persist an externally obtained token for `server_name`.
+///
+/// For an OAuth server the store is bound to the server's discovered
+/// authority first, exactly as `plug auth login` does, because the runtime
+/// only accepts an issuer/resource-bound pair: an unbound save on a fresh
+/// store is never used and leaves the server AuthRequired. Returns whether a
+/// stored refresh token can actually be used for background refresh.
+async fn inject_credentials(
     server_name: &str,
+    server_config: &plug_core::config::ServerConfig,
     access_token: &str,
     refresh_token: Option<&str>,
     expires_in: Option<u64>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::VendorExtraTokenFields;
 
-    let cfg = config::load_config(config_path)?;
-    let server_config = cfg
-        .servers
-        .get(server_name)
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
+    let is_oauth = server_config.auth.as_deref() == Some("oauth");
     let store = oauth::get_or_create_store(server_name);
+    if is_oauth {
+        let url = server_config
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
+        oauth::bind_discovered_authority(
+            &store,
+            url,
+            std::time::Duration::from_secs(server_config.timeout_secs),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1041,7 +1057,7 @@ async fn cmd_auth_inject(
         .as_ref()
         .map(|creds| creds.client_id.as_str());
     let (client_id, refreshable) = oauth::injected_client_identity(
-        server_config.auth.as_deref() == Some("oauth"),
+        is_oauth,
         server_config.oauth_client_id.as_deref(),
         existing_client_id,
         refresh_token.is_some(),
@@ -1053,6 +1069,29 @@ async fn cmd_auth_inject(
         .save(stored)
         .await
         .map_err(|e| anyhow::anyhow!("failed to save injected credentials: {e}"))?;
+    Ok(refreshable)
+}
+
+async fn cmd_auth_inject(
+    config_path: Option<&PathBuf>,
+    server_name: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_in: Option<u64>,
+) -> anyhow::Result<()> {
+    let cfg = config::load_config(config_path)?;
+    let server_config = cfg
+        .servers
+        .get(server_name)
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
+    let refreshable = inject_credentials(
+        server_name,
+        server_config,
+        access_token,
+        refresh_token,
+        expires_in,
+    )
+    .await?;
 
     match refresh_live_daemon_server(server_name).await {
         Ok(true) => ui::print_info_line("Refreshed live daemon server state"),
@@ -1887,5 +1926,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "got: {}", err);
+    }
+
+    /// `plug auth inject` on a store with no prior login used to save an
+    /// unbound legacy record. The runtime only admits issuer/resource-bound
+    /// pairs, so the injected token was never used and the server stayed
+    /// AuthRequired.
+    #[tokio::test]
+    async fn inject_on_an_empty_store_is_usable_by_the_runtime() {
+        crate::install_test_credential_environment();
+        plug_core::tls::ensure_rustls_provider_installed();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let authority = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let resource_url = format!("http://{address}/mcp");
+        let server_name = format!("auth-inject-{}", uuid::Uuid::new_v4());
+        let server = plug_core::config::ServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            transport: plug_core::config::TransportType::Http,
+            protocol_mode: Default::default(),
+            url: Some(resource_url.clone()),
+            auth_token: None,
+            auth: Some("oauth".to_string()),
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: std::collections::HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+        };
+        let store = oauth::get_or_create_store(&server_name);
+        store.clear().await.unwrap();
+
+        inject_credentials(&server_name, &server, "injected-access", None, Some(3600))
+            .await
+            .expect("inject succeeds");
+
+        let token = oauth::verified_access_token_for_resource(
+            &server_name,
+            &resource_url,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("runtime lookup succeeds");
+        assert_eq!(token.as_deref(), Some("injected-access"));
+
+        authority.abort();
+        store.clear().await.unwrap();
     }
 }
