@@ -64,6 +64,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- The OAuth client-metadata fetch now stops reading at its 64 KiB cap even
+  when the response has no `Content-Length`. A chunked body used to be
+  buffered in full for up to five seconds.
 
 ## [0.8.11] - 2026-09-01
 

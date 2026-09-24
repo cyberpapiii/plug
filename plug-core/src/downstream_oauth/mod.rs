@@ -2024,14 +2024,32 @@ async fn fetch_client_metadata_document(
     {
         return Err(DownstreamOauthError::MetadataFetch);
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| DownstreamOauthError::MetadataFetch)?;
-    if bytes.len() > MAX_METADATA_DOCUMENT_BYTES {
-        return Err(DownstreamOauthError::MetadataFetch);
-    }
+    let bytes = read_capped_body(response, MAX_METADATA_DOCUMENT_BYTES).await?;
     serde_json::from_slice(&bytes).map_err(|_| DownstreamOauthError::InvalidClientMetadata)
+}
+
+/// Read a response body chunk by chunk and give up as soon as it passes `cap`.
+///
+/// `Content-Length` is only a hint: a chunked response carries none, so the
+/// cap has to be enforced while reading or an unauthenticated
+/// `/oauth/authorize?client_id=https://...` could make the daemon buffer an
+/// arbitrarily large body until the request timeout.
+async fn read_capped_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, DownstreamOauthError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| DownstreamOauthError::MetadataFetch)?
+    {
+        if body.len() + chunk.len() > cap {
+            return Err(DownstreamOauthError::MetadataFetch);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// IPv6 forms that carry an IPv4 address inside them and that no legitimate
@@ -2875,6 +2893,44 @@ mod tests {
             "plug-downstream-oauth-{}.json",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    /// Serve one HTTP response with a chunked body that never ends, and
+    /// return the URL. Nothing in the response states a length.
+    async fn endless_chunked_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let chunk = format!("{:x}\r\n{}\r\n", 4096, "a".repeat(4096));
+            while socket.write_all(chunk.as_bytes()).await.is_ok() {}
+        });
+        format!("http://{address}/client.json")
+    }
+
+    #[tokio::test]
+    async fn metadata_body_cap_applies_to_chunked_responses() {
+        crate::tls::ensure_rustls_provider_installed();
+        let url = endless_chunked_server().await;
+        let response = reqwest::Client::new().get(url).send().await.expect("send");
+        assert!(response.content_length().is_none(), "body must be chunked");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_capped_body(response, MAX_METADATA_DOCUMENT_BYTES),
+        )
+        .await
+        .expect("an oversized chunked body must be refused, not buffered to the end");
+        assert!(matches!(result, Err(DownstreamOauthError::MetadataFetch)));
     }
 
     #[test]
