@@ -67,6 +67,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Plug.app no longer leaks a socket each time it checks on the background
   service. Setup and repair checked several times per pass, and up to 180
   times while a new service started, without closing the connection.
+- The menu bar panel and main window update every two seconds from the moment
+  they open. The background poll used to finish its 30-second sleep first, so
+  after the first read an open panel could miss changes for up to half a
+  minute.
 
 ## [0.8.11] - 2026-09-01
 

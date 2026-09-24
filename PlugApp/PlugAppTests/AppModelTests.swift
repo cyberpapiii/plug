@@ -167,6 +167,35 @@ final class AppModelTests: XCTestCase {
         XCTAssertGreaterThan(snapshots.count, 1, "the polls themselves must still have happened")
     }
 
+    /// Opening a panel switches polling to the brisk pace at once. The loop
+    /// used to finish its background sleep first, so a panel opened just after
+    /// a poll showed state that stayed stale for the whole background interval.
+    @MainActor
+    func testOpeningASurfaceDropsTheBackgroundSleep() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL(),
+            foregroundPollInterval: .milliseconds(20),
+            backgroundPollInterval: .seconds(3600)
+        )
+        await model.start()
+        model.setWatching(true)
+        defer { model.setWatching(false) }
+        try await Task.sleep(for: .milliseconds(500))
+
+        let snapshots = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
+        // One at start, one from setWatching, and more from the brisk loop.
+        XCTAssertGreaterThan(snapshots, 3)
+    }
+
     /// The tool list is by far the largest thing the daemon can be asked for.
     /// It used to be refetched on a timer; the snapshot now reports when it
     /// would answer differently, so a poll that sees the same revision must not

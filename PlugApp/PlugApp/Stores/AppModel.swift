@@ -84,15 +84,23 @@ final class AppModel {
 
     static let foregroundPollInterval = Duration.seconds(2)
     static let backgroundPollInterval = Duration.seconds(30)
+    private let foregroundPollInterval: Duration
+    private let backgroundPollInterval: Duration
 
     private var pollInterval: Duration {
-        watcherCount > 0 ? Self.foregroundPollInterval : Self.backgroundPollInterval
+        watcherCount > 0 ? foregroundPollInterval : backgroundPollInterval
     }
 
     /// Called when a surface appears or disappears. Balanced pairs only.
     func setWatching(_ watching: Bool) {
+        let wasWatched = watcherCount > 0
         watcherCount = max(0, watcherCount + (watching ? 1 : -1))
-        if watching { Task { await refresh() } }
+        guard watching else { return }
+        // The poll loop may be halfway through a background sleep. Left alone,
+        // a panel opened now would show state up to that long out of date
+        // until the sleep ran out, so start the loop over at the new pace.
+        if !wasWatched, monitoringTask != nil { startMonitoring() }
+        Task { await refresh() }
     }
 
     init(
@@ -100,13 +108,17 @@ final class AppModel {
         coordinator: any InstallationCoordinating = InstallationCoordinator(),
         clientVersion: String = AppModel.defaultClientVersion,
         tokenURL: URL = PlugIPCClient.defaultTokenURL,
-        appLinker: any AppLinking = AppLinkService()
+        appLinker: any AppLinking = AppLinkService(),
+        foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
+        backgroundPollInterval: Duration = AppModel.backgroundPollInterval
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
         self.coordinator = coordinator
         self.tokenURL = tokenURL
         self.appLinker = appLinker
+        self.foregroundPollInterval = foregroundPollInterval
+        self.backgroundPollInterval = backgroundPollInterval
     }
 
     /// Read live rather than mirrored. A copy refreshed only when a
@@ -261,10 +273,14 @@ final class AppModel {
         guard !Task.isCancelled else { return }
         await refresh()
         guard !Task.isCancelled else { return }
+        startMonitoring()
+    }
 
+    private func startMonitoring() {
+        monitoringTask?.cancel()
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
-                let interval = self?.pollInterval ?? Self.backgroundPollInterval
+                guard let interval = self?.pollInterval else { return }
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
                 await self?.refresh()
