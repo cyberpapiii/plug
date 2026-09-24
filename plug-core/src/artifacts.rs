@@ -95,9 +95,11 @@ impl ArtifactStore {
         result: CallToolResult,
         max_store_bytes: u64,
     ) -> Result<CallToolResult, McpError> {
-        let serialized = serde_json::to_vec(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let size = serialized.len();
+        // Most results stay inline, so measure the serialized size without
+        // buffering it. Only a result that is spilled to disk gets
+        // serialized into memory, just before the write.
+        let size =
+            serialized_len(&result).map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         if size <= INLINE_RESULT_MAX_BYTES || !should_artifactize(source_tool, &result, size) {
             return Ok(result);
@@ -127,6 +129,8 @@ impl ArtifactStore {
             .content
             .iter()
             .find_map(|content| content.as_text().map(|text| text.text.clone()));
+        let serialized = serde_json::to_vec(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let write_dir = artifact_dir.clone();
         let write_payload_path = payload_path.clone();
         let materialized_path = tokio::task::spawn_blocking(move || {
@@ -281,6 +285,27 @@ impl Default for ArtifactStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Byte length of `value` serialized with `serde_json::to_vec`, measured
+/// without allocating the output.
+fn serialized_len<T: Serialize>(value: &T) -> serde_json::Result<usize> {
+    struct CountingWriter(usize);
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn should_artifactize(source_tool: &str, result: &CallToolResult, size: usize) -> bool {
@@ -746,6 +771,18 @@ mod tests {
             base_dir,
             records: DashMap::new(),
         }
+    }
+
+    #[test]
+    fn serialized_len_matches_to_vec() {
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("plain"),
+            ContentBlock::text("quotes \" and unicode \u{00e9}\u{1F600} and \n newlines"),
+        ]);
+        assert_eq!(
+            serialized_len(&result).unwrap(),
+            serde_json::to_vec(&result).unwrap().len()
+        );
     }
 
     #[test]

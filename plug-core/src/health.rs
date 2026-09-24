@@ -9,13 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable as _};
-use tokio::sync::broadcast;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::engine::{Engine, EngineEvent};
+use crate::engine::Engine;
 use crate::proxy::ToolRouter;
 use crate::server::ServerManager;
 use crate::types::ServerHealth;
@@ -32,7 +31,6 @@ pub fn spawn_health_checks(
     server_manager: Arc<ServerManager>,
     router: Arc<ToolRouter>,
     engine: Arc<Engine>,
-    event_tx: broadcast::Sender<EngineEvent>,
     cancel: CancellationToken,
     config: &Config,
     tracker: &TaskTracker,
@@ -52,7 +50,6 @@ pub fn spawn_health_checks(
             server_manager.clone(),
             router.clone(),
             engine.clone(),
-            event_tx.clone(),
             cancel.clone(),
             name.clone(),
             sc.health_check_interval_secs,
@@ -61,12 +58,10 @@ pub fn spawn_health_checks(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_health_check(
     server_manager: Arc<ServerManager>,
     router: Arc<ToolRouter>,
     engine: Arc<Engine>,
-    event_tx: broadcast::Sender<EngineEvent>,
     cancel: CancellationToken,
     name: String,
     health_check_interval_secs: u64,
@@ -147,11 +142,6 @@ pub fn spawn_health_check(
                     if let Some((old, new)) = result {
                         tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
                         router.schedule_tool_list_changed_refresh();
-                        let _ = event_tx.send(EngineEvent::ServerHealthChanged {
-                            server_id: Arc::from(name.as_str()),
-                            old,
-                            new,
-                        });
 
                         if new == ServerHealth::Failed {
                             // Always-on Failed-recovery (not gated by the
@@ -295,7 +285,7 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
 /// Ping a single upstream server and update its health state.
 ///
 /// Returns `Some((old, new))` if the health state changed (caller should
-/// refresh tools and emit event). Returns `None` if unchanged.
+/// refresh tools). Returns `None` if unchanged.
 async fn health_check_server(
     mgr: &ServerManager,
     name: &str,

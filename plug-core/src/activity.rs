@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 
 pub const ACTIVITY_CAPACITY: usize = 500;
 
@@ -52,16 +51,13 @@ pub struct ActivityFilter {
 pub struct ActivityStore {
     next_sequence: AtomicU64,
     events: Mutex<VecDeque<ActivityEvent>>,
-    tx: broadcast::Sender<ActivityEvent>,
 }
 
 impl Default for ActivityStore {
     fn default() -> Self {
-        let (tx, _) = broadcast::channel(ACTIVITY_CAPACITY);
         Self {
             next_sequence: AtomicU64::new(1),
             events: Mutex::new(VecDeque::with_capacity(ACTIVITY_CAPACITY)),
-            tx,
         }
     }
 }
@@ -82,9 +78,7 @@ impl ActivityStore {
         if events.len() == ACTIVITY_CAPACITY {
             events.pop_front();
         }
-        events.push_back(event.clone());
-        drop(events);
-        let _ = self.tx.send(event);
+        events.push_back(event);
     }
 
     pub fn snapshot(&self, filter: &ActivityFilter) -> Vec<ActivityEvent> {
@@ -106,10 +100,6 @@ impl ActivityStore {
             .collect::<Vec<_>>();
         events.reverse();
         events
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<ActivityEvent> {
-        self.tx.subscribe()
     }
 }
 
