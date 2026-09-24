@@ -82,6 +82,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   timeout; it now gives up after three seconds and runs beside the tool list.
 - Re-listing tools after an upstream's `tools/list_changed` now times out
   after the server's `call_timeout_secs` instead of waiting forever.
+- A server that failed at startup is now retried the moment its health task
+  starts. It used to sit out a random pause of up to ten seconds meant only
+  to stagger pings to healthy servers.
 
 ## [0.8.11] - 2026-09-01
 
