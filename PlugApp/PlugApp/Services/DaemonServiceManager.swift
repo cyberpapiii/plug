@@ -474,7 +474,9 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func handshake() async throws -> OperatorHandshake {
-        try await PlugIPCClient().connect()
+        // Called several times a reconcile and up to `retryLimit` times while
+        // a replacement proves itself, so each probe closes its own socket.
+        try await PlugIPCClient().handshakeAndDisconnect()
     }
 
     func waitBeforeRetry() async {

@@ -28,6 +28,13 @@ public actor PlugIPCClient {
         decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
     }
 
+    /// A client dropped while connected must not keep its socket. Callers are
+    /// expected to disconnect, but a descriptor leaked by every forgotten
+    /// client is how a long-running app runs out of them.
+    deinit {
+        if descriptor >= 0 { Darwin.close(descriptor) }
+    }
+
     // Keep package-level callers source-compatible while app callers pass the
     // installed bundle version explicitly.
     public init(
@@ -72,6 +79,13 @@ public actor PlugIPCClient {
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         negotiated = handshake
         return handshake
+    }
+
+    /// One handshake on a connection of its own, closed before returning. For
+    /// callers that only want to know who is listening, not to talk to it.
+    public func handshakeAndDisconnect() throws -> OperatorHandshake {
+        defer { disconnect() }
+        return try connect()
     }
 
     public func request(_ request: IPCRequest) throws -> IPCResponse {

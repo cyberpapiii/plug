@@ -64,6 +64,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- Plug.app no longer leaks a socket each time it checks on the background
+  service. Setup and repair checked several times per pass, and up to 180
+  times while a new service started, without closing the connection.
 
 ## [0.8.11] - 2026-09-01
 
